@@ -29,7 +29,7 @@ use rift_protocol::read::EdgeKind;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 
 use crate::EnclosingDefinitions;
-use crate::static_resolution::StaticOccurrence;
+use crate::static_resolution::{ExternalOccurrence, StaticOccurrence};
 
 /// Most edges one [`EdgeStore`] holds across both directions combined.
 ///
@@ -60,8 +60,8 @@ impl Edge {
 
     /// Projects this resolved reference with its physical occurrence.
     #[must_use]
-    pub fn to_protocol(&self) -> rift_protocol::read::Edge {
-        rift_protocol::read::Edge {
+    pub fn to_protocol(&self) -> rift_protocol::index::StoredEdge {
+        rift_protocol::index::StoredEdge {
             producer: None,
             from: rift_protocol::read::SymbolId(self.from.as_str().to_owned()),
             to: rift_protocol::read::SymbolId(self.to.as_str().to_owned()),
@@ -408,14 +408,49 @@ impl get_size2::GetSize for EdgeStore {
     }
 }
 
+/// Edges of static occurrences whose targets a dependency or standard library owns.
+fn admit_external<'a>(
+    external: &'a [ExternalOccurrence],
+    enclosing: &'a UnitDefinitions,
+    admitted: &mut BTreeMap<&'a SymbolId, Vec<Edge>>,
+) {
+    for occurrence in external {
+        let Some(from) = occurrence
+            .edge_from
+            .as_ref()
+            .or_else(|| enclosing.resolve(&occurrence.binding))
+        else {
+            continue;
+        };
+        let edge = Edge {
+            from: from.clone(),
+            to: occurrence.target.clone(),
+            kind: occurrence
+                .edge_kind
+                .unwrap_or_else(|| role_kind(occurrence.role)),
+            occurrence: occurrence.binding.clone(),
+            static_callee: (occurrence.role == ReferenceRole::Call)
+                .then_some(occurrence.callee_range),
+            from_graph: false,
+            derivation: if occurrence.declared {
+                rift_protocol::read::EdgeDerivation::Resolution
+            } else {
+                rift_protocol::read::EdgeDerivation::Syntax
+            },
+        };
+        admitted.entry(from).or_default().push(edge);
+    }
+}
+
 impl EdgeStore {
     pub(crate) fn add_static(
         &mut self,
         graph: &NormalizedGraph,
         occurrences: &[StaticOccurrence],
+        external: &[ExternalOccurrence],
         edges_max: usize,
     ) {
-        if occurrences.is_empty() {
+        if occurrences.is_empty() && external.is_empty() {
             return;
         }
         // `graph` is the graph this store was built from (`WorkspaceSemantics` builds its
@@ -457,6 +492,7 @@ impl EdgeStore {
             };
             admitted.entry(from).or_default().push(edge);
         }
+        admit_external(external, &enclosing, &mut admitted);
         for (from, mut edges) in admitted {
             edges.sort_by(edge_order);
             edges.dedup();
@@ -466,22 +502,27 @@ impl EdgeStore {
                     .binary_search_by(|other| edge_order(other, edge))
                     .is_err()
             });
-            let (fits, omitted) = edges.split_at(edges.len().min(remaining));
+            let fits = edges.len().min(remaining);
             self.dropped_edges = self
                 .dropped_edges
-                .saturating_add(u64::try_from(omitted.len()).unwrap_or(u64::MAX));
-            remaining -= fits.len();
-            for edge in fits {
-                self.outgoing
-                    .entry(from.clone())
-                    .or_default()
-                    .push(edge.clone());
+                .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
+            remaining -= fits;
+            changed |= fits > 0;
+            edges.truncate(fits);
+            if edges.is_empty() {
+                continue;
+            }
+            // The admitted list becomes the outgoing list's tail: one copy per direction.
+            for edge in &edges {
                 self.incoming
                     .entry(edge.to.clone())
                     .or_default()
                     .push(edge.clone());
             }
-            changed |= !fits.is_empty();
+            self.outgoing
+                .entry(from.clone())
+                .or_default()
+                .append(&mut edges);
         }
         if changed {
             for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {

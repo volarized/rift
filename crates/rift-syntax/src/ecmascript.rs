@@ -21,11 +21,13 @@
 //! - Exports are read from the module's top-level statements: an assignment
 //!   nested in a block or a function marks nothing. A re-export
 //!   (`export { x } from './y'`, `export * from './y'`) names another
-//!   module's declarations, so it marks none here. An anonymous function in a
+//!   module's declarations, so it marks none here. A function in a
 //!   literal property assignment (`exports.run = function () {}`) retains the
 //!   property binding and the original function source. The binding carries no
-//!   `Public` kind without supported module export context. Named function and
-//!   class expressions assigned to an export add no declaration.
+//!   `Public` kind without supported module export context. A named function
+//!   expression keeps its local name inside its own body. An anonymous
+//!   `module.exports` function has the export name `default`. Class expressions
+//!   assigned to an export add no declaration.
 //! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
 //!   `protected`), and stays `None` everywhere else.
@@ -38,6 +40,10 @@
 //!   scope, as a class does: a local or a method of an object literal
 //!   qualifies under the declaration holding it (`outer.local`,
 //!   `options.open`), never at module scope.
+//! - A function assigned to a literal member declares a method when its
+//!   receiver uniquely resolves to a local variable, function, or class.
+//!   A prototype method belongs to its local function or class. Declarations
+//!   in the method body keep that method's qualified name as their owner.
 //! - A class field and a constructor parameter property declare a
 //!   `property` of the class; an enum member declares an `enum_member` of
 //!   the enum. The anonymous class `export default class { .. }` declares a
@@ -53,9 +59,8 @@
 //!   to the declaration it qualifies: a child of the declared syntax element, or, for a
 //!   TypeScript method, a sibling written before it that starts its span.
 //! - A `method_signature` or `property_signature` declares a `method` or a
-//!   `property` only inside an interface or class body, qualified by it
-//!   (`Array.map`); the same kinds inside a type literal (`{ size: number }`)
-//!   declare nothing.
+//!   `property` inside an interface, class, or type literal, qualified by the
+//!   declaration containing it (`Array.map`, `Options.size`).
 //! - `documentation` carries those attached `JSDoc` blocks, nearest last,
 //!   joined by a line break, with the `/**`, `*/`, and leading `*` markers
 //!   stripped and `@` tags kept as written. A `//` or `/* */` comment is not
@@ -71,6 +76,8 @@ use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 mod commonjs;
+mod members;
+pub(crate) mod recovery;
 
 use tree_sitter::{Node, Parser};
 
@@ -307,6 +314,9 @@ impl EcmaScriptSymbolKind {
                 | Self::Function
                 | Self::Method
                 | Self::Variable
+                | Self::Property
+                | Self::Field
+                | Self::TypeAlias
         )
     }
 }
@@ -388,11 +398,17 @@ pub(crate) struct EcmaScriptKinds {
     equals_token: u16,
     expression_statement: u16,
     assignment_expression: u16,
-    function_expression: u16,
     member_expression: u16,
     object_literal: u16,
     shorthand_property_identifier: u16,
     pair: u16,
+    key: NonZeroU16,
+    static_token: u16,
+    catch_clause: u16,
+    for_in: u16,
+    loop_kind: NonZeroU16,
+    parameter: NonZeroU16,
+    parenthesized: u16,
     name: NonZeroU16,
     body: NonZeroU16,
     value: NonZeroU16,
@@ -409,6 +425,9 @@ pub(crate) struct EcmaScriptKinds {
     class_expression: u16,
     /// Function expressions that make the variable holding one callable.
     function_values: Vec<u16>,
+    /// Expressions that hold the same value as their operand: a type assertion first,
+    /// then `as`, `satisfies` and a non-null mark. Empty on the JavaScript grammar.
+    value_assertions: Vec<u16>,
     /// `Some` on the TypeScript grammars.
     enum_body: Option<u16>,
     property_identifier: u16,
@@ -444,31 +463,40 @@ impl EcmaScriptKinds {
         kinds
     }
 
+    fn core_declarations(language: &tree_sitter::Language) -> Vec<(u16, EcmaScriptSymbolKind)> {
+        vec![
+            (
+                kind_id(language, FUNCTION_DECLARATION_KIND),
+                EcmaScriptSymbolKind::Function,
+            ),
+            (
+                kind_id(language, GENERATOR_FUNCTION_DECLARATION_KIND),
+                EcmaScriptSymbolKind::Function,
+            ),
+            (
+                kind_id(language, CLASS_DECLARATION_KIND),
+                EcmaScriptSymbolKind::Class,
+            ),
+            (
+                kind_id(language, METHOD_DEFINITION_KIND),
+                EcmaScriptSymbolKind::Method,
+            ),
+            (
+                kind_id(language, VARIABLE_DECLARATOR_KIND),
+                EcmaScriptSymbolKind::Variable,
+            ),
+            (kind_id(language, PAIR_KIND), EcmaScriptSymbolKind::Property),
+            (
+                kind_id(language, SHORTHAND_PROPERTY_IDENTIFIER_KIND),
+                EcmaScriptSymbolKind::Property,
+            ),
+        ]
+    }
+
     /// Resolves the vocabulary every pinned ECMAScript grammar shares.
     fn resolve_core(language: &tree_sitter::Language) -> Self {
         Self {
-            declarations: vec![
-                (
-                    kind_id(language, FUNCTION_DECLARATION_KIND),
-                    EcmaScriptSymbolKind::Function,
-                ),
-                (
-                    kind_id(language, GENERATOR_FUNCTION_DECLARATION_KIND),
-                    EcmaScriptSymbolKind::Function,
-                ),
-                (
-                    kind_id(language, CLASS_DECLARATION_KIND),
-                    EcmaScriptSymbolKind::Class,
-                ),
-                (
-                    kind_id(language, METHOD_DEFINITION_KIND),
-                    EcmaScriptSymbolKind::Method,
-                ),
-                (
-                    kind_id(language, VARIABLE_DECLARATOR_KIND),
-                    EcmaScriptSymbolKind::Variable,
-                ),
-            ],
+            declarations: Self::core_declarations(language),
             lexical_declaration: kind_id(language, LEXICAL_DECLARATION_KIND),
             variable_declaration: kind_id(language, VARIABLE_DECLARATION_KIND),
             export_statement: kind_id(language, EXPORT_STATEMENT_KIND),
@@ -494,11 +522,17 @@ impl EcmaScriptKinds {
             equals_token: token_id(language, EQUALS_TOKEN),
             expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
             assignment_expression: kind_id(language, ASSIGNMENT_EXPRESSION_KIND),
-            function_expression: kind_id(language, FUNCTION_EXPRESSION_KIND),
             member_expression: kind_id(language, MEMBER_EXPRESSION_KIND),
             object_literal: kind_id(language, OBJECT_KIND),
             shorthand_property_identifier: kind_id(language, SHORTHAND_PROPERTY_IDENTIFIER_KIND),
             pair: kind_id(language, PAIR_KIND),
+            key: field_id(language, "key"),
+            static_token: token_id(language, "static"),
+            catch_clause: kind_id(language, "catch_clause"),
+            for_in: kind_id(language, "for_in_statement"),
+            loop_kind: field_id(language, "kind"),
+            parameter: field_id(language, "parameter"),
+            parenthesized: kind_id(language, "parenthesized_expression"),
             name: field_id(language, "name"),
             body: field_id(language, "body"),
             value: field_id(language, "value"),
@@ -517,6 +551,16 @@ impl EcmaScriptKinds {
             ]
             .map(|kind| kind_id(language, kind))
             .to_vec(),
+            value_assertions: [
+                "type_assertion",
+                "as_expression",
+                "satisfies_expression",
+                "non_null_expression",
+            ]
+            .into_iter()
+            .map(|kind| language.id_for_node_kind(kind, true))
+            .filter(|id| *id != 0)
+            .collect(),
             enum_body: None,
             property_identifier: kind_id(language, PROPERTY_IDENTIFIER_KIND),
             method_definition: kind_id(language, METHOD_DEFINITION_KIND),
@@ -610,6 +654,7 @@ impl EcmaScriptKinds {
         kinds.member_bodies = vec![
             kind_id(language, INTERFACE_BODY_KIND),
             kind_id(language, CLASS_BODY_KIND),
+            kind_id(language, "object_type"),
         ];
         kinds.accessibility_modifier = Some(kind_id(language, ACCESSIBILITY_MODIFIER_KIND));
         kinds.ambient_declaration = Some(kind_id(language, AMBIENT_DECLARATION_KIND));
@@ -670,6 +715,44 @@ impl EcmaScriptKinds {
     fn is_declaration_statement(&self, syntax_element: Node<'_>) -> bool {
         syntax_element.kind_id() == self.lexical_declaration
             || syntax_element.kind_id() == self.variable_declaration
+    }
+
+    /// The value inside expression parentheses. Syntax admission bounds the depth.
+    fn expression_value<'tree>(&self, mut value: Node<'tree>) -> Node<'tree> {
+        while value.kind_id() == self.parenthesized {
+            let Some(child) = value.named_child(0) else {
+                break;
+            };
+            value = child;
+        }
+        value
+    }
+
+    /// The value an initializer holds once parentheses and assertions are read through.
+    ///
+    /// `<T>value`, `value as T`, `value satisfies T` and `value!` hold `value` itself. The
+    /// grammar also reads a generic arrow function after a parse error as a type assertion
+    /// over the arrow. Syntax admission bounds the depth.
+    fn asserted_value<'tree>(&self, value: Node<'tree>) -> Node<'tree> {
+        let mut value = self.expression_value(value);
+        while self.value_assertions.contains(&value.kind_id()) {
+            // A type assertion, listed first, writes its type before the value; the
+            // other forms write the value first.
+            let cast = self.value_assertions.first() == Some(&value.kind_id());
+            let operand = if cast {
+                u32::try_from(value.named_child_count())
+                    .ok()
+                    .and_then(|count| count.checked_sub(1))
+                    .and_then(|last| value.named_child(last))
+            } else {
+                value.named_child(0)
+            };
+            let Some(operand) = operand else {
+                break;
+            };
+            value = self.expression_value(operand);
+        }
+        value
     }
 
     /// Whether `syntax element` is the plain identifier `spelling`.
@@ -748,7 +831,7 @@ impl EcmaScriptKinds {
         }
     }
 
-    /// The original property token and anonymous function assigned to one literal export.
+    /// The original property token and function assigned to one literal export.
     /// This records the physical binding; module and build evidence decide public export.
     fn export_function<'tree>(
         &self,
@@ -759,17 +842,28 @@ impl EcmaScriptKinds {
             return None;
         }
         let left = self.child(syntax_element, EcmaScriptGrammarField::Left)?;
-        if self.export_target(left, text) != Some(ExportTarget::Property) {
-            return None;
-        }
-        let function = self.child(syntax_element, EcmaScriptGrammarField::Right)?;
-        if function.kind_id() != self.function_expression
-            || self.child(function, EcmaScriptGrammarField::Name).is_some()
-        {
+        self.export_target(left, text)?;
+        let function =
+            self.expression_value(self.child(syntax_element, EcmaScriptGrammarField::Right)?);
+        if !self.function_values.contains(&function.kind_id()) {
             return None;
         }
         let property = self.child(left, EcmaScriptGrammarField::Property)?;
         Some((property, function))
+    }
+
+    fn export_function_name<'text>(
+        &self,
+        assignment: Node<'_>,
+        text: &'text str,
+    ) -> Option<&'text str> {
+        let (property, _) = self.export_function(assignment, text)?;
+        let left = self.child(assignment, EcmaScriptGrammarField::Left)?;
+        if self.export_target(left, text) == Some(ExportTarget::Module) {
+            Some(DEFAULT_EXPORT_NAME)
+        } else {
+            text.get(property.byte_range())
+        }
     }
 
     /// The export an assignment's left side addresses; `None` for any other
@@ -800,6 +894,12 @@ impl EcmaScriptKinds {
     /// The declaration syntax element's name: its `name` field, or the `property` field
     /// a JavaScript `field_definition` spells it in.
     fn name_syntax_element<'tree>(&self, syntax_element: Node<'tree>) -> Option<Node<'tree>> {
+        if syntax_element.kind_id() == self.pair {
+            return syntax_element.child_by_field_id(self.key.get());
+        }
+        if syntax_element.kind_id() == self.shorthand_property_identifier {
+            return Some(syntax_element);
+        }
         self.child(syntax_element, EcmaScriptGrammarField::Name)
             .or_else(|| {
                 (self.symbol_kind(syntax_element) == Some(EcmaScriptSymbolKind::Field))
@@ -827,6 +927,15 @@ impl EcmaScriptKinds {
         let mut through_pattern = false;
         while let Some(parent) = child.parent() {
             let id = parent.syntax_element().kind_id();
+            if id == self.for_in {
+                return (parent
+                    .syntax_element()
+                    .child_by_field_id(self.loop_kind.get())
+                    .is_some()
+                    && self.child(parent.syntax_element(), EcmaScriptGrammarField::Left)
+                        == Some(child.syntax_element()))
+                .then_some(parent);
+            }
             if id == self.variable_declarator {
                 let binds = through_pattern
                     && self.child(parent.syntax_element(), EcmaScriptGrammarField::Name)
@@ -897,19 +1006,6 @@ impl EcmaScriptKinds {
             && parent.map(|parent| parent.kind_id()) == self.enum_body
     }
 
-    /// Whether `syntax_element` is the anonymous class `export default class { .. }`
-    /// exports.
-    fn is_default_class(&self, syntax_element: Node<'_>, parent: Option<Node<'_>>) -> bool {
-        syntax_element.kind_id() == self.class_expression
-            && self
-                .child(syntax_element, EcmaScriptGrammarField::Name)
-                .is_none()
-            && parent.is_some_and(|parent| {
-                parent.kind_id() == self.export_statement
-                    && EcmaScriptRules::has_token(parent, &[self.default_token])
-            })
-    }
-
     /// The `object` of a `member_expression`; `None` for any other syntax element.
     fn member_object<'tree>(&self, syntax_element: Node<'tree>) -> Option<Node<'tree>> {
         if syntax_element.kind_id() != self.member_expression {
@@ -955,6 +1051,8 @@ struct ModuleExports<'text> {
     /// Ids of the object literals the module exports whole; a method written
     /// in one is exported.
     objects: BTreeSet<usize>,
+    /// Anonymous functions and classes exported under the default name.
+    default_values: BTreeSet<usize>,
     /// Exact named bindings from top-level `CommonJS` object exports.
     bindings: BTreeMap<usize, SyntaxExportBinding>,
 }
@@ -969,6 +1067,7 @@ impl<'text> ModuleExports<'text> {
     ) -> Result<Self, RiftError> {
         let mut exports = Self::default();
         for statement in named_children(program) {
+            exports.record_default(statement, kinds);
             for exported in kinds.statement_exports(statement, text) {
                 exports.add(exported, text, kinds);
             }
@@ -980,6 +1079,32 @@ impl<'text> ModuleExports<'text> {
             }
         }
         Ok(exports)
+    }
+
+    fn record_default(&mut self, statement: Node<'_>, kinds: &EcmaScriptKinds) {
+        if statement.kind_id() != kinds.export_statement
+            || !EcmaScriptRules::has_token(statement, &[kinds.default_token])
+        {
+            return;
+        }
+        let mut value = kinds
+            .child(statement, EcmaScriptGrammarField::Value)
+            .or_else(|| {
+                named_children(statement).find(|child| {
+                    child.kind_id() == kinds.class_expression
+                        || kinds.function_values.contains(&child.kind_id())
+                })
+            });
+        while value.is_some_and(|value| value.kind_id() == kinds.parenthesized) {
+            value = value.and_then(|value| value.named_child(0));
+        }
+        if let Some(value) = value.filter(|value| {
+            kinds.child(*value, EcmaScriptGrammarField::Name).is_none()
+                && (value.kind_id() == kinds.class_expression
+                    || kinds.function_values.contains(&value.kind_id()))
+        }) {
+            self.default_values.insert(value.id());
+        }
     }
 
     fn record_bindings(
@@ -1069,6 +1194,34 @@ pub(crate) struct EcmaScriptRules<'text> {
 }
 
 impl EcmaScriptRules<'_> {
+    /// The name range of a named function a module-scope assignment gives to
+    /// `module.exports`: the function is declared under the name it is written with.
+    fn default_function_name(&self, assignment: Node<'_>) -> Option<crate::ByteRange> {
+        let binding = self.exports.bindings.get(&assignment.id())?;
+        let function = self.kinds.expression_value(
+            self.kinds
+                .child(assignment, EcmaScriptGrammarField::Right)?,
+        );
+        let written = self.kinds.child(function, EcmaScriptGrammarField::Name)?;
+        let written = extract::byte_range(written).ok()?;
+        (binding.kind == SyntaxExportKind::Default && binding.local == Some(written))
+            .then_some(written)
+    }
+
+    /// The name an exported function assignment declares: the written name of a named
+    /// function given to `module.exports`, else the export name.
+    fn export_function_name<'text>(
+        &self,
+        assignment: Node<'_>,
+        text: &'text str,
+    ) -> Option<&'text str> {
+        let name = self.kinds.export_function_name(assignment, text)?;
+        let written = self.default_function_name(assignment).and_then(|range| {
+            text.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+        });
+        Some(written.unwrap_or(name))
+    }
+
     /// The export statement directly carrying this declaration.
     fn declaration_export<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let mut parent = visited.parent()?;
@@ -1165,7 +1318,11 @@ impl EcmaScriptRules<'_> {
                 SyntaxExportKind::Named
             },
             range: extract::byte_range(statement)?,
-            local,
+            local: local.or(if is_default {
+                Some(extract::byte_range(syntax_element)?)
+            } else {
+                None
+            }),
             exported: (!is_default).then_some(local).flatten(),
             source: None,
             container: (!qualification.is_empty()).then(|| qualification.to_owned()),
@@ -1205,7 +1362,7 @@ impl EcmaScriptRules<'_> {
                     .child(syntax_element, EcmaScriptGrammarField::Value)
             })
             .flatten()
-            .filter(|value| value.kind_id() == self.kinds.identifier);
+            .map(|value| self.kinds.expression_value(value));
         let exported = namespace.and_then(|namespace| namespace.named_child(0));
         Ok(Some(SyntaxExportBinding {
             kind,
@@ -1253,6 +1410,16 @@ impl EcmaScriptRules<'_> {
                 kinds.push(SymbolKind::Public);
             }
             (name, EcmaScriptSymbolKind::Variable, kinds)
+        } else if parent.is_some_and(|parent| {
+            parent.kind_id() == self.kinds.catch_clause
+                && parent.child_by_field_id(self.kinds.parameter.get()) == Some(syntax_element)
+        }) {
+            let name = text.get(syntax_element.byte_range()).unwrap_or_default();
+            (
+                name,
+                EcmaScriptSymbolKind::Variable,
+                EcmaScriptSymbolKind::Variable.kinds(),
+            )
         } else if let Some(name) = self.kinds.parameter_property(visited, text) {
             let name = text.get(name.byte_range()).unwrap_or_default();
             (
@@ -1264,10 +1431,15 @@ impl EcmaScriptRules<'_> {
             let name = text.get(syntax_element.byte_range()).unwrap_or_default();
             let kind = EcmaScriptSymbolKind::EnumMember;
             (name, kind, kind.kinds())
-        } else if self.kinds.is_default_class(syntax_element, parent) {
-            let mut kinds = EcmaScriptSymbolKind::Class.kinds();
+        } else if self.exports.default_values.contains(&syntax_element.id()) {
+            let kind = if syntax_element.kind_id() == self.kinds.class_expression {
+                EcmaScriptSymbolKind::Class
+            } else {
+                EcmaScriptSymbolKind::Function
+            };
+            let mut kinds = kind.kinds();
             kinds.push(SymbolKind::Public);
-            (DEFAULT_EXPORT_NAME, EcmaScriptSymbolKind::Class, kinds)
+            (DEFAULT_EXPORT_NAME, kind, kinds)
         } else {
             return Ok(None);
         };
@@ -1276,7 +1448,10 @@ impl EcmaScriptRules<'_> {
         }
         let (documentation, documentation_ranges) =
             self.attached_jsdoc(self.statement(visited), text)?;
-        let body_range = if kind == EcmaScriptSymbolKind::Class {
+        let body_range = if matches!(
+            kind,
+            EcmaScriptSymbolKind::Class | EcmaScriptSymbolKind::Function
+        ) {
             self.body_range(syntax_element, kind)?
         } else {
             None
@@ -1473,6 +1648,12 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        if self.exports.objects.contains(&syntax_element.id()) {
+            return extract::byte_range(syntax_element).map(Some);
+        }
+        if let Some(written) = self.default_function_name(syntax_element) {
+            return Ok(Some(written));
+        }
         let named_by_itself = syntax_element.kind_id() == self.kinds.identifier
             || syntax_element.kind_id() == self.kinds.shorthand_property_identifier_pattern
             || syntax_element.kind_id() == self.kinds.property_identifier;
@@ -1512,8 +1693,23 @@ impl GrammarRules for EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
-        if let Some((property, function)) = self.kinds.export_function(syntax_element, text) {
-            let Some(name) = text.get(property.byte_range()) else {
+        if self.exports.objects.contains(&syntax_element.id()) {
+            return Ok(Some(Declaration {
+                name: DEFAULT_EXPORT_NAME.to_owned(),
+                kind: OBJECT_KIND,
+                kinds: vec![
+                    SymbolKind::Value,
+                    SymbolKind::MemberContainer,
+                    SymbolKind::Public,
+                ],
+                visibility: None,
+                body_range: Some(extract::byte_range(syntax_element)?),
+                documentation: Vec::new(),
+                documentation_ranges: Vec::new(),
+            }));
+        }
+        if let Some((_, function)) = self.kinds.export_function(syntax_element, text) {
+            let Some(name) = self.export_function_name(syntax_element, text) else {
                 return Ok(None);
             };
             let body = self.kinds.child(function, EcmaScriptGrammarField::Body);
@@ -1537,28 +1733,42 @@ impl GrammarRules for EcmaScriptRules<'_> {
             return Ok(None);
         };
         let mut kinds = kind.kinds();
-        if kind == EcmaScriptSymbolKind::Variable
-            && self.kinds.declaration_type.is_some_and(|field| {
-                syntax_element
-                    .child_by_field_id(field.get())
-                    .is_some_and(|annotation| {
-                        Some(annotation.kind_id()) == self.kinds.type_annotation
-                            && annotation.named_child(0).is_some_and(|declared| {
-                                Some(declared.kind_id()) == self.kinds.function_type
-                            })
-                    })
-            })
-        {
+        if matches!(
+            kind,
+            EcmaScriptSymbolKind::Variable
+                | EcmaScriptSymbolKind::Field
+                | EcmaScriptSymbolKind::Property
+        ) && self.kinds.declaration_type.is_some_and(|field| {
+            syntax_element
+                .child_by_field_id(field.get())
+                .is_some_and(|annotation| {
+                    Some(annotation.kind_id()) == self.kinds.type_annotation
+                        && annotation.named_child(0).is_some_and(|declared| {
+                            Some(declared.kind_id()) == self.kinds.function_type
+                        })
+                })
+        }) {
             kinds.push(SymbolKind::Callable);
         }
-        if kind == EcmaScriptSymbolKind::Variable
-            && !kinds.contains(&SymbolKind::Callable)
+        if matches!(
+            kind,
+            EcmaScriptSymbolKind::Variable
+                | EcmaScriptSymbolKind::Field
+                | EcmaScriptSymbolKind::Property
+        ) && !kinds.contains(&SymbolKind::Callable)
             && self
                 .kinds
                 .child(syntax_element, EcmaScriptGrammarField::Value)
-                .is_some_and(|value| self.kinds.function_values.contains(&value.kind_id()))
+                .is_some_and(|value| {
+                    self.kinds
+                        .function_values
+                        .contains(&self.kinds.asserted_value(value).kind_id())
+                })
         {
             kinds.push(SymbolKind::Callable);
+        }
+        if Self::has_token(syntax_element, &[self.kinds.static_token]) {
+            kinds.push(SymbolKind::Static);
         }
         if self
             .kinds
@@ -1600,20 +1810,20 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
-        let Some(kind) = self.kinds.symbol_kind(syntax_element) else {
-            // Only a class expression reads its parent, so the walk pays the
-            // parent lookup for the rare `export default class { .. }` alone.
-            let default_class = syntax_element.kind_id() == self.kinds.class_expression
-                && self
-                    .kinds
-                    .is_default_class(syntax_element, syntax_element.parent());
-            return default_class.then(|| DEFAULT_EXPORT_NAME.to_owned());
-        };
+        if let Some(name) = self.export_function_name(syntax_element, text) {
+            return Some(name.to_owned());
+        }
+        if self.exports.objects.contains(&syntax_element.id()) {
+            return Some(DEFAULT_EXPORT_NAME.to_owned());
+        }
+        if self.exports.default_values.contains(&syntax_element.id()) {
+            return Some(DEFAULT_EXPORT_NAME.to_owned());
+        }
+        let kind = self.kinds.symbol_kind(syntax_element)?;
         if !kind.opens_scope() {
             return None;
         }
-        let name = syntax_element
-            .child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
+        let name = self.kinds.name_syntax_element(syntax_element)?;
         if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
             return None;
         }
@@ -1719,14 +1929,19 @@ pub(crate) fn analyze_included(
         parser.set_included_ranges(ranges).is_ok(),
         "host grammar ranges must be ordered and non-overlapping: ranges={ranges:?}",
     );
-    let tree = parser
-        .parse(source.text, None)
-        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    // A host grammar's ranges already select what this parser reads.
+    let parsed = if ranges.is_empty() {
+        recovery::parse(&mut parser, source.text)
+    } else {
+        parser.parse(source.text, None).map(|tree| (tree, false))
+    };
+    let (tree, recovered) =
+        parsed.ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
     let mut rules = EcmaScriptRules {
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
     };
-    commonjs::record(
+    let assignments = commonjs::record(
         tree.root_node(),
         source,
         limits,
@@ -1746,7 +1961,7 @@ pub(crate) fn analyze_included(
             crate::static_analysis::Capture::for_javascript(source.text)
         }
     });
-    let (syntax_elements, symbols, export_bindings) = extract::extract_with_capture(
+    let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),
         source,
         limits,
@@ -1754,16 +1969,30 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
+    let static_facts = capture.map(crate::static_analysis::Capture::finish);
+    if let Some(facts) = &static_facts {
+        members::record(
+            &rules,
+            source.text,
+            language,
+            facts,
+            &visits,
+            &assignments,
+            &mut symbols,
+        )?;
+    }
+    symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
         syntax_elements,
         symbols,
-        tree.root_node().has_error(),
+        // A recovered tree holds no error node; the source still failed to parse whole.
+        recovered || tree.root_node().has_error(),
     )
     .with_source_witness(source.text)
     .with_export_bindings(export_bindings)
-    .with_static_facts(capture.map(crate::static_analysis::Capture::finish))
+    .with_static_facts(static_facts)
     .with_syntax_limits(limits))
 }
 
@@ -1824,6 +2053,9 @@ fn suffix_kinds(kind: &str) -> Vec<SyntaxKind> {
 }
 
 pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Option<&'static str> {
+    if name == OBJECT_KIND {
+        return Some(OBJECT_KIND);
+    }
     kinds
         .declarations
         .iter()
@@ -1847,7 +2079,7 @@ mod tests {
     fn test_kind_tables_resolve_on_every_pinned_grammar() {
         let javascript =
             EcmaScriptKinds::resolve_javascript(&tree_sitter_javascript::LANGUAGE.into());
-        assert_eq!(javascript.declarations.len(), 6);
+        assert_eq!(javascript.declarations.len(), 8);
         assert!(javascript.accessibility_modifier.is_none());
 
         for grammar in [
@@ -1855,7 +2087,7 @@ mod tests {
             tree_sitter_typescript::language_tsx(),
         ] {
             let typescript = EcmaScriptKinds::resolve_typescript(&grammar);
-            assert_eq!(typescript.declarations.len(), 17);
+            assert_eq!(typescript.declarations.len(), 19);
             assert_eq!(typescript.member_signatures.len(), 2);
             assert!(typescript.accessibility_modifier.is_some());
         }

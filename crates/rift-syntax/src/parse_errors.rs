@@ -31,9 +31,20 @@ pub(crate) fn invalid_declarations(
             .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
             .error()
     })?;
-    let tree = parser
-        .parse(source.text, None)
-        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    // Validation reads the tree extraction read: a recovered ECMAScript document.
+    let ecmascript = [
+        ShippedLanguage::JavaScript,
+        ShippedLanguage::TypeScript,
+        ShippedLanguage::TypeScriptTsx,
+    ]
+    .iter()
+    .any(|shipped| shipped.language() == *language);
+    let tree = if ecmascript {
+        crate::ecmascript::recovery::parse(&mut parser, source.text).map(|(tree, _)| tree)
+    } else {
+        parser.parse(source.text, None)
+    }
+    .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
     let declarations = declarations.iter().copied().collect::<BTreeSet<_>>();
     let header_terminator = [ShippedLanguage::Python, ShippedLanguage::Cython]
         .iter()
@@ -46,13 +57,48 @@ pub(crate) fn invalid_declarations(
             );
             id
         });
+    // TypeScript variance annotations (`in`, `out`) are not in the grammar. The parser
+    // confines that error to the type parameter list, which names no declaration.
+    let recovered_header = [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx]
+        .iter()
+        .any(|shipped| shipped.language() == *language)
+        .then(|| {
+            let id = grammar.field_id_for_name("type_parameters");
+            assert!(
+                id.is_some(),
+                "shipped grammar must define header field: field=type_parameters"
+            );
+            id
+        })
+        .flatten();
     invalid_ranges(
         tree.root_node(),
         source,
         limits,
         &declarations,
-        header_terminator,
+        HeaderRules {
+            terminator: header_terminator,
+            recovered: recovered_header,
+            value: ecmascript
+                .then(|| grammar.field_id_for_name("value"))
+                .flatten(),
+            // Zero in JavaScript, which has no object type.
+            members: grammar.id_for_node_kind("object_type", true),
+        },
     )
+}
+
+/// Grammar facts that decide which header errors keep a declaration's name.
+#[derive(Clone, Copy)]
+struct HeaderRules {
+    /// Token that ends a header before an optional body.
+    terminator: Option<u16>,
+    /// Header field whose own errors leave the name and the other header parts intact.
+    recovered: Option<NonZeroU16>,
+    /// Field holding the value a declaration is initialized with or aliases.
+    value: Option<NonZeroU16>,
+    /// Kind of a braced member list that can be a declaration's whole value.
+    members: u16,
 }
 
 fn invalid_ranges(
@@ -60,7 +106,7 @@ fn invalid_ranges(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
     declarations: &BTreeSet<ByteRange>,
-    header_terminator: Option<u16>,
+    rules: HeaderRules,
 ) -> Result<BTreeSet<ByteRange>, RiftError> {
     let mut invalid = BTreeSet::new();
     let body_field = root.language().field_id_for_name("body");
@@ -88,7 +134,8 @@ fn invalid_ranges(
         if declarations.contains(&range)
             && (in_error
                 || (syntax_element != root
-                    && header_has_error(syntax_element, body_field, header_terminator)))
+                    && header_has_error(syntax_element, body_field, rules)
+                    && !opaque_macro_body(syntax_element)))
         {
             invalid.insert(range);
         }
@@ -100,25 +147,102 @@ fn invalid_ranges(
 }
 
 /// A declaration's body does not decide whether its header can name a symbol.
+///
+/// Neither does an error confined to the recovered header field: the name, the
+/// heritage clause and every other header part are then outside the error.
+///
+/// A declaration without a body of its own can take one from its value: the member
+/// list a type alias names, or the body of the function a variable or field is
+/// initialized with. That function's parameters stay part of the header.
 fn header_has_error(
     syntax_element: Node<'_>,
     body_field: Option<NonZeroU16>,
-    header_terminator: Option<u16>,
+    rules: HeaderRules,
 ) -> bool {
-    let Some(body) = body_field.and_then(|field| syntax_element.child_by_field_id(field.get()))
-    else {
+    let own_body = body_field.and_then(|field| syntax_element.child_by_field_id(field.get()));
+    let value = rules
+        .value
+        .filter(|_| own_body.is_none())
+        .and_then(|field| syntax_element.child_by_field_id(field.get()));
+    let value_body = value.and_then(|value| {
+        if value.kind_id() == rules.members && rules.members != 0 {
+            Some(value)
+        } else {
+            body_field.and_then(|field| value.child_by_field_id(field.get()))
+        }
+    });
+    // The function between the declaration and its body, when the value is one.
+    let function = value.filter(|value| value_body.is_some_and(|body| body != *value));
+    let body = own_body.or(value_body);
+    let recovered = rules
+        .recovered
+        .and_then(|field| syntax_element.child_by_field_id(field.get()));
+    if body.is_none() && recovered.is_none() {
         return syntax_element.has_error();
-    };
+    }
+    if let Some(function) = function
+        && header_children_have_error(function, body, None, rules)
+    {
+        return true;
+    }
+    // The declaration's own header ends where its value function or its body starts.
+    header_children_have_error(syntax_element, function.or(body), recovered, rules)
+}
+
+/// Whether a child before `end` holds an error, other than the `recovered` child.
+fn header_children_have_error(
+    syntax_element: Node<'_>,
+    end: Option<Node<'_>>,
+    recovered: Option<Node<'_>>,
+    rules: HeaderRules,
+) -> bool {
     let mut cursor = syntax_element.walk();
     syntax_element
         .children(&mut cursor)
         .take_while(|child| {
             // Python can place a body error before an empty block. A missing
             // colon still belongs to the header and must be validated.
-            let header_ended = header_terminator == Some(child.kind_id()) && !child.is_missing();
-            *child != body && !header_ended
+            let header_ended = rules.terminator == Some(child.kind_id()) && !child.is_missing();
+            Some(*child) != end && !header_ended
         })
-        .any(|child| child.has_error())
+        .any(|child| child.has_error() && Some(child) != recovered)
+}
+
+// The Rust grammar parses macro matchers as token trees. Their contents do not
+// determine whether the macro's name and delimiters form a valid declaration.
+fn opaque_macro_body(element: Node<'_>) -> bool {
+    if element.kind() != "macro_definition" {
+        return false;
+    }
+    let Some(name) = element
+        .child_by_field_name("name")
+        .filter(|name| !name.has_error())
+    else {
+        return false;
+    };
+    let mut cursor = element.walk();
+    let mut children = element
+        .children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    let Some(keyword) = children.next() else {
+        return false;
+    };
+    if keyword.kind() != "macro_rules!" || children.next() != Some(name) {
+        return false;
+    }
+    let Some(open) = children.next() else {
+        return false;
+    };
+    let close = match open.kind() {
+        "(" => ")",
+        "[" => "]",
+        "{" => "}",
+        _ => return false,
+    };
+    children
+        .filter(|child| child.kind() != ";")
+        .last()
+        .is_some_and(|last| last.kind() == close && !last.is_missing())
 }
 
 #[cfg(test)]
@@ -176,6 +300,125 @@ mod tests {
                 .symbols()
                 .iter()
                 .filter(|symbol| invalid.contains(&symbol.item_range))
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected, "{extension}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn type_parameter_errors_keep_declarations_named_outside_them() {
+        for (extension, text, expected) in [
+            (
+                "ts",
+                "interface Base<T> { base: T }\ninterface Task<out T, in U = string> extends Base<T> { value: T }\n",
+                &[][..],
+            ),
+            ("ts", "type Alias<out T> = Array<T>;\n", &[][..]),
+            (
+                "ts",
+                "class Other<T> {}\nclass Box<in out T> extends Other<T> { item!: T }\n",
+                &[][..],
+            ),
+            (
+                "tsx",
+                "interface Task<out T> { value: T }\nconst view = <div />;\n",
+                &[][..],
+            ),
+            // An error on the heritage clause still refuses the declaration.
+            (
+                "ts",
+                "interface Broken<out T> extends { value: T }\n",
+                &["Broken"][..],
+            ),
+            // So does an error in a header part of a declaration without a body.
+            ("ts", "type Broken<out T> = ;\n", &["Broken"][..]),
+            // Other grammars keep refusing a broken type parameter list.
+            ("py", "class Broken[???]:\n    pass\n", &["Broken"][..]),
+        ] {
+            let path = ProjectPath::new(format!("main.{extension}")).expect("source path");
+            let source = SyntaxSource { path: &path, text };
+            let provider = crate::registry::provider_for_extension(extension).expect("provider");
+            let document = provider
+                .analyze(source, SyntaxLimits::DEFAULT)
+                .expect("source facts");
+            assert!(document.has_errors(), "{extension}: {text:?}");
+            let ranges = document
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            let invalid = provider
+                .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+                .expect("declaration validation");
+            let names = document
+                .symbols()
+                .iter()
+                .filter(|symbol| invalid.contains(&symbol.item_range))
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected, "{extension}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn value_body_errors_keep_the_declaration_they_initialize() {
+        for (extension, text, expected) in [
+            // The grammar reads `global` as a keyword, so its use is an error in the body.
+            (
+                "ts",
+                "export const inspect = () => {\n  const global = globalThis as any\n  return global?.process\n}\nexport function run() { return inspect() }\n",
+                &[][..],
+            ),
+            (
+                "mjs",
+                "export const inspect = () => { return ) }\n",
+                &[][..],
+            ),
+            ("ts", "class Item { run = () => { return ) } }\n", &[][..]),
+            // A type alias takes its member list as its body.
+            (
+                "ts",
+                "type Shape = {\n  <T>(value: T): [T, Box<T>]\n  <T = undefined>(): [T | undefined, Box<T>]\n}\nexport const after = 1\n",
+                &[][..],
+            ),
+            // The function's parameters and a value that is no body still refuse.
+            (
+                "ts",
+                "export const bad = (value: ) => { return 1 }\n",
+                &["bad"][..],
+            ),
+            (
+                "ts",
+                "export const broken = { value: ) }\n",
+                &["broken"][..],
+            ),
+            (
+                "ts",
+                "type Broken = { value: string } & ;\n",
+                &["Broken"][..],
+            ),
+        ] {
+            let path = ProjectPath::new(format!("main.{extension}")).expect("source path");
+            let source = SyntaxSource { path: &path, text };
+            let provider = crate::registry::provider_for_extension(extension).expect("provider");
+            let document = provider
+                .analyze(source, SyntaxLimits::DEFAULT)
+                .expect("source facts");
+            assert!(document.has_errors(), "{extension}: {text:?}");
+            let ranges = document
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            let invalid = provider
+                .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+                .expect("declaration validation");
+            let names = document
+                .symbols()
+                .iter()
+                .filter(|symbol| invalid.contains(&symbol.item_range))
+                .filter(|symbol| symbol.container.is_none())
                 .map(|symbol| symbol.name.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(names, expected, "{extension}: {text:?}");
@@ -277,5 +520,81 @@ mod tests {
             .invalid_declarations(source, limits, &declarations)
             .expect_err("declaration bound");
         assert_eq!(error.slug(), errors::syntax::too_many_syntax_elements::SLUG);
+    }
+
+    #[test]
+    fn a_root_error_keeps_declarations_outside_the_body_that_holds_it() {
+        // Three generic call signatures without separators make the document root an
+        // error. Leaving out that interface body's interior parses the rest whole.
+        let signatures = "  <T extends Before, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<T, U, 'body'>\n  <T extends Before, U extends number>(\n    data: T,\n    init?: Init<U>\n  ): Wrapped<T, U, 'body'>\n  <T extends null, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<null, U, 'body'>\n";
+        let tail = "export class Item {\n  value = 1\n  read() { return this.value }\n}\nexport function later(item: Item) { return item.read() }\n";
+        let recovered = format!(
+            "export type Before = string\nexport interface Respond {{\n{signatures}}}\n{tail}"
+        );
+        // The body never closes, so no interior can be left out.
+        let unclosed = format!("export interface Respond {{\n{signatures}{tail}");
+        // An error outside every braced body gives recovery nothing to leave out.
+        let outside = format!(") ) )\n{recovered}");
+        // A second body with its own error is left out as well.
+        let second = format!("{recovered}export function tail() {{ return ) ) ) }}\n");
+        let all = &["Before", "Respond", "Item", "value", "read", "later"][..];
+        for (extension, text, kept, refused) in [
+            ("ts", recovered.as_str(), all, &[][..]),
+            ("tsx", recovered.as_str(), all, &[][..]),
+            (
+                "ts",
+                second.as_str(),
+                &["Before", "Item", "later", "tail"][..],
+                &[][..],
+            ),
+            ("ts", unclosed.as_str(), &[][..], &["Item", "later"][..]),
+            (
+                "ts",
+                outside.as_str(),
+                &[][..],
+                &["Before", "Item", "later"][..],
+            ),
+        ] {
+            let path = ProjectPath::new(format!("main.{extension}")).expect("source path");
+            let source = SyntaxSource { path: &path, text };
+            let provider = crate::registry::provider_for_extension(extension).expect("provider");
+            let document = provider
+                .analyze(source, SyntaxLimits::DEFAULT)
+                .expect("source facts");
+            assert!(document.has_errors(), "{extension}: {text:?}");
+            let ranges = document
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            let invalid = provider
+                .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+                .expect("declaration validation");
+            let valid = document
+                .symbols()
+                .iter()
+                .filter(|symbol| !invalid.contains(&symbol.item_range))
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            for name in kept {
+                assert!(
+                    valid.contains(name),
+                    "{extension}: {name} kept in {valid:?}"
+                );
+            }
+            for name in refused {
+                assert!(
+                    !valid.contains(name),
+                    "{extension}: {name} refused in {valid:?}"
+                );
+            }
+            // Offsets are the source's own: every kept name is read at its written place.
+            for symbol in document.symbols() {
+                let range = symbol.name_range.expect("declaration name");
+                let start = usize::try_from(range.start).expect("offset");
+                let end = usize::try_from(range.end).expect("offset");
+                assert_eq!(&text[start..end], symbol.name, "{extension}");
+            }
+        }
     }
 }

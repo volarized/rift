@@ -33,7 +33,9 @@ use crate::history::{StoredHistory, SymbolTimelines};
 mod canonical;
 mod facets;
 mod symbol;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+pub use canonical::{
+    InventoryCoverage, LocalSymbolViewInput, LocalSymbolViews, RetainedViewLimits,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -378,6 +380,60 @@ impl ReadService {
         text: &[CoreProjectPath],
     ) -> WorkspaceMap {
         crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
+    }
+
+    /// Whether static edge producers completed captured sources within their bounds.
+    ///
+    /// # Errors
+    /// Returns the captured identity directory failure.
+    pub fn static_edges_complete(&self) -> Result<bool, RiftError> {
+        Ok(self.index.edges().is_complete() && self.index.symbol_view()?.objects_complete())
+    }
+
+    /// Captured objects whose identities are unestablished, which edge inventories omit.
+    fn edge_identity_omissions(&self) -> usize {
+        self.index
+            .normalized_graph()
+            .records()
+            .iter()
+            .filter(|object| object.identity().is_none())
+            .count()
+    }
+
+    /// Whether edge inventories omit no captured object for an unestablished identity.
+    ///
+    /// An inventory that omits one still answers its edges between identified endpoints, but
+    /// cannot establish an absence or an aggregate.
+    #[must_use]
+    pub fn edge_identities_complete(&self) -> bool {
+        self.edge_identity_omissions() == 0
+    }
+
+    /// Reports captured objects omitted from edges because their identities are unestablished.
+    #[must_use]
+    pub fn edge_identity_warning(&self) -> Option<ReadWarning> {
+        let omitted = self.edge_identity_omissions();
+        (omitted > 0).then(|| ReadWarning::EdgeCoverageMissing {
+            kinds: Vec::new(),
+            detail: format!(
+                "captured objects without established identities: {omitted}; edge inventories omit these objects and retain edges between identified endpoints"
+            ),
+        })
+    }
+
+    /// Sites static analysis left without a target, counted per edge kind. A whole-inventory
+    /// edge read reports them, since its rows cannot name those targets.
+    #[must_use]
+    pub fn static_targets_omitted(&self) -> &BTreeMap<rift_protocol::read::EdgeKind, u64> {
+        self.index.static_targets_omitted()
+    }
+
+    /// Whether a configured engine serves a captured source language.
+    #[must_use]
+    pub fn uses_edge_engines(&self, engines: &crate::EnginePool) -> bool {
+        self.index
+            .files()
+            .any(|file| engines.engine_for(file.syntax().language()).is_some())
     }
 
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
@@ -790,6 +846,21 @@ impl ReadService {
         &self.index
     }
 
+    /// Builds what the first read of this snapshot builds: the declaration inventory,
+    /// the symbol view, and the documentation layer of its index.
+    ///
+    /// The publication that completes preparation calls this before it is published.
+    pub fn prepare_reads(&self) {
+        self.index.prepare_reads();
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this snapshot's index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.index.reads_prepared()
+    }
+
     pub(crate) fn engine_revision(&self) -> &str {
         &self.revisions.tree_revision
     }
@@ -925,11 +996,20 @@ impl ReadService {
 
     /// Returns the warnings every answer from this service carries: one
     /// `stale_index` when the published index lags the captured tree, one
-    /// `source_unavailable` for each file the index left out, bounded by
-    /// [`SOURCE_WARNINGS_MAX`], and none of either when nothing applies.
+    /// `source_unavailable` for each file the index left out although no bound
+    /// excluded it, bounded by [`SOURCE_WARNINGS_MAX`], and none of either when
+    /// nothing applies.
+    ///
+    /// A file a bound left out is outside the indexed set, as a file the source
+    /// policy excludes is: the build names it in the log, and no answer carries it.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
         let mut warnings = self.revisions.warnings();
-        warnings.extend(source_warnings(self.index.warnings()));
+        warnings.extend(selected_source_warnings(
+            self.index
+                .warnings()
+                .iter()
+                .filter(|warning| !warning.is_left_out_by_bound()),
+        ));
         warnings
     }
 
@@ -1585,8 +1665,15 @@ pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning
 /// when more were left out - one more counting the rest, which `rift server logs` names one by
 /// one; and one `large_file_unparsed` naming the files held as text alone.
 pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
+    selected_source_warnings(warnings.iter())
+}
+
+/// [`source_warnings`] for the files `warnings` selects.
+fn selected_source_warnings<'warning>(
+    warnings: impl Iterator<Item = &'warning WorkspaceIndexWarning> + Clone,
+) -> Vec<ReadWarning> {
     let framework = warnings
-        .iter()
+        .clone()
         .filter(|warning| {
             matches!(
                 warning,
@@ -1595,7 +1682,6 @@ pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWar
         })
         .collect::<Vec<_>>();
     let (unparsed, left_out): (Vec<&WorkspaceIndexWarning>, Vec<&WorkspaceIndexWarning>) = warnings
-        .iter()
         .filter(|warning| {
             !matches!(
                 warning,
@@ -1613,7 +1699,7 @@ pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWar
         warnings.push(ReadWarning::SourceUnavailable {
             unit: None,
             detail: format!(
-                "{rest} more files are absent from the index; rift server logs names each"
+                "{rest} more files are absent from the index; rift server logs records them"
             ),
         });
     }
@@ -2481,7 +2567,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             value["pagination"],
-            json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 3})
         );
         Ok(())
     }
@@ -2546,7 +2632,10 @@ pub(crate) mod tests {
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
         assert_eq!(beacon["kind"], json!("struct"));
-        assert_eq!(beacon["kinds"], json!(["type", "public"]));
+        assert_eq!(
+            beacon["kinds"],
+            json!(["type", "public", "member_container"])
+        );
         assert!(
             beacon.get("container").is_none(),
             "a top-level declaration serves no container"
@@ -2873,7 +2962,7 @@ pub(crate) mod tests {
             result.warnings.last(),
             Some(&ReadWarning::SourceUnavailable {
                 unit: None,
-                detail: "1 more files are absent from the index; rift server logs names each"
+                detail: "1 more files are absent from the index; rift server logs records them"
                     .to_owned(),
             })
         );
@@ -3010,7 +3099,7 @@ pub(crate) mod tests {
             "to": symbol.id,
             "kind": symbol.kind,
             "kinds": ["calls"],
-            "provider": "static", "derivation": "syntax"
+            "providers": ["static"], "derivation": "syntax"
         });
         assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);
@@ -3940,7 +4029,8 @@ pub(crate) mod tests {
 
     /// A committed file the syntax provider refuses under its depth bound is left out of
     /// the revision index the way the workspace scan leaves it out, so `get_symbol` at
-    /// the revision still answers from the file beside it and names the refused one.
+    /// the revision still answers from the file beside it. A bound left the file out, so
+    /// the answer carries nothing for it (D37) while the revision index keeps the omission.
     #[test]
     fn revision_read_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() -> TestResult {
         let directory = committed_fixture()?;
@@ -3966,12 +4056,18 @@ pub(crate) mod tests {
         );
         let deep_path = rift_core::ProjectPath::new("src/deep.rs")?;
         assert!(
-            result.warnings.iter().any(|warning| matches!(
+            !result.warnings.iter().any(|warning| matches!(
                 warning,
                 ReadWarning::SourceUnavailable { unit: Some(unit), .. } if *unit == file_id(&deep_path)
             )),
-            "the answer names the refused file: {:?}",
+            "the answer carries nothing for the refused file: {:?}",
             result.warnings
+        );
+        assert!(
+            service.file_warning(&deep_path).is_some_and(
+                |warning| warning.is_left_out_by_bound() && warning.reason().contains("depth")
+            ),
+            "the revision index keeps the omission and its bound"
         );
         Ok(())
     }
@@ -4190,20 +4286,28 @@ pub(crate) mod tests {
         let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
         assert_eq!(
             first_value["pagination"],
-            json!({"page": 1, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 1, "pages": 3, "max_results": 1, "total": 3})
         );
         let second: GetSymbolParams =
             serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 2}))?;
         let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
         assert_eq!(
             second_value["pagination"],
-            json!({"page": 2, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 2, "pages": 3, "max_results": 1, "total": 3})
         );
         assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
         assert_ne!(
-            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            first_value["hits"][0]["range"], second_value["hits"][0]["range"],
             "consecutive pages must serve distinct declarations"
         );
+        assert_eq!(
+            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            "the type declaration and its implementation are facets of one symbol"
+        );
+        let third: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 3}))?;
+        let third_value = serde_json::to_value(service.get_symbol(&third)?)?;
+        assert_eq!(third_value["hits"][0]["symbol"]["name"], "signal");
         Ok(())
     }
 
@@ -4216,7 +4320,7 @@ pub(crate) mod tests {
         assert_eq!(value["hits"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({"page": 40, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 40, "pages": 3, "max_results": 1, "total": 3})
         );
         Ok(())
     }

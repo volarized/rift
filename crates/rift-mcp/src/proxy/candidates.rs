@@ -2,6 +2,7 @@ use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::{SearchParams, SearchScope};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
+use rift_server::RetainedViewLimits;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ServerResult,
 };
@@ -23,6 +24,8 @@ pub(in crate::proxy) use read::dispatch_facets_request;
 pub(super) enum CandidateAnswer {
     Captured(CapturedCandidates),
     Response(CallToolResult),
+    /// A project no longer holds the view the continued search named.
+    Unavailable(SymbolUnavailableReason),
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -33,9 +36,12 @@ pub(super) struct CapturedCandidates {
     pub(super) results_max: usize,
 }
 
+/// Captured combined searches in least-recent-use order, oldest first.
 #[derive(Debug)]
 pub(super) struct CandidateViews {
     rows: Mutex<Vec<SavedCandidateBytes>>,
+    /// Keys of rows released to admit newer ones; locked after `rows` only.
+    released: Mutex<std::collections::BTreeSet<[u8; 32]>>,
 }
 
 #[derive(Debug)]
@@ -68,7 +74,11 @@ enum SavedCandidateRead {
 impl Default for CandidateViews {
     fn default() -> Self {
         Self {
-            rows: Mutex::new(Vec::with_capacity(256)),
+            rows: Mutex::new(Vec::with_capacity(
+                RetainedViewLimits::from(&rift_protocol::query::QueryConfiguration::default())
+                    .views_max(),
+            )),
+            released: Mutex::default(),
         }
     }
 }
@@ -78,6 +88,7 @@ impl CandidateViews {
         &self,
         params: &SearchParams,
         captured: &CapturedCandidates,
+        limits: RetainedViewLimits,
         now: SystemTime,
     ) -> Result<CapturedView, RiftError> {
         let (view, expires) = captured_view(captured)?;
@@ -94,33 +105,84 @@ impl CandidateViews {
             CANDIDATE_BYTES_MAX,
         )
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        self.retain(&view, expires, bytes, limits, now)?;
+        Ok(view)
+    }
+
+    /// Admits one encoded capture, charging its allocation and the owning table.
+    fn retain(
+        &self,
+        view: &CapturedView,
+        expires: SystemTime,
+        bytes: Vec<u8>,
+        limits: RetainedViewLimits,
+        now: SystemTime,
+    ) -> Result<(), RiftError> {
         let mut rows = self
             .rows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         rows.retain(|row| row.expires > now);
-        let retained = rows.iter().fold(
-            rows.capacity()
-                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
-                .and_then(|size| size.checked_add(bytes.capacity())),
-            |sum, row| sum.and_then(|sum| sum.checked_add(row.bytes.capacity())),
-        );
-        if rows.len() == 256 || retained.is_none_or(|size| size > CANDIDATE_BYTES_MAX) {
-            return Err(invalid(
-                "view",
-                "captured search exceeds the byte or view bound",
-            ));
+        if retained_row_bytes(&rows[..0], rows.capacity(), bytes.capacity())
+            .is_none_or(|size| size > limits.bytes_max())
+        {
+            return Err(invalid("view", "captured search exceeds the byte bound"));
         }
         let key = view_key(view.id.as_str());
         if rows.iter().any(|row| row.key == key) {
             return Err(invalid("view", "captured search view is already retained"));
+        }
+        if rows.len() == rows.capacity() && rows.len() < limits.views_max() {
+            let mut grown = Vec::with_capacity(limits.views_max());
+            if retained_row_bytes(&grown, grown.capacity(), bytes.capacity())
+                .is_none_or(|size| size > limits.bytes_max())
+            {
+                return Err(invalid("view", "captured search exceeds the byte bound"));
+            }
+            grown.append(&mut rows);
+            *rows = grown;
+        }
+        // Each release scans the rows once; at most every retained row is released.
+        let mut released = Vec::new();
+        while !rows.is_empty()
+            && (rows.len() >= limits.views_max()
+                || retained_row_bytes(&rows, rows.capacity(), bytes.capacity())
+                    .is_none_or(|size| size > limits.bytes_max()))
+        {
+            released.push(rows.remove(0).key);
         }
         rows.push(SavedCandidateBytes {
             key,
             expires,
             bytes,
         });
-        Ok(view)
+        drop(rows);
+        self.release(released);
+        Ok(())
+    }
+
+    /// Records released keys so a later continuation names its view expired.
+    fn release(&self, released: Vec<[u8; 32]>) {
+        if released.is_empty() {
+            return;
+        }
+        let mut keys = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.extend(released);
+        while keys.len()
+            > usize::try_from(rift_protocol::query::QUERY_RETAINED_VIEWS_MAX).unwrap_or(usize::MAX)
+        {
+            keys.pop_first();
+        }
+    }
+
+    fn is_released(&self, key: &[u8; 32]) -> bool {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
     }
 
     pub(super) fn backend(
@@ -173,19 +235,26 @@ impl CandidateViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = view_key(id.as_str());
-        let Some(row) = rows.iter().find(|row| row.key == key) else {
-            return Ok(Err(
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-            ));
+        let Some(position) = rows.iter().position(|row| row.key == key) else {
+            drop(rows);
+            return Ok(Err(if self.is_released(&key) {
+                SymbolUnavailableReason::ViewExpired
+            } else {
+                SymbolUnavailableReason::ViewContext
+            }));
         };
-        if row.expires <= now {
+        if rows[position].expires <= now {
             rows.retain(|row| row.expires > now);
             return Ok(Err(
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
             ));
         }
-        let SavedCandidateRead::Search(saved) = serde_json::from_slice(&row.bytes)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        let row = rows.remove(position);
+        let decoded = serde_json::from_slice(&row.bytes);
+        rows.push(row);
+        drop(rows);
+        let SavedCandidateRead::Search(saved) =
+            decoded.map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         if saved.view.id != *id || saved.params != normalized_params(params) {
             return Ok(Err(
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
@@ -193,6 +262,21 @@ impl CandidateViews {
         }
         Ok(Ok(Some(*saved)))
     }
+}
+
+/// Bytes `rows` and one incoming row of `incoming` bytes charge, with the table at
+/// `capacity` rows.
+fn retained_row_bytes(
+    rows: &[SavedCandidateBytes],
+    capacity: usize,
+    incoming: usize,
+) -> Option<usize> {
+    rows.iter().fold(
+        capacity
+            .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
+            .and_then(|size| size.checked_add(incoming)),
+        |sum, row| sum.and_then(|sum| sum.checked_add(row.bytes.capacity())),
+    )
 }
 
 fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError> {
@@ -335,6 +419,9 @@ impl RiftProxy {
         {
             Err(error) => return Ok(Some(Err(error))),
             Ok(CandidateAnswer::Response(result)) => return Ok(Some(Ok(result.into()))),
+            Ok(CandidateAnswer::Unavailable(reason)) => {
+                return Ok(Some(unavailable_search(reason)));
+            }
             Ok(CandidateAnswer::Captured(captured)) => captured,
         };
         let view = match previous {
@@ -348,9 +435,12 @@ impl RiftProxy {
                 }
                 saved.view
             }
-            None => self
-                .candidate_views
-                .save(&params, &captured, SystemTime::now())?,
+            None => self.candidate_views.save(
+                &params,
+                &captured,
+                self.retention_limits().await?,
+                SystemTime::now(),
+            )?,
         };
         let policy = &captured.ranking;
         let weights = rift_ranking::RankingWeights::new(
@@ -366,6 +456,13 @@ impl RiftProxy {
             captured.results_max,
         )?;
         merged.view = Some(view);
+        merged.revision = super::query::combined_revision(
+            captured
+                .pools
+                .iter()
+                .filter(|pool| pool.backend != "global")
+                .map(|pool| pool.revision.as_ref()),
+        )?;
         Ok(Some(crate::output::Json(merged).retrieval_result()))
     }
     fn candidate_context_matches(
@@ -448,6 +545,7 @@ impl RiftProxy {
                 selected.packages.clear();
                 SearchScope::Local
             };
+            let named = view.is_some();
             let result = backend
                 .candidate_response(SearchCandidateRequest {
                     params: selected,
@@ -463,6 +561,9 @@ impl RiftProxy {
                 Ok(result) => match decode_response(&result)? {
                     SearchCandidateResult::Captured(response) => *response,
                     SearchCandidateResult::Unavailable(answer) => {
+                        if let Some(reason) = view_refusal(&answer, named) {
+                            return Ok(Ok(CandidateAnswer::Unavailable(reason)));
+                        }
                         validate_preparing_response(&answer, require_ready_ranking)?;
                         return Ok(Ok(CandidateAnswer::Response(result)));
                     }
@@ -495,6 +596,7 @@ impl RiftProxy {
                 owner: Some(response.owner),
                 root: root.to_owned(),
                 view: response.view,
+                revision: response.revision,
                 inputs: response.inputs,
             });
             super::encode_bounded(&pools, CANDIDATE_BYTES_MAX)
@@ -542,6 +644,21 @@ fn decode_response(result: &CallToolResult) -> Result<SearchCandidateResult, Rif
     })?;
     serde_json::from_value(value)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
+}
+
+/// The reason a project refused the view a continued search named, as the combined
+/// search answers it.
+fn view_refusal(
+    answer: &rift_protocol::search_read::SearchUnavailable,
+    named: bool,
+) -> Option<SymbolUnavailableReason> {
+    let rift_protocol::search_read::SearchUnavailable::Unavailable { reason, .. } = answer;
+    (named
+        && matches!(
+            reason,
+            SymbolUnavailableReason::ViewExpired | SymbolUnavailableReason::ViewContext
+        ))
+    .then_some(*reason)
 }
 
 fn validate_preparing_response(
@@ -671,6 +788,10 @@ mod tests {
     use serde_json::json;
     use std::error::Error as _;
 
+    fn limits() -> RetainedViewLimits {
+        RetainedViewLimits::from(&rift_protocol::query::QueryConfiguration::default())
+    }
+
     fn params() -> SearchParams {
         serde_json::from_value(json!({"query":"beacon","scope":"all","max_results":2}))
             .expect("search")
@@ -734,6 +855,7 @@ mod tests {
                 id: CapturedViewId::parse(key).expect("captured key"),
                 expires_at: expiry.to_owned(),
             },
+            revision: None,
             inputs: serde_json::from_value(json!({"precise":[],"broad":[],"warnings":[]}))
                 .expect("empty captured inputs"),
         }
@@ -758,6 +880,27 @@ mod tests {
             ranking: rift_protocol::configuration::RankingConfiguration::default(),
             results_max: 100,
         }
+    }
+
+    /// #766: a project's typed view refusal reaches the caller of a continued search.
+    #[test]
+    fn continued_search_keeps_a_project_view_refusal() {
+        let answer = |reason| rift_protocol::search_read::SearchUnavailable::Unavailable {
+            reason,
+            view: None,
+            warnings: Vec::new(),
+        };
+        for reason in [
+            SymbolUnavailableReason::ViewExpired,
+            SymbolUnavailableReason::ViewContext,
+        ] {
+            assert_eq!(view_refusal(&answer(reason), true), Some(reason));
+            assert_eq!(view_refusal(&answer(reason), false), None);
+        }
+        assert_eq!(
+            view_refusal(&answer(SymbolUnavailableReason::IndexPreparing), true),
+            None
+        );
     }
 
     #[test]
@@ -792,6 +935,7 @@ mod tests {
             root: pool.root.clone(),
             owner: SymbolOwner::Local,
             view: pool.view.clone(),
+            revision: None,
             inputs,
             ranking: captured.ranking,
             results_max: captured.results_max,
@@ -828,10 +972,14 @@ mod tests {
         first.pools[1].backend = "global".to_owned();
         first.pools[1].owner = None;
         first.pools[1].root = first.pools[0].root.clone();
-        store.save(&params(), &first, now).expect("first capture");
+        store
+            .save(&params(), &first, limits(), now)
+            .expect("first capture");
         let mut second = first.clone();
         second.pools[0].view.id = CapturedViewId::parse("claims.second").expect("second view");
-        store.save(&params(), &second, now).expect("second capture");
+        store
+            .save(&params(), &second, limits(), now)
+            .expect("second capture");
         let selected = store
             .backend(&first.pools[1].view.id, now)
             .expect("decode")
@@ -848,13 +996,17 @@ mod tests {
         let store = CandidateViews::default();
         let now = SystemTime::UNIX_EPOCH;
         let first = captured();
-        store.save(&params(), &first, now).expect("first capture");
+        store
+            .save(&params(), &first, limits(), now)
+            .expect("first capture");
         let mut second = first.clone();
         second.pools[0].view.id = CapturedViewId::parse("claims.second").expect("second view");
         second.pools[1].owner = Some(SymbolOwner::NamedLocal {
             name: "extra".to_owned(),
         });
-        store.save(&params(), &second, now).expect("second capture");
+        store
+            .save(&params(), &second, limits(), now)
+            .expect("second capture");
         assert!(matches!(
             store.backend(&first.pools[1].view.id, now),
             Ok(Err(SymbolUnavailableReason::ViewContext))
@@ -866,7 +1018,9 @@ mod tests {
         let store = CandidateViews::default();
         let captured = captured();
         let now = SystemTime::UNIX_EPOCH;
-        let view = store.save(&params(), &captured, now).expect("capture");
+        let view = store
+            .save(&params(), &captured, limits(), now)
+            .expect("capture");
         let selected = store
             .backend(&captured.pools[1].view.id, now)
             .expect("decode")
@@ -899,11 +1053,15 @@ mod tests {
         let store = CandidateViews::default();
         let now = SystemTime::UNIX_EPOCH;
         let first = captured();
-        store.save(&params(), &first, now).expect("first capture");
+        store
+            .save(&params(), &first, limits(), now)
+            .expect("first capture");
         let mut second = first.clone();
         second.pools[0].view.id = CapturedViewId::parse("claims.second").expect("second view");
         second.pools[1].root = "/fixture/replaced".to_owned();
-        store.save(&params(), &second, now).expect("second capture");
+        store
+            .save(&params(), &second, limits(), now)
+            .expect("second capture");
         assert!(matches!(
             store.backend(&first.pools[1].view.id, now),
             Ok(Err(SymbolUnavailableReason::ViewContext))
@@ -914,7 +1072,9 @@ mod tests {
         let store = CandidateViews::default();
         let captured = captured();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let view = store.save(&params(), &captured, now).expect("capture");
+        let view = store
+            .save(&params(), &captured, limits(), now)
+            .expect("capture");
         assert_eq!(view.id, captured.pools[0].view.id);
         assert_eq!(view.expires_at, captured.pools[1].view.expires_at);
         let mut request = params();
@@ -934,11 +1094,71 @@ mod tests {
         ));
     }
 
+    fn numbered(serial: usize) -> CapturedCandidates {
+        let mut captured = captured();
+        captured.pools[0].view.id =
+            CapturedViewId::parse(&format!("claims.p{serial}")).expect("captured key");
+        captured
+    }
+
+    #[test]
+    fn full_candidate_store_releases_least_recently_used_search() {
+        let store = CandidateViews::default();
+        let limits = RetainedViewLimits::new(limits().views_max(), CANDIDATE_BYTES_MAX);
+        let now = SystemTime::UNIX_EPOCH;
+        let views: Vec<_> = (0..limits.views_max())
+            .map(|serial| {
+                store
+                    .save(&params(), &numbered(serial), limits, now)
+                    .expect("save")
+            })
+            .collect();
+        let selected = |view: &CapturedView| {
+            let mut request = params();
+            request.view = Some(view.id.clone());
+            store.selected(&request, now).expect("lookup")
+        };
+        assert!(
+            matches!(selected(&views[0]), Ok(Some(_))),
+            "reading the oldest search makes it the most recently used"
+        );
+        let next = store
+            .save(&params(), &numbered(limits.views_max()), limits, now)
+            .expect("a full store admits the next search");
+        assert!(matches!(selected(&next), Ok(Some(_))));
+        assert!(matches!(selected(&views[0]), Ok(Some(_))));
+        assert!(
+            matches!(
+                selected(&views[1]),
+                Err(SymbolUnavailableReason::ViewExpired)
+            ),
+            "a released search reads as expired"
+        );
+        assert_eq!(store.rows.lock().expect("rows").len(), limits.views_max());
+        let mut oversized = numbered(limits.views_max() + 1);
+        // Encodes inside the message bound, but not beside the table's own charge.
+        oversized.pools[0].root = "x".repeat(CANDIDATE_BYTES_MAX - 8192);
+        let refused = store
+            .save(&params(), &oversized, limits, now)
+            .expect_err("oversized search");
+        assert!(
+            refused.to_string().contains("exceeds the byte bound"),
+            "{refused}"
+        );
+        assert_eq!(
+            store.rows.lock().expect("rows").len(),
+            limits.views_max(),
+            "an oversized search releases nothing"
+        );
+    }
+
     #[test]
     fn captured_search_refuses_changed_query_scope_limit_and_unknown_view() {
         let store = CandidateViews::default();
         let now = SystemTime::UNIX_EPOCH;
-        let view = store.save(&params(), &captured(), now).expect("capture");
+        let view = store
+            .save(&params(), &captured(), limits(), now)
+            .expect("capture");
         for changed in [
             json!({"query":"other","scope":"all","max_results":2}),
             json!({"query":"beacon","scope":"local","max_results":2}),
@@ -981,9 +1201,112 @@ mod tests {
         let store = CandidateViews::default();
         assert!(
             store
-                .save(&params(), &captured, SystemTime::UNIX_EPOCH)
+                .save(&params(), &captured, limits(), SystemTime::UNIX_EPOCH)
                 .is_err()
         );
         assert!(store.rows.lock().expect("rows").is_empty());
+    }
+    fn selected_view(store: &CandidateViews, view: &CapturedView) -> bool {
+        let mut request = params();
+        request.view = Some(view.id.clone());
+        matches!(
+            store.selected(&request, SystemTime::UNIX_EPOCH),
+            Ok(Ok(Some(_)))
+        )
+    }
+
+    #[test]
+    fn candidate_retention_uses_configured_count_and_lru() {
+        let store = CandidateViews::default();
+        let now = SystemTime::UNIX_EPOCH;
+        let limits = RetainedViewLimits::new(2, 1 << 20);
+        let first = store
+            .save(&params(), &numbered(0), limits, now)
+            .expect("first");
+        let second = store
+            .save(&params(), &numbered(1), limits, now)
+            .expect("second");
+        assert!(selected_view(&store, &first));
+        let third = store
+            .save(&params(), &numbered(2), limits, now)
+            .expect("third");
+        assert!(selected_view(&store, &first));
+        assert!(!selected_view(&store, &second));
+        assert!(selected_view(&store, &third));
+    }
+
+    #[test]
+    fn candidate_retention_accepts_more_than_the_default_count() {
+        let store = CandidateViews::default();
+        let limits = RetainedViewLimits::new(257, 1 << 20);
+        let views: Vec<_> = (0..257)
+            .map(|serial| {
+                store
+                    .save(&params(), &numbered(serial), limits, SystemTime::UNIX_EPOCH)
+                    .expect("configured capture")
+            })
+            .collect();
+        assert!(selected_view(&store, &views[0]));
+        assert!(selected_view(&store, &views[256]));
+        assert_eq!(store.rows.lock().expect("rows").len(), 257);
+    }
+
+    #[test]
+    fn candidate_retention_uses_configured_bytes_and_preserves_views_on_refusal() {
+        let store = CandidateViews::default();
+        let limits = RetainedViewLimits::new(256, 1 << 20);
+        let mut views = Vec::new();
+        for serial in 0..20 {
+            let mut captured = numbered(serial);
+            captured.pools[0].root = "x".repeat(100 << 10);
+            views.push(
+                store
+                    .save(&params(), &captured, limits, SystemTime::UNIX_EPOCH)
+                    .expect("bounded capture"),
+            );
+        }
+        assert!(!selected_view(&store, &views[0]));
+        assert!(selected_view(&store, &views[19]));
+        let before = {
+            let rows = store.rows.lock().expect("rows");
+            assert!(
+                retained_row_bytes(&rows, rows.capacity(), 0).expect("bytes") <= limits.bytes_max()
+            );
+            rows.iter().map(|row| row.key).collect::<Vec<_>>()
+        };
+        let mut oversized = numbered(20);
+        oversized.pools[0].root = "x".repeat(2 << 20);
+        assert!(
+            store
+                .save(&params(), &oversized, limits, SystemTime::UNIX_EPOCH)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .rows
+                .lock()
+                .expect("rows")
+                .iter()
+                .map(|row| row.key)
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn candidate_retention_accepts_more_than_the_old_aggregate_byte_bound() {
+        let store = CandidateViews::default();
+        let limits = RetainedViewLimits::new(2, 64 << 20);
+        let mut views = Vec::new();
+        for serial in 0..2 {
+            let mut captured = numbered(serial);
+            captured.pools[0].root = "x".repeat(9 << 20);
+            views.push(
+                store
+                    .save(&params(), &captured, limits, SystemTime::UNIX_EPOCH)
+                    .expect("capture below the message bound"),
+            );
+        }
+        assert!(views.iter().all(|view| selected_view(&store, view)));
     }
 }

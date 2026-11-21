@@ -1,5 +1,6 @@
 //! Checks captured item-repetition macros without expanding source.
 
+pub(crate) mod chain;
 mod scope;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,13 +71,15 @@ impl Scope {
 
 type Inventory<'a> = BTreeMap<&'a str, &'a SelectedFile<'a>>;
 type Child = (String, Vec<String>, Scope);
+/// A module file a conditional item chain declares, with the condition of its branch.
+pub(super) type Conditioned<'a> = (String, Vec<&'a str>);
 
-fn text_range(source: &str, range: ByteRange) -> Option<&str> {
+pub(super) fn text_range(source: &str, range: ByteRange) -> Option<&str> {
     source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
 }
 
 // Every token borrows the admitted source. Unsupported literal forms refuse proof.
-fn tokens(source: &str) -> Option<Vec<&str>> {
+pub(super) fn tokens(source: &str) -> Option<Vec<&str>> {
     let mut output = Vec::new();
     let mut offset = 0;
     let bytes = source.as_bytes();
@@ -267,35 +270,70 @@ fn transparent_definition(source: &str, symbol: &SyntaxSymbol, scope: &Scope) ->
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Condition {
+pub(super) enum Condition {
     Known(bool),
     Unknown,
 }
 
 fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
+    configured(input, library, depth, &|_| None)
+}
+
+pub(super) fn configured(
+    input: &[&str],
+    library: bool,
+    depth: usize,
+    feature: &impl Fn(&str) -> Option<bool>,
+) -> Option<Condition> {
+    configured_with_flags(input, library, depth, feature, &|_| None)
+}
+
+pub(super) fn configured_with_flags(
+    input: &[&str],
+    library: bool,
+    depth: usize,
+    feature: &impl Fn(&str) -> Option<bool>,
+    flag: &impl Fn(&[&str]) -> Option<bool>,
+) -> Option<Condition> {
     if depth == 0 {
         return None;
     }
     match input {
-        ["test"] => Some(if library {
-            Condition::Known(false)
-        } else {
-            Condition::Unknown
-        }),
+        ["test"] => Some(flag(input).map_or_else(
+            || {
+                if library {
+                    Condition::Known(false)
+                } else {
+                    Condition::Unknown
+                }
+            },
+            Condition::Known,
+        )),
         ["true"] => Some(Condition::Known(true)),
         ["false"] => Some(Condition::Known(false)),
-        [name] if super::crate_name_is_valid(name) => Some(Condition::Unknown),
+        [name] if super::crate_name_is_valid(name) => {
+            Some(flag(input).map_or(Condition::Unknown, Condition::Known))
+        }
+        ["feature", "=", value] if value.starts_with('"') && value.ends_with('"') => Some(
+            flag(input)
+                .or_else(|| feature(value))
+                .map_or(Condition::Unknown, Condition::Known),
+        ),
         [name, "=", value]
             if super::crate_name_is_valid(name)
                 && value.starts_with('"')
                 && value.ends_with('"') =>
         {
-            Some(Condition::Unknown)
+            Some(flag(input).map_or(Condition::Unknown, Condition::Known))
         }
-        ["not", "(", rest @ .., ")"] => cfg(rest, library, depth - 1).map(|value| match value {
-            Condition::Known(value) => Condition::Known(!value),
-            Condition::Unknown => Condition::Unknown,
-        }),
+        ["not", "(", rest @ .., ")"] => {
+            configured_with_flags(rest, library, depth - 1, feature, flag).map(
+                |value| match value {
+                    Condition::Known(value) => Condition::Known(!value),
+                    Condition::Unknown => Condition::Unknown,
+                },
+            )
+        }
         [operation @ ("all" | "any"), "(", rest @ .., ")"] => {
             let mut rest = rest;
             let mut result = Condition::Known(*operation == "all");
@@ -317,7 +355,8 @@ fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
                 if nested != 0 || split == 0 {
                     return None;
                 }
-                let value = cfg(&rest[..split], library, depth - 1)?;
+                let value =
+                    configured_with_flags(&rest[..split], library, depth - 1, feature, flag)?;
                 result = if *operation == "all" {
                     match (result, value) {
                         (Condition::Known(false), _) | (_, Condition::Known(false)) => {
@@ -856,7 +895,7 @@ impl Context<'_> {
                 Some(())
             },
             &mut |range, name, target| {
-                requested.push((path.clone(), range, name, target));
+                requested.push((path.clone(), range, name, target, None));
                 Some(())
             },
         )?;
@@ -919,7 +958,13 @@ fn invocation_name(source: &str, range: ByteRange) -> Option<&str> {
         .filter(|name| super::crate_name_is_valid(name))
 }
 
-pub(super) type Export = (rift_core::ProjectPath, ByteRange, String, Vec<String>);
+pub(super) type Export = (
+    rift_core::ProjectPath,
+    ByteRange,
+    String,
+    Vec<String>,
+    Option<ByteRange>,
+);
 
 pub(super) fn children<'a>(
     file: &'a SelectedFile<'a>,
@@ -930,11 +975,12 @@ pub(super) fn children<'a>(
         Scope,
         &mut std::collections::BTreeSet<ByteRange>,
         &mut Vec<Export>,
+        &mut Vec<Conditioned<'a>>,
     ),
     limits: rift_syntax::SyntaxLimits,
     library: bool,
 ) -> Vec<Child> {
-    let (mut scope, admitted, exports) = scope;
+    let (mut scope, admitted, exports, conditioned) = scope;
     let context = Context {
         inventory,
         originals,
@@ -942,15 +988,16 @@ pub(super) fn children<'a>(
         library,
     };
     let ordinary = super::module_children(file, directory, inventory, limits);
+    // Keyed by the declaring item: alternative `mod` items of one name each keep their file.
     let direct = ordinary
         .iter()
-        .filter(|(_, local)| local.len() == 1)
-        .map(|(path, local)| (local[0].as_str(), (path, local)))
+        .filter(|(_, local, _)| local.len() == 1)
+        .map(|(path, local, item)| (*item, (path, local)))
         .collect::<BTreeMap<_, _>>();
     let mut children = ordinary
         .iter()
-        .filter(|(_, local)| local.len() > 1)
-        .map(|(path, local)| (path.clone(), local.clone(), Scope::default()))
+        .filter(|(_, local, _)| local.len() > 1)
+        .map(|(path, local, _)| (path.clone(), local.clone(), Scope::default()))
         .collect::<Vec<_>>();
     let tokens = context.tokens(file, directory, &scope);
     if file.syntax.macro_invocations().is_none() || tokens.is_none() {
@@ -964,8 +1011,7 @@ pub(super) fn children<'a>(
                 scope.define(file, symbol, transparent, original);
             }
             Event::Symbol(symbol) => {
-                let name = super::source_identifier(&symbol.name);
-                let child = name.as_deref().and_then(|name| direct.get(name)).copied();
+                let child = direct.get(&symbol.item_range).copied();
                 if let Some((path, local)) = child {
                     children.push((path.clone(), local.clone(), scope.clone()));
                 }
@@ -995,6 +1041,12 @@ pub(super) fn children<'a>(
                         })
                     {
                         children.extend(literal);
+                    }
+                    if let Some(name) = name
+                        && let Some(tokens) = tokens.as_ref()
+                    {
+                        let declared = (&mut children, &mut *conditioned);
+                        context.chain_children((*range, name, directory), &scope, tokens, declared);
                     }
                     scope.clear();
                     continue;
@@ -1032,6 +1084,61 @@ pub(super) fn children<'a>(
 }
 
 impl Context<'_> {
+    /// Adds the module files of a conditional item chain invocation to `children`, and
+    /// each with its branch condition to `conditioned`.
+    fn chain_children<'a>(
+        &self,
+        (invocation, name, directory): (ByteRange, &str, &str),
+        scope: &Scope,
+        tokens: &scope::Tokens<'a>,
+        (children, conditioned): (&mut Vec<Child>, &mut Vec<Conditioned<'a>>),
+    ) {
+        let Some(modules) = self.chain(invocation, name, scope, tokens) else {
+            return;
+        };
+        let mut incomplete = scope.clone();
+        incomplete.clear();
+        for (module, condition) in modules {
+            if let Some(path) = child_path(module, directory, self.inventory) {
+                children.push((path.clone(), vec![module.to_owned()], incomplete.clone()));
+                conditioned.push((path, condition));
+            }
+        }
+    }
+
+    /// The modules of an invocation of `name` when its definition in scope is the
+    /// conditional item chain, each with the condition of its branch.
+    fn chain<'a>(
+        &self,
+        invocation: ByteRange,
+        name: &str,
+        scope: &Scope,
+        tokens: &scope::Tokens<'a>,
+    ) -> Option<Vec<(&'a str, Vec<&'a str>)>> {
+        let (path, range) = scope.definition(name)?;
+        let defining = self.inventory.get(path.as_str())?;
+        let limits = defining.syntax.syntax_limits()?;
+        let mut symbols = defining
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == name && symbol.kind == "macro");
+        let symbol = symbols.next()?;
+        if symbols.next().is_some()
+            || symbol.item_range != *range
+            || symbol.syntax_element_kind != Some("macro_definition")
+            || self.originals.get(path.as_str()).copied() != Some(defining.source)
+            || defining.syntax.has_errors()
+        {
+            return None;
+        }
+        let definition = chain::token_texts(defining.source, *range, limits)?;
+        if !chain::is_definition(&definition, name, limits) {
+            return None;
+        }
+        chain::modules(&tokens.range(invocation)?, self.depth_max)
+    }
+
     fn item(
         &self,
         file: &SelectedFile<'_>,
@@ -1040,15 +1147,15 @@ impl Context<'_> {
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
-        // Original public imports remain declarations when macro effects are unknown.
+        // Original explicit imports remain declarations when macro effects are unknown.
         // Their own attributes and paths are checked before recording an alias.
         if let Some(tokens) = tokens
             && let Some(item) = tokens.range(range)
         {
             let mut requested = Vec::new();
             if tokens
-                .public_imports(&item, &mut |range, name, target| {
-                    requested.push((file.path.clone(), range, name, target));
+                .public_imports(&item, true, &mut |range, name, target, visibility| {
+                    requested.push((file.path.clone(), range, name, target, visibility));
                     Some(())
                 })
                 .is_some()

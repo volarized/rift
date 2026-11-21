@@ -171,11 +171,11 @@ fn typescript_export_forms_keep_type_and_namespace_bindings() {
 
 #[test]
 fn default_exports_keep_named_references_and_anonymous_forms() {
-    for text in [
-        "function run() {}\nexport default run;",
-        "export default function run() {}",
-        "export default () => 1;",
-        "export default function () {}",
+    for (text, local) in [
+        ("function run() {}\nexport default run;", "run"),
+        ("export default function run() {}", "run"),
+        ("export default () => 1;", "() => 1"),
+        ("export default function () {}", "function () {}"),
     ] {
         let document = analyze(&JavaScriptSyntaxProvider::default(), text);
         let bindings = document
@@ -184,10 +184,7 @@ fn default_exports_keep_named_references_and_anonymous_forms() {
             .expect("recorded exports");
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].kind, SyntaxExportKind::Default);
-        assert_eq!(
-            token(text, bindings[0].local),
-            text.contains("run").then_some("run")
-        );
+        assert_eq!(token(text, bindings[0].local), Some(local));
         assert!(bindings[0].source.is_none());
     }
 }

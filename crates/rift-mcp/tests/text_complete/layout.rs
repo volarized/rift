@@ -798,7 +798,7 @@ mod tests {
                                 "from": "rift://symbol/rust/src/m.rs/main",
                                 "to": "rift://symbol/rust/src/b.rs/b",
                                 "kinds": ["calls"],
-                                "provider": "static", "derivation": "resolution"
+                                "providers": ["static"], "derivation": "resolution"
                             }
                         },
                         {
@@ -807,7 +807,7 @@ mod tests {
                                 "from": "rift://symbol/rust/src/b.rs/b",
                                 "to": "rift://symbol/rust/src/d.rs/d",
                                 "kinds": ["calls", "has_type"],
-                                "provider": "static", "derivation": "heuristic"
+                                "providers": ["static"], "derivation": "heuristic"
                             }
                         }
                     ]
@@ -840,10 +840,10 @@ mod tests {
 
 \tat rift://symbol/rust/src/m.rs/main
 
-\t\t↳ calls [static]
+\t\t↳ calls (providers: static)
 \t\t\tat rift://symbol/rust/src/b.rs/b
 
-\t\t\t↳ probably calls, has type [static]
+\t\t\t↳ probably calls, has type (providers: static)
 \t\t\t\tpub fn d()
 \t\t\t\tin src/d.rs:30 · name · score 1.5
 \t\t\t\tat rift://symbol/rust/src/d.rs/d
@@ -1098,7 +1098,7 @@ mod tests {
                 "from": id_of(from),
                 "to": id_of(to),
                 "kinds": kinds,
-                "provider": "static", "derivation": derivation
+                "providers": ["static"], "derivation": derivation
             }
         })
     }
@@ -1202,34 +1202,34 @@ mod tests {
 \tin src/load_config.rs:10 · name
 \tat rift://symbol/rust/src/load_config.rs/load_config
 
-\t\t↳ referenced [static]
+\t\t↳ referenced (providers: static)
 \t\t\tby fn run()
 \t\t\tin src/run.rs:20
 \t\t\tat rift://symbol/rust/src/run.rs/run
 
-\t\t\t↳ called [static]
+\t\t\t↳ called (providers: static)
 \t\t\t\tby fn main()
 \t\t\t\tin src/main.rs:9 · name · score 0.5
 \t\t\t\tat rift://symbol/rust/src/main.rs/main
 
-\t\t↳ called [static]
+\t\t↳ called (providers: static)
 \t\t\tby fn reload_config()
 \t\t\tin src/reload_config.rs:41
 \t\t\tat rift://symbol/rust/src/reload_config.rs/reload_config
 
 \tat rift://symbol/rust/src/serve.rs/serve
 
-\t\t↳ calls [static]
+\t\t↳ calls (providers: static)
 \t\t\tat rift://symbol/rust/src/handler.rs/handler
 
-\t\t\t↳ probably calls, reads [static]
+\t\t\t↳ probably calls, reads (providers: static)
 \t\t\t\tfn parse()
 \t\t\t\tin src/parse.rs:4
 \t\t\t\tat rift://symbol/rust/src/parse.rs/parse
 ";
 
     /// The block of the symbol `reload_config` of [`WALK_TEXT`], with the blank line before it.
-    const RELOAD_BLOCK: &str = "\n\t\t↳ called [static]\n\t\t\tby fn reload_config()\n\t\t\tin src/reload_config.rs:41\n\t\t\tat rift://symbol/rust/src/reload_config.rs/reload_config\n";
+    const RELOAD_BLOCK: &str = "\n\t\t↳ called (providers: static)\n\t\t\tby fn reload_config()\n\t\t\tin src/reload_config.rs:41\n\t\t\tat rift://symbol/rust/src/reload_config.rs/reload_config\n";
 
     /// Asserts the failure of the walk text edited by `from` to `to` names `path`.
     fn walk_refusal(from: &str, to: &str, path: &str) -> Result<(), String> {
@@ -1254,11 +1254,11 @@ mod tests {
         for provider in ["static", "engine", "lsp"] {
             let answer = with(
                 search_answer(),
-                "/results/2/traversal_path/0/edge/provider",
-                json!(provider),
+                "/results/2/traversal_path/0/edge/providers",
+                json!([provider]),
             )?;
-            let head = format!("\t\t↳ calls [{provider}]\n");
-            let text = edited(SEARCH_TEXT, "\t\t↳ calls [static]\n", &head)?;
+            let head = format!("\t\t↳ calls (providers: {provider})\n");
+            let text = edited(SEARCH_TEXT, "\t\t↳ calls (providers: static)\n", &head)?;
             assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()));
             let absent = edited(&text, &head, "\t\t↳ calls\n")?;
             let failure = refused(Tool::Search, &absent, &answer)?;
@@ -1299,33 +1299,33 @@ mod tests {
     #[test]
     fn a_wrong_edge_word_is_refused() -> Result<(), String> {
         walk_refusal(
-            "\t\t↳ referenced [static]\n",
-            "\t\t↳ calls [static]\n",
+            "\t\t↳ referenced (providers: static)\n",
+            "\t\t↳ calls (providers: static)\n",
             "$.results[2].traversal_path[0]",
         )?;
         walk_refusal(
-            "\t\t↳ referenced [static]\n",
-            "\t\t↳ referenced by [static]\n",
+            "\t\t↳ referenced (providers: static)\n",
+            "\t\t↳ referenced by (providers: static)\n",
             "$.results[2].traversal_path[0]",
         )?;
         walk_refusal(
-            "\n\t\t↳ called [static]\n\t\t\tby fn reload_config()",
-            "\n\t\t↳ calls [static]\n\t\t\tby fn reload_config()",
+            "\n\t\t↳ called (providers: static)\n\t\t\tby fn reload_config()",
+            "\n\t\t↳ calls (providers: static)\n\t\t\tby fn reload_config()",
             "$.results[4].traversal_path[0]",
         )?;
         walk_refusal(
-            "↳ probably calls, reads [static]\n",
-            "↳ calls, reads [static]\n",
+            "↳ probably calls, reads (providers: static)\n",
+            "↳ calls, reads (providers: static)\n",
             "$.results[5].traversal_path[1]",
         )?;
         walk_refusal(
-            "↳ probably calls, reads [static]\n",
-            "↳ probably calls [static]\n",
+            "↳ probably calls, reads (providers: static)\n",
+            "↳ probably calls (providers: static)\n",
             "$.results[5].traversal_path[1]",
         )?;
         walk_refusal(
-            "\t\t↳ calls [static]\n",
-            "\t\t↳ called [static]\n",
+            "\t\t↳ calls (providers: static)\n",
+            "\t\t↳ called (providers: static)\n",
             "$.results[5].traversal_path[0]",
         )
     }
@@ -1427,13 +1427,13 @@ mod tests {
     #[test]
     fn a_symbol_at_a_wrong_indent_is_refused() -> Result<(), String> {
         walk_refusal(
-            "\n\t\t↳ called [static]\n\t\t\tby fn reload_config()",
-            "\n\t↳ called [static]\n\t\t\tby fn reload_config()",
+            "\n\t\t↳ called (providers: static)\n\t\t\tby fn reload_config()",
+            "\n\t↳ called (providers: static)\n\t\t\tby fn reload_config()",
             "$.results[4].traversal_path[0]",
         )?;
         walk_refusal(
-            "\n\t\t\t↳ called [static]\n",
-            "\n\t\t↳ called [static]\n",
+            "\n\t\t\t↳ called (providers: static)\n",
+            "\n\t\t↳ called (providers: static)\n",
             "$.results[3].traversal_path[1]",
         )?;
         walk_refusal(
@@ -1457,7 +1457,7 @@ mod tests {
     fn a_missing_symbol_is_refused() -> Result<(), String> {
         walk_refusal(RELOAD_BLOCK, "", "$.results[4].traversal_path[0]")?;
         walk_refusal(
-            "\n\t\t↳ calls [static]\n\t\t\tat rift://symbol/rust/src/handler.rs/handler\n",
+            "\n\t\t↳ calls (providers: static)\n\t\t\tat rift://symbol/rust/src/handler.rs/handler\n",
             "",
             "$.results[5].traversal_path[0]",
         )?;
@@ -1467,7 +1467,7 @@ mod tests {
             "$.results[5].traversal_path[0]",
         )?;
         walk_refusal(
-            "\n\t\t\t↳ called [static]\n\t\t\t\tby fn main()\n\t\t\t\tin src/main.rs:9 · name · score 0.5\n\t\t\t\tat rift://symbol/rust/src/main.rs/main\n",
+            "\n\t\t\t↳ called (providers: static)\n\t\t\t\tby fn main()\n\t\t\t\tin src/main.rs:9 · name · score 0.5\n\t\t\t\tat rift://symbol/rust/src/main.rs/main\n",
             "",
             "$.results[3].traversal_path[1]",
         )
@@ -1478,8 +1478,8 @@ mod tests {
         let swapped = edited(WALK_TEXT, RELOAD_BLOCK, "")?;
         let text = edited(
             &swapped,
-            "\n\t\t↳ referenced [static]\n",
-            &format!("{RELOAD_BLOCK}\n\t\t↳ referenced [static]\n"),
+            "\n\t\t↳ referenced (providers: static)\n",
+            &format!("{RELOAD_BLOCK}\n\t\t↳ referenced (providers: static)\n"),
         )?;
         let failure = refused(Tool::Search, &text, &walk_answer())?;
         assert!(failure.contains("$.results["), "{failure}");
@@ -1489,8 +1489,8 @@ mod tests {
     #[test]
     fn a_missing_blank_line_before_a_symbol_is_refused() -> Result<(), String> {
         walk_refusal(
-            "\n\n\t\t↳ called [static]\n\t\t\tby fn reload_config()",
-            "\n\t\t↳ called [static]\n\t\t\tby fn reload_config()",
+            "\n\n\t\t↳ called (providers: static)\n\t\t\tby fn reload_config()",
+            "\n\t\t↳ called (providers: static)\n\t\t\tby fn reload_config()",
             "$.results[4].traversal_path[0]",
         )?;
         walk_refusal(
@@ -1559,12 +1559,12 @@ mod tests {
 2 results
 \tat rift://symbol/rust/src/root.rs/root
 
-\t\t↳ called [static]
+\t\t↳ called (providers: static)
 \t\t\tby fn x()
 \t\t\tin src/x.rs:1
 \t\t\tat rift://symbol/rust/src/x.rs/x
 
-\t\t↳ called [static]
+\t\t↳ called (providers: static)
 \t\t\tby fn x()
 \t\t\tin src/x.rs:2
 \t\t\tat rift://symbol/rust/src/x.rs/x
@@ -1572,7 +1572,7 @@ mod tests {
         assert_eq!(text_states(Tool::Search, text, &answer), Ok(()));
         let one = edited(
             text,
-            "\n\t\t↳ called [static]\n\t\t\tby fn x()\n\t\t\tin src/x.rs:2\n\t\t\tat rift://symbol/rust/src/x.rs/x\n",
+            "\n\t\t↳ called (providers: static)\n\t\t\tby fn x()\n\t\t\tin src/x.rs:2\n\t\t\tat rift://symbol/rust/src/x.rs/x\n",
             "",
         )?;
         assert!(text_states(Tool::Search, &one, &answer).is_err());
@@ -1687,18 +1687,18 @@ mod tests {
     fn the_tree_of_the_search_text_is_checked_through_its_hops() -> Result<(), String> {
         let path = "$.results[2].traversal_path";
         search_refusal(
-            "\t\t↳ calls [static]\n\t\t\tat rift://symbol/rust/src/b.rs/b\n\n",
+            "\t\t↳ calls (providers: static)\n\t\t\tat rift://symbol/rust/src/b.rs/b\n\n",
             "",
             &format!("{path}[0]"),
         )?;
         search_refusal(
-            "↳ probably calls, has type [static]\n",
-            "↳ calls, has type [static]\n",
+            "↳ probably calls, has type (providers: static)\n",
+            "↳ calls, has type (providers: static)\n",
             &format!("{path}[1]"),
         )?;
         search_refusal(
-            "↳ probably calls, has type [static]\n",
-            "↳ probably calls, type of [static]\n",
+            "↳ probably calls, has type (providers: static)\n",
+            "↳ probably calls, type of (providers: static)\n",
             &format!("{path}[1]"),
         )?;
         search_refusal(
@@ -1741,7 +1741,7 @@ mod tests {
             )]);
             let word = if by { "by " } else { "" };
             let text = format!(
-                "1 result\n\tat rift://symbol/rust/src/x.rs/x\n\n\t\t↳ {words} [static]\n\t\t\t{word}fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n"
+                "1 result\n\tat rift://symbol/rust/src/x.rs/x\n\n\t\t↳ {words} (providers: static)\n\t\t\t{word}fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n"
             );
             assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()), "{kind}");
             let wrong = text.replace(words, "touches");
@@ -1762,12 +1762,12 @@ mod tests {
                 vec![hop("incoming", ("x", "root"), kinds, "resolution")],
             )])
         };
-        let all = "1 result\n\tat rift://symbol/rust/src/root.rs/root\n\n\t\t↳ called, referenced [static]\n\t\t\tby fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n";
+        let all = "1 result\n\tat rift://symbol/rust/src/root.rs/root\n\n\t\t↳ called, referenced (providers: static)\n\t\t\tby fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n";
         assert_eq!(
             text_states(Tool::Search, all, &hit(&["calls", "references"])),
             Ok(())
         );
-        let one = "1 result\n\tat rift://symbol/rust/src/root.rs/root\n\n\t\t↳ called by, type of [static]\n\t\t\tfn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n";
+        let one = "1 result\n\tat rift://symbol/rust/src/root.rs/root\n\n\t\t↳ called by, type of (providers: static)\n\t\t\tfn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n";
         assert_eq!(
             text_states(Tool::Search, one, &hit(&["calls", "has_type"])),
             Ok(())

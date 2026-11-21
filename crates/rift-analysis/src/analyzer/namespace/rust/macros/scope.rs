@@ -331,7 +331,7 @@ impl<'a> Tokens<'a> {
         let mut exports = Vec::new();
         let mut names = BTreeSet::new();
         items(body, self.depth, |item| {
-            self.public_imports(item, &mut |range, name, path| {
+            self.public_imports(item, false, &mut |range, name, path, _| {
                 exports.push((range, name, path));
                 Some(())
             })?;
@@ -381,7 +381,8 @@ impl<'a> Tokens<'a> {
     pub(super) fn public_imports(
         &self,
         item: &[&str],
-        callback: &mut dyn FnMut(ByteRange, String, Vec<String>) -> Option<()>,
+        allow_restricted: bool,
+        callback: &mut dyn FnMut(ByteRange, String, Vec<String>, Option<ByteRange>) -> Option<()>,
     ) -> Option<()> {
         let mut input = item;
         while consume(&mut input, &["#"]) {
@@ -393,7 +394,21 @@ impl<'a> Tokens<'a> {
                 return Some(());
             }
         }
-        if !consume(&mut input, &["pub", "use"]) {
+        if input.first() != Some(&"pub") {
+            return Some(());
+        }
+        let prefix = input;
+        visibility(&mut input)?;
+        let consumed = prefix.len().checked_sub(input.len())?;
+        let visibility = if consumed > 1 {
+            if !allow_restricted {
+                return Some(());
+            }
+            Some(self.module_range(&prefix[..consumed])?)
+        } else {
+            None
+        };
+        if !consume(&mut input, &["use"]) {
             return Some(());
         }
         let range = self.module_range(item)?;
@@ -417,7 +432,10 @@ impl<'a> Tokens<'a> {
             return None;
         }
         for (name, path) in exports {
-            callback(range, name, path)?;
+            if let Some(visibility) = visibility {
+                self.charge(usize::try_from(visibility.end.checked_sub(visibility.start)?).ok()?)?;
+            }
+            callback(range, name, path, visibility)?;
         }
         Some(())
     }
@@ -881,10 +899,10 @@ fn compile_error_tokens(mut input: &[&str]) -> bool {
     input.is_empty() && message.starts_with('"') && message.ends_with('"')
 }
 
-fn items(
-    mut input: &[&str],
+pub(super) fn items<'a>(
+    mut input: &[&'a str],
     depth: usize,
-    mut callback: impl FnMut(&[&str]) -> Option<()>,
+    mut callback: impl FnMut(&[&'a str]) -> Option<()>,
 ) -> Option<()> {
     if depth == 0 {
         return None;
@@ -943,7 +961,7 @@ fn constant(mut input: &[&str]) -> Option<bool> {
     Some(consume(&mut input, &[":"]))
 }
 
-fn visibility(input: &mut &[&str]) -> Option<()> {
+pub(super) fn visibility(input: &mut &[&str]) -> Option<()> {
     if consume(input, &["pub"]) && input.first() == Some(&"(") {
         let value = group(input, "(", ")")?;
         if value.is_empty()

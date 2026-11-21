@@ -97,6 +97,11 @@ const RECORDED_DIGEST_BYTES: usize = 32;
 /// Typed rows inserted per statement. Each row binds at most 12 values, so one statement
 /// uses at most 768 variables, below bundled SQLite's 32,766-variable limit.
 const LEXICAL_INSERT_ROWS_MAX: usize = 64;
+/// Paths one delete statement names. Each path binds one value, so one statement uses at
+/// most 256 variables, below bundled SQLite's 32,766-variable limit.
+pub(crate) const LEXICAL_DELETE_PATHS_MAX: usize = 256;
+/// Typed rows of any other table inserted per statement, under the same variable limit.
+pub(crate) const STORE_INSERT_ROWS_MAX: usize = LEXICAL_INSERT_ROWS_MAX;
 
 /// Primary key of the single `lexical_index_state` row this adapter maintains.
 const LEXICAL_INDEX_STATE_ID: i64 = 1;
@@ -635,8 +640,39 @@ fn searchable_columns() -> String {
     SearchableField::ALL.map(SearchableField::column).join(", ")
 }
 
-/// Deletes every unit filed under one path, from both FTS indexes and the typed table
-/// alike, and forgets the digest recorded for the path.
+/// The numbered placeholders `?1` to `?count`, comma separated, for one `IN` list.
+pub(crate) fn numbered_placeholders(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `sql` with every name of `names` bound, in order, to the placeholders
+/// [`numbered_placeholders`] names.
+pub(crate) fn naming<'name>(
+    sql: String,
+    names: impl IntoIterator<Item = &'name str>,
+) -> toasty::sql::Statement {
+    names
+        .into_iter()
+        .fold(toasty::sql::statement(sql), |statement, name| {
+            statement.bind(name.to_owned())
+        })
+}
+
+/// `sql` with every path of `paths` bound, in order.
+pub(crate) fn naming_paths(sql: String, paths: &[ProjectPath]) -> toasty::sql::Statement {
+    naming(sql, paths.iter().map(ProjectPath::as_str))
+}
+
+/// Deletes every unit filed under `paths`, from both FTS indexes and the typed table
+/// alike, and forgets the digest recorded for each path.
+///
+/// A write names its paths [`LEXICAL_DELETE_PATHS_MAX`] to a statement, so its statement
+/// count follows the batches it names and never its paths: every statement is one exchange
+/// with the database thread, and a write of a thousand paths would otherwise spend its
+/// time on five thousand of them.
 ///
 /// The index entries go first, through the FTS5 `'delete'` command, while the typed rows
 /// still hold the values they were indexed from: the command "must match the values
@@ -644,32 +680,36 @@ fn searchable_columns() -> String {
 /// (<https://www.sqlite.org/fts5.html>). The path index finds the rows, so the work is one
 /// lookup per path and one delete per unit, never a scan of an FTS table.
 ///
-/// The trigram index gives up the path's rows through
-/// [`crate::trigram_store::delete_path`], while the typed rows still hold them as well.
-async fn delete_path_units(
+/// The trigram index gives up the paths' rows through
+/// [`crate::trigram_store::delete_paths`], while the typed rows still hold them as well.
+async fn delete_units_under(
     executor: &mut dyn Executor,
-    path: &ProjectPath,
+    paths: &[ProjectPath],
 ) -> Result<(), RiftError> {
     let columns = searchable_columns();
-    toasty::sql::statement(format!(
-        "INSERT INTO lexical_documents_fts(lexical_documents_fts, rowid, {columns}) \
-         SELECT 'delete', id, {columns} FROM lexical_documents WHERE path = ?1"
-    ))
-    .bind(path.as_str().to_owned())
-    .exec(&mut *executor)
-    .await
-    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-    crate::trigram_store::delete_path(&mut *executor, path).await?;
-    toasty::sql::statement("DELETE FROM lexical_documents WHERE path = ?1")
-        .bind(path.as_str().to_owned())
+    for paths in paths.chunks(LEXICAL_DELETE_PATHS_MAX) {
+        let named = numbered_placeholders(paths.len());
+        naming_paths(
+            format!(
+                "INSERT INTO lexical_documents_fts(lexical_documents_fts, rowid, {columns}) \
+                 SELECT 'delete', id, {columns} FROM lexical_documents WHERE path IN ({named})"
+            ),
+            paths,
+        )
         .exec(&mut *executor)
         .await
         .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-    LexicalFileRecord::filter_by_project_path(path.as_str())
-        .delete()
-        .exec(executor)
-        .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        crate::trigram_store::delete_paths(&mut *executor, paths).await?;
+        for table in ["lexical_documents", "lexical_files"] {
+            naming_paths(
+                format!("DELETE FROM {table} WHERE path IN ({named})"),
+                paths,
+            )
+            .exec(&mut *executor)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        }
+    }
     Ok(())
 }
 
@@ -898,19 +938,24 @@ fn insert_document(
     })
 }
 
-/// Records the digest each named file's rows were derived from.
+/// Records the digest each named file's rows were derived from, in the same bounded
+/// batches the typed rows are written in.
 async fn record_files(
     executor: &mut dyn Executor,
     recorded: &[(ProjectPath, FileDigest)],
 ) -> Result<(), RiftError> {
-    for (path, digest) in recorded {
-        toasty::create!(LexicalFileRecord {
-            project_path: path.as_str().to_owned(),
-            digest: digest.as_bytes().to_vec(),
-        })
-        .exec(&mut *executor)
-        .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+    for recorded in recorded.chunks(LEXICAL_INSERT_ROWS_MAX) {
+        let mut insert = LexicalFileRecord::create_many();
+        for (path, digest) in recorded {
+            insert = insert.item(toasty::create!(LexicalFileRecord {
+                project_path: path.as_str().to_owned(),
+                digest: digest.as_bytes().to_vec(),
+            }));
+        }
+        insert
+            .exec(&mut *executor)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     }
     Ok(())
 }
@@ -1422,9 +1467,7 @@ impl<'a> StoredUnits<'a> {
                 insert_documents(executor, inserted).await
             }
             Self::Named(change) => {
-                for path in change.replaced() {
-                    delete_path_units(&mut *executor, path).await?;
-                }
+                delete_units_under(&mut *executor, change.replaced()).await?;
                 let stored = indexed_unit_count(&mut *executor).await?;
                 validate_indexed_count(stored.saturating_add(change.inserted().len()), limits)?;
                 insert_documents(&mut *executor, change.inserted()).await?;

@@ -147,7 +147,12 @@ Requesting `:source` and `:score` projects the corresponding producer payload. S
 require those input values as stored facts on every result.
 
 `:max_results` and `:page` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
-SPARQL result after evaluation. Missing producer coverage can make the query unavailable.
+SPARQL result after evaluation. Missing producer coverage can make the query unavailable; a
+producer bound does not. When a producer stops at one of its bounds (`results_truncated`,
+`lexical_ranking_truncated`, `pattern_matches_truncated`, `query_narrowed`, `change_truncated`),
+or the server reaches the solution, byte, or page bound of the producer pages it reads, the
+query evaluates over the rows the producer returned and pages them, with `pagination.total`
+counting those rows. `rift server logs` records the bound; the answer carries no warning for it.
 A package answered from the nearest collected release under `package_substituted` is covered.
 A global API read that fails answers `unavailable` with reason `read_failed`, and
 `rift server logs` names its `failure_class`.
@@ -169,8 +174,9 @@ ORDER BY ?path ?start
 
 Matching runs line by line. `(?i)` selects case-insensitive matching. Existing pattern length,
 compiled size, candidate rows, verified text size, and matches-per-file bounds remain in
-effect. Invalid patterns refuse with the registered field error. Incomplete pattern coverage
-cannot be evaluated as a complete graph, boolean, aggregate, or binding result.
+effect. Invalid patterns refuse with the registered field error. A pattern index that is still
+preparing cannot be evaluated as a complete graph, boolean, aggregate, or binding result; the
+matches a bound kept answer as the producer returned them.
 
 ### References and calls [#search-traversal]
 
@@ -322,6 +328,9 @@ Remote acquisition uses bounded batches and holds the selected publication for t
 ### Captured answers and pages
 
 A successful answer names the `revision` it read. The caller sends that `revision` for later pages.
+An answer that combines extra projects names a tree revision over the revisions those projects
+read. A later page sent with it reads the retained answer. Once any of those projects serves
+another revision, the server refuses it.
 `page` starts at 1 and defaults to 1. `max_results` defaults to 10 and accepts 1 to 1000.
 
 `pagination` carries `page`, `pages`, `max_results`, and `total`. A page past the last returns
@@ -332,10 +341,34 @@ without pagination. SPARQL `LIMIT` and `OFFSET` bound the result set before pagi
 
 The server bounds statement size, algebra, fact acquisition, and the evaluated answer.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
+An evaluated answer past its solution or byte bound holds the solutions before the bound, and
+a graph walk past its acquisition budget answers over the facts it acquired. Both page like any
+other answer, and `rift server logs` records the bound and its value.
 
-A query requiring missing facts returns typed unavailability before evaluation.
-This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
-from unavailable facts. A query needing only published symbol names does not require
+A query over the captured inventory - every symbol, call, reference, or usage it holds - answers
+from partly covered facts. This holds for a `SELECT` that joins, projects, filters, binds, orders,
+or slices, and for an `ASK` that finds a witness; every row such an answer returns stands.
+
+The answer's warnings name what is missing:
+
+- `source_unavailable` - a file left out of the index although no bound excluded it: bytes that
+  are not valid UTF-8, a NUL byte, or a refused declaration. A file a bound left out - past the
+  per-file byte bound, past `[providers.syntax]` `max_file`, or past the declarations the index
+  holds - is outside the indexed set, as a file the source policy excludes is: no answer names
+  it, and `rift server logs` records it
+- `framework_context_unresolved` - a framework whose context is unresolved; the file's ordinary
+  declarations still answer
+- `engine_analysis_unavailable` - a language whose engine analysis is missing; the captured static
+  facts still answer
+
+Any other query needs complete coverage and returns `insufficient_coverage` with the same warnings:
+
+- an empty result or a false `ASK`, which claims an absence
+- an aggregate such as a count
+- a negation, `EXISTS`, `MINUS`, or `OPTIONAL`
+- a graph result
+
+Available-empty facts differ from unavailable facts. A query needing only published symbol names does not require
 unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved; query evaluation
 does not reparse source to manufacture a complete syntax family.
 
@@ -603,8 +636,10 @@ provider's own facts disagree.
 A `source_unavailable` record names a file the index left out - bytes that are not valid UTF-8,
 a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
 lookup while every other file stays available. A read logs at most eight omitted files in
-project-path order, followed by a `source_unavailable` summary if more files were omitted.
-The index build logs each omission.
+project-path order, followed by a `source_unavailable` summary if more files were omitted; a
+file a bound left out is not among them. The index build records each omission with its bound
+and measured value, one record per file for the first 64 files one build reads, then one record
+per publication counting the rest.
 
 Text search can produce these diagnostics:
 
@@ -620,7 +655,9 @@ Text search can produce these diagnostics:
   declaration such a file holds still answers.
 - `large_file_unparsed` - files past `[providers.syntax] max_file` are held as text the syntax
   provider does not parse: their text answers `search`, and none of their declarations answers a
-  symbol hit or `get_symbol`. `files` names them, at most eight, in project-path order.
+  symbol hit or `get_symbol`. `files` names them, at most eight, in project-path order. An
+  answer carries it only for files the request names in `paths.force_include` or a
+  comparison; the index build records every other such file in the log.
 - `lockfile_excluded` - a lockfile the request's `paths.include` selects is left out of search
   under the `[search.text]` key `excluded_lockfiles`. `rift://map` still carries the versions it
   pins, and naming the file in `paths.force_include` searches it for one request.
@@ -857,15 +894,18 @@ no entries. It refuses a read whose text exceeds the byte limit, with typed `Err
 The answer carries:
 
 - `configuration_revision` - an eight-character digest of the accepted `rift.toml` bytes
+- `revision` - the indexed revision the page read
 - `languages` - effective identities in order, with enabled state, include and exclude patterns,
   syntax availability, and selected LSP process state
 - `source` - captured project paths, content digests, and matched language identities
-- `pagination` - the zero-based page and total page count
+- `pagination` - `page`, `pages`, `max_results`, and `total` of the source catalog
 
-The bare URI selects page zero. `rift://workspace?page=1` selects another page. Each page
-holds at most 50 source units and repeats the language summaries. When another page exists,
-the compact response ends with its URI. A page past the end returns an empty `source` list
-with the actual page count.
+The bare URI selects page 1. `rift://workspace?page=2&max_results=50&revision=<revision>`
+selects a later page of the catalog that `revision` names. `max_results` defaults to 10 and
+accepts 1 through 50, and each page repeats the language summaries. The server refuses a
+revision it no longer serves. When another page exists, the compact response ends with its URI,
+which carries the revision. A page past the end returns an empty `source` list with the actual
+page count.
 
 The compact text has these parts:
 
@@ -925,9 +965,12 @@ source:
     }
   ],
   "pagination": {
+    "max_results": 10,
     "page": 1,
-    "pages": 1
+    "pages": 1,
+    "total": 1
   },
+  "revision": "rift://revision/tree/9f0c4e2a7b1d3c5e8f6a0b2d4c6e8a1f3b5d7c9e0a2b4d6f8e1c3a5b7d9f0e2c",
   "source": [
     {
       "digest": "8a4d20bc",
@@ -943,7 +986,7 @@ source:
 </ExampleTabs>
 
 The source page describes one published catalog. The server **MUST** return its configuration
-revision, source digests, and pagination from that publication. During preparation, the server
+revision, revision, source digests, and pagination from that publication. During preparation, the server
 logs [`local_index_preparing`](#reads) and the page lists prepared files.
 After preparation, the catalog also includes visible files without enabled syntax.
 

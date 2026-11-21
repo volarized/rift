@@ -5,8 +5,8 @@ use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
 
 use super::{
     GraphAnswer, GraphDataset, GraphDatasetBuilder, GraphFact, GraphLimits, GraphQuery, GraphTerm,
-    HistoryEvent, QueryCancellation, RevisionIri, SymbolRelation, SyntaxAddress, SyntaxFact,
-    SyntaxLocation,
+    HistoryEvent, QueryCancellation, RevisionIri, SymbolRelation, SymbolSelection, SyntaxAddress,
+    SyntaxFact, SyntaxLocation,
 };
 
 const MAIN: &str = "rift://symbol/local/rust/app/main";
@@ -324,30 +324,94 @@ fn test_graph_dataset_construct_and_describe_preserve_rdf_terms() {
     }));
 }
 
+/// A numeric log field, which the record stores as its rendered text.
+fn number(field: &serde_json::Value) -> u64 {
+    field
+        .as_u64()
+        .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or_else(|| panic!("a numeric field: {field}"))
+}
+
+/// One in-memory count as the log record carries it.
+fn count_of(count: usize) -> u64 {
+    u64::try_from(count).expect("a count fits u64")
+}
+
+/// The answer-bound records one evaluation writes, as `(bound, limit, held)`.
+fn answer_cuts(drain: &mut rift_tracing::LogDrain) -> Vec<(String, u64, u64)> {
+    drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| {
+            record
+                .message()
+                .starts_with("a SPARQL answer reached its bound")
+        })
+        .map(|record| {
+            assert_eq!(record.level(), "warn", "{record:?}");
+            let fields: serde_json::Value =
+                serde_json::from_str(record.fields()).expect("record fields");
+            (
+                fields["bound"].as_str().expect("bound").to_owned(),
+                number(&fields["limit"]),
+                number(&fields["held"]),
+            )
+        })
+        .collect()
+}
+
+/// D37 (#713): a graph answer past its triple or byte bound ends at the bound with the
+/// triples before it, and the log records the cut once; below and at the bound nothing is
+/// cut.
 #[test]
-fn test_graph_dataset_refuses_graph_past_answer_bounds() {
-    let narrow = GraphLimits::builder()
-        .solutions_max(1)
-        .build()
-        .expect("nonzero");
-    let dataset = model(narrow).expect("model builds");
-    let error = answer(
-        &dataset,
-        "CONSTRUCT { ?s a r:Symbol } WHERE { ?s a :Symbol }",
-    )
-    .expect_err("three symbols exceed one triple");
-    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
-    assert!(error.to_string().contains("triples"), "{error}");
+fn test_graph_dataset_ends_graph_at_answer_bounds() {
+    let construct = "CONSTRUCT { ?s a r:Symbol } WHERE { ?s a :Symbol }";
+    for (solutions_max, held, cut) in [(4_usize, 3_usize, false), (3, 3, false), (1, 1, true)] {
+        let narrow = GraphLimits::builder()
+            .solutions_max(solutions_max)
+            .build()
+            .expect("nonzero");
+        let dataset = model(narrow).expect("model builds");
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("warn")
+            .install()
+            .expect("recorder");
+        let GraphAnswer::Graph(graph) = answer(&dataset, construct).expect("the graph answers")
+        else {
+            panic!("a CONSTRUCT answers a graph");
+        };
+        assert_eq!(graph.len(), held, "solutions_max={solutions_max}");
+        let expected: Vec<(String, u64, u64)> = cut
+            .then(|| {
+                (
+                    "triples".to_owned(),
+                    count_of(solutions_max),
+                    count_of(held),
+                )
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(answer_cuts(&mut drain), expected);
+    }
 
     let narrow = GraphLimits::builder()
         .answer_bytes_max(16)
         .build()
         .expect("nonzero");
     let dataset = model(narrow).expect("model builds");
-    let error =
-        answer(&dataset, &format!("DESCRIBE <{MAIN}>")).expect_err("terms exceed sixteen bytes");
-    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
-    assert!(error.to_string().contains("answer bytes"), "{error}");
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .capture("warn")
+        .install()
+        .expect("recorder");
+    let GraphAnswer::Graph(graph) =
+        answer(&dataset, &format!("DESCRIBE <{MAIN}>")).expect("the graph answers")
+    else {
+        panic!("a DESCRIBE answers a graph");
+    };
+    let cuts = answer_cuts(&mut drain);
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
+    assert_eq!(cuts[0].0, "answer bytes");
+    assert_eq!(cuts[0].2, count_of(graph.len()));
 }
 
 #[test]
@@ -449,19 +513,40 @@ fn test_graph_dataset_refuses_identity_outside_its_form() {
     assert_eq!(revision(TREE).as_str(), TREE);
 }
 
+/// D37 (#713): a `SELECT` past its solution or byte bound answers the solutions before the
+/// bound, so the caller pages them, and the log records the cut once.
 #[test]
-fn test_graph_dataset_evaluate_refuses_answer_past_solution_and_byte_bounds() {
-    let narrow = GraphLimits::builder()
-        .solutions_max(2)
-        .build()
-        .expect("nonzero");
-    let dataset = model(narrow).expect("model builds");
+fn test_graph_dataset_evaluate_ends_answer_at_solution_and_byte_bounds() {
     let three = "SELECT ?s { ?s a :Symbol }";
-    let error = answer(&dataset, three).expect_err("three symbols pass two solutions");
-    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
-    assert!(error.to_string().contains("solutions"), "{error}");
-    let limited = "SELECT ?s { ?s a :Symbol } LIMIT 2";
-    assert_eq!(rows(&dataset, limited).len(), 2, "two solutions fit");
+    for (solutions_max, held, cut) in [(4_usize, 3_usize, false), (3, 3, false), (2, 2, true)] {
+        let narrow = GraphLimits::builder()
+            .solutions_max(solutions_max)
+            .build()
+            .expect("nonzero");
+        let dataset = model(narrow).expect("model builds");
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("warn")
+            .install()
+            .expect("recorder");
+        assert_eq!(
+            rows(&dataset, three).len(),
+            held,
+            "solutions_max={solutions_max}"
+        );
+        let expected: Vec<(String, u64, u64)> = cut
+            .then(|| {
+                (
+                    "solutions".to_owned(),
+                    count_of(solutions_max),
+                    count_of(held),
+                )
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(answer_cuts(&mut drain), expected);
+        let limited = "SELECT ?s { ?s a :Symbol } LIMIT 2";
+        assert_eq!(rows(&dataset, limited).len(), 2, "two solutions fit");
+    }
 
     let narrow = GraphDataset::builder(
         GraphLimits::builder()
@@ -470,9 +555,18 @@ fn test_graph_dataset_evaluate_refuses_answer_past_solution_and_byte_bounds() {
             .expect("nonzero"),
     )
     .build();
-    let error = answer(&narrow, "SELECT ?x { BIND(\"0123456789abcdef\" AS ?x) }")
-        .expect_err("bytes pass sixteen");
-    assert!(error.to_string().contains("answer bytes"), "{error}");
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .capture("warn")
+        .install()
+        .expect("recorder");
+    assert!(
+        rows(&narrow, "SELECT ?x { BIND(\"0123456789abcdef\" AS ?x) }").is_empty(),
+        "the one solution passes sixteen bytes, so the answer holds none"
+    );
+    assert_eq!(
+        answer_cuts(&mut drain),
+        [("answer bytes".to_owned(), 16, 0)]
+    );
 }
 
 #[test]
@@ -779,4 +873,134 @@ fn normalized_query_text_preserves_literals_and_normalizes_syntax() -> Result<()
     let changed = GraphQuery::parse("SELECT ?v { VALUES ?v { 'a b' } }", &limits)?;
     assert_ne!(first.normalized_text(), changed.normalized_text());
     Ok(())
+}
+
+#[test]
+fn semantic_inventory_requests_engine_types_and_heritage() {
+    let limits = GraphLimits::default();
+    for (predicate, selected) in [
+        ("hasType", "types"),
+        ("extends", "extends"),
+        ("implements", "implements"),
+    ] {
+        for query in [
+            format!("SELECT ?s ?t {{ ?s :{predicate} ?t }}"),
+            format!("SELECT ?s ?t {{ ?s :{predicate}+ ?t }}"),
+        ] {
+            let parsed = GraphQuery::parse(&query, &limits).expect("query");
+            let required = parsed.semantic_inventory().expect("inventory");
+            let enabled = match selected {
+                "types" => required.adjacency.type_uses,
+                "extends" => required.adjacency.heritage.extends,
+                _ => required.adjacency.heritage.implements,
+            };
+            assert!(enabled, "{query}: {required:?}");
+        }
+    }
+}
+
+#[test]
+fn history_queries_select_their_symbols_and_revision_facts() {
+    let limits = GraphLimits::default();
+    let id = "rift://symbol/local/rust/app/beacon";
+    for predicate in ["introducedIn", "changedIn", "removedIn"] {
+        let text =
+            format!("SELECT ?revision {{ <{id}> :{predicate} ?revision . ?revision a :Revision }}");
+        let query = GraphQuery::parse(&text, &limits).expect("history query parses");
+        assert_eq!(
+            query.history_selection(),
+            Some(SymbolSelection::Identified(id))
+        );
+        let text =
+            format!("SELECT ?revision {{ ?symbol :{predicate} ?revision . ?revision a :Commit }}");
+        let query = GraphQuery::parse(&text, &limits).expect("history inventory parses");
+        assert_eq!(query.history_selection(), Some(SymbolSelection::All));
+    }
+    let query = GraphQuery::parse(
+        "SELECT ?symbol { ?symbol a :Symbol; :name 'beacon'; :kind 'function'; :language 'rust'; :introducedIn ?revision }",
+        &limits,
+    )
+    .expect("named history parses");
+    assert_eq!(
+        query.history_selection(),
+        Some(SymbolSelection::Named("beacon"))
+    );
+    let query = GraphQuery::parse(
+        "ASK { ?symbol :name 'beacon' FILTER NOT EXISTS { ?symbol :removedIn ?revision } }",
+        &limits,
+    )
+    .expect("history absence parses");
+    assert_eq!(query.history_selection(), Some(SymbolSelection::All));
+    let query = GraphQuery::parse(
+        "SELECT ?symbol { ?symbol :introducedIn ?revision; :calls ?callee }",
+        &limits,
+    )
+    .expect("mixed facts parse");
+    assert_eq!(query.history_selection(), None);
+}
+
+#[test]
+fn history_projection_preserves_commit_and_release_events() {
+    use rift_protocol::read::{
+        CommitAuthor, HistoryChange, HistoryCommit, HistoryEdge, ProjectPath, SymbolHistory,
+    };
+    use rift_protocol::revision::Revision;
+
+    let commit = HistoryCommit {
+        revision: Revision::parse(COMMIT).expect("commit revision"),
+        path: ProjectPath("lib.rs".to_owned()),
+        timestamp: "2026-01-01T00:00:00Z".to_owned(),
+        summary: None,
+        author: CommitAuthor {
+            name: "Fixture".to_owned(),
+            email: "fixture@example.com".to_owned(),
+        },
+    };
+    let release = Revision::parse(RELEASE).expect("release revision");
+    let history = SymbolHistory {
+        symbol: symbol(MAIN),
+        edges: vec![
+            HistoryEdge::IntroducedIn {
+                commit: commit.clone(),
+            },
+            HistoryEdge::ChangedIn {
+                commit: commit.clone(),
+                change: HistoryChange::BodyChanged,
+            },
+            HistoryEdge::RemovedIn { commit },
+        ],
+        complete: true,
+        co_changes_truncated: None,
+    };
+    let released = SymbolHistory {
+        symbol: symbol("rift://symbol/cargo/crates.io/demo/rust/demo/main"),
+        edges: vec![
+            HistoryEdge::IntroducedInRelease {
+                revision: release.clone(),
+            },
+            HistoryEdge::ChangedInRelease {
+                revision: release.clone(),
+                change: HistoryChange::BodyChanged,
+            },
+            HistoryEdge::RemovedInRelease { revision: release },
+        ],
+        complete: true,
+        co_changes_truncated: None,
+    };
+    let mut dataset = GraphDataset::builder(GraphLimits::default());
+    dataset.insert_history(&history).expect("history projects");
+    dataset
+        .insert_history(&released)
+        .expect("release history projects");
+    let dataset = dataset.build();
+    for predicate in ["introducedIn", "changedIn", "removedIn"] {
+        let text = format!(
+            "SELECT ?revision {{ ?symbol :{predicate} ?revision . ?revision a :Revision }}"
+        );
+        assert_eq!(rows(&dataset, &text), vec![vec![RELEASE], vec![COMMIT]]);
+    }
+    assert_eq!(
+        rows(&dataset, "SELECT ?revision { ?revision a :Commit }"),
+        vec![vec![COMMIT]]
+    );
 }

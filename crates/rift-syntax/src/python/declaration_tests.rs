@@ -49,6 +49,114 @@ fn spelled(text: &str, range: crate::ByteRange) -> &str {
     &text[start..end]
 }
 
+#[test]
+fn test_overloads_keep_source_evidence_beside_unrelated_local_imports() {
+    let text = "from typing import overload\n@overload\ndef leaf(value: int) -> int: ...\ndef leaf(value): return value\ndef unrelated():\n    import os\n";
+    let document = analyze(text);
+    let functions = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.qualified_name == "leaf")
+        .collect::<Vec<_>>();
+    assert_eq!(functions.len(), 2);
+    let Some(crate::PythonOverload::Overload {
+        decorator, module, ..
+    }) = functions[0].python_overload
+    else {
+        panic!("validated overload: {:?}", functions[0]);
+    };
+    assert_eq!(spelled(text, decorator), "overload");
+    assert_eq!(spelled(text, module), "typing");
+    assert_eq!(
+        spelled(text, functions[0].name_range.expect("name")),
+        "leaf"
+    );
+    assert_eq!(
+        spelled(text, functions[1].item_range),
+        "def leaf(value): return value"
+    );
+    assert_ne!(functions[0].name_range, functions[1].name_range);
+}
+
+#[test]
+fn test_property_returns_keep_annotation_and_member_source() {
+    let text = "class Item: pass\nclass Owner:\n    @property\n    def item(self) -> Item: pass\n    def use(self): return self.item.read()\n";
+    let document = analyze(text);
+    let getter = symbol(&document, "Owner.item");
+    assert_eq!(getter.container.as_deref(), Some("Owner"));
+    assert!(getter.kinds.contains(&SymbolKind::Property));
+    let facts = document.facts().static_facts().expect("static facts");
+    let binding = facts
+        .bindings()
+        .iter()
+        .find(|binding| Some(binding.name) == getter.name_range)
+        .expect("getter evidence");
+    let crate::StaticBindingKind::PythonFunction {
+        annotation,
+        decorator,
+    } = binding.kind
+    else {
+        panic!("return annotation: {binding:?}");
+    };
+    assert_eq!(spelled(text, annotation), "Item");
+    assert_eq!(
+        spelled(text, decorator.expect("property decorator")),
+        "property"
+    );
+    assert!(
+        facts
+            .calls()
+            .iter()
+            .any(|call| spelled(text, call.callee_range) == "self.item.read")
+    );
+}
+
+#[test]
+fn test_wildcard_import_keeps_module_evidence_and_unknown_bindings() {
+    let text = "from .models import *\n";
+    let document = analyze(text);
+    let facts = document.facts().static_facts().expect("static facts");
+    let import = facts
+        .bindings()
+        .iter()
+        .find(|binding| spelled(text, binding.name) == "*")
+        .expect("wildcard import evidence");
+    let crate::StaticBindingKind::PythonImport { module, export } = import.kind else {
+        panic!("module import: {import:?}");
+    };
+    assert_eq!(spelled(text, module), ".models");
+    assert!(export.is_none());
+    assert_eq!(facts.unsupported_bindings(), [import.scope]);
+    assert_eq!(spelled(text, import.scope), text);
+    assert_eq!(declared(&document), []);
+}
+
+#[test]
+fn test_annotated_locals_keep_the_enclosing_callable_and_source_range() {
+    let text = "def build():\n    visited: list[str] = []\n    if True:\n        pending: int\n    def nested():\n        result: str = ''\n";
+    let document = analyze(text);
+    for (name, container, source) in [
+        ("build.visited", "build", "visited: list[str] = []"),
+        ("build.pending", "build", "pending: int"),
+        ("build.nested.result", "build.nested", "result: str = ''"),
+    ] {
+        let declaration = symbol(&document, name);
+        assert_eq!(declaration.container.as_deref(), Some(container));
+        assert_eq!(spelled(text, declaration.range), source);
+        assert_eq!(declaration.kinds, [SymbolKind::Value]);
+    }
+}
+
+#[test]
+fn test_empty_python_module_keeps_a_source_facet() {
+    let document = analyze("");
+    let module = symbol(&document, ".");
+    assert_eq!(module.kind, "module");
+    assert_eq!(module.range, crate::ByteRange { start: 0, end: 0 });
+    assert_eq!(module.item_range, module.range);
+    assert!(module.name_range.is_none());
+}
+
 /// A `def` directly in a class body declares a `method` member of the
 /// class; `__init__` constructs it, `staticmethod` and `classmethod` belong
 /// to the class, and `property` reads like a field. A class owns members,
@@ -170,6 +278,7 @@ fn test_module_level_conditional_suites_declare_module_variables() {
             ("json", None, "variable"),
             ("DONE", None, "variable"),
             ("run", None, "function"),
+            ("run.local", Some("run"), "variable"),
             ("Config", None, "class"),
             ("Config.DEBUG", Some("Config"), "variable"),
         ]
@@ -342,7 +451,7 @@ fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
         "Module docstring."
     );
     assert_eq!(symbol(&document, "module").kind, "variable");
-    assert!(analyze("").symbols().is_empty());
+    assert_eq!(symbol(&analyze(""), ".").kind, "module");
     for text in ["# Comment.\n", "f\"{value}\"\n", "b\"bytes\"\n"] {
         let document = analyze(text);
         let module = document
@@ -352,4 +461,80 @@ fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
             .expect("a module without documentation still declares");
         assert!(module.documentation.is_empty());
     }
+}
+
+#[test]
+fn test_python_member_accesses_keep_assignment_roles() {
+    use rift_core::ReferenceRole;
+    let text = "class Task:\n    def run(self):\n        self.first, self.second = (1, 2)\n        self.first += 1\n        self.declared: int\n        self.child.value = 2\n";
+    let document = analyze(text);
+    let accesses = document
+        .facts()
+        .static_facts()
+        .expect("captured facts")
+        .references()
+        .iter()
+        .filter(|reference| reference.role != ReferenceRole::Type)
+        .map(|reference| (spelled(text, reference.target), reference.role))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accesses,
+        [
+            ("self.first", ReferenceRole::Write),
+            ("self.second", ReferenceRole::Write),
+            ("self.first", ReferenceRole::Read),
+            ("self.first", ReferenceRole::Write),
+            ("self.child.value", ReferenceRole::Write),
+            ("self.child", ReferenceRole::Read),
+        ]
+    );
+}
+
+#[test]
+fn test_python_rebindings_keep_the_declared_variable_scope() {
+    let text = "shared = 0\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n    def publish():\n        global shared\n        shared = 1\n";
+    let document = analyze(text);
+    for (name, qualified, container) in [
+        ("active", "root.active", Some("root")),
+        ("shared", "shared", None),
+    ] {
+        let declarations = document
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 2);
+        for (ordinal, symbol) in declarations.into_iter().enumerate() {
+            assert_eq!(symbol.qualified_name, qualified);
+            assert_eq!(symbol.container.as_deref(), container);
+            assert_eq!(symbol.declaration_ordinal, ordinal);
+        }
+    }
+}
+
+#[test]
+fn test_python_rebindings_keep_class_members_and_skip_class_scopes() {
+    let source = "shared = 0\nclass Holder:\n    global shared\n    shared = 1\n    def run(self):\n        self.shared = 2\ndef root():\n    value = 0\n    class Inner:\n        value = 1\n        def run(self):\n            nonlocal value\n            value = 2\n";
+    let document = analyze(source);
+    let values = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "value")
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["root.value", "root.Inner.value", "root.value"]);
+    let shared = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "shared")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["shared", "shared", "Holder.shared"]
+    );
+    assert!(!shared[1].kinds.contains(&SymbolKind::Member));
+    assert!(shared[2].kinds.contains(&SymbolKind::Member));
 }

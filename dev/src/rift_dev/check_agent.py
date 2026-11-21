@@ -52,6 +52,7 @@ build-backend='setuptools.build_meta'
 [tool.setuptools]
 py-modules=['service']
 """
+STANDARD_INT = "rift://symbol/stdlib/cpython/python/builtins/int"
 PYTHON_CONFIGURATION = """
 [languages.python.lsp]
 embedded = "ty"
@@ -84,15 +85,33 @@ async def check_embedded_references(client: Client, root: Path) -> None:
     require(original == PYTHON_SOURCE.encode(), "reference read changed source bytes")
 
 
-async def check_mixed_references_unavailable(client: Client) -> None:
-    """Require complete edge acquisition to refuse an unserved language."""
+async def check_mixed_references(client: Client) -> None:
+    """Require a complete mixed edge answer to carry the edges of every language.
+
+    The Python annotations also name the standard-library `int` the static pass and the
+    engine both establish.
+    """
+    expected = {
+        (
+            symbol_id(await symbol_hit(client, caller, language)),
+            symbol_id(await symbol_hit(client, target, language)),
+        )
+        for caller, target, language in (
+            ("caller", "serve", "python"),
+            ("beacon_two", "beacon_one", "rust"),
+        )
+    } | {
+        (symbol_id(await symbol_hit(client, caller, "python")), STANDARD_INT)
+        for caller in ("caller", "serve")
+    }
     answer = await client.call(
         "search", {"query": "SELECT ?caller ?target { ?caller :references ?target }"}
     )
+    require("warnings" not in answer, f"mixed edge answer is partial: {answer}")
+    observed = {(iri(row, "caller"), iri(row, "target")) for row in bindings(answer)}
     require(
-        answer.get("outcome") == "unavailable"
-        and answer.get("reason") == "insufficient_coverage",
-        f"unserved Rust edges returned a complete answer: {answer}",
+        observed == expected,
+        f"complete mixed edge answer differs from the Python and Rust edges: {answer}",
     )
 
 
@@ -260,7 +279,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     await check_reads(client)
                     await check_resources(client)
                     await check_external_change(client, root)
-                    await check_mixed_references_unavailable(client)
+                    await check_mixed_references(client)
                     await declaration_facet(client, "beacon_one")
                     client.require_complete(READ_TOOLS)
                 server.stop()

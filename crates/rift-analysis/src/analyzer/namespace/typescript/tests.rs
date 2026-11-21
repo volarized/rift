@@ -182,6 +182,9 @@ fn one(metadata: &str, path: &str, source: &str) -> BTreeMap<String, SymbolId> {
     )
     .remove(path)
     .unwrap_or_default()
+    .into_iter()
+    .filter(|(name, _)| name != ".")
+    .collect()
 }
 
 #[test]
@@ -711,15 +714,21 @@ fn conflicting_export_subpaths_refuse_one_physical_module_assignment() {
 }
 
 #[test]
-fn raw_anonymous_export_bindings_need_module_export_context_before_identity() {
+fn raw_anonymous_export_bindings_keep_checked_physical_identities() {
     let metadata = [(
         "package.json",
         r#"{"name":"prettier","version":"3.8.5","main":"./index.js"}"#,
     )];
-    for source in [
-        "exports.open = function () {}; function kept() {}",
-        "function outer(exports) { exports.open = function () {}; } function kept() {}",
-        "(function (exports) { exports.open = function () {}; })(other); function kept() {}",
+    for (source, established) in [
+        ("exports.open = function () {}; function kept() {}", true),
+        (
+            "function outer(exports) { exports.open = function () {}; } function kept() {}",
+            false,
+        ),
+        (
+            "(function (exports) { exports.open = function () {}; })(other); function kept() {}",
+            false,
+        ),
     ] {
         let prepared = prepared(
             ShippedLanguage::JavaScript,
@@ -728,7 +737,13 @@ fn raw_anonymous_export_bindings_need_module_export_context_before_identity() {
         );
         let anchors = prepared.anchors.get("index.js").expect("captured module");
         assert!(anchors.contains_key("kept"));
-        assert!(!anchors.contains_key("open"));
+        assert_eq!(anchors.contains_key("open"), established);
+        assert!(
+            !prepared
+                .public_names
+                .get("index.js")
+                .is_some_and(|names| names.contains("open"))
+        );
     }
 }
 
@@ -1193,39 +1208,47 @@ fn commonjs_receiver_shadow_reassignment_qualified_and_ordinary_functions_remain
 }
 
 #[test]
-fn commonjs_original_entry_conditions_owner_and_esm_context_are_required() {
+fn commonjs_public_exports_require_entry_conditions_owner_and_mode() {
     let source = "exports.open=function(){};";
-    for (metadata, conditions) in [
+    for (metadata, conditions, physical) in [
         (
             r#"{"name":"wrong","version":"19.3.0","main":"index.js"}"#,
             &["node", "require"][..],
+            false,
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"other.js"}"#,
             &["node", "require"][..],
+            false,
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"index.js","type":"module"}"#,
             &["node", "require"][..],
+            true,
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
             &[][..],
+            true,
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
             &["import"][..],
+            true,
         ),
     ] {
         let (prepared, _) =
             commonjs_prepared(metadata, &[("index.js", source)], "index.js", conditions);
-        assert!(
-            !prepared
+        assert_eq!(
+            prepared
                 .anchors
                 .get("index.js")
-                .is_some_and(|anchors| anchors.contains_key("open"))
+                .is_some_and(|anchors| anchors.contains_key("open")),
+            physical
         );
         assert!(prepared.public_names.is_empty());
+        assert!(prepared.exports.is_empty());
+        assert!(prepared.unresolved_exports);
     }
 }
 

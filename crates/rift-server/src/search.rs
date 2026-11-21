@@ -24,6 +24,7 @@ pub use pattern::{PatternBounds, accepted_pattern};
 use rift_error::errors;
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rift_core::ProjectPath;
@@ -269,7 +270,7 @@ impl ReadService {
                 .fail();
         }
         self.accept_revision(params.revision.as_ref())?;
-        let ((results, pagination), warnings) = self.ordered_search_hits(
+        let ((mut results, pagination), warnings) = self.ordered_search_hits(
             params,
             store,
             references,
@@ -279,6 +280,15 @@ impl ReadService {
                 Ok(((results, pagination), warnings))
             },
         )?;
+        if !params.include.providers {
+            for hop in results
+                .iter_mut()
+                .filter_map(|hit| hit.traversal_path.as_mut())
+                .flatten()
+            {
+                hop.edge.providers.clear();
+            }
+        }
         Ok(SearchResult {
             view: None,
             revision: Some(self.served_revision()?),
@@ -1224,6 +1234,11 @@ fn resolve_ranked_hits(
     results: &mut Vec<SearchHit>,
 ) -> Result<(), RiftError> {
     let mut answered: Vec<ProjectPath> = Vec::new();
+    let mut symbols: BTreeMap<SymbolId, usize> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(position, hit)| Some((hit_symbol_id(hit)?.clone(), position)))
+        .collect();
     for candidate in ranked.candidates() {
         if let Some(hit) = documentation.and_then(|documentation| documentation.hit(candidate)) {
             results.push(hit);
@@ -1242,9 +1257,37 @@ fn resolve_ranked_hits(
             }
             answered.push(path.clone());
         }
-        results.push(resolved.into_hit(criteria, candidate)?);
+        append_ranked_hit(
+            results,
+            &mut symbols,
+            resolved.into_hit(criteria, candidate)?,
+        );
     }
     Ok(())
+}
+
+/// Keeps the best-ranked facet and combines fields that matched the same symbol.
+fn append_ranked_hit(
+    results: &mut Vec<SearchHit>,
+    symbols: &mut BTreeMap<SymbolId, usize>,
+    hit: SearchHit,
+) {
+    if let Some(identity) = hit_symbol_id(&hit) {
+        if let Some(position) = symbols.get(identity) {
+            merge_matched_fields(&mut results[*position], hit.matched_by);
+            return;
+        }
+        symbols.insert(identity.clone(), results.len());
+    }
+    results.push(hit);
+}
+
+fn merge_matched_fields(hit: &mut SearchHit, fields: Vec<MatchedField>) {
+    for field in fields {
+        if !hit.matched_by.contains(&field) {
+            hit.matched_by.push(field);
+        }
+    }
 }
 
 /// The indexes one resolution may read.
@@ -1298,9 +1341,8 @@ impl ResolvedCandidate<'_> {
         }
     }
 
-    /// The path this candidate answers whole, for a candidate that answers a file
-    /// rather than a declaration. A declaration has its own identity, so two of them
-    /// never collapse.
+    /// The path this candidate answers whole when it names a file.
+    /// A declaration's canonical symbol identity controls symbol merging.
     const fn answered_path(&self) -> Option<&ProjectPath> {
         match self {
             Self::SourceFile(file) => Some(file.path()),
@@ -3966,7 +4008,9 @@ impl Tower {
     }
 
     /// A committed file the syntax provider refuses under its depth bound is absent from
-    /// the revision index, so a revision search still answers from the file beside it.
+    /// the revision index, so a revision search still answers from the file beside it. A
+    /// bound left the file out, so the answer carries nothing for it (D37) and the revision
+    /// index keeps the omission.
     #[test]
     fn search_at_a_revision_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() -> TestResult
     {
@@ -4007,7 +4051,14 @@ impl Tower {
                     && warning["unit"] == "rift://source/project/deep.rs"
             })
         });
-        assert!(names_deep, "{value:#}");
+        assert!(!names_deep, "{value:#}");
+        let deep_path = rift_core::ProjectPath::new("deep.rs")?;
+        assert!(
+            service
+                .file_warning(&deep_path)
+                .is_some_and(rift_index::WorkspaceIndexWarning::is_left_out_by_bound),
+            "the revision index keeps the omission"
+        );
         let refused: SearchParams = serde_json::from_value(
             json!({"query": "deep_probe", "revision": "rift://revision/git/HEAD"}),
         )?;
@@ -4589,8 +4640,8 @@ impl Tower {
         Ok(())
     }
 
-    /// Every ranked identity reaches the answer directly or through its documentation block,
-    /// carrying the score derived from its place in the fused order.
+    /// Every ranked identity reaches its logical symbol, declaration, file or documentation block.
+    /// The answer carries the score derived from its place in the fused order.
     #[tokio::test]
     async fn search_answers_every_identity_the_store_ranked() -> TestResult {
         let (directory, service) = fixture()?;
@@ -4607,6 +4658,16 @@ impl Tower {
                     .symbols_by_provider_identity(entry.identity().as_str(), 1)?
                     .into_iter()
                     .next();
+                let canonical = declaration
+                    .map(|matched| crate::read::symbol_id(service.index(), matched))
+                    .transpose()?
+                    .flatten();
+                let logical_hit = canonical.as_ref().is_some_and(|identity| {
+                    answer
+                        .results
+                        .iter()
+                        .any(|hit| super::hit_symbol_id(hit) == Some(identity))
+                });
                 let physical_hit = declaration.is_some_and(|matched| {
                     answer.results.iter().any(|hit| {
                         matches!(hit.hit, SearchHitTarget::Symbol { .. })
@@ -4621,7 +4682,8 @@ impl Tower {
                     })
                 });
                 assert!(
-                    physical_hit
+                    logical_hit
+                        || physical_hit
                         || identities
                             .iter()
                             .any(|held| held == entry.identity().as_str())

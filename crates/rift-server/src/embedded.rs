@@ -8,7 +8,8 @@
 //! references and diagnostics need no embedded-specific path.
 //!
 //! The served surface is the subset the server itself asks engines for:
-//! `initialize`, document open and close, `textDocument/references`, call
+//! `initialize`, document open and close, references, definitions, inferred types,
+//! implementations, type hierarchy, call
 //! hierarchy (`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`,
 //! and `callHierarchy/outgoingCalls`), and the `textDocument/diagnostic` pull.
 //! Ranges cross the wire in UTF-8 positions, the encoding the answer
@@ -21,6 +22,7 @@
 //! the time an exchange runs. The Python environment comes from the tree alone:
 //! the one its ty configuration names, else its `.venv`, else none.
 
+mod edges;
 mod hermetic;
 
 use std::collections::HashMap;
@@ -232,6 +234,44 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
         ("initialize", Some(id)) => Handled::Reply(reply(&id, &initialize_result())),
         ("shutdown", Some(id)) => Handled::Reply(reply(&id, &Value::Null)),
 
+        ("textDocument/definition", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::definitions,
+        ),
+        ("textDocument/typeDefinition", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::type_definitions,
+        ),
+        ("textDocument/implementation", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::implementations,
+        ),
+        ("textDocument/prepareTypeHierarchy", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::prepare_types,
+        ),
+        ("typeHierarchy/supertypes", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, edges::supertypes)
+        }
+        ("typeHierarchy/subtypes", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, edges::subtypes)
+        }
         ("textDocument/references", Some(id)) => {
             answered(&id, root, documents, &params, DOCUMENT_URI, references)
         }
@@ -314,14 +354,18 @@ fn error_reply(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// The capabilities this engine advertises: UTF-8 positions, references,
-/// call hierarchy, and the diagnostic pull. No file-operation capability is
+/// The capabilities this engine advertises: UTF-8 positions, references, definitions,
+/// inferred types, implementations, type hierarchy, call hierarchy, and the diagnostic pull. No file-operation capability is
 /// declared, so moves warn instead of asking.
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
             "positionEncoding": "utf-8",
             "referencesProvider": true,
+            "typeDefinitionProvider": true,
+            "definitionProvider": true,
+            "implementationProvider": true,
+            "typeHierarchyProvider": true,
             "callHierarchyProvider": true,
             "diagnosticProvider": {
                 "interFileDependencies": true,
@@ -672,7 +716,7 @@ fn references(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
     )?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
     let text = exchange.conversion_text(text.as_str());
@@ -697,28 +741,38 @@ fn references(
     Ok(Value::Array(locations))
 }
 
-/// One reference target as a `file://` URI and UTF-8 range; `None` for a
-/// target outside the filesystem, such as a vendored stub. The canonical
-/// workspace prefix swaps back to the root spelling the session addressed,
-/// so an answer echoes the caller's own paths, symlinked temp roots
-/// included.
+/// Keeps semantic reads from resetting ty's open-file inputs for an already open file.
+fn open_file(database: &mut ProjectDatabase, file: File) {
+    if !database.is_open_file(file) {
+        database.project().open_file(database, file);
+    }
+}
+
+/// One reference target as a filesystem or vendored URI and UTF-8 range.
+/// The canonical workspace prefix swaps back to the root spelling the session
+/// addressed, so an answer echoes the caller's own paths, symlinked temp roots
+/// included. Other files establish no address.
 fn target_location(
     database: &ProjectDatabase,
     exchange: &Exchange<'_>,
     file: File,
     range: TextRange,
 ) -> Result<Option<(String, Value)>, AnswerRefusal> {
-    let Some(system_path) = file.path(database).as_system_path() else {
+    let path = file.path(database);
+    let uri = if let Some(vendored) = path.as_vendored_path() {
+        vendored_uri(vendored)
+    } else if let Some(system_path) = path.as_system_path() {
+        let spelled = system_path
+            .as_std_path()
+            .strip_prefix(exchange.canonical_root)
+            .map_or_else(
+                |_| system_path.as_std_path().to_path_buf(),
+                |relative| exchange.spelled_root.join(relative),
+            );
+        path_to_uri(&spelled)?
+    } else {
         return Ok(None);
     };
-    let spelled = system_path
-        .as_std_path()
-        .strip_prefix(exchange.canonical_root)
-        .map_or_else(
-            |_| system_path.as_std_path().to_path_buf(),
-            |relative| exchange.spelled_root.join(relative),
-        );
-    let uri = path_to_uri(&spelled)?;
     let text = source_text(database, file);
     let range = range_at(text.as_str(), range)?;
     Ok(Some((uri, range)))
@@ -735,7 +789,7 @@ fn prepared_call_hierarchy(
         database,
         params.pointer(DOCUMENT_URI).unwrap_or(&Value::Null),
     )?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
     let text = exchange.conversion_text(text.as_str());
@@ -763,7 +817,7 @@ fn call_hierarchy_anchor(
     params: &Value,
 ) -> Result<(File, TextSize), AnswerRefusal> {
     let file = file_at(database, params.pointer(ITEM_URI).unwrap_or(&Value::Null))?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let text = source_text(database, file);
     let offset = offset_at(
         exchange.conversion_text(text.as_str()),
@@ -894,7 +948,7 @@ fn pulled_diagnostics(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
     )?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let text = source_text(database, file);
     let text = exchange.conversion_text(text.as_str());
     let mut items = Vec::new();
@@ -1864,6 +1918,39 @@ mod tests {
             handle_message(&open, directory.path(), &empty_documents()),
             Handled::Silent
         ));
+    }
+
+    #[test]
+    fn repeated_references_keep_the_file_open_without_resetting_the_project() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("service.py");
+        std::fs::write(&path, "def serve():\n    pass\n\nserve()\n").expect("source");
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "textDocument/references",
+            "params": {"textDocument": {"uri": uri_of(&path)},
+                "position": {"line": 0, "character": 4},
+                "context": {"includeDeclaration": false}},
+        });
+        let documents = empty_documents();
+        let first = handle_message(&request, directory.path(), &documents);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("ty_project=debug")
+            .install()
+            .expect("recorder");
+        let second = handle_message(&request, directory.path(), &documents);
+        drop(recorder);
+        let (Handled::Reply(first), Handled::Reply(second)) = (first, second) else {
+            panic!("references must reply");
+        };
+        assert_eq!(first["result"].as_array().map(Vec::len), Some(1));
+        assert_eq!(first["result"], second["result"]);
+        let records = drain.queued_records();
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.message().starts_with("Opening file")),
+            "an already open file must not reset the project's open files: {records:?}"
+        );
     }
 
     #[test]

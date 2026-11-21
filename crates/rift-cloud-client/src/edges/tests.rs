@@ -63,7 +63,7 @@ async fn missing_edge_coverage_keeps_its_typed_reason() {
 }
 
 fn page(start: u64, complete: bool, _next: Option<&str>) -> Value {
-    json!({"groups":[{"seed":SEED,"complete":complete,"edges":[{"id":format!("{start:064x}"),"edge":{"from":SEED,"to":TARGET,"kind":"call","kinds":["calls"],"provider": "static", "derivation":"resolution","occurrence":{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","range":{"start":start,"end":start+1}}}}]}],
+    json!({"groups":[{"seed":SEED,"complete":complete,"edges":[{"id":format!("{start:064x}"),"edge":{"from":SEED,"to":TARGET,"kind":"call","kinds":["calls"],"derivation":"resolution","occurrence":{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","range":{"start":start,"end":start+1}}}}]}],
         "symbols":[symbol(SEED,"entry"),symbol(TARGET,"helper")],
         "sources":[{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","digest":full_digest("...")}],
         "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1","view":{"id":"a".repeat(64),"expires_at":"2099-01-01T00:00:00Z"}})
@@ -387,4 +387,71 @@ fn located_projection(identity: u64, edge: Option<u64>, start: u64) -> Value {
     json!({"id":format!("{identity:064x}"), "edge":edge.map(|id|format!("{id:064x}")),
         "occurrence":{"target":TARGET,"enclosing":SEED,
         "source":{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","range":{"start":start,"end":start+1}},"kind":"calls"}})
+}
+
+#[tokio::test]
+async fn merged_edge_providers_are_requested_and_default_edges_omit_them() {
+    for included in [false, true] {
+        let mut selected = page(0, true, None);
+        if included {
+            selected["groups"][0]["edges"][0]["edge"]["providers"] =
+                json!(["engine", "lsp", "static"]);
+        }
+        let (server, client) = operation_client(OperationFixture::Edges {
+            pages: vec![selected],
+            advertised: true,
+        })
+        .await;
+        let mut request = request();
+        request.include.providers = included;
+        let result = client
+            .edge_pages(&request, limits())
+            .await
+            .expect("merged edge page");
+        let EdgeSearchResult::Page(result) = result else {
+            panic!("raw page")
+        };
+        assert_eq!(result.groups[0].edges.len(), 1);
+        let edge = serde_json::to_value(&result.groups[0].edges[0].edge).expect("wire edge");
+        assert!(edge.get("provider").is_none());
+        assert_eq!(
+            edge.get("providers"),
+            included
+                .then(|| json!(["engine", "lsp", "static"]))
+                .as_ref()
+        );
+        let requests = server.state.request_log.lock().await;
+        let sent = requests
+            .iter()
+            .find(|request| request.path.ends_with("/search"))
+            .expect("search request");
+        let body: Value = serde_json::from_slice(&sent.body).expect("request body");
+        assert_eq!(
+            body.pointer("/include/providers"),
+            included.then_some(&Value::Bool(true))
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_edge_pages_refuse_unmerged_edges_and_singular_wire_provider() {
+    for singular in [false, true] {
+        let mut selected = page(0, true, None);
+        if singular {
+            selected["groups"][0]["edges"][0]["edge"]["provider"] = json!("static");
+        } else {
+            let mut duplicate = selected["groups"][0]["edges"][0].clone();
+            duplicate["id"] = json!("b".repeat(64));
+            selected["groups"][0]["edges"]
+                .as_array_mut()
+                .expect("edges")
+                .push(duplicate);
+        }
+        let (_server, client) = operation_client(OperationFixture::Edges {
+            pages: vec![selected],
+            advertised: true,
+        })
+        .await;
+        assert!(client.edge_pages(&request(), limits()).await.is_err());
+    }
 }

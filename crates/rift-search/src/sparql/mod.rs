@@ -63,7 +63,10 @@ pub use dataset::{
     RevisionIri, SymbolAddress, SymbolRelation, SyntaxAddress, SyntaxFact, SyntaxLocation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
-pub use inventory::{OccurrenceSelection, SemanticInventory};
+pub use inventory::{
+    OccurrenceSelection, SemanticAdjacency, SemanticEdges, SemanticHeritage, SemanticInventory,
+    TypeSelection,
+};
 pub use limits::{
     ALGEBRA_DEPTH_MAX, ANSWER_BYTES_MAX, BRACKETS_MAX, COMPUTED_BYTES_MAX, EVALUATION_TIMEOUT,
     EXPRESSION_BYTES_MAX, GraphLimits, GraphLimitsBuilder, LITERAL_BYTES_MAX, OPERATORS_MAX,
@@ -79,3 +82,6 @@ pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,
     VocabularyResource, VocabularyValue,
 };
+
+mod projection;
+pub use projection::QueryAnswerProjection;

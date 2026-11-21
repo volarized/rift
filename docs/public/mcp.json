@@ -1360,7 +1360,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift server logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or, for a file the request names through\n`paths.force_include` or a comparison, it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. A file a bound left out is outside the indexed set, as a file the\nsource policy excludes is, so no other answer names it. `rift server logs` records the\nfiles the index left out, and `paths` narrows a comparison onto the others.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -1411,7 +1411,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising\n`max_file` parses them.",
+                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. An answer\ncarries it only for files the request names through `paths.force_include` or a\ncomparison; `rift server logs` records every other such file. Raising `max_file`\nparses them.",
                 "properties": {
                   "code": {
                     "const": "large_file_unparsed",
@@ -1530,7 +1530,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -1557,7 +1557,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -4680,7 +4680,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift server logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or, for a file the request names through\n`paths.force_include` or a comparison, it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. A file a bound left out is outside the indexed set, as a file the\nsource policy excludes is, so no other answer names it. `rift server logs` records the\nfiles the index left out, and `paths` narrows a comparison onto the others.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -4731,7 +4731,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising\n`max_file` parses them.",
+                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. An answer\ncarries it only for files the request names through `paths.force_include` or a\ncomparison; `rift server logs` records every other such file. Raising `max_file`\nparses them.",
                 "properties": {
                   "code": {
                     "const": "large_file_unparsed",
@@ -4850,7 +4850,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -4877,7 +4877,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -6273,9 +6273,25 @@
       }
     },
     {
-      "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.",
+      "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.\nA query over the captured inventory answers from partly covered facts, and `warnings`\nname the files, languages, or engines left out. A query whose answer needs every fact - an empty\nresult, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with\n`insufficient_coverage` instead. A bound never makes an answer unavailable: a file a bound\nleft out of the index is outside the indexed set, and a producer or acquisition bound ends\nthe answer with the rows it reached; the server logs the bound, and `warnings` carry\nnothing for it.",
       "input_schema": {
         "$defs": {
+          "QueryInclude": {
+            "additionalProperties": false,
+            "description": "Optional projections of a query answer. An omitted member is `false`.",
+            "examples": [
+              {
+                "providers": true
+              }
+            ],
+            "properties": {
+              "providers": {
+                "description": "Attaches `providers` to merged edge terms and call steps. Explicit SPARQL\nselections and filters on `:provider` retain the stored producer facts.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
           "QueryLanguage": {
             "description": "The query language the server evaluates.",
             "oneOf": [
@@ -6311,9 +6327,19 @@
           {
             "language": "sparql",
             "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }"
+          },
+          {
+            "include": {
+              "providers": true
+            },
+            "query": "SELECT ?edge { ?caller :calls ?callee . ?edge a :Edge; :from ?caller; :to ?callee }"
           }
         ],
         "properties": {
+          "include": {
+            "$ref": "#/$defs/QueryInclude",
+            "description": "Attaches the sorted analyses that produced each returned edge."
+          },
           "language": {
             "$ref": "#/$defs/QueryLanguage",
             "default": "sparql",
@@ -6690,6 +6716,26 @@
               {
                 "const": "binds",
                 "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
+          },
+          "EdgeProvider": {
+            "description": "Which analysis produced an edge.",
+            "oneOf": [
+              {
+                "const": "engine",
+                "description": "A language engine embedded in Rift, such as ty.",
+                "type": "string"
+              },
+              {
+                "const": "lsp",
+                "description": "A language server reached through LSP.",
+                "type": "string"
+              },
+              {
+                "const": "static",
+                "description": "Static analysis captured into the index.",
                 "type": "string"
               }
             ]
@@ -7150,7 +7196,7 @@
                 "description": "The captured read and its expiry."
               },
               "warnings": {
-                "description": "Coverage and discovery limits affecting the query result. For `SERVICE :flows`,\n`traversal_truncated` reports the visited symbol count and names the bound in `detail`.",
+                "description": "Coverage and discovery limits affecting the query result. An answer read from partly\ncovered facts carries the warnings that name what is missing, and every row it returns\nstands. For `SERVICE :flows`, `traversal_truncated` reports the visited symbol count and\nnames the bound in `detail`.",
                 "items": {
                   "$ref": "#/$defs/ReadWarning"
                 },
@@ -7188,6 +7234,14 @@
                 "additionalProperties": false,
                 "description": "A blank node identity within the retained answer.",
                 "properties": {
+                  "providers": {
+                    "description": "Sorted analyses for an edge or call step, present when `include.providers` is `true`.",
+                    "items": {
+                      "$ref": "#/$defs/EdgeProvider"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
                   "type": {
                     "const": "blank_node",
                     "type": "string"
@@ -7786,7 +7840,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift server logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or, for a file the request names through\n`paths.force_include` or a comparison, it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. A file a bound left out is outside the indexed set, as a file the\nsource policy excludes is, so no other answer names it. `rift server logs` records the\nfiles the index left out, and `paths` narrows a comparison onto the others.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -7837,7 +7891,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising\n`max_file` parses them.",
+                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. An answer\ncarries it only for files the request names through `paths.force_include` or a\ncomparison; `rift server logs` records every other such file. Raising `max_file`\nparses them.",
                 "properties": {
                   "code": {
                     "const": "large_file_unparsed",
@@ -7956,7 +8010,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -7983,7 +8037,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",

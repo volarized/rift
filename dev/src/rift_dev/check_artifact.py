@@ -34,7 +34,7 @@ from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
 
 ARTIFACT_SECONDS = 240.0
 CONFIGURATION = "[search.vector]\ndisabled = true\n"
-SOURCE = "pub fn beacon_one() -> u8 { 1 }\npub fn beacon_two() -> u8 { 2 }\n"
+SOURCE = "pub fn beacon_one() -> u8 { 1 }\npub fn beacon_two() -> u8 { beacon_one() }\n"
 
 
 def lay_out_workspace(root: Path) -> None:

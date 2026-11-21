@@ -34,32 +34,38 @@ pub(crate) const TRIGRAM_ROWS: &str = "file_content IS NOT NULL";
 const TRIGRAM_INDEXED: &str = "NOT EXISTS (SELECT 1 FROM lexical_trigram_pending \
      WHERE lexical_trigram_pending.id = lexical_documents.id)";
 
-/// Takes one path's rows out of the trigram index and the pending set, while the typed rows
-/// still hold them.
+/// Takes the rows of `paths` out of the trigram index and the pending set, while the typed
+/// rows still hold them. The caller names at most
+/// [`crate::lexical::LEXICAL_DELETE_PATHS_MAX`] paths.
 ///
 /// The index gives up the entries of the rows it holds through the FTS5 `'delete'` command,
 /// which "must match the values currently stored in the table"
 /// (<https://www.sqlite.org/fts5.html>). It names those rows alone: a `'delete'` naming a
 /// row the index never took leaves its `integrity-check` reporting the table malformed. The
 /// rows it has not taken leave the pending set instead.
-pub(crate) async fn delete_path(
+pub(crate) async fn delete_paths(
     executor: &mut dyn Executor,
-    path: &ProjectPath,
+    paths: &[ProjectPath],
 ) -> Result<(), RiftError> {
-    toasty::sql::statement(format!(
-        "INSERT INTO lexical_documents_trigram(lexical_documents_trigram, rowid, file_content) \
-         SELECT 'delete', id, file_content FROM lexical_documents \
-         WHERE path = ?1 AND {TRIGRAM_ROWS} AND {TRIGRAM_INDEXED}"
-    ))
-    .bind(path.as_str().to_owned())
+    let named = crate::lexical::numbered_placeholders(paths.len());
+    crate::lexical::naming_paths(
+        format!(
+            "INSERT INTO lexical_documents_trigram(lexical_documents_trigram, rowid, file_content) \
+             SELECT 'delete', id, file_content FROM lexical_documents \
+             WHERE path IN ({named}) AND {TRIGRAM_ROWS} AND {TRIGRAM_INDEXED}"
+        ),
+        paths,
+    )
     .exec(&mut *executor)
     .await
     .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-    toasty::sql::statement(
-        "DELETE FROM lexical_trigram_pending \
-         WHERE id IN (SELECT id FROM lexical_documents WHERE path = ?1)",
+    crate::lexical::naming_paths(
+        format!(
+            "DELETE FROM lexical_trigram_pending \
+             WHERE id IN (SELECT id FROM lexical_documents WHERE path IN ({named}))"
+        ),
+        paths,
     )
-    .bind(path.as_str().to_owned())
     .exec(executor)
     .await
     .map_err(|source| errors::index::lexical_storage().source(source).error())?;

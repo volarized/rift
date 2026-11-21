@@ -112,7 +112,7 @@ impl<'request> FlowAcquisition<'request> {
         &mut self,
         request: &FlowAdjacency<Subject>,
     ) -> Result<FlowNeighbors, RiftError> {
-        if self.walk.remaining.requests_max == 0 {
+        if self.walk.remaining.requests_max == 0 || self.walk.reached.is_some() {
             return Ok(FlowNeighbors {
                 neighbors: Vec::new(),
                 coverage: FlowCoverage::RequestLimit,
@@ -124,19 +124,39 @@ impl<'request> FlowAcquisition<'request> {
             HopDirection::Outgoing => TraversalDirection::Outgoing,
         };
         let mut reached = BTreeSet::new();
-        Box::pin(self.walk.local_step(&request.subject, &mut reached)).await?;
+        let step = Box::pin(self.walk.local_step(&request.subject, &mut reached)).await;
+        if self.walk.spent(step)? {
+            return Ok(FlowNeighbors {
+                neighbors: Vec::new(),
+                coverage: FlowCoverage::RequestLimit,
+            });
+        }
         self.walk.acquired.local_edges.clear();
-        let mut sites = BTreeMap::<_, BTreeSet<_>>::new();
+        let mut sites = BTreeMap::<_, BTreeMap<_, BTreeSet<_>>>::new();
+        for edge in std::mem::take(&mut self.walk.acquired.edge_facts) {
+            let neighbor =
+                super::endpoint((&edge.from, &edge.to), self.walk.step.direction).clone();
+            let span = edge
+                .occurrence
+                .map(|span| (span.unit, span.range.start, span.range.end));
+            sites
+                .entry(neighbor)
+                .or_default()
+                .entry(span)
+                .or_default()
+                .insert(edge.provider);
+        }
         for occurrence in std::mem::take(&mut self.walk.acquired.local) {
             let neighbor = match request.direction {
                 HopDirection::Incoming => occurrence.enclosing.ok_or_else(coverage_failure)?,
                 HopDirection::Outgoing => occurrence.target,
             };
-            sites.entry(neighbor).or_default().insert(Some((
+            let span = Some((
                 occurrence.source.unit,
                 occurrence.source.range.start,
                 occurrence.source.range.end,
-            )));
+            ));
+            sites.entry(neighbor).or_default().entry(span).or_default();
         }
         let mut neighbors = Vec::new();
         for symbol in reached {
@@ -148,13 +168,20 @@ impl<'request> FlowAcquisition<'request> {
             };
             let evidence = sites
                 .remove(&symbol)
-                .unwrap_or_else(|| BTreeSet::from([None]));
+                .unwrap_or_else(|| BTreeMap::from([(None, BTreeSet::new())]));
             let subject = Arc::new(symbol);
-            neighbors.extend(evidence.into_iter().map(|evidence| FlowNeighbor {
-                subject: Arc::clone(&subject),
-                continuation,
-                evidence,
-            }));
+            neighbors.extend(
+                evidence
+                    .into_iter()
+                    .map(|(occurrence, providers)| FlowNeighbor {
+                        subject: Arc::clone(&subject),
+                        continuation,
+                        evidence: FlowCallSite {
+                            occurrence,
+                            providers,
+                        },
+                    }),
+            );
         }
         let coverage = if self.walk.acquired.incomplete {
             FlowCoverage::ProviderIncomplete

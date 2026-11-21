@@ -120,7 +120,7 @@ mod tests {
             "edge": {
                 "from": "rift://symbol/stdlib/node/javascript/fs/open",
                 "to": "rift://symbol/stdlib/node/javascript/fs/readFile",
-                "kind": "call", "kinds": ["calls"], "provider": "static", "derivation": "resolution"
+                "kind": "call", "kinds": ["calls"], "providers": ["static"], "derivation": "resolution"
             }
         }]);
         let expected: rift_protocol::read::SearchHit =

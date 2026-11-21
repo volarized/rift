@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use rift_core::{FileDigest, ProjectPath, SymbolId};
+use rift_core::{ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, LogicalDeclaration, SyntaxExportKind, SyntaxFacts, SyntaxSymbol};
@@ -205,7 +205,7 @@ fn export_bindings(
     (exports, unresolved)
 }
 
-pub(super) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
+pub(crate) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
     let mut targets = BTreeMap::<&str, Option<&SymbolId>>::new();
     for export in exports {
         match targets.entry(export.identity.as_str()) {
@@ -274,11 +274,11 @@ fn selected_source_is_valid(input: &NamespaceInput<'_>, file: &SelectedFile<'_>)
     matches!(
         file.syntax.language().name.as_str(),
         "typescript" | "javascript"
-    ) && file.syntax.source_digest() == Some(&FileDigest::of(file.source.as_bytes()))
+    ) && file.syntax.source_digest().is_some()
         && input
             .files()
             .iter()
-            .any(|source| source.path() == file.path && source.text() == file.source)
+            .any(|source| source.path() == file.path && source.text().len() == file.source.len())
 }
 
 fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
@@ -288,9 +288,7 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
         .chain(input.context_sources())
         .filter(|source| source.path().as_str() == "package.json");
     let source = sources.next()?;
-    if source.text().len() > input.syntax().source_bytes_max()
-        || sources.any(|other| other.text() != source.text())
-    {
+    if source.text().len() > input.syntax().source_bytes_max() || sources.next().is_some() {
         return None;
     }
     let metadata: PackageMetadata = serde_json::from_str(source.text()).ok()?;
@@ -727,11 +725,34 @@ fn declaration_anchors_with_public(
     let source = file.source;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
-    for symbol in syntax.symbols().iter().filter(|symbol| {
-        symbol.syntax_element_kind != Some("assignment_expression")
-            || symbol.kinds.contains(&SymbolKind::Public)
-            || public.contains(&symbol.qualified_name)
-    }) {
+    let conflicts = assignment_name_conflicts(syntax, source);
+    let assignments = syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter(|binding| binding.source.is_none())
+        .filter_map(|binding| Some((binding.range, binding.local?, binding.container.as_deref())))
+        .collect::<BTreeSet<_>>();
+    let mut declarations = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.syntax_element_kind != Some("assignment_expression")
+                || member_assignment(symbol)
+                || symbol.kinds.contains(&SymbolKind::Public)
+                || public.contains(&symbol.qualified_name)
+                || symbol.name_range.is_some_and(|name| {
+                    assignments.contains(&(symbol.item_range, name, symbol.container.as_deref()))
+                })
+        })
+        .collect::<Vec<_>>();
+    // A checked out-of-line member may precede its hoisted constructor in source.
+    // Process containing declarations first without changing the document's source order.
+    declarations.sort_by_key(|symbol| symbol.qualified_name.len());
+    for symbol in declarations {
+        if conflicting_assignment_name(&symbol.qualified_name, &conflicts) {
+            continue;
+        }
         let literal = declared_module_name(symbol, source);
         let Some(mut path) = literal
             .as_ref()
@@ -758,7 +779,88 @@ fn declaration_anchors_with_public(
             anchors.insert(symbol.qualified_name.clone(), identity);
         }
     }
-    super::retain_valid_declarations(input, file, anchors)
+    let mut anchors = super::retain_valid_declarations(input, file, anchors);
+    if let Some(module) = module
+        && let Ok(identity) = SymbolIdentity::new(
+            input.owner().clone(),
+            syntax.language().clone(),
+            vec![module.to_owned()],
+        )
+        && let Ok(identity) = SymbolId::new(identity.wire_identity())
+    {
+        anchors.insert(".".to_owned(), identity);
+    }
+    anchors
+}
+
+fn assignment_name_conflicts<'source>(
+    syntax: &'source SyntaxFacts,
+    source: &str,
+) -> BTreeSet<&'source str> {
+    let lexical = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind != Some("assignment_expression"))
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    // A member assigned to a class or a constructor function is another facet of a
+    // same-named member (D38), never a conflict.
+    let assignments = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("assignment_expression")
+                && !member_assignment(symbol)
+        })
+        .map(|symbol| symbol.qualified_name.as_str())
+        .filter(|name| lexical.contains(name))
+        .collect::<BTreeSet<_>>();
+    let literal = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some("assignment_expression"))
+        .filter(|symbol| assignment_name_is_literal(symbol, source))
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let generated = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some("assignment_expression"))
+        .filter(|symbol| !assignment_name_is_literal(symbol, source))
+        .map(|symbol| symbol.qualified_name.as_str());
+    assignments
+        .into_iter()
+        .chain(generated.filter(|name| literal.contains(name)))
+        .collect()
+}
+
+/// Whether an assignment declares a member of the declaration it belongs to: a method
+/// or a field assigned to a class, a constructor function or its prototype.
+fn member_assignment(symbol: &SyntaxSymbol) -> bool {
+    matches!(symbol.kind, "method" | "property") && symbol.container.is_some()
+}
+
+fn assignment_name_is_literal(symbol: &SyntaxSymbol, source: &str) -> bool {
+    let Some(range) = symbol.name_range else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
+        return false;
+    };
+    source.get(start..end) == Some(symbol.name.as_str())
+}
+
+fn conflicting_assignment_name(mut name: &str, conflicts: &BTreeSet<&str>) -> bool {
+    // Each step removes a segment from the provider-bounded qualified name.
+    loop {
+        if conflicts.contains(name) {
+            return true;
+        }
+        let Some((parent, _)) = name.rsplit_once('.') else {
+            return false;
+        };
+        name = parent;
+    }
 }
 
 fn defining_name(symbol: &SyntaxSymbol) -> String {

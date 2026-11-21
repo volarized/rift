@@ -10,7 +10,167 @@ mod hermetic_search;
 
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use serde_json::json;
+use std::fmt::Write as _;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
+
+#[tokio::test]
+async fn test_typescript_deferred_calls_and_declared_receivers_are_queryable() -> TestResult {
+    let (_directory, client, task) = served_workspace(
+        &[
+            ("entry.ts", "import type { Box } from './types.js'; let value = 0; export function root(input: Box) { value += 1; input.run(); later(); return input.value; } const later = () => {};"),
+            ("types.ts", "export interface Box { run(): void; value: number; }"),
+        ],
+        None,
+    ).await?;
+    let params = QueryParams {
+        query: "SELECT ?name { ?source :calls ?target . ?target :name ?name } ORDER BY ?name"
+            .into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    let names = rows
+        .iter()
+        .map(|row| workspace_client::query::literal(row, "name"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(names, ["later", "run"], "{answer}");
+    let params = QueryParams {
+        query: "SELECT (COUNT(*) AS ?n) { ?source :writes ?target }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(workspace_client::query::literal(&rows[0], "n")?, "1");
+    let params = QueryParams {
+        query: "SELECT (COUNT(DISTINCT ?target) AS ?n) { ?source :calls ?target . ?edge a :Edge; :from ?source; :to ?target; :kinds :calls; :provider 'static' }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(
+        workspace_client::query::literal(&rows[0], "n")?,
+        "2",
+        "{answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_static_usage_records_keep_kind_and_enclosing_symbol_together() -> TestResult {
+    let (_directory, client, task) = served_workspace(
+        &[
+            ("entry.ts", "export * as tools from './tools.js';"),
+            ("tools.ts", "export const value = 1;"),
+        ],
+        None,
+    )
+    .await?;
+    let params = QueryParams {
+        query: "SELECT ?source ?kind { ?target :usages ?usage . ?usage :of ?source; :kind ?kind } ORDER BY ?source ?kind".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(rows.len(), 2, "{answer}");
+    for (row, (source, kind)) in rows.iter().zip([
+        ("rift://symbol/local/typescript/.%2Fentry.ts", "imports"),
+        (
+            "rift://symbol/local/typescript/.%2Fentry.ts/tools",
+            "aliases",
+        ),
+    ]) {
+        assert_eq!(workspace_client::query::iri(row, "source")?, source);
+        assert_eq!(workspace_client::query::literal(row, "kind")?, kind);
+    }
+    let params = QueryParams {
+        query: "SELECT (COUNT(?usage) AS ?n) { ?target :usages ?usage }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(workspace_client::query::literal(&rows[0], "n")?, "2");
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_static_inventory_projects_repeated_occurrences_with_dataset_bounds() -> TestResult {
+    let count = 10_001;
+    let source = format!(
+        "function leaf() {{}}\nexport function root() {{ {} }}\n",
+        "leaf();".repeat(count)
+    );
+    let (_directory, client, task) = served_workspace(&[("entry.ts", &source)], None).await?;
+    // Each invocation contributes a call occurrence and a callee read.
+    for (predicate, expected) in [("calls", 1), ("references", 1), ("usages", 2 * count)] {
+        let params = QueryParams {
+            query: format!("SELECT (COUNT(*) AS ?count) {{ ?s :{predicate} ?t }}"),
+            ..QueryParams::default()
+        };
+        let answer = query_after_population(&client, &params).await?;
+        let rows = workspace_client::query::rows(&answer)?;
+        assert_eq!(rows.len(), 1, "{params:?}: {answer}");
+        assert_eq!(
+            workspace_client::query::literal(&rows[0], "count")?,
+            expected.to_string(),
+            "{params:?}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_typescript_static_facts_are_read_through_sparql() -> TestResult {
+    let files = [
+        (
+            "entry.ts",
+            "import * as core from './index.js';\ninterface Value {}\ninterface Task extends Value {}\nclass Derived extends core.Base<Value> { run(input: Value): Value { this.value = core.value; this.leaf(); return this.value; } }\nexport function root() { core.leaf(); new core.Base(); }",
+        ),
+        ("index.ts", "export * from './base.js';"),
+        (
+            "base.ts",
+            "export const value = 1;\nexport function leaf() {}\nexport class Base<T> { value: T; leaf() {} run(input: T): T { return input; } }",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    let derived = captured_seed(&client, "Derived", "entry.ts").await?;
+    let root = captured_seed(&client, "root", "entry.ts").await?;
+    let run = captured_seed(&client, "run", "entry.ts").await?;
+    for query in [
+        format!("ASK {{ <{derived}> :extends ?base . ?base :name 'Base' }}"),
+        format!("ASK {{ <{derived}> :contains ?member . ?member :name 'run' }}"),
+        format!("ASK {{ <{root}> :calls ?target . ?target :name 'leaf' }}"),
+        format!("ASK {{ <{run}> :overrides ?target }}"),
+        format!("ASK {{ <{run}> :reads ?target . ?target :name 'value' }}"),
+        format!("ASK {{ <{run}> :writes ?target . ?target :name 'value' }}"),
+        format!("ASK {{ <{run}> :hasType ?target . ?target :name 'Value' }}"),
+        "ASK { ?symbol :imports ?target }".into(),
+        "ASK { ?alias :name 'leaf'; :aliases ?target . ?target :name 'leaf' }".into(),
+    ] {
+        let params = QueryParams {
+            query,
+            language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 10,
+            revision: None,
+            include: rift_protocol::query::QueryInclude::default(),
+        };
+        let answer = query_after_population(&client, &params).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{params:?}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_edge_static_calls_agree_in_both_directions_and_with_flows() -> TestResult {
@@ -26,6 +186,7 @@ async fn test_edge_static_calls_agree_in_both_directions_and_with_flows() -> Tes
         ),
     ] {
         let params = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: text,
             language: QueryLanguage::Sparql,
             page: 1,
@@ -65,6 +226,7 @@ async fn test_edge_heritage_imports_aliases_and_outgoing_references_are_queryabl
         "ASK { ?alias :aliases ?target }".to_owned(),
     ] {
         let params = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: text,
             language: QueryLanguage::Sparql,
             page: 1,
@@ -128,6 +290,7 @@ async fn test_edge_readiness_budget_reports_a_typed_warning_for_calls_and_struct
         format!("SELECT ?usage {{ <{worker}> :usages ?usage }}"),
     ] {
         let params = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: text,
             language: QueryLanguage::Sparql,
             page: 1,
@@ -178,6 +341,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     let worker = captured_seed(&client, "Worker", "lib.rs").await?;
     let run = captured_seed(&client, "run", "lib.rs").await?;
     let usages = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?usage ?kind {{ <{worker}> :usages ?usage . ?usage :kind ?kind }}"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -190,6 +354,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
         "{usages}"
     );
     let outgoing = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?target {{ <{run}> :calls ?target }}"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -202,6 +367,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     for row in targets {
         let target = workspace_client::query::iri(row, "target")?;
         let incoming = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: format!("SELECT ?caller {{ ?caller :calls <{target}> }}"),
             language: QueryLanguage::Sparql,
             page: 1,
@@ -219,6 +385,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     }
     let trait_area = worker.replace("/Worker", "/Task/area");
     let incoming = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?caller {{ ?caller :calls <{trait_area}> }}"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -250,7 +417,7 @@ while IFS= read -r header; do
   id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
   case "$body" in
     *'"method":"initialize"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true,\"implementationProvider\":true,\"typeHierarchyProvider\":true}}}"
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"definitionProvider\":true,\"callHierarchyProvider\":true,\"implementationProvider\":true,\"typeHierarchyProvider\":true}}}"
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"edge/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
     *'"method":"textDocument/didOpen"'*)
       uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d '"' -f4) ;;
@@ -267,6 +434,9 @@ while IFS= read -r header; do
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":$(item leaf 12 1 7 11),\"fromRanges\":[$(range 2 30 38)]}]}" ;;
     *'"method":"callHierarchy/incomingCalls"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"from\":$(item root 12 2 7 11),\"fromRanges\":[$(range 2 30 38)]}]}" ;;
+    *'"method":"textDocument/definition"'*)
+      if printf '%s' "$body" | grep -q '"line":3'; then resolved=$(range 0 11 17); else resolved=$(range 1 7 11); fi
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$uri\",\"range\":$resolved}]}" ;;
     *'"method":"textDocument/references"'*)
       if printf '%s' "$body" | grep -q '"line":0'; then result="[{\"uri\":\"$uri\",\"range\":$(range 3 20 26)}]"; else result='[]'; fi
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":$result}" ;;
@@ -300,7 +470,7 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         ),
         (
             "lib.rs",
-            "pub struct Worker;\npub fn leaf() {}\npub fn root(callback: fn()) { callback(); }\npub fn take(worker: Worker) {}\npub trait Task {}\npub struct Base;\nimpl Worker {}\n",
+            "pub struct Worker;\npub fn leaf() {}\npub fn root(callback: fn()) { callback(); }\npub fn take(worker: Worker) {}\npub trait Task {}\npub struct Base;\nimpl Task for Worker {}\n",
         ),
     ];
     let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
@@ -333,13 +503,20 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         ),
         (
             format!("SELECT ?target {{ ?target :implements <{trait_edge}> }}"),
+            Some(worker.clone()),
+        ),
+        (
+            format!(
+                "SELECT ?target {{ ?target :implements ?trait FILTER(?trait = <{trait_edge}>) }}"
+            ),
             Some(worker),
         ),
     ] {
         let answer = query_after_population(
             &client,
             &QueryParams {
-                query,
+                include: rift_protocol::query::QueryInclude::default(),
+                query: query.clone(),
                 language: QueryLanguage::Sparql,
                 page: 1,
                 max_results: 10,
@@ -348,7 +525,7 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         )
         .await?;
         let rows = workspace_client::query::rows(&answer)?;
-        assert!(!rows.is_empty(), "{answer}");
+        assert!(!rows.is_empty(), "{query}: {answer}");
         if let Some(target) = target {
             assert!(
                 rows.iter()
@@ -370,6 +547,7 @@ async fn test_edge_queries_page_targets_at_the_same_revision() -> TestResult {
     let (_directory, client, task) = served_workspace(&[("entry.mjs", source)], None).await?;
     let root = captured_seed(&client, "root", "entry.mjs").await?;
     let mut params = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?target {{ <{root}> :calls ?target }} ORDER BY ?target"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -405,6 +583,296 @@ async fn test_edge_queries_page_targets_at_the_same_revision() -> TestResult {
         empty["pagination"],
         json!({"page": 3, "pages": 2, "max_results": 1, "total": 2}),
         "{empty}"
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_reexports_keep_imports_and_aliases() -> TestResult {
+    let files = [
+        ("pkg/__init__.py", "from .models import Value as Value\n"),
+        ("pkg/models.py", "class Value: pass\n"),
+        (
+            "main.py",
+            "from pkg import Value\ndef build(): return Value()\n",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    for query in [
+        "ASK { <rift://symbol/local/python/pkg> :imports <rift://symbol/local/python/pkg/models/Value> }",
+        "ASK { <rift://symbol/local/python/pkg/Value> :aliases <rift://symbol/local/python/pkg/models/Value> }",
+        "ASK { <rift://symbol/local/python/main/build> :calls <rift://symbol/local/python/pkg/models/Value> }",
+    ] {
+        let params = QueryParams {
+            query: query.to_owned(),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        };
+        let answer = query_after_population(&client, &params).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{query}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_rebindings_share_the_existing_symbol_facets() -> TestResult {
+    let source = "shared = 0\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n    def publish():\n        global shared\n        shared = 1\n";
+    let (_directory, client, task) = served_workspace(&[("main.py", source)], None).await?;
+    for expected in [
+        "rift://symbol/local/python/main/root/active",
+        "rift://symbol/local/python/main/shared",
+    ] {
+        let query = QueryParams {
+            query: format!("ASK {{ <{expected}> a :Symbol }}"),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        };
+        let answer = query_after_population(&client, &query).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{answer}"
+        );
+        let params = rift_protocol::read::FacetsParams::of(rift_protocol::read::SymbolId(
+            expected.to_owned(),
+        ));
+        let request = workspace_client::tool_request("facets", &serde_json::to_value(params)?);
+        let facets = workspace_client::call_retrying_acceptance(&client, request).await?;
+        assert_eq!(facets["pagination"]["total"], json!(2), "{facets}");
+    }
+    let params = QueryParams {
+        query: "ASK { <rift://symbol/local/python/main/root/finish/active> a :Symbol }".to_owned(),
+        language: QueryLanguage::Sparql,
+        ..Default::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    assert_eq!(
+        answer["answer"],
+        json!({"result":"boolean", "value":false}),
+        "{answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult {
+    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\ndef typed(value: models.Value):\n    value.run()\n    value.item = 1\n    models.current = value\n    return value.item\ndef build() -> models.Value | None: return None\ndef alias():\n    module = models\n    value = build()\n    second = value\n    second.item = 2\n    module.current = second\n    return second.item\ndef checked(value):\n    if not isinstance(value, models.Value): return\n    value.item = 3\n";
+    let files = [
+        ("main.py", source),
+        (
+            "models.py",
+            "class Value:\n    item: int = 0\n    def run(self): pass\ncurrent: Value\n",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    captured_seed(&client, "Child", "main.py").await?;
+    for query in [
+        "ASK { <rift://symbol/local/python/main/alias> :writes <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/alias> :reads <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/alias> :writes <rift://symbol/local/python/models/current> }",
+        "ASK { <rift://symbol/local/python/main/checked> :writes <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/typed> :calls <rift://symbol/local/python/models/Value/run> }",
+        "ASK { <rift://symbol/local/python/main/typed> :reads <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/typed> :writes <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/typed> :writes <rift://symbol/local/python/models/current> }",
+        "ASK { <rift://symbol/local/python/main> :contains <rift://symbol/local/python/main/Child> }",
+        "ASK { <rift://symbol/local/python/main/Child> :contains <rift://symbol/local/python/main/Child/run> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :overrides <rift://symbol/local/python/main/Base/run> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :reads <rift://symbol/local/python/models/current> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :writes <rift://symbol/local/python/main/Base/value> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :hasType <rift://symbol/local/python/models/Value> }",
+        "ASK { <rift://symbol/local/python/main> :imports <rift://symbol/local/python/models> }",
+    ] {
+        let params = QueryParams {
+            query: query.to_owned(),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        };
+        let answer = query_after_population(&client, &params).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{query}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_static_inventory_survives_dependency_context_and_many_symbols() -> TestResult {
+    let mut source = "def leaf(): pass\n".to_owned();
+    for index in 0..70 {
+        writeln!(source, "def root{index}(): leaf()")?;
+    }
+    for context in [None, Some("[[dependencies.packages]]\nmanager = 'pypi'\nregistry = 'pypi.org'\nname = 'httpx'\nversion = '0.28.1'\n".to_owned())] {
+        let (_directory, client, task) = served_workspace(&[("main.py", &source)], context).await?;
+        captured_seed(&client, "leaf", "main.py").await?;
+        for predicate in ["calls", "references"] {
+            let params = QueryParams { query: format!("SELECT ?from ?to {{ ?from :{predicate} ?to }}"), language: QueryLanguage::Sparql, ..Default::default() };
+            let answer = query_after_population(&client, &params).await?;
+            assert_eq!(answer["pagination"]["total"], json!(70), "{predicate}: {answer}");
+        }
+        client.cancel().await?;
+        task.await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_declarations_include_locals_empty_modules_and_project_files() -> TestResult {
+    let files = [
+        ("pkg/empty.py", ""),
+        (
+            "docs_src/tutorial.py",
+            "class Item: pass\ndef build():\n    visited: list[Item] = []\n",
+        ),
+        (
+            "pyproject.toml",
+            "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    for (name, path, identity) in [
+        (
+            "Item",
+            "docs_src/tutorial.py",
+            "rift://symbol/local/python/docs_src/tutorial/Item",
+        ),
+        (
+            "visited",
+            "docs_src/tutorial.py",
+            "rift://symbol/local/python/docs_src/tutorial/build/visited",
+        ),
+    ] {
+        assert_eq!(captured_seed(&client, name, path).await?, identity);
+    }
+    let params = QueryParams {
+        query: "ASK { <rift://symbol/local/python/pkg/empty> a :Symbol }".to_owned(),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
+        include: rift_protocol::query::QueryInclude::default(),
+    };
+    let answer = query_after_population(&client, &params).await?;
+    assert_eq!(answer["answer"], json!({"result":"boolean", "value":true}));
+    let symbol = rift_protocol::read::SymbolId("rift://symbol/local/python/pkg/empty".to_owned());
+    let params = rift_protocol::read::FacetsParams::of(symbol);
+    let request = workspace_client::tool_request("facets", &serde_json::to_value(params)?);
+    let facets = workspace_client::call_retrying_acceptance(&client, request).await?;
+    assert_eq!(facets["pagination"]["total"], json!(1), "{facets}");
+    assert_eq!(facets["declarations"][0]["source"]["text"], json!(""));
+    assert_eq!(
+        facets["declarations"][0]["range"],
+        json!({"start":0,"end":0})
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_local_initializer_calls_start_at_the_enclosing_callable() -> TestResult {
+    let source = "def leaf(): return 1\ndef root():\n    value: int = leaf()\n    return value\n";
+    let (_directory, client, task) = served_workspace(&[("main.py", source)], None).await?;
+    let root = captured_seed(&client, "root", "main.py").await?;
+    let leaf = captured_seed(&client, "leaf", "main.py").await?;
+    let params = QueryParams {
+        query: format!("ASK {{ <{root}> :calls <{leaf}> }}"),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
+        include: rift_protocol::query::QueryInclude::default(),
+    };
+    let answer = query_after_population(&client, &params).await?;
+    assert_eq!(answer["answer"], json!({"result":"boolean", "value":true}));
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_edge_rust_static_inventory_and_multiple_facets_are_queryable() -> TestResult {
+    let mut source = String::from(
+        "mod jobs; use crate::jobs::{Task, leaf}; trait Run { fn execute(&self); } \
+         pub fn root(task: &Task) { leaf(); Task::new(); task.execute(); }\n",
+    );
+    for index in 0..70 {
+        writeln!(source, "pub fn extra_{index}() {{ leaf(); }}")?;
+    }
+    let files = [
+        ("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n"),
+        ("src/lib.rs", source.as_str()),
+        (
+            "src/jobs.rs",
+            "use crate::Run; pub struct Value; impl Value { fn open(&self) {} } \
+             pub struct Task { value: Value } pub fn leaf() {} \
+             impl Task { pub fn new() -> Self { Self { value: Value } } \
+             fn read(&mut self, value: Value) { self.value = value; \
+             let value = &self.value; self.value.open(); } } \
+             impl Run for Task { fn execute(&self) {} }",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    let seed = captured_seed(&client, "Task", "src/jobs.rs").await?;
+    for predicate in [
+        "calls",
+        "contains",
+        "imports",
+        "implements",
+        "overrides",
+        "reads",
+        "writes",
+        "hasType",
+    ] {
+        let answer = query_after_population(
+            &client,
+            &QueryParams {
+                query: format!("ASK {{ ?source :{predicate} ?target }}"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{predicate}: {answer}"
+        );
+    }
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: format!("SELECT ?target {{ <{seed}> :calls ?target }}"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(answer.get("answer").is_some(), "{answer}");
+    let absence = query_after_population(
+        &client,
+        &QueryParams {
+            query: "ASK { FILTER NOT EXISTS { ?source :calls ?target } }".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        absence["reason"],
+        json!("insufficient_coverage"),
+        "{absence}"
     );
     client.cancel().await?;
     task.await?;

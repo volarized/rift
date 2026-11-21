@@ -10,7 +10,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.83"
+version = "0.0.85"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -52,6 +52,7 @@ candle-core = { version = "0.11.1", default-features = false }
 candle-nn = { version = "0.11.1", default-features = false }
 candle-transformers = { version = "0.11.1", default-features = false }
 clap = { version = "4.6.5", features = ["derive"] }
+cpu-time = "=1.0.0"
 data-encoding = "2.6.0"
 digest-io = "=0.1.0"
 getrandom = { version = "0.4.3", features = ["std"] }
@@ -236,6 +237,14 @@ overflow-checks = true
 # test fixture or a corpus holds thousands of them; sha2 at opt-level 0 hashes several
 # times slower than optimized.
 [profile.dev.package.sha2]
+opt-level = 3
+
+# Parsing and tree release dominate large syntax captures in unoptimized builds.
+# Keep the shared parser runtime optimized for development and tests.
+[profile.dev.package.tree-sitter]
+opt-level = 3
+
+[profile.test.package.tree-sitter]
 opt-level = 3
 
 # gemm-common's `vmulq_f16` is an `#[inline]` fp16 `asm!` without a `target_feature`

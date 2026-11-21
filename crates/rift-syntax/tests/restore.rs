@@ -520,6 +520,82 @@ fn symbol_ranges_must_stay_inside_the_declaration() {
 }
 
 #[test]
+fn a_member_assigned_after_its_owner_restores_with_the_owner_as_container() {
+    let text = "function logger() {}\nlogger.warn = () => {};\nPage.load = function () {};\nfunction Page() {}\n";
+    let document = parsed(ShippedLanguage::JavaScript, text);
+    let containers = document
+        .symbols()
+        .iter()
+        .map(|symbol| (symbol.qualified_name.as_str(), symbol.container.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        containers,
+        [
+            ("logger", None),
+            ("logger.warn", Some("logger")),
+            ("Page.load", Some("Page")),
+            ("Page", None)
+        ]
+    );
+    let restored = SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(document.facts()))
+        .expect("an assigned member names its owner by binding, not by nesting");
+    assert_eq!(&restored, document.facts());
+
+    let mut nested = parts(document.facts());
+    nested.symbols[3].syntax_element_kind = Some("assignment_expression");
+    assert_eq!(
+        SyntaxFacts::from_parts(text, SyntaxLimits::default(), nested)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG),
+        "an assigned member's container is a declaration not itself assigned"
+    );
+    let mut unassigned = parts(document.facts());
+    unassigned.symbols[1].syntax_element_kind = Some("function_declaration");
+    assert_eq!(
+        SyntaxFacts::from_parts(text, SyntaxLimits::default(), unassigned)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG),
+        "any other declaration still nests inside its container"
+    );
+    let limits = SyntaxLimits::new(text.len(), 100, 1).expect("bounds");
+    assert_eq!(
+        SyntaxFacts::from_parts(text, limits, parts(document.facts()))
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_depth_exceeded::SLUG),
+        "an assigned member sits one level below its owner"
+    );
+}
+
+#[test]
+fn a_member_assigned_inside_its_own_method_keeps_the_method_as_container() {
+    let text = "class Stream {\n  run() {\n    this.run = null;\n    const step = 1;\n  }\n}\n";
+    let document = parsed(ShippedLanguage::JavaScript, text);
+    let containers = document
+        .symbols()
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.qualified_name.as_str(),
+                symbol.kind,
+                symbol.container.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        containers,
+        [
+            ("Stream", "class", None),
+            ("Stream.run", "method", Some("Stream")),
+            ("Stream.run", "property", Some("Stream")),
+            ("Stream.run.step", "variable", Some("Stream.run")),
+        ]
+    );
+    let restored = SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(document.facts()))
+        .expect("the method, not the facet assigned inside it, holds the later declaration");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
 fn authored_containers_need_portable_names_but_may_be_unresolved() {
     let text = "pub mod client { pub fn open() {} }\n";
     let document = parsed(ShippedLanguage::Rust, text);

@@ -12,7 +12,7 @@ use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportR
 mod errors;
 pub(crate) mod python;
 mod rust;
-mod typescript;
+pub(crate) mod typescript;
 
 use self::errors::retain_valid_declarations;
 
@@ -50,6 +50,7 @@ pub(crate) struct PreparedNamespace {
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     pub(crate) mappings: BTreeMap<String, BTreeMap<String, rift_syntax::LogicalDeclaration>>,
     pub(crate) exports: Vec<ExportBinding>,
+    pub(crate) alias_visibilities: BTreeMap<SymbolId, String>,
     pub(crate) unresolved_exports: bool,
     /// Original file paths no namespace reaches by construction: their declarations carry
     /// no identity because the language assigns none there, not because analysis failed.
@@ -57,11 +58,20 @@ pub(crate) struct PreparedNamespace {
 }
 
 pub(crate) fn placed_aliases(
-    prepared: &PreparedNamespace,
+    input: &NamespaceInput<'_>,
+    prepared: &mut PreparedNamespace,
     selected: &[SelectedFile<'_>],
     placements: &[&rift_syntax::DocumentPlacement],
+    aliases_max: usize,
     invalid: impl Fn() -> rift_error::RiftError,
 ) -> Result<BTreeMap<String, Vec<rift_syntax::PlacedAlias>>, rift_error::RiftError> {
+    crate::static_resolution::prepare_javascript_reexports(
+        input,
+        prepared,
+        selected,
+        placements,
+        aliases_max,
+    );
     let positions = selected
         .iter()
         .enumerate()
@@ -105,6 +115,7 @@ pub(crate) fn placed_aliases(
                 identity: export.identity.clone(),
                 target_identity,
                 range,
+                visibility: prepared.alias_visibilities.get(&export.identity).cloned(),
             });
     }
     Ok(aliases)
@@ -116,6 +127,10 @@ pub(super) fn prepare(
     selected: &[SelectedFile<'_>],
 ) -> PreparedNamespace {
     prepare_context(&input.namespace_input(), selected)
+}
+
+pub(crate) fn rust_configuration_is_valid(flags: &[&str]) -> bool {
+    rust::configuration::valid_flags(flags)
 }
 
 pub(crate) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
@@ -130,6 +145,7 @@ pub(crate) fn prepare_context(
     let rust = rust::prepare(input, selected);
     prepared.anchors.extend(rust.anchors);
     prepared.exports.extend(rust.exports);
+    prepared.alias_visibilities.extend(rust.alias_visibilities);
     prepared.unresolved_exports |= rust.unresolved_exports;
     prepared.outside_namespaces.extend(rust.outside_namespaces);
     let mut roots = input.import_roots().to_vec();
@@ -493,3 +509,8 @@ pub(crate) fn namespace_paths(
 ) -> Result<BTreeSet<rift_core::ProjectPath>, rift_error::RiftError> {
     rust::namespace_paths(input, documents, contains, selected, files_max)
 }
+
+pub(crate) use rust::chain_modules as rust_chain_modules;
+pub(crate) use rust::configuration::{
+    Configuration as RustConfiguration, Configurations as RustConfigurations,
+};

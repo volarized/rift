@@ -29,8 +29,8 @@ use std::time::Duration;
 /// Calls `search` until the lexical population pass has landed.
 ///
 /// Workspace map readiness covers local file preparation. The lexical lane commits its
-/// initial write behind that publication, so a search can still return identifier matches
-/// with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
+/// initial write behind that publication, so a search can return `index_preparing` or
+/// identifier matches with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
 ///
 /// # Errors
 ///
@@ -48,8 +48,8 @@ async fn search_after_population(
     let query = arguments["query"].as_str().unwrap_or("<missing query>");
     let mut answer = proxied_call(client, "search", arguments).await?;
     for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-        let population_pending =
-            answer["warnings"]
+        let population_pending = answer["reason"] == "index_preparing"
+            || answer["warnings"]
                 .as_array()
                 .into_iter()
                 .flatten()

@@ -1192,8 +1192,8 @@ pub struct PackageSearchRequest {
     /// Identifier candidates of `query`, in the order Rift extracts them. The server refuses a request whose list differs from the candidates it extracts from `query`.
     #[validate(length(max = 16u64))]
     pub identifiers: Option<Vec<String>>,
-    /// Optional fields to include. An omitted member is `false`.
-    pub include: Option<PackageSearchRequestInclude>,
+    /// The optional projections of read records. An omitted member is `false`.
+    pub include: Option<EdgeInclude>,
     /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
@@ -2424,7 +2424,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `edge` retains its occurrence, provider, and
+/// One auditable step in a search traversal. `edge` retains its occurrence, requested providers, and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2586,8 +2586,8 @@ pub struct Edge {
     /// One byte range in a source-catalog unit.
     #[validate(nested)]
     pub occurrence: Option<SourceUnitSpan>,
-    /// Which analysis produced an edge.
-    pub provider: EdgeProvider,
+    /// Sorted analyses that produced this edge, present when `include.providers` is `true`.
+    pub providers: Option<Vec<EdgeProvider>>,
     /// How this edge was established. Every edge reaches Rift from a provider, and this field
     /// records whether the provider resolved the edge semantically, read it from syntax, or
     /// inferred it.
@@ -4186,7 +4186,7 @@ pub struct QuerySource {
     pub unit: String,
     /// Complete lowercase SHA-256 digest of immutable source bytes.
     pub digest: String,
-    /// Selected text, absent when source is unavailable or unrequested.
+    /// Exact UTF-8 text of the selected source unit, absent when unavailable or unrequested.
     pub text: Option<String>,
 }
 /// A symbol together with the physical declarations selected for this read.
@@ -4229,52 +4229,54 @@ pub struct EdgeCapability {
     /// Positive count bounds for one raw edge operation.
     pub bounds: Option<EdgeBounds>,
 }
-/// Original edge records for one requested subject on this page.
+/// Merged edge records for one requested subject on this page.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeGroup {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub seed: String,
-    /// Original records, preserving parallel edges, evidence and occurrences.
+    /// Merged records, preserving distinct kinds and physical occurrences. Producer rows of the same edge consume one slot.
     pub edges: Vec<EdgeRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
-    /// Page limits count distinct original record identities across edges and usages.
+    /// Page limits count distinct merged edges and physical usages across their record identities.
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
     pub occurrences: Option<Vec<EdgeOccurrence>>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
-/// The optional projections of records in an edge page. An omitted member is `false`.
+/// The optional projections of read records. An omitted member is `false`.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeInclude {
-    /// Attaches the exact UTF-8 bytes of the selected source units.
+    /// Attaches the sorted analyses that produced each merged edge.
+    pub providers: Option<bool>,
+    /// Attaches source text to the selected records.
     pub source: Option<bool>,
 }
 /// One physical usage projected from an original selected-publication record.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeOccurrence {
-    /// Opaque full identity of one original edge record within its selected publication.
+    /// Opaque full identity of one merged edge or physical usage within its selected publication.
     pub id: String,
-    /// Opaque full identity of one original edge record within its selected publication.
+    /// Opaque full identity of one merged edge or physical usage within its selected publication.
     pub edge: Option<String>,
     /// One physical reference or call supplied by a selected provider.
     pub occurrence: QueryOccurrence,
 }
-/// One original edge record, independent of equal endpoint or evidence payloads.
+/// One edge merged by source, exact kind, target and physical occurrence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeRecord {
-    /// Opaque full identity of one original edge record within its selected publication.
+    /// Opaque full identity of one merged edge or physical usage within its selected publication.
     pub id: String,
     /// One directed edge between two symbols. Its occurrence is where it was read from, and its
     /// derivation is how much the provider knew when it was read.
     pub edge: Edge,
 }
-/// Opaque full identity of one original edge record within its selected publication.
+/// Opaque full identity of one merged edge or physical usage within its selected publication.
 pub type EdgeRecordId = String;
 /// One raw edge page from an immutable selected publication.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -4318,7 +4320,7 @@ pub struct EdgeSearchRequest {
     /// Exact eligible runtime domain, retaining compiler or runtime versions.
     #[validate(length(min = 1u64, max = 20_000u64), nested)]
     pub runtimes: Option<Vec<RuntimeIdentity>>,
-    /// The optional projections of records in an edge page. An omitted member is `false`.
+    /// The optional projections of read records. An omitted member is `false`.
     pub include: Option<EdgeInclude>,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
@@ -4376,23 +4378,23 @@ pub struct FacetDeclaration {
 /// Which analysis produced an edge.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum EdgeProvider {
-    /// Static analysis captured into the index.
-    #[serde(rename = "static")]
-    #[default]
-    Static,
     /// A language engine embedded in Rift, such as ty.
     #[serde(rename = "engine")]
+    #[default]
     Engine,
     /// A language server reached through LSP.
     #[serde(rename = "lsp")]
     Lsp,
+    /// Static analysis captured into the index.
+    #[serde(rename = "static")]
+    Static,
 }
 impl core::fmt::Display for EdgeProvider {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Static => write!(f, "static"),
             Self::Engine => write!(f, "engine"),
             Self::Lsp => write!(f, "lsp"),
+            Self::Static => write!(f, "static"),
         }
     }
 }
@@ -4403,10 +4405,10 @@ impl<'de> serde::Deserialize<'de> for EdgeProvider {
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "static" => Ok(EdgeProvider::Static),
             "engine" => Ok(EdgeProvider::Engine),
             "lsp" => Ok(EdgeProvider::Lsp),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["static", "engine", "lsp"])),
+            "static" => Ok(EdgeProvider::Static),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["engine", "lsp", "static"])),
         }
     }
 }
@@ -5470,14 +5472,6 @@ impl<'de> serde::Deserialize<'de> for WarningCode {
             _ => Ok(WarningCode::Unknown),
         }
     }
-}
-/// Optional fields to include. An omitted member is `false`.
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields)]
-pub struct PackageSearchRequestInclude {
-    /// Attaches the declaration's source to each hit.
-    pub source: Option<bool>,
 }
 /// Ranking phase to execute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]

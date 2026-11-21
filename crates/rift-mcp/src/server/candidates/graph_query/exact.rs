@@ -21,6 +21,7 @@ const SYNTAX_ELEMENT_PAGES_MAX: usize = 64;
 pub(super) struct ExactFacts {
     revision: RevisionIri,
     symbol: Option<Box<Symbol>>,
+    history: Option<rift_protocol::read::SymbolHistory>,
     kinds: Vec<SyntaxElement>,
     source: bool,
     warnings: Vec<ReadWarning>,
@@ -43,6 +44,12 @@ impl ExactFacts {
             language: &symbol.language,
             revision: &self.revision,
         })?;
+        if let Some(history) = &self.history {
+            if !history.complete {
+                return Err(coverage_failure());
+            }
+            dataset.insert_history(history)?;
+        }
         for syntax_element in &self.kinds {
             dataset.insert_declared_syntax_element(id, syntax_element, self.source)?;
         }
@@ -60,6 +67,7 @@ impl RiftMcp {
         let facets = query.syntax_element_selection();
         let selection = facets
             .map(|selected| selected.symbols)
+            .or_else(|| query.history_selection())
             .or_else(|| query.symbol_selection());
         let Some(SymbolSelection::Identified(id)) = selection else {
             return Ok(Ok(None));
@@ -78,24 +86,31 @@ impl RiftMcp {
             )));
         };
         let id = SymbolId(id.to_owned());
-        let answer = self
-            .global
-            .exact_symbol(&configuration, &exact_request(&id, &revision))
-            .await?;
+        let mut request = exact_request(&id, &revision);
+        request.include.history = query.history_selection().is_some();
+        let answer = self.global.exact_symbol(&configuration, &request).await?;
         if answer.revision().is_some_and(|answer| answer != &revision) {
             return Ok(Err(unavailable(SymbolUnavailableReason::ViewContext)));
         }
         let mut result = ExactFacts {
             revision: RevisionIri::parse(&revision.to_string())?,
             symbol: None,
+            history: None,
             kinds: Vec::new(),
             source: facets.is_some_and(|selected| selected.source),
             warnings: Vec::new(),
         };
         match answer {
             GetSymbolResult::Found {
-                symbol, warnings, ..
+                symbol,
+                history,
+                warnings,
+                ..
             } => {
+                if request.include.history && history.is_none() {
+                    return Err(coverage_failure());
+                }
+                result.history = history;
                 result.symbol = Some(symbol);
                 result.warnings = warnings;
             }
@@ -134,16 +149,14 @@ impl RiftMcp {
         request.revision = Some(revision.clone());
         let mut remaining_bytes = limits.literal_bytes_max();
         for _ in 0..SYNTAX_ELEMENT_PAGES_MAX {
-            let page = self.global.symbol_kinds(configuration, &request).await?;
+            let mut page = self.global.symbol_kinds(configuration, &request).await?;
             if &page.revision != revision || &page.symbol != id {
                 return Ok(Some(unavailable(SymbolUnavailableReason::ViewContext)));
             }
             if page.warnings.iter().any(|warning| {
                 matches!(
                     warning,
-                    ReadWarning::SourceUnavailable { .. }
-                        | ReadWarning::ObjectUnavailable(_)
-                        | ReadWarning::ResultsTruncated { .. }
+                    ReadWarning::SourceUnavailable { .. } | ReadWarning::ObjectUnavailable(_)
                 )
             }) {
                 return Ok(Some(SearchUnavailable::Unavailable {
@@ -152,10 +165,21 @@ impl RiftMcp {
                     warnings: page.warnings,
                 }));
             }
-            let charge = crate::proxy::encode_bounded(&page, remaining_bytes)
-                .map_err(|_| coverage_failure())?
-                .len();
-            remaining_bytes -= charge;
+            // A producer bound on the facet page leaves the kinds it returned standing.
+            if page
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::ResultsTruncated { .. }))
+            {
+                page.warnings
+                    .retain(|warning| !matches!(warning, ReadWarning::ResultsTruncated { .. }));
+                record_facet_cut("results_max");
+            }
+            let Ok(encoded) = crate::proxy::encode_bounded(&page, remaining_bytes) else {
+                record_facet_cut("literal_bytes_max");
+                return Ok(None);
+            };
+            remaining_bytes -= encoded.len();
             result.kinds.extend(
                 page.declarations
                     .into_iter()
@@ -172,8 +196,20 @@ impl RiftMcp {
             request.revision = Some(page.revision);
             request.page += 1;
         }
-        Err(coverage_failure())
+        record_facet_cut("syntax_element_pages_max");
+        Ok(None)
     }
+}
+
+/// Writes the one record naming the bound that ended a package facet acquisition: the
+/// syntax kinds read before it stand, and the answer carries nothing for the cut.
+fn record_facet_cut(bound: &'static str) {
+    rift_tracing::warn!(
+        component = "search",
+        operation = "search.graph.acquire",
+        bound = bound,
+        "a package facet acquisition reached a bound; the answer holds the kinds it read"
+    );
 }
 
 pub(super) fn exact_request(id: &SymbolId, revision: &Revision) -> GetSymbolParams {
@@ -199,8 +235,10 @@ pub(super) fn selected_release(
         .filter(|entry| {
             entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER
                 && entry.availability == rift_protocol::dependencies::PackageAvailability::Canonical
-                && rift_dependency::StandardLibrary::from_name(&entry.name)
-                    .is_some_and(|library| library.runtime() == runtime)
+                && rift_dependency::StandardLibrary::from_name(&entry.name).is_some_and(|library| {
+                    library.runtime() == runtime
+                        || (library == rift_dependency::StandardLibrary::Rust && runtime == "rust")
+                })
         })
         .filter_map(|entry| entry.version.as_deref())
         .collect();
@@ -234,12 +272,22 @@ mod tests {
         context.add_standard_libraries(StandardLibraryAnswer {
             entries: vec![
                 entry("python", PackageSelector::Version("3.12.9".to_owned())),
+                entry("rust", PackageSelector::Version("1.98.1".to_owned())),
                 entry("node", PackageSelector::Requirement(">=0".to_owned())),
             ],
             ..StandardLibraryAnswer::default()
         });
         let release = selected_release(&context, &runtime).expect("exact CPython pin");
         assert_eq!(release.to_string(), "rift://revision/stdlib/cpython@3.12.9");
+        let rust = SymbolOwner::Runtime {
+            runtime: "rust".to_owned(),
+        };
+        assert_eq!(
+            selected_release(&context, &rust)
+                .expect("Rust source owner")
+                .to_string(),
+            "rift://revision/stdlib/rust@1.98.1"
+        );
         assert!(
             selected_release(
                 &context,

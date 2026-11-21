@@ -13,8 +13,10 @@ use rift_protocol::read::{Pagination, ReadWarning, SearchResult};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryCancellation, SemanticInventory,
+    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryAnswerProjection,
+    QueryCancellation, SemanticInventory,
 };
+use rift_server::InventoryCoverage;
 
 use super::{RiftMcp, read_failure};
 use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
@@ -22,13 +24,17 @@ use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
 mod edges;
 mod exact;
 mod installed;
+#[cfg(test)]
+mod inventory_tests;
 pub(crate) mod retrieval;
 
 use super::super::RequestDeadline;
 use edges::AcquiredAdjacency;
+pub(crate) use edges::EngineInventoryCache;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
+    pub(crate) include: rift_protocol::query::QueryInclude,
     pub(crate) configuration: &'a QueryConfiguration,
     pub(crate) page: u64,
     pub(crate) max_results: u64,
@@ -55,7 +61,7 @@ impl RiftMcp {
             rift_protocol::query::QUERY_MAX_RESULTS,
         )
         .map_err(read_failure)?;
-        let paging = (params.page, params.max_results);
+        let paging = (params.page, params.max_results, params.include);
         let deadline = self.request_deadline().await;
         let limits = GraphLimits::default();
         let query = tokio::time::timeout_at(
@@ -130,7 +136,7 @@ impl RiftMcp {
     async fn retained_query_page(
         &self,
         key: [u8; 32],
-        paging: (u64, u64),
+        paging: (u64, u64, rift_protocol::query::QueryInclude),
         revision: rift_protocol::revision::Revision,
         configuration: QueryConfiguration,
         deadline: RequestDeadline,
@@ -148,6 +154,7 @@ impl RiftMcp {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include: paging.2,
                         configuration: &configuration,
                         page: paging.0,
                         max_results: paging.1,
@@ -239,6 +246,9 @@ impl RiftMcp {
             .query;
         let reads = Arc::clone(&resolved.published.reads);
         let mut warnings = acquired.take_warnings();
+        if local_semantics.is_some() {
+            warnings.extend(reads.edge_identity_warning());
+        }
         warnings.extend(resolved.stale);
         if let Some(exact) = &mut exact {
             warnings.extend(exact.take_warnings());
@@ -323,6 +333,7 @@ impl RiftMcp {
                     .acquire_semantic_inventory(resolved, required, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
+                || query.history_selection().is_some()
                 || query.syntax_element_selection().is_some()
                 || !query.reads_base()
             {
@@ -382,7 +393,7 @@ fn project_retrievals(
         };
         let (flows, partial) = flows.finish(limit, warnings);
         if partial {
-            if flows.paths.is_empty() || !query.projects_flow_rows() {
+            if flows.paths.is_empty() || !query.admits_partial_rows() {
                 return Ok(ProjectedRetrievals::Unavailable);
             }
             coverage = ProjectedRetrievals::Partial;
@@ -428,25 +439,130 @@ fn project_local_endpoints(
 }
 
 fn project_semantic_inventory(
+    reads: &rift_server::ReadService,
     input: &rift_server::LocalSymbolViewInput,
     acquired: &AcquiredAdjacency,
     required: SemanticInventory,
     dataset: &mut rift_search::sparql::GraphDatasetBuilder,
     cancellation: &QueryCancellation,
-    deadline: std::time::Instant,
-) -> Result<(), RiftError> {
-    input.project_symbols(
-        rift_search::sparql::SymbolSelection::All,
-        dataset,
-        cancellation,
-        deadline,
-    )?;
+    deadline: RequestDeadline,
+) -> Result<InventoryCoverage, RiftError> {
+    let coverage = if required.symbols {
+        input.project_symbols(
+            rift_search::sparql::SymbolSelection::All,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?
+    } else {
+        InventoryCoverage::Complete
+    };
+    acquired.project_captured_inventory(dataset, input, reads, cancellation, deadline)?;
     acquired.project_local(
         dataset,
         input,
-        required.edges || required.references || required.calls,
+        rift_search::sparql::SemanticEdges {
+            relations: required.edges.relations
+                || required.adjacency.references
+                || required.adjacency.calls,
+            ..required.edges
+        },
         required.occurrences,
+    )?;
+    Ok(if acquired.is_partial() {
+        InventoryCoverage::Partial
+    } else {
+        coverage
+    })
+}
+
+/// Whether a symbol selection reads the captured inventory rather than one identity.
+const fn reads_inventory(selection: rift_search::sparql::SymbolSelection<'_>) -> bool {
+    !matches!(
+        selection,
+        rift_search::sparql::SymbolSelection::Identified(_)
     )
+}
+
+/// What a projection that reads the captured inventory, or one exact selection, reads from.
+#[derive(Clone, Copy)]
+struct InventoryProjection<'read> {
+    query: &'read GraphQuery,
+    input: &'read rift_server::LocalSymbolViewInput,
+    reads: &'read rift_server::ReadService,
+    acquired: &'read AcquiredAdjacency,
+    local_semantics: Option<SemanticInventory>,
+    exact: Option<&'read exact::ExactFacts>,
+}
+
+/// Projects the local facts a query without an adjacency selection reads. Returns the
+/// inventory's coverage when the projection read the captured inventory rather than one
+/// exact selection or identity.
+fn project_inventory(
+    projection: InventoryProjection<'_>,
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    cancellation: &QueryCancellation,
+    deadline: RequestDeadline,
+) -> Result<Option<InventoryCoverage>, RiftError> {
+    let InventoryProjection {
+        query,
+        input,
+        reads,
+        acquired,
+        local_semantics,
+        exact,
+    } = projection;
+    if let Some(required) = local_semantics {
+        return project_semantic_inventory(
+            reads,
+            input,
+            acquired,
+            required,
+            dataset,
+            cancellation,
+            deadline,
+        )
+        .map(Some);
+    }
+    if let Some(exact) = exact {
+        exact.project(dataset)?;
+        return Ok(None);
+    }
+    if let Some(selection) = query.history_selection() {
+        input.project_history(
+            reads,
+            selection,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+        return Ok(reads_inventory(selection).then_some(InventoryCoverage::Complete));
+    }
+    if let Some(selection) = query.syntax_element_selection() {
+        let coverage = input.project_syntax_elements(
+            reads,
+            selection,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+        return Ok(reads_inventory(selection.symbols).then_some(coverage));
+    }
+    if let Some(selection) = query.symbol_selection() {
+        let coverage =
+            input.project_symbols(selection, dataset, cancellation, deadline.at().into_std())?;
+        return Ok(reads_inventory(selection).then_some(coverage));
+    }
+    Ok(None)
+}
+
+/// Whether an answer claims an absence: no rows, no triples, or a false `ASK`.
+fn claims_absence(answer: &QueryAnswer) -> bool {
+    match answer {
+        QueryAnswer::Bindings { bindings, .. } => bindings.is_empty(),
+        QueryAnswer::Graph { triples } => triples.is_empty(),
+        QueryAnswer::Boolean { value } => !value,
+    }
 }
 
 fn constrain_provider_expiry<'view>(
@@ -475,7 +591,7 @@ impl AcquiredGraph {
         deadline: RequestDeadline,
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
-        paging: (u64, u64),
+        paging: (u64, u64, rift_protocol::query::QueryInclude),
         key: [u8; 32],
     ) -> Result<QueryOutput, RiftError> {
         let Self {
@@ -489,11 +605,18 @@ impl AcquiredGraph {
             configuration,
             mut warnings,
         } = self;
-        if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(incomplete_flows(warnings).into());
+        if acquired.is_incomplete() {
+            warnings.push(ReadWarning::EdgeCoverageMissing {
+                kinds: Vec::new(),
+                detail: "the selected edge read is incomplete, so edges outside its captured and engine coverage are missing from this answer".to_owned(),
+            });
+            if !query.admits_partial_rows() && !query.admits_partial_witness() {
+                return Ok(insufficient_coverage(warnings).into());
+            }
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
+        let mut inventory = InventoryCoverage::Complete;
         if let Some(selected) = &selected {
             if let Err(error) = acquired.project(&mut dataset, selected, &input) {
                 if lacks_coverage(&error) {
@@ -512,36 +635,38 @@ impl AcquiredGraph {
                 cancellation,
                 deadline.at().into_std(),
             )?;
-        } else if let Some(required) = local_semantics {
-            project_semantic_inventory(
-                &input,
-                &acquired,
-                required,
+        } else {
+            let inventory_read = project_inventory(
+                InventoryProjection {
+                    query,
+                    input: &input,
+                    reads: &reads,
+                    acquired: &acquired,
+                    local_semantics,
+                    exact: exact.as_ref(),
+                },
                 &mut dataset,
                 cancellation,
-                deadline.at().into_std(),
+                deadline,
             )?;
-        } else if let Some(exact) = &exact {
-            exact.project(&mut dataset)?;
-        } else if let Some(selection) = query.syntax_element_selection() {
-            input.project_syntax_elements(
-                &reads,
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
-        } else if let Some(selection) = query.symbol_selection() {
-            input.project_symbols(
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
+            if let Some(read) = inventory_read {
+                inventory = read;
+                for warning in input.warnings()? {
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+            }
         }
         let coverage = project_retrievals(query, &mut retrieved, &mut dataset, &mut warnings)?;
         if coverage == ProjectedRetrievals::Unavailable {
-            return Ok(incomplete_flows(warnings).into());
+            return Ok(insufficient_coverage(warnings).into());
+        }
+        let partial = acquired.leaves_facts_out()
+            || coverage == ProjectedRetrievals::Partial
+            || inventory == InventoryCoverage::Partial;
+        if partial && !query.admits_partial_rows() && !query.admits_partial_witness() {
+            return Ok(insufficient_coverage(warnings).into());
         }
         if query.names_local_graph() {
             if selected.is_some() {
@@ -552,12 +677,12 @@ impl AcquiredGraph {
         let Some(answer) =
             evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
         else {
-            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
+            return Ok(insufficient_coverage(warnings).into());
         };
-        if coverage == ProjectedRetrievals::Partial
-            && matches!(&answer, QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
-        {
-            return Ok(incomplete_flows(warnings).into());
+        // Over partial coverage an empty answer would claim an absence the missing facts may
+        // contradict, so it refuses with the warnings that name what is missing.
+        if partial && claims_absence(&answer) {
+            return Ok(insufficient_coverage(warnings).into());
         }
         let views = views.get().ok_or_else(retention_failure)?;
         let retention = QueryRetention {
@@ -578,7 +703,7 @@ struct QueryRetention<'answer> {
     key: [u8; 32],
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
-    paging: (u64, u64),
+    paging: (u64, u64, rift_protocol::query::QueryInclude),
     warnings: Vec<ReadWarning>,
     display: QueryDisplay,
     acquired: &'answer AcquiredAdjacency,
@@ -602,7 +727,8 @@ impl QueryRetention<'_> {
             .min();
         let input = input.with_query(self.key, bytes, expires);
         let mut response = None;
-        views.capture_with(input, |view| {
+        let limits = rift_server::RetainedViewLimits::from(self.configuration);
+        views.capture_with(input, limits, |view| {
             let mut view = view.clone();
             if !constrain_provider_expiry(&mut view, self.provider_views())? {
                 response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired).into());
@@ -615,6 +741,7 @@ impl QueryRetention<'_> {
                 &view,
                 self.answer,
                 QueryPageOptions {
+                    include: self.paging.2,
                     configuration: self.configuration,
                     page: self.paging.0,
                     max_results: self.paging.1,
@@ -660,11 +787,12 @@ fn evaluate_acquired_query(
     cancellation: &QueryCancellation,
     acquired: &AcquiredAdjacency,
 ) -> Result<Option<QueryAnswer>, RiftError> {
-    let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
-    Ok(
-        (!acquired.is_incomplete() || matches!(answer, QueryAnswer::Boolean { value: true }))
-            .then_some(answer),
-    )
+    let mut answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+    dataset.annotate_providers(&mut answer)?;
+    Ok((!acquired.is_incomplete()
+        || matches!(answer, QueryAnswer::Boolean { value: true })
+        || (query.admits_partial_rows() && !claims_absence(&answer)))
+    .then_some(answer))
 }
 
 /// Selects one fixed-size answer page within the accepted response byte bound.
@@ -673,9 +801,14 @@ pub(crate) fn query_page(
     answer: &QueryAnswer,
     options: QueryPageOptions<'_>,
 ) -> Result<QueryOutput, RiftError> {
+    let provider = rift_search::sparql::VocabularyProperty::Provider.iri();
+    let visible = |triple: &&rift_protocol::query::RdfTriple| {
+        !matches!(&triple.predicate,
+        rift_protocol::query::RdfTerm::Iri { value } if value == provider.as_str())
+    };
     let total = match answer {
         QueryAnswer::Bindings { bindings, .. } => bindings.len(),
-        QueryAnswer::Graph { triples } => triples.len(),
+        QueryAnswer::Graph { triples } => triples.iter().filter(visible).count(),
         QueryAnswer::Boolean { .. } => 1,
     };
     let pagination = Pagination::new(options.page, options.max_results, total as u64);
@@ -693,10 +826,17 @@ pub(crate) fn query_page(
             bindings: bindings[start..end].to_vec(),
         },
         QueryAnswer::Graph { triples } => QueryAnswer::Graph {
-            triples: triples[start..end].to_vec(),
+            triples: triples
+                .iter()
+                .filter(visible)
+                .skip(start)
+                .take(end - start)
+                .cloned()
+                .collect(),
         },
         QueryAnswer::Boolean { value } => QueryAnswer::Boolean { value: *value },
     };
+    let answer = answer.project(options.include);
     let output = QueryOutput::new(
         QueryReadResult::Results(Box::new(QueryResult {
             answer,
@@ -753,7 +893,7 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
     QueryReadResult::Unavailable(unavailable(reason))
 }
 
-fn incomplete_flows(warnings: Vec<ReadWarning>) -> QueryReadResult {
+fn insufficient_coverage(warnings: Vec<ReadWarning>) -> QueryReadResult {
     QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
         reason: SymbolUnavailableReason::InsufficientCoverage,
         view: None,
@@ -768,6 +908,93 @@ mod tests {
     use serde_json::{Value, json};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    pub(super) mod dependency_inventory;
+
+    #[test]
+    fn query_pages_project_requested_providers_before_counting_graph_rows() -> TestResult {
+        use rift_protocol::query::{QueryInclude, RdfTerm, RdfTriple};
+        use rift_protocol::read::EdgeProvider;
+        let providers = [
+            EdgeProvider::Engine,
+            EdgeProvider::Lsp,
+            EdgeProvider::Static,
+        ]
+        .into_iter()
+        .collect();
+        let edge = RdfTerm::BlankNode {
+            value: "edge".to_owned(),
+            providers,
+        };
+        let triple = |predicate: &str, object| RdfTriple {
+            subject: edge.clone(),
+            predicate: RdfTerm::Iri {
+                value: format!("urn:rift:vocabulary:{predicate}"),
+            },
+            object,
+        };
+        let mut triples = vec![triple(
+            "to",
+            RdfTerm::Iri {
+                value: "rift://symbol/local/rust/app/callee".to_owned(),
+            },
+        )];
+        triples.extend(["engine", "lsp", "static"].map(|provider| {
+            triple(
+                "provider",
+                RdfTerm::Literal {
+                    value: provider.to_owned(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#string".to_owned(),
+                },
+            )
+        }));
+        let answer = QueryAnswer::Graph { triples };
+        let view = CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(&"a".repeat(64))?,
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        };
+        for included in [false, true] {
+            for page in [1, 2] {
+                let output = query_page(
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        include: QueryInclude {
+                            providers: included,
+                        },
+                        configuration: &QueryConfiguration::default(),
+                        page,
+                        max_results: 1,
+                        warnings: Vec::new(),
+                        display: QueryDisplay::default(),
+                    },
+                )?;
+                let QueryReadResult::Results(result) = output.result else {
+                    panic!("paged graph")
+                };
+                assert_eq!(result.pagination, Some(Pagination::new(page, 1, 1)));
+                let QueryAnswer::Graph { triples } = &result.answer else {
+                    panic!("graph answer")
+                };
+                assert_eq!(triples.len(), usize::from(page == 1));
+                if page == 1 {
+                    let value = serde_json::to_value(&triples[0])?;
+                    assert!(
+                        value["predicate"]["value"]
+                            .as_str()
+                            .is_some_and(|value| !value.ends_with(":provider"))
+                    );
+                    assert_eq!(
+                        value["subject"].get("providers"),
+                        included
+                            .then(|| json!(["engine", "lsp", "static"]))
+                            .as_ref()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn query_key_names_normalized_text_revision_and_selection() -> TestResult {
@@ -809,6 +1036,53 @@ mod tests {
         assert_ne!(
             query_key(&serde, QueryLanguage::Sparql, &revision, 1)?,
             query_key(&tokio, QueryLanguage::Sparql, &revision, 1)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occurrence_inventory_does_not_project_unrequested_symbols_and_edges() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("entry.ts"),
+            "interface Value {}\ntype Alias = Value;\nconst unused = { first: 1, second: 2, third: 3 };\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let limits = GraphLimits::builder().triples_max(16).build()?;
+        let query = GraphQuery::parse(
+            "SELECT (COUNT(*) AS ?n) { ?target :usages ?usage }",
+            &limits,
+        )?;
+        let deadline = server.request_deadline().await;
+        let resolved = server
+            .published_workspace(super::super::super::wire::ErrorPhase::Read, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        let revision = resolved.published.reads.served_revision()?;
+        let epoch = resolved.published.epoch;
+        let key = query_key(&query, QueryLanguage::Sparql, &revision, epoch)?;
+        let graph = server
+            .prepare_graph(resolved, &query, limits, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .map_err(|reason| format!("{reason:?}"))?;
+        let output = graph.evaluate(
+            &query,
+            deadline,
+            &QueryCancellation::new(),
+            &server.local_views,
+            (1, 10, rift_protocol::query::QueryInclude::default()),
+            key,
+        )?;
+        assert!(
+            matches!(&output.result, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                    if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "1"))),
+            "{:?}",
+            output.result
         );
         Ok(())
     }
@@ -934,11 +1208,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distinct_queries_past_the_view_bound_release_and_evaluate_again() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            "[search.query]\nretained_views = 2\n",
+        )?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let query = |first: u64| QueryParams {
+            query: format!(
+                "SELECT ?value {{ VALUES ?value {{ {first} {} }} }} ORDER BY ?value",
+                first + 1
+            ),
+            max_results: 1,
+            ..Default::default()
+        };
+        let read = |request: QueryParams| {
+            let server = server.clone();
+            async move {
+                let output = server
+                    .graph_query(request)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?
+                    .0;
+                match output.result {
+                    QueryReadResult::Results(answer) => Ok::<_, String>(answer),
+                    QueryReadResult::Unavailable(unavailable) => Err(format!("{unavailable:?}")),
+                }
+            }
+        };
+        let mut evaluations = move || {
+            drain
+                .queued_records()
+                .iter()
+                .filter(|record| {
+                    record.message() == "worker admitted"
+                        && serde_json::from_str::<Value>(record.fields())
+                            .is_ok_and(|fields| fields["work"] == "graph query")
+                })
+                .count()
+        };
+        let first = read(query(0)).await?;
+        for distinct in 1..=5 {
+            let answer = read(query(distinct * 10)).await?;
+            assert_eq!(answer.pagination, Some(Pagination::new(1, 1, 2)));
+        }
+        assert_eq!(
+            evaluations(),
+            6,
+            "every distinct query past the bound is answered"
+        );
+        let mut released = query(0);
+        released.page = 2;
+        released.revision = first.revision.clone();
+        let answer = read(released).await?;
+        assert_eq!(answer.pagination, Some(Pagination::new(2, 1, 2)));
+        assert_eq!(
+            evaluations(),
+            1,
+            "a later page of a released view evaluates the query again"
+        );
+        let mut retained = query(50);
+        retained.page = 2;
+        retained.revision = first.revision;
+        let answer = read(retained).await?;
+        assert_eq!(answer.pagination, Some(Pagination::new(2, 1, 2)));
+        assert_eq!(
+            evaluations(),
+            0,
+            "a retained view still answers its later page"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_query_acquires_complete_local_semantics_for_general_algebra() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(
             directory.path(),
-            "[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
+            "[global]\nenabled = false\n[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
         )?;
         std::fs::write(
             directory.path().join("pyproject.toml"),
@@ -953,6 +1305,7 @@ mod tests {
             "from helper import beacon\n\nbeacon()\n\ndef caller() -> int:\n    return beacon() + beacon()\n\ncaller()\n",
         )?;
         let root = directory.path().canonicalize()?;
+        dependency_inventory::observed_python_environment(&root)?;
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let count = server
@@ -1221,14 +1574,14 @@ mod tests {
                         B => (C, 3),
                         _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
                     };
-                    let source = request["include"] == json!({"source": true});
+                    let source = request["include"]["source"] == json!(true);
                     let (seed_symbol, seed_source) = graph_fixture_symbol(seed, source);
                     let (next_symbol, next_source) = graph_fixture_symbol(next, source);
                     let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"provider": "static", "derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"providers": ["static"], "derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1279,7 +1632,7 @@ mod tests {
                     "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
                         "edge":{"from":caller,"to":seed,"kind":"calls",
-                            "kinds":["calls"],"provider": "static", "derivation":"resolution"}
+                            "kinds":["calls"],"providers": ["static"], "derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1421,25 +1774,43 @@ mod tests {
             "{witness:?}"
         );
 
-        std::fs::write(root.join("unestablished.py"), "def might_call(): pass\n")?;
-        let incomplete = RiftMcp::build_settled(&root, limits).await?;
-        let response = incomplete
+        std::fs::create_dir(root.join("invalid-directory"))?;
+        std::fs::write(
+            root.join("invalid-directory/unestablished.py"),
+            "def might_call(): pass\n",
+        )?;
+        let partial = RiftMcp::build_settled(&root, limits).await?;
+        let response = partial
             .graph_query(query)
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0
             .result;
-        assert!(
-            matches!(
-                response,
-                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                    reason: SymbolUnavailableReason::InsufficientCoverage,
-                    ..
-                })
-            ),
-            "{response:?}"
-        );
+        assert_identified_incoming_callers(response)?;
         service.abort();
+        Ok(())
+    }
+
+    fn assert_identified_incoming_callers(response: QueryReadResult) -> TestResult {
+        let QueryReadResult::Results(answer) = response else {
+            return Err(format!("identified callers remain available: {response:?}").into());
+        };
+        let expected = ["rift://symbol/local/python/app/hello", PACKAGE_BRIDGE];
+        assert!(
+            matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
+        if bindings.len() == expected.len() && bindings.iter().all(|row|
+            matches!(&row["caller"], rift_protocol::query::RdfTerm::Iri { value }
+                if expected.contains(&value.as_str())))),
+            "{answer:?}"
+        );
+        assert!(
+            answer.warnings.iter().any(
+                |warning| matches!(warning, ReadWarning::EdgeCoverageMissing { detail, .. }
+            if detail.contains("identities"))
+            ),
+            "{:?}",
+            answer.warnings
+        );
         Ok(())
     }
 
@@ -1599,7 +1970,10 @@ mod tests {
         );
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["include"], json!({"source": true}));
+        assert_eq!(
+            requests[0]["include"],
+            json!({"source": true, "providers": true})
+        );
         service.abort();
         Ok(())
     }
@@ -1945,7 +2319,150 @@ mod tests {
         Ok(())
     }
 
-    async fn static_endpoint(
+    /// Asserts that whole-inventory and seeded reads of one workspace answer static edges to
+    /// `expected` dependency and standard-library symbols, and that the inventory names
+    /// the edge kinds whose sites static analysis left without a target.
+    async fn assert_external_edges(
+        files: &[(&str, &str)],
+        heritage: &str,
+        expected: &[&str],
+    ) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        for (path, text) in files {
+            let path = directory.path().join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+        }
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let caller = static_endpoint(&server, "encode").await?;
+        let mut answers = String::new();
+        for query in [
+            "SELECT ?a ?b { ?a :calls ?b }".to_owned(),
+            format!("SELECT ?a ?b {{ ?a {heritage} ?b }}"),
+        ] {
+            let output = server
+                .graph_query(QueryParams {
+                    query: query.clone(),
+                    language: QueryLanguage::Sparql,
+                    max_results: 100,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0
+                .result;
+            assert!(
+                matches!(&output, QueryReadResult::Results(_)),
+                "{query}: {output:?}"
+            );
+            let rendered = format!("{output:?}");
+            assert!(
+                rendered.contains("EdgeCoverageMissing") && rendered.contains("Calls"),
+                "{query}: {rendered}"
+            );
+            answers.push_str(&rendered);
+        }
+        for target in expected {
+            assert!(answers.contains(target), "{target} not in {answers}");
+        }
+        let target = expected.first().ok_or("an expected target")?;
+        let seeded = server
+            .graph_query(QueryParams {
+                query: format!("ASK {{ <{caller}> :calls <{target}> }}"),
+                language: QueryLanguage::Sparql,
+                ..Default::default()
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0
+            .result;
+        assert!(
+            matches!(&seeded, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
+            "{caller}: {seeded:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_rust_edges_to_dependency_and_standard_library_symbols() -> TestResult
+    {
+        let files = [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde_json = \"1\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "use std::fmt;\npub struct Task;\nimpl fmt::Display for Task {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }\n}\npub fn encode(task: &Task) -> String { task.label(); serde_json::to_string(&1).unwrap_or_default() }\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":implements",
+            &[
+                "rift://symbol/cargo/crates.io/serde_json/rust/serde_json/to_string",
+                "rift://symbol/stdlib/rust/rust/std/fmt/Display",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_python_edges_to_dependency_and_standard_library_symbols()
+    -> TestResult {
+        let files = [
+            (
+                "pyproject.toml",
+                "[project]\nname = 'app'\nversion = '0.1.0'\ndependencies = ['greeting==1.0.0']\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n",
+            ),
+            (
+                "app.py",
+                "import os\nfrom greeting.core import greet, Base\n\nclass Child(Base):\n    pass\n\ndef encode(items):\n    greet()\n    items.sort()\n    return len(os.path.join('a', 'b'))\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":extends",
+            &[
+                "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet",
+                "rift://symbol/stdlib/cpython/python/builtins/len",
+                "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/Base",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_typescript_edges_to_dependency_and_standard_library_symbols()
+    -> TestResult {
+        let files = [
+            (
+                "package.json",
+                "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"zod\":\"4.6.7\"}}",
+            ),
+            (
+                "src/app.ts",
+                "import { parse, ZodType } from \"zod\";\nexport class Shape implements ZodType {}\nexport function encode() { undeclared(); return parse(1); }\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":implements",
+            &[
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/parse",
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType",
+            ],
+        )
+        .await
+    }
+
+    pub(super) async fn static_endpoint(
         server: &RiftMcp,
         name: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

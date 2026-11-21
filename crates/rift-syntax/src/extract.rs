@@ -77,6 +77,27 @@ impl<'tree> Visits<'tree> {
         index
     }
 
+    /// The innermost named syntax element containing a nonempty source range.
+    /// Source order locates the last possible child; cached parents find its owner.
+    pub(crate) fn containing(&self, range: ByteRange) -> Option<Visited<'_, 'tree>> {
+        let start = usize::try_from(range.start).ok()?;
+        let end = usize::try_from(range.end).ok()?;
+        if start >= end {
+            return None;
+        }
+        let mut index = self
+            .syntax_elements
+            .partition_point(|element| element.start_byte() <= start)
+            .checked_sub(1)?;
+        loop {
+            let element = self.syntax_elements[index];
+            if element.start_byte() <= start && end <= element.end_byte() {
+                return Some(self.visited(index));
+            }
+            index = self.parents[index]?;
+        }
+    }
+
     /// The visited syntax element at `index`.
     fn visited(&self, index: usize) -> Visited<'_, 'tree> {
         Visited {
@@ -273,8 +294,21 @@ pub(crate) fn extract_with_capture(
     limits: SyntaxLimits,
     language: &Language,
     rules: &dyn GrammarRules,
-    mut capture: Option<&mut crate::static_analysis::Capture<'_>>,
+    capture: Option<&mut crate::static_analysis::Capture<'_>>,
 ) -> Result<Extraction, RiftError> {
+    extract_with_visits(root, source, limits, language, rules, capture)
+        .map(|(extraction, _)| extraction)
+}
+
+/// Retains the bounded walk's links for a later grammar-specific collection pass.
+pub(crate) fn extract_with_visits<'tree>(
+    root: Node<'tree>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    language: &Language,
+    rules: &dyn GrammarRules,
+    mut capture: Option<&mut crate::static_analysis::Capture<'_>>,
+) -> Result<(Extraction, Visits<'tree>), RiftError> {
     let text = source.text;
     let names = SyntaxNames::new(language).expect("a syntax provider uses a shipped grammar");
     let grammar = names.grammar();
@@ -366,7 +400,7 @@ pub(crate) fn extract_with_capture(
             depth + 1,
         );
     }
-    Ok((syntax_elements, symbols, export_bindings))
+    Ok(((syntax_elements, symbols, export_bindings), visits))
 }
 
 /// One syntax element the walk has queued, with what its visit needs from its parent.
@@ -534,7 +568,7 @@ mod tests {
     use rift_core::ProjectPath;
     use tree_sitter::{Node, Parser};
 
-    use super::{Declaration, GrammarRules, Visited, extract};
+    use super::{Declaration, GrammarRules, Visited, extract_with_visits};
     use crate::failure::RiftError;
     use crate::provider::{SyntaxLimits, SyntaxSource};
     use crate::{ShippedLanguage, SyntaxNames};
@@ -611,14 +645,29 @@ mod tests {
             compared: Cell::new(0),
             names: SyntaxNames::new(&language).expect("a shipped grammar has names"),
         };
-        extract(
+        let (_, visits) = extract_with_visits(
             tree.root_node(),
             source,
             SyntaxLimits::default(),
             &language,
             &oracle,
+            None,
         )
         .expect("the fixture must walk");
+        let mut pending = vec![tree.root_node()];
+        let mut cursor = tree.root_node().walk();
+        while let Some(element) = pending.pop() {
+            if element.start_byte() < element.end_byte() {
+                let range = super::byte_range(element).expect("fixture range");
+                assert_eq!(
+                    visits.containing(range).map(Visited::syntax_element),
+                    tree.root_node()
+                        .named_descendant_for_byte_range(element.start_byte(), element.end_byte()),
+                    "cached range lookup must select the compiler's named owner",
+                );
+            }
+            pending.extend(element.children(&mut cursor));
+        }
         oracle.compared.get()
     }
 

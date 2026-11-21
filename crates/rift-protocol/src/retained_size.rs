@@ -84,6 +84,12 @@ macro_rules! heap_field {
     ($value:expr, $tracker:expr) => {
         $value.get_heap_size_with_tracker($tracker)
     };
+    ($value:expr, $tracker:expr, edge_providers) => {
+        (
+            btree_material_bytes::<crate::read::EdgeProvider, ()>($value.len()),
+            $tracker,
+        )
+    };
     ($value:expr, $tracker:expr, vector) => {
         retained_vector_material($value, $tracker)
     };
@@ -502,7 +508,7 @@ heap_fields!(crate::read::SourceUnitSpan, unit);
 heap_fields!(crate::producer::ProducerName, 0);
 heap_fields!(crate::producer::ProducerRevision, 0);
 heap_fields!(crate::producer::FactProducer, name, revision);
-heap_fields!(crate::read::Edge, from, kind, kinds => vector, to, occurrence, producer, extensions);
+heap_fields!(crate::read::Edge, from, kind, kinds => vector, to, occurrence, providers => edge_providers, producer, extensions);
 heap_fields!(crate::search::GraphHop, edge);
 
 impl GetSize for crate::read::EdgeKind {
@@ -585,7 +591,7 @@ mod tests {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },
             }),
-            provider: crate::read::EdgeProvider::Static,
+            providers: std::collections::BTreeSet::from([crate::read::EdgeProvider::Static]),
             derivation: crate::read::EdgeDerivation::Resolution,
             confidence: None,
             producer: Some(crate::producer::FactProducer {
@@ -599,6 +605,7 @@ mod tests {
             + producer.name.as_str().len()
             + producer.revision.as_str().len()
             + edge.kinds.capacity() * std::mem::size_of::<crate::read::EdgeKind>()
+            + btree_material_bytes::<crate::read::EdgeProvider, ()>(edge.providers.len())
             + edge.from.0.capacity()
             + edge.to.0.capacity();
         let hop = crate::search::GraphHop {

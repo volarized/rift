@@ -30,6 +30,217 @@ fn javascript(text: &str) -> SyntaxDocument {
     analyze(&JavaScriptSyntaxProvider::default(), "src/main.js", text)
 }
 
+#[test]
+fn test_commonjs_local_object_members_distinguish_receiver_declarations_from_body_aliases() {
+    for (source, method, alias) in [
+        (
+            "var res = {}; res.clear = function() { var res = this; return res; };",
+            "res.clear",
+            "res.clear.res",
+        ),
+        (
+            "function View() {} View.prototype.render = function() { var View = this; return View; };",
+            "View.render",
+            "View.render.View",
+        ),
+    ] {
+        for document in [javascript(source), typescript(source)] {
+            assert_eq!(symbol(&document, method).kind, "method");
+            assert_eq!(symbol(&document, alias).kind, "variable");
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_keep_attached_documentation() {
+    for (prefix, assignment, name) in [
+        ("var object = {};", "object.run", "object.run"),
+        ("function View() {}", "View.prototype.run", "View.run"),
+    ] {
+        for gap in ["\n", "\n\n"] {
+            let source = format!("{prefix}\n/** Runs. */{gap}{assignment} = function() {{}};");
+            for document in [javascript(&source), typescript(&source)] {
+                let method = symbol(&document, name);
+                assert!(spelled(&source, method.item_range).starts_with(assignment));
+                if gap == "\n" {
+                    assert_eq!(method.documentation[0].text, "Runs.");
+                    assert!(spelled(&source, method.range).starts_with("/** Runs. */"));
+                    assert_eq!(
+                        spelled(&source, method.documentation_ranges[0]),
+                        "/** Runs. */"
+                    );
+                } else {
+                    assert!(method.documentation.is_empty());
+                    assert!(spelled(&source, method.range).starts_with(assignment));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_keep_callable_owners() {
+    let source = "var res = {}; res.clear = function clear() { const opts = { expires: 1 }; return opts.expires; }; res.set = function() { const opts = {}; opts.expires = 2; return opts; }; module.exports = res;";
+    for document in [javascript(source), typescript(source)] {
+        for name in ["res.clear", "res.set"] {
+            let method = symbol(&document, name);
+            assert_eq!(method.kind, "method");
+            assert_eq!(method.container.as_deref(), Some("res"));
+        }
+        let property = symbol(&document, "res.clear.opts.expires");
+        assert_eq!(
+            spelled(source, property.name_range.expect("property name")),
+            "expires"
+        );
+        assert_eq!(symbol(&document, "res.set.opts").kind, "variable");
+        assert!(
+            !document
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.qualified_name == "res.set.opts.expires")
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_refuse_constructors_with_colliding_lexical_identities() {
+    let source = "unknown(function() { function View() {} View.prototype.render = function() {}; }); unknown(function() { function View() {} View.prototype.render = function() {}; });";
+    for document in [javascript(source), typescript(source)] {
+        assert!(
+            !document
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.kind == "method")
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_refuse_replaced_constructor_or_prototype_values() {
+    for change in [
+        "View = Other;",
+        "View.prototype = Other.prototype;",
+        "View[key] = other;",
+        "eval('replace()');",
+    ] {
+        let source =
+            format!("function View() {{}} {change} View.prototype.render = function() {{}};");
+        for document in [javascript(&source), typescript(&source)] {
+            assert!(
+                !document
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.kind == "method"),
+                "{change}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_keep_lexical_constructor_owners() {
+    let source = "function View() {} View.prototype.render = function render() { const opts = { value: 1 }; };\nfunction nested() { function View() {} View.prototype.lookup = function() {}; }\nfunction shadow(View) { View.prototype.hidden = function() {}; }\nfunction duplicate() { function View() {} function View() {} View.prototype.ambiguous = function() {}; }\nUnknown.prototype.missing = function() {};";
+    for document in [javascript(source), typescript(source)] {
+        for name in ["View.render", "nested.View.lookup"] {
+            let method = symbol(&document, name);
+            assert_eq!(method.kind, "method");
+            assert_eq!(
+                method.container.as_deref(),
+                name.rsplit_once('.').map(|(parent, _)| parent)
+            );
+            assert_eq!(
+                spelled(source, method.name_range.expect("method name")),
+                method.name
+            );
+            assert!(spelled(source, method.item_range).contains("prototype"));
+            assert!(spelled(source, method.body_range.expect("method body")).starts_with('{'));
+        }
+        assert_eq!(symbol(&document, "View.render.opts.value").kind, "property");
+        assert!(
+            !document
+                .symbols()
+                .iter()
+                .any(|symbol| ["hidden", "ambiguous", "missing"].contains(&symbol.name.as_str()))
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_keep_names_and_lexical_children() {
+    let source = "exports.run = function(value) { const local = {}; };\nexports.other = function inner() { const local = {}; };\nmodule.exports.third = function named() {};\nmodule.exports = function(value) {};";
+    for document in [javascript(source), typescript(source)] {
+        for (name, token) in [
+            ("run", "run"),
+            ("other", "other"),
+            ("third", "third"),
+            ("default", "exports"),
+        ] {
+            let function = symbol(&document, name);
+            assert_eq!(function.kind, "function");
+            assert_eq!(
+                spelled(source, function.name_range.expect("assignment name")),
+                token
+            );
+            assert!(spelled(source, function.item_range).contains("function"));
+        }
+        for name in ["run.local", "other.local"] {
+            assert_eq!(symbol(&document, name).kind, "variable");
+        }
+    }
+}
+
+#[test]
+fn test_typescript_loop_bindings_keep_each_declaration() {
+    let document =
+        typescript("for (const [leftName, left] of entries) { for (const key in value) { key; } }");
+    let names = document
+        .symbols()
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["leftName", "left", "key"]);
+}
+
+#[test]
+fn test_type_literal_members_and_catch_names_keep_their_declarations() {
+    let document = typescript(
+        "type Result = { value: string; run(): void }; function root() { try {} catch (error) { const value = error; } }",
+    );
+    for name in ["Result.value", "Result.run", "root.error"] {
+        assert!(!symbol(&document, name).name.is_empty());
+    }
+}
+
+#[test]
+fn test_object_members_keep_names_callable_values_and_nested_containers() {
+    // #753: object members retain the declaration holding their source.
+    let source = "const dictionary = { url: 'URL', validate: (value: string) => value, nested: { value: 1 }, short };";
+    let document = typescript(source);
+    for name in [
+        "dictionary.url",
+        "dictionary.validate",
+        "dictionary.nested",
+        "dictionary.nested.value",
+        "dictionary.short",
+    ] {
+        assert_eq!(symbol(&document, name).kind, "property");
+    }
+    assert!(
+        symbol(&document, "dictionary.validate")
+            .kinds
+            .contains(&SymbolKind::Callable)
+    );
+    assert_eq!(
+        spelled(
+            source,
+            symbol(&document, "dictionary.url")
+                .name_range
+                .expect("member name")
+        ),
+        "url"
+    );
+}
+
 /// Each declaration's qualified name, container, and kind word.
 fn declared(document: &SyntaxDocument) -> Vec<(&str, Option<&str>, &str)> {
     document
@@ -238,6 +449,7 @@ fn test_nested_declarations_qualify_under_their_enclosing_declaration() {
             ("Widget.go.step", Some("Widget.go"), "variable"),
             ("obj", None, "variable"),
             ("obj.method", Some("obj"), "method"),
+            ("obj.prop", Some("obj"), "property"),
             ("picked", None, "variable"),
         ]
     );

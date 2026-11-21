@@ -441,12 +441,20 @@ carrying its `root`. History retains the existing common Git store and its fill 
 <VersionBadge version="v0.0.47" />
 
 The initial publication answers reads before discovery finishes. The supervisor discovers visible
-paths, publishes their map counts, and then captures and analyzes bounded batches. Each publication
-owns its map, source catalog, configuration, and preparation counts.
+paths, publishes their map counts, and then captures and analyzes bounded batches. It publishes
+the first batch of 512 files, then the complete index. Semantic facts, documentation, and the
+declaration inventory are built over every prepared file of a publication, so a publication of
+each larger part of the files would build them again for the files already published. Each
+publication owns its map, source catalog, configuration, and preparation counts.
 
 `search` and `get_symbol` use the declarations already prepared. Their
 [`local_index_preparing`](/docs/developer/protocol/mcp#reads) warning remains until their selected
 local scope is complete, including an exact symbol read that already found a declaration. A `facets` read refuses while source preparation is incomplete.
+
+Static calls, references, and containment resolve across files. A publication of a part of the
+sources leaves that pass out: it holds no static edge and reports unavailable static call coverage
+for every source unit. The publication that completes preparation runs the pass once over every
+source. A publication after an edit runs it again.
 
 The index keeps each file's symbols but not its complete syntax element table: a parse shares its syntax elements with
 the path-independent syntax facts, and the index releases them when it takes the facts. A `facets`

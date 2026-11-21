@@ -83,16 +83,42 @@ fn static_call_targets_follow_edits_and_held_views_keep_original_occurrences() {
             .iter()
             .find(|occurrence| occurrence.role == rift_core::ReferenceRole::Call)
             .expect("captured call");
-        assert_eq!(call.target_binding.unit().to_string(), expected);
+        assert_eq!(
+            call.target_binding
+                .as_ref()
+                .expect("target declaration")
+                .unit()
+                .to_string(),
+            expected
+        );
         assert_eq!(
             call.source_digest,
             FileDigest::of(source.source().as_bytes())
         );
     }
     let deleted_view = static_project(&[&edited], 9, Some(&edited_view));
-    assert!(deleted_view.static_occurrences().is_empty());
-    assert_eq!(original_view.static_occurrences().len(), 2);
-    assert_eq!(edited_view.static_occurrences().len(), 2);
+    assert!(
+        !deleted_view
+            .static_occurrences()
+            .iter()
+            .any(|occurrence| occurrence.role == rift_core::ReferenceRole::Call)
+    );
+    for view in [&original_view, &edited_view] {
+        assert_eq!(
+            view.static_occurrences()
+                .iter()
+                .filter(|occurrence| occurrence.role == rift_core::ReferenceRole::Call)
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.static_occurrences()
+                .iter()
+                .filter(|occurrence| occurrence.role == rift_core::ReferenceRole::Import)
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]
@@ -274,4 +300,41 @@ fn captured_source_membership_mismatch_and_duplicate_documents_refuse() {
         WorkspaceSemantics::build_captured_project_facts(input, &[&file, &file], 16, 16, 7, None)
             .is_err()
     );
+}
+
+#[test]
+fn typescript_reexports_retain_alias_declarations_and_edges() {
+    let barrel = source_file(
+        "index.ts",
+        "export * from './jobs.js'; export { default as run } from './job.js';",
+    );
+    let jobs = source_file("jobs.ts", "export function leaf() {}");
+    let job = source_file("job.ts", "export default function () { return 1; }");
+    let view = static_project(&[&barrel, &jobs, &job], 1, None);
+    let aliases = view
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == rift_protocol::read::EdgeKind::Aliases)
+        .collect::<Vec<_>>();
+    assert_eq!(aliases.len(), 2);
+    assert!(
+        aliases
+            .iter()
+            .any(|edge| edge.from().as_str().ends_with("index.ts/leaf")
+                && edge.to().as_str().ends_with("jobs.ts/leaf"))
+    );
+    assert!(
+        aliases
+            .iter()
+            .any(|edge| edge.from().as_str().ends_with("index.ts/run")
+                && edge.to().as_str().ends_with("job.ts/default"))
+    );
+    for alias in aliases {
+        assert!(
+            view.graph()
+                .records()
+                .iter()
+                .any(|record| record.identity() == Some(alias.from()))
+        );
+    }
 }

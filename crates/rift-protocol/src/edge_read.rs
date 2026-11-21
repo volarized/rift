@@ -52,7 +52,7 @@ pub struct EdgeCapability {
     pub bounds: Option<EdgeBounds>,
 }
 
-/// Opaque identity of one original record within its selected publication.
+/// Opaque identity of one merged edge or physical usage within its selected publication.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct EdgeRecordId(pub(crate) crate::identity::SourceDigest);
@@ -67,7 +67,7 @@ impl JsonSchema for EdgeRecordId {
         schema.insert(
             "description".to_owned(),
             serde_json::Value::String(
-                "Opaque full identity of one original edge record within its selected publication."
+                "Opaque full identity of one merged edge or physical usage within its selected publication."
                     .to_owned(),
             ),
         );
@@ -91,7 +91,7 @@ impl EdgeRecordId {
     }
 }
 
-/// One original edge record, independent of equal endpoint or evidence payloads.
+/// One edge merged by source, exact kind, target and physical occurrence.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeRecord {
@@ -128,12 +128,15 @@ pub struct EdgeSelection {
     pub kinds: Vec<EdgeKind>,
 }
 
-/// The optional projections of records in an edge page. An omitted member is `false`.
+/// The optional projections of read records. An omitted member is `false`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(example = serde_json::json!({"source": true}))]
 pub struct EdgeInclude {
-    /// Attaches the exact UTF-8 bytes of the selected source units.
+    /// Attaches the sorted analyses that produced each merged edge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub providers: bool,
+    /// Attaches source text to the selected records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub source: bool,
 }
@@ -142,7 +145,7 @@ impl EdgeInclude {
     /// Whether the caller requested no projection.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        !self.source
+        !self.source && !self.providers
     }
 }
 
@@ -179,7 +182,7 @@ pub struct QuerySource {
     pub unit: SourceUnitId,
     /// Full digest of the selected physical bytes, including when text is unrequested.
     pub digest: crate::identity::SourceDigest,
-    /// Selected text, absent when source is unavailable or unrequested.
+    /// Exact UTF-8 text of the selected source unit, absent when unavailable or unrequested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 }
@@ -207,16 +210,16 @@ pub struct EdgeSearchRequest {
     pub view: Option<CapturedViewId>,
 }
 
-/// Original edge records for one requested subject on this page.
+/// Merged edge records for one requested subject on this page.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeGroup {
     /// Requested canonical subject, including when its adjacency is empty.
     pub seed: SymbolId,
-    /// Original records, preserving parallel edges, evidence and occurrences.
+    /// Merged records, preserving distinct kinds and physical occurrences. Producer rows of the same edge consume one slot.
     pub edges: Vec<EdgeRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
-    /// Page limits count distinct original record identities across edges and usages.
+    /// Page limits count distinct merged edges and physical usages across their record identities.
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

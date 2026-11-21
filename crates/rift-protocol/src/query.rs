@@ -31,9 +31,16 @@ pub enum QueryLanguage {
     {
         "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }",
         "language": "sparql"
+    },
+    {
+        "query": "SELECT ?edge { ?caller :calls ?callee . ?edge a :Edge; :from ?caller; :to ?callee }",
+        "include": { "providers": true }
     }
 ]))]
 pub struct QueryParams {
+    /// Attaches the sorted analyses that produced each returned edge.
+    #[serde(default, skip_serializing_if = "QueryInclude::is_empty")]
+    pub include: QueryInclude,
     /// Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex
     /// retrieval and `SERVICE :flows` for call paths around ranked symbols.
     pub query: String,
@@ -53,6 +60,25 @@ pub struct QueryParams {
     pub revision: Option<crate::revision::Revision>,
 }
 
+/// Optional projections of a query answer. An omitted member is `false`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(example = serde_json::json!({"providers": true}))]
+pub struct QueryInclude {
+    /// Attaches `providers` to merged edge terms and call steps. Explicit SPARQL
+    /// selections and filters on `:provider` retain the stored producer facts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub providers: bool,
+}
+
+impl QueryInclude {
+    /// Whether the caller requested no projection.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.providers
+    }
+}
+
 /// Most answer rows in one query page.
 pub const QUERY_MAX_RESULTS: u64 = 1000;
 fn default_page() -> u64 {
@@ -65,6 +91,7 @@ impl Default for QueryParams {
     fn default() -> Self {
         Self {
             query: String::new(),
+            include: QueryInclude::default(),
             language: QueryLanguage::default(),
             page: default_page(),
             max_results: default_max_results(),
@@ -88,8 +115,10 @@ pub struct QueryResult {
     /// The indexed revision this answer read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<crate::revision::Revision>,
-    /// Coverage and discovery limits affecting the query result. For `SERVICE :flows`,
-    /// `traversal_truncated` reports the visited symbol count and names the bound in `detail`.
+    /// Coverage and discovery limits affecting the query result. An answer read from partly
+    /// covered facts carries the warnings that name what is missing, and every row it returns
+    /// stands. For `SERVICE :flows`, `traversal_truncated` reports the visited symbol count and
+    /// names the bound in `detail`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
@@ -152,29 +181,65 @@ pub enum QueryReadResult {
     Unavailable(SearchUnavailable),
 }
 
-/// Bounds on one query result page.
+/// Views one server retains when `[search.query] retained_views` is omitted.
+pub const QUERY_RETAINED_VIEWS_DEFAULT: u64 = 256;
+/// Most views `[search.query] retained_views` accepts.
+pub const QUERY_RETAINED_VIEWS_MAX: u64 = 4096;
+/// Retained view material when `[search.query] retained_size` is omitted: 8 GiB.
+pub const QUERY_RETAINED_BYTES_DEFAULT: u64 = 8 << 30;
+/// Least retained view material `[search.query] retained_size` accepts: 1 MiB.
+pub const QUERY_RETAINED_BYTES_MIN: u64 = 1 << 20;
+/// Most retained view material `[search.query] retained_size` accepts: 64 GiB.
+pub const QUERY_RETAINED_BYTES_MAX: u64 = 64 << 30;
+
+/// Bounds on one query result page and on the views retained for later pages.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_query_ranges)]
 pub struct QueryConfiguration {
     /// Most encoded bytes on one page, from 1 KiB to 4 MiB.
     pub page_limit: crate::configuration::ByteSize,
+    /// Most views the server retains for later pages, 1 to 4096. A new view past
+    /// the bound releases the least recently used one.
+    #[schemars(range(min = 1, max = QUERY_RETAINED_VIEWS_MAX))]
+    pub retained_views: u64,
+    /// Most material the retained views hold together, 1mb to 64gb. A new view past
+    /// the bound releases the least recently used ones; a view larger than the bound
+    /// alone is refused.
+    pub retained_size: crate::configuration::ByteSize,
 }
 
 impl Default for QueryConfiguration {
     fn default() -> Self {
         Self {
             page_limit: crate::configuration::ByteSize::from_bytes(4 * 1024 * 1024),
+            retained_views: QUERY_RETAINED_VIEWS_DEFAULT,
+            retained_size: crate::configuration::ByteSize::from_bytes(QUERY_RETAINED_BYTES_DEFAULT),
         }
     }
 }
 
 impl QueryConfiguration {
     pub(crate) fn violation(&self) -> Option<crate::configuration::ConfigurationViolation> {
-        crate::configuration::first_out_of_range([(
-            "search.query.page_limit",
-            self.page_limit.bytes(),
-            1024,
-            4 * 1024 * 1024,
-        )])
+        crate::configuration::first_out_of_range([
+            (
+                "search.query.page_limit",
+                self.page_limit.bytes(),
+                1024,
+                4 * 1024 * 1024,
+            ),
+            (
+                "search.query.retained_views",
+                self.retained_views,
+                1,
+                QUERY_RETAINED_VIEWS_MAX,
+            ),
+            (
+                "search.query.retained_size",
+                self.retained_size.bytes(),
+                QUERY_RETAINED_BYTES_MIN,
+                QUERY_RETAINED_BYTES_MAX,
+            ),
+        ])
     }
 }

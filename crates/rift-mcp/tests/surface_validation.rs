@@ -79,10 +79,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
-    assert!(
-        structured.get("warnings").is_none(),
-        "{context}: {structured:#}"
-    );
+    assert_fixture_warnings(name, request, structured);
     assert!(
         structured["documentation"].get("warnings").is_none(),
         "{context}: {structured:#}"
@@ -135,6 +132,43 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             }
         }
     }
+}
+
+fn assert_fixture_warnings(name: &str, request: &Value, structured: &Value) {
+    use rift_protocol::read::ReadWarning;
+
+    let Some(warnings) = structured.get("warnings") else {
+        return;
+    };
+    assert_eq!(name, "search", "{structured:#}");
+    let query = request["query"].as_str().expect("query statement");
+    assert!(
+        [":calls", ":references", ":usages"]
+            .iter()
+            .any(|predicate| query.contains(predicate)),
+        "only edge reads omit the fixture's unlinked declarations: {request:#}"
+    );
+    let warnings: Vec<rift_protocol::read::ReadWarning> =
+        serde_json::from_value(warnings.clone()).expect("typed read warnings");
+    // The unlinked change_witness.rs holds two declarations without identities.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| matches!(warning,
+        ReadWarning::EdgeCoverageMissing { kinds, detail }
+            if kinds.is_empty() && detail.contains("identities: 2;")))
+            .count(),
+        1,
+        "{warnings:?}"
+    );
+    // Mixed-language reads retain their captured and engine coverage warnings too.
+    assert!(
+        warnings.iter().all(|warning| matches!(
+            warning,
+            ReadWarning::EdgeCoverageMissing { .. } | ReadWarning::EngineAnalysisUnavailable { .. }
+        )),
+        "{warnings:?}"
+    );
 }
 
 /// Exact retrieval reaches the released owner its canonical identity names.
@@ -1265,11 +1299,10 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     Ok(())
 }
 
-/// A global API with declaration lookups but missing edge coverage returns
-/// typed unavailability in the advertised search result schema.
+/// A named runtime call remains schema-valid beside a warning for missing edge coverage.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_package_walk_with_missing_edge_coverage_matches_the_served_schema() -> TestResult {
+async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> TestResult {
     let global = GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
         ..global_api::FixtureOptions::default()
@@ -1307,9 +1340,19 @@ async fn a_package_walk_with_missing_edge_coverage_matches_the_served_schema() -
         &structured,
         "an outgoing walk naming package callees",
     );
-    assert_eq!(structured["outcome"], "unavailable", "{structured}");
+    let rows = workspace_client::query::rows(&structured)?;
+    assert_eq!(rows.len(), 1, "{structured}");
     assert_eq!(
-        structured["reason"], "insufficient_coverage",
+        workspace_client::query::iri(&rows[0], "symbol")?,
+        "rift://symbol/stdlib/cpython/python/builtins/len",
+        "{structured}"
+    );
+    assert!(
+        structured["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|warning| warning["code"] != "edge_coverage_missing"),
         "{structured}"
     );
     client.cancel().await?;

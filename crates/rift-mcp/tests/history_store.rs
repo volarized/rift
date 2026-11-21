@@ -10,6 +10,7 @@ mod hermetic_search;
 #[allow(dead_code)]
 mod workspace_client;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -147,6 +148,48 @@ fn store_files(folder: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// #751: search exposes the same commit timeline as `get_symbol`.
+async fn assert_history_queries(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    history: &Value,
+) -> TestResult {
+    let id = history["symbol"]
+        .as_str()
+        .ok_or("history names its symbol")?;
+    let edges = history["edges"].as_array().ok_or("history carries edges")?;
+    for (edge, predicate) in [
+        ("introduced_in", "introducedIn"),
+        ("changed_in", "changedIn"),
+        ("removed_in", "removedIn"),
+    ] {
+        let expected: BTreeSet<_> = edges
+            .iter()
+            .filter(|entry| entry["edge"] == edge)
+            .filter_map(|entry| entry["commit"]["revision"].as_str())
+            .collect();
+        for selection in [format!("<{id}>"), "?symbol".to_owned()] {
+            let text = format!(
+                "SELECT ?revision {{ {selection} :{predicate} ?revision . ?revision a :Revision }}"
+            );
+            let request = tool_request("search", &json!({"query": text, "max_results": 100}));
+            let answer = call_retrying_acceptance(client, request).await?;
+            assert_eq!(answer["answer"]["result"], "bindings", "{answer}");
+            let rows = answer["answer"]["bindings"]
+                .as_array()
+                .ok_or("history query returns bindings")?;
+            let actual: BTreeSet<_> = rows
+                .iter()
+                .filter_map(|row| row["revision"]["value"].as_str())
+                .collect();
+            assert!(expected.is_subset(&actual), "{expected:?}: {answer}");
+            if selection != "?symbol" {
+                assert_eq!(actual, expected, "{answer}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_symbol_history_answers_from_the_store_with_authors_across_a_move() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -154,6 +197,8 @@ async fn a_symbol_history_answers_from_the_store_with_authors_across_a_move() ->
     let (client, _server_task) = served_root(directory.path()).await?;
 
     let history = complete_history(&client).await?;
+
+    assert_history_queries(&client, &history).await?;
 
     let (commits, co_changes): (Vec<&Value>, Vec<&Value>) = history["edges"]
         .as_array()

@@ -64,7 +64,7 @@ impl QueryDisplay {
 fn blank_prefix(answer: &QueryAnswer) -> usize {
     fn blank(term: &RdfTerm) -> Option<&str> {
         match term {
-            RdfTerm::BlankNode { value } => Some(value),
+            RdfTerm::BlankNode { value, .. } => Some(value),
             _ => None,
         }
     }
@@ -150,7 +150,7 @@ impl Render for QueryOutput {
                 crate::output::log_warnings(&result.warnings);
                 result
                     .warnings
-                    .retain(|warning| query_warning_detail(warning).is_some());
+                    .retain(|warning| query_warning_text(warning).is_some());
             }
             QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
                 reason,
@@ -159,7 +159,7 @@ impl Render for QueryOutput {
             }) => {
                 crate::output::log_warnings(warnings);
                 warnings.retain(|warning| {
-                    query_warning_detail(warning).is_some()
+                    query_warning_text(warning).is_some()
                         || super::unavailable::reports(*reason, warning)
                 });
             }
@@ -236,7 +236,7 @@ fn graph(
     };
     // An isolated blank subject needs no label when its entire graph is in this answer.
     if complete
-        && matches!(first.subject, RdfTerm::BlankNode { .. })
+        && matches!(&first.subject, RdfTerm::BlankNode { providers, .. } if providers.is_empty())
         && triples
             .iter()
             .all(|triple| triple.subject == first.subject && triple.object != first.subject)
@@ -431,7 +431,7 @@ fn flow_title<'a>(
 ) -> Result<String, TextError> {
     match flow {
         Some(RdfTerm::BlankNode { .. }) if !page.multiple_flows => Ok("Call path".to_owned()),
-        Some(RdfTerm::BlankNode { value }) if !page.linked_pages => {
+        Some(RdfTerm::BlankNode { value, .. }) if !page.linked_pages => {
             let next = path_numbers.len() + 1;
             let ordinal = path_numbers.entry(value).or_insert(next);
             Ok(format!("Call path {ordinal}"))
@@ -474,7 +474,7 @@ fn other_fields(
 }
 
 fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Result<(), TextError> {
-    for detail in warnings.iter().filter_map(query_warning_detail) {
+    for detail in warnings.iter().filter_map(query_warning_text) {
         out.raw_line(0, &format!("warning · {detail}"))?;
     }
     if warnings
@@ -489,12 +489,21 @@ fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Resul
     Ok(())
 }
 
-fn query_warning_detail(warning: &ReadWarning) -> Option<&str> {
+/// The text of a warning a query answer carries: the coverage and discovery conditions that
+/// name what is missing from it. Every other warning is logged and left out of the answer.
+fn query_warning_text(warning: &ReadWarning) -> Option<String> {
     match warning {
         ReadWarning::EdgeCoverageMissing { detail, .. }
         | ReadWarning::TraversalTruncated { detail, .. }
         | ReadWarning::EngineAnalysisUnavailable { detail, .. }
-        | ReadWarning::EngineReadinessUnconfirmed { detail, .. } => Some(detail),
+        | ReadWarning::EngineReadinessUnconfirmed { detail, .. }
+        | ReadWarning::CalleesDropped { detail, .. }
+        | ReadWarning::SourceUnavailable { detail, .. }
+        | ReadWarning::LargeFileUnparsed { detail, .. } => Some(detail.clone()),
+        ReadWarning::FrameworkContextUnresolved { unit, detail, .. } => Some(
+            unit.project_path()
+                .map_or_else(|| detail.clone(), |path| format!("{path}: {detail}")),
+        ),
         _ => None,
     }
 }
@@ -535,9 +544,21 @@ impl Terms {
         };
         match term {
             RdfTerm::Iri { value } => Ok(iri(value)),
-            RdfTerm::BlankNode { value } => {
+            RdfTerm::BlankNode { value, providers } => {
                 let end = value.ceil_char_boundary(self.blank_prefix);
-                Ok(format!("_:{}", &value[..end]))
+                let analyses = if providers.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (providers: {})",
+                        providers
+                            .iter()
+                            .map(AsRef::as_ref)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                Ok(format!("_:{}{analyses}", &value[..end]))
             }
             RdfTerm::Literal { value, datatype } if datatype == XSD_STRING => quoted(value),
             RdfTerm::Literal { value, datatype }
@@ -632,6 +653,12 @@ mod tests {
             "predicate": predicate,
             "object": { "type": "literal", "value": "Rift", "datatype": XSD_STRING }
         });
+        let mut produced = triple.clone();
+        produced["subject"]["providers"] = serde_json::json!(["static", "lsp", "engine"]);
+        assert_eq!(
+            query(vec![produced], 1)?,
+            "_:anonymous (providers: engine, lsp, static) :name \"Rift\" .\n"
+        );
         let count = serde_json::json!({
             "subject": blank,
             "predicate": { "type": "iri", "value": "urn:rift:vocabulary:count" },
@@ -681,6 +708,7 @@ mod tests {
                     "flow".to_owned(),
                     RdfTerm::BlankNode {
                         value: flow.to_owned(),
+                        providers: std::collections::BTreeSet::default(),
                     },
                 ),
                 (
@@ -767,9 +795,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let first = RdfTerm::BlankNode {
             value: "retained_node_á1_more".to_owned(),
+            providers: std::collections::BTreeSet::default(),
         };
         let second = RdfTerm::BlankNode {
             value: "retained_node_ã2_more".to_owned(),
+            providers: std::collections::BTreeSet::default(),
         };
         let row = |value| BTreeMap::from([("syntax_element".to_owned(), value)]);
         let variables = vec!["syntax_element".to_owned()];

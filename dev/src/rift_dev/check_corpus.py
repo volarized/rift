@@ -1080,12 +1080,7 @@ class Corpus:
         )
         ended = datetime.now(UTC)
         chunked_answer(answer, path, len(data), offset)
-        named = chunked_warnings(
-            await pattern_warnings(
-                server, started, ended, self.pin.name == "bun", path
-            ),
-            path,
-        )
+        named = chunked_warnings(await pattern_warnings(server, started, ended), path)
         if self.pin.name == "bun":
             workspace = await client.resource("rift://workspace")
             claimed = [
@@ -1099,10 +1094,9 @@ class Corpus:
                 and claimed[0].get("syntax") is True,
                 "Bun's pinned C source must have an enabled syntax provider",
             )
-            require(
-                named == ["large_file_unparsed"],
-                f"{path}: named by {named}, expected large_file_unparsed alone",
-            )
+            # A bound left the file's declarations out, so no answer names it; the build
+            # records it in the log instead.
+            require(not named, f"{path}: named by {named}, expected no answer warning")
             found = await observed(
                 server, "index", lambda rows: bool(build_records(rows, path))
             )
@@ -1119,8 +1113,8 @@ class Corpus:
         """Search the pinned file past `[providers.syntax] max_file` held as text.
 
         The provider refuses its source for its size alone, so under the default `split`
-        its text answers search, the logs name it in `large_file_unparsed`, and the
-        build that reads it records it as held unparsed rather than left out.
+        its text answers search, no answer names it, and the build that reads it records
+        it as held unparsed rather than left out.
         """
         if not self.pin.unparsed_path:
             return
@@ -1142,13 +1136,8 @@ class Corpus:
         )
         ended = datetime.now(UTC)
         chunked_answer(answer, path, len(data), offset)
-        named = chunked_warnings(
-            await pattern_warnings(server, started, ended, True, path), path
-        )
-        require(
-            named == ["large_file_unparsed"],
-            f"{path}: named by {named}, expected large_file_unparsed alone",
-        )
+        named = chunked_warnings(await pattern_warnings(server, started, ended), path)
+        require(not named, f"{path}: named by {named}, expected no answer warning")
         found = await observed(
             server,
             "index",
@@ -2023,7 +2012,7 @@ async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
 
 
 async def pattern_warnings(
-    server: Server, started: datetime, ended: datetime, expected: bool, path: str
+    server: Server, started: datetime, ended: datetime
 ) -> list[JsonObject]:
     """Read diagnostics from the completed pattern request, including pending log writes."""
 
@@ -2042,14 +2031,7 @@ async def pattern_warnings(
         return [row for row in matching if row.label("req") == request]
 
     def available(rows: list[Line]) -> bool:
-        request_rows = selected(rows)
-        if not request_rows:
-            return False
-        if not expected:
-            return True
-        return "large_file_unparsed" in chunked_warnings(
-            logged_read_warnings(request_rows), path
-        )
+        return bool(selected(rows))
 
     return logged_read_warnings(selected(await observed(server, "mcp", available)))
 
@@ -2073,7 +2055,7 @@ def held_unparsed_records(
     >>> from rift_dev.log_records import parse_line
     >>> path = "src/jsc/bindings/sqlite/sqlite3.c"
     >>> reason = f"Rust syntax analysis failed: cause source bytes 9508000 exceed accepted limit 4194304: path {path}; reduce source bytes below 4194304 and retry"
-    >>> line = parse_line(f'2026-10-09 17:50:00.852Z WARN rift_index::workspace::log_held_unparsed component=index operation=index.build path={path} reason="{reason}"  file held unparsed in the index')
+    >>> line = parse_line(f'2026-10-09 17:50:00.852Z WARN rift_index::workspace::OmittedFileRecords::record component=index operation=index.build path={path} reason="{reason}"  file held unparsed in the index')
     >>> assert line is not None
     >>> held_unparsed_records([line], path, 9508000, 4194304)
     >>> held_unparsed_records([line], path, 9508000, 8388608)

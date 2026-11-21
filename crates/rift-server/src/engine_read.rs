@@ -1,6 +1,13 @@
 //! Edge traversal through configured language engines: incoming references,
 //! and outgoing calls through call hierarchy.
 
+mod inventory;
+pub use inventory::{
+    EngineInventory, EngineInventoryAnswer, EngineInventoryFile, EngineInventorySelection,
+    PackageEdge,
+};
+use rift_protocol::index::StoredEdge;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use lsp_types::{CallHierarchyOutgoingCall, Location, Position, Range, Uri};
@@ -13,7 +20,7 @@ use rift_lsp::session::EngineSession;
 use rift_lsp::uri::TreeRoot;
 use rift_protocol::edge_read::QueryOccurrence;
 use rift_protocol::read::{
-    Edge, EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, GraphHop, HopDirection,
+    EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, GraphHop, HopDirection,
     Language, ReadWarning, SearchParams, SearchParamsTarget, SearchTraversal, SourceUnitId,
     SourceUnitSpan, Symbol, SymbolId, TextRange, TraversalDirection,
 };
@@ -588,7 +595,7 @@ fn callee_hops(
 /// The outgoing edge from `from` to the declaration `to` it calls.
 fn call_hop(from: &SymbolId, to: SymbolId, provider: EdgeProvider) -> GraphHop {
     GraphHop {
-        edge: graph_edge(from, to, EdgeKind::Calls, None, provider),
+        edge: graph_edge(from, to, EdgeKind::Calls, None, provider).into(),
         direction: HopDirection::Outgoing,
     }
 }
@@ -996,16 +1003,18 @@ fn map_callees(
 
 mod call_evidence;
 mod heritage_edges;
+mod type_uses;
 use call_evidence::CapturedCalls;
-pub use heritage_edges::graph_heritage_edges;
+pub use heritage_edges::{graph_heritage_edges, graph_heritage_inventory};
+pub use type_uses::graph_type_uses;
 
 /// Calls established for one selected local declaration.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct GraphCalls {
     /// Canonical neighbors in the current tree.
     pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
     /// Original edges with their analysis and physical occurrences.
-    pub edges: Vec<Edge>,
+    pub edges: Vec<StoredEdge>,
     /// Outgoing targets in admitted dependency sources, awaiting exact identity resolution.
     pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
     /// Whether static capture or a configured engine covered the requested direction.
@@ -1017,6 +1026,30 @@ pub struct GraphCalls {
 }
 
 impl GraphCalls {
+    /// Number of retained call targets, occurrences, and observations.
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.local
+            .iter()
+            .map(|(_, ranges)| ranges.len().saturating_add(1))
+            .chain(
+                self.packages
+                    .iter()
+                    .map(|(_, ranges)| ranges.len().saturating_add(1)),
+            )
+            .fold(self.corroboration.len(), usize::saturating_add)
+    }
+
+    /// Adds calls and keeps both answers' coverage and observations.
+    pub fn merge(&mut self, other: Self) {
+        self.complete &= other.complete;
+        self.edges.extend(other.edges);
+        self.local.extend(other.local);
+        self.packages.extend(other.packages);
+        self.corroboration.extend(other.corroboration);
+        self.edge_warnings.extend(other.edge_warnings);
+    }
+
     /// Names a package call with the analysis that produced it.
     pub fn name_package_call(
         &mut self,
@@ -1075,8 +1108,8 @@ fn graph_edge(
     kind: EdgeKind,
     occurrence: Option<SourceUnitSpan>,
     provider: EdgeProvider,
-) -> Edge {
-    Edge {
+) -> StoredEdge {
+    StoredEdge {
         from: from.clone(),
         to,
         kind: ExactKind(kind.as_ref().to_owned()),
@@ -1104,15 +1137,19 @@ pub enum CallDestination {
 pub enum CallProvider {
     /// Configured language engine.
     Engine,
+    /// A configured engine's incoming references at the authored callee.
+    EngineReferences,
     /// Language-specific extractor.
     Extractor,
 }
 
 /// Independent call evidence attached to the same authored site.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CallCorroboration {
     /// Invocation span supplied by static resolution.
     pub authored: SourceUnitSpan,
+    /// Authored callee selection, excluding invocation arguments.
+    pub callee: TextRange,
     /// Original engine span.
     pub observed: SourceUnitSpan,
     /// Target selected by static resolution.
@@ -1139,17 +1176,87 @@ pub async fn graph_calls(
 ) -> Result<GraphCalls, RiftError> {
     let unavailable = graph_call_coverage;
     let identity = CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| unavailable())?;
-    let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
-    let [declaration] = declarations.as_slice() else {
-        return Err(unavailable());
-    };
-    if count != 1 {
+    let declarations = edge_declarations(reads, &identity)?;
+    if declarations.is_empty() {
         return Err(unavailable());
     }
-    let file = declaration.file;
+    if direction == TraversalDirection::Outgoing
+        && declarations.iter().any(|declaration| {
+            engines
+                .engine_for(declaration.file.syntax().language())
+                .is_some()
+        })
+    {
+        return Box::pin(inventory::outgoing_calls(
+            reads, engines, roots, seed, deadline,
+        ))
+        .await;
+    }
     let static_calls = CapturedCalls::read(reads, &identity, direction);
+    let mut combined = GraphCalls {
+        complete: true,
+        ..GraphCalls::default()
+    };
+    let mut observed = false;
+    let mut remaining = TRAVERSAL_SYMBOLS_MAX;
+    for declaration in declarations {
+        let answer = Box::pin(graph_calls_for_declaration(
+            reads,
+            engines,
+            roots,
+            &identity,
+            declaration,
+            direction,
+            deadline,
+        ))
+        .await?;
+        let Some(answer) = answer else {
+            combined.complete &= static_calls.is_complete();
+            continue;
+        };
+        remaining = remaining
+            .checked_sub(answer.record_count())
+            .ok_or_else(unavailable)?;
+        observed = true;
+        combined.complete &= answer.complete;
+        combined.edges.extend(answer.edges);
+        combined.local.extend(answer.local);
+        combined.packages.extend(answer.packages);
+        combined.edge_warnings.extend(answer.edge_warnings);
+        combined.corroboration.extend(answer.corroboration);
+    }
+    let answer = if observed {
+        static_calls.combine(combined)
+    } else {
+        static_calls.answer().ok_or_else(unavailable)?
+    };
+    if direction == TraversalDirection::Outgoing {
+        Ok(Box::pin(call_evidence::confirm_reference_sites(
+            reads,
+            engines,
+            seed,
+            answer,
+            &mut call_evidence::TargetReferences::default(),
+            deadline,
+        ))
+        .await)
+    } else {
+        Ok(answer)
+    }
+}
+
+async fn graph_calls_for_declaration(
+    reads: &ReadService,
+    engines: &EnginePool,
+    roots: &CalleeRoots,
+    identity: &CoreSymbolId,
+    declaration: rift_index::SymbolMatch<'_>,
+    direction: TraversalDirection,
+    deadline: Instant,
+) -> Result<Option<GraphCalls>, RiftError> {
+    let file = declaration.file;
     let Some(slot) = engines.engine_for(file.syntax().language()) else {
-        return static_calls.answer().ok_or_else(unavailable);
+        return Ok(None);
     };
     let request = ReferenceTarget::new(
         slot.workspace_root(),
@@ -1164,7 +1271,7 @@ pub async fn graph_calls(
             if graph_engine_method_missing(&error)
                 || error.slug() == errors::server::search_coverage_unavailable::SLUG =>
         {
-            return static_calls.answer().ok_or_else(unavailable);
+            return Ok(None);
         }
         Err(error) => return Err(error),
     };
@@ -1177,19 +1284,19 @@ pub async fn graph_calls(
                 .to_owned()]))),
         ),
         OutgoingAnswer::Unsettled { attempts } => {
-            let mut answer = static_calls.answer().unwrap_or_default();
+            let mut answer = GraphCalls::default();
             answer.edge_warnings.push(walk_unsettled_warning(
                 file.syntax().language().clone(),
                 attempts,
             ));
-            return Ok(answer);
+            return Ok(Some(answer));
         }
-        OutgoingAnswer::Unprepared => return static_calls.answer().ok_or_else(unavailable),
+        OutgoingAnswer::Unprepared => return Ok(None),
     };
     let engine = map_graph_calls(
         reads,
         roots,
-        &identity,
+        identity,
         report,
         &CallGraphSource {
             provider: slot.edge_provider(),
@@ -1202,13 +1309,28 @@ pub async fn graph_calls(
     match engine {
         Ok(mut engine) => {
             engine.edge_warnings.extend(edge_warning);
-            Ok(static_calls.combine(engine))
+            Ok(Some(engine))
         }
-        Err(error) if error.slug() == errors::server::search_coverage_unavailable::SLUG => {
-            static_calls.answer().ok_or(error)
-        }
+        Err(error) if error.slug() == errors::server::search_coverage_unavailable::SLUG => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Reads the calls the captured static pass established for one declaration, without a
+/// language engine. `complete` holds only when static capture covers the declaration.
+///
+/// # Errors
+/// Refuses a seed that is not a canonical identity.
+pub fn captured_graph_calls(
+    reads: &ReadService,
+    seed: &SymbolId,
+    direction: TraversalDirection,
+) -> Result<GraphCalls, RiftError> {
+    let identity =
+        CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| graph_call_coverage())?;
+    Ok(CapturedCalls::read(reads, &identity, direction)
+        .answer()
+        .unwrap_or_default())
 }
 
 struct CallGraphSource<'source> {
@@ -1232,6 +1354,12 @@ fn map_graph_calls(
         ..GraphCalls::default()
     };
     let mut locations = 0usize;
+    let captured = held
+        .unit
+        .project_path()
+        .map(ProjectPath::new)
+        .transpose()?
+        .and_then(|path| reads.index().file(&path));
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
         let at = NamedCallee {
@@ -1258,6 +1386,7 @@ fn map_graph_calls(
         };
         let index = LineIndex::new(source);
         let mut occurrences = Vec::new();
+        let located = !call.from_ranges.is_empty();
         for range in call.from_ranges {
             locations = locations
                 .checked_add(1)
@@ -1268,6 +1397,13 @@ fn map_graph_calls(
             if source.get(start..end).is_none() {
                 return Err(unavailable());
             }
+            if held.direction == TraversalDirection::Outgoing
+                && let Some(file) = captured
+                && edge_enclosing_symbol(reads, file, start as u64, end as u64)?
+                    .is_some_and(|caller| caller.as_str() != identity.as_str())
+            {
+                continue;
+            }
             occurrences.push(SourceUnitSpan {
                 unit: unit.clone(),
                 range: TextRange {
@@ -1276,14 +1412,25 @@ fn map_graph_calls(
                 },
             });
         }
+        if located && occurrences.is_empty() {
+            continue;
+        }
         match neighbor {
             CalleeFile::Project(path) => {
-                let target = project_declaration(
-                    reads,
-                    &path,
-                    (item.selection_range, report.encoding),
-                    "graph calls",
-                )?;
+                let target = match held.direction {
+                    TraversalDirection::Outgoing => project_definition(
+                        reads,
+                        &path,
+                        (item.selection_range, report.encoding),
+                        false,
+                    )?,
+                    TraversalDirection::Incoming => project_declaration(
+                        reads,
+                        &path,
+                        (item.selection_range, report.encoding),
+                        "graph calls",
+                    )?,
+                };
                 if let Some(target) = target {
                     result.push_local(
                         &SymbolId(identity.as_str().to_owned()),
@@ -1413,7 +1560,7 @@ async fn resolve_symbol_references(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let answered = Box::pin(references_on_engine(slot, &target, deadline)).await;
+    let answered = Box::pin(references_on_engine(slot, &target, false, deadline)).await;
     let (report, unconfirmed) = match answered {
         Ok((report, unconfirmed)) => (report, unconfirmed.then(|| slot.name().to_owned())),
         Err(error) if error.slug() == errors::lsp::engine_capability_absent::SLUG => {
@@ -1470,6 +1617,7 @@ fn symbol_references(
     }
 }
 
+#[derive(Debug)]
 struct ReferenceTarget {
     path: ProjectPath,
     language: String,
@@ -1530,17 +1678,19 @@ impl ReferenceTarget {
         file: &IndexedFile,
         symbol: &SyntaxSymbol,
     ) -> Result<Self, RiftError> {
-        let source = file.source();
+        let mut target = Self::file(workspace_root, canonical_root, file)?;
         let offset = declaration_name_offset(file, symbol)?;
-        let index = LineIndex::new(source);
-        let position = |encoding| {
-            index.position(encoding, offset).map_err(|error| {
-                errors::server::read_task()
-                    .operation("reference position conversion")
-                    .detail(error.detail())
-                    .error()
-            })
-        };
+        let index = LineIndex::new(file.source());
+        target.utf8 = index.position(PositionEncoding::Utf8, offset)?;
+        target.utf16 = index.position(PositionEncoding::Utf16, offset)?;
+        Ok(target)
+    }
+
+    fn file(
+        workspace_root: &std::path::Path,
+        canonical_root: &std::path::Path,
+        file: &IndexedFile,
+    ) -> Result<Self, RiftError> {
         Ok(Self {
             path: file.path().clone(),
             language: file.syntax().language().name.clone(),
@@ -1560,15 +1710,61 @@ impl ReferenceTarget {
                         .detail(error.detail())
                         .error()
                 })?,
-            source: source.to_owned(),
-            utf8: position(PositionEncoding::Utf8)?,
-            utf16: position(PositionEncoding::Utf16)?,
+            source: file.source().to_owned(),
+            utf8: Position::default(),
+            utf16: Position::default(),
         })
     }
 }
 
+type ReferenceDefinitions = BTreeMap<(String, u32, u32), Vec<Location>>;
+
+fn reference_key(location: &Location) -> (String, u32, u32) {
+    (
+        location.uri.as_str().to_owned(),
+        location.range.start.line,
+        location.range.start.character,
+    )
+}
+
+async fn reference_definitions(
+    session: &mut EngineSession,
+    locations: &[Location],
+    maximum: usize,
+    mut remaining: usize,
+) -> Result<ReferenceDefinitions, RiftError> {
+    let mut definitions = BTreeMap::new();
+    if !session.capabilities().definitions.definition {
+        return Ok(definitions);
+    }
+    let positions: BTreeMap<_, _> = locations
+        .iter()
+        .filter_map(|location| {
+            let path = session.root().project_path(&location.uri).ok()?;
+            Some((reference_key(location), (path, location.range.start)))
+        })
+        .collect();
+    let positions: Vec<_> = positions.into_iter().collect();
+    for chunk in positions.chunks(maximum.clamp(1, rift_lsp::correlation::PENDING_REQUESTS_MAX)) {
+        let requests: Vec<_> = chunk.iter().map(|(_, position)| position.clone()).collect();
+        let answers = session.definition_batch(&requests).await?;
+        let records = answers.iter().map(Vec::len).sum::<usize>();
+        remaining = remaining
+            .checked_sub(records)
+            .ok_or_else(graph_reference_coverage)?;
+        definitions.extend(
+            chunk
+                .iter()
+                .zip(answers)
+                .map(|((key, _), answer)| (key.clone(), answer)),
+        );
+    }
+    Ok(definitions)
+}
+
 #[derive(PartialEq)]
 struct ReferenceReport {
+    definitions: std::sync::Arc<ReferenceDefinitions>,
     locations: Result<Vec<Location>, usize>,
     encoding: PositionEncoding,
     full: bool,
@@ -1577,6 +1773,7 @@ struct ReferenceReport {
 async fn references_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
+    resolve_targets: bool,
     deadline: Instant,
 ) -> Result<(ReferenceReport, bool), RiftError> {
     let request_path = target.path.clone();
@@ -1597,6 +1794,7 @@ async fn references_on_engine(
                     if locations.len() > TRAVERSAL_SYMBOLS_MAX {
                         return Ok(Some(ReferenceReport {
                             locations: Err(locations.len()),
+                            definitions: BTreeMap::new().into(),
                             encoding,
                             full: true,
                         }));
@@ -1618,7 +1816,19 @@ async fn references_on_engine(
                             ))
                     });
                     locations.dedup();
+                    let definitions = if resolve_targets {
+                        reference_definitions(
+                            session,
+                            &locations,
+                            rift_lsp::correlation::PENDING_REQUESTS_MAX,
+                            TRAVERSAL_SYMBOLS_MAX,
+                        )
+                        .await?
+                    } else {
+                        BTreeMap::new()
+                    };
                     Ok(Some(ReferenceReport {
+                        definitions: definitions.into(),
                         locations: Ok(locations),
                         encoding,
                         full: true,
@@ -1645,7 +1855,7 @@ pub struct GraphReferences {
     /// Captured physical usages.
     pub occurrences: Vec<QueryOccurrence>,
     /// Reference edges with their analysis and physical occurrences.
-    pub edges: Vec<Edge>,
+    pub edges: Vec<StoredEdge>,
     /// Whether a configured provider covered the request.
     pub complete: bool,
     /// Typed warnings from the engine edge read.
@@ -1666,6 +1876,15 @@ pub async fn graph_references(
     let identity =
         CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| graph_reference_coverage())?;
     let captured = captured_references(reads, &identity, target, require_caller)?;
+    let language = rift_protocol::identity::SymbolIdentity::parse(target.as_str())?
+        .language()
+        .clone();
+    if engines.engine_for(&language).is_none() {
+        return Ok(GraphReferences {
+            complete: captured.complete && reads.static_edges_complete()?,
+            ..captured
+        });
+    }
     match Box::pin(engine_graph_references(
         reads,
         engines,
@@ -1707,6 +1926,21 @@ pub async fn graph_references(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Reads the physical usages the captured static pass resolved for one local declaration,
+/// without a language engine.
+///
+/// # Errors
+/// Refuses a target that is not a canonical identity or a captured path that is invalid.
+pub fn captured_graph_references(
+    reads: &ReadService,
+    target: &SymbolId,
+    require_caller: bool,
+) -> Result<GraphReferences, RiftError> {
+    let identity =
+        CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| graph_reference_coverage())?;
+    captured_references(reads, &identity, target, require_caller)
 }
 
 fn captured_references(
@@ -1801,15 +2035,7 @@ async fn engine_graph_references(
     if declarations.is_empty() {
         return Err(unavailable());
     }
-    let excluded: BTreeSet<_> = declarations
-        .iter()
-        .filter_map(|declaration| {
-            declaration
-                .symbol
-                .name_range
-                .map(|range| (declaration.file.path().clone(), range.start, range.end))
-        })
-        .collect();
+    let mut complete = true;
     let mut found = BTreeMap::new();
     let mut edges = Vec::new();
     let mut edge_warnings = Vec::new();
@@ -1824,7 +2050,7 @@ async fn engine_graph_references(
             file,
             declaration.symbol,
         )?;
-        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, deadline))
+        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, true, deadline))
             .await
             .map_err(|error| {
                 if graph_engine_method_missing(&error) {
@@ -1837,40 +2063,109 @@ async fn engine_graph_references(
             return Err(unavailable());
         }
         if unconfirmed {
-            edge_warnings.push(readiness_unconfirmed_warning(&BTreeSet::from([slot
-                .name()
-                .to_owned()])));
+            let processes = BTreeSet::from([slot.name().to_owned()]);
+            edge_warnings.push(readiness_unconfirmed_warning(&processes));
         }
-        let root = TreeRoot::new(slot.workspace_root())?;
-        let canonical = TreeRoot::new(reads.index().root())?;
-        let provider = slot.edge_provider();
-        let mut positions = BTreeMap::new();
-        for location in report.locations.map_err(|_| unavailable())? {
-            let path = root
-                .project_path(&location.uri)
-                .or_else(|_| canonical.project_path(&location.uri))
-                .map_err(|_| unavailable())?;
-            let file = reads.index().file(&path).ok_or_else(unavailable)?;
-            let positions = positions
-                .entry(file.path())
-                .or_insert_with(|| LineIndex::new(file.source()));
-            let start = positions.byte_offset(report.encoding, location.range.start)?;
-            let end = positions.byte_offset(report.encoding, location.range.end)?;
-            if file.source().get(start..end).is_none() {
-                return Err(unavailable());
-            }
-            let key = (path, start as u64, end as u64);
-            if excluded.contains(&key) || found.contains_key(&key) {
-                continue;
-            }
-            if found.len() == TRAVERSAL_SYMBOLS_MAX {
-                return Err(unavailable());
-            }
-            let enclosing = edge_enclosing_symbol(reads, file, key.1, key.2)?;
-            if require_caller && enclosing.is_none() {
-                continue;
-            }
-            let occurrence = QueryOccurrence {
+        let mapped = map_inventory_references(
+            reads,
+            target,
+            report,
+            slot.workspace_root(),
+            require_caller,
+            slot.edge_provider(),
+        )?;
+        edges.extend(mapped.edges);
+        complete &= mapped.complete;
+        edge_warnings.extend(mapped.edge_warnings);
+        for occurrence in mapped.occurrences {
+            let key = (
+                occurrence.source.unit.0.clone(),
+                occurrence.source.range.start,
+                occurrence.source.range.end,
+            );
+            found.insert(key, occurrence);
+        }
+    }
+    Ok(GraphReferences {
+        occurrences: found.into_values().collect(),
+        edges,
+        complete,
+        edge_warnings,
+    })
+}
+
+/// Maps the local part of an engine reference answer into the captured index.
+fn map_inventory_references(
+    reads: &ReadService,
+    target: &SymbolId,
+    report: ReferenceReport,
+    workspace_root: &std::path::Path,
+    require_caller: bool,
+    provider: EdgeProvider,
+) -> Result<GraphReferences, RiftError> {
+    let mut mapping = ReferenceMapping::new(reads, workspace_root, report.encoding, provider)?;
+    map_inventory_references_with_mapping(target, report, require_caller, &mut mapping)
+}
+
+fn map_inventory_references_with_mapping(
+    target: &SymbolId,
+    report: ReferenceReport,
+    require_caller: bool,
+    mapping: &mut ReferenceMapping<'_>,
+) -> Result<GraphReferences, RiftError> {
+    let reads = mapping.reads;
+    if report.encoding != mapping.encoding {
+        return Err(graph_reference_coverage());
+    }
+    let identity = CoreSymbolId::new(target.as_str())?;
+    let excluded: BTreeSet<_> = edge_declarations(reads, &identity)?
+        .into_iter()
+        .filter_map(|declaration| {
+            declaration
+                .symbol
+                .name_range
+                .map(|range| (declaration.file.path().clone(), range.start, range.end))
+        })
+        .collect();
+    let mut dropped = 0_u64;
+    let mut found = BTreeMap::new();
+    for location in report.locations.map_err(|_| graph_reference_coverage())? {
+        let path = mapping.roots[0]
+            .project_path(&location.uri)
+            .or_else(|_| mapping.roots[1].project_path(&location.uri));
+        let path = match path {
+            Ok(path) => path,
+            Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(file) = reads.index().file(&path) else {
+            continue;
+        };
+        let (start, end) = mapping.range(file, location.range)?;
+        if file.source().get(start..end).is_none() {
+            return Err(graph_reference_coverage());
+        }
+        let key = (path, start as u64, end as u64);
+        if excluded.contains(&key) || found.contains_key(&key) {
+            continue;
+        }
+        let resolved = mapping.targets(&report.definitions, &location)?;
+        if resolved.is_empty() {
+            dropped += 1;
+        }
+        if !resolved.contains(target) {
+            continue;
+        }
+        if found.len() == TRAVERSAL_SYMBOLS_MAX {
+            return Err(graph_reference_coverage());
+        }
+        let enclosing = edge_enclosing_symbol(reads, file, key.1, key.2)?;
+        if require_caller && enclosing.is_none() {
+            continue;
+        }
+        found.insert(
+            key.clone(),
+            QueryOccurrence {
                 target: target.clone(),
                 enclosing,
                 source: SourceUnitSpan {
@@ -1881,23 +2176,136 @@ async fn engine_graph_references(
                     },
                 },
                 kind: EdgeKind::References,
-            };
-            edges.extend(reference_edges(std::slice::from_ref(&occurrence), provider));
-            found.insert(key, occurrence);
-        }
+            },
+        );
     }
+    let occurrences: Vec<_> = found.into_values().collect();
     Ok(GraphReferences {
-        occurrences: found.into_values().collect(),
-        edges,
-        complete: true,
-        edge_warnings,
+        edges: reference_edges(&occurrences, mapping.provider),
+        occurrences,
+        complete: report.full && dropped == 0,
+        edge_warnings: if dropped == 0 {
+            Vec::new()
+        } else {
+            vec![ReadWarning::EngineAnalysisUnavailable {
+                language: None,
+                detail: format!(
+                    "the language engine did not resolve a local definition for {dropped} reference locations; those locations were dropped"
+                ),
+            }]
+        },
     })
+}
+
+type DefinitionLocationKey = (String, u32, u32, u32, u32);
+
+/// Reuses only positions and definitions from one captured inventory.
+struct ReferenceMapping<'a> {
+    reads: &'a ReadService,
+    roots: [TreeRoot; 2],
+    encoding: PositionEncoding,
+    provider: EdgeProvider,
+    positions: BTreeMap<ProjectPath, LineIndex<'a>>,
+    definitions: BTreeMap<DefinitionLocationKey, Option<SymbolId>>,
+    #[cfg(test)]
+    line_index_builds: usize,
+    #[cfg(test)]
+    definition_resolutions: usize,
+}
+
+impl<'a> ReferenceMapping<'a> {
+    fn new(
+        reads: &'a ReadService,
+        workspace_root: &std::path::Path,
+        encoding: PositionEncoding,
+        provider: EdgeProvider,
+    ) -> Result<Self, RiftError> {
+        Ok(Self {
+            reads,
+            roots: [
+                TreeRoot::new(workspace_root)?,
+                TreeRoot::new(reads.index().root())?,
+            ],
+            encoding,
+            provider,
+            positions: BTreeMap::new(),
+            definitions: BTreeMap::new(),
+            #[cfg(test)]
+            line_index_builds: 0,
+            #[cfg(test)]
+            definition_resolutions: 0,
+        })
+    }
+
+    fn range(&mut self, file: &'a IndexedFile, range: Range) -> Result<(usize, usize), RiftError> {
+        let positions = match self.positions.entry(file.path().clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                #[cfg(test)]
+                {
+                    self.line_index_builds += 1;
+                }
+                entry.insert(LineIndex::new(file.source()))
+            }
+        };
+        Ok((
+            positions.byte_offset(self.encoding, range.start)?,
+            positions.byte_offset(self.encoding, range.end)?,
+        ))
+    }
+
+    fn targets(
+        &mut self,
+        definitions: &ReferenceDefinitions,
+        location: &Location,
+    ) -> Result<BTreeSet<SymbolId>, RiftError> {
+        let mut resolved = BTreeSet::new();
+        for definition in definitions
+            .get(&reference_key(location))
+            .into_iter()
+            .flatten()
+        {
+            if let Some(symbol) = self.definition(definition)? {
+                resolved.insert(symbol);
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn definition(&mut self, location: &Location) -> Result<Option<SymbolId>, RiftError> {
+        let key = (
+            location.uri.as_str().to_owned(),
+            location.range.start.line,
+            location.range.start.character,
+            location.range.end.line,
+            location.range.end.character,
+        );
+        if let Some(symbol) = self.definitions.get(&key) {
+            return Ok(symbol.clone());
+        }
+        let path = self.roots[0]
+            .project_path(&location.uri)
+            .or_else(|_| self.roots[1].project_path(&location.uri));
+        let mut symbol = None;
+        if let Ok(path) = path
+            && let Some(file) = self.reads.index().file(&path)
+        {
+            let (start, end) = self.range(file, location.range)?;
+            symbol = project_definition_at(self.reads, file, (start as u64, end as u64), false)?;
+        }
+        #[cfg(test)]
+        {
+            self.definition_resolutions += 1;
+        }
+        self.definitions.insert(key, symbol.clone());
+        Ok(symbol)
+    }
 }
 
 /// Reads outgoing reference edges by resolving the bounded local target inventory.
 ///
 /// # Errors
-/// Refuses incomplete identity coverage, an inventory above the traversal bound, or engine failure.
+/// Refuses incomplete sources, an inventory above the traversal bound, or engine failure.
 ///
 /// # Cancel safety
 /// Dropping the future cancels the current engine exchange and publishes no retained answer.
@@ -1914,6 +2322,18 @@ pub async fn outgoing_reference_edges(
     }
     let captured = adjacent
         .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind(),
+                EdgeKind::Calls
+                    | EdgeKind::References
+                    | EdgeKind::Imports
+                    | EdgeKind::Aliases
+                    | EdgeKind::Reads
+                    | EdgeKind::Writes
+                    | EdgeKind::HasType
+            )
+        })
         .map(|edge| QueryOccurrence {
             target: SymbolId(edge.to().as_str().to_owned()),
             enclosing: Some(seed.clone()),
@@ -1937,7 +2357,7 @@ pub async fn outgoing_reference_edges(
         .language()
         .clone();
     if engines.engine_for(&language).is_none() {
-        answer.complete = false;
+        answer.complete = reads.edges().is_complete();
         return Ok(answer);
     }
     let seeds = edge_reference_targets(reads, &language)?;
@@ -1972,6 +2392,15 @@ fn edge_declarations<'read>(
     reads: &'read ReadService,
     identity: &CoreSymbolId,
 ) -> Result<Vec<rift_index::SymbolMatch<'read>>, RiftError> {
+    let mut declarations = all_edge_declarations(reads, identity)?;
+    declarations.retain(|declaration| declaration.symbol.name_range.is_some());
+    Ok(declarations)
+}
+
+fn all_edge_declarations<'read>(
+    reads: &'read ReadService,
+    identity: &CoreSymbolId,
+) -> Result<Vec<rift_index::SymbolMatch<'read>>, RiftError> {
     let limit = reads.index().results_max().min(TRAVERSAL_SYMBOLS_MAX);
     let (mut declarations, total) = reads.index().symbols_by_identity_page(identity, 0, limit)?;
     if total > TRAVERSAL_SYMBOLS_MAX || declarations.len() != total.min(limit) {
@@ -1989,7 +2418,6 @@ fn edge_declarations<'read>(
         }
         declarations.extend(page);
     }
-    declarations.retain(|declaration| declaration.symbol.name_range.is_some());
     Ok(declarations)
 }
 
@@ -1997,26 +2425,26 @@ fn edge_reference_targets(
     reads: &ReadService,
     language: &Language,
 ) -> Result<BTreeSet<SymbolId>, RiftError> {
+    if !reads.index().symbol_view()?.objects_complete() {
+        return Err(graph_reference_coverage());
+    }
     let mut targets = BTreeSet::new();
     for file in reads
         .index()
         .files()
         .filter(|file| file.syntax().language().name == language.name)
     {
-        if !reads
-            .index()
-            .identity_coverage_complete(file.syntax().language())?
-        {
-            return Err(graph_reference_coverage());
-        }
         for declaration in file
             .syntax()
             .symbols()
             .iter()
             .filter(|declaration| declaration.name_range.is_some())
         {
-            let target = symbol_id(reads.index(), crate::search::declared(file, declaration))?
-                .ok_or_else(graph_reference_coverage)?;
+            let Some(target) =
+                symbol_id(reads.index(), crate::search::declared(file, declaration))?
+            else {
+                continue;
+            };
             targets.insert(target);
             if targets.len() > TRAVERSAL_SYMBOLS_MAX {
                 return Err(graph_reference_coverage());
@@ -2042,7 +2470,7 @@ fn edge_enclosing_symbol(
         .map(|id| SymbolId(id.as_str().to_owned())))
 }
 
-fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> Vec<Edge> {
+fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> Vec<StoredEdge> {
     occurrences
         .iter()
         .filter_map(|occurrence| {
@@ -2058,7 +2486,7 @@ fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> V
 }
 
 /// One reference edge's target, physical occurrence, and analysis.
-fn reference_edge_key(edge: &Edge) -> (SymbolId, Option<(String, u64, u64)>, EdgeProvider) {
+fn reference_edge_key(edge: &StoredEdge) -> (SymbolId, Option<(String, u64, u64)>, EdgeProvider) {
     (
         edge.to.clone(),
         edge.occurrence.as_ref().map(|span| {
@@ -2114,7 +2542,8 @@ fn map_references(
                 EdgeKind::References,
                 None,
                 provider,
-            ),
+            )
+            .into(),
             direction: HopDirection::Incoming,
         })
         .collect())
@@ -2184,6 +2613,50 @@ fn project_declaration(
     let Some(symbol) = file.enclosing_symbol(start, end) else {
         return Ok(None);
     };
+    symbol_id(reads.index(), crate::search::declared(file, symbol))
+}
+
+/// Names an engine definition only when its range belongs to a declaration's name.
+fn project_definition(
+    reads: &ReadService,
+    path: &ProjectPath,
+    (range, encoding): (Range, PositionEncoding),
+    require_type: bool,
+) -> Result<Option<SymbolId>, RiftError> {
+    let Some(file) = reads.index().file(path) else {
+        return Ok(None);
+    };
+    let lines = LineIndex::new(file.source());
+    let start = lines.byte_offset(encoding, range.start)? as u64;
+    let end = lines.byte_offset(encoding, range.end)? as u64;
+    project_definition_at(reads, file, (start, end), require_type)
+}
+
+fn project_definition_at(
+    reads: &ReadService,
+    file: &IndexedFile,
+    (start, end): (u64, u64),
+    require_type: bool,
+) -> Result<Option<SymbolId>, RiftError> {
+    let Some(symbol) = file.enclosing_symbol(start, end) else {
+        return Ok(None);
+    };
+    let Some(name) = symbol.name_range else {
+        return Ok(None);
+    };
+    let named =
+        (name.start <= start && end <= name.end) || (start <= name.start && name.end <= end);
+    if !named
+        || symbol
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Module)
+        || (require_type
+            && !symbol
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Type))
+    {
+        return Ok(None);
+    }
     symbol_id(reads.index(), crate::search::declared(file, symbol))
 }
 
@@ -2267,6 +2740,37 @@ mod tests {
             assert_eq!(hop.edge.from, id("seed"));
             assert_eq!(hop.edge.kinds, [rift_protocol::read::EdgeKind::Calls]);
         }
+    }
+
+    #[test]
+    fn reference_targets_keep_identities_beside_a_variance_parse_error() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"beacon"}"#,
+        )?;
+        fs::write(
+            directory.path().join("index.ts"),
+            // A declaration whose own value is unreadable keeps no identity; a variance
+            // annotation no longer serves, since its declaration keeps one (D26).
+            "export const Broken = { value: (globalThis as any)?.value ?? }\n\
+             export function target() {}\nexport function caller() { target(); }\n",
+        )?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let language = rift_protocol::read::Language::from_identity_segment("typescript")?;
+        assert!(!reads.index().identity_coverage_complete(&language)?);
+        let targets = super::edge_reference_targets(&reads, &language)?;
+        assert!(targets.contains(&symbol(&reads, "caller")));
+        assert!(targets.contains(&symbol(&reads, "target")));
+        assert!(reads.static_edges_complete()?);
+        assert!(reads.edge_identity_warning().is_some());
+        Ok(())
     }
 
     #[test]
@@ -2370,6 +2874,72 @@ mod tests {
             source.get(usize::try_from(site.range.start)?..usize::try_from(site.range.end)?),
             Some("beacon")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_calls_keep_only_sites_owned_by_the_selected_callable() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source = "pub fn leaf() {}\npub fn root() { let nested = || { leaf(); }; leaf(); }\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = reads(directory.path())?;
+        let line = source.lines().nth(1).ok_or("caller line")?;
+        let nested = u32::try_from(line.find("leaf()").ok_or("nested call")?)?;
+        let direct = u32::try_from(line.rfind("leaf()").ok_or("direct call")?)?;
+        let mut call = item(location(directory.path(), "lib.rs", 0, 7, 11), "leaf");
+        call.from_ranges = vec![
+            Range::new(Position::new(1, nested), Position::new(1, nested + 4)),
+            Range::new(Position::new(1, direct), Position::new(1, direct + 4)),
+        ];
+        let held = super::CallGraphSource {
+            provider: rift_protocol::read::EdgeProvider::Engine,
+            trees: [directory.path(), directory.path()],
+            source,
+            unit: crate::read::source_unit_id(&ProjectPath::new("lib.rs")?),
+            direction: rift_protocol::read::TraversalDirection::Outgoing,
+        };
+        let expected = u64::try_from(source.rfind("leaf()").ok_or("direct call")?)?;
+        for (name, ranges, start) in [
+            ("root", call.from_ranges.clone(), Some(expected)),
+            ("root", vec![call.from_ranges[0]], None),
+            (
+                "nested",
+                call.from_ranges.clone(),
+                Some(u64::try_from(source.find("leaf();").ok_or("nested call")?)?),
+            ),
+        ] {
+            let seed = rift_core::SymbolId::new(symbol(&reads, name).0)?;
+            let mut observed = call.clone();
+            observed.from_ranges = ranges;
+            let graph = super::map_graph_calls(
+                &reads,
+                &CalleeRoots::default(),
+                &seed,
+                CalleeReport {
+                    calls: Ok(vec![observed]),
+                    encoding: PositionEncoding::Utf16,
+                },
+                &held,
+            )?;
+            if let Some(start) = start {
+                let [(_, sites)] = graph.local.as_slice() else {
+                    return Err("one callee".into());
+                };
+                assert_eq!(
+                    sites.len(),
+                    1,
+                    "a nested closure owns its own call: {sites:?}"
+                );
+                assert_eq!(sites[0].range.start, start);
+            } else {
+                assert!(
+                    graph.local.is_empty(),
+                    "a filtered site is not an unlocated neighbor"
+                );
+            }
+            assert!(graph.complete);
+        }
+
         Ok(())
     }
 
@@ -2793,6 +3363,124 @@ mod tests {
     }
 
     #[test]
+    fn definition_mapping_requires_a_declared_name() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn caller() -> u32 { 0 }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let path = ProjectPath::new("lib.rs")?;
+        let location = Range::new(Position::new(0, 19), Position::new(0, 22));
+        assert!(
+            super::project_definition(&reads, &path, (location, PositionEncoding::Utf8), false)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_reference_mapping_keeps_local_locations_beside_outside_locations() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\npub fn caller() { beacon(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let target = symbol(&reads, "beacon");
+        let report = ReferenceReport {
+            definitions: BTreeMap::from([(
+                super::reference_key(&location(directory.path(), "lib.rs", 1, 18, 24)),
+                vec![location(directory.path(), "lib.rs", 0, 7, 13)],
+            )])
+            .into(),
+            locations: Ok(vec![
+                location(outside.path(), "other.rs", 0, 0, 3),
+                location(directory.path(), "lib.rs", 0, 7, 13),
+                location(directory.path(), "not_indexed.rs", 0, 0, 3),
+                location(directory.path(), "lib.rs", 1, 18, 24),
+            ]),
+            encoding: PositionEncoding::Utf16,
+            full: true,
+        };
+        let answer = super::map_inventory_references(
+            &reads,
+            &target,
+            report,
+            directory.path(),
+            true,
+            EdgeProvider::Lsp,
+        )?;
+        assert!(answer.complete);
+        assert_eq!(answer.occurrences.len(), 1);
+        assert_eq!(
+            answer.occurrences[0].enclosing,
+            Some(symbol(&reads, "caller"))
+        );
+        assert_eq!(answer.occurrences[0].target, target);
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_references_follow_definitions_for_two_seeds_in_one_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn first() {}\npub fn second() {}\npub fn caller() { first(); second(); unknown(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let first = symbol(&reads, "first");
+        let second = symbol(&reads, "second");
+        let locations = vec![
+            location(directory.path(), "lib.rs", 2, 18, 23),
+            location(directory.path(), "lib.rs", 2, 27, 33),
+            location(directory.path(), "lib.rs", 2, 37, 44),
+        ];
+        let definitions = BTreeMap::from([
+            (
+                super::reference_key(&locations[0]),
+                vec![location(directory.path(), "lib.rs", 0, 7, 12)],
+            ),
+            (
+                super::reference_key(&locations[1]),
+                vec![location(directory.path(), "lib.rs", 1, 7, 13)],
+            ),
+        ]);
+        // A server can return the same structural-property occurrences for both seeds.
+        let mut mapping = super::ReferenceMapping::new(
+            &reads,
+            directory.path(),
+            PositionEncoding::Utf8,
+            EdgeProvider::Lsp,
+        )?;
+        for (target, start) in [(first, 55), (second, 64)] {
+            let report = ReferenceReport {
+                definitions: definitions.clone().into(),
+                locations: Ok(locations.clone()),
+                encoding: PositionEncoding::Utf8,
+                full: true,
+            };
+            let answer =
+                super::map_inventory_references_with_mapping(&target, report, true, &mut mapping)?;
+            assert_eq!(answer.occurrences.len(), 1, "{answer:?}");
+            assert_eq!(answer.occurrences[0].target, target);
+            assert_eq!(answer.occurrences[0].source.range.start, start);
+            assert!(!answer.complete);
+            assert_eq!(answer.edge_warnings.len(), 1);
+        }
+        assert_eq!(
+            mapping.line_index_builds, 1,
+            "one captured file is indexed once across seeds"
+        );
+        assert_eq!(
+            mapping.definition_resolutions, 2,
+            "each returned definition is resolved once across seeds"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reference_mapping_retains_cross_file_callers_and_deduplicates() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
@@ -2811,6 +3499,7 @@ mod tests {
         let other = location(directory.path(), "caller.rs", 0, 28, 34);
         let canonical = location(reads.index().root(), "caller.rs", 0, 18, 24);
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![own, caller.clone(), other, caller, canonical]),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -2834,6 +3523,7 @@ mod tests {
         let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         for (start, end) in [(80, 81), (10, 2)] {
             let report = ReferenceReport {
+                definitions: BTreeMap::new().into(),
                 locations: Ok(vec![location(directory.path(), "lib.rs", 0, start, end)]),
                 encoding: PositionEncoding::Utf16,
                 full: true,
@@ -2843,6 +3533,7 @@ mod tests {
             );
         }
         let overflow = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Err(super::TRAVERSAL_SYMBOLS_MAX + 1),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -2861,6 +3552,7 @@ mod tests {
         let reads = reads(directory.path())?;
         let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![
                 location(outside.path(), "lib.rs", 0, 0, 1),
                 location(directory.path(), "absent.rs", 0, 0, 1),
@@ -2875,6 +3567,7 @@ mod tests {
         let mut refused = location(directory.path(), "lib.rs", 0, 0, 1);
         refused.uri = "https://example.com/lib.rs".parse()?;
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![refused]),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -3102,6 +3795,7 @@ done
         let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let prior = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![location(directory.path(), "main.py", 4, 11, 17)]),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -3498,6 +4192,166 @@ while IFS= read -r header; do
   esac
 done
 "#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_references_keep_only_captured_engine_files() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\nfn caller() { beacon(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let locations = vec![
+            location(directory.path(), "lib.rs", 1, 14, 20),
+            location(directory.path(), "excluded.rs", 0, 0, 6),
+        ];
+        let payload = serde_json::to_string(&locations)?.replace('"', "\\\"");
+        let definition = serde_json::to_string(&[location(directory.path(), "lib.rs", 0, 7, 13)])?
+            .replace('"', "\\\"");
+        let step = format!(
+            "    *'\"method\":\"textDocument/references\"'*)\n      frame \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{payload}}}\" ;;\n    *'\"method\":\"textDocument/definition\"'*)\n      frame \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{definition}}}\" ;;\n    *'\"method\":\"exit\"'*)"
+        );
+        let script = directory.path().join("engine.sh");
+        let text = METHOD_ENGINE
+            .replace(
+                "CAPABILITIES",
+                r#"{\"referencesProvider\":true,\"definitionProvider\":true}"#,
+            )
+            .replace("PREPARE", ":")
+            .replace("OUTGOING", ":")
+            .replace("    *'\"method\":\"exit\"'*)", &step);
+        fs::write(&script, text)?;
+        let configuration = serde_json::from_value(json!({
+            "command": ["sh", script.display().to_string()],
+            "settle_delay": "1ms",
+            "retry": {"attempts": 2, "delay": "1ms", "delay_limit": "1ms"}
+        }))?;
+        let engines = pool(directory.path(), "rust", configuration);
+        let target = symbol(&reads, "beacon");
+        let result = Box::pin(super::graph_references(
+            &reads,
+            &engines,
+            &target,
+            true,
+            far(),
+        ))
+        .await;
+        engines.shutdown().await;
+        let answer = result?;
+        assert!(answer.complete, "{answer:?}");
+        assert_eq!(answer.occurrences.len(), 1, "{answer:?}");
+        assert_eq!(
+            answer.occurrences[0].enclosing,
+            Some(symbol(&reads, "caller"))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_calls_restore_only_independently_confirmed_callee_sites() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn leaf() {}\npub fn other() {}\npub fn root() { leaf(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let uri = location(directory.path(), "lib.rs", 2, 7, 11).uri;
+        let range = json!({"start":{"line":2,"character":7},"end":{"line":2,"character":11}});
+        let prepared =
+            json!([{"name":"root","kind":12,"uri":uri,"range":range,"selectionRange":range}]);
+        let mut outgoing = item(location(directory.path(), "lib.rs", 1, 7, 12), "other");
+        outgoing
+            .from_ranges
+            .push(Range::new(Position::new(2, 16), Position::new(2, 20)));
+        let response = |value: &serde_json::Value| -> Result<String, Box<dyn std::error::Error>> {
+            let payload = serde_json::to_string(value)?.replace('"', "\\\"");
+            Ok(format!(
+                "frame \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{payload}}}\""
+            ))
+        };
+        for confirmed in [false, true] {
+            let references = if confirmed {
+                serde_json::to_value([location(directory.path(), "lib.rs", 2, 16, 20)])?
+            } else {
+                json!([])
+            };
+            let reference_step = format!(
+                "    *'\"method\":\"textDocument/references\"'*)\n      references_read=1\n      {} ;;\n    *'\"method\":\"textDocument/definition\"'*)\n      if [ \"$references_read\" = 1 ]; then {} ; else {} ; fi ;;\n    *'\"method\":\"exit\"'*)",
+                response(&references)?,
+                response(&serde_json::to_value([location(
+                    directory.path(),
+                    "lib.rs",
+                    0,
+                    7,
+                    11
+                )])?)?,
+                response(&serde_json::to_value([location(
+                    directory.path(),
+                    "lib.rs",
+                    1,
+                    7,
+                    12
+                )])?)?,
+            );
+            let text = METHOD_ENGINE
+                .replace(
+                    "CAPABILITIES",
+                    r#"{\"referencesProvider\":true,\"definitionProvider\":true,\"callHierarchyProvider\":true}"#,
+                )
+                .replace("PREPARE", &response(&prepared)?)
+                .replace("OUTGOING", &response(&serde_json::to_value([&outgoing])?)?)
+                .replace("    *'\"method\":\"exit\"'*)", &reference_step);
+            let engine = tempfile::tempdir()?;
+            let script = engine.path().join("engine.sh");
+            fs::write(&script, text)?;
+            let configuration = serde_json::from_value(json!({
+                "command":["sh",script.display().to_string()], "settle_delay":"1ms",
+                "retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}
+            }))?;
+            let engines = pool(directory.path(), "rust", configuration);
+            let result = Box::pin(super::graph_calls(
+                &reads,
+                &engines,
+                &CalleeRoots::default(),
+                &symbol(&reads, "root"),
+                rift_protocol::read::TraversalDirection::Outgoing,
+                far(),
+            ))
+            .await;
+            engines.shutdown().await;
+            let graph = result?;
+            assert!(
+                !graph.complete,
+                "the original disagreement remains incomplete"
+            );
+            assert_eq!(
+                graph
+                    .local
+                    .iter()
+                    .any(|(target, _)| target == &symbol(&reads, "leaf")),
+                confirmed
+            );
+            assert_eq!(
+                graph.edges.iter().any(|edge| {
+                    edge.from == symbol(&reads, "root")
+                        && edge.to == symbol(&reads, "leaf")
+                        && edge.kinds == [rift_protocol::read::EdgeKind::Calls]
+                        && edge.provider == EdgeProvider::Lsp
+                }),
+                confirmed,
+                "a confirmed call retains the provider edge: {:?}",
+                graph.edges
+            );
+            assert!(graph.corroboration.iter().any(|record| !record.agrees));
+            assert_eq!(
+                graph.corroboration.iter().any(|record| record.agrees),
+                confirmed
+            );
+        }
+        Ok(())
+    }
 
     /// The range [`METHOD_ENGINE`] names every item at, `beacon` on line 0.
     #[cfg(unix)]

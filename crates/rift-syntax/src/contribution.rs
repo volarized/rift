@@ -5,7 +5,7 @@ use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, ContributionReference, ExactKind,
     PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision, ProviderSymbolId,
     SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
-    SymbolId, TreeRevision, declaration_address, encode_path, symbol_identity,
+    SymbolId, TreeRevision, declaration_address, encode_path,
 };
 use rift_error::RiftError;
 use rift_provider::{ProviderPublication, PublicationLimits};
@@ -28,6 +28,8 @@ pub struct PlacedAlias {
     pub target_identity: String,
     /// Original export statement range.
     pub range: crate::ByteRange,
+    /// Written restricted visibility; absent for an unrestricted public export.
+    pub visibility: Option<String>,
 }
 
 /// Logical identity and language supplied by an established declaration mapping.
@@ -143,6 +145,12 @@ impl DocumentPlacement {
     pub fn with_aliases(mut self, aliases: Vec<PlacedAlias>) -> Self {
         self.aliases = aliases;
         self
+    }
+
+    /// The explicit aliases declared by this source unit.
+    #[must_use]
+    pub fn aliases(&self) -> &[PlacedAlias] {
+        &self.aliases
     }
 
     /// Number of additional export alias declarations.
@@ -284,7 +292,13 @@ impl SyntaxPublicationBuilder {
             latest.insert(symbol.qualified_name.as_str(), symbol);
             let source = rift_core::DeclarationBinding::new(
                 placement.unit().clone(),
-                SourceRange::new(symbol.item_range.start, symbol.item_range.end)?,
+                if symbol.kind == "module"
+                    && symbol.item_range == (crate::ByteRange { start: 0, end: 0 })
+                {
+                    SourceRange::empty()
+                } else {
+                    SourceRange::new(symbol.item_range.start, symbol.item_range.end)?
+                },
             );
             let mut contribution = Contribution::builder(
                 ContributionKey::new(self.provider.clone(), self.publication, provider_symbol),
@@ -313,12 +327,16 @@ impl SyntaxPublicationBuilder {
         additions: &mut Vec<Contribution>,
     ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
+        let mut ordinals = BTreeMap::<&str, usize>::new();
         for alias in &placement.aliases {
-            let identity = symbol_identity(
+            let ordinal = ordinals.entry(&alias.qualified_name).or_default();
+            let identity = declaration_address(
                 &language_segment,
                 placement.identity_path(),
                 &alias.qualified_name,
+                *ordinal,
             );
+            *ordinal += 1;
             let provider_symbol = ProviderSymbolId::for_symbol(&identity)?;
             let target = ContributionReference::new(
                 self.provider.clone(),
@@ -328,17 +346,18 @@ impl SyntaxPublicationBuilder {
                 placement.unit().clone(),
                 SourceRange::new(alias.range.start, alias.range.end)?,
             );
+            let mut kinds = vec![rift_protocol::read::SymbolKind::Alias];
+            if alias.visibility.is_none() {
+                kinds.push(rift_protocol::read::SymbolKind::Public);
+            }
             let facts = PortableSymbolFacts::new(
                 syntax.language().clone(),
                 alias.name.clone(),
                 alias.qualified_name.clone(),
                 ExactKind("export".to_owned()),
             )
-            .kinds(vec![
-                rift_protocol::read::SymbolKind::Alias,
-                rift_protocol::read::SymbolKind::Public,
-            ])
-            .visibility("public");
+            .kinds(kinds)
+            .visibility(alias.visibility.as_deref().unwrap_or("public"));
             let edge = rift_core::ContributionEdge::new(rift_core::EdgeKind::Alias, target)
                 .with_derivation(rift_protocol::read::EdgeDerivation::Syntax)
                 .with_occurrence(source.clone());
@@ -548,7 +567,7 @@ mod tests {
                 .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
-            Some("rift://symbol/rust/src/lib.rs/Beacon")
+            Some("rift://symbol/rust/src/lib.rs/Beacon#1")
         );
         assert_eq!(
             run.facts().expect("portable facts").visibility_spelling(),
@@ -678,6 +697,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_python_module_publishes_its_empty_source_range() {
+        let provider = crate::PythonSyntaxProvider::default();
+        let path = ProjectPath::new("pkg/__init__.py").expect("path");
+        let source = SyntaxSource {
+            path: &path,
+            text: "",
+        };
+        let document = provider
+            .analyze(source, SyntaxLimits::default())
+            .expect("empty module");
+        let limits = rift_provider::PublicationLimits::new(1, 1, 1).expect("limits");
+        let mut builder = SyntaxPublicationBuilder::new(
+            publication(1),
+            source_revision(1),
+            tree_revision(1),
+            limits,
+        )
+        .expect("builder");
+        builder
+            .add_document(&document)
+            .expect("empty module source");
+        let publication = builder.build().expect("publication");
+        let contributions = publication.contributions();
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(
+            contributions[0].source().expect("source").range(),
+            rift_core::SourceRange::empty()
+        );
+    }
+
     /// A dependency placement files the unit and identity under the package,
     /// and the container reference embeds the same identity path.
     #[test]
@@ -755,7 +805,7 @@ mod tests {
                 .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
-            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime")
+            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime#1")
         );
     }
 }
