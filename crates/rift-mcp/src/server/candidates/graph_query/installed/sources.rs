@@ -125,6 +125,8 @@ impl Sources {
         roots: &CalleeRoots,
         tree: &Path,
     ) -> Result<PackageAnalysis, RiftError> {
+        #[cfg(test)]
+        super::runs::record(tree, callee);
         let mut parsed = BTreeMap::<ProjectPath, IndexedFile>::new();
         if self.language.name == "rust" {
             self.capture_modules(callee, roots, tree, &mut parsed)?;

@@ -23,7 +23,7 @@ use rift_search::sparql::{
 
 use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
 use super::exact::{exact_request, selected_release};
-use super::installed::InstalledTarget;
+use super::installed::{InstalledAnalyses, InstalledTarget};
 
 mod flows;
 mod inventory;
@@ -613,6 +613,8 @@ struct AdjacencyWalk<'request> {
     neighbors: BTreeMap<(SymbolId, AdjacencyStep), Vec<SymbolId>>,
     local_reverse: Option<BTreeMap<SymbolId, BTreeSet<SymbolId>>>,
     use_installed: Option<bool>,
+    /// Package analyses this walk's installed targets were placed in, one per source set.
+    installed_analyses: InstalledAnalyses,
 }
 
 impl<'request> AdjacencyWalk<'request> {
@@ -642,6 +644,7 @@ impl<'request> AdjacencyWalk<'request> {
             neighbors: BTreeMap::new(),
             local_reverse: None,
             use_installed: None,
+            installed_analyses: InstalledAnalyses::default(),
         }
     }
 

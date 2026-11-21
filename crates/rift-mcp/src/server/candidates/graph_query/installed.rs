@@ -1,5 +1,6 @@
 //! Engine targets named by admitted installed dependency sources.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use rift_error::RiftError;
 use rift_protocol::read::{SourceUnitId, Symbol, SymbolId, SyntaxElement};
 use rift_protocol::revision::Revision;
 use rift_search::sparql::{GraphDatasetBuilder, GraphFact, RevisionIri, SymbolAddress};
-use rift_server::{CalleeRoots, PackageCallee};
+use rift_server::{CalleePackage, CalleeRoots, PackageCallee};
 
 use super::edges::coverage_failure;
 
@@ -22,8 +23,102 @@ pub(super) struct InstalledTarget {
     pub(super) revision: Revision,
     pub(super) unit: SourceUnitId,
     pub(super) source: Arc<String>,
-    sources: Sources,
+    sources: Arc<Sources>,
     declarations: Vec<InstalledDeclaration>,
+}
+
+/// The package analyses one inventory walk captured, one per source set.
+///
+/// Every engine target that lands in an already captured source set is served from that
+/// set's single analysis. The map holds at most one entry per distinct source set the
+/// walk's targets landed in, and lives only as long as the walk.
+#[derive(Debug, Default)]
+pub(super) struct InstalledAnalyses {
+    analyses: BTreeMap<SourceSet, Option<Arc<CapturedAnalysis>>>,
+}
+
+/// Which captured sources an engine target needs: its exact package or runtime release,
+/// the document the engine answered and that document's path below the package root.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SourceSet {
+    package: SourcePackage,
+    document: Option<String>,
+    path: rift_core::ProjectPath,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SourcePackage {
+    Installed(rift_core::PackageIdentity),
+    Runtime(rift_protocol::read::RuntimeIdentity),
+}
+
+impl SourceSet {
+    /// `None` for a target outside every exact release, which no capture places.
+    fn of(callee: &PackageCallee) -> Option<Self> {
+        let package = match callee.package() {
+            CalleePackage::Installed(package) => SourcePackage::Installed(package.clone()),
+            CalleePackage::Runtime(runtime) => SourcePackage::Runtime(runtime.clone()),
+            CalleePackage::StandardLibrary(_) => return None,
+        };
+        Some(Self {
+            package,
+            document: callee
+                .document()
+                .map(|document| document.as_str().to_owned()),
+            path: callee.path().clone(),
+        })
+    }
+}
+
+/// One source set's bounded sources and the single package analysis built from them.
+#[derive(Debug)]
+struct CapturedAnalysis {
+    sources: Arc<Sources>,
+    analysis: rift_analysis::PackageAnalysis,
+}
+
+impl CapturedAnalysis {
+    fn capture(
+        callee: &PackageCallee,
+        roots: &CalleeRoots,
+        tree: &Path,
+        accepted: &rift_protocol::configuration::WorkspaceConfiguration,
+    ) -> Result<Self, RiftError> {
+        let mut sources = Sources::capture(callee, roots, tree, accepted)?;
+        let analysis = sources.analyze(callee, roots, tree)?;
+        Ok(Self {
+            sources: Arc::new(sources),
+            analysis,
+        })
+    }
+}
+
+impl InstalledAnalyses {
+    /// Places `callee` in its source set's analysis, capturing and analyzing that set only
+    /// the first time a target of this walk lands in it. A set whose capture or analysis
+    /// failed names none of its targets.
+    pub(super) fn target(
+        &mut self,
+        callee: PackageCallee,
+        roots: &CalleeRoots,
+        tree: &Path,
+        accepted: &rift_protocol::configuration::WorkspaceConfiguration,
+    ) -> Result<InstalledTarget, RiftError> {
+        let Some(set) = SourceSet::of(&callee) else {
+            return InstalledTarget::capture(callee, roots, tree, accepted);
+        };
+        let captured = self
+            .analyses
+            .entry(set)
+            .or_insert_with(|| {
+                CapturedAnalysis::capture(&callee, roots, tree, accepted)
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
+            .ok_or_else(coverage_failure)?;
+        InstalledTarget::select(callee, &captured)
+    }
 }
 
 #[derive(Debug)]
@@ -39,16 +134,22 @@ impl InstalledTarget {
         tree: &Path,
         accepted: &rift_protocol::configuration::WorkspaceConfiguration,
     ) -> Result<Self, RiftError> {
-        let mut sources = Sources::capture(&callee, roots, tree, accepted)?;
-        let analysis = sources.analyze(&callee, roots, tree)?;
+        let captured = CapturedAnalysis::capture(&callee, roots, tree, accepted)?;
+        Self::select(callee, &captured)
+    }
+
+    /// The declaration at `callee`'s position in an analysis of its own source set.
+    fn select(callee: PackageCallee, captured: &CapturedAnalysis) -> Result<Self, RiftError> {
+        let analysis = &captured.analysis;
         let source = Arc::clone(
-            sources
+            captured
+                .sources
                 .files
                 .get(callee.path())
                 .ok_or_else(coverage_failure)?,
         );
         let offset = u64::try_from(callee.byte_offset(&source)?).map_err(|_| coverage_failure())?;
-        let selected = declaration_at(&analysis, callee.path(), offset)?;
+        let selected = declaration_at(analysis, callee.path(), offset)?;
         let publication = analysis.publication();
         let symbol = publication
             .objects
@@ -71,7 +172,7 @@ impl InstalledTarget {
             revision: publication.revision.clone(),
             unit: selected.unit.clone(),
             source,
-            sources,
+            sources: Arc::clone(&captured.sources),
             declarations,
         })
     }
@@ -197,6 +298,35 @@ fn declaration_at<'a>(
                 && offset < item.range.end
         })
         .ok_or_else(coverage_failure)
+}
+
+/// Package analyses each test workspace ran, by workspace and engine document.
+#[cfg(test)]
+pub(super) mod runs {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static RUNS: Mutex<BTreeMap<(PathBuf, String), usize>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn record(tree: &Path, callee: &rift_server::PackageCallee) {
+        let document = callee.document().map_or_else(
+            || callee.path().to_string(),
+            |document| document.as_str().to_owned(),
+        );
+        if let Ok(mut runs) = RUNS.lock() {
+            *runs.entry((tree.to_path_buf(), document)).or_default() += 1;
+        }
+    }
+
+    /// How many package analyses `tree`'s reads ran for the engine document `document`.
+    pub(in crate::server::candidates::graph_query) fn count(tree: &Path, document: &str) -> usize {
+        RUNS.lock().map_or(0, |runs| {
+            runs.get(&(tree.to_path_buf(), document.to_owned()))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
 }
 
 #[cfg(test)]

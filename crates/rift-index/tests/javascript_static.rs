@@ -2768,3 +2768,58 @@ module.exports = build
         );
     }
 }
+
+#[test]
+fn test_this_writes_store_the_member_they_resolve_to() {
+    // `this.name = value` always stores a write from the code that runs it. An ancestor
+    // the static pass resolves that declares `name` is the target; otherwise the member
+    // the assignment declares is, also under an ancestor that does not resolve.
+    let entry = "import * as core from './index.js';
+import { External } from 'missing-package';
+interface Value {}
+class Derived extends core.Base<Value> { run(input: Value): Value { this.value = core.value; return this.value; } }
+class Own { run() { this.count = 1; return this.count } }
+class Outside extends External { run() { this.count = 1; return this.count } }
+export { Derived, Own, Outside }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            ("entry.ts", entry),
+            ("index.ts", "export * from './base.js';"),
+            (
+                "base.ts",
+                "export const value = 1;\nexport class Base<T> { value: T; run(input: T): T { return input; } }",
+            ),
+        ],
+        module_manifest(),
+    );
+    for (kind, from, to) in [
+        (
+            EdgeKind::Writes,
+            "entry.ts/Derived/run",
+            "base.ts/Base/value",
+        ),
+        (
+            EdgeKind::Reads,
+            "entry.ts/Derived/run",
+            "base.ts/Base/value",
+        ),
+        (EdgeKind::Reads, "entry.ts/Derived/run", "base.ts/value"),
+        (EdgeKind::Writes, "entry.ts/Own/run", "entry.ts/Own/count"),
+        (EdgeKind::Reads, "entry.ts/Own/run", "entry.ts/Own/count"),
+        (
+            EdgeKind::Writes,
+            "entry.ts/Outside/run",
+            "entry.ts/Outside/count",
+        ),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{kind:?} {from} {to}");
+    }
+    // No write is owned by the member it writes.
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| { edge.kind() == EdgeKind::Writes && edge.from() == edge.to() })
+    );
+}
