@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CorpusName = Literal["bun", "nextjs", "fastapi"]
-CorpusCase = Literal["workspace", "stop", "churn"]
+CorpusCase = Literal["workspace", "stop", "churn", "burst"]
 
 
 class BinaryOptions(BaseModel):
@@ -42,6 +42,8 @@ class CorpusOptions(BaseModel):
                 raise ValueError("test requires one corpus name and --binary")
             if self.case == "stop" and self.name != "bun":
                 raise ValueError("only bun has a stop case")
+            if self.case == "burst" and self.name != "bun":
+                raise ValueError("only bun has a burst case")
             if self.case == "churn" and self.name != "nextjs":
                 raise ValueError("only nextjs has a churn case")
         return self

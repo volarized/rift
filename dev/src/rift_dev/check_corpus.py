@@ -51,6 +51,7 @@ from rift_dev.corpus_assertions import (
     unit_path,
     warnings,
 )
+from rift_dev.corpus_burst import run_burst
 from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.log_records import (
@@ -407,7 +408,11 @@ class Corpus:
     def __init__(
         self, pin: Pin, binary: Path, report: Path, case: str = "workspace"
     ) -> None:
-        require(case in ("workspace", "stop", "churn"), f"unknown corpus case: {case}")
+        require(
+            case in ("workspace", "stop", "churn", "burst"),
+            f"unknown corpus case: {case}",
+        )
+        require(case != "burst" or pin.name == "bun", "only bun has a burst case")
         require(case != "stop" or pin.name == "bun", "only bun has a stop case")
         require(case != "churn" or pin.name == "nextjs", "only nextjs has a churn case")
         self.pin = pin
@@ -684,6 +689,13 @@ class Corpus:
         self.configure()
         if self.case == "stop":
             await self.stop_states()
+            return
+        if self.case == "burst":
+            with self.server() as server:
+                async with server.connect() as client:
+                    await await_startup_publication(server)
+                    await run_burst(server, client, self.record)
+                self.stop(server)
             return
         if self.case == "churn":
             await self.churn_case()
