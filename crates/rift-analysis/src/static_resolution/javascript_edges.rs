@@ -168,7 +168,10 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         if reference.role != ReferenceRole::Type
-            || !file.document.path.as_str().ends_with(".ts")
+            || !matches!(
+                file.document.path.as_str().rsplit_once('.'),
+                Some((_, "ts"))
+            )
             || file.members.contains_key(&reference.target)
         {
             return None;
