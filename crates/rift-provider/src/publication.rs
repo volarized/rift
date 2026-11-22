@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use rift_core::{Contribution, ProviderId, ProviderRevision};
+use rift_core::{Contribution, ContributionKey, ProviderId, ProviderRevision, ProviderSymbolId};
 use rift_error::{RiftError, errors};
 
 /// Default provider count bound for one publication set.
@@ -83,6 +83,7 @@ pub struct ProviderPublication {
     provider: ProviderId,
     revision: ProviderRevision,
     contributions: Box<[Contribution]>,
+    positions: BTreeMap<ProviderSymbolId, usize>,
 }
 
 impl ProviderPublication {
@@ -102,11 +103,12 @@ impl ProviderPublication {
                 .field("contributions")
                 .fail();
         }
-        validate_keys(&provider, revision, &contributions)?;
+        let positions = validate_keys(&provider, revision, &contributions)?;
         Ok(Self {
             provider,
             revision,
             contributions: contributions.into_boxed_slice(),
+            positions,
         })
     }
 
@@ -133,9 +135,9 @@ fn validate_keys(
     provider: &ProviderId,
     revision: ProviderRevision,
     contributions: &[Contribution],
-) -> Result<(), RiftError> {
-    let mut symbols = BTreeSet::new();
-    for contribution in contributions {
+) -> Result<BTreeMap<ProviderSymbolId, usize>, RiftError> {
+    let mut positions = BTreeMap::new();
+    for (position, contribution) in contributions.iter().enumerate() {
         let key = contribution.key();
         if key.reference().provider() != provider {
             return errors::provider::publication_provider_mismatch()
@@ -147,13 +149,16 @@ fn validate_keys(
                 .field("contribution.publication")
                 .fail();
         }
-        if !symbols.insert(key.reference().symbol()) {
+        if positions
+            .insert(key.reference().symbol().clone(), position)
+            .is_some()
+        {
             return errors::provider::publication_duplicate_symbol()
                 .field("contribution.provider_symbol")
                 .fail();
         }
     }
-    Ok(())
+    Ok(positions)
 }
 
 /// One immutable set of captured provider publications.
@@ -226,6 +231,17 @@ impl PublicationSet {
     #[must_use]
     pub fn provider(&self, provider: &ProviderId) -> Option<&ProviderPublication> {
         self.publications.get(provider).map(Arc::as_ref)
+    }
+
+    /// Resolves a key in the provider publication that admitted it.
+    pub(crate) fn contribution(&self, key: &ContributionKey) -> Option<&Contribution> {
+        let reference = key.reference();
+        let publication = self.provider(reference.provider())?;
+        if publication.revision != key.publication() {
+            return None;
+        }
+        let position = publication.positions.get(reference.symbol())?;
+        publication.contributions.get(*position)
     }
 
     /// Returns publications in provider identity order.
@@ -325,7 +341,10 @@ impl get_size2::GetSize for ProviderPublication {
         );
         bytes = bytes.saturating_add(field);
         tracker = next;
-        (bytes, tracker)
+        // Each position key shares its symbol string with the admitted Contribution.
+        let positions =
+            rift_protocol::btree_material_bytes::<ProviderSymbolId, usize>(self.positions.len());
+        (bytes.saturating_add(positions), tracker)
     }
 }
 
@@ -620,6 +639,55 @@ mod tests {
             "rift.provider.publication_contribution_limit"
         );
         assert_eq!(store.snapshot().contribution_count(), 2);
+    }
+
+    #[test]
+    fn positions_are_charged_once_across_shared_publications() {
+        use get_size2::{GetSize, StandardTracker};
+
+        let limits = PublicationLimits::default();
+        for count in [8, 80] {
+            let rows = (0..count)
+                .map(|position| contribution("syntax", 1, &format!("item{position}")))
+                .collect();
+            let mut publication =
+                ProviderPublication::new(provider("syntax"), revision(1), rows, limits)
+                    .expect("valid publication");
+            let charged = publication
+                .get_heap_size_with_tracker(StandardTracker::new())
+                .0;
+            let positions = std::mem::take(&mut publication.positions);
+            let without = publication
+                .get_heap_size_with_tracker(StandardTracker::new())
+                .0;
+            assert_eq!(
+                charged - without,
+                rift_protocol::btree_material_bytes::<ProviderSymbolId, usize>(count)
+                    - rift_protocol::btree_material_bytes::<ProviderSymbolId, usize>(0)
+            );
+            publication.positions = positions;
+            let first = super::PublicationSet::empty(limits)
+                .replaced(publication)
+                .expect("first set");
+            let docs = ProviderPublication::new(provider("docs"), revision(2), Vec::new(), limits)
+                .expect("second provider");
+            let second = first.replaced(docs).expect("second set");
+
+            let shared_key = provider("syntax");
+            let first_owner = &first.publications[&shared_key];
+            let second_owner = &second.publications[&shared_key];
+            assert!(Arc::ptr_eq(first_owner, second_owner));
+            let (_, seen) = first.get_heap_size_with_tracker(StandardTracker::new());
+            assert_eq!(
+                rift_protocol::retained_arc_material(
+                    second_owner,
+                    seen,
+                    GetSize::get_heap_size_with_tracker,
+                )
+                .0,
+                0
+            );
+        }
     }
 
     #[test]
