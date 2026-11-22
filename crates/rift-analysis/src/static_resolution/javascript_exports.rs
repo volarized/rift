@@ -589,7 +589,10 @@ impl<'source> File<'source> {
         Some((parent.receiver, slot))
     }
 
-    fn javascript_export_is_stable(&self, binding: &rift_syntax::SyntaxExportBinding) -> bool {
+    pub(super) fn javascript_export_is_stable(
+        &self,
+        binding: &rift_syntax::SyntaxExportBinding,
+    ) -> bool {
         if self.unknown_member_writes.contains(&None) {
             return false;
         }

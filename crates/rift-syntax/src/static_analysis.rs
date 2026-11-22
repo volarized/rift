@@ -43,6 +43,26 @@ pub struct StaticMember {
     pub member: Option<ByteRange>,
 }
 
+/// Authored names of two callable members assigned the same function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMemberAlias {
+    /// Name of the member on the outer assignment.
+    pub name: ByteRange,
+    /// Name of the member whose assignment holds the function.
+    pub target: ByteRange,
+}
+
+/// A plain assignment that copies an authored `this` member to the same named member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMemberCopy {
+    /// Complete assignment expression.
+    pub assignment: ByteRange,
+    /// Member on the left of the assignment.
+    pub target: ByteRange,
+    /// Complete member expression on the right.
+    pub value: ByteRange,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -114,6 +134,11 @@ pub enum StaticBindingKind {
     },
     /// A local variable initialized directly by a constructor.
     JavaScriptInstance {
+        /// Constructor name.
+        constructor: ByteRange,
+    },
+    /// A lexical `const` initialized directly by a constructor.
+    JavaScriptConstInstance {
         /// Constructor name.
         constructor: ByteRange,
     },
@@ -297,15 +322,30 @@ pub struct StaticMemberCallback {
     pub intersection: Option<ByteRange>,
 }
 
+/// A direct `CommonJS` default write whose wrapper uses were checked in the same file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticCommonJsExport {
+    /// The complete `module.exports = name` assignment.
+    pub assignment: ByteRange,
+    /// The surrounding assignment also updates the original `exports` binding.
+    pub synchronized: bool,
+    /// Binding names that the exports use and direct module declarations initialize.
+    pub initialized: Vec<ByteRange>,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
     /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
     pub javascript_module_syntax: bool,
+    /// The single direct default write in a file with closed `CommonJS` wrapper uses.
+    pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
     /// Receiver and property spans for member expressions.
     pub members: Vec<StaticMember>,
+    /// Callable member aliases established from assignment chains.
+    pub member_aliases: Vec<StaticMemberAlias>,
     /// Declaration names and their explicit named type annotations.
     pub declared_types: Vec<(ByteRange, ByteRange)>,
     /// Type declaration names whose own shape is a signature: a call signature or
@@ -346,6 +386,8 @@ pub struct StaticFactsParts {
     pub assignments: Vec<ByteRange>,
     /// Name and member targets of assignments whose value is a function written in place.
     pub function_writes: Vec<ByteRange>,
+    /// Plain assignments copying a member from `this`.
+    pub member_copies: Vec<StaticMemberCopy>,
     /// Declaration names whose written type is an array, with the named element type.
     pub element_types: Vec<(ByteRange, ByteRange)>,
     /// Declarations whose function writes an array return type, with the named element
@@ -394,6 +436,12 @@ impl StaticFacts {
         self.0.javascript_module_syntax
     }
 
+    /// The direct default write, if the `CommonJS` wrapper remains closed.
+    #[must_use]
+    pub const fn commonjs_export(&self) -> Option<&StaticCommonJsExport> {
+        self.0.commonjs_export.as_ref()
+    }
+
     /// Captured value accesses and type references.
     #[must_use]
     pub fn references(&self) -> &[StaticReference] {
@@ -404,6 +452,16 @@ impl StaticFacts {
     #[must_use]
     pub fn members(&self) -> &[StaticMember] {
         &self.0.members
+    }
+
+    /// Callable member aliases established from assignment chains.
+    #[must_use]
+    pub fn member_aliases(&self) -> &[StaticMemberAlias] {
+        &self.0.member_aliases
+    }
+
+    pub(crate) fn set_member_aliases(&mut self, aliases: Vec<StaticMemberAlias>) {
+        self.0.member_aliases = aliases;
     }
     /// Declaration names and their explicit named type annotations.
     #[must_use]
@@ -535,6 +593,12 @@ impl StaticFacts {
         &self.0.function_writes
     }
 
+    /// Authored same-member copies in order of the assignment target.
+    #[must_use]
+    pub fn member_copies(&self) -> &[StaticMemberCopy] {
+        &self.0.member_copies
+    }
+
     /// Declaration names written with an array type, and the named element type.
     #[must_use]
     pub fn element_types(&self) -> &[(ByteRange, ByteRange)] {
@@ -621,8 +685,11 @@ impl StaticFacts {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         [
+            self.commonjs_export()
+                .map_or(0, |export| vector_capacity(&export.initialized)),
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
+            vector_capacity(&self.0.member_aliases),
             vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.type_signatures),
             vector_capacity(&self.0.parameters),
@@ -642,6 +709,7 @@ impl StaticFacts {
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
             vector_capacity(&self.0.function_writes),
+            vector_capacity(&self.0.member_copies),
             vector_capacity(&self.0.element_types),
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
@@ -677,8 +745,11 @@ impl StaticFacts {
 
     fn validate_counts(&self, limits: &SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
+            self.commonjs_export()
+                .map_or(0, |export| export.initialized.len()),
             self.references().len(),
             self.members().len(),
+            self.member_aliases().len(),
             self.declared_types().len(),
             self.type_signatures().len(),
             self.parameters().len(),
@@ -698,6 +769,7 @@ impl StaticFacts {
             self.reexports().len(),
             self.assignments().len(),
             self.function_writes().len(),
+            self.member_copies().len(),
             self.element_types().len(),
             self.element_returns().len(),
             self.object_members().len(),
@@ -807,6 +879,18 @@ impl StaticFacts {
             .chain(self.function_writes())
             .copied()
             .all(valid)
+            && self.member_copies().iter().all(|copy| {
+                valid(copy.assignment)
+                    && valid(copy.target)
+                    && valid(copy.value)
+                    && copy.assignment.start == copy.target.start
+                    && copy.assignment.end == copy.value.end
+                    && copy.target.end < copy.value.start
+            })
+            && self
+                .member_copies()
+                .windows(2)
+                .all(|pair| pair[0].target.start < pair[1].target.start)
             && self
                 .element_types()
                 .iter()
@@ -835,6 +919,13 @@ impl StaticFacts {
                 .zip(end)
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
+        if self.commonjs_export().is_some_and(|export| {
+            !valid(export.assignment)
+                || !export.initialized.iter().copied().all(valid)
+                || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
+        }) {
+            return errors::syntax::facts_range_invalid().fail();
+        }
         let edges = self.heritage_edges().iter().all(|edge| {
             valid(edge.from)
                 && valid(edge.target)
@@ -900,6 +991,13 @@ impl StaticFacts {
             && reexports
             && assignments
             && members
+            && self.member_aliases().iter().all(|alias| {
+                valid(alias.name) && valid(alias.target) && alias.name.end <= alias.target.start
+            })
+            && self
+                .member_aliases()
+                .windows(2)
+                .all(|pair| pair[0].name < pair[1].name)
             && unsupported
             && implementations
             && rust
@@ -950,6 +1048,7 @@ impl StaticBinding {
                 valid(module) && valid(export)
             }
             StaticBindingKind::JavaScriptInstance { constructor }
+            | StaticBindingKind::JavaScriptConstInstance { constructor }
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
             StaticBindingKind::PythonAnnotation { annotation }
@@ -1080,6 +1179,10 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn finish(self) -> StaticFacts {
         self.facts
+    }
+
+    pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {
+        self.facts.0.commonjs_export = export;
     }
 }
 

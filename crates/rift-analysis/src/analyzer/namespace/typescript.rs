@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, de};
 use super::{ExportBinding, PreparedNamespace, SelectedFile};
 use crate::NamespaceInput;
 
-mod commonjs;
+pub(crate) mod commonjs;
 mod observations;
 
 /// Establishes declarations in an entry module from captured owner and metadata.

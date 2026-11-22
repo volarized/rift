@@ -3,7 +3,8 @@
 use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_syntax::{
-    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, SyntaxDocument, SyntaxFacts,
+    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind, StaticFacts,
+    StaticFactsParts, StaticMemberAlias, StaticMemberCopy, SyntaxDocument, SyntaxFacts,
     SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
 };
 
@@ -37,6 +38,287 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         static_facts: facts.static_facts().cloned(),
         source_digest: *facts.source_digest().expect("source witness"),
     }
+}
+
+#[test]
+fn test_callable_member_alias_restores_only_against_its_inner_assignment() {
+    let source = "var req = {};
+req.get = req.header = function header() { return 1; };
+req.other = function other() { return 2; };
+module.exports = req;
+";
+    let document = parsed(ShippedLanguage::JavaScript, source);
+    let captured = parts(document.facts());
+    let facts = captured.static_facts.as_ref().expect("static facts");
+    let [alias] = facts.member_aliases() else {
+        panic!("one captured callable alias");
+    };
+    let alias = *alias;
+    let symbol = |name| {
+        document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.qualified_name == name)
+            .expect("symbol")
+    };
+    assert_eq!(symbol("req.get").name_range, Some(alias.name));
+    assert_eq!(symbol("req.header").name_range, Some(alias.target));
+    assert!(symbol("req.get").body_range.is_none());
+    assert!(symbol("req.header").body_range.is_some());
+
+    let limits = SyntaxLimits::default();
+    let restored =
+        SyntaxFacts::from_parts(source, limits, captured.clone()).expect("checked alias");
+    assert_eq!(restored.static_facts(), Some(facts));
+    let mismatched = StaticFactsParts {
+        member_aliases: vec![StaticMemberAlias {
+            name: alias.name,
+            target: symbol("req.other").name_range.expect("other name"),
+        }],
+        ..StaticFactsParts::default()
+    };
+    let mut invalid = captured.clone();
+    invalid.static_facts =
+        Some(StaticFacts::from_parts(source, limits, mismatched).expect("valid ranges"));
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, invalid).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG),
+    );
+
+    let mut older = captured;
+    older
+        .symbols
+        .retain(|symbol| symbol.name_range != Some(alias.name));
+    older.static_facts = Some(StaticFacts::default());
+    let older = SyntaxFacts::from_parts(source, limits, older).expect("older facts");
+    assert!(
+        older
+            .static_facts()
+            .expect("older static facts")
+            .member_aliases()
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_commonjs_synchronization_keeps_named_exports_after_the_shared_write() {
+    let source = "var req = require('./request');
+var res = require('./response');
+exports.dropped = req;
+exports = module.exports = create;
+function create() {}
+exports.request = req;
+exports.response = res;
+";
+    let get_bindings = |source: &str| {
+        let document = parsed(ShippedLanguage::JavaScript, source);
+        let captured = parts(document.facts());
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
+            .expect("checked export capture")
+    };
+    let checked = get_bindings(source);
+    let bindings = checked.export_bindings().expect("captured export bindings");
+    let text = |range: ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    let witness = checked
+        .static_facts()
+        .and_then(rift_syntax::StaticFacts::commonjs_export)
+        .expect("closed synchronized write");
+    assert!(witness.synchronized);
+    assert_eq!(text(witness.assignment), "module.exports = create");
+    assert_eq!(
+        witness
+            .initialized
+            .iter()
+            .copied()
+            .map(text)
+            .collect::<Vec<_>>(),
+        ["req", "res", "create"]
+    );
+    let mut removed = parts(&checked);
+    removed.export_bindings = Some(Vec::new());
+    assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), removed).is_err());
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| (
+                binding.kind,
+                binding.exported.map(text),
+                binding.local.map(text)
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (rift_syntax::SyntaxExportKind::Default, None, Some("create")),
+            (
+                rift_syntax::SyntaxExportKind::Named,
+                Some("request"),
+                Some("req")
+            ),
+            (
+                rift_syntax::SyntaxExportKind::Named,
+                Some("response"),
+                Some("res")
+            ),
+        ]
+    );
+    for changed in [
+        "module.exports = req;",
+        "exports = req;",
+        "exports[slot] = req;",
+        "module['exports'] = req;",
+        "Object.defineProperty(module, 'exports', { value: req });",
+        "function hidden(exports) { exports.response = req; }",
+        "function detach() { eval('exports = {}'); } detach();",
+    ] {
+        let changed = format!("{source}{changed}");
+        assert!(
+            get_bindings(&changed)
+                .export_bindings()
+                .expect("captured export bindings")
+                .is_empty(),
+            "{changed}"
+        );
+    }
+    let non_direct = source.replace(
+        "exports = module.exports = create;",
+        "if (enabled) exports = module.exports = create;",
+    );
+    assert!(
+        get_bindings(&non_direct)
+            .export_bindings()
+            .expect("captured export bindings")
+            .is_empty()
+    );
+    let continued = source.replace("exports.request = req;", "exports.request = req\n.member;");
+    let continued = get_bindings(&continued);
+    assert_eq!(
+        continued
+            .export_bindings()
+            .expect("captured export bindings")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes() {
+    let target = "var root = {}; module.exports = root;";
+    let checked = |source: &str| {
+        let document = parsed(ShippedLanguage::JavaScript, source);
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("checked export capture")
+            .static_facts()
+            .and_then(rift_syntax::StaticFacts::commonjs_export)
+            .cloned()
+    };
+    let witness = checked(target).expect("closed direct default write");
+    assert!(!witness.synchronized);
+    assert_eq!(
+        &target[usize::try_from(witness.assignment.start).expect("start")
+            ..usize::try_from(witness.assignment.end).expect("end")],
+        "module.exports = root"
+    );
+    for source in [
+        "var root = {}; if (flag) module.exports = root;",
+        "var root = {}; module.exports = root; getAlias(module);",
+        "var root = {}; module.exports = root; module.exports = other;",
+        r"var root = {}; module.exports = root; \u006dodule.exports = other;",
+    ] {
+        assert_eq!(checked(source), None, "{source}");
+    }
+}
+
+#[test]
+fn test_member_copy_checks_original_ranges_and_keeps_older_facts_unknown() {
+    let source = "class Owner {
+        handle = () => '';
+        copy() {
+            const clone = new Owner()
+            let mutable = new Owner()
+            clone.handle = this.handle
+            mutable.handle = this.handle
+                .bind(this)
+        }
+    }";
+    let document = parsed(ShippedLanguage::TypeScript, source);
+    let captured = parts(document.facts());
+    let facts = captured.static_facts.as_ref().expect("static facts");
+    let [copy] = facts.member_copies() else {
+        panic!("only the complete direct member copy");
+    };
+    let text = |range: ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    assert_eq!(text(copy.assignment), "clone.handle = this.handle");
+    assert_eq!(text(copy.target), "clone.handle");
+    assert_eq!(text(copy.value), "this.handle");
+    assert!(facts.bindings().iter().any(|binding| {
+        text(binding.name) == "clone"
+            && matches!(binding.kind, StaticBindingKind::JavaScriptConstInstance { constructor }
+                if text(constructor) == "Owner")
+    }));
+    assert!(facts.bindings().iter().any(|binding| {
+        text(binding.name) == "mutable"
+            && matches!(binding.kind, StaticBindingKind::JavaScriptInstance { constructor }
+                if text(constructor) == "Owner")
+    }));
+    let limits = SyntaxLimits::default();
+    let checked = SyntaxFacts::from_parts(source, limits, captured.clone()).expect("checked copy");
+    assert_eq!(checked.static_facts(), Some(facts));
+
+    let older = StaticFactsParts {
+        bindings: facts
+            .bindings()
+            .iter()
+            .map(|binding| {
+                let mut older = *binding;
+                if let StaticBindingKind::JavaScriptConstInstance { constructor } = older.kind {
+                    older.kind = StaticBindingKind::JavaScriptInstance { constructor };
+                }
+                older
+            })
+            .collect(),
+        assignments: facts.assignments().to_vec(),
+        members: facts.members().to_vec(),
+        ..StaticFactsParts::default()
+    };
+    let mut older_capture = captured.clone();
+    older_capture.static_facts = Some(
+        StaticFacts::from_parts(source, limits, older).expect("older facts without copy evidence"),
+    );
+    let older =
+        SyntaxFacts::from_parts(source, limits, older_capture).expect("checked older facts");
+    let older = older.static_facts().expect("older static facts");
+    assert!(older.member_copies().is_empty());
+    assert_eq!(older.assignments(), facts.assignments());
+    assert_eq!(older.members(), facts.members());
+
+    let partial = StaticFactsParts {
+        member_copies: vec![StaticMemberCopy {
+            value: ByteRange {
+                start: copy.value.start,
+                end: copy.value.end - 1,
+            },
+            ..*copy
+        }],
+        ..StaticFactsParts::default()
+    };
+    assert_eq!(
+        StaticFacts::from_parts(source, limits, partial).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_range_invalid::SLUG),
+    );
+    let excess = StaticFactsParts {
+        member_copies: vec![*copy; 2],
+        ..StaticFactsParts::default()
+    };
+    let limits = SyntaxLimits::new(source.len(), 1, 32).expect("positive limits");
+    assert_eq!(
+        StaticFacts::from_parts(source, limits, excess).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG),
+    );
 }
 
 fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
