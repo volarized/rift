@@ -1,0 +1,42 @@
+name: Windows collector accept diagnostic
+
+on:
+  push:
+    branches: [diagnostic/windows-collector-accept-v092]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-collector-accept:
+    if: github.repository == 'volarized/rift' && github.ref == 'refs/heads/diagnostic/windows-collector-accept-v092'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the diagnostic and product commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCT_SHA: 09153ce3d54b5ed8b3ab628e6910c68213c03a38
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$PRODUCT_SHA"
+          for sha in "$PRODUCT_SHA" "$GITHUB_SHA"; do
+            verified=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.commit.verification.verified')
+            test "$verified" = true
+          done
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - name: Test collector accept recovery on native Windows
+        run: >-
+          uv run --locked --project dev python -m unittest discover
+          -s dev/tests -p test_trace_collector.py -v
