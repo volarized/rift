@@ -6,16 +6,11 @@ import stat
 import tarfile
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from rift_release import release
 from rift_release.cli import app
 from typer.testing import CliRunner
-
-# The commit a release binary names after its version.
-COMMIT = "b006b8433ba06679f06a3c7f0743d65634d32c34"
-
 
 @pytest.mark.parametrize(
     "tag",
@@ -44,70 +39,6 @@ def test_workspace_version_reports_every_mismatch(
 
     with pytest.raises(ValueError, match="rift-core=1.2.2"):
         release.validate_workspace_version(tmp_path, "v1.2.3")
-
-
-def test_binary_version_must_equal_tag(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    binary = tmp_path / "rift"
-    binary.touch()
-    processes = iter(
-        [
-            SimpleNamespace(returncode=0, stdout=f"rift 1.2.3+{COMMIT}\n"),
-            SimpleNamespace(returncode=0, stdout="Usage: rift [OPTIONS]\n"),
-        ]
-    )
-    monkeypatch.setattr(
-        release.subprocess, "run", lambda *args, **kwargs: next(processes)
-    )
-    release.verify_binary_version(binary, "v1.2.3")
-
-    mismatch = SimpleNamespace(returncode=0, stdout=f"rift 1.2.2+{COMMIT}\n")
-    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: mismatch)
-    with pytest.raises(ValueError, match="rift 1.2.3"):
-        release.verify_binary_version(binary, "v1.2.3")
-
-
-@pytest.mark.parametrize(
-    "printed",
-    [
-        "rift 1.2.3\n",
-        f"rift 1.2.3+{COMMIT}.dirty.78008464.1790239195123456789\n",
-        "rift 1.2.3+b006b843\n",
-    ],
-)
-def test_binary_version_must_name_one_clean_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    printed: str,
-) -> None:
-    binary = tmp_path / "rift"
-    binary.touch()
-    answer = SimpleNamespace(returncode=0, stdout=printed)
-    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: answer)
-    with pytest.raises(ValueError, match="one commit"):
-        release.verify_binary_version(binary, "v1.2.3")
-
-
-def test_binary_help_is_required(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    binary = tmp_path / "rift"
-    binary.touch()
-    processes = iter(
-        [
-            SimpleNamespace(returncode=0, stdout=f"rift 1.2.3+{COMMIT}\n"),
-            SimpleNamespace(returncode=0, stdout=""),
-        ]
-    )
-    monkeypatch.setattr(
-        release.subprocess, "run", lambda *args, **kwargs: next(processes)
-    )
-
-    with pytest.raises(ValueError, match="expose rift help"):
-        release.verify_binary_version(binary, "v1.2.3")
 
 
 def test_package_has_exact_files_and_modes(tmp_path: Path) -> None:

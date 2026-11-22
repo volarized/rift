@@ -49,15 +49,6 @@ def validate_tag(
     invoke(lambda: release.validate_workspace_version(repository, tag))
 
 
-@app.command("verify-binary")
-def verify_binary(
-    binary: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
-    tag: Tag,
-) -> None:
-    """Verify binary version and help output."""
-    invoke(lambda: release.verify_binary_version(binary, tag))
-
-
 @app.command("package")
 def package(
     binary: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
