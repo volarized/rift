@@ -692,14 +692,17 @@ impl EngineCoverage {
         read: &mut InventoryRead,
         answer: Result<Option<rift_server::EngineInventory>, RiftError>,
     ) -> Result<(), RiftError> {
-        self.file_observations = match (&self.file_observations, &answer) {
+        match (&self.file_observations, &answer) {
+            // A file with no engine adds no observation. A ready engine returns a
+            // report even when it found no facts.
+            (_, Ok(None)) => {}
             (FileObservations::None | FileObservations::OnlyReadinessRefusals, Err(error))
                 if error.slug() == rift_error::errors::lsp::engine_analyzing::SLUG =>
             {
-                FileObservations::OnlyReadinessRefusals
+                self.file_observations = FileObservations::OnlyReadinessRefusals;
             }
-            _ => FileObservations::Other,
-        };
+            _ => self.file_observations = FileObservations::Other,
+        }
         match answer {
             Ok(Some(answer)) => {
                 read.partial |= answer.warnings.iter().any(|warning| {
