@@ -5,8 +5,8 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    ByteRange, StaticBinding, StaticBindingKind, SyntaxExportBinding, SyntaxExportKind,
-    SyntaxSymbol,
+    ByteRange, StaticBinding, StaticBindingKind, StaticReference, SyntaxExportBinding,
+    SyntaxExportKind, SyntaxSymbol,
 };
 
 use super::javascript::MemberMode;
@@ -74,7 +74,8 @@ impl<'source> Index<'source> {
                     reference.role != ReferenceRole::Type
                         || target.symbol.kinds.contains(&SymbolKind::Type)
                         || target.symbol.kinds.contains(&SymbolKind::Variant)
-                });
+                })
+                .or_else(|| self.javascript_merged_alias_type(file, reference, work));
             let mut occurrence = target
                 .and_then(|target| {
                     self.occurrence(
@@ -156,6 +157,73 @@ impl<'source> Index<'source> {
             result.record(occurrence());
         }
         self.javascript_contains(file, work, result);
+    }
+
+    /// Selects the alias facet for a direct TypeScript reference to an established
+    /// alias and namespace pair in the same lexical scope.
+    fn javascript_merged_alias_type(
+        &self,
+        file: &File<'source>,
+        reference: &StaticReference,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if reference.role != ReferenceRole::Type
+            || !file.document.path.as_str().ends_with(".ts")
+            || file.members.contains_key(&reference.target)
+        {
+            return None;
+        }
+        let name = file.text(reference.target)?;
+        let position = reference.target.start;
+        if file.by_name.get(name)?.len() < 2 || file.blocked(position, work) {
+            return None;
+        }
+
+        let mut pair: [Option<&StaticBinding>; 2] = [None, None];
+        let mut additional = false;
+        file.innermost_bindings(
+            name,
+            position,
+            work,
+            // Keep the fallback limited to an unshadowed pair of written declarations.
+            |_| true,
+            |binding, first| {
+                if first {
+                    pair = [Some(binding), None];
+                    additional = false;
+                } else if pair[1].is_none() {
+                    pair[1] = Some(binding);
+                } else {
+                    additional = true;
+                }
+            },
+        )?;
+
+        let [Some(first), Some(second)] = pair else {
+            return None;
+        };
+        if additional
+            || first.kind != StaticBindingKind::Local
+            || second.kind != StaticBindingKind::Local
+        {
+            return None;
+        }
+        let left = file.target_at(first.name)?;
+        let right = file.target_at(second.name)?;
+        let (alias, namespace) = match (
+            left.symbol.syntax_element_kind,
+            right.symbol.syntax_element_kind,
+        ) {
+            (Some("type_alias_declaration"), Some("internal_module")) => (left, right),
+            (Some("internal_module"), Some("type_alias_declaration")) => (right, left),
+            _ => return None,
+        };
+        if alias.symbol.kinds.contains(&SymbolKind::Public)
+            != namespace.symbol.kinds.contains(&SymbolKind::Public)
+        {
+            return None;
+        }
+        (self.javascript_identity(alias)? == self.javascript_identity(namespace)?).then_some(alias)
     }
 
     fn javascript_assignment_reference_from(

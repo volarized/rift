@@ -2973,6 +2973,105 @@ fn test_typescript_qualified_annotation_names_are_not_value_accesses() {
 }
 
 #[test]
+fn test_typescript_declaration_type_use_selects_the_physical_merged_alias() {
+    let source = "export declare namespace Shape { export type Nested = { item?: Shape }; } export type Shape = { label: string }; declare namespace Types { export interface Member {} } export type Qualified = Types.Member;";
+    let path = "main.d.ts";
+    let result = resolution("typescript", &[(path, source)], &[], WORK_MAX);
+    let reference_start = u64::try_from(source.find("?: Shape").expect("type reference") + 3)
+        .expect("reference start");
+    let mut occurrences = result.occurrences.iter().filter(|edge| {
+        edge.role == ReferenceRole::Type && edge.binding.range().start() == reference_start
+    });
+    let edge = occurrences.next().expect("merged alias use");
+    assert_eq!(source_of(edge, source), "Shape");
+    assert_eq!(edge.binding.unit().key().as_str(), path);
+    assert_eq!(
+        target(edge),
+        "rift://symbol/local/typescript/.%2Fmain.d.ts/Shape"
+    );
+    let physical = edge.target_binding.as_ref().expect("physical alias");
+    assert_eq!(physical.unit(), edge.binding.unit());
+    let declaration = "type Shape = { label: string };";
+    let alias_start =
+        u64::try_from(source.find(declaration).expect("alias declaration")).expect("alias start");
+    let alias_length = u64::try_from(declaration.len()).expect("alias length");
+    assert_eq!(physical.range().start(), alias_start);
+    assert_eq!(physical.range().end(), alias_start + alias_length);
+    assert!(occurrences.next().is_none());
+    assert!(result.occurrences.iter().any(|edge| {
+        edge.role == ReferenceRole::Type
+            && source_of(edge, source) == "Types.Member"
+            && target(edge).ends_with("/Types/Member")
+    }));
+}
+
+#[test]
+fn test_typescript_merged_alias_refuses_competing_and_wrong_space_bindings() {
+    let fixtures = [
+        "declare namespace Shape { export type Nested = { item?: Shape }; }",
+        "export declare namespace Shape { export type Nested = { item?: Shape }; } export type Shape = number; export type Shape = string;",
+        "export declare namespace Shape { export type Nested<Shape> = { item?: Shape }; } export type Shape = number;",
+        "declare namespace Shape { export type Nested = { item?: Shape }; } export type Shape = number;",
+        "declare namespace Shapes { export type Shape = number; } declare namespace Shape { export type Nested = { item?: Shape }; }",
+    ];
+    for path in ["main.d.ts", "main.ts"] {
+        let logical = format!("rift://symbol/local/typescript/.%2F{path}/Shape");
+        for source in fixtures {
+            let result = resolution("typescript", &[(path, source)], &[], WORK_MAX);
+            assert!(
+                !result.occurrences.iter().any(|edge| {
+                    edge.role == ReferenceRole::Type
+                        && source_of(edge, source) == "Shape"
+                        && target(edge) == logical
+                }),
+                "{path} {source}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_typescript_source_type_use_selects_the_physical_merged_alias() {
+    let source = "export namespace Result { export function make() {} }
+export type Result<T> = { data: T };
+export type One = Result<number>;
+export type Runtime = typeof Result;
+export type Shadow<Result> = Result;
+export namespace Other { export type Result<T> = T; export type Two = Result<string>; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let logical = "rift://symbol/local/typescript/.%2Fmain.ts/Result";
+    let annotation = source.find("Result<number>").expect("type annotation");
+    let mut alias_types = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Type && target(edge) == logical);
+    let edge = alias_types.next().expect("merged type alias");
+    assert!(alias_types.next().is_none());
+    assert_eq!(source_of(edge, source), "Result");
+    assert_eq!(
+        edge.binding.range().start(),
+        u64::try_from(annotation).expect("type start")
+    );
+    let physical = edge.target_binding.as_ref().expect("physical type alias");
+    assert_eq!(physical.unit(), edge.binding.unit());
+    let declaration = "type Result<T> = { data: T };";
+    let alias_start = source.find(declaration).expect("type declaration");
+    assert_eq!(
+        physical.range().start(),
+        u64::try_from(alias_start).expect("alias start")
+    );
+    assert_eq!(
+        physical.range().end(),
+        u64::try_from(alias_start + declaration.len()).expect("alias end")
+    );
+    assert!(result.occurrences.iter().any(|edge| {
+        edge.role == ReferenceRole::Type
+            && source_of(edge, source) == "Result"
+            && target(edge).ends_with(".%2Fmain.ts/Other/Result")
+    }));
+}
+
+#[test]
 fn test_rust_trait_default_and_explicit_bounds_keep_source_and_identity() {
     let source = "pub trait Count { fn remaining(&self) -> usize; fn get(&self) -> usize { self.remaining() } } pub fn generic<T: Count>(item: &T) -> usize { item.remaining() } pub fn bounded<T>(item: &T) -> usize where T: Count { item.remaining() }";
     let result = resolution(
