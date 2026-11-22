@@ -2624,6 +2624,81 @@ export function loose(connection: unknown) {
 }
 
 #[test]
+fn test_javascript_bound_function_owns_direct_prototype_methods() {
+    let source = "var Writer = function() {};
+Writer.prototype.write = function() {};
+var Alias = Writer;
+Alias.prototype.hidden = function() {};
+var Replaced = function() {};
+Replaced.prototype = {};
+Replaced.prototype.hidden = function() {};
+var Rebound = function() {};
+Rebound.prototype.hidden = function() {};
+Rebound = function() {};
+const Arrow = () => {};
+Arrow.prototype.hidden = function() {};
+const Async = async function() {};
+Async.prototype.hidden = function() {};
+const Generator = function*() {};
+Generator.prototype.hidden = function() {};
+Early.prototype.hidden = function() {};
+var Early = function() {};
+";
+    let (_directory, index) = workspace(&[("writer.js", source)]);
+    let view = index.symbol_view().expect("symbol view");
+    let graph = view.normalized_graph();
+    let identity = |suffix: &str| {
+        graph.records().iter().find(|record| {
+            record
+                .identity()
+                .is_some_and(|name| name.as_str().ends_with(suffix))
+        })
+    };
+    for (name, kind) in [
+        ("writer.js/Writer", "variable"),
+        ("writer.js/Writer/write", "method"),
+    ] {
+        let symbol = identity(name).expect("authored symbol");
+        assert!(symbol.contributions().iter().any(|key| {
+            graph
+                .contribution(key)
+                .and_then(rift_core::Contribution::facts)
+                .is_some_and(|fact| fact.kind().0 == kind)
+        }));
+    }
+    for owner in [
+        "Alias",
+        "Replaced",
+        "Rebound",
+        "Arrow",
+        "Async",
+        "Generator",
+        "Early",
+    ] {
+        assert!(
+            identity(&format!("writer.js/{owner}/hidden")).is_none(),
+            "{owner}"
+        );
+    }
+    let mut edges = index.edges().edges().filter(|edge| {
+        edge.kind() == EdgeKind::Contains
+            && edge.from().as_str().ends_with("writer.js/Writer")
+            && edge.to().as_str().ends_with("writer.js/Writer/write")
+    });
+    let edge = edges.next().expect("stored containment");
+    assert!(edges.next().is_none());
+    assert_eq!(edge.occurrence().unit().key().as_str(), "writer.js");
+    let range = edge.occurrence().range();
+    let start = usize::try_from(range.start()).expect("method start");
+    let end = usize::try_from(range.end()).expect("method end");
+    assert_eq!(
+        start,
+        source.find("prototype.write").expect("method") + "prototype.".len()
+    );
+    assert_eq!(&source[start..end], "write");
+}
+
+#[test]
 fn test_this_assignments_declare_members_and_join_existing_facets() {
     // `this.name = value` in a constructor or method declares member `name` of the class;
     // a same-named field is another facet of that member. Members of an object literal
