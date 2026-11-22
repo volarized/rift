@@ -398,6 +398,65 @@ async fn graph_paths_and_physical_usages_select_exact_pages() -> TestResult {
 }
 
 #[tokio::test]
+async fn anchored_call_usages_keep_exact_invocation_ranges() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", SOURCE)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let entry = identity(&client, "graph_root").await?;
+    let leaf = identity(&client, "graph_leaf").await?;
+    let orphan = identity(&client, "graph_orphan").await?;
+    let usages = format!(
+        "<{leaf}> :usages ?u . ?u :kind 'calls'; :of <{entry}>; :source ?source; \
+         :range [ :unit ?unit; :start ?start; :end ?end ] ."
+    );
+    let select = |additional: &str| {
+        format!("SELECT ?unit ?start ?end ?source {{ {usages} {additional} }} ORDER BY ?start")
+    };
+    let direct = statement(&client, select("")).await?;
+    let joined = statement(&client, select(&format!("<{entry}> :calls <{leaf}> ."))).await?;
+    let rows = query::rows(&direct)?;
+    assert_eq!(rows.len(), 2, "{direct}");
+    assert_eq!(rows, query::rows(&joined)?, "{joined}");
+    for (row, (start, source)) in rows.iter().zip(SOURCE.match_indices("graph_leaf()")) {
+        assert_eq!(query::literal(row, "start")?.parse::<usize>()?, start);
+        assert_eq!(
+            query::literal(row, "end")?.parse::<usize>()?,
+            start + source.len(),
+        );
+        assert_eq!(query::literal(row, "source")?, source);
+        assert_eq!(query::iri(row, "unit")?, "rift://source/project/graph.py");
+    }
+    let limited = statement(&client, format!("{} LIMIT 1", select(""))).await?;
+    assert_eq!(query::rows(&limited)?, &rows[..1]);
+
+    let empty = statement(
+        &client,
+        format!("ASK {{ <{orphan}> :usages ?u . ?u :kind 'calls' }}"),
+    )
+    .await?;
+    let calls = statement(&client, format!("ASK {{ ?caller :calls <{orphan}> }}")).await?;
+    assert_eq!(empty["answer"], calls["answer"], "{empty}");
+    assert_eq!(empty["reason"], calls["reason"], "{empty}");
+    if empty["answer"].is_null() {
+        assert_eq!(empty["reason"], "insufficient_coverage", "{empty}");
+    } else {
+        assert_eq!(empty["answer"], json!({"result":"boolean", "value": false}));
+    }
+
+    let uncovered = statement(
+        &client,
+        "ASK { <rift://symbol/pypi/pypi.org/otherpkg/python/otherpkg/entry> \
+         :usages ?u . ?u :kind 'calls' }",
+    )
+    .await?;
+    assert_eq!(uncovered["reason"], "insufficient_coverage", "{uncovered}");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn retrieval_projections_keep_ranked_and_regex_results_and_refuse_missing_coverage()
 -> TestResult {
     let (_directory, client, _server_task) = served_workspace(

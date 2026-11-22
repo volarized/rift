@@ -8032,6 +8032,112 @@ done
         Ok(())
     }
 
+    /// Gives the first capture its normal answer and makes a second capture outlast the
+    /// request's 1 s budget.
+    #[cfg(unix)]
+    fn delay_inventory_revalidation(server: &RiftMcp, root: std::path::PathBuf) {
+        let hook = Arc::downgrade(&server.forced_capture.0);
+        server.force_capture(move |current| {
+            let deferred_root = root.clone();
+            let deferred =
+                move |current: &super::PublishedWorkspace| captured_tree(&deferred_root, current);
+            *hook
+                .upgrade()
+                .expect("the server still holds its capture")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((Arc::new(deferred), Duration::from_secs(2)));
+            captured_tree(&root, current)
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inventory_readiness_refusal_keeps_calls_at_the_accepted_revision() -> TestResult {
+        use rift_protocol::query::{QueryAnswer, QueryParams, QueryReadResult, RdfTerm};
+        use rift_protocol::read::ReadWarning;
+        use rift_protocol::search_read::SearchUnavailable;
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+
+        let calls = "SELECT ?s ?t { ?s :calls ?t }";
+        for (explicit, query, partial_rows) in [
+            (false, calls, true),
+            (true, calls, true),
+            (false, "ASK { ?s :calls ?t . FILTER(?s = ?t) }", false),
+            (false, "SELECT (COUNT(?s) AS ?n) { ?s :calls ?t }", false),
+        ] {
+            let engine = tempfile::tempdir()?;
+            let script = engine.path().join("engine.sh");
+            let analyzing = ANALYZING_ENGINE.replace("referencesProvider", "callHierarchyProvider");
+            // The requested publication is already accepted when the engine starts.
+            fs::write(
+                &script,
+                format!("printf '%s\\n' 'pub fn later() {{}}' > \"$1\"\n{analyzing}"),
+            )?;
+            let directory = tempfile::tempdir()?;
+            let source = directory.path().join("lib.rs");
+            fs::write(
+                &source,
+                "pub fn beacon() {}\npub fn caller() { beacon(); }\n",
+            )?;
+            captured_rust_traversal_metadata(directory.path())?;
+            super::hermetic_workspace(
+                directory.path(),
+                &format!(
+                    concat!(
+                        "[server]\nreadiness_timeout = '1s'\n",
+                        "[languages.rust.lsp]\ncommand = ['sh', {}, {}]\n",
+                    ),
+                    serde_json::to_string(&script)?,
+                    serde_json::to_string(&source)?,
+                ),
+            )?;
+            let assembled = unsupervised_server(directory.path()).await?;
+            let server = &assembled.server;
+            let published = Arc::clone(&server.published.read().await.current);
+            let revision = published.reads.served_revision()?;
+            let from = captured_traversal_seed(&published.reads, "caller")?;
+            let to = captured_traversal_seed(&published.reads, "beacon")?;
+            delay_inventory_revalidation(server, directory.path().canonicalize()?);
+            let result = server
+                .graph_query(QueryParams {
+                    query: query.to_owned(),
+                    revision: explicit.then(|| revision.clone()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0
+                .result;
+            assert_eq!(fs::read_to_string(&source)?, "pub fn later() {}\n");
+            let warnings = match result {
+                QueryReadResult::Results(result) if partial_rows => {
+                    assert_eq!(result.revision.as_ref(), Some(&revision));
+                    assert!(
+                        matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                            if bindings.len() == 1
+                                && bindings[0].get("s") == Some(&RdfTerm::Iri { value: from })
+                                && bindings[0].get("t") == Some(&RdfTerm::Iri { value: to }))
+                    );
+                    result.warnings
+                }
+                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason: SymbolUnavailableReason::InsufficientCoverage,
+                    warnings,
+                    ..
+                }) if !partial_rows => warnings,
+                result => return Err(format!("unexpected graph result: {result:?}").into()),
+            };
+            assert!(warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::EngineAnalysisUnavailable { detail, .. }
+                    if detail.contains("readiness_timeout")
+            )));
+            server.engine_pool().await.shutdown().await;
+        }
+        Ok(())
+    }
+
     /// A traversal whose tree check takes a third of the 3 s budget still answers inside
     /// it: the walk reserves twice the request-time capture, so the check after a walk
     /// that waited out its engine fits before the deadline. Three such captures alone

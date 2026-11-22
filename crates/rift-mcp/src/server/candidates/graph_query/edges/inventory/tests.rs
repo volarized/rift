@@ -1,6 +1,52 @@
 use super::*;
 use rift_protocol::read::{SourceUnitId, SourceUnitSpan, TextRange};
 
+#[test]
+fn only_readiness_refusals_skip_live_inventory_validation() -> Result<(), RiftError> {
+    let analyzing = || {
+        Err(rift_error::errors::lsp::engine_analyzing()
+            .attempts(1_u64)
+            .error())
+    };
+    let successful_empty = || {
+        Ok(Some(rift_server::EngineInventory {
+            calls: Vec::new(),
+            references: Vec::new(),
+            types: Vec::new(),
+            heritage: Vec::new(),
+            warnings: Vec::new(),
+            packages: Vec::new(),
+        }))
+    };
+    let observe = |answers: Vec<_>| -> Result<_, RiftError> {
+        let mut read = InventoryRead::default();
+        let mut coverage = EngineCoverage::default();
+        for answer in answers {
+            coverage.admit(&mut read, answer)?;
+        }
+        let captured_only = coverage.finish(&mut read);
+        Ok((read, captured_only))
+    };
+    let (captured, captured_only) = observe(vec![Ok(None), analyzing(), analyzing(), Ok(None)])?;
+    assert!(captured_only);
+    assert!(captured.partial);
+    assert!(matches!(
+        captured.warnings.as_slice(),
+        [ReadWarning::EngineAnalysisUnavailable { .. }]
+    ));
+    for other in [
+        vec![],
+        vec![Ok(None), Ok(None)],
+        vec![successful_empty()],
+        vec![analyzing(), successful_empty()],
+        vec![successful_empty(), Ok(None), analyzing()],
+        vec![analyzing(), Err(coverage_failure())],
+    ] {
+        assert!(!observe(other)?.1);
+    }
+    Ok(())
+}
+
 fn references() -> (SymbolId, Vec<QueryOccurrence>) {
     let target = SymbolId("rift://symbol/local/rust/test/target".to_owned());
     let caller = SymbolId("rift://symbol/local/rust/test/caller".to_owned());

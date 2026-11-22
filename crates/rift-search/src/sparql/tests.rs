@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use rift_error::{ErrorSlug, RiftError, errors};
-use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
+use rift_protocol::read::{
+    EdgeKind, Language, SourceUnitId, SymbolId, TextRange, TraversalDirection,
+};
 
 use super::{
     GraphAnswer, GraphDataset, GraphDatasetBuilder, GraphFact, GraphLimits, GraphQuery, GraphTerm,
@@ -683,6 +685,52 @@ fn structure_refusal(text: &str, limits: &GraphLimits) -> String {
         "{error}"
     );
     error.to_string()
+}
+
+#[test]
+fn anchored_usage_acquisition_selects_a_single_local_call_kind() {
+    let limits = GraphLimits::default();
+    let package = "rift://symbol/cargo/crates.io/demo/rust/demo/parse";
+    for (anchor, constraint, expected) in [
+        (PARSE, r#"?usage :kind "calls" ."#, EdgeKind::Calls),
+        (
+            PARSE,
+            r#"?usage :kind "calls"^^xsd:string ."#,
+            EdgeKind::Calls,
+        ),
+        (PARSE, r#"?usage :kind "calls"@en ."#, EdgeKind::References),
+        (PARSE, "?usage :kind ?kind .", EdgeKind::References),
+        (
+            PARSE,
+            r#"?usage :kind "calls", ?kind ."#,
+            EdgeKind::References,
+        ),
+        (PARSE, "", EdgeKind::References),
+        (package, r#"?usage :kind "calls" ."#, EdgeKind::References),
+    ] {
+        let text = format!(
+            "SELECT ?start {{ <{anchor}> :usages ?usage . \
+             ?usage :range/:start ?start . {constraint} }} LIMIT 1"
+        );
+        let query = GraphQuery::parse(&text, &limits).expect("usage query");
+        let selection = query.adjacency_selection().expect("anchored usage plan");
+        assert_eq!(selection.step(0).kind, expected, "{text}");
+        assert_eq!(selection.step(0).direction, TraversalDirection::Incoming);
+        assert_eq!(selection.depth, Some(1));
+        assert_eq!(selection.seed.as_str(), anchor);
+        assert!(selection.occurrences.is_some());
+        assert!(query.admits_partial_rows(), "{text}");
+    }
+    let patterns = format!(r#"<{PARSE}> :usages ?usage . ?usage :kind "calls" ."#);
+    let tight = GraphLimits::builder()
+        .patterns_max(1)
+        .build()
+        .expect("nonzero");
+    let capped = format!("SELECT ?usage {{ {patterns} }}");
+    assert!(structure_refusal(&capped, &tight).contains("2 patterns"));
+    let aggregate = format!("SELECT (COUNT(?usage) AS ?count) {{ {patterns} }}");
+    let query = GraphQuery::parse(&aggregate, &limits).expect("aggregate usage query");
+    assert!(!query.admits_partial_rows(), "{aggregate}");
 }
 
 #[test]

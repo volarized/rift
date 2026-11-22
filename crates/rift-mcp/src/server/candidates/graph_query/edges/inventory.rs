@@ -395,9 +395,14 @@ impl RiftMcp {
         if let Some(read) = cache.get(inventory.facts, tokio::time::Instant::now()) {
             return Ok(read);
         }
-        let read = self
+        let (read, captured_only) = self
             .read_engine_inventory(resolved, engines, inventory, end)
             .await?;
+        // The request already accepted this publication. Every engine file refused
+        // readiness, so there are no live facts or new source positions to validate.
+        if captured_only {
+            return Ok(Arc::new(read));
+        }
         if !self
             .engine_tree_matches(&resolved.published)
             .await
@@ -416,7 +421,7 @@ impl RiftMcp {
         engines: &Arc<rift_server::EnginePool>,
         inventory: &InventorySelection<'_>,
         end: tokio::time::Instant,
-    ) -> Result<InventoryRead, RiftError> {
+    ) -> Result<(InventoryRead, bool), RiftError> {
         let reads = Arc::clone(&resolved.published.reads);
         let seeds = inventory.seeds.to_vec();
         let capture = Arc::clone(&reads);
@@ -492,18 +497,20 @@ impl RiftMcp {
         while let Some(answer) = requests.next().await {
             coverage.admit(&mut read, answer)?;
         }
-        coverage.finish(&mut read);
-        self.name_inventory_targets(
-            resolved,
-            engines,
-            roots.clone(),
-            &mut read,
-            end,
-            selection.occurrences.is_some(),
-        )
-        .await?;
+        let captured_only = coverage.finish(&mut read);
+        if !captured_only {
+            self.name_inventory_targets(
+                resolved,
+                engines,
+                roots.clone(),
+                &mut read,
+                end,
+                selection.occurrences.is_some(),
+            )
+            .await?;
+        }
         read.report_missing();
-        Ok(read)
+        Ok((read, captured_only))
     }
 
     async fn name_inventory_targets(
@@ -639,7 +646,7 @@ impl RiftMcp {
                     end,
                 )
                 .await
-                .map(Arc::new);
+                .map(|(read, _)| Arc::new(read));
         }
         let capture = Arc::clone(&resolved.published.reads);
         let seeds = self
@@ -665,9 +672,18 @@ impl RiftMcp {
 #[derive(Default)]
 struct EngineCoverage {
     occurrences: bool,
+    file_observations: FileObservations,
     seen_calls: BTreeSet<SymbolId>,
     calls: BTreeMap<SymbolId, bool>,
     references: BTreeMap<SymbolId, bool>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum FileObservations {
+    #[default]
+    None,
+    OnlyReadinessRefusals,
+    Other,
 }
 
 impl EngineCoverage {
@@ -676,6 +692,17 @@ impl EngineCoverage {
         read: &mut InventoryRead,
         answer: Result<Option<rift_server::EngineInventory>, RiftError>,
     ) -> Result<(), RiftError> {
+        match (&self.file_observations, &answer) {
+            // A file with no engine adds no observation. A ready engine returns a
+            // report even when it found no facts.
+            (_, Ok(None)) => {}
+            (FileObservations::None | FileObservations::OnlyReadinessRefusals, Err(error))
+                if error.slug() == rift_error::errors::lsp::engine_analyzing::SLUG =>
+            {
+                self.file_observations = FileObservations::OnlyReadinessRefusals;
+            }
+            _ => self.file_observations = FileObservations::Other,
+        }
         match answer {
             Ok(Some(answer)) => {
                 read.partial |= answer.warnings.iter().any(|warning| {
@@ -732,7 +759,8 @@ impl EngineCoverage {
         Ok(())
     }
 
-    fn finish(self, read: &mut InventoryRead) {
+    /// Completes coverage and returns whether only the accepted capture supplies facts.
+    fn finish(self, read: &mut InventoryRead) -> bool {
         for (seed, complete) in self.calls {
             if complete {
                 read.missing.calls.remove(&seed);
@@ -743,6 +771,9 @@ impl EngineCoverage {
                 read.missing.references.remove(&seed);
             }
         }
+        self.file_observations == FileObservations::OnlyReadinessRefusals
+            && read.packages.is_empty()
+            && read.calls.values().all(|calls| calls.packages.is_empty())
     }
 }
 

@@ -5,8 +5,8 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    ByteRange, StaticBinding, StaticBindingKind, SyntaxExportBinding, SyntaxExportKind,
-    SyntaxSymbol,
+    ByteRange, StaticBinding, StaticBindingKind, StaticReference, SyntaxExportBinding,
+    SyntaxExportKind, SyntaxSymbol,
 };
 
 use super::javascript::MemberMode;
@@ -74,7 +74,8 @@ impl<'source> Index<'source> {
                     reference.role != ReferenceRole::Type
                         || target.symbol.kinds.contains(&SymbolKind::Type)
                         || target.symbol.kinds.contains(&SymbolKind::Variant)
-                });
+                })
+                .or_else(|| self.javascript_merged_alias_type(file, reference, work));
             let mut occurrence = target
                 .and_then(|target| {
                     self.occurrence(
@@ -156,6 +157,76 @@ impl<'source> Index<'source> {
             result.record(occurrence());
         }
         self.javascript_contains(file, work, result);
+    }
+
+    /// Selects the alias facet for a direct TypeScript reference to an established
+    /// alias and namespace pair in the same lexical scope.
+    fn javascript_merged_alias_type(
+        &self,
+        file: &File<'source>,
+        reference: &StaticReference,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if reference.role != ReferenceRole::Type
+            || !matches!(
+                file.document.path.as_str().rsplit_once('.'),
+                Some((_, "ts"))
+            )
+            || file.members.contains_key(&reference.target)
+        {
+            return None;
+        }
+        let name = file.text(reference.target)?;
+        let position = reference.target.start;
+        if file.by_name.get(name)?.len() < 2 || file.blocked(position, work) {
+            return None;
+        }
+
+        let mut pair: [Option<&StaticBinding>; 2] = [None, None];
+        let mut additional = false;
+        file.innermost_bindings(
+            name,
+            position,
+            work,
+            // Keep the fallback limited to an unshadowed pair of written declarations.
+            |_| true,
+            |binding, first| {
+                if first {
+                    pair = [Some(binding), None];
+                    additional = false;
+                } else if pair[1].is_none() {
+                    pair[1] = Some(binding);
+                } else {
+                    additional = true;
+                }
+            },
+        )?;
+
+        let [Some(first), Some(second)] = pair else {
+            return None;
+        };
+        if additional
+            || first.kind != StaticBindingKind::Local
+            || second.kind != StaticBindingKind::Local
+        {
+            return None;
+        }
+        let left = file.target_at(first.name)?;
+        let right = file.target_at(second.name)?;
+        let (alias, namespace) = match (
+            left.symbol.syntax_element_kind,
+            right.symbol.syntax_element_kind,
+        ) {
+            (Some("type_alias_declaration"), Some("internal_module")) => (left, right),
+            (Some("internal_module"), Some("type_alias_declaration")) => (right, left),
+            _ => return None,
+        };
+        if alias.symbol.kinds.contains(&SymbolKind::Public)
+            != namespace.symbol.kinds.contains(&SymbolKind::Public)
+        {
+            return None;
+        }
+        (self.javascript_identity(alias)? == self.javascript_identity(namespace)?).then_some(alias)
     }
 
     fn javascript_assignment_reference_from(
@@ -242,7 +313,9 @@ impl<'source> Index<'source> {
                         .or_else(|| file.qualified_target(container))
                 })
                 .and_then(|target| self.javascript_identity(target));
-            let from = from.or_else(|| module.clone());
+            let from = from
+                .or_else(|| self.javascript_merged_alias_property_parent(file, target, work))
+                .or_else(|| module.clone());
             if let Some(from) = from {
                 result.record(self.javascript_declaration_edge(
                     file,
@@ -255,6 +328,48 @@ impl<'source> Index<'source> {
                 self.javascript_overrides(file, symbol, work, result);
             }
         }
+    }
+
+    /// A property written inside the alias facet of one local namespace and type alias.
+    fn javascript_merged_alias_property_parent(
+        &self,
+        file: &File<'source>,
+        child: Target<'source>,
+        work: &mut Work,
+    ) -> Option<SymbolId> {
+        if child.symbol.syntax_element_kind != Some("property_signature") {
+            return None;
+        }
+        let [left, right] = file
+            .by_qualified_name
+            .get(child.symbol.container.as_deref()?)?
+            .as_slice()
+        else {
+            return None;
+        };
+        if !work.charge() || !work.charge() {
+            return None;
+        }
+        let (alias, namespace) = match (left.syntax_element_kind, right.syntax_element_kind) {
+            (Some("type_alias_declaration"), Some("internal_module")) => (*left, *right),
+            (Some("internal_module"), Some("type_alias_declaration")) => (*right, *left),
+            _ => return None,
+        };
+        if alias.container != namespace.container
+            || !alias.item_range.encloses(child.symbol.item_range)
+            || (alias.item_range.start < namespace.item_range.end
+                && namespace.item_range.start < alias.item_range.end)
+        {
+            return None;
+        }
+        let target = |symbol| Target {
+            file: file.document,
+            symbol,
+        };
+        let identity = self.javascript_identity(target(alias))?;
+        (self.javascript_identity(target(namespace))? == identity
+            && self.javascript_identity(child)? != identity)
+            .then_some(identity)
     }
 
     fn javascript_module_reference(
