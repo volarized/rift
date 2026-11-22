@@ -27,7 +27,7 @@ fn only_readiness_refusals_skip_live_inventory_validation() -> Result<(), RiftEr
         let captured_only = coverage.finish(&mut read);
         Ok((read, captured_only))
     };
-    let (captured, captured_only) = observe(vec![analyzing(), analyzing()])?;
+    let (captured, captured_only) = observe(vec![Ok(None), analyzing(), analyzing(), Ok(None)])?;
     assert!(captured_only);
     assert!(captured.partial);
     assert!(matches!(
@@ -36,10 +36,10 @@ fn only_readiness_refusals_skip_live_inventory_validation() -> Result<(), RiftEr
     ));
     for other in [
         vec![],
+        vec![Ok(None), Ok(None)],
         vec![successful_empty()],
         vec![analyzing(), successful_empty()],
-        vec![successful_empty(), analyzing()],
-        vec![analyzing(), Ok(None)],
+        vec![successful_empty(), Ok(None), analyzing()],
         vec![analyzing(), Err(coverage_failure())],
     ] {
         assert!(!observe(other)?.1);
