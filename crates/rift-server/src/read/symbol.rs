@@ -8,7 +8,7 @@ use rift_protocol::symbol_read::{
     SymbolUnavailableReason,
 };
 
-use rift_index::WorkspaceSymbolView;
+use rift_index::{WorkspaceIndex, WorkspaceSymbolView};
 
 use super::ReadService;
 
@@ -47,8 +47,8 @@ impl ReadService {
             ));
         }
         let key = rift_core::SymbolId::new(request.id.as_str())?;
-        let index = self.index.symbol_view()?;
-        let Some(readable) = index.object_by_identity(&key)? else {
+        let Some(readable) = self.index.object_by_identity(&key)? else {
+            let index = self.index.symbol_view()?;
             if !covers_exact_identity(&index, &identity) {
                 return Ok(unavailable(
                     request,
@@ -73,7 +73,7 @@ impl ReadService {
             offset,
             limit,
         };
-        self.found_symbol(request, &index, &readable, &key, page, warnings)
+        self.found_symbol(request, &readable, &key, page, warnings)
     }
 
     /// The answer for a symbol the index holds: its facts, one page of its declarations, and
@@ -81,7 +81,6 @@ impl ReadService {
     fn found_symbol(
         &self,
         request: &GetSymbolParams,
-        index: &WorkspaceSymbolView,
         readable: &rift_index::ReadableSymbol,
         key: &rift_core::SymbolId,
         page: DeclarationPage,
@@ -89,7 +88,7 @@ impl ReadService {
     ) -> Result<GetSymbolResult, RiftError> {
         let symbol = readable.to_protocol_symbol();
         if !symbol.name_is_public() {
-            let (bindings, _) = index.symbols_by_identity_page(key, 0, 1)?;
+            let (bindings, _) = self.index.symbols_by_identity_page(key, 0, 1)?;
             warnings.push(bindings.first().copied().map_or_else(
                 || super::object_unavailable_at(readable.facts().qualified_name(), None, None),
                 super::object_unavailable,
@@ -101,7 +100,7 @@ impl ReadService {
             ));
         }
         let history = if request.include.history {
-            let Some(history) = self.exact_history(index, request, key)? else {
+            let Some(history) = self.exact_history(request, key)? else {
                 return Ok(unavailable(
                     request,
                     SymbolUnavailableReason::InsufficientCoverage,
@@ -112,11 +111,11 @@ impl ReadService {
         } else {
             None
         };
-        let (declarations, total) = declarations_page(index, key, page.offset, page.limit)?;
+        let (declarations, total) = declarations_page(&self.index, key, page.offset, page.limit)?;
         let documentation = request
             .include
             .documentation
-            .then(|| exact_documentation(index, request));
+            .then(|| exact_documentation(&self.index, request));
         warnings.extend(super::symbol_disagreement_warning(readable.assembled()));
         Ok(GetSymbolResult::Found {
             symbol: Box::new(symbol),
@@ -137,11 +136,12 @@ impl ReadService {
     /// binds it.
     fn exact_history(
         &self,
-        index: &WorkspaceSymbolView,
         request: &GetSymbolParams,
         key: &rift_core::SymbolId,
     ) -> Result<Option<SymbolHistory>, RiftError> {
-        let (bindings, _) = index.symbols_by_identity_page(key, 0, self.index.results_max())?;
+        let (bindings, _) =
+            self.index
+                .symbols_by_identity_page(key, 0, self.index.results_max())?;
         if bindings.is_empty() {
             return Ok(None);
         }
@@ -182,7 +182,7 @@ fn covers_exact_identity(index: &WorkspaceSymbolView, identity: &SymbolIdentity)
 
 /// The bounded documentation that refers to the requested symbol.
 fn exact_documentation(
-    index: &WorkspaceSymbolView,
+    index: &WorkspaceIndex,
     request: &GetSymbolParams,
 ) -> rift_protocol::documentation::DocumentationContext {
     let mut bytes_left = rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
@@ -258,7 +258,7 @@ fn unavailable(
 mod tests;
 
 fn declarations_page(
-    index: &WorkspaceSymbolView,
+    index: &WorkspaceIndex,
     key: &rift_core::SymbolId,
     offset: usize,
     max_results: usize,

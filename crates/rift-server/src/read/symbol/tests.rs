@@ -61,6 +61,47 @@ fn request(id: SymbolId) -> GetSymbolParams {
 }
 
 #[test]
+fn exact_hit_after_edit_matches_cold_pages_without_building_lexical_units() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let previous = service(directory.path(), true)?;
+    let mut params = request(open_identity(&previous)?);
+    std::fs::write(
+        directory.path().join("index.d.ts"),
+        OVERLOADS.replace("First overload", "Edited overload"),
+    )?;
+    let cold = build(directory.path())?;
+    let changes =
+        rift_index::PathChanges::between(&previous.workspace_digests(), &cold.workspace_digests());
+    assert_eq!(changes.len(), 1);
+    let edited = previous.rebuilt(&changes)?;
+    params.revision = Some(cold.served_revision()?);
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .capture("trace")
+        .install()?;
+    for page in 1..=4 {
+        params.page = page;
+        let answer = edited.exact_symbol(&params, true)?;
+        assert!(matches!(answer, GetSymbolResult::Found { .. }));
+        assert_eq!(answer, cold.exact_symbol(&params, true)?);
+    }
+    assert!(
+        drain
+            .queued_records()
+            .iter()
+            .all(|record| record.operation() != "index.lexical_units")
+    );
+    assert!(!edited.index_documents().is_empty());
+    drop(recorder);
+    assert!(
+        drain
+            .queued_records()
+            .iter()
+            .any(|record| record.operation() == "index.lexical_units")
+    );
+    Ok(())
+}
+
+#[test]
 fn declaration_pages_continue_at_the_revision_they_were_read_at() -> TestResult {
     let directory = tempfile::tempdir()?;
     let service = service(directory.path(), true)?;
