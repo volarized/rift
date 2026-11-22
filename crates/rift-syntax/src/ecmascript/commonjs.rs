@@ -15,6 +15,7 @@ pub(super) fn record<'tree>(
     let mut blocked = BTreeSet::new();
     // Scope of each `module.exports = value`, with the end of its last write there.
     let mut replaced: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut synchronized = None;
     let mut assignments = Vec::new();
     let mut visited = 0_usize;
     let mut cursor = root.walk();
@@ -35,7 +36,16 @@ pub(super) fn record<'tree>(
         if blocked_binding(syntax_element, source.text)
             && let Some(scope) = lexical_scope(syntax_element)
         {
-            blocked.insert(scope.id());
+            if let Some(module_write) = synchronization(syntax_element, root, source.text, kinds) {
+                if synchronized
+                    .replace((syntax_element, module_write))
+                    .is_some()
+                {
+                    blocked.insert(root.id());
+                }
+            } else {
+                blocked.insert(scope.id());
+            }
         }
         if syntax_element.kind_id() == kinds.assignment_expression {
             assignments.push(syntax_element);
@@ -63,15 +73,26 @@ pub(super) fn record<'tree>(
             (child, depth + 1)
         });
     }
+    let synchronized = synchronized.and_then(|(outer, inner)| {
+        if !blocked.contains(&root.id())
+            && closed_wrapper_uses(root, outer, inner, source.text, kinds)
+        {
+            Some(inner)
+        } else {
+            blocked.insert(root.id());
+            None
+        }
+    });
+    let synchronized_scope = synchronized.map(|inner| (root.id(), inner.end_byte()));
     for &syntax_element in &assignments {
-        if !module_execution(syntax_element, &blocked) {
+        if synchronized != Some(syntax_element) && !module_execution(syntax_element, &blocked) {
             continue;
         }
         let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
             continue;
         };
         if binding.kind == SyntaxExportKind::Named
-            && !kept_after_replacement(syntax_element, source.text, &replaced)
+            && !kept_after_replacement(syntax_element, source.text, &replaced, synchronized_scope)
         {
             continue;
         }
@@ -80,29 +101,124 @@ pub(super) fn record<'tree>(
     Ok(assignments)
 }
 
+/// Inner write of one unconditional `exports = module.exports = name` statement.
+fn synchronization<'tree>(
+    outer: Node<'tree>,
+    root: Node<'tree>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+) -> Option<Node<'tree>> {
+    if outer.kind_id() != kinds.assignment_expression {
+        return None;
+    }
+    let left = kinds.child(outer, EcmaScriptGrammarField::Left)?;
+    if source.get(left.byte_range())? != "exports" {
+        return None;
+    }
+    let statement = outer.parent()?;
+    if outer.has_error()
+        || statement.kind_id() != kinds.expression_statement
+        || statement.parent() != Some(root)
+    {
+        return None;
+    }
+    let inner = kinds.child(outer, EcmaScriptGrammarField::Right)?;
+    if inner.kind_id() != kinds.assignment_expression {
+        return None;
+    }
+    let module = kinds.child(inner, EcmaScriptGrammarField::Left)?;
+    let value = kinds.child(inner, EcmaScriptGrammarField::Right)?;
+    (source.get(module.byte_range())? == "module.exports" && value.kind_id() == kinds.identifier)
+        .then_some(inner)
+}
+
+/// The wrapper names stay inside the synchronized writes and direct root export writes.
+fn closed_wrapper_uses(
+    root: Node<'_>,
+    outer: Node<'_>,
+    inner: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+) -> bool {
+    let outer_left = kinds.child(outer, EcmaScriptGrammarField::Left);
+    let module = kinds
+        .child(inner, EcmaScriptGrammarField::Left)
+        .and_then(|left| kinds.child(left, EcmaScriptGrammarField::Object));
+    let mut pending = vec![root];
+    let mut cursor = root.walk();
+    // The capture walk has already admitted the element count and depth of this tree.
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+        ) && matches!(
+            source.get(node.byte_range()),
+            Some("module" | "exports" | "eval")
+        ) && Some(node) != outer_left
+            && Some(node) != module
+            && !direct_exports_write(node, root, source, kinds)
+        {
+            return false;
+        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
+    }
+    true
+}
+
+fn direct_exports_write(
+    receiver: Node<'_>,
+    root: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+) -> bool {
+    if source.get(receiver.byte_range()) != Some("exports") {
+        return false;
+    }
+    receiver.parent().is_some_and(|member| {
+        member.kind_id() == kinds.member_expression
+            && kinds.child(member, EcmaScriptGrammarField::Object) == Some(receiver)
+            && kinds
+                .child(member, EcmaScriptGrammarField::Property)
+                .is_some_and(|name| name.kind_id() == kinds.property_identifier)
+            && member.parent().is_some_and(|assignment| {
+                assignment.kind_id() == kinds.assignment_expression
+                    && !assignment.has_error()
+                    && kinds.child(assignment, EcmaScriptGrammarField::Left) == Some(member)
+                    && assignment.parent().is_some_and(|statement| {
+                        statement.kind_id() == kinds.expression_statement
+                            && statement.parent() == Some(root)
+                    })
+            })
+    })
+}
+
 /// Whether a named export survives every `module.exports = value` of the scopes around it.
 ///
 /// A replacement written later replaces the object the name was added to. One written
-/// earlier is the object `module.exports.name = ...` adds to; `exports` no longer names
-/// it, so `exports.name = ...` after it exports nothing. `module.exports.default` keeps
-/// colliding with the default slot the replacement writes.
+/// earlier is the object `module.exports.name = ...` adds to. A checked synchronization
+/// also establishes that `exports` names that same object. The default slot stays ambiguous.
 fn kept_after_replacement(
     syntax_element: Node<'_>,
     source: &str,
     replaced: &BTreeMap<usize, usize>,
+    synchronized: Option<(usize, usize)>,
 ) -> bool {
-    let through_module = syntax_element
+    let left = syntax_element
         .child_by_field_name("left")
         .and_then(|left| source.get(left.byte_range()))
-        .is_some_and(|left| {
-            left.starts_with("module.exports.") && left != "module.exports.default"
-        });
+        .unwrap_or_default();
+    let through_module = left.starts_with("module.exports.") && left != "module.exports.default";
     let mut scope = syntax_element;
     while let Some(parent) = scope.parent() {
-        if let Some(&end) = replaced.get(&parent.id())
-            && (!through_module || end > syntax_element.start_byte())
-        {
-            return false;
+        if let Some(&end) = replaced.get(&parent.id()) {
+            let through_synchronized = synchronized == Some((parent.id(), end))
+                && left.starts_with("exports.")
+                && left != "exports.default";
+            if end > syntax_element.start_byte() || !(through_module || through_synchronized) {
+                return false;
+            }
         }
         scope = parent;
     }

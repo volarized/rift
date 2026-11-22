@@ -100,6 +100,90 @@ module.exports = req;
     );
 }
 
+#[test]
+fn test_commonjs_synchronization_keeps_named_exports_after_the_shared_write() {
+    let source = "var req = require('./request');
+var res = require('./response');
+exports.dropped = req;
+exports = module.exports = create;
+function create() {}
+exports.request = req;
+exports.response = res;
+";
+    let get_bindings = |source: &str| {
+        let document = parsed(ShippedLanguage::JavaScript, source);
+        let captured = parts(document.facts());
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
+            .expect("checked export capture")
+    };
+    let checked = get_bindings(source);
+    let bindings = checked.export_bindings().expect("captured export bindings");
+    let text = |range: ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| (
+                binding.kind,
+                binding.exported.map(text),
+                binding.local.map(text)
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (rift_syntax::SyntaxExportKind::Default, None, Some("create")),
+            (
+                rift_syntax::SyntaxExportKind::Named,
+                Some("request"),
+                Some("req")
+            ),
+            (
+                rift_syntax::SyntaxExportKind::Named,
+                Some("response"),
+                Some("res")
+            ),
+        ]
+    );
+    for changed in [
+        "module.exports = req;",
+        "exports = req;",
+        "exports[slot] = req;",
+        "module['exports'] = req;",
+        "Object.defineProperty(module, 'exports', { value: req });",
+        "function hidden(exports) { exports.response = req; }",
+        "function detach() { eval('exports = {}'); } detach();",
+    ] {
+        let changed = format!("{source}{changed}");
+        assert!(
+            get_bindings(&changed)
+                .export_bindings()
+                .expect("captured export bindings")
+                .is_empty(),
+            "{changed}"
+        );
+    }
+    let non_direct = source.replace(
+        "exports = module.exports = create;",
+        "if (enabled) exports = module.exports = create;",
+    );
+    assert!(
+        get_bindings(&non_direct)
+            .export_bindings()
+            .expect("captured export bindings")
+            .is_empty()
+    );
+    let continued = source.replace("exports.request = req;", "exports.request = req\n.member;");
+    let continued = get_bindings(&continued);
+    assert_eq!(
+        continued
+            .export_bindings()
+            .expect("captured export bindings")
+            .len(),
+        2
+    );
+}
+
 fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
     MarkdownFactsParts {
         blocks: facts.blocks().to_vec(),
