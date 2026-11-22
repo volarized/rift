@@ -7930,7 +7930,13 @@ done
             return Err("an unavailable graph worker must exhaust the request deadline".into());
         };
         assert!(format!("{failure:?}").contains("rift.search.query_deadline_exceeded"));
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        let budget = Duration::from_secs(1);
+        let elapsed = started.elapsed();
+        // Tokio rounds a timer's deadline up to the next millisecond tick.
+        assert!(
+            (budget..=budget + Duration::from_millis(1)).contains(&elapsed),
+            "the paused request expired after {elapsed:?}"
+        );
         drop(permit);
         Ok(())
     }
