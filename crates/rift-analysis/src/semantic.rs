@@ -109,22 +109,28 @@ impl PreparedSemantics {
         let index_revision = IndexRevision::new(self.revision)?;
         let source_revision = SourceRevision::new(self.revision)?;
         let tree_revision = TreeRevision::new(self.revision)?;
-        let graph = match external {
+        let graph = rift_tracing::debug_span!(
+            target: "rift_measure",
+            "analysis.normalize_project",
+            component = "measurement",
+            operation = "analysis.normalize_project",
+        )
+        .in_scope(|| match external {
             Some(external) => Normalizer::normalize_with(
                 index_revision,
                 source_revision,
                 tree_revision,
                 &self.publications,
                 external,
-            )?,
+            ),
             None => Normalizer::normalize(
                 index_revision,
                 source_revision,
                 tree_revision,
                 &self.publications,
                 previous,
-            )?,
-        };
+            ),
+        })?;
         let syntax_provider = ProviderId::new(SYNTAX_PROVIDER_ID)?;
         let (edges, static_resolution) = match static_inputs {
             Some((sources, input))
@@ -153,7 +159,13 @@ impl PreparedSemantics {
             static_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
         };
-        semantics.hold_static_resolution(static_resolution);
+        rift_tracing::debug_span!(
+            target: "rift_measure",
+            "analysis.retain_static_occurrences",
+            component = "measurement",
+            operation = "analysis.retain_static_occurrences",
+        )
+        .in_scope(|| semantics.hold_static_resolution(static_resolution));
         Ok(BuiltSemantics {
             semantics,
             beyond_declaration_bound: self.beyond_declaration_bound,

@@ -965,3 +965,217 @@ jobs:
             echo "$failed"
             exit 1
           fi
+
+  rust-call-activation:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.number == 910 &&
+      github.event.pull_request.draft &&
+      github.run_attempt == '1' &&
+      github.head_ref == 'perf/selected-document-burst' &&
+      github.base_ref == 'perf/selected-document-burst-base' &&
+      github.event.pull_request.base.sha == '63f8f208432915805b989c8d38f326a8c457653c'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 27
+    env:
+      BASE: 63f8f208432915805b989c8d38f326a8c457653c
+      PARENT: 14a59c6b953ffa55cb9d304dbf5451ceb00bc2b2
+      HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+      BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+      RIFT_OTLP_FILTER: rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 16
+      - name: Verify the diagnostic tree and scope
+        run: |
+          set -euo pipefail
+          test "$BASE_COMMIT" = "$BASE"
+          test "$(git rev-parse "$HEAD_COMMIT^")" = "$PARENT"
+          test "$(git show --no-patch --format=%P "$GITHUB_SHA")" = "$BASE $HEAD_COMMIT"
+          git diff --exit-code "$GITHUB_SHA" "$HEAD_COMMIT"
+          git diff --exit-code "$PARENT" "$HEAD_COMMIT" -- . \
+            ':(exclude).github/workflows/ci.yml' \
+            ':(exclude)dev/check_burst_pair.py' \
+            ':(exclude)dev/check_rust_call_activation.py' \
+            ':(exclude)dev/fetch_rust_call_activation_cli.sh' \
+            ':(exclude)dev/src/rift_dev/corpus_burst.py'
+          mkdir -p target/rust-call-activation/reports
+          echo "RIFT_CORPUS_DIR=$RUNNER_TEMP/rift-corpus-cache" >> "$GITHUB_ENV"
+          git show --no-patch --format='%H %T' "$BASE" "$PARENT" "$HEAD_COMMIT" "$GITHUB_SHA" > target/rust-call-activation/reports/trees.txt
+      - name: Retrieve the archived candidate CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash dev/fetch_rust_call_activation_cli.sh candidate "$GITHUB_WORKSPACE/target/rust-call-activation"
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - name: Prepare the pinned corpus
+        run: |
+          uv sync --locked --project dev
+          uv run --locked --project dev rift-dev corpus sync bun
+      - name: Observe cache activation on Bun
+        id: activation
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/target/rust-call-activation"
+          uv run --locked --project dev python dev/check_rust_call_activation.py candidate "$root/bin-candidate/rift" "$root/reports"
+          decision=$(jq -er '.matched_control_admitted | tostring' "$root/reports/candidate-summary.json")
+          test "$decision" = true || test "$decision" = false
+          echo "control=$decision" >> "$GITHUB_OUTPUT"
+      - name: Retrieve the matched v0.0.91 control CLI
+        if: steps.activation.outputs.control == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash dev/fetch_rust_call_activation_cli.sh control "$GITHUB_WORKSPACE/target/rust-call-activation"
+      - name: Run the matched control once on this runner
+        if: steps.activation.outputs.control == 'true'
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/target/rust-call-activation"
+          uv run --locked --project dev python dev/check_rust_call_activation.py control "$root/bin-control/rift" "$root/reports"
+      - uses: actions/upload-artifact@v7.0.2
+        if: ${{ always() }}
+        with:
+          name: rust-call-activation
+          path: target/rust-call-activation/reports
+          if-no-files-found: warn
+          retention-days: 7
+
+  native-cli-extraction:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.number == 910 &&
+      github.event.pull_request.head.sha == '14a59c6b953ffa55cb9d304dbf5451ceb00bc2b2' &&
+      github.event.pull_request.draft &&
+      github.head_ref == 'perf/selected-document-burst' &&
+      github.base_ref == 'perf/selected-document-burst-base' &&
+      github.event.pull_request.base.sha == '63f8f208432915805b989c8d38f326a8c457653c'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: declaration-imports
+            run: '45034125678'
+            job: '137243968091'
+            artifact: '14759730641'
+            head: 7215dbe139ff3ef059ad509ed0aefdf5789c44fb
+            base: 627e7355d0f7ec2821cf17dbb83b24fe8340163c
+            merge: ea07b1e858561b981e3580d190b74d63c3b1f305
+            tree: db8569b3faf6354c8b1611e8b6471102694829c6
+            size: '3024048139'
+            digest: 27a8099fb67c304feb99ced923c1c6511138c88eb563eed48cefa6dc04e03a2c
+          - variant: declaration-type-stars
+            run: '45036907684'
+            job: '137252758665'
+            artifact: '14759789524'
+            head: 9d86472fb49a5a45f80fb210d9d36f636135a571
+            base: 7215dbe139ff3ef059ad509ed0aefdf5789c44fb
+            merge: c55083cc5be62c7005c43293db5a20e2b67d908d
+            tree: 7b2f509dbddf44f7632f20f5934914509852f0fa
+            size: '3023574113'
+            digest: c6756782aff54c44f9ba814bf13a463c35013507c30550ef09f4a5f55b8e4341
+    steps:
+      - name: Verify and extract the macOS ARM64 CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ matrix.run }}
+          JOB: ${{ matrix.job }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_HEAD: ${{ matrix.head }}
+          SOURCE_BASE: ${{ matrix.base }}
+          SOURCE_MERGE: ${{ matrix.merge }}
+          SOURCE_TREE: ${{ matrix.tree }}
+          ARCHIVE_SIZE: ${{ matrix.size }}
+          ARCHIVE_DIGEST: ${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          test "$(df -P -B1 . | awk 'NR==2 {print $4}')" -ge $((7 * 1024 * 1024 * 1024))
+          mkdir extracted-native-cli
+          out="$RUNNER_TEMP/extracted-native-cli"
+          api="repos/$GITHUB_REPOSITORY"
+          gh api "$api/actions/runs/$RUN" --jq '{id,head_sha,event,path}' > "$out/run.json"
+          jq -e --argjson run "$RUN" --arg head "$SOURCE_HEAD" '
+            .id==$run and .head_sha==$head and .event=="pull_request" and .path==".github/workflows/ci.yml"
+          ' "$out/run.json"
+          gh api "$api/actions/jobs/$JOB" --jq '{id,head_sha,run_id,name,conclusion,labels}' > "$out/job.json"
+          jq -e --argjson run "$RUN" --argjson job "$JOB" --arg head "$SOURCE_HEAD" '
+            .id==$job and .run_id==$run and .head_sha==$head and .conclusion=="success"
+            and .name=="native (macos-15, aarch64-apple-darwin, true)" and .labels==["macos-15"]
+          ' "$out/job.json"
+          gh api "$api/git/commits/$SOURCE_HEAD" --jq '{sha,verified:.verification.verified}' > "$out/head.json"
+          jq -e --arg head "$SOURCE_HEAD" '.sha==$head and .verified' "$out/head.json"
+          gh api "$api/git/commits/$SOURCE_MERGE" --jq '{sha,tree:.tree.sha,parents:[.parents[].sha]}' > "$out/tree.json"
+          jq -e --arg merge "$SOURCE_MERGE" --arg tree "$SOURCE_TREE" --arg base "$SOURCE_BASE" --arg head "$SOURCE_HEAD" '
+            .sha==$merge and .tree==$tree and .parents==[$base,$head]
+          ' "$out/tree.json"
+          gh api "$api/actions/artifacts/$ARTIFACT" --jq '{id,name,size_in_bytes,digest,expired,workflow_run}' > "$out/artifact.json"
+          jq -e --argjson id "$ARTIFACT" --argjson run "$RUN" --argjson size "$ARCHIVE_SIZE" \
+            --arg head "$SOURCE_HEAD" --arg digest "sha256:$ARCHIVE_DIGEST" '
+              .id==$id and .name=="native-live" and (.expired|not) and .size_in_bytes==$size and .digest==$digest
+              and .workflow_run.id==$run and .workflow_run.head_sha==$head
+            ' "$out/artifact.json"
+          gh api "$api/actions/artifacts/$ARTIFACT/zip" > native-live.zip
+          test "$(stat -c %s native-live.zip)" = "$ARCHIVE_SIZE"
+          echo "$ARCHIVE_DIGEST  native-live.zip" | sha256sum --check
+          test "$(unzip -Z1 native-live.zip)" = "native-live.tar.zst"
+          cat > extract-cli.py <<'PY'
+          import shutil
+          import struct
+          import sys
+          import tarfile
+          from pathlib import Path
+
+          output = Path(sys.argv[1])
+          member_name = None
+          with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+              for member in archive:
+                  if member.name.removeprefix("./") != "target/debug/rift":
+                      continue
+                  if member_name is not None or not member.isfile() or not 0 < member.size <= 2**30:
+                      raise ValueError("invalid or repeated native CLI member")
+                  source = archive.extractfile(member)
+                  if source is None:
+                      raise ValueError("missing native CLI payload")
+                  with source, (output / "rift").open("xb") as binary:
+                      shutil.copyfileobj(source, binary)
+                  member_name = member.name
+          while sys.stdin.buffer.read(2**20):
+              pass
+          if member_name is None:
+              raise ValueError("native CLI member not found")
+          MH_MAGIC_64, CPU_TYPE_ARM64, MH_EXECUTE = 0xFEEDFACF, 0x0100000C, 2
+          with (output / "rift").open("rb") as binary:
+              magic, cpu_type, _, file_type, *_ = struct.unpack("<8I", binary.read(32))
+          if (magic, cpu_type, file_type) != (MH_MAGIC_64, CPU_TYPE_ARM64, MH_EXECUTE):
+              raise ValueError("expected a 64-bit Mach-O ARM executable")
+          (output / "member.txt").write_text(member_name + "\n")
+          PY
+          unzip -p native-live.zip native-live.tar.zst | zstd -dc | python3 extract-cli.py "$out"
+          cd "$out"
+          file -b rift | tee executable-format.txt
+          zstd -T1 -3 --quiet rift -o rift.zst
+          sha256sum rift rift.zst > checksums.txt
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: native-cli-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/extracted-native-cli/*.json
+            ${{ runner.temp }}/extracted-native-cli/*.txt
+            ${{ runner.temp }}/extracted-native-cli/rift.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

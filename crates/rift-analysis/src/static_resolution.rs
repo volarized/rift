@@ -166,7 +166,13 @@ fn resolve_by<'source>(
         })
         .collect();
     let mut work = Work::new(work_max);
-    let Some(index) = Index::new(graph, documents, namespace, &mut work) else {
+    let Some(index) = rift_tracing::debug_span!(
+        target: "rift_measure",
+        "analysis.prepare_static_index",
+        component = "measurement",
+        operation = "analysis.prepare_static_index",
+    )
+    .in_scope(|| Index::new(graph, documents, namespace, &mut work)) else {
         for coverage in edge_calls.values_mut() {
             coverage.unavailable = true;
         }
@@ -181,7 +187,13 @@ fn resolve_by<'source>(
         edge_calls,
         ..StaticResolution::default()
     };
-    files(&index, &mut work, &mut resolution);
+    rift_tracing::debug_span!(
+        target: "rift_measure",
+        "analysis.resolve_static_files",
+        component = "measurement",
+        operation = "analysis.resolve_static_files",
+    )
+    .in_scope(|| files(&index, &mut work, &mut resolution));
     external::admit_declared(namespace, &mut resolution.external, work_max);
     resolution.exhausted = work.exhausted;
     resolution

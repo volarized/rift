@@ -51,6 +51,7 @@ from rift_dev.corpus_assertions import (
     unit_path,
     warnings,
 )
+from rift_dev.corpus_burst import FILE_COUNT, run_burst
 from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.log_records import (
@@ -407,7 +408,14 @@ class Corpus:
     def __init__(
         self, pin: Pin, binary: Path, report: Path, case: str = "workspace"
     ) -> None:
-        require(case in ("workspace", "stop", "churn"), f"unknown corpus case: {case}")
+        require(
+            case in ("workspace", "stop", "churn", "burst", "single-edit"),
+            f"unknown corpus case: {case}",
+        )
+        require(
+            case not in ("burst", "single-edit") or pin.name == "bun",
+            f"only bun has a {case} case",
+        )
         require(case != "stop" or pin.name == "bun", "only bun has a stop case")
         require(case != "churn" or pin.name == "nextjs", "only nextjs has a churn case")
         self.pin = pin
@@ -684,6 +692,22 @@ class Corpus:
         self.configure()
         if self.case == "stop":
             await self.stop_states()
+            return
+        if self.case in ("burst", "single-edit"):
+            file_count = FILE_COUNT if self.case == "burst" else 1
+            server = self.server()
+            launched_at = utc_now()
+            launched = time.perf_counter()
+            with server:
+                async with server.connect() as client:
+                    await await_startup_publication(server)
+                    self.record(
+                        "burst_startup",
+                        launched_at=launched_at,
+                        publication_observed_seconds=time.perf_counter() - launched,
+                    )
+                    await run_burst(server, client, self.record, file_count, launched)
+                self.stop(server)
             return
         if self.case == "churn":
             await self.churn_case()

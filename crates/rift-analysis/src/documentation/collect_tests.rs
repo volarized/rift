@@ -58,7 +58,7 @@ fn source(path: &str, text: &str) -> DocumentationSource {
     }
 }
 
-fn input<'a>(path: &str, text: &'a str) -> DocumentationInput<'a> {
+pub(super) fn input<'a>(path: &str, text: &'a str) -> DocumentationInput<'a> {
     let chunks = crate::text_chunks(text, 16)
         .into_iter()
         .enumerate()
@@ -187,6 +187,8 @@ fn incremental_collection_relinks_cached_candidates_after_declaration_changes() 
     let previous =
         collect_documentation(&previous_sources, std::slice::from_ref(&rust_declaration))
             .expect("previous collection");
+    assert_eq!(previous.index().references.len(), 1);
+    assert_eq!(previous.index().references[0].target, rust_symbol);
     let next = collect_documentation_incremental(
         Some(&previous),
         &previous_sources,
