@@ -966,7 +966,7 @@ jobs:
             exit 1
           fi
 
-  static-adjacency-activation:
+  rust-call-activation:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -980,105 +980,71 @@ jobs:
       actions: read
       contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 27
     env:
       BASE: 63f8f208432915805b989c8d38f326a8c457653c
-      PAIRED_HEAD: 6f1c38724ba8dd69cf39ca1f8f1c82d8bf9b501b
-      PAIRED_TREE: 7c05cfdf9fa81b07f98c7f44ba7437488a0d8335
-      ARCHIVED_HEAD: a11fcf8fda4930f97b98da7b235e928af2b20210
-      ARCHIVED_MERGE: ea34210018e8843f61a464528fb77883726159c4
-      ARCHIVED_TREE: 4db78e3e11f933e13e8a528f670e46659ef23583
-      ARCHIVED_RUN: '45040924656'
-      ARCHIVED_JOB: '137264966412'
-      ARCHIVED_ARTIFACT: '14762016978'
-      ARCHIVED_SIZE: '147970005'
-      ARCHIVED_DIGEST: 4efe83bee863bb995ad206c6b07b2064f6e6cdee08585bcf62d7758b3cc8a5b6
+      PARENT: 14a59c6b953ffa55cb9d304dbf5451ceb00bc2b2
       HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
       BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+      RIFT_OTLP_FILTER: rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 12
-      - name: Verify the candidate tree
+          fetch-depth: 16
+      - name: Verify the diagnostic tree and scope
         run: |
           set -euo pipefail
           test "$BASE_COMMIT" = "$BASE"
-          test "$(git rev-parse "$HEAD_COMMIT^")" = "$ARCHIVED_HEAD"
-          test "$(git rev-parse "$ARCHIVED_HEAD^")" = "$PAIRED_HEAD"
-          test "$(git rev-parse "$ARCHIVED_HEAD^{tree}")" = "$ARCHIVED_TREE"
-          test "$(git rev-parse "$PAIRED_HEAD^{tree}")" = "$PAIRED_TREE"
-          git merge-base --is-ancestor "$BASE" "$PAIRED_HEAD"
+          test "$(git rev-parse "$HEAD_COMMIT^")" = "$PARENT"
           test "$(git show --no-patch --format=%P "$GITHUB_SHA")" = "$BASE $HEAD_COMMIT"
           git diff --exit-code "$GITHUB_SHA" "$HEAD_COMMIT"
-          git diff --exit-code "$ARCHIVED_HEAD" "$HEAD_COMMIT" -- . \
+          git diff --exit-code "$PARENT" "$HEAD_COMMIT" -- . \
             ':(exclude).github/workflows/ci.yml' \
-            ':(exclude)crates/rift-analysis/src/analyzer-manifest.json' \
-            ':(exclude)crates/rift-analysis/src/edge.rs'
-          mkdir -p target/burst-proof/reports
+            ':(exclude)dev/check_burst_pair.py' \
+            ':(exclude)dev/check_rust_call_activation.py' \
+            ':(exclude)dev/fetch_rust_call_activation_cli.sh' \
+            ':(exclude)dev/src/rift_dev/corpus_burst.py'
+          mkdir -p target/rust-call-activation/reports
           echo "RIFT_CORPUS_DIR=$RUNNER_TEMP/rift-corpus-cache" >> "$GITHUB_ENV"
-          git show --no-patch --format='%H %T' "$BASE" "$PAIRED_HEAD" "$ARCHIVED_HEAD" "$HEAD_COMMIT" "$GITHUB_SHA" > target/burst-proof/reports/trees.txt
-      - name: Retrieve the archived corpus profile executable
+          git show --no-patch --format='%H %T' "$BASE" "$PARENT" "$HEAD_COMMIT" "$GITHUB_SHA" > target/rust-call-activation/reports/trees.txt
+      - name: Retrieve the archived candidate CLI
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          root="$GITHUB_WORKSPACE/target/burst-proof"
-          api="repos/$GITHUB_REPOSITORY"
-          gh api "$api/actions/runs/$ARCHIVED_RUN" --jq '{id,head_sha,event,path,run_attempt}' > "$root/reports/candidate-run.json"
-          jq -e --argjson run "$ARCHIVED_RUN" --arg head "$ARCHIVED_HEAD" '
-            .id==$run and .head_sha==$head and .event=="pull_request"
-            and .path==".github/workflows/ci.yml" and .run_attempt==1
-          ' "$root/reports/candidate-run.json"
-          gh api "$api/actions/runs/$ARCHIVED_RUN/jobs?filter=latest&per_page=100" --paginate --slurp \
-            | jq '[.[].jobs[] | select(.name=="integration-cli") | {id,name,run_id,head_sha,conclusion}]' > "$root/reports/candidate-jobs.json"
-          jq -e --argjson run "$ARCHIVED_RUN" --argjson job "$ARCHIVED_JOB" --arg head "$ARCHIVED_HEAD" '
-            length==1 and .[0].id==$job and .[0].run_id==$run and .[0].head_sha==$head and .[0].conclusion=="success"
-          ' "$root/reports/candidate-jobs.json"
-          gh api "$api/git/commits/$ARCHIVED_MERGE" --jq '{sha,tree:.tree.sha,parents:[.parents[].sha]}' > "$root/reports/candidate-tree.json"
-          jq -e --arg merge "$ARCHIVED_MERGE" --arg tree "$ARCHIVED_TREE" --arg base "$BASE" --arg head "$ARCHIVED_HEAD" '
-            .sha==$merge and .tree==$tree and .parents==[$base,$head]
-          ' "$root/reports/candidate-tree.json"
-          meta="$root/reports/candidate-artifact.json"
-          gh api "$api/actions/artifacts/$ARCHIVED_ARTIFACT" --jq '{id,name,size_in_bytes,digest,expired,workflow_run}' > "$meta"
-          jq -e --argjson run "$ARCHIVED_RUN" --argjson id "$ARCHIVED_ARTIFACT" --arg head "$ARCHIVED_HEAD" \
-            --argjson size "$ARCHIVED_SIZE" --arg digest "sha256:$ARCHIVED_DIGEST" '
-              .id==$id and .workflow_run.id==$run and .workflow_run.head_sha==$head and .name=="integration-cli"
-              and (.expired|not) and .size_in_bytes==$size and .digest==$digest
-            ' "$meta"
-          mkdir "$root/candidate"
-          cd "$root/candidate"
-          gh api "$api/actions/artifacts/$ARCHIVED_ARTIFACT/zip" > artifact.zip
-          test "$(stat -c %s artifact.zip)" = "$ARCHIVED_SIZE"
-          echo "$ARCHIVED_DIGEST  artifact.zip" | sha256sum --check
-          test "$(unzip -Z1 artifact.zip)" = "integration-cli.tar.zst"
-          unzip -p artifact.zip integration-cli.tar.zst > integration-cli.tar.zst
-          test "$(tar --zstd -tf integration-cli.tar.zst)" = rift
-          test "$(tar --zstd -tvf integration-cli.tar.zst | cut -c1)" = -
-          tar --zstd -xOf integration-cli.tar.zst rift > rift
-          chmod +x rift
-          sha256sum artifact.zip integration-cli.tar.zst rift > "$root/reports/candidate-sha256.txt"
-          ./rift --version | tee "$root/reports/candidate-version.txt"
-          test "$(cat "$root/reports/candidate-version.txt")" = "rift 0.0.90"
+        run: bash dev/fetch_rust_call_activation_cli.sh candidate "$GITHUB_WORKSPACE/target/rust-call-activation"
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - name: Prepare pinned corpus
+      - name: Prepare the pinned corpus
         run: |
           uv sync --locked --project dev
           uv run --locked --project dev rift-dev corpus sync bun
-      - name: Attribute project facts for one 50-file publication
-        env:
-          RIFT_OTLP_FILTER: rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info,rift_measure=debug
+      - name: Observe cache activation on Bun
+        id: activation
         run: |
-          uv run --locked --project dev python dev/check_static_activation.py \
-            --project-facts target/burst-proof/candidate/rift target/burst-proof/reports
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/target/rust-call-activation"
+          uv run --locked --project dev python dev/check_rust_call_activation.py candidate "$root/bin-candidate/rift" "$root/reports"
+          decision=$(jq -er '.matched_control_admitted | tostring' "$root/reports/candidate-summary.json")
+          test "$decision" = true || test "$decision" = false
+          echo "control=$decision" >> "$GITHUB_OUTPUT"
+      - name: Retrieve the matched v0.0.91 control CLI
+        if: steps.activation.outputs.control == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash dev/fetch_rust_call_activation_cli.sh control "$GITHUB_WORKSPACE/target/rust-call-activation"
+      - name: Run the matched control once on this runner
+        if: steps.activation.outputs.control == 'true'
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/target/rust-call-activation"
+          uv run --locked --project dev python dev/check_rust_call_activation.py control "$root/bin-control/rift" "$root/reports"
       - uses: actions/upload-artifact@v7.0.2
         if: ${{ always() }}
         with:
-          name: project-facts-attribution
-          path: target/burst-proof/reports
+          name: rust-call-activation
+          path: target/rust-call-activation/reports
           if-no-files-found: warn
           retention-days: 7
 
@@ -1087,6 +1053,7 @@ jobs:
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.number == 910 &&
+      github.event.pull_request.head.sha == '14a59c6b953ffa55cb9d304dbf5451ceb00bc2b2' &&
       github.event.pull_request.draft &&
       github.head_ref == 'perf/selected-document-burst' &&
       github.base_ref == 'perf/selected-document-burst-base' &&

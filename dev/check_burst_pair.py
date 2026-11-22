@@ -62,11 +62,10 @@ def stop(process: subprocess.Popen[bytes]) -> None:
             process.wait()
 
 
-def run(binary: Path, output: Path, cpus: str, case: EditCase = "burst") -> dict:
+def run_guarded(output: Path, cpus: str, command: list[str]) -> None:
     output.mkdir()
     scratch = Path(os.environ["RUNNER_TEMP"]) / "rift-burst-work" / output.name
     scratch.mkdir(parents=True)
-    report = output / "burst.json"
     with (output / "resources.jsonl").open("x") as samples:
 
         def sample() -> dict[str, int | float]:
@@ -83,21 +82,7 @@ def run(binary: Path, output: Path, cpus: str, case: EditCase = "burst") -> dict
                     "insufficient quiet memory, CPU or disk for the burst"
                 )
             quiet = quiet + 1 if ready(sample()) else 0
-        command = [
-            "taskset",
-            "-c",
-            cpus,
-            str(Path(sys.executable).parent / "rift-dev"),
-            "corpus",
-            "test",
-            "bun",
-            "--binary",
-            str(binary),
-            "--case",
-            case,
-            "--report",
-            str(report),
-        ]
+        command = ["taskset", "-c", cpus, *command]
         process = subprocess.Popen(
             command,
             start_new_session=True,
@@ -124,6 +109,26 @@ def run(binary: Path, output: Path, cpus: str, case: EditCase = "burst") -> dict
                 raise subprocess.CalledProcessError(process.returncode, command)
         finally:
             stop(process)
+
+
+def run(binary: Path, output: Path, cpus: str, case: EditCase = "burst") -> dict:
+    report = output / "burst.json"
+    run_guarded(
+        output,
+        cpus,
+        [
+            str(Path(sys.executable).parent / "rift-dev"),
+            "corpus",
+            "test",
+            "bun",
+            "--binary",
+            str(binary),
+            "--case",
+            case,
+            "--report",
+            str(report),
+        ],
+    )
     result = json.loads(report.read_bytes())
     if (result["commit"], result["case"], result["status"]) != (
         pins()["bun"].commit,

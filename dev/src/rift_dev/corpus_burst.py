@@ -178,8 +178,38 @@ def publication_report(log: str, revision: str, written: datetime) -> JsonObject
     }
 
 
+async def observe_publication(
+    server: Server, offset: int, revision: str, written: datetime
+) -> JsonObject:
+    trace = publication_report(log_since(server.log_path, offset), revision, written)
+    if trace is None:
+        records = await asyncio.to_thread(
+            server.read_logs,
+            [
+                "server",
+                "logs",
+                "--tail",
+                "all",
+                "--since",
+                written.isoformat(timespec="milliseconds"),
+            ],
+        )
+        trace = publication_report(records, revision, written)
+    if trace is None:
+        raise AssertionError(
+            "no published filesystem build matches the settled revision"
+        )
+    return trace
+
+
 async def run_burst(
-    server: Server, client: Client, record: Record, file_count: int, launched: float
+    server: Server,
+    client: Client,
+    record: Record,
+    file_count: int,
+    launched: float,
+    *,
+    observe_restore: bool = False,
 ) -> None:
     root = server.root
     before_map = await client.resource("rift://map")
@@ -250,26 +280,7 @@ async def run_burst(
                             continue
                     break
         require(revision != initial, "burst left the initial revision current")
-        trace = publication_report(
-            log_since(server.log_path, offset), revision, written
-        )
-        if trace is None:
-            records = await asyncio.to_thread(
-                server.read_logs,
-                [
-                    "server",
-                    "logs",
-                    "--tail",
-                    "all",
-                    "--since",
-                    written.isoformat(timespec="milliseconds"),
-                ],
-            )
-            trace = publication_report(records, revision, written)
-        if trace is None:
-            raise AssertionError(
-                "no published filesystem build matches the settled revision"
-            )
+        trace = await observe_publication(server, offset, revision, written)
         changed_rows = snapshot(root, marker)
         current_map = await client.resource("rift://map")
         record(
@@ -293,9 +304,32 @@ async def run_burst(
             "changed index did not persist exactly one probe declaration",
         )
     finally:
-        for name, content in original.items():
-            (root / name).write_bytes(content)
-    await wait_files(server, before, str(initial))
+        restore_written = datetime.now(UTC)
+        restore_started = time.perf_counter()
+        try:
+            restore_offset = server.log_path.stat().st_size if observe_restore else 0
+        finally:
+            for name, content in original.items():
+                (root / name).write_bytes(content)
+        if observe_restore:
+            record(
+                "burst_restore_write",
+                written_at=restore_written.isoformat(),
+                seconds=time.perf_counter() - restore_started,
+            )
+    restored_at, _ = await wait_files(server, before, str(initial))
+    convergence = {}
+    if observe_restore:
+        try:
+            async with asyncio.timeout(5):
+                await wait_publication(server, restore_offset, "filesystem")
+        except TimeoutError:
+            # A capped stderr stream leaves the committed publication in server records.
+            pass
+        convergence = await observe_publication(
+            server, restore_offset, str(initial), restore_written
+        )
+        convergence["all_digests_seconds"] = restored_at - restore_started
     restored = snapshot(root, marker)
     restored_map = await client.resource("rift://map")
     on_disk = digests({name: (root / name).read_bytes() for name in paths})
@@ -304,6 +338,7 @@ async def run_burst(
         restored=restored,
         disk_sha256=dict(on_disk),
         map_equal=before_map == restored_map,
+        **convergence,
     )
     require(on_disk == before, "restored source digests differ")
     require(
