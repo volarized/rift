@@ -170,14 +170,13 @@ back to indexed declarations. Rift can also request diagnostics from the engine.
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
 
-Incoming traversal follows edges within the current project to the declarations that
-refer to the requested declaration. A language engine supplies additional reference locations
-where available. Rift uses syntax to identify the declaration containing each location.
-
-At the next depth, each caller becomes the declaration whose references Rift looks up.
+Incoming traversal follows edges ending at each visited declaration. The walk can follow
+stored `calls`, `imports`, `contains`, and other available kinds when `kinds` is empty or
+omitted. A language engine can add `references` edges. Rift uses syntax to identify the
+declaration containing each reference returned by the engine.
 
 <VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> Outgoing
-traversal follows calls from a declaration to its callees. A language engine can supply the
+traversal follows edges starting at each visited declaration. A language engine can supply the
 declaration's
 [call hierarchy](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy),
 and syntax identifies the declaration that holds each callee's name.

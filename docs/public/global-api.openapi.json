@@ -5349,7 +5349,7 @@
           },
           "direction": {
             "$ref": "#/components/schemas/TraversalDirection",
-            "description": "Which edges the walk follows from each visited symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. Omitted, `incoming`.",
+            "description": "The direction the walk follows from each visited symbol. Omitted, `incoming`.",
             "default": "incoming"
           },
           "kinds": {
@@ -5540,15 +5540,15 @@
         "description": "One auditable step in a search traversal. `edge` retains its occurrence, requested providers, and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
-        "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
+        "description": "The direction a traversal follows from each visited symbol. All stored edge kinds are\neligible when `kinds` is empty or omitted.",
         "type": "string",
         "enum": [
           "incoming",
           "outgoing"
         ],
         "x-enum-descriptions": [
-          "Walks edges arriving at each visited symbol: the references a language engine\nresolves to it, each hop carrying the `references` kind.",
-          "Walks edges leaving each visited symbol: the calls a language engine's call\nhierarchy names for it, each hop carrying the `calls` kind."
+          "Follows edges ending at each visited symbol. A language engine can add `references`\nedges.",
+          "Follows edges starting at each visited symbol. A language engine can add `calls`\nedges from its call hierarchy."
         ]
       },
       "CommitHit": {

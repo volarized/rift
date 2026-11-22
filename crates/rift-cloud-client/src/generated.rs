@@ -2245,9 +2245,8 @@ pub struct SearchTraversal {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub seed: Option<String>,
-    /// Which edge direction a search traversal walks from each visited symbol. A language
-    /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
-    /// `outgoing`.
+    /// The direction a traversal follows from each visited symbol. All stored edge kinds are
+    /// eligible when `kinds` is empty or omitted.
     pub direction: Option<TraversalDirection>,
     /// Portable edge kinds eligible for the walk. Omitted or empty, every kind is
     /// eligible.
@@ -2444,18 +2443,17 @@ pub struct GraphHop {
     /// How one path step followed its directed edge.
     pub direction: HopDirection,
 }
-/// Which edge direction a search traversal walks from each visited symbol. A language
-/// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
-/// `outgoing`.
+/// The direction a traversal follows from each visited symbol. All stored edge kinds are
+/// eligible when `kinds` is empty or omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum TraversalDirection {
-    /// Walks edges arriving at each visited symbol: the references a language engine
-    /// resolves to it, each hop carrying the `references` kind.
+    /// Follows edges ending at each visited symbol. A language engine can add `references`
+    /// edges.
     #[serde(rename = "incoming")]
     #[default]
     Incoming,
-    /// Walks edges leaving each visited symbol: the calls a language engine's call
-    /// hierarchy names for it, each hop carrying the `calls` kind.
+    /// Follows edges starting at each visited symbol. A language engine can add `calls`
+    /// edges from its call hierarchy.
     #[serde(rename = "outgoing")]
     Outgoing,
 }
@@ -4220,9 +4218,8 @@ pub struct EdgeBounds {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeCapability {
-    /// Which edge direction a search traversal walks from each visited symbol. A language
-    /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
-    /// `outgoing`.
+    /// The direction a traversal follows from each visited symbol. All stored edge kinds are
+    /// eligible when `kinds` is empty or omitted.
     pub direction: TraversalDirection,
     /// Kinds whose complete selected-domain reads the reader supports.
     pub kinds: Vec<EdgeKind>,
@@ -4343,9 +4340,8 @@ pub struct EdgeSelection {
     /// Established subjects whose complete adjacency is required.
     #[validate(length(min = 1u64))]
     pub seeds: Vec<String>,
-    /// Which edge direction a search traversal walks from each visited symbol. A language
-    /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
-    /// `outgoing`.
+    /// The direction a traversal follows from each visited symbol. All stored edge kinds are
+    /// eligible when `kinds` is empty or omitted.
     pub direction: TraversalDirection,
     /// Portable edge kinds. Empty selects every available kind.
     pub kinds: Vec<EdgeKind>,
