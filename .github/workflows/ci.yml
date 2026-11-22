@@ -965,3 +965,96 @@ jobs:
             echo "$failed"
             exit 1
           fi
+
+  selected-document-burst:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'perf/selected-document-burst' &&
+      github.base_ref == 'perf/selected-document-burst-base'
+    needs: integration-cli
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      BASE: 63f8f208432915805b989c8d38f326a8c457653c
+      PRODUCT: 54ae618213378e71c0a7187a2f65adec66a24f53
+      BASE_RUN: '45016505049'
+      BASE_ARTIFACT: '14752331645'
+      BASE_DIGEST: sha256:a9b79972522c86a6d5c6deea3657df742f12f2d1db91f1151499d66b32c39647
+      HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+      BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 4
+      - name: Verify compared trees
+        run: |
+          set -euo pipefail
+          test "$BASE_COMMIT" = "$BASE"
+          test "$(git rev-parse "$PRODUCT^")" = "$BASE"
+          test "$(git rev-parse "$HEAD_COMMIT^")" = "$PRODUCT"
+          git diff --exit-code "$GITHUB_SHA" "$HEAD_COMMIT"
+          git diff --exit-code "$PRODUCT" "$GITHUB_SHA" -- . ':(exclude).github/workflows/ci.yml' ':(exclude)dev/check_burst_pair.py'
+          mkdir -p target/burst-proof/reports
+          echo "RIFT_CORPUS_DIR=$RUNNER_TEMP/rift-corpus-cache" >> "$GITHUB_ENV"
+          git show --no-patch --format='%H %T' "$BASE" "$PRODUCT" "$HEAD_COMMIT" "$GITHUB_SHA" > target/burst-proof/reports/trees.txt
+      - name: Retrieve the two corpus profile executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/target/burst-proof"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BASE_RUN" > "$root/base-run.json"
+          jq -e --arg base "$BASE" '.head_sha==$base and .event=="push" and .conclusion=="success" and .path==".github/workflows/ci.yml"' "$root/base-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > "$root/current.json"
+          candidate=$(jq -er '[.artifacts[] | select(.name=="integration-cli" and (.expired|not))] | select(length==1) | .[0].id' "$root/current.json")
+          for variant in base candidate; do
+            id="$candidate"
+            run="$GITHUB_RUN_ID"
+            if [[ "$variant" == base ]]; then id="$BASE_ARTIFACT"; run="$BASE_RUN"; fi
+            meta="$root/reports/$variant-artifact.json"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --jq '{id,name,digest,expired,workflow_run}' > "$meta"
+            jq -e --argjson run "$run" --argjson id "$id" '.id==$id and .workflow_run.id==$run and .name=="integration-cli" and (.expired|not)' "$meta"
+            if [[ "$variant" == base ]]; then
+              jq -e --arg digest "$BASE_DIGEST" --arg sha "$BASE" '.digest==$digest and .workflow_run.head_sha==$sha' "$meta"
+            else
+              jq -e --arg head "$HEAD_COMMIT" --arg merge "$GITHUB_SHA" '.workflow_run.head_sha==$head or .workflow_run.head_sha==$merge' "$meta"
+            fi
+            mkdir "$root/$variant"
+            cd "$root/$variant"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > artifact.zip
+            digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:";"")' "$meta")
+            echo "$digest  artifact.zip" | sha256sum --check
+            test "$(unzip -Z1 artifact.zip)" = "integration-cli.tar.zst"
+            unzip -p artifact.zip integration-cli.tar.zst > integration-cli.tar.zst
+            test "$(tar --zstd -tf integration-cli.tar.zst)" = rift
+            test "$(tar --zstd -tvf integration-cli.tar.zst | cut -c1)" = -
+            tar --zstd -xOf integration-cli.tar.zst rift > rift
+            chmod +x rift
+            sha256sum artifact.zip integration-cli.tar.zst rift > "$root/reports/$variant-sha256.txt"
+            ./rift --version | tee "$root/reports/$variant-version.txt"
+          done
+          ! cmp -s "$root/base/rift" "$root/candidate/rift"
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - name: Prepare pinned corpus
+        run: |
+          uv sync --locked --project dev
+          uv run --locked --project dev rift-dev corpus sync bun
+      - name: Compare the four burst runs
+        run: |
+          uv run --locked --project dev python dev/check_burst_pair.py \
+            target/burst-proof/base/rift target/burst-proof/candidate/rift target/burst-proof/reports
+      - uses: actions/upload-artifact@v7.0.2
+        if: ${{ always() }}
+        with:
+          name: selected-document-burst
+          path: target/burst-proof/reports
+          if-no-files-found: warn
+          retention-days: 7
