@@ -1199,7 +1199,13 @@ impl EngineSlot {
         mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
     ) -> Result<T, RiftError> {
         let retry = self.configuration.retry;
+        // A walk started after its cutoff can ask once without retrying. A walk that
+        // queued in time must not start a new exchange after waiting out its budget.
+        let queued_cutoff = deadline.filter(|end| Instant::now() < *end);
         let mut held = self.hold().await;
+        if queued_cutoff.is_some_and(|end| Instant::now() >= end) {
+            return errors::lsp::engine_analyzing().attempts(0_u64).fail();
+        }
         let mut guarded = RequestSessionGuard {
             state: &mut held,
             reported_state: &self.reported_state,
@@ -2675,6 +2681,50 @@ done
             "the retry ends at the walk deadline"
         );
         assert!(retrying.is_none(), "the spent retry has no later exchange");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_cutoff_spent_waiting_for_the_slot_starts_no_exchange() {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        fn unexpected_request(
+            _session: &mut EngineSession,
+        ) -> SessionFuture<'_, Result<Option<()>, RiftError>> {
+            panic!("the elapsed walk sent its first request");
+        }
+
+        let key = LspProcessKey::named("rust");
+        let pool = EnginePool::new(
+            Path::new("/rift-test-root"),
+            BTreeMap::from([(key.clone(), table("unlaunched-test-engine"))]),
+            BTreeMap::new(),
+        );
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let held = slot.state.lock().await;
+        let cutoff = Instant::now() + Duration::from_millis(100);
+        let mut queued = Box::pin(slot.request_outgoing(
+            begin_immediately,
+            unexpected_request,
+            finish_immediately,
+            cutoff,
+        ));
+        poll_fn(|context| {
+            assert!(queued.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        drop(held);
+
+        assert!(matches!(
+            queued.await,
+            Ok(OutgoingAnswer::Unsettled { attempts: 0 })
+        ));
+        let state = slot.state.lock().await;
+        assert!(state.session.is_none() && state.starting.is_none());
+        assert!(!state.restarts.started && state.restarts.spent.is_empty());
+        assert!(!state.discarded);
     }
 
     /// The default retry table spends 8 attempts over 9.75 s of waits; a walk

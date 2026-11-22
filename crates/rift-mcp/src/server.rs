@@ -1547,8 +1547,8 @@ const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
 /// The read ends itself at its deadline: the session cancels the requests it still waits
 /// for and the read reports the file unsettled, so no frame is cut part-written and the
 /// engine keeps running. Dropping the read is the last bound, for a write the engine does
-/// not read. The grace is a share of the least reserve a walk keeps before the request's
-/// deadline ([`WALK_BUDGET_RESERVE_DIVISOR`]), so the answer still fits after a drop.
+/// not read. A graph read reserves this grace before revalidating the tree and evaluating
+/// the graph answer.
 const ENGINE_READ_GRACE: Duration = Duration::from_millis(50);
 
 /// How many request-time captures of the same tree a walk reserves time for after it
@@ -1619,6 +1619,17 @@ impl RequestDeadline {
         let floor = self.budget / WALK_BUDGET_RESERVE_DIVISOR;
         let check = capture_elapsed.saturating_mul(WALK_CAPTURE_RESERVE_FACTOR);
         self.at - floor.max(check).min(self.budget)
+    }
+
+    /// Ends graph engine waits before their cleanup, tree revalidation, and graph evaluation
+    /// spend the rest of the same request budget.
+    fn graph_walk_end(self, capture_elapsed: Duration) -> tokio::time::Instant {
+        let evaluation = self.budget / WALK_BUDGET_RESERVE_DIVISOR;
+        let revalidation = capture_elapsed.saturating_mul(WALK_CAPTURE_RESERVE_FACTOR);
+        let reserve = ENGINE_READ_GRACE
+            .saturating_add(revalidation)
+            .saturating_add(evaluation);
+        self.at - reserve.min(self.budget)
     }
 }
 
@@ -7878,6 +7889,52 @@ done
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn graph_engine_waits_reserve_each_remaining_phase() {
+        let budget = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        let deadline = RequestDeadline::starting(budget);
+        let capture = Duration::from_millis(80);
+        let engine_read = deadline.graph_walk_end(capture);
+        let cleanup = engine_read + super::ENGINE_READ_GRACE;
+        let revalidation = cleanup + capture * super::WALK_CAPTURE_RESERVE_FACTOR;
+        assert_eq!(engine_read - started, Duration::from_millis(690));
+        assert_eq!(deadline.at() - revalidation, Duration::from_millis(100));
+        assert_eq!(deadline.at() - started, budget);
+        assert_eq!(deadline.graph_walk_end(budget), started);
+    }
+
+    #[tokio::test]
+    async fn a_graph_query_spending_its_whole_budget_keeps_the_deadline_error() -> TestResult {
+        use rift_protocol::query::{QueryLanguage, QueryParams};
+
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "[server]\nreadiness_timeout = '1s'\n")?;
+        let mut assembled = unsupervised_server(directory.path()).await?;
+        assembled.server.blocking = super::BlockingExecutor::isolated(1, 2_000);
+        let permit = Arc::clone(&assembled.server.blocking.operations)
+            .acquire_owned()
+            .await?;
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = assembled
+            .server
+            .graph_query(QueryParams {
+                language: QueryLanguage::Sparql,
+                query: "ASK {}".to_owned(),
+                ..Default::default()
+            })
+            .await;
+        let Err(failure) = result else {
+            return Err("an unavailable graph worker must exhaust the request deadline".into());
+        };
+        assert!(format!("{failure:?}").contains("rift.search.query_deadline_exceeded"));
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        drop(permit);
+        Ok(())
+    }
+
     /// A `sh` engine that answers `initialize`, announces work it never ends, and answers
     /// every later request with no location, so a walk reads it analyzing on every attempt.
     #[cfg(unix)]
@@ -7898,6 +7955,76 @@ while IFS= read -r header; do
   esac
 done
 "#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_engine_wait_cut_keeps_captured_calls_and_typed_usage_warning() -> TestResult {
+        use rift_protocol::query::{QueryLanguage, QueryParams, QueryReadResult};
+        use rift_protocol::read::ReadWarning;
+        use rift_protocol::search_read::SearchUnavailable;
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+
+        let engine = tempfile::tempdir()?;
+        let script = engine.path().join("engine.sh");
+        let analyzing = ANALYZING_ENGINE.replace(
+            r#"referencesProvider\":true"#,
+            r#"referencesProvider\":true,\"callHierarchyProvider\":true"#,
+        );
+        fs::write(&script, analyzing)?;
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub struct Worker;\npub fn beacon() {}\npub fn caller() { beacon(); }\n",
+        )?;
+        captured_rust_traversal_metadata(directory.path())?;
+        super::hermetic_workspace(
+            directory.path(),
+            &format!(
+                "[server]\nreadiness_timeout = '1s'\n[languages.rust.lsp]\ncommand = ['sh', {}]\n",
+                serde_json::to_string(&script)?
+            ),
+        )?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        let published = Arc::clone(&server.published.read().await.current);
+        let worker = captured_traversal_seed(&published.reads, "Worker")?;
+        let root = directory.path().canonicalize()?;
+        server.force_capture_after(Duration::from_millis(180), move |current| {
+            captured_tree(&root, current)
+        });
+        for (whole_inventory, query) in [
+            (true, "SELECT ?s ?t { ?s :calls ?t }".to_owned()),
+            (
+                false,
+                format!("SELECT ?usage {{ <{worker}> :usages ?usage }}"),
+            ),
+        ] {
+            let result = server
+                .graph_query(QueryParams {
+                    language: QueryLanguage::Sparql,
+                    query,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0
+                .result;
+            let warnings = match result {
+                QueryReadResult::Results(answer) if whole_inventory => answer.warnings,
+                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason: SymbolUnavailableReason::InsufficientCoverage,
+                    warnings,
+                    ..
+                }) if !whole_inventory => warnings,
+                result => return Err(format!("unexpected graph result: {result:?}").into()),
+            };
+            assert!(warnings.iter().any(|warning| matches!(warning,
+                ReadWarning::EngineAnalysisUnavailable { detail, .. }
+                    if detail.contains("readiness_timeout"))));
+        }
+        server.engine_pool().await.shutdown().await;
+        Ok(())
+    }
 
     /// A traversal whose tree check takes a third of the 3 s budget still answers inside
     /// it: the walk reserves twice the request-time capture, so the check after a walk

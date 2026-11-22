@@ -320,7 +320,7 @@ impl RiftMcp {
         let engine = if served.is_empty() || skipped.is_some() {
             None
         } else {
-            let end = deadline.walk_end(resolved.capture_elapsed);
+            let end = deadline.graph_walk_end(resolved.capture_elapsed);
             match Box::pin(self.engine_inventory(resolved, &engines, &inventory, end)).await {
                 Ok(engine) => Some(engine),
                 Err(error) if super::super::lacks_coverage(&error) => None,
