@@ -1837,6 +1837,7 @@ fn resolved_in_one_pass(
         documents,
         input,
         work_max,
+        None,
         |index, work, resolution| {
             for file in index.files.values() {
                 if !work.charge() {
@@ -1870,8 +1871,128 @@ fn resolved_apart(
         documents,
         input,
         work_max,
+        None,
         |index, work, resolution| index.resolve_files(file_work, work, resolution),
     )
+}
+
+#[test]
+fn rust_call_reuse_keeps_the_native_budget_and_current_graph_probes() {
+    use std::sync::Arc;
+
+    use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, PublicationSet};
+
+    let source = "pub fn leaf() {}\npub fn call() { leaf(); }\n";
+    let cargo = "[package]\nname='fixture'\nversion='1.0.0'\n";
+    resolution_by(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", cargo)],
+        WORK_MAX,
+        &|graph, documents, input, maximum| {
+            let document = syntax("src/lib.rs", source);
+            let indexed_file = crate::IndexedFile::new(
+                document.path().clone(),
+                Arc::new(source.to_owned()),
+                rift_core::FileDigest::of(source.as_bytes()),
+                false,
+                document,
+            );
+            let selected = [(&indexed_file, documents[0].placement)];
+            let capture =
+                super::RustCallCapture::new(*input, selected, None).expect("capture context");
+            let seeded =
+                super::resolve_with_rust_calls(graph, documents, input, maximum, Some(&capture));
+            assert_eq!(calls(&seeded, "src/lib.rs").count(), 1);
+            let replay = super::RustCallCapture::new(*input, selected, seeded.rust_calls.as_ref())
+                .expect("direct replay context");
+            let independent = syntax("src/lib.rs", source);
+            let independent = crate::IndexedFile::new(
+                independent.path().clone(),
+                Arc::new(source.to_owned()),
+                rift_core::FileDigest::of(source.as_bytes()),
+                false,
+                independent,
+            );
+            let foreign = super::RustCallCapture::new(
+                *input,
+                [(&independent, documents[0].placement)],
+                seeded.rust_calls.as_ref(),
+            )
+            .expect("another complete capture context");
+            assert!(foreign.file(0, 1).lookup(0).is_none());
+
+            let provider = graph
+                .publications()
+                .publications()
+                .next()
+                .expect("source publication");
+            let limits = PublicationLimits::default();
+            let rows = provider
+                .contributions()
+                .iter()
+                .filter(|row| row.facts().is_none_or(|facts| facts.name() != "leaf"))
+                .cloned()
+                .collect();
+            let changed = ProviderPublication::new(
+                provider.provider().clone(),
+                provider.revision(),
+                rows,
+                limits,
+            )
+            .expect("current publication without the target");
+            let changed = Arc::new(
+                PublicationSet::empty(limits)
+                    .replaced(changed)
+                    .expect("current publications"),
+            );
+            let changed = Normalizer::normalize(
+                graph.index_revision(),
+                graph.source_revision(),
+                graph.tree_revision(),
+                &changed,
+                None,
+            )
+            .expect("normalization without the target");
+
+            super::resolve_by(
+                &changed,
+                documents,
+                input,
+                maximum,
+                Some(&replay),
+                |index, _, _| {
+                    let file = index.files.get("src/lib.rs").expect("admitted file");
+                    let slot = file.rust_file.expect("Rust file slot");
+                    let call = &file.facts.calls()[0];
+                    let run = replay.file(slot, file.rust_call_slots);
+                    let charged = run.lookup(0).expect("retained target lookup").charged;
+                    assert!(charged > 0);
+                    for budget in [charged - 1, charged, charged + 1, maximum] {
+                        let mut cached = super::Work::new(budget);
+                        cached.rust_calls = replay.file(slot, file.rust_call_slots);
+                        let mut cold = super::Work::new(budget);
+                        assert!(index.call_occurrence(file, 0, call, &mut cached).is_none());
+                        assert!(index.call_occurrence(file, 0, call, &mut cold).is_none());
+                        assert_eq!(cached.budget.remaining(), cold.budget.remaining());
+                        assert_eq!(cached.exhausted, cold.exhausted);
+                        assert_eq!(
+                            cached.rust_call_counts.charged,
+                            cold.rust_call_counts.charged
+                        );
+                        if budget < charged {
+                            assert_eq!(cached.rust_call_counts.native, 1);
+                            assert_eq!(cached.rust_call_counts.reused, 0);
+                        } else {
+                            assert_eq!(cached.rust_call_counts.native, 0);
+                            assert_eq!(cached.rust_call_counts.reused, 1);
+                            assert_eq!(cached.rust_call_counts.occurrences, 1);
+                        }
+                    }
+                },
+            )
+        },
+    );
 }
 
 const APART_SOURCES: [(&str, &str); 4] = [
@@ -2013,6 +2134,7 @@ fn work_done_once_the_budget_ends_stays_inside_the_budget() {
                     documents,
                     input,
                     work_max,
+                    None,
                     |index, work, resolution| {
                         left.store(work.budget.remaining(), Ordering::Relaxed);
                         index.resolve_files(super::FileWork::CAPTURED, work, resolution);

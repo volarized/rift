@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_index::DatabaseName;
@@ -66,6 +67,178 @@ fn index_of(root: &Path) -> TestResult<WorkspaceIndex> {
         &text_inclusion(),
         &LanguageFileSelections::default(),
     )?)
+}
+
+fn observe_rust_lookups(
+    build: impl FnOnce() -> TestResult<WorkspaceIndex>,
+) -> TestResult<(WorkspaceIndex, Option<serde_json::Value>)> {
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let index = build()?;
+    drop(recorder);
+    let mut observations = drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| {
+            record.message() == "Index::rust_call_lookups"
+                && record.operation() == "Index::rust_call_lookups"
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        observations.len() <= 1,
+        "one complete static pass per build"
+    );
+    let fields = observations
+        .pop()
+        .map(|record| serde_json::from_str(record.fields()))
+        .transpose()?;
+    Ok((index, fields))
+}
+
+fn rust_lookup_count(fields: &serde_json::Value, name: &str) -> TestResult<u64> {
+    let value = &fields[name];
+    if let Some(count) = value.as_u64() {
+        return Ok(count);
+    }
+    Ok(value
+        .as_str()
+        .ok_or_else(|| format!("missing Rust lookup count {name}"))?
+        .parse()?)
+}
+
+fn rust_successor(
+    root: &Path,
+    before: &WorkspaceIndex,
+    expected_changes: usize,
+) -> TestResult<WorkspaceIndex> {
+    let (captured, _) = capture_digests_with_languages(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &text_inclusion(),
+        &LanguageFileSelections::default(),
+        &LastCapture::default(),
+    )?;
+    let changes = PathChanges::between(&before.digests(), &captured);
+    assert_eq!(changes.len(), expected_changes);
+    Ok(before.rebuilt(&changes)?)
+}
+
+fn assert_static_facts_equal(current: &WorkspaceIndex, cold: &WorkspaceIndex) {
+    let current_graph = current.normalized_graph();
+    let cold_graph = cold.normalized_graph();
+    assert_eq!(
+        current_graph.source_revision(),
+        cold_graph.source_revision()
+    );
+    assert_eq!(current_graph.records(), cold_graph.records());
+    assert_eq!(current_graph.candidates(), cold_graph.candidates());
+    assert_eq!(current_graph.references(), cold_graph.references());
+    assert_eq!(current_graph.edges(), cold_graph.edges());
+    assert_eq!(current.edges(), cold.edges());
+    assert_eq!(
+        current.static_targets_omitted(),
+        cold.static_targets_omitted()
+    );
+    let warnings = |index: &WorkspaceIndex| {
+        index
+            .warnings()
+            .iter()
+            .map(|warning| (warning.path().clone(), warning.reason()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(warnings(current), warnings(cold));
+}
+
+#[test]
+fn typescript_edits_reuse_positive_rust_calls_and_keep_native_misses() -> TestResult {
+    const RUST: &str = "pub fn leaf() {}\npub fn relay() { leaf(); absent(); }\n";
+    for rust_files in [8, 80] {
+        use std::fmt::Write as _;
+        let directory = TempDir::new()?;
+        let root = directory.path();
+        std::fs::create_dir(root.join("src"))?;
+        let manifest = "[package]\nname='calls'\nversion='1.0.0'\n";
+        std::fs::write(root.join("Cargo.toml"), manifest)?;
+        std::fs::write(root.join("binary.ts"), b"excluded\0source")?;
+        let mut library = String::new();
+        for suffix in 0..rust_files {
+            writeln!(library, "pub mod unit_{suffix};")?;
+            std::fs::write(root.join(format!("src/unit_{suffix}.rs")), RUST)?;
+        }
+        std::fs::write(root.join("src/lib.rs"), library)?;
+        for ordinal in 0..50 {
+            std::fs::write(
+                root.join(format!("edit_{ordinal}.ts")),
+                "export const edited = 1;\n",
+            )?;
+        }
+
+        let (initial, cold_work) = observe_rust_lookups(|| index_of(root))?;
+        let initial = Arc::new(initial);
+        let cold_work = cold_work.expect("a whole captured Rust domain records lookups");
+        assert!(!initial.warnings().is_empty());
+        let initial_clock = initial.normalized_graph().source_revision();
+        let initial_edges = initial.edges().edges().collect::<Vec<_>>();
+        assert_eq!(rust_lookup_count(&cold_work, "native")?, rust_files * 2);
+        assert_eq!(rust_lookup_count(&cold_work, "recorded")?, rust_files);
+        let mut ready = Arc::clone(&initial);
+        for changes in [1, 50] {
+            for ordinal in 0..changes {
+                std::fs::write(
+                    root.join(format!("edit_{ordinal}.ts")),
+                    format!("export const edited = {};\n", changes + 1),
+                )?;
+            }
+            let (current, fields) = observe_rust_lookups(|| rust_successor(root, &ready, changes))?;
+            let fields = fields.expect("the complete named successor reports Rust lookup work");
+            assert_eq!(rust_lookup_count(&fields, "native")?, rust_files);
+            assert_eq!(rust_lookup_count(&fields, "reused")?, rust_files);
+            assert_eq!(rust_lookup_count(&fields, "occurrences")?, rust_files);
+            assert_eq!(
+                rust_lookup_count(&fields, "charged")?,
+                rust_lookup_count(&cold_work, "charged")?
+            );
+            assert_eq!(rust_lookup_count(&fields, "witness_files")?, rust_files + 1);
+            assert_static_facts_equal(&current, &index_of(root)?);
+            println!("rust_files={rust_files} changed_paths={changes} lookup_work={fields}");
+            ready = Arc::new(current);
+        }
+
+        std::fs::write(root.join("src/unit_0.rs"), format!("\n{RUST}"))?;
+        let (moved, work) = observe_rust_lookups(|| rust_successor(root, &ready, 1))?;
+        assert_eq!(
+            rust_lookup_count(&work.expect("Rust edit runs native"), "reused")?,
+            0
+        );
+        assert_static_facts_equal(&moved, &index_of(root)?);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("{manifest}\n[features]\ndefault=[]\n"),
+        )?;
+        let (reconfigured, work) = observe_rust_lookups(|| rust_successor(root, &moved, 1))?;
+        assert_eq!(
+            rust_lookup_count(&work.expect("manifest edit runs native"), "reused")?,
+            0
+        );
+        assert_static_facts_equal(&reconfigured, &index_of(root)?);
+
+        std::fs::write(root.join("src/left_out.rs"), b"excluded\0rust source")?;
+        let (omitted, work) = observe_rust_lookups(|| index_of(root))?;
+        assert!(
+            work.is_none(),
+            "an omitted Rust file prevents retaining lookups"
+        );
+        std::fs::write(root.join("edit_0.ts"), "export const edited = 52;\n")?;
+        let (after, work) = observe_rust_lookups(|| rust_successor(root, &omitted, 1))?;
+        assert!(
+            work.is_none(),
+            "the named path keeps the ordinary resolver for an omitted Rust file"
+        );
+        assert_static_facts_equal(&after, &index_of(root)?);
+        assert_eq!(initial.normalized_graph().source_revision(), initial_clock);
+        assert_eq!(initial.edges().edges().collect::<Vec<_>>(), initial_edges);
+    }
+    Ok(())
 }
 
 fn pool() -> DatabasePool {

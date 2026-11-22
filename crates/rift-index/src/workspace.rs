@@ -1457,13 +1457,19 @@ impl IndexContents {
         let context =
             self.apply_frameworks(root, language, limits.syntax(), previous, cancelled)?;
         self.capture_build_paths(root, limits, cancelled)?;
-        built_contents_with_owner(
-            (root, owner),
-            self.sorted(),
-            limits,
-            previous.map(|index| index.semantics.graph()),
-        )
-        .map(|built| (built, context))
+        let history = match previous {
+            Some(index)
+                if index.root != root
+                    || &index.owner != owner
+                    || index.limits != limits
+                    || !std::ptr::eq(language, index.language.as_ref()) =>
+            {
+                SemanticHistory::Graph(Some(index.semantics.graph()))
+            }
+            _ => SemanticHistory::Captured(previous.map(|index| index.semantics.as_ref())),
+        };
+        built_contents_with_owner((root, owner), self.sorted(), limits, history)
+            .map(|built| (built, context))
     }
 
     fn resolve_frameworks(
@@ -3165,7 +3171,7 @@ impl WorkspaceIndex {
             (&self.root, &self.owner),
             contents.sorted(),
             self.limits,
-            Some(self.semantics.graph()),
+            SemanticHistory::Captured(Some(&self.semantics)),
         )?;
         check_cancelled(cancelled)?;
         let (declarations, canonical_examples) =
@@ -3310,7 +3316,7 @@ impl WorkspaceIndex {
             (&root, &owner),
             contents.sorted(),
             limits,
-            previous.map(|index| index.semantics.graph()),
+            SemanticHistory::Graph(previous.map(|index| index.semantics.graph())),
         )?;
         let (declarations, canonical_examples) = accepted_declarations(&files, &semantics, &owner);
         let (documentation, notebooks) = crate::documentation::build(
@@ -5030,12 +5036,27 @@ enum ProjectSemanticsAdmission {
     },
 }
 
+#[derive(Clone, Copy)]
+enum SemanticHistory<'previous> {
+    Captured(Option<&'previous WorkspaceSemantics>),
+    Graph(Option<&'previous NormalizedGraph>),
+}
+
+impl<'previous> SemanticHistory<'previous> {
+    fn graph(self) -> Option<&'previous NormalizedGraph> {
+        match self {
+            Self::Captured(previous) => previous.map(WorkspaceSemantics::graph),
+            Self::Graph(previous) => previous,
+        }
+    }
+}
+
 fn captured_project_semantics(
     (root, owner): (&Path, &SymbolOwner),
     contents: &IndexContents,
     limits: WorkspaceIndexLimits,
     fingerprint: &WorkspaceFingerprint,
-    previous: Option<&NormalizedGraph>,
+    history: SemanticHistory<'_>,
 ) -> Result<ProjectSemanticsAdmission, RiftError> {
     let revision = captured_semantic_revision(fingerprint, root, owner)?;
     let revision = captured_build_paths_revision(
@@ -5056,7 +5077,7 @@ fn captured_project_semantics(
                     limits.declarations_max(),
                     limits.edges_max(),
                     revision,
-                    previous,
+                    history.graph(),
                 )
             }
         )
@@ -5108,9 +5129,20 @@ fn captured_project_semantics(
         files = documents.len(),
         {
             if contents.partial {
-                prepared.build_deferring_static(limits.edges_max(), previous)
+                prepared.build_deferring_static(limits.edges_max(), history.graph())
+            } else if let SemanticHistory::Captured(previous) = history
+                && contents.build_paths.len() == contents.build_path_requests.len()
+                && !contents.warnings.iter().any(|warning| {
+                    let path = warning.path().as_str();
+                    warning.leaves_declarations_out()
+                        && (path.ends_with(".rs")
+                            || path == "Cargo.toml"
+                            || path.ends_with("/Cargo.toml"))
+                })
+            {
+                prepared.build_with_static_history(limits.edges_max(), previous)
             } else {
-                prepared.build(limits.edges_max(), previous)
+                prepared.build(limits.edges_max(), history.graph())
             }
         }
     )
@@ -5234,14 +5266,19 @@ fn built_contents(
     limits: WorkspaceIndexLimits,
     previous: Option<&NormalizedGraph>,
 ) -> Result<BuiltContents, RiftError> {
-    built_contents_with_owner((root, &SymbolOwner::Local), contents, limits, previous)
+    built_contents_with_owner(
+        (root, &SymbolOwner::Local),
+        contents,
+        limits,
+        SemanticHistory::Graph(previous),
+    )
 }
 
 fn built_contents_with_owner(
     (root, owner): (&Path, &SymbolOwner),
     mut contents: IndexContents,
     limits: WorkspaceIndexLimits,
-    previous: Option<&NormalizedGraph>,
+    history: SemanticHistory<'_>,
 ) -> Result<BuiltContents, RiftError> {
     validate_project_owner(owner)?;
     validate_captured_source_bytes(&contents)?;
@@ -5264,7 +5301,11 @@ fn built_contents_with_owner(
                     &contents,
                     limits,
                     &fingerprint,
-                    previous,
+                    if passes == 0 {
+                        history
+                    } else {
+                        SemanticHistory::Graph(history.graph())
+                    },
                 );
                 match built {
                     Ok(ProjectSemanticsAdmission::Omitted {
