@@ -371,40 +371,7 @@ impl SymbolAssembler {
                 )
             })
             .collect();
-        let (references, edges) = match sources {
-            Some(sources) => (
-                AssemblySources::positions(&sources.references, record)
-                    .into_iter()
-                    .filter_map(|position| graph.references().get(position))
-                    .cloned()
-                    .collect(),
-                AssemblySources::positions(&sources.edges, record)
-                    .into_iter()
-                    .filter_map(|position| graph.edges().get(position))
-                    .cloned()
-                    .collect(),
-            ),
-            None if contributions.iter().all(|(_, contribution)| {
-                contribution.references().is_empty() && contribution.edges().is_empty()
-            }) =>
-            {
-                (Vec::new(), Vec::new())
-            }
-            None => (
-                graph
-                    .references()
-                    .iter()
-                    .filter(|reference| record.contributions().contains(reference.source()))
-                    .cloned()
-                    .collect(),
-                graph
-                    .edges()
-                    .iter()
-                    .filter(|edge| record.contributions().contains(edge.source()))
-                    .cloned()
-                    .collect(),
-            ),
-        };
+        let (references, edges) = relationships(graph, record, sources, &contributions);
         Some(AssembledSymbol {
             index_revision: record.index_revision(),
             identity: record.identity().cloned(),
@@ -439,6 +406,48 @@ impl SymbolAssembler {
             facts |= contribution.facts().is_some();
         }
         facts
+    }
+}
+
+fn relationships(
+    graph: &NormalizedGraph,
+    record: &SymbolRecord,
+    sources: Option<&AssemblySources<'_>>,
+    contributions: &[(ContributionKey, &Contribution)],
+) -> (Vec<crate::NormalizedReference>, Vec<crate::NormalizedEdge>) {
+    match sources {
+        Some(sources) => (
+            AssemblySources::positions(&sources.references, record)
+                .into_iter()
+                .filter_map(|position| graph.references().get(position))
+                .cloned()
+                .collect(),
+            AssemblySources::positions(&sources.edges, record)
+                .into_iter()
+                .filter_map(|position| graph.edges().get(position))
+                .cloned()
+                .collect(),
+        ),
+        None if contributions.iter().all(|(_, contribution)| {
+            contribution.references().is_empty() && contribution.edges().is_empty()
+        }) =>
+        {
+            (Vec::new(), Vec::new())
+        }
+        None => (
+            graph
+                .references()
+                .iter()
+                .filter(|reference| record.contributions().contains(reference.source()))
+                .cloned()
+                .collect(),
+            graph
+                .edges()
+                .iter()
+                .filter(|edge| record.contributions().contains(edge.source()))
+                .cloned()
+                .collect(),
+        ),
     }
 }
 

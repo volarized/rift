@@ -190,27 +190,45 @@ mod tests {
     #[tokio::test]
     async fn accepted_exact_symbol_proof_requires_current_provenance() -> TestResult {
         let (_directory, server) = fixture().await?;
-        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
-            .capture("debug")
-            .install()?;
-        let accepted = server.exact_symbol(request()?).await?.0;
-        assert!(matches!(accepted, GetSymbolResult::Found { .. }));
+        let phase = crate::server::wire::ErrorPhase::Read;
+        let current = server
+            .published_workspace(phase, server.request_deadline().await)
+            .await?;
+        assert!(current.verified_current);
+        assert!(current.stale.is_none());
+        assert!(current.published.preparation.is_none());
+        let params = request()?;
+        let identity = params.id.clone();
+        let accepted = server
+            .exact_symbol_in_publication(&current, params)
+            .await?
+            .0;
+        let GetSymbolResult::Found {
+            revision,
+            declarations,
+            ..
+        } = &accepted
+        else {
+            return Err("the verified current snapshot must establish the symbol".into());
+        };
+        assert!(accepted.is_valid_for(&identity));
+        assert_eq!(*revision, current.published.reads.served_revision()?);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0].path.as_ref().map(|path| path.as_str()),
+            Some("index.ts")
+        );
 
-        let publication = Arc::clone(&server.published.read().await.current);
+        let publication = Arc::clone(&current.published);
         let digests = publication.reads.workspace_digests();
         let changes = PathChanges::default();
         let reason = StaleIndexReason::RebuildSuperseded {
             epoch: publication.epoch + 1,
             changes: &changes,
         };
-        let stale = ResolvedWorkspace::stale(
-            publication,
-            &digests,
-            None,
-            &reason,
-            crate::server::wire::ErrorPhase::Read,
-            Duration::ZERO,
-        )?;
+        let stale =
+            ResolvedWorkspace::stale(publication, &digests, None, &reason, phase, Duration::ZERO)?;
+        assert!(!stale.verified_current);
         assert!(stale.stale.is_none());
         assert_eq!(
             accepted,
@@ -220,14 +238,6 @@ mod tests {
                 .0
         );
         assert_eq!(accepted, server.exact_symbol(request()?).await?.0);
-        assert_eq!(
-            drain
-                .queued_records()
-                .iter()
-                .filter(|record| record.operation() == "read.symbol.current_direct")
-                .count(),
-            1
-        );
         Ok(())
     }
 
