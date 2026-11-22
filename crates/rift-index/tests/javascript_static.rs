@@ -2646,9 +2646,7 @@ export function replace(target: Replaced, handle: Handler) { target.handle = han
     }
 }
 
-#[test]
-fn test_written_callable_field_copy_needs_the_complete_value_and_const_instance() {
-    let source = "
+const CALLABLE_FIELD_COPY_SOURCE: &str = "
 export type Handler = (value: string) => string
 
 export class DirectCopy {
@@ -2726,6 +2724,10 @@ export class Unknown {
   }
 }
 ";
+
+#[test]
+fn test_written_callable_field_copy_needs_the_complete_value_and_const_instance() {
+    let source = CALLABLE_FIELD_COPY_SOURCE;
     let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
     for owner in [
         "DirectCopy",
