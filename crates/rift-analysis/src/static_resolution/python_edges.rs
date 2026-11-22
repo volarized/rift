@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
 
-use super::{File, Index, Target, Work};
+use super::{File, Index, StaticOccurrence, Target, Work};
 use crate::analyzer::namespace::python::python_import_target;
 
 pub(super) struct EdgePythonModules(BTreeMap<String, Option<String>>);
@@ -346,6 +346,41 @@ impl<'source> Index<'source> {
         };
         self.module_value(&module)
             .and_then(|value| self.value_target(value))
+    }
+
+    /// Keeps the written module when the named import resolves across a re-export.
+    pub(super) fn python_written_import(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        terminal: Target<'source>,
+        original: &StaticOccurrence,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let StaticBindingKind::PythonImport {
+            module,
+            export: Some(_),
+        } = binding.kind
+        else {
+            return None;
+        };
+        if terminal.symbol.kind == "module" {
+            return None;
+        }
+        let name = EdgePythonModules::name(file, file.text(module)?)?;
+        let written = self.files.get(self.edge_python.path(&name)?)?;
+        if terminal.file.path == written.document.path || !work.charge() {
+            return None;
+        }
+        let mut occurrence = self.occurrence(
+            file,
+            module,
+            module,
+            rift_core::ReferenceRole::Import,
+            written.qualified_target(".")?,
+        )?;
+        occurrence.edge_from = Some(original.edge_from.as_ref()?.clone());
+        Some(occurrence)
     }
 
     fn value_target(&self, value: Value<'source>) -> Option<Target<'source>> {
