@@ -39,6 +39,9 @@ use crate::static_resolution::{ExternalOccurrence, StaticOccurrence, StaticResol
 /// against a graph built outside those limits.
 pub const EDGES_MAX: usize = 10_000_000;
 
+/// Most base graph endpoints carried through one static admission, across both directions.
+const STATIC_FINALIZATION_BASE_KEYS_MAX: usize = 8_192;
+
 /// One resolved reference edge: the enclosing definition a reference occurred in, the
 /// established symbol it resolved to, and the reference's portable category.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +442,43 @@ fn admit_external<'a>(
     }
 }
 
+struct GraphAdjacency {
+    outgoing_lists: usize,
+    incoming_lists: usize,
+    dropped_edges: u64,
+    rows: usize,
+}
+
+fn finalize_lists(
+    lists: &mut BTreeMap<SymbolId, Vec<Edge>>,
+    base_keys: Option<Vec<SymbolId>>,
+    total_rows: usize,
+) -> (usize, usize, usize, usize) {
+    let finish = |edges: &mut Vec<Edge>| {
+        let count = edges.len();
+        edges.sort_by(edge_order);
+        edges.dedup();
+        count
+    };
+    let total_lists = lists.len();
+    if let Some(keys) = base_keys {
+        let finalized_lists = keys.len();
+        let finalized_rows = keys
+            .iter()
+            .map(|key| finish(lists.get_mut(key).expect("admission keeps base lists")))
+            .sum::<usize>();
+        (
+            finalized_lists,
+            finalized_rows,
+            total_lists - finalized_lists,
+            total_rows - finalized_rows,
+        )
+    } else {
+        let finalized_rows = lists.values_mut().map(finish).sum();
+        (total_lists, finalized_rows, 0, 0)
+    }
+}
+
 impl EdgeStore {
     fn add_static(
         &mut self,
@@ -448,11 +488,29 @@ impl EdgeStore {
         edges_max: usize,
     ) {
         if occurrences.is_empty() && external.is_empty() {
+            rift_tracing::info!(
+                component = "analysis",
+                operation = "EdgeStore::finalize_static_adjacency",
+                mode = "no_static_inputs",
+                graph_outgoing_lists = self.outgoing.len(),
+                graph_incoming_lists = self.incoming.len(),
+                graph_drops = self.dropped_edges,
+                edges_max = edges_max,
+                candidate_sources = 0,
+                static_admitted = 0,
+                skipped_outgoing_rows = 0,
+                skipped_incoming_rows = 0,
+                "EdgeStore::finalize_static_adjacency"
+            );
             return;
         }
-        let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
-        let mut remaining = edges_max.saturating_sub(existing);
-        let mut changed = false;
+        let graph = GraphAdjacency {
+            outgoing_lists: self.outgoing.len(),
+            incoming_lists: self.incoming.len(),
+            dropped_edges: self.dropped_edges,
+            rows: self.outgoing.values().map(Vec::len).sum(),
+        };
+        let mut remaining = edges_max.saturating_sub(graph.rows);
         let mut admitted = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         for occurrence in occurrences {
             if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
@@ -487,6 +545,18 @@ impl EdgeStore {
             admitted.entry(from).or_default().push(edge);
         }
         admit_external(external, spans, &self.edge_modules, &mut admitted);
+        let candidate_sources = admitted.len();
+        let base_keys = (!admitted.is_empty()
+            && remaining > 0
+            && self.dropped_edges == 0
+            && self.outgoing.len().saturating_add(self.incoming.len())
+                <= STATIC_FINALIZATION_BASE_KEYS_MAX)
+            .then(|| {
+                (
+                    self.outgoing.keys().cloned().collect(),
+                    self.incoming.keys().cloned().collect(),
+                )
+            });
         for (from, mut edges) in admitted {
             edges.sort_by(edge_order);
             edges.dedup();
@@ -501,7 +571,6 @@ impl EdgeStore {
                 .dropped_edges
                 .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
             remaining -= fits;
-            changed |= fits > 0;
             edges.truncate(fits);
             if edges.is_empty() {
                 continue;
@@ -518,12 +587,66 @@ impl EdgeStore {
                 .or_default()
                 .append(&mut edges);
         }
-        if changed {
-            for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
-                edges.sort_by(edge_order);
-                edges.dedup();
-            }
-        }
+        self.finalize_static(&graph, base_keys, edges_max, remaining, candidate_sources);
+    }
+
+    fn finalize_static(
+        &mut self,
+        graph: &GraphAdjacency,
+        base_keys: Option<(Vec<SymbolId>, Vec<SymbolId>)>,
+        edges_max: usize,
+        remaining: usize,
+        candidate_sources: usize,
+    ) {
+        let static_admitted = edges_max.saturating_sub(graph.rows) - remaining;
+        let keys = base_keys.filter(|_| remaining > 0 && self.dropped_edges == 0);
+        let mode = if static_admitted == 0 {
+            "no_new_rows"
+        } else if keys.is_some() {
+            "static_only"
+        } else {
+            "full"
+        };
+        let (
+            (outgoing_lists, outgoing_rows, skipped_outgoing_lists, skipped_outgoing_rows),
+            (incoming_lists, incoming_rows, skipped_incoming_lists, skipped_incoming_rows),
+        ) = if static_admitted == 0 {
+            // The ordinary pass leaves even duplicate graph rows alone until a new row fits.
+            ((0, 0, 0, 0), (0, 0, 0, 0))
+        } else {
+            // The static list for each source is sorted and deduplicated. A static-only
+            // destination receives its subsequence in ascending source order. Retain
+            // ordinary finalization for every original list, including unmodified ones.
+            let (outgoing_keys, incoming_keys) = keys.unzip();
+            let rows = graph.rows + static_admitted;
+            (
+                finalize_lists(&mut self.outgoing, outgoing_keys, rows),
+                finalize_lists(&mut self.incoming, incoming_keys, rows),
+            )
+        };
+        rift_tracing::info!(
+            component = "analysis",
+            operation = "EdgeStore::finalize_static_adjacency",
+            mode = mode,
+            graph_outgoing_lists = graph.outgoing_lists,
+            graph_incoming_lists = graph.incoming_lists,
+            graph_rows = graph.rows,
+            candidate_sources = candidate_sources,
+            graph_drops = graph.dropped_edges,
+            static_drops = self.dropped_edges - graph.dropped_edges,
+            static_admitted = static_admitted,
+            edges_max = edges_max,
+            remaining = remaining,
+            outgoing_lists = outgoing_lists,
+            outgoing_rows = outgoing_rows,
+            skipped_outgoing_lists = skipped_outgoing_lists,
+            skipped_outgoing_rows = skipped_outgoing_rows,
+            incoming_lists = incoming_lists,
+            incoming_rows = incoming_rows,
+            skipped_incoming_lists = skipped_incoming_lists,
+            skipped_incoming_rows = skipped_incoming_rows,
+            "EdgeStore::finalize_static_adjacency"
+        );
     }
 
     /// Builds the adjacency from every reference in `graph`, capped at
@@ -1015,6 +1138,282 @@ mod tests {
         ];
         let normalized = graph(contributions);
         assert_eq!(EdgeStore::build(&normalized), EdgeStore::build(&normalized));
+    }
+
+    fn static_call(
+        from: &SymbolId,
+        to: &SymbolId,
+        start: u64,
+        end: u64,
+    ) -> super::StaticOccurrence {
+        super::StaticOccurrence {
+            binding: binding("src/lib.rs", start, end),
+            target: super::NormalizedTarget::Symbol(to.clone()),
+            target_binding: None,
+            source_digest: rift_core::FileDigest::of(b"fixture"),
+            callee_range: rift_syntax::ByteRange { start, end },
+            role: ReferenceRole::Call,
+            edge_from: Some(from.clone()),
+            edge_kind: None,
+        }
+    }
+
+    fn finalization_fields(drain: &mut rift_tracing::LogDrain) -> serde_json::Value {
+        let records = drain.queued_records();
+        let record = records
+            .iter()
+            .find(|record| record.operation() == "EdgeStore::finalize_static_adjacency")
+            .expect("static finalization was recorded");
+        serde_json::from_str(record.fields()).expect("finalization counters are JSON")
+    }
+
+    #[test]
+    fn static_only_adjacency_matches_full_finalization_in_both_directions() {
+        use crate::static_resolution::EdgeCallCoverage;
+
+        let base = fixture_symbol("base");
+        let graph_target = fixture_symbol("graph_target");
+        let isolated = fixture_symbol("isolated");
+        let isolated_target = fixture_symbol("isolated_target");
+        let early = fixture_symbol("early");
+        let late = fixture_symbol("late");
+        let static_target = fixture_symbol("static_target");
+        let path = "src/lib.rs";
+        let normalized = graph(vec![
+            definition("base", base.as_str(), path, (0, 20)),
+            definition("graph_target", graph_target.as_str(), path, (20, 40)),
+            definition("isolated", isolated.as_str(), path, (40, 60)),
+            definition("isolated_target", isolated_target.as_str(), path, (60, 80)),
+            reference(
+                "base_call",
+                binding(path, 5, 8),
+                ReferenceRole::Call,
+                "graph_target",
+            ),
+            reference(
+                "isolated_call",
+                binding(path, 43, 46),
+                ReferenceRole::Call,
+                "isolated_target",
+            ),
+        ]);
+        let unavailable = source_unit("src/unavailable.rs");
+        let resolution = || super::StaticResolution {
+            occurrences: vec![
+                static_call(&late, &static_target, 90, 94),
+                static_call(&late, &static_target, 90, 94),
+                static_call(&early, &static_target, 91, 95),
+                static_call(&base, &graph_target, 5, 8),
+                static_call(&base, &graph_target, 1, 3),
+            ],
+            external: vec![super::ExternalOccurrence {
+                binding: binding(path, 90, 94),
+                target: static_target.clone(),
+                callee_range: rift_syntax::ByteRange { start: 92, end: 93 },
+                role: ReferenceRole::Call,
+                edge_from: Some(late.clone()),
+                edge_kind: None,
+                declared: false,
+            }],
+            unavailable_sources: 1,
+            omitted: std::collections::BTreeMap::from([(EdgeKind::Calls, 1)]),
+            edge_calls: std::collections::BTreeMap::from([(
+                unavailable.clone(),
+                EdgeCallCoverage {
+                    language: Language {
+                        name: "rust".to_owned(),
+                        dialect: None,
+                    },
+                    unavailable: true,
+                    unresolved: vec![rift_syntax::ByteRange { start: 1, end: 2 }],
+                },
+            )]),
+            ..super::StaticResolution::default()
+        };
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("trace");
+        let (reused, coverage) = EdgeStore::build_resolving(&normalized, 7, resolution);
+        drop(recorder);
+        let counts = finalization_fields(&mut drain);
+        assert_eq!(counts["mode"], "static_only");
+        assert_eq!(counts["static_drops"], "0");
+        assert_eq!(counts["graph_drops"], "0");
+        assert_eq!(counts["remaining"], "1");
+        assert_eq!(counts["edges_max"], "7");
+        assert_eq!(counts["skipped_outgoing_lists"], "2");
+        assert_eq!(counts["skipped_outgoing_rows"], "3");
+        assert_eq!(counts["skipped_incoming_lists"], "1");
+        assert_eq!(counts["skipped_incoming_rows"], "3");
+        assert_eq!(counts["outgoing_rows"], "3");
+        assert_eq!(counts["incoming_rows"], "3");
+        assert_eq!(coverage.unavailable_sources, 1);
+        assert_eq!(coverage.omitted[&EdgeKind::Calls], 1);
+        assert!(coverage.edge_calls[&unavailable].unavailable);
+        assert_eq!(coverage.edge_calls[&unavailable].unresolved.len(), 1);
+
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("trace");
+        let (at_cap, _) = EdgeStore::build_resolving(&normalized, 6, resolution);
+        drop(recorder);
+        let counts = finalization_fields(&mut drain);
+        assert_eq!(counts["mode"], "full");
+        assert_eq!(counts["remaining"], "0");
+        assert_eq!(counts["static_drops"], "0");
+        assert_eq!(counts["skipped_outgoing_rows"], "0");
+        assert_eq!(counts["skipped_incoming_rows"], "0");
+        assert_eq!(reused, at_cap);
+        assert_eq!(reused.dropped_edges(), 0);
+        assert_eq!(reused.outgoing(&base).len(), 2);
+        let incoming = reused.incoming(&static_target);
+        assert_eq!(incoming.len(), 3);
+        assert_eq!(incoming[0].from(), &early);
+        assert_eq!(&incoming[1..], reused.outgoing(&late));
+        assert_eq!(incoming[1].static_callee().expect("local call").start, 90);
+        assert_eq!(
+            incoming[2].static_callee().expect("external call").start,
+            92
+        );
+        let (truncated, _) = EdgeStore::build_resolving(&normalized, 5, resolution);
+        assert_eq!(truncated.dropped_edges(), 1);
+        assert_eq!(truncated.edges().count(), 5);
+    }
+
+    #[test]
+    fn first_static_edge_finalizes_old_only_duplicates_and_zero_fit_does_not() {
+        let graph_origin = fixture_symbol("graph_origin");
+        let graph_target = fixture_symbol("graph_target");
+        let normalized = graph(vec![
+            definition("origin", graph_origin.as_str(), "src/lib.rs", (0, 20)),
+            definition("target", graph_target.as_str(), "src/lib.rs", (20, 40)),
+            reference(
+                "origin_call",
+                binding("src/lib.rs", 5, 8),
+                ReferenceRole::Call,
+                "target",
+            ),
+        ]);
+        let occurrence = static_call(
+            &fixture_symbol("static_origin"),
+            &fixture_symbol("static_target"),
+            41,
+            44,
+        );
+        for (cap, base_rows, drops) in [(2, 2, 1), (3, 1, 0), (4, 1, 0)] {
+            let (mut store, spans) = EdgeStore::build_with_spans(&normalized, cap);
+            for edges in [
+                store
+                    .outgoing
+                    .get_mut(&graph_origin)
+                    .expect("base outgoing list"),
+                store
+                    .incoming
+                    .get_mut(&graph_target)
+                    .expect("base incoming list"),
+            ] {
+                edges.push(edges[0].clone());
+            }
+            let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+                .install()
+                .expect("trace");
+            store.add_static(&spans, std::slice::from_ref(&occurrence), &[], cap);
+            drop(recorder);
+            let counts = finalization_fields(&mut drain);
+            let expected = match cap {
+                2 => "no_new_rows",
+                3 => "full",
+                _ => "static_only",
+            };
+            assert_eq!(counts["mode"], expected);
+            assert_eq!(counts["graph_rows"], "2");
+            assert_eq!(counts["static_drops"], drops.to_string());
+            assert_eq!(store.outgoing(&graph_origin).len(), base_rows);
+            assert_eq!(store.incoming(&graph_target).len(), base_rows);
+            assert_eq!(store.dropped_edges(), drops);
+        }
+    }
+
+    #[test]
+    fn empty_static_input_records_zero_admission_without_changing_graph_rows() {
+        let normalized = graph(vec![definition(
+            "origin",
+            fixture_symbol("origin").as_str(),
+            "src/lib.rs",
+            (0, 20),
+        )]);
+        let (mut store, spans) = EdgeStore::build_with_spans(&normalized, 4);
+        let expected = EdgeStore::build_capped(&normalized, 4);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("trace");
+        store.add_static(&spans, &[], &[], 4);
+        drop(recorder);
+        let counts = finalization_fields(&mut drain);
+        assert_eq!(counts["mode"], "no_static_inputs");
+        assert_eq!(counts["static_admitted"], "0");
+        assert_eq!(counts["skipped_outgoing_rows"], "0");
+        assert_eq!(counts["skipped_incoming_rows"], "0");
+        assert_eq!(store, expected);
+    }
+
+    #[test]
+    fn too_many_base_endpoints_finalize_all_lists() {
+        let mut store = EdgeStore {
+            outgoing: std::collections::BTreeMap::new(),
+            incoming: std::collections::BTreeMap::new(),
+            dropped_edges: 0,
+            edge_modules: std::collections::BTreeMap::new(),
+        };
+        let target = fixture_symbol("base_target");
+        for index in 0..super::STATIC_FINALIZATION_BASE_KEYS_MAX {
+            let source = fixture_symbol(&format!("base_source_{index}"));
+            let edge = super::Edge {
+                from: source.clone(),
+                to: target.clone(),
+                kind: EdgeKind::Calls,
+                occurrence: binding("src/lib.rs", 5, 8),
+                static_callee: None,
+                derivation: rift_protocol::read::EdgeDerivation::Resolution,
+                from_graph: false,
+            };
+            store.outgoing.insert(source, vec![edge.clone()]);
+            store.incoming.entry(target.clone()).or_default().push(edge);
+        }
+        store
+            .incoming
+            .get_mut(&target)
+            .expect("base target")
+            .sort_by(super::edge_order);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("trace");
+        store.add_static(
+            &super::DefinitionSpans(std::collections::BTreeMap::new()),
+            &[static_call(
+                &fixture_symbol("static_origin"),
+                &fixture_symbol("static_target"),
+                41,
+                44,
+            )],
+            &[],
+            super::EDGES_MAX,
+        );
+        drop(recorder);
+        let counts = finalization_fields(&mut drain);
+        assert_eq!(counts["mode"], "full");
+        assert_eq!(counts["graph_incoming_lists"], "1");
+        assert_eq!(
+            counts["graph_outgoing_lists"],
+            super::STATIC_FINALIZATION_BASE_KEYS_MAX.to_string()
+        );
+        assert_eq!(counts["static_admitted"], "1");
+        assert_eq!(counts["skipped_outgoing_rows"], "0");
+        assert_eq!(counts["skipped_incoming_rows"], "0");
+        assert_eq!(
+            store.edges().count(),
+            super::STATIC_FINALIZATION_BASE_KEYS_MAX + 1
+        );
     }
 
     #[test]
