@@ -52,6 +52,17 @@ pub struct StaticMemberAlias {
     pub target: ByteRange,
 }
 
+/// A plain assignment that copies an authored `this` member to the same named member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMemberCopy {
+    /// Complete assignment expression.
+    pub assignment: ByteRange,
+    /// Member on the left of the assignment.
+    pub target: ByteRange,
+    /// Complete member expression on the right.
+    pub value: ByteRange,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -123,6 +134,11 @@ pub enum StaticBindingKind {
     },
     /// A local variable initialized directly by a constructor.
     JavaScriptInstance {
+        /// Constructor name.
+        constructor: ByteRange,
+    },
+    /// A lexical `const` initialized directly by a constructor.
+    JavaScriptConstInstance {
         /// Constructor name.
         constructor: ByteRange,
     },
@@ -370,6 +386,8 @@ pub struct StaticFactsParts {
     pub assignments: Vec<ByteRange>,
     /// Name and member targets of assignments whose value is a function written in place.
     pub function_writes: Vec<ByteRange>,
+    /// Plain assignments copying a member from `this`.
+    pub member_copies: Vec<StaticMemberCopy>,
     /// Declaration names whose written type is an array, with the named element type.
     pub element_types: Vec<(ByteRange, ByteRange)>,
     /// Declarations whose function writes an array return type, with the named element
@@ -575,6 +593,12 @@ impl StaticFacts {
         &self.0.function_writes
     }
 
+    /// Authored same-member copies in order of the assignment target.
+    #[must_use]
+    pub fn member_copies(&self) -> &[StaticMemberCopy] {
+        &self.0.member_copies
+    }
+
     /// Declaration names written with an array type, and the named element type.
     #[must_use]
     pub fn element_types(&self) -> &[(ByteRange, ByteRange)] {
@@ -685,6 +709,7 @@ impl StaticFacts {
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
             vector_capacity(&self.0.function_writes),
+            vector_capacity(&self.0.member_copies),
             vector_capacity(&self.0.element_types),
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
@@ -744,6 +769,7 @@ impl StaticFacts {
             self.reexports().len(),
             self.assignments().len(),
             self.function_writes().len(),
+            self.member_copies().len(),
             self.element_types().len(),
             self.element_returns().len(),
             self.object_members().len(),
@@ -853,6 +879,18 @@ impl StaticFacts {
             .chain(self.function_writes())
             .copied()
             .all(valid)
+            && self.member_copies().iter().all(|copy| {
+                valid(copy.assignment)
+                    && valid(copy.target)
+                    && valid(copy.value)
+                    && copy.assignment.start == copy.target.start
+                    && copy.assignment.end == copy.value.end
+                    && copy.target.end < copy.value.start
+            })
+            && self
+                .member_copies()
+                .windows(2)
+                .all(|pair| pair[0].target.start < pair[1].target.start)
             && self
                 .element_types()
                 .iter()
@@ -1010,6 +1048,7 @@ impl StaticBinding {
                 valid(module) && valid(export)
             }
             StaticBindingKind::JavaScriptInstance { constructor }
+            | StaticBindingKind::JavaScriptConstInstance { constructor }
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
             StaticBindingKind::PythonAnnotation { annotation }

@@ -2647,6 +2647,128 @@ export function replace(target: Replaced, handle: Handler) { target.handle = han
 }
 
 #[test]
+fn test_written_callable_field_copy_needs_the_complete_value_and_const_instance() {
+    let source = "
+export type Handler = (value: string) => string
+
+export class DirectCopy {
+  handle: Handler = value => value
+  clone() {
+    const clone = new DirectCopy()
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() { return this.handle('direct') }
+}
+
+export class ContinuedExpression {
+  handle: Handler = value => value
+  clone() {
+    const clone = new ContinuedExpression()
+    clone.handle = this.handle
+      .bind(this)
+    return clone
+  }
+  invoke() { return this.handle('continued') }
+}
+
+export class Parenthesized {
+  handle: Handler = value => value
+  clone() {
+    const clone = new Parenthesized()
+    clone.handle = (this.handle)
+    return clone
+  }
+  invoke() { return this.handle('wrapped') }
+}
+
+export class OtherField {
+  handle: Handler = value => value
+  other: Handler = value => value.toUpperCase()
+  clone() {
+    const clone = new OtherField()
+    clone.handle = this.other
+    return clone
+  }
+  invoke() { return this.handle('different') }
+}
+
+export class Rebound {
+  handle: Handler = value => value
+  clone(replacement: Rebound) {
+    let clone = new Rebound()
+    clone = replacement
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() { return this.handle('rebound') }
+}
+
+export class Method {
+  handle(value: string): string { return value }
+  clone() {
+    const clone = new Method()
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() { return this.handle('method') }
+}
+
+export class Unknown {
+  handle: unknown
+  clone() {
+    const clone = new Unknown()
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() {
+    if (typeof this.handle === 'function') return this.handle('unknown')
+  }
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for owner in [
+        "DirectCopy",
+        "ContinuedExpression",
+        "Parenthesized",
+        "OtherField",
+        "Rebound",
+        "Method",
+        "Unknown",
+    ] {
+        let caller = format!("main.ts/{owner}/invoke");
+        let field = format!("main.ts/{owner}/handle");
+        let occurrences = |kind| {
+            index
+                .edges()
+                .edges()
+                .filter(|edge| {
+                    edge.kind() == kind
+                        && edge.from().as_str().ends_with(&caller)
+                        && edge.to().as_str().ends_with(&field)
+                })
+                .map(|edge| {
+                    let range = edge.occurrence().range();
+                    let start = usize::try_from(range.start()).expect("start");
+                    let end = usize::try_from(range.end()).expect("end");
+                    &source[start..end]
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            occurrences(EdgeKind::Reads).contains(&"this.handle"),
+            "{owner} read"
+        );
+        let expected: &[_] = if owner == "DirectCopy" {
+            &["this.handle('direct')"]
+        } else {
+            &[]
+        };
+        assert_eq!(occurrences(EdgeKind::Calls), expected, "{owner} call");
+    }
+}
+
+#[test]
 fn test_type_assertions_on_initializers_type_their_locals() {
     // `const name = value as T` types `name` as `T`, as `const name: T = value` does; the
     // last assertion of a chain decides. A union or an assertion to no named type types

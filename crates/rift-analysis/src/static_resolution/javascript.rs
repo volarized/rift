@@ -481,7 +481,8 @@ impl<'source> Index<'source> {
                     symbol,
                 })
             }),
-            StaticBindingKind::JavaScriptInstance { .. } => file.target_at(binding.name),
+            StaticBindingKind::JavaScriptInstance { .. }
+            | StaticBindingKind::JavaScriptConstInstance { .. } => file.target_at(binding.name),
             StaticBindingKind::JavaScriptImport { module, export } => {
                 let name = match export {
                     Some(range) => file.text(range)?,
@@ -606,7 +607,8 @@ impl<'source> Index<'source> {
                 role,
                 work,
             ),
-            StaticBindingKind::JavaScriptInstance { constructor } => {
+            StaticBindingKind::JavaScriptInstance { constructor }
+            | StaticBindingKind::JavaScriptConstInstance { constructor } => {
                 let class = self.javascript_target(
                     file,
                     constructor,

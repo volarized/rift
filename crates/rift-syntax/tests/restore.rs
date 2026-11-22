@@ -3,9 +3,9 @@
 use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_syntax::{
-    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticFacts, StaticFactsParts,
-    StaticMemberAlias, SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames,
-    SyntaxSource,
+    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind, StaticFacts,
+    StaticFactsParts, StaticMemberAlias, StaticMemberCopy, SyntaxDocument, SyntaxFacts,
+    SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
 };
 
 fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
@@ -228,6 +228,97 @@ fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes()
     ] {
         assert_eq!(checked(source), None, "{source}");
     }
+}
+
+#[test]
+fn test_member_copy_checks_original_ranges_and_keeps_older_facts_unknown() {
+    let source = "class Owner {
+        handle = () => '';
+        copy() {
+            const clone = new Owner()
+            let mutable = new Owner()
+            clone.handle = this.handle
+            mutable.handle = this.handle
+                .bind(this)
+        }
+    }";
+    let document = parsed(ShippedLanguage::TypeScript, source);
+    let captured = parts(document.facts());
+    let facts = captured.static_facts.as_ref().expect("static facts");
+    let [copy] = facts.member_copies() else {
+        panic!("only the complete direct member copy");
+    };
+    let text = |range: ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    assert_eq!(text(copy.assignment), "clone.handle = this.handle");
+    assert_eq!(text(copy.target), "clone.handle");
+    assert_eq!(text(copy.value), "this.handle");
+    assert!(facts.bindings().iter().any(|binding| {
+        text(binding.name) == "clone"
+            && matches!(binding.kind, StaticBindingKind::JavaScriptConstInstance { constructor }
+                if text(constructor) == "Owner")
+    }));
+    assert!(facts.bindings().iter().any(|binding| {
+        text(binding.name) == "mutable"
+            && matches!(binding.kind, StaticBindingKind::JavaScriptInstance { constructor }
+                if text(constructor) == "Owner")
+    }));
+    let limits = SyntaxLimits::default();
+    let checked = SyntaxFacts::from_parts(source, limits, captured.clone()).expect("checked copy");
+    assert_eq!(checked.static_facts(), Some(facts));
+
+    let older = StaticFactsParts {
+        bindings: facts
+            .bindings()
+            .iter()
+            .map(|binding| {
+                let mut older = *binding;
+                if let StaticBindingKind::JavaScriptConstInstance { constructor } = older.kind {
+                    older.kind = StaticBindingKind::JavaScriptInstance { constructor };
+                }
+                older
+            })
+            .collect(),
+        assignments: facts.assignments().to_vec(),
+        members: facts.members().to_vec(),
+        ..StaticFactsParts::default()
+    };
+    let mut older_capture = captured.clone();
+    older_capture.static_facts = Some(
+        StaticFacts::from_parts(source, limits, older).expect("older facts without copy evidence"),
+    );
+    let older =
+        SyntaxFacts::from_parts(source, limits, older_capture).expect("checked older facts");
+    let older = older.static_facts().expect("older static facts");
+    assert!(older.member_copies().is_empty());
+    assert_eq!(older.assignments(), facts.assignments());
+    assert_eq!(older.members(), facts.members());
+
+    let partial = StaticFactsParts {
+        member_copies: vec![StaticMemberCopy {
+            value: ByteRange {
+                start: copy.value.start,
+                end: copy.value.end - 1,
+            },
+            ..*copy
+        }],
+        ..StaticFactsParts::default()
+    };
+    assert_eq!(
+        StaticFacts::from_parts(source, limits, partial).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_range_invalid::SLUG),
+    );
+    let excess = StaticFactsParts {
+        member_copies: vec![*copy; 2],
+        ..StaticFactsParts::default()
+    };
+    let limits = SyntaxLimits::new(source.len(), 1, 32).expect("positive limits");
+    assert_eq!(
+        StaticFacts::from_parts(source, limits, excess).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG),
+    );
 }
 
 fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
