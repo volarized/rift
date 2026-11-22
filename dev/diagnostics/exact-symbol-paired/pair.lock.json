@@ -1,0 +1,28 @@
+{
+  "repository": "volarized/rift",
+  "runner": "ubuntu-24.04",
+  "binary_version": "0.0.92",
+  "corpus_pin": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "corpus_paths_sha256": "8e7bf05a11d7feaadcdb3d02232e8306c44aebbe24d2cd575e72769c50abb9ec",
+  "baseline": {
+    "head": "1a3803a3356e13b12830d2d143f7687dc9116871",
+    "tree": "e3c2e485b1e8c0d90926519cbdd69dd431a732bf",
+    "run": 45064537826,
+    "job": 137337625491,
+    "artifact": 14770734348,
+    "bytes": 147944042,
+    "sha256": "adac923d6b256d46018d085cdc418006be5e04f6b8a3e68604b1e4fc6f80bee6",
+    "event": "push"
+  },
+  "candidate": {
+    "head": "6821039f2deac48c649084311009b75b352119ba",
+    "tree": "8a5127f672525bd7e258e2fdfe0cefc16df93b71",
+    "synthetic": "618dd20f0be99a96831a2ea7af77fe9158e69b52",
+    "run": 45071903643,
+    "job": 137360627450,
+    "artifact": 14773534156,
+    "bytes": 148017542,
+    "sha256": "102d71dc4f18e226ffab18c1901a276a535fd3e26afe971d0183f3ddfcaadd05",
+    "event": "pull_request"
+  }
+}
