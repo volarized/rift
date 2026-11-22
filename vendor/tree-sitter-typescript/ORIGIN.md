@@ -4,6 +4,8 @@ This crate is based on tree-sitter-typescript 0.21.1 at commit `35a3762218ca481c
 
 The local scanner also recognizes a line break before a generic signature when an object type expects another member. Type arguments within a member and less-than expressions continue to use their existing grammar rules.
 
+Both grammars also accept `export type * from` as a type-only re-export.
+
 `LICENSE` covers the TypeScript grammar and `LICENSE.tree-sitter-javascript` covers its JavaScript grammar input. Cargo builds both parsers from the checked-in C sources.
 
 ## Regenerate the parsers

@@ -146,26 +146,46 @@ fn every_exported_variable_declarator_retains_its_binding() {
 
 #[test]
 fn typescript_export_forms_keep_type_and_namespace_bindings() {
-    let text = "type Input = string;\nconst value = 1;\nexport { type Input as Options, value };\nexport type { Input as Config } from './types';\nexport * from './all';\nexport * as tools from './tools';\nexport interface Shape { size: number }\n";
+    let text = "type Input = string;\nconst value = 1;\nexport { type Input as Options, value };\nexport type { Input as Config } from './types';\nexport * from './all';\nexport type * from './type-all';\nexport * as tools from './tools';\nexport interface Shape { size: number }\n";
+    let path = rift_core::ProjectPath::new("index.ts").expect("fixture path");
     for dialect in [TypeScriptDialect::TypeScript, TypeScriptDialect::Tsx] {
-        let document = analyze(&TypeScriptSyntaxProvider::new(dialect), text);
+        let provider = TypeScriptSyntaxProvider::new(dialect);
+        let document = analyze(&provider, text);
+        assert!(!document.facts().has_errors());
         let bindings = document
             .facts()
             .export_bindings()
             .expect("recorded exports");
-        assert_eq!(bindings.len(), 6);
+        assert_eq!(bindings.len(), 7);
         assert_eq!(
             bindings
                 .iter()
                 .map(|binding| binding.type_only)
                 .collect::<Vec<_>>(),
-            [true, false, true, false, false, true]
+            [true, false, true, false, true, false, true]
         );
         assert_eq!(bindings[3].kind, SyntaxExportKind::All);
-        assert_eq!(bindings[4].kind, SyntaxExportKind::Namespace);
-        assert_eq!(token(text, bindings[4].exported), Some("tools"));
-        assert_eq!(token(text, bindings[4].source), Some("'./tools'"));
-        assert_eq!(token(text, bindings[5].exported), Some("Shape"));
+        assert_eq!(bindings[4].kind, SyntaxExportKind::All);
+        assert_eq!(token(text, bindings[4].source), Some("'./type-all'"));
+        assert_eq!(bindings[5].kind, SyntaxExportKind::Namespace);
+        assert_eq!(token(text, bindings[5].exported), Some("tools"));
+        assert_eq!(token(text, bindings[5].source), Some("'./tools'"));
+        assert_eq!(token(text, bindings[6].exported), Some("Shape"));
+        let malformed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "export type * from;\n",
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("malformed fixture source");
+        assert!(malformed.has_errors());
+        assert!(malformed.facts().export_bindings().is_none_or(|bindings| {
+            bindings
+                .iter()
+                .all(|binding| binding.kind != SyntaxExportKind::All || !binding.type_only)
+        }));
     }
 }
 

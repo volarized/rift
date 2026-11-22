@@ -4,7 +4,10 @@ use rift_core::{ReferenceRole, SourceRange, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
-use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, StaticBinding, StaticBindingKind, SyntaxExportBinding, SyntaxExportKind,
+    SyntaxSymbol,
+};
 
 use super::javascript::MemberMode;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
@@ -133,7 +136,7 @@ impl<'source> Index<'source> {
                     start: module.start + 1,
                     end: module.end - 1,
                 };
-                result.record(self.javascript_namespace_import(file, export.range, module, work));
+                result.record(self.javascript_reexport_module(file, export, module, work));
             }
         }
         for alias in file.facts.member_aliases() {
@@ -414,6 +417,29 @@ impl<'source> Index<'source> {
         )?;
         let imported = self.edge_javascript_module(&path)?;
         self.javascript_import_module_occurrence(file, range, imported, work)
+    }
+
+    fn javascript_reexport_module(
+        &self,
+        file: &File<'source>,
+        export: &SyntaxExportBinding,
+        module: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        if export.kind != SyntaxExportKind::All
+            || !export.type_only
+            || export.container.is_some()
+            || !file.document.path.as_str().ends_with(".d.ts")
+        {
+            return self.javascript_namespace_import(file, export.range, module, work);
+        }
+        let path = super::javascript_exports::relative_path(
+            file.document.path.as_str(),
+            file.text(module)?,
+            work,
+        )?;
+        let imported = super::javascript_exports::module_file(&self.files, &path, true)?;
+        self.javascript_import_module_occurrence(file, export.range, imported, work)
     }
 
     fn javascript_import_module_occurrence(
