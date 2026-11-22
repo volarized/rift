@@ -82,7 +82,7 @@ impl RustCallCapture {
             sources.push(Arc::clone(file.syntax_facts()));
             hash_field(&mut hasher, file.path().as_str().as_bytes());
             hasher.update(file.digest().as_bytes());
-            hash_field(&mut hasher, placement.unit().as_str().as_bytes());
+            hash_field(&mut hasher, placement.unit().to_string().as_bytes());
             hash_field(&mut hasher, placement.identity_path().as_bytes());
             hasher.update(syntax.symbols().len().to_be_bytes());
             for symbol in syntax.symbols() {
