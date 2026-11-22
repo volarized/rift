@@ -2584,6 +2584,69 @@ export class Untyped {
 }
 
 #[test]
+fn test_written_callable_fields_keep_their_call_and_read_after_assignment() {
+    let source = "export type Handler = (value: string) => number
+export class Owner {
+  readonly named: Handler
+  inline: (value: string) => number
+  constructor(handle: Handler) { this.named = handle; this.inline = handle }
+  invoke() { return this.named('named') + this.inline('inline') }
+}
+export class Patched {
+  leaf() { return 1 }
+  use() { return this.leaf() }
+  patch(value: () => number) { this.leaf = value }
+}
+export class Inferred {
+  handle = (value: string) => value.length
+  use() { return this.handle('inferred') }
+  patch(handle: Handler) { this.handle = handle }
+}
+export class Unknown {
+  handle: unknown
+  constructor(handle: unknown) { this.handle = handle }
+  use() {
+    if (typeof this.handle === 'function') return this.handle('unknown')
+  }
+}
+export class Replaced {
+  handle: Handler
+  constructor(handle: Handler) { this.handle = handle }
+  use() { return this.handle('written') }
+}
+export function replace(target: Replaced, handle: Handler) { target.handle = handle }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for field in ["named", "inline"] {
+        let target = format!("main.ts/Owner/{field}");
+        let callee = format!("this.{field}");
+        let call = format!("{callee}('{field}')");
+        for (kind, expected) in [(EdgeKind::Calls, &call), (EdgeKind::Reads, &callee)] {
+            let mut edges = index.edges().edges().filter(|edge| {
+                edge.kind() == kind
+                    && edge.from().as_str().ends_with("main.ts/Owner/invoke")
+                    && edge.to().as_str().ends_with(&target)
+            });
+            let edge = edges.next().unwrap_or_else(|| panic!("{kind:?} {target}"));
+            let range = edge.occurrence().range();
+            let start = usize::try_from(range.start()).expect("start");
+            let end = usize::try_from(range.end()).expect("end");
+            assert_eq!(&source[start..end], expected);
+            assert!(edges.next().is_none());
+        }
+    }
+    for name in ["Patched", "Inferred", "Unknown", "Replaced"] {
+        let owner = format!("main.ts/{name}/use");
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(&owner)
+            }),
+            "{owner}"
+        );
+    }
+}
+
+#[test]
 fn test_type_assertions_on_initializers_type_their_locals() {
     // `const name = value as T` types `name` as `T`, as `const name: T = value` does; the
     // last assertion of a chain decides. A union or an assertion to no named type types

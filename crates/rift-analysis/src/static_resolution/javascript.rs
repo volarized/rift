@@ -363,7 +363,7 @@ impl<'source> Index<'source> {
     /// declaration whose own shape is the signature: a function or constructor type alias,
     /// or an interface with a call or construct signature. The call then targets the
     /// binding itself; no function body is chosen for it.
-    fn javascript_declared_signature(
+    pub(super) fn javascript_declared_signature(
         &self,
         target: Target<'source>,
         constructs: bool,

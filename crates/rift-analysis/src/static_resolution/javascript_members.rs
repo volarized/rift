@@ -362,14 +362,6 @@ impl<'source> Index<'source> {
                 continue;
             }
             let file = self.files.get(class.file.path.as_str())?;
-            if role == ReferenceRole::Call
-                && class.symbol.kind != "interface"
-                && self.javascript_member_replaced(file, class, member, work)
-            {
-                // A call to the written member itself has no target.
-                tail?;
-                replaced = true;
-            }
             let target = file.javascript_declared_member(
                 &format!("{}.{}", class.symbol.qualified_name, member),
                 class.symbol.range,
@@ -377,6 +369,16 @@ impl<'source> Index<'source> {
                 role,
                 work,
             );
+            if role == ReferenceRole::Call && class.symbol.kind != "interface" {
+                let field = target.filter(|target| {
+                    tail.is_none()
+                        && target.symbol.syntax_element_kind == Some("public_field_definition")
+                });
+                if self.javascript_member_replaced(file, class, member, field, work) {
+                    tail?;
+                    replaced = true;
+                }
+            }
             match target {
                 // A member assigned through `this` names the declaration an ancestor
                 // makes when one resolves (D46); otherwise it is the class's own facet.
@@ -434,6 +436,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         class: Target<'source>,
         member: &str,
+        field: Option<Target<'source>>,
         work: &mut Work,
     ) -> bool {
         for &(start, target) in &file.assignments.member_writes {
@@ -465,9 +468,19 @@ impl<'source> Index<'source> {
             {
                 continue;
             }
-            if self.javascript_receiver_denotes(file, class, receiver, start, work) {
-                return true;
+            if !self.javascript_receiver_denotes(file, class, receiver, start, work) {
+                continue;
             }
+            // A write through `this` changes the field's value. Its written signature
+            // still establishes that a direct call names the declared field.
+            if property == member
+                && !matches!(property, "constructor" | "prototype")
+                && receiver.trim() == "this"
+                && field.is_some_and(|field| self.javascript_declared_signature(field, false, work))
+            {
+                continue;
+            }
+            return true;
         }
         false
     }
