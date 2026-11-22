@@ -1988,7 +1988,7 @@ pub(crate) fn analyze_included(
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
     };
-    let assignments = commonjs::record(
+    let (assignments, commonjs_export) = commonjs::record(
         tree.root_node(),
         source,
         limits,
@@ -2008,6 +2008,12 @@ pub(crate) fn analyze_included(
             crate::static_analysis::Capture::for_javascript(source.text)
         }
     });
+    if let Some(capture) = &mut capture
+        && !recovered
+        && !tree.root_node().has_error()
+    {
+        capture.record_commonjs_export(commonjs_export);
+    }
     let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),
         source,

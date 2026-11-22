@@ -306,11 +306,24 @@ pub struct StaticMemberCallback {
     pub intersection: Option<ByteRange>,
 }
 
+/// A direct CommonJS default write whose wrapper uses were checked in the same file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticCommonJsExport {
+    /// The complete `module.exports = name` assignment.
+    pub assignment: ByteRange,
+    /// The surrounding assignment also updates the original `exports` binding.
+    pub synchronized: bool,
+    /// Binding names that the exports use and direct module declarations initialize.
+    pub initialized: Vec<ByteRange>,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
     /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
     pub javascript_module_syntax: bool,
+    /// The single direct default write in a file with closed CommonJS wrapper uses.
+    pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
     /// Receiver and property spans for member expressions.
@@ -403,6 +416,12 @@ impl StaticFacts {
     #[must_use]
     pub fn has_javascript_module_syntax(&self) -> bool {
         self.0.javascript_module_syntax
+    }
+
+    /// The direct default write, if the CommonJS wrapper remains closed.
+    #[must_use]
+    pub const fn commonjs_export(&self) -> Option<&StaticCommonJsExport> {
+        self.0.commonjs_export.as_ref()
     }
 
     /// Captured value accesses and type references.
@@ -642,6 +661,8 @@ impl StaticFacts {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         [
+            self.commonjs_export()
+                .map_or(0, |export| vector_capacity(&export.initialized)),
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
             vector_capacity(&self.0.member_aliases),
@@ -699,6 +720,8 @@ impl StaticFacts {
 
     fn validate_counts(&self, limits: &SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
+            self.commonjs_export()
+                .map_or(0, |export| export.initialized.len()),
             self.references().len(),
             self.members().len(),
             self.member_aliases().len(),
@@ -858,6 +881,13 @@ impl StaticFacts {
                 .zip(end)
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
+        if self.commonjs_export().is_some_and(|export| {
+            !valid(export.assignment)
+                || !export.initialized.iter().copied().all(valid)
+                || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
+        }) {
+            return errors::syntax::facts_range_invalid().fail();
+        }
         let edges = self.heritage_edges().iter().all(|edge| {
             valid(edge.from)
                 && valid(edge.target)
@@ -1110,6 +1140,10 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn finish(self) -> StaticFacts {
         self.facts
+    }
+
+    pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {
+        self.facts.0.commonjs_export = export;
     }
 }
 

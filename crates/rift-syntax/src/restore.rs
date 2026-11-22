@@ -10,7 +10,8 @@ use rift_protocol::read::Language;
 
 use crate::{
     ByteRange, MarkdownBlockFact, MarkdownHeadingFact, MarkdownLinkFact,
-    MarkdownReferenceCandidate, ShippedLanguage, SyntaxFacts, SyntaxLimits, SyntaxSymbol,
+    MarkdownReferenceCandidate, ShippedLanguage, SyntaxExportKind, SyntaxFacts, SyntaxLimits,
+    SyntaxSymbol,
 };
 
 /// Every field needed to reconstruct normalized per-file facts.
@@ -847,6 +848,19 @@ impl SyntaxFacts {
             }
             facts.validate(source, limits)?;
             validate_member_aliases(&parts, facts.member_aliases())?;
+            if let Some(export) = facts.commonjs_export()
+                && (parts.has_errors
+                    || !matches!(parts.language.name.as_str(), "javascript" | "typescript")
+                    || !parts.export_bindings.iter().flatten().any(|binding| {
+                        binding.kind == SyntaxExportKind::Default
+                            && binding.range == export.assignment
+                            && binding.container.is_none()
+                            && binding.source.is_none()
+                            && binding.local.is_some()
+                    }))
+            {
+                return errors::syntax::facts_structure_invalid().fail();
+            }
         }
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {

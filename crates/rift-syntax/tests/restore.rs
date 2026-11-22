@@ -122,6 +122,24 @@ exports.response = res;
         &source
             [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
     };
+    let witness = checked
+        .static_facts()
+        .and_then(rift_syntax::StaticFacts::commonjs_export)
+        .expect("closed synchronized write");
+    assert!(witness.synchronized);
+    assert_eq!(text(witness.assignment), "module.exports = create");
+    assert_eq!(
+        witness
+            .initialized
+            .iter()
+            .copied()
+            .map(text)
+            .collect::<Vec<_>>(),
+        ["req", "res", "create"]
+    );
+    let mut removed = parts(&checked);
+    removed.export_bindings = Some(Vec::new());
+    assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), removed).is_err());
     assert_eq!(
         bindings
             .iter()
@@ -182,6 +200,34 @@ exports.response = res;
             .len(),
         2
     );
+}
+
+#[test]
+fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes() {
+    let target = "var root = {}; module.exports = root;";
+    let checked = |source: &str| {
+        let document = parsed(ShippedLanguage::JavaScript, source);
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("checked export capture")
+            .static_facts()
+            .and_then(rift_syntax::StaticFacts::commonjs_export)
+            .cloned()
+    };
+    let witness = checked(target).expect("closed direct default write");
+    assert!(!witness.synchronized);
+    assert_eq!(
+        &target[usize::try_from(witness.assignment.start).expect("start")
+            ..usize::try_from(witness.assignment.end).expect("end")],
+        "module.exports = root"
+    );
+    for source in [
+        "var root = {}; if (flag) module.exports = root;",
+        "var root = {}; module.exports = root; getAlias(module);",
+        "var root = {}; module.exports = root; module.exports = other;",
+        r"var root = {}; module.exports = root; \u006dodule.exports = other;",
+    ] {
+        assert_eq!(checked(source), None, "{source}");
+    }
 }
 
 fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {

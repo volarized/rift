@@ -1,5 +1,8 @@
 use super::{EcmaScriptGrammarField, EcmaScriptKinds, ExportTarget, named_children};
-use crate::{SyntaxExportBinding, SyntaxExportKind, SyntaxLimits, SyntaxSource, extract};
+use crate::{
+    StaticCommonJsExport, SyntaxExportBinding, SyntaxExportKind, SyntaxLimits, SyntaxSource,
+    extract,
+};
 use rift_error::{RiftError, errors};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
@@ -10,12 +13,13 @@ pub(super) fn record<'tree>(
     limits: SyntaxLimits,
     kinds: &EcmaScriptKinds,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
-) -> Result<Vec<Node<'tree>>, RiftError> {
+) -> Result<(Vec<Node<'tree>>, Option<StaticCommonJsExport>), RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut blocked = BTreeSet::new();
     // Scope of each `module.exports = value`, with the end of its last write there.
     let mut replaced: BTreeMap<usize, usize> = BTreeMap::new();
     let mut synchronized = None;
+    let mut direct_default = None;
     let mut assignments = Vec::new();
     let mut visited = 0_usize;
     let mut cursor = root.walk();
@@ -57,6 +61,12 @@ pub(super) fn record<'tree>(
             {
                 let end = replaced.entry(scope.id()).or_default();
                 *end = (*end).max(syntax_element.end_byte());
+                if syntax_element.parent().is_some_and(|statement| {
+                    statement.kind_id() == kinds.expression_statement
+                        && statement.parent() == Some(root)
+                }) {
+                    direct_default = Some(syntax_element);
+                }
             }
         }
         if visited
@@ -75,7 +85,7 @@ pub(super) fn record<'tree>(
     }
     let synchronized = synchronized.and_then(|(outer, inner)| {
         if !blocked.contains(&root.id())
-            && closed_wrapper_uses(root, outer, inner, source.text, kinds)
+            && closed_wrapper_uses(root, Some(outer), inner, source.text, kinds)
         {
             Some(inner)
         } else {
@@ -83,6 +93,7 @@ pub(super) fn record<'tree>(
             None
         }
     });
+    let mut closed_export = None;
     let synchronized_scope = synchronized.map(|inner| (root.id(), inner.end_byte()));
     for &syntax_element in &assignments {
         if synchronized != Some(syntax_element) && !module_execution(syntax_element, &blocked) {
@@ -96,9 +107,78 @@ pub(super) fn record<'tree>(
         {
             continue;
         }
+        if binding.kind == SyntaxExportKind::Default
+            && binding.local.is_some()
+            && kinds
+                .child(syntax_element, EcmaScriptGrammarField::Right)
+                .is_some_and(|value| value.kind_id() == kinds.identifier)
+            && (synchronized == Some(syntax_element)
+                || (direct_default == Some(syntax_element)
+                    && closed_wrapper_uses(root, None, syntax_element, source.text, kinds)))
+        {
+            closed_export = Some((binding.range, synchronized == Some(syntax_element)));
+        }
         bindings.insert(syntax_element.id(), binding);
     }
-    Ok(assignments)
+    let closed_export = if let Some((assignment, synchronized)) = closed_export {
+        Some(StaticCommonJsExport {
+            assignment,
+            synchronized,
+            initialized: initialized_exports(root, source.text, kinds, bindings)?,
+        })
+    } else {
+        None
+    };
+    Ok((assignments, closed_export))
+}
+
+/// Finds the authored bindings that supply these exports directly from the module body.
+fn initialized_exports(
+    root: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+    bindings: &BTreeMap<usize, SyntaxExportBinding>,
+) -> Result<Vec<crate::ByteRange>, RiftError> {
+    let exported = bindings
+        .values()
+        .filter(|binding| binding.container.is_none() && binding.source.is_none())
+        .filter_map(|binding| {
+            let range = binding.local?;
+            source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut initialized = Vec::new();
+    let mut record = |declaration| -> Result<(), RiftError> {
+        if let Some(name) = kinds.child(declaration, EcmaScriptGrammarField::Name)
+            && name.kind_id() == kinds.identifier
+            && source
+                .get(name.byte_range())
+                .is_some_and(|name| exported.contains(name))
+        {
+            initialized.push(extract::byte_range(name)?);
+        }
+        Ok(())
+    };
+    // The main capture walk bounded this tree. Only direct children can run
+    // unconditionally in the module, regardless of their lexical hoisting scope.
+    for statement in named_children(root) {
+        match statement.kind() {
+            "function_declaration" => record(statement)?,
+            "variable_declaration" | "lexical_declaration" => {
+                for declaration in named_children(statement) {
+                    if declaration.kind_id() == kinds.variable_declarator
+                        && kinds
+                            .child(declaration, EcmaScriptGrammarField::Value)
+                            .is_some()
+                    {
+                        record(declaration)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(initialized)
 }
 
 /// Inner write of one unconditional `exports = module.exports = name` statement.
@@ -135,12 +215,12 @@ fn synchronization<'tree>(
 /// The wrapper names stay inside the synchronized writes and direct root export writes.
 fn closed_wrapper_uses(
     root: Node<'_>,
-    outer: Node<'_>,
+    outer: Option<Node<'_>>,
     inner: Node<'_>,
     source: &str,
     kinds: &EcmaScriptKinds,
 ) -> bool {
-    let outer_left = kinds.child(outer, EcmaScriptGrammarField::Left);
+    let outer_left = outer.and_then(|outer| kinds.child(outer, EcmaScriptGrammarField::Left));
     let module = kinds
         .child(inner, EcmaScriptGrammarField::Left)
         .and_then(|left| kinds.child(left, EcmaScriptGrammarField::Object));
@@ -153,13 +233,13 @@ fn closed_wrapper_uses(
             "identifier"
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
-        ) && matches!(
-            source.get(node.byte_range()),
-            Some("module" | "exports" | "eval")
-        ) && Some(node) != outer_left
-            && Some(node) != module
-            && !direct_exports_write(node, root, source, kinds)
-        {
+        ) && source.get(node.byte_range()).is_some_and(|name| {
+            name.contains('\\')
+                || (matches!(name, "module" | "exports" | "eval")
+                    && Some(node) != outer_left
+                    && Some(node) != module
+                    && !(outer.is_some() && direct_exports_write(node, root, source, kinds)))
+        }) {
             return false;
         }
         extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
