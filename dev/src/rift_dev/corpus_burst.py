@@ -45,8 +45,9 @@ def connection(root: Path) -> sqlite3.Connection:
     return db
 
 
-def source_paths(root: Path) -> list[str]:
+def source_paths(root: Path, file_count: int) -> list[str]:
     """Spread the formatting edits over tracked TypeScript files admitted to storage."""
+    require(file_count in (1, FILE_COUNT), "unsupported Bun edit file count")
     tracked = git(root, "ls-files", "-z", "--", "*.ts").output_bytes()
     with closing(connection(root)) as db:
         admitted = {
@@ -64,7 +65,7 @@ def source_paths(root: Path) -> list[str]:
     ]
     require(MARKER_PATH in regular, "marker file is missing from the pinned index")
     regular.remove(MARKER_PATH)
-    count = FILE_COUNT - 1
+    count = file_count - 1
     require(len(regular) >= count, "too few indexed TypeScript files")
     return [regular[i * len(regular) // count] for i in range(count)] + [MARKER_PATH]
 
@@ -177,15 +178,18 @@ def publication_report(log: str, revision: str, written: datetime) -> JsonObject
     }
 
 
-async def run_burst(server: Server, client: Client, record: Record) -> None:
+async def run_burst(
+    server: Server, client: Client, record: Record, file_count: int, launched: float
+) -> None:
     root = server.root
     before_map = await client.resource("rift://map")
     initial = before_map["revision"]
     require(isinstance(initial, str), "map has no tree revision")
-    await wait_files(server, {}, str(initial))
-    paths = source_paths(root)
+    lexical_ready, _ = await wait_files(server, {}, str(initial))
+    record("burst_lexical_ready", seconds=lexical_ready - launched, revision=initial)
+    paths = source_paths(root, file_count)
     original = {name: (root / name).read_bytes() for name in paths}
-    marker, body, symbol = declaration("bun", FILE_COUNT)
+    marker, body, symbol = declaration("bun", file_count)
     changed = {
         name: changed_source(name, content, body) for name, content in original.items()
     }
@@ -206,6 +210,7 @@ async def run_burst(server: Server, client: Client, record: Record) -> None:
         for name, content in changed.items():
             (root / name).write_bytes(content)
         write_seconds = time.perf_counter() - started
+        record("burst_write", written_at=written.isoformat(), seconds=write_seconds)
         async with asyncio.TaskGroup() as group:
             files = group.create_task(wait_files(server, after))
             publication = group.create_task(
@@ -221,7 +226,7 @@ async def run_burst(server: Server, client: Client, record: Record) -> None:
             while True:
                 persisted_at_start = files.done()
                 try:
-                    answer = await read_edit(client, symbol, marker, FILE_COUNT)
+                    answer = await read_edit(client, symbol, marker, file_count)
                 except ToolFailure as failure:
                     if (
                         failure.identity != "rift.server.read_symbol_not_found"
@@ -240,7 +245,7 @@ async def run_burst(server: Server, client: Client, record: Record) -> None:
                     if not persisted_at_start:
                         # The first read can finish before all digests commit. An
                         # independent current read confirms the complete revision.
-                        confirmed = await read_edit(client, symbol, marker, FILE_COUNT)
+                        confirmed = await read_edit(client, symbol, marker, file_count)
                         if confirmed["revision"] != answer["revision"]:
                             continue
                     break

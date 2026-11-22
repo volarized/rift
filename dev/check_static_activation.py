@@ -1,4 +1,4 @@
-"""Measure static adjacency finalization for one restored Bun burst on Linux."""
+"""Compare two static adjacency executables with restored Bun edits on Linux."""
 
 from __future__ import annotations
 
@@ -9,17 +9,25 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import psutil
-from check_burst_pair import run
+from check_burst_pair import VARIANTS, EditCase, run
+from rift_dev.corpus_burst import FILE_COUNT
+from rift_dev.corpus_cache import pins
 
 DECISION = "EdgeStore::finalize_static_adjacency"
 PROJECT = "WorkspaceSemantics::build_project_facts"
 
 
-def summarize(burst: dict, lines: Iterable[bytes]) -> dict:
+def summarize(
+    burst: dict,
+    lines: Iterable[bytes],
+    file_count: int = FILE_COUNT,
+    *,
+    decision_required: bool = True,
+) -> dict:
     revision = burst["settled"]["revision"]
     [match] = [p for p in burst["publications"] if p["revision"] == revision]
-    if int(match["changed_count"]) != 50:
-        raise ValueError("final publication did not contain the 50 changed paths")
+    if int(match["changed_count"]) != file_count:
+        raise ValueError("final publication did not contain the changed paths")
     publications, projects, decisions = [], [], []
     for line in lines:
         if not any(
@@ -57,7 +65,7 @@ def summarize(burst: dict, lines: Iterable[bytes]) -> dict:
         if dict(span["resource"])["service.instance.id"] == instance
         and start <= span["start_time_unix_nano"] < span["end_time_unix_nano"] <= end
     ]
-    [decision] = [
+    matched_decisions = [
         event
         for event in decisions
         if dict(event["resource"])["service.instance.id"] == instance
@@ -65,7 +73,23 @@ def summarize(burst: dict, lines: Iterable[bytes]) -> dict:
         <= event["time_unix_nano"]
         <= project["end_time_unix_nano"]
         and (not event.get("trace_id") or event["trace_id"] == project["trace_id"])
+        and (not event.get("span_id") or event["span_id"] == project["span_id"])
     ]
+    publication_fact = {
+        "epoch": match["epoch"],
+        "revision": revision,
+        "project_facts_seconds": (
+            project["end_time_unix_nano"] - project["start_time_unix_nano"]
+        )
+        / 1e9,
+    }
+    if not decision_required:
+        if matched_decisions:
+            raise ValueError(
+                "the control unexpectedly recorded a finalization decision"
+            )
+        return {**publication_fact, "mode": "unreported"}
+    [decision] = matched_decisions
     attrs = dict(decision["attributes"])
     mode = attrs["mode"]
     keys = [
@@ -137,32 +161,48 @@ def summarize(burst: dict, lines: Iterable[bytes]) -> dict:
     ):
         raise ValueError("fallback reported skipped rows")
     return {
-        "epoch": match["epoch"],
-        "revision": revision,
+        **publication_fact,
         "mode": mode,
         "fallback_reasons": reasons,
         "counts": counts,
-        "project_facts_seconds": (
-            project["end_time_unix_nano"] - project["start_time_unix_nano"]
-        )
-        / 1e9,
     }
 
 
 def main() -> None:
-    binary, output = (Path(value).resolve(strict=True) for value in sys.argv[1:])
+    baseline, candidate, output = (
+        Path(value).resolve(strict=True) for value in sys.argv[1:]
+    )
+    binaries = {"base": baseline, "candidate": candidate}
     allowed = sorted(psutil.Process().cpu_affinity())
     if len(allowed) < 4:
-        raise RuntimeError("the burst requires four available logical CPUs")
-    sample = output / "candidate"
-    measurement = run(binary, sample, ",".join(str(cpu) for cpu in allowed[:2]))
-    measurement.pop("input")
-    report = json.loads((sample / "burst.json").read_bytes())
-    [burst] = [row for row in report["actions"] if row["action"] == "burst"]
-    with gzip.open(sample / "burst.telemetry/telemetry.jsonl.gz", "rb") as records:
-        result = {**summarize(burst, records), **measurement}
-    (output / "activation.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result), flush=True)
+        raise RuntimeError("the comparison requires four available logical CPUs")
+    if pins()["bun"].seconds != 540:
+        raise ValueError("the comparison requires the pinned 540-second case limit")
+    cpus = ",".join(str(cpu) for cpu in allowed[:2])
+    cases: tuple[EditCase, ...] = ("burst", "single-edit")
+    results = {}
+    for case in cases:
+        expected = None
+        file_count = FILE_COUNT if case == "burst" else 1
+        for slot, label in enumerate(VARIANTS, 1):
+            sample = output / f"{case}-{slot}-{label}"
+            measurement = run(binaries[label], sample, cpus, case)
+            fact = (measurement.pop("input"), measurement.pop("result"))
+            if expected is None:
+                expected = fact
+            elif fact != expected:
+                raise ValueError(f"{sample.name} differs in input or restored results")
+            report = json.loads((sample / "burst.json").read_bytes())
+            [burst] = [row for row in report["actions"] if row["action"] == "burst"]
+            with gzip.open(
+                sample / "burst.telemetry/telemetry.jsonl.gz", "rb"
+            ) as records:
+                finalization = summarize(
+                    burst, records, file_count, decision_required=label == "candidate"
+                )
+            results[sample.name] = {**measurement, **finalization}
+            (output / "pair.json").write_text(json.dumps(results, indent=2) + "\n")
+            print(sample.name, json.dumps(results[sample.name]), flush=True)
 
 
 if __name__ == "__main__":

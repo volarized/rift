@@ -10,9 +10,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
 import psutil
+from rift_dev.corpus_burst import FILE_COUNT, MARKER_PATH
 from rift_dev.corpus_cache import pins
+
+EditCase = Literal["burst", "single-edit"]
+VARIANTS = ("base", "candidate", "candidate", "base")
 
 
 def resource_sample(scratch: Path) -> dict[str, int | float]:
@@ -57,7 +62,7 @@ def stop(process: subprocess.Popen[bytes]) -> None:
             process.wait()
 
 
-def run(binary: Path, output: Path, cpus: str) -> dict:
+def run(binary: Path, output: Path, cpus: str, case: EditCase = "burst") -> dict:
     output.mkdir()
     scratch = Path(os.environ["RUNNER_TEMP"]) / "rift-burst-work" / output.name
     scratch.mkdir(parents=True)
@@ -89,7 +94,7 @@ def run(binary: Path, output: Path, cpus: str) -> dict:
             "--binary",
             str(binary),
             "--case",
-            "burst",
+            case,
             "--report",
             str(report),
         ]
@@ -122,7 +127,7 @@ def run(binary: Path, output: Path, cpus: str) -> dict:
     result = json.loads(report.read_bytes())
     if (result["commit"], result["case"], result["status"]) != (
         pins()["bun"].commit,
-        "burst",
+        case,
         "passed",
     ):
         raise ValueError("unexpected corpus revision, case or outcome")
@@ -130,8 +135,16 @@ def run(binary: Path, output: Path, cpus: str) -> dict:
     inputs, burst, restored = (
         records[key] for key in ("burst_inputs", "burst", "burst_restore")
     )
+    file_count = FILE_COUNT if case == "burst" else 1
     if (
-        len(inputs["original_sha256"]) != 50
+        len(inputs["original_sha256"]) != file_count
+        or inputs["original_sha256"].keys() != inputs["changed_sha256"].keys()
+        or MARKER_PATH not in inputs["original_sha256"]
+        or any(
+            digest == inputs["changed_sha256"][path]
+            for path, digest in inputs["original_sha256"].items()
+        )
+        or burst["files"] != file_count
         or inputs["initial"] != restored["restored"]
         or inputs["original_sha256"] != restored["disk_sha256"]
         or not restored["map_equal"]
@@ -141,10 +154,20 @@ def run(binary: Path, output: Path, cpus: str) -> dict:
         "input": {
             key: inputs[key] for key in ("original_sha256", "changed_sha256", "initial")
         },
+        "result": {
+            "settled": burst["settled"],
+            "facets_revision": burst["facets"]["revision"],
+            "facets_warnings": burst["facets"]["warnings"],
+            "restored": restored["restored"],
+        },
         "publication_seconds": burst["final_matching_publication_seconds"],
         "facets_seconds": burst["facets_seconds"],
         "digests_seconds": burst["all_digests_seconds"],
         "write_seconds": burst["write_seconds"],
+        "startup_publication_observed_seconds": records["burst_startup"][
+            "publication_observed_seconds"
+        ],
+        "cold_lexical_observed_seconds": records["burst_lexical_ready"]["seconds"],
     }
 
 
@@ -158,17 +181,10 @@ def main() -> None:
     cpus = ",".join(str(cpu) for cpu in allowed[:2])
     results = {}
     expected = None
-    for slot, (label, binary) in enumerate(
-        [
-            ("base", baseline),
-            ("candidate", candidate),
-            ("candidate", candidate),
-            ("base", baseline),
-        ],
-        1,
-    ):
+    binaries = {"base": baseline, "candidate": candidate}
+    for slot, label in enumerate(VARIANTS, 1):
         name = f"{slot}-{label}"
-        measurement = run(binary, output / name, cpus)
+        measurement = run(binaries[label], output / name, cpus)
         inputs = measurement.pop("input")
         if expected is None:
             expected = inputs
