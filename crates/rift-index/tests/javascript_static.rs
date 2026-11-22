@@ -1087,6 +1087,109 @@ export type Shadow<Direct> = Direct;
 }
 
 #[test]
+fn test_typescript_type_star_reexports_keep_the_written_modules_and_selected_type() {
+    let star = "export type * from './leaf';";
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            (
+                "main.d.ts",
+                "import type { Item } from './barrel'; export type Selected = Item;",
+            ),
+            ("barrel.d.ts", star),
+            ("leaf.d.ts", "export type Item = string;"),
+        ],
+        module_manifest(),
+    );
+    for (kind, from, to) in [
+        (EdgeKind::Imports, "main.d.ts", "barrel.d.ts"),
+        (EdgeKind::Imports, "main.d.ts", "leaf.d.ts/Item"),
+        (EdgeKind::HasType, "main.d.ts/Selected", "leaf.d.ts/Item"),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{kind:?} {from} {to}");
+    }
+    let written = index
+        .edges()
+        .edges()
+        .find(|edge| {
+            edge.kind() == EdgeKind::Imports
+                && edge.from().as_str().ends_with("barrel.d.ts")
+                && edge.to().as_str().ends_with("leaf.d.ts")
+        })
+        .expect("written type-only star module edge");
+    assert_eq!(written.occurrence().unit().key().as_str(), "barrel.d.ts");
+    assert_eq!(written.occurrence().range().start(), 0);
+    assert_eq!(
+        written.occurrence().range().end(),
+        u64::try_from(star.len()).expect("source length")
+    );
+}
+
+#[test]
+fn test_typescript_type_star_reexports_refuse_value_lookup_and_unresolved_members() {
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            (
+                "main.ts",
+                "import { run as ordinary } from './plain.ts'; import { run as typed } from './typed.ts'; import { tools } from './namespace.ts'; export function keep() { ordinary(); tools.run(); } export function refuse() { typed(); }",
+            ),
+            ("runtime.ts", "export function run() {}"),
+            ("plain.ts", "export * from './runtime.ts';"),
+            ("namespace.ts", "export * as tools from './runtime.ts';"),
+            ("typed.ts", "export type * from './runtime.ts';"),
+            (
+                "unknown.d.ts",
+                "import type { Item } from './ambiguous'; import type { Absent } from './cycle-a'; import type { Kept } from './shadow'; export type Ambiguous = Item; export type Cyclic = Absent; export type Shadowed = Kept;",
+            ),
+            (
+                "shadow.d.ts",
+                "export type * from './other'; export type Kept = string;",
+            ),
+            ("other.d.ts", "export type Kept = number;"),
+            (
+                "ambiguous.d.ts",
+                "export type * from './first'; export type * from './second';",
+            ),
+            ("first.d.ts", "export type Item = string;"),
+            ("second.d.ts", "export type Item = number;"),
+            ("cycle-a.d.ts", "export type * from './cycle-b';"),
+            ("cycle-b.d.ts", "export type * from './cycle-a';"),
+        ],
+        module_manifest(),
+    );
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| {
+                edge.kind() == EdgeKind::Calls
+                    && edge.from().as_str().ends_with("main.ts/keep")
+                    && edge.to().as_str().ends_with("runtime.ts/run")
+            })
+            .count(),
+        2
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::HasType,
+        "unknown.d.ts/Shadowed",
+        "shadow.d.ts/Kept"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::HasType,
+        "unknown.d.ts/Shadowed",
+        "other.d.ts/Kept"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        (edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.ts/refuse"))
+            || (edge.kind() == EdgeKind::HasType
+                && ["unknown.d.ts/Ambiguous", "unknown.d.ts/Cyclic"]
+                    .iter()
+                    .any(|owner| edge.from().as_str().ends_with(owner)))
+    }));
+}
+
+#[test]
 fn test_typescript_function_value_keeps_its_identity_through_a_body_error() {
     // The grammar reads `global` as a keyword: its use as a value is a parse error
     // inside the arrow body. The variable is still named by its own header.
