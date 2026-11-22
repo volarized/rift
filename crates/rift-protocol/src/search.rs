@@ -890,8 +890,7 @@ pub struct SearchTraversal {
     /// The declaration the walk starts at. The seed itself is never a hit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<SymbolId>,
-    /// Which edges the walk follows from each visited symbol: `incoming` reaches the
-    /// declarations referencing it, `outgoing` the declarations it calls. Omitted, `incoming`.
+    /// The direction the walk follows from each visited symbol. Omitted, `incoming`.
     #[serde(default = "default_search_traversal_direction")]
     pub direction: TraversalDirection,
     /// Portable edge kinds eligible for the walk. Omitted or empty, every kind is
@@ -918,20 +917,19 @@ fn default_search_traversal_depth() -> u64 {
     SEARCH_TRAVERSAL_DEPTH_DEFAULT
 }
 
-/// Which edge direction a search traversal walks from each visited symbol. A language
-/// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
-/// `outgoing`.
+/// The direction a traversal follows from each visited symbol. All stored edge kinds are
+/// eligible when `kinds` is empty or omitted.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TraversalDirection {
-    /// Walks edges arriving at each visited symbol: the references a language engine
-    /// resolves to it, each hop carrying the `references` kind.
+    /// Follows edges ending at each visited symbol. A language engine can add `references`
+    /// edges.
     #[default]
     Incoming,
-    /// Walks edges leaving each visited symbol: the calls a language engine's call
-    /// hierarchy names for it, each hop carrying the `calls` kind.
+    /// Follows edges starting at each visited symbol. A language engine can add `calls`
+    /// edges from its call hierarchy.
     Outgoing,
 }
 
