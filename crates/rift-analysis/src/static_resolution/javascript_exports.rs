@@ -47,7 +47,24 @@ impl<'source> Exports<'_, 'source> {
         work: &mut Work,
     ) -> Option<&File<'source>> {
         let path = relative_path(from.document.path.as_str(), module, work)?;
-        module_file(self.files, &path)
+        module_file(self.files, &path, false)
+    }
+
+    fn imported_for_role(
+        &self,
+        from: &File<'source>,
+        module: &str,
+        mode: ModuleMode,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<&File<'source>> {
+        let path = relative_path(from.document.path.as_str(), module, work)?;
+        // A declaration file's type resolution can reach another declaration file.
+        // A runtime lookup must still name a source it can execute.
+        let declarations = mode == ModuleMode::Esm
+            && role == rift_core::ReferenceRole::Type
+            && from.document.path.as_str().ends_with(".d.ts");
+        module_file(self.files, &path, declarations)
     }
 
     pub(super) fn resolve(
@@ -59,7 +76,13 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        self.resolve_file(self.imported(from, module, work)?, name, mode, role, work)
+        self.resolve_file(
+            self.imported_for_role(from, module, mode, role, work)?,
+            name,
+            mode,
+            role,
+            work,
+        )
     }
 
     pub(super) fn resolve_file(
@@ -122,7 +145,11 @@ impl<'source> Exports<'_, 'source> {
             let Some(export) = direct else {
                 if mode == ModuleMode::CommonJs || name != ExportSlot::Named("default") {
                     pending.extend(stars.into_iter().filter_map(|module| {
-                        Some((self.imported(file, module, work)?, name, member))
+                        Some((
+                            self.imported_for_role(file, module, mode, role, work)?,
+                            name,
+                            member,
+                        ))
                     }));
                 }
                 continue;
@@ -134,13 +161,13 @@ impl<'source> Exports<'_, 'source> {
                     member,
                 }),
                 Export::Reexport { module, name } => {
-                    if let Some(imported) = self.imported(file, module, work) {
+                    if let Some(imported) = self.imported_for_role(file, module, mode, role, work) {
                         pending.push((imported, ExportSlot::Named(name), member));
                     }
                     None
                 }
                 Export::Module { module } => {
-                    let imported = self.imported(file, module, work)?;
+                    let imported = self.imported_for_role(file, module, mode, role, work)?;
                     if let Some(member) = member {
                         let (name, tail) = split_name(member);
                         pending.push((imported, ExportSlot::Named(name), tail));
@@ -283,6 +310,7 @@ fn split_name(name: &str) -> (&str, Option<&str>) {
 pub(super) fn module_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     path: &str,
+    declarations: bool,
 ) -> Option<&'index File<'source>> {
     if let Some(directory) = path.strip_suffix('/') {
         // A directory specifier names only the directory's index module.
@@ -299,7 +327,11 @@ pub(super) fn module_file<'index, 'source>(
                 return None;
             }
         }
-        return found;
+        return found.or_else(|| {
+            declarations
+                .then(|| files.get(format!("{path}index.d.ts").as_str()))
+                .flatten()
+        });
     }
     if let Some(file) = files.get(path).filter(|file| {
         matches!(
@@ -335,7 +367,15 @@ pub(super) fn module_file<'index, 'source>(
             return None;
         }
     }
-    found
+    if found.is_some() || !declarations || std::path::Path::new(path).extension().is_some() {
+        return found;
+    }
+    let direct = files.get(format!("{path}.d.ts").as_str());
+    let index = files.get(format!("{path}/index.d.ts").as_str());
+    match (direct, index) {
+        (Some(file), None) | (None, Some(file)) => Some(file),
+        _ => None,
+    }
 }
 
 enum Export<'source> {

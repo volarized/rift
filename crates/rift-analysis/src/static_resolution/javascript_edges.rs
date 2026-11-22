@@ -397,17 +397,27 @@ impl<'source> Index<'source> {
             work,
         )?;
         let imported = self.edge_javascript_module(&path)?;
+        self.javascript_import_module_occurrence(file, range, imported, work)
+    }
+
+    fn javascript_import_module_occurrence(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        imported: &File<'source>,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
         let mut occurrence =
             self.javascript_module_occurrence(file, range, imported, ReferenceRole::Import, work)?;
         occurrence.edge_from = self.javascript_module_identity(file, work);
         Some(occurrence)
     }
 
-    /// The written module of an import whose name is declared in another file.
+    /// The written module of a reexport or a relative declaration-only import.
     ///
     /// The terminal declaration is stored by the import itself. A name reached through a
-    /// reexport also keeps the module the import is written against. A name declared in
-    /// that module, an unresolved name and an unresolved module add nothing.
+    /// reexport also keeps the module the import is written against. Type resolution
+    /// through a declaration-only module keeps the newly admitted module as well.
     fn javascript_written_import(
         &self,
         file: &File<'source>,
@@ -424,11 +434,15 @@ impl<'source> Index<'source> {
             file.text(module)?,
             work,
         )?;
-        let written = self.edge_javascript_module(&path)?;
-        if written.document.path == terminal.file.path {
-            return None;
-        }
-        self.javascript_namespace_import(file, binding.name, module, work)
+        let written = match self.edge_javascript_module(&path) {
+            Some(written) if written.document.path == terminal.file.path => return None,
+            Some(written) => written,
+            None if file.document.path.as_str().ends_with(".d.ts") => {
+                super::javascript_exports::module_file(&self.files, &path, true)?
+            }
+            None => return None,
+        };
+        self.javascript_import_module_occurrence(file, binding.name, written, work)
     }
 
     fn javascript_module_occurrence(

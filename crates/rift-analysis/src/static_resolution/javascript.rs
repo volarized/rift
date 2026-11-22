@@ -785,7 +785,7 @@ impl<'source> Index<'source> {
     }
 
     pub(super) fn edge_javascript_module(&self, path: &str) -> Option<&File<'source>> {
-        super::javascript_exports::module_file(&self.files, path)
+        super::javascript_exports::module_file(&self.files, path, false)
     }
 
     fn javascript_export(
