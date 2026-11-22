@@ -1,6 +1,6 @@
 //! Projection proofs for the facts a graph query needs.
 
-use oxrdf::vocab::rdf;
+use oxrdf::vocab::{rdf, xsd};
 use rift_protocol::read::{EdgeKind, SymbolId, TraversalDirection};
 use spargebra::Query;
 use spargebra::algebra::{Expression, PropertyPathExpression, QueryExpression};
@@ -648,12 +648,20 @@ fn usage_selection(
         .collect();
     let mut source = false;
     let mut usage_enclosing = false;
+    let mut call_kind = false;
+    let mut other_kind = false;
     for &triple in triples {
         match property(triple) {
             Some("usages") if triple == *usage => {}
             Some("source") if triple.subject == usage.object => source = true,
             Some("of") if triple.subject == usage.object => usage_enclosing = true,
-            Some("range" | "kind") if triple.subject == usage.object => {}
+            Some("kind") if triple.subject == usage.object => {
+                let calls = matches!(&triple.object, TermPattern::Literal(value)
+                    if value.value() == "calls" && *value.datatype() == xsd::STRING);
+                call_kind |= calls;
+                other_kind |= !calls;
+            }
+            Some("range") if triple.subject == usage.object => {}
             Some("unit" | "start" | "end") if ranges.contains(&&triple.subject) => {}
             _ if is_occurrence_class(triple) && triple.subject == usage.object => {}
             _ => return None,
@@ -678,11 +686,20 @@ fn usage_selection(
             return None;
         }
     }
+    let kind = if call_kind
+        && !other_kind
+        && rift_protocol::identity::SymbolIdentity::parse(seed.as_str())
+            .is_ok_and(|identity| identity.owner().is_local())
+    {
+        EdgeKind::Calls
+    } else {
+        EdgeKind::References
+    };
     Some(AdjacencySelection {
         seed,
         first_step: AdjacencyStep {
             direction: TraversalDirection::Incoming,
-            kind: EdgeKind::References,
+            kind,
         },
         steps: Vec::new(),
         depth: Some(1),
