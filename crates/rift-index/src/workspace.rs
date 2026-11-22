@@ -4160,7 +4160,7 @@ impl WorkspaceIndex {
         }
         let language = syntax.language().identity_segment();
         let graph = self.semantics.graph();
-        let mut matches = syntax
+        let mut candidates = syntax
             .symbols()
             .iter()
             .enumerate()
@@ -4170,8 +4170,8 @@ impl WorkspaceIndex {
                 let record = graph.records().get(position)?;
                 (record.identity() == Some(key)).then_some((index, provider, record))
             });
-        let (selected, provider, record) = matches.next()?;
-        if matches.next().is_some() {
+        let (selected, provider, record) = candidates.next()?;
+        if candidates.next().is_some() {
             return None;
         }
         let [member] = record.contributions() else {
