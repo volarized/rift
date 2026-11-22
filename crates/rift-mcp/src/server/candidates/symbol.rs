@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(*revision, current.published.reads.served_revision()?);
         assert_eq!(declarations.len(), 1);
         assert_eq!(
-            declarations[0].path.as_ref().map(|path| path.as_str()),
+            declarations[0].path.as_ref().map(|path| path.0.as_str()),
             Some("index.ts")
         );
 
