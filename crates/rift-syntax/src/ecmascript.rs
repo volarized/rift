@@ -2016,9 +2016,9 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
-    let static_facts = capture.map(crate::static_analysis::Capture::finish);
-    if let Some(facts) = &static_facts {
-        members::record(
+    let mut static_facts = capture.map(crate::static_analysis::Capture::finish);
+    if let Some(facts) = &mut static_facts {
+        let aliases = members::record(
             &rules,
             source.text,
             language,
@@ -2027,6 +2027,7 @@ pub(crate) fn analyze_included(
             &assignments,
             &mut symbols,
         )?;
+        facts.set_member_aliases(aliases);
     }
     symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(

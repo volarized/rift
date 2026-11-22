@@ -110,6 +110,74 @@ fn test_commonjs_local_object_members_store_distinct_lexical_identities() {
 }
 
 #[test]
+fn test_commonjs_callable_assignment_chain_keeps_the_inner_body_and_outer_alias() {
+    let source = "var req = Object.create(null);
+module.exports = req;
+function value() { return 1; }
+req.get =
+req.header = function header() { return value(); };
+function read() { return req.get(); }
+function shadow() { const req = {}; req.get = 0; }
+
+const different = {};
+const other = {};
+different.alias = other.inner = function inner() { return value(); };
+function parameter(different) {
+    different.alias = other.nested = function nested() { return value(); };
+}
+const changed = {};
+changed.alias = changed.inner = function inner() { return value(); };
+changed.alias = 0;
+const replaced = {};
+replaced.alias = replaced.inner = function inner() { return value(); };
+replaced.inner = 0;
+const computed = {};
+const key = ['alias'].join('');
+computed[key] = computed.inner = function inner() { return value(); };
+const continued = {};
+continued.alias = (continued.inner = function inner() { return value(); }, 0);
+const returned = {};
+returned.alias = returned.inner = value();
+";
+    for path in ["main.cjs", "main.cts"] {
+        let (_directory, index) = workspace(&[(path, source)]);
+        let from = format!("{path}/req/get");
+        let to = format!("{path}/req/header");
+        let aliases = index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Aliases)
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 1, "{path} aliases");
+        let edge = aliases[0];
+        assert!(edge.from().as_str().ends_with(&from));
+        assert!(edge.to().as_str().ends_with(&to));
+        let range = edge.occurrence().range();
+        let start = usize::try_from(range.start()).expect("start");
+        let end = usize::try_from(range.end()).expect("end");
+        assert_eq!(&source[start..end], "get");
+        assert!(has_edge(
+            &index,
+            EdgeKind::Calls,
+            &to,
+            &format!("{path}/value")
+        ));
+        assert!(has_edge(
+            &index,
+            EdgeKind::Calls,
+            &format!("{path}/read"),
+            &from
+        ));
+        assert!(!has_edge(
+            &index,
+            EdgeKind::Calls,
+            &from,
+            &format!("{path}/value")
+        ));
+    }
+}
+
+#[test]
 fn test_commonjs_prototype_methods_keep_hoisted_constructor_identities() {
     for path in ["main.cjs", "main.cts"] {
         let (_directory, index) = workspace(&[(

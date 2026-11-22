@@ -9,11 +9,15 @@ use tree_sitter::Node;
 
 use super::{EcmaScriptGrammarField, EcmaScriptRules, EcmaScriptSymbolKind};
 use crate::extract::{self, Declaration, GrammarRules, Visited, Visits};
-use crate::{ByteRange, StaticBinding, StaticBindingKind, StaticFacts, SyntaxSymbol};
+use crate::{
+    ByteRange, StaticBinding, StaticBindingKind, StaticFacts, StaticMember, StaticMemberAlias,
+    SyntaxSymbol,
+};
 
 struct Bindings<'source> {
     scopes: BTreeMap<(ByteRange, &'source str), Option<&'source StaticBinding>>,
     symbols: BTreeMap<ByteRange, Option<usize>>,
+    members: BTreeMap<ByteRange, &'source StaticMember>,
     replaced: BTreeSet<&'source str>,
     blocked: BTreeSet<ByteRange>,
 }
@@ -60,6 +64,7 @@ impl<'source> Bindings<'source> {
         Self {
             scopes,
             symbols: names,
+            members,
             replaced,
             blocked: facts.unsupported_bindings().iter().copied().collect(),
         }
@@ -72,7 +77,16 @@ impl<'source> Bindings<'source> {
         if prototype && self.replaced.contains(name) {
             return None;
         }
-        let mut ancestor = Some(function.visited);
+        self.lexical_owner(function.visited, name)
+            .map(|(_, owner)| owner)
+    }
+
+    fn lexical_owner(
+        &self,
+        visited: Visited<'_, '_>,
+        name: &str,
+    ) -> Option<(&'source StaticBinding, usize)> {
+        let mut ancestor = Some(visited);
         // The shared walk has admitted the source depth before this lookup.
         while let Some(visited) = ancestor {
             let scope = visited.syntax_element();
@@ -84,7 +98,8 @@ impl<'source> Bindings<'source> {
                 if binding.kind != StaticBindingKind::Local {
                     return None;
                 }
-                return self.symbols.get(&binding.name).copied().flatten();
+                let owner = self.symbols.get(&binding.name).copied().flatten()?;
+                return Some((binding, owner));
             }
             ancestor = visited.parent();
         }
@@ -221,7 +236,7 @@ pub(super) fn record<'tree>(
     visits: &Visits<'tree>,
     assignments: &[Node<'tree>],
     symbols: &mut Vec<SyntaxSymbol>,
-) -> Result<(), RiftError> {
+) -> Result<Vec<StaticMemberAlias>, RiftError> {
     let functions = assignments
         .iter()
         .filter_map(|&assignment| {
@@ -232,11 +247,12 @@ pub(super) fn record<'tree>(
         })
         .collect::<Vec<_>>();
     if functions.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let bindings = Bindings::new(source, facts, symbols);
     let mut declarations = DeclarationNames::new(visits, rules, facts, symbols);
     let mut containers = BTreeMap::new();
+    let mut aliases = Vec::new();
     // Assignments and declarations share the admitted syntax count. Renaming touches only
     // declarations in a callable's source interval, at most once per admitted ancestor depth.
     for function in functions {
@@ -283,7 +299,7 @@ pub(super) fn record<'tree>(
         );
         containers.insert(assignment.id(), qualified.clone());
         *declarations.names.entry(qualified.clone()).or_default() += 1;
-        symbols.push(method(
+        let method = method(
             rules,
             function,
             declaration,
@@ -291,9 +307,151 @@ pub(super) fn record<'tree>(
             qualified,
             source,
             language,
-        )?);
+        )?;
+        if let Some(alias) = assignment_alias(rules, source, &bindings, function, owner) {
+            aliases.push((alias, owner, symbols.len()));
+        }
+        symbols.push(method);
     }
-    Ok(())
+    record_aliases(source, facts, &bindings, visits, &aliases, symbols)
+}
+
+/// The outer assignment in `object.alias = object.method = function ...`.
+fn assignment_alias<'walk, 'tree>(
+    rules: &EcmaScriptRules<'_>,
+    source: &str,
+    bindings: &Bindings<'_>,
+    function: MemberFunction<'walk, 'tree>,
+    owner: usize,
+) -> Option<MemberFunction<'walk, 'tree>> {
+    let kinds = rules.kinds;
+    if function.prototype
+        || function.this_member
+        || kinds.child(function.assignment, EcmaScriptGrammarField::Right) != Some(function.value)
+    {
+        return None;
+    }
+    let visited = function.visited.parent()?;
+    let assignment = visited.syntax_element();
+    if assignment.kind_id() != kinds.assignment_expression
+        || assignment.has_error()
+        || kinds.child(assignment, EcmaScriptGrammarField::Right) != Some(function.assignment)
+    {
+        return None;
+    }
+    let target = kinds.child(assignment, EcmaScriptGrammarField::Left)?;
+    let receiver = kinds.child(target, EcmaScriptGrammarField::Object)?;
+    let name = kinds.child(target, EcmaScriptGrammarField::Property)?;
+    if target.kind_id() != kinds.member_expression
+        || receiver.kind_id() != kinds.identifier
+        || name.kind_id() != kinds.property_identifier
+        || source.get(name.byte_range())? == source.get(function.name.byte_range())?
+    {
+        return None;
+    }
+    let (outer_binding, outer) =
+        bindings.lexical_owner(visited, source.get(receiver.byte_range())?)?;
+    let (inner_binding, _) = bindings.lexical_owner(
+        function.visited,
+        source.get(function.receiver.byte_range())?,
+    )?;
+    if outer != owner
+        || outer_binding.name != inner_binding.name
+        || outer_binding.available_from > extract::byte_range(receiver).ok()?.start
+    {
+        return None;
+    }
+    Some(MemberFunction {
+        visited,
+        assignment,
+        receiver,
+        name,
+        ..function
+    })
+}
+
+fn record_aliases(
+    source: &str,
+    facts: &StaticFacts,
+    bindings: &Bindings<'_>,
+    visits: &Visits<'_>,
+    candidates: &[(MemberFunction<'_, '_>, usize, usize)],
+    symbols: &mut Vec<SyntaxSymbol>,
+) -> Result<Vec<StaticMemberAlias>, RiftError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let receivers = candidates
+        .iter()
+        .filter_map(|(alias, _, _)| source.get(alias.receiver.byte_range()))
+        .collect::<BTreeSet<_>>();
+    let mut unknown = BTreeSet::new();
+    let mut writes = BTreeMap::<(usize, Option<&str>), u8>::new();
+    for &target in facts.assignments() {
+        let member = bindings.members.get(&target);
+        let receiver = member.map_or(target, |member| member.receiver);
+        let Some(name) = text(source, receiver).filter(|name| receivers.contains(name)) else {
+            continue;
+        };
+        let Some((_, owner)) = visits
+            .containing(receiver)
+            .and_then(|visited| bindings.lexical_owner(visited, name))
+        else {
+            unknown.insert(name);
+            continue;
+        };
+        let member = member
+            .and_then(|member| member.member)
+            .and_then(|member| text(source, member));
+        let count = writes.entry((owner, member)).or_default();
+        *count = count.saturating_add(1);
+    }
+    let mut aliases = Vec::new();
+    let mut declarations = Vec::new();
+    let names = symbols
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    for &(alias, owner, inner) in candidates {
+        let Some(name) = source.get(alias.name.byte_range()) else {
+            continue;
+        };
+        let target = &symbols[inner];
+        let qualified_name = extract::qualify(".", &symbols[owner].qualified_name, name);
+        if unknown.contains(source.get(alias.receiver.byte_range()).unwrap_or_default())
+            || target.body_range.is_none()
+            || writes.get(&(owner, Some(name))) != Some(&1)
+            || writes.get(&(owner, Some(target.name.as_str()))) != Some(&1)
+            || writes.contains_key(&(owner, None))
+            || names.contains(qualified_name.as_str())
+        {
+            continue;
+        }
+        let Some(target_name) = target.name_range else {
+            continue;
+        };
+        let range = extract::byte_range(alias.assignment)?;
+        let alias = extract::byte_range(alias.name)?;
+        declarations.push(SyntaxSymbol {
+            name: name.to_owned(),
+            qualified_name,
+            range,
+            item_range: range,
+            name_range: Some(alias),
+            body_range: None,
+            signatures: Arc::default(),
+            documentation: Arc::default(),
+            documentation_ranges: Vec::new(),
+            ..target.clone()
+        });
+        aliases.push(StaticMemberAlias {
+            name: alias,
+            target: target_name,
+        });
+    }
+    symbols.extend(declarations);
+    aliases.sort_by_key(|alias| alias.name);
+    Ok(aliases)
 }
 
 fn qualification(

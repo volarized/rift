@@ -846,6 +846,7 @@ impl SyntaxFacts {
                 return errors::syntax::facts_structure_invalid().fail();
             }
             facts.validate(source, limits)?;
+            validate_member_aliases(&parts, facts.member_aliases())?;
         }
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {
@@ -857,6 +858,44 @@ impl SyntaxFacts {
         }
         Ok(Self::restored(parts, limits))
     }
+}
+
+fn validate_member_aliases(
+    parts: &SyntaxFactsParts,
+    aliases: &[crate::StaticMemberAlias],
+) -> Result<(), RiftError> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    if !matches!(parts.language.name.as_str(), "javascript" | "typescript") {
+        return errors::syntax::facts_structure_invalid().fail();
+    }
+    let mut names = BTreeMap::new();
+    for symbol in parts.symbols.iter().chain(&parts.left_out_symbols) {
+        if let Some(name) = symbol.name_range {
+            names
+                .entry(name)
+                .and_modify(|symbol| *symbol = None)
+                .or_insert(Some(symbol));
+        }
+    }
+    for alias in aliases {
+        let source = names.get(&alias.name).copied().flatten();
+        let target = names.get(&alias.target).copied().flatten();
+        if !source.zip(target).is_some_and(|(source, target)| {
+            [source, target].into_iter().all(|symbol| {
+                symbol.kind == "method" && symbol.syntax_element_kind == Some(ASSIGNED_MEMBER_KIND)
+            }) && source.container.is_some()
+                && source.container == target.container
+                && source.name != target.name
+                && source.body_range.is_none()
+                && target.body_range.is_some()
+                && source.item_range.encloses(target.item_range)
+        }) {
+            return errors::syntax::facts_reference_invalid().fail();
+        }
+    }
+    Ok(())
 }
 
 fn embedded_symbol_kind(name: &str) -> Option<&'static str> {

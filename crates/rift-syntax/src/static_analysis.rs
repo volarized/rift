@@ -43,6 +43,15 @@ pub struct StaticMember {
     pub member: Option<ByteRange>,
 }
 
+/// Authored names of two callable members assigned the same function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMemberAlias {
+    /// Name of the member on the outer assignment.
+    pub name: ByteRange,
+    /// Name of the member whose assignment holds the function.
+    pub target: ByteRange,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -306,6 +315,8 @@ pub struct StaticFactsParts {
     pub references: Vec<StaticReference>,
     /// Receiver and property spans for member expressions.
     pub members: Vec<StaticMember>,
+    /// Callable member aliases established from assignment chains.
+    pub member_aliases: Vec<StaticMemberAlias>,
     /// Declaration names and their explicit named type annotations.
     pub declared_types: Vec<(ByteRange, ByteRange)>,
     /// Type declaration names whose own shape is a signature: a call signature or
@@ -404,6 +415,16 @@ impl StaticFacts {
     #[must_use]
     pub fn members(&self) -> &[StaticMember] {
         &self.0.members
+    }
+
+    /// Callable member aliases established from assignment chains.
+    #[must_use]
+    pub fn member_aliases(&self) -> &[StaticMemberAlias] {
+        &self.0.member_aliases
+    }
+
+    pub(crate) fn set_member_aliases(&mut self, aliases: Vec<StaticMemberAlias>) {
+        self.0.member_aliases = aliases;
     }
     /// Declaration names and their explicit named type annotations.
     #[must_use]
@@ -623,6 +644,7 @@ impl StaticFacts {
         [
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
+            vector_capacity(&self.0.member_aliases),
             vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.type_signatures),
             vector_capacity(&self.0.parameters),
@@ -679,6 +701,7 @@ impl StaticFacts {
         let lengths = [
             self.references().len(),
             self.members().len(),
+            self.member_aliases().len(),
             self.declared_types().len(),
             self.type_signatures().len(),
             self.parameters().len(),
@@ -900,6 +923,13 @@ impl StaticFacts {
             && reexports
             && assignments
             && members
+            && self.member_aliases().iter().all(|alias| {
+                valid(alias.name) && valid(alias.target) && alias.name.end <= alias.target.start
+            })
+            && self
+                .member_aliases()
+                .windows(2)
+                .all(|pair| pair[0].name < pair[1].name)
             && unsupported
             && implementations
             && rust

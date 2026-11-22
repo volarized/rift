@@ -3,8 +3,9 @@
 use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_syntax::{
-    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, SyntaxDocument, SyntaxFacts,
-    SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
+    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticFacts, StaticFactsParts,
+    StaticMemberAlias, SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames,
+    SyntaxSource,
 };
 
 fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
@@ -37,6 +38,66 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         static_facts: facts.static_facts().cloned(),
         source_digest: *facts.source_digest().expect("source witness"),
     }
+}
+
+#[test]
+fn test_callable_member_alias_restores_only_against_its_inner_assignment() {
+    let source = "var req = {};
+req.get = req.header = function header() { return 1; };
+req.other = function other() { return 2; };
+module.exports = req;
+";
+    let document = parsed(ShippedLanguage::JavaScript, source);
+    let captured = parts(document.facts());
+    let facts = captured.static_facts.as_ref().expect("static facts");
+    let [alias] = facts.member_aliases() else {
+        panic!("one captured callable alias");
+    };
+    let alias = *alias;
+    let symbol = |name| {
+        document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.qualified_name == name)
+            .expect("symbol")
+    };
+    assert_eq!(symbol("req.get").name_range, Some(alias.name));
+    assert_eq!(symbol("req.header").name_range, Some(alias.target));
+    assert!(symbol("req.get").body_range.is_none());
+    assert!(symbol("req.header").body_range.is_some());
+
+    let limits = SyntaxLimits::default();
+    let restored =
+        SyntaxFacts::from_parts(source, limits, captured.clone()).expect("checked alias");
+    assert_eq!(restored.static_facts(), Some(facts));
+    let mismatched = StaticFactsParts {
+        member_aliases: vec![StaticMemberAlias {
+            name: alias.name,
+            target: symbol("req.other").name_range.expect("other name"),
+        }],
+        ..StaticFactsParts::default()
+    };
+    let mut invalid = captured.clone();
+    invalid.static_facts =
+        Some(StaticFacts::from_parts(source, limits, mismatched).expect("valid ranges"));
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, invalid).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG),
+    );
+
+    let mut older = captured;
+    older
+        .symbols
+        .retain(|symbol| symbol.name_range != Some(alias.name));
+    older.static_facts = Some(StaticFacts::default());
+    let older = SyntaxFacts::from_parts(source, limits, older).expect("older facts");
+    assert!(
+        older
+            .static_facts()
+            .expect("older static facts")
+            .member_aliases()
+            .is_empty()
+    );
 }
 
 fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
