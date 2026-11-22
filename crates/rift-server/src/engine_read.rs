@@ -3043,7 +3043,7 @@ mod tests {
                 super::TRAVERSAL_SYMBOLS_MAX,
                 &engine,
             );
-            assert_selected_call_providers(walk, first, label, lsp);
+            assert_selected_call_providers(&walk, first, label, lsp);
         }
         let walk = crate::traversal::walk_traversal_with_references(
             store,
@@ -3052,7 +3052,7 @@ mod tests {
             super::TRAVERSAL_SYMBOLS_MAX,
             &EngineReferences::default(),
         );
-        assert_selected_call_providers(walk, first, "no engine", false);
+        assert_selected_call_providers(&walk, first, "no engine", false);
         Ok(())
     }
 
@@ -3068,7 +3068,7 @@ mod tests {
     }
 
     fn assert_selected_call_providers(
-        walk: rift_index::TraversalWalk,
+        walk: &rift_index::TraversalWalk,
         stored: &rift_index::Edge,
         label: &str,
         lsp: bool,
