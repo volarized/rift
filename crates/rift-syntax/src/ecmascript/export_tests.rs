@@ -147,8 +147,10 @@ fn every_exported_variable_declarator_retains_its_binding() {
 #[test]
 fn typescript_export_forms_keep_type_and_namespace_bindings() {
     let text = "type Input = string;\nconst value = 1;\nexport { type Input as Options, value };\nexport type { Input as Config } from './types';\nexport * from './all';\nexport type * from './type-all';\nexport * as tools from './tools';\nexport interface Shape { size: number }\n";
+    let path = rift_core::ProjectPath::new("index.ts").expect("fixture path");
     for dialect in [TypeScriptDialect::TypeScript, TypeScriptDialect::Tsx] {
-        let document = analyze(&TypeScriptSyntaxProvider::new(dialect), text);
+        let provider = TypeScriptSyntaxProvider::new(dialect);
+        let document = analyze(&provider, text);
         assert!(!document.facts().has_errors());
         let bindings = document
             .facts()
@@ -169,11 +171,21 @@ fn typescript_export_forms_keep_type_and_namespace_bindings() {
         assert_eq!(token(text, bindings[5].exported), Some("tools"));
         assert_eq!(token(text, bindings[5].source), Some("'./tools'"));
         assert_eq!(token(text, bindings[6].exported), Some("Shape"));
-        let malformed = analyze(
-            &TypeScriptSyntaxProvider::new(dialect),
-            "export type * from;\n",
-        );
-        assert!(malformed.facts().has_errors());
+        let malformed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "export type * from;\n",
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("malformed fixture source");
+        assert!(malformed.has_errors());
+        assert!(malformed.facts().export_bindings().is_none_or(|bindings| {
+            bindings
+                .iter()
+                .all(|binding| binding.kind != SyntaxExportKind::All || !binding.type_only)
+        }));
     }
 }
 
