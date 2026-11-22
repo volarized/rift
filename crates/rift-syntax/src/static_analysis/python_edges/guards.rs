@@ -10,6 +10,8 @@ pub(super) struct TypeGuards {
     statement: u16,
     negative: u16,
     boolean: u16,
+    comparison: u16,
+    none: u16,
     parenthesized: u16,
     returns: [u16; 2],
     names: [u16; 2],
@@ -18,7 +20,9 @@ pub(super) struct TypeGuards {
     alternative: u16,
     argument: u16,
     left: u16,
+    right: u16,
     operator: u16,
+    comparison_operators: u16,
     function: u16,
     arguments: u16,
 }
@@ -31,6 +35,8 @@ impl TypeGuards {
             statement: id("if_statement"),
             negative: id("not_operator"),
             boolean: id("boolean_operator"),
+            comparison: id("comparison_operator"),
+            none: id("none"),
             parenthesized: id("parenthesized_expression"),
             returns: [id("return_statement"), id("raise_statement")],
             names: [id("identifier"), id("attribute")],
@@ -39,7 +45,9 @@ impl TypeGuards {
             alternative: field("alternative"),
             argument: field("argument"),
             left: field("left"),
+            right: field("right"),
             operator: field("operator"),
+            comparison_operators: field("operators"),
             function: field("function"),
             arguments: field("arguments"),
         }
@@ -55,6 +63,7 @@ impl TypeGuards {
         if statement.kind_id() != self.statement {
             return Ok(());
         }
+        self.record_non_none(statement, facts)?;
         let Some((name, annotation, scope)) = self.guard(visited, source) else {
             return Ok(());
         };
@@ -70,6 +79,69 @@ impl TypeGuards {
             },
         });
         Ok(())
+    }
+
+    /// Collects the checks that must pass for the if statement's body to run.
+    fn record_non_none(
+        &self,
+        statement: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let condition = statement
+            .child_by_field_id(self.condition)
+            .filter(|condition| !condition.has_error());
+        let body = statement
+            .child_by_field_id(self.consequence)
+            .filter(|body| body.start_byte() < body.end_byte());
+        let Some((condition, body)) = condition.zip(body) else {
+            return Ok(());
+        };
+        let body = byte_range(body)?;
+        let mut pending = vec![condition];
+        // Each condition is visited once within the provider's syntax element bound.
+        while let Some(condition) = pending.pop() {
+            if condition.kind_id() == self.parenthesized {
+                pending.extend(condition.named_child(0));
+            } else if condition.kind_id() == self.boolean
+                && condition
+                    .child_by_field_id(self.operator)
+                    .is_some_and(|operator| operator.kind() == "and")
+            {
+                pending.extend(condition.child_by_field_id(self.right));
+                pending.extend(condition.child_by_field_id(self.left));
+            } else if let Some(name) = self.non_none(condition).filter(|name| !name.is_missing()) {
+                facts.non_none_guards.push((byte_range(name)?, body));
+            }
+        }
+        Ok(())
+    }
+
+    /// A name whose truthiness or comparison excludes `None`.
+    fn non_none<'tree>(&self, condition: Node<'tree>) -> Option<Node<'tree>> {
+        if condition.kind_id() == self.names[0] {
+            return Some(condition);
+        }
+        if condition.kind_id() != self.comparison
+            || condition
+                .child_by_field_id(self.comparison_operators)?
+                .kind()
+                != "is not"
+        {
+            return None;
+        }
+        let mut cursor = condition.walk();
+        let mut operands = condition
+            .named_children(&mut cursor)
+            .filter(|operand| !operand.is_extra());
+        let (left, right) = (operands.next()?, operands.next()?);
+        if operands.next().is_some() {
+            return None;
+        }
+        match (left.kind_id(), right.kind_id()) {
+            (name, none) if name == self.names[0] && none == self.none => Some(left),
+            (none, name) if name == self.names[0] && none == self.none => Some(right),
+            _ => None,
+        }
     }
 
     fn guard<'tree>(

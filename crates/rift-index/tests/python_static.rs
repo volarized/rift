@@ -364,6 +364,51 @@ fn test_python_reads_before_a_later_rebinding_store_member_facts() {
 }
 
 #[test]
+fn test_python_conditional_receivers_store_calls_before_and_after_a_none_reset() {
+    let source = "class Item:\n    def start(self): pass\n    def stop(self): pass\ndef use(enabled):\n    first: Item | None = None\n    second: Item | None = None\n    if enabled:\n        first = Item()\n        second = Item()\n        try:\n            first.start()\n            second.start()\n        except OSError:\n            first = second = None\n            first.start()\n    if first is not None:\n        first.stop()\n    if second is not None:\n        second.stop()\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    let mut calls = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind().as_ref() == "calls"
+                && edge.from().as_str() == "rift://symbol/local/python/main/use"
+                && edge
+                    .to()
+                    .as_str()
+                    .starts_with("rift://symbol/local/python/main/Item/")
+        })
+        .map(|edge| {
+            let occurrence = edge.occurrence();
+            assert_eq!(occurrence.unit().key().as_str(), "main.py");
+            let start = usize::try_from(occurrence.range().start()).expect("start");
+            let end = usize::try_from(occurrence.range().end()).expect("end");
+            (start, end, edge.to().as_str())
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        (
+            "first.start()",
+            "rift://symbol/local/python/main/Item/start",
+        ),
+        (
+            "second.start()",
+            "rift://symbol/local/python/main/Item/start",
+        ),
+        ("first.stop()", "rift://symbol/local/python/main/Item/stop"),
+        ("second.stop()", "rift://symbol/local/python/main/Item/stop"),
+    ]
+    .map(|(spelling, target)| {
+        let start = source.find(spelling).expect("first written call");
+        (start, start + spelling.len(), target)
+    });
+    calls.sort_unstable();
+    assert_eq!(calls, expected);
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
 fn test_python_rebound_classes_optional_receivers_and_conditional_methods_store_facts() {
     let connection = "def wrap(cls): return cls\nclass Base:\n    def connect(self) -> int: return 1\nclass Secure(Base):\n    def connect(self) -> int: return 2\nSecure = wrap(Secure)\n";
     let socks = "from .connection import Secure\nclass Tunnel(Secure):\n    def connect(self) -> int: return super().connect()\ndef build() -> int: return Secure().connect()\n";
