@@ -124,6 +124,7 @@ fn a_registered_failure_without_an_action_writes_its_message_alone() {
 #[test]
 fn a_registered_failure_writes_its_causes_after_its_identity() {
     let error = errors::index::workspace_syntax()
+        .path(std::path::Path::new("app.jsx"))
         .cause(
             errors::syntax::source_too_large()
                 .source_bytes(2_u64)
@@ -131,12 +132,28 @@ fn a_registered_failure_writes_its_causes_after_its_identity() {
                 .error(),
         )
         .error();
+    assert_eq!(error.slug().as_str(), "rift.index.workspace_syntax");
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == "app.jsx")
+    );
+    let cause = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<RiftError>())
+        .expect("registered syntax cause");
+    assert_eq!(cause.slug().as_str(), "rift.syntax.source_too_large");
     let text = completed_text(McpFailure::new(error).tool_failure(ErrorPhase::Read));
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], "2 errors", "{text}");
     assert_eq!(lines[1], "\tlimit_exceeded · retry never", "{text}");
+    assert!(lines[2].starts_with("\t\tsyntax analysis failed"), "{text}");
+    assert!(lines[2].contains("app.jsx"), "{text}");
     assert_eq!(lines[3], "\t\trift.index.workspace_syntax", "{text}");
     assert_eq!(lines[4], "\tlimit_exceeded · retry never", "{text}");
+    assert!(
+        lines[5].contains("source bytes 2 exceed accepted limit 1"),
+        "{text}"
+    );
     assert_eq!(lines.len(), 6, "{text}");
 }
 

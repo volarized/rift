@@ -263,7 +263,7 @@ __rift_error_definition!(
 __rift_error_definition!(
     workspace_syntax,
     slug = "rift.index.workspace_syntax",
-    message = "Rust syntax analysis failed",
+    message = "syntax analysis failed",
     action = "correct the source syntax and retry",
     fields = {
         cause: optional(cause),

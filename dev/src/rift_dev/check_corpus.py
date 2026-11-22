@@ -2083,7 +2083,7 @@ def held_unparsed_records(
 
     >>> from rift_dev.log_records import parse_line
     >>> path = "src/jsc/bindings/sqlite/sqlite3.c"
-    >>> reason = f"Rust syntax analysis failed: cause source bytes 9508000 exceed accepted limit 4194304: path {path}; reduce source bytes below 4194304 and retry"
+    >>> reason = f"syntax analysis failed: cause source bytes 9508000 exceed accepted limit 4194304: path {path}; reduce source bytes below 4194304 and retry"
     >>> line = parse_line(f'2026-10-09 17:50:00.852Z WARN rift_index::workspace::OmittedFileRecords::record component=index operation=index.build path={path} reason="{reason}"  file held unparsed in the index')
     >>> assert line is not None
     >>> held_unparsed_records([line], path, 9508000, 4194304)

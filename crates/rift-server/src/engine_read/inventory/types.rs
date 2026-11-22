@@ -44,11 +44,15 @@ pub(super) fn declared_types(
 }
 
 fn rust_types(source: &str) -> Result<BTreeMap<u64, Vec<usize>>, RiftError> {
+    // The closure name can resolve to a captured type. Read an explicit output where it is written.
     let query = RustQuery::new(
-        "[(const_item name: (identifier) @declaration type: (_) @annotation)
+        r#"[(const_item name: (identifier) @declaration type: (_) @annotation)
           (static_item name: (identifier) @declaration type: (_) @annotation)
           (field_declaration name: (field_identifier) @declaration type: (_) @annotation)]
-         [(type_identifier) (primitive_type)] @type_name",
+         ((let_declaration pattern: (identifier) @declaration
+            value: (closure_expression return_type: (_) @annotation))
+          (#not-eq? @annotation "_"))
+         [(type_identifier) (primitive_type)] @type_name"#,
     )?;
     let mut declaration = None;
     let mut annotations = BTreeMap::<u64, ByteRange>::new();
@@ -199,6 +203,51 @@ mod tests {
             assert_eq!(actual, expected, "{name}");
         }
         assert_eq!(types.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn closure_return_annotations_take_precedence_over_inferred_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = "type SizeAlias = usize;\nfn owner() {\n    let primitive = || -> usize { 1 };\n    let alias = || -> SizeAlias { 2 };\n    let unit = || -> () {};\n    let inferred = || 3;\n    let placeholder = || -> _ { 4 };\n}\n";
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = crate::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )?;
+        let file = reads
+            .index()
+            .file(&rift_core::ProjectPath::new("lib.rs")?)
+            .ok_or("file")?;
+        let types = super::declared_types(file)?;
+        for (name, spelling) in [("primitive", "usize"), ("alias", "SizeAlias")] {
+            let start = source.find(name).ok_or("closure binding")?;
+            let annotation = start + source[start..].find(spelling).ok_or("return type")?;
+            assert_eq!(
+                types.get(&u64::try_from(start)?).map(Vec::as_slice),
+                Some([annotation].as_slice())
+            );
+        }
+        let unit = source.find("unit").ok_or("unit closure binding")?;
+        assert_eq!(
+            types.get(&u64::try_from(unit)?).map(Vec::as_slice),
+            Some([].as_slice())
+        );
+        let inferred = source.find("inferred").ok_or("inferred closure binding")?;
+        assert!(!types.contains_key(&u64::try_from(inferred)?));
+        let placeholder = source
+            .find("placeholder")
+            .ok_or("placeholder closure binding")?;
+        let placeholder_type =
+            placeholder + source[placeholder..].find('_').ok_or("placeholder")?;
+        assert_eq!(
+            types.get(&u64::try_from(placeholder)?).map(Vec::as_slice),
+            Some([placeholder_type].as_slice())
+        );
         Ok(())
     }
 }
