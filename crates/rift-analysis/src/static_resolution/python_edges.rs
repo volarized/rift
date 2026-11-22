@@ -5,6 +5,7 @@ mod classes;
 mod elements;
 mod overloads;
 mod rebinding;
+mod receiver_guards;
 mod references;
 mod slots;
 
@@ -70,6 +71,12 @@ enum Value<'source> {
     Module(String),
 }
 
+#[derive(Clone, Copy)]
+enum ReceiverJoin {
+    All,
+    NonNone,
+}
+
 impl<'source> Index<'source> {
     pub(super) fn edge_python_call(
         &self,
@@ -103,12 +110,29 @@ impl<'source> Index<'source> {
         if module || file.class_scopes.contains(&scope) {
             return None;
         }
+        self.python_agreed_receiver(file, candidates, ReceiverJoin::All, work)
+    }
+
+    fn python_agreed_receiver(
+        &self,
+        file: &File<'source>,
+        candidates: impl Iterator<Item = &'source StaticBinding>,
+        mode: ReceiverJoin,
+        work: &mut Work,
+    ) -> Option<&'source StaticBinding> {
         let mut agreed = None;
         let mut selected: Option<&StaticBinding> = None;
         let mut count = 0_usize;
+        let mut has_none = false;
         for binding in candidates {
             if !work.charge() {
                 return None;
+            }
+            if matches!(mode, ReceiverJoin::NonNone)
+                && binding.kind == StaticBindingKind::PythonNone
+            {
+                has_none = true;
+                continue;
             }
             if !matches!(
                 binding.kind,
@@ -139,7 +163,11 @@ impl<'source> Index<'source> {
                 selected = Some(binding);
             }
         }
-        (count > 1).then_some(selected?)
+        let has_agreement = match mode {
+            ReceiverJoin::All => count > 1,
+            ReceiverJoin::NonNone => has_none,
+        };
+        has_agreement.then_some(selected?)
     }
 
     /// A class base names a class, directly or through unchanged aliases; other values stay
@@ -361,6 +389,7 @@ impl<'source> Index<'source> {
         match binding.kind {
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
+            | StaticBindingKind::PythonNone
             | StaticBindingKind::PythonInstance { .. }
             | StaticBindingKind::PythonAlias { .. }
             | StaticBindingKind::PythonFunction { .. } => {
@@ -569,7 +598,11 @@ fn edge_python_binding<'source>(
                 .filter(|binding| binding.scope == scope && !later.contains(&binding.name.start));
             let selected = match index.python_binding_group(file, candidates.clone(), work) {
                 Some(selected) => selected,
-                None => index.python_receiver_join(file, scope, candidates, work)?,
+                None => index
+                    .python_receiver_join(file, scope, candidates.clone(), work)
+                    .or_else(|| {
+                        index.python_guarded_receiver(file, name, scope, position, candidates, work)
+                    })?,
             };
             if selected.available_from > position {
                 return None;

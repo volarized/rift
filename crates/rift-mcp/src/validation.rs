@@ -781,6 +781,8 @@ pub(crate) struct IndexValidation {
     /// The engine hold each publication hands its changed files to, set once the server
     /// holds one. Absent in a test that builds no server.
     engines: std::sync::OnceLock<Arc<EngineHold>>,
+    /// The server's retained views, notified when a workspace publication becomes current.
+    local_views: std::sync::OnceLock<Arc<std::sync::OnceLock<rift_server::LocalSymbolViews>>>,
     /// The watch failures recorded since the last report of their repeats.
     watch_failures: SyncMutex<WatchFailures>,
 }
@@ -1112,6 +1114,7 @@ impl IndexValidation {
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
                 engines: std::sync::OnceLock::new(),
+                local_views: std::sync::OnceLock::new(),
                 watch_failures: SyncMutex::new(WatchFailures::default()),
             }),
             receiver,
@@ -1140,6 +1143,28 @@ impl IndexValidation {
     /// is the one fed, and a second is ignored.
     pub(crate) fn feed_engines(&self, engines: Arc<EngineHold>) {
         let _first_hold_stays = self.engines.set(engines);
+    }
+
+    /// Registers the view store and its initial publication before serving reads.
+    pub(crate) fn feed_local_views(
+        &self,
+        views: Arc<std::sync::OnceLock<rift_server::LocalSymbolViews>>,
+        published: &PublishedWorkspace,
+    ) {
+        if self.local_views.set(views).is_ok() {
+            self.publish_local_views(published);
+        }
+    }
+
+    fn publish_local_views(&self, published: &PublishedWorkspace) {
+        if let Some(views) = self.local_views.get().and_then(|views| views.get()) {
+            let limits = published.configuration.is_accepted().then(|| {
+                rift_server::RetainedViewLimits::from(
+                    &published.configuration.search_configuration().query,
+                )
+            });
+            views.publish_current(&published.reads, limits);
+        }
     }
 
     /// Records one observation that names no path, so the next rebuild reads every visible
@@ -1338,6 +1363,8 @@ impl IndexValidation {
             .published
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Account for the incoming publication before a reader can resolve it.
+        self.publish_local_views(published);
         *current = Some(Arc::clone(published));
     }
 

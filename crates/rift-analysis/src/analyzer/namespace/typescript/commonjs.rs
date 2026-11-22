@@ -75,16 +75,13 @@ pub(super) fn prepare(
                 prepared.unresolved_exports = true;
                 continue;
             };
-            let Some(target) = relative_target(file.path, &relative) else {
+            let Some(target) = relative_target(file.path, &relative, &inventory) else {
                 prepared.unresolved_exports = true;
                 continue;
             };
             // Resolved CommonJS filenames identify distinct defining modules.
             let target_module = format!("{}/{}", metadata.name, target.as_str());
             prepared.unresolved_exports = true;
-            if !inventory.contains_key(&target) {
-                continue;
-            }
             if queued.insert(target.clone()) {
                 pending.push_back((target, target_module));
             }
@@ -102,7 +99,7 @@ fn entry_matches(metadata: &PackageMetadata, observation: &NamespaceModule<'_>) 
             )
             .map(|(_, implementation)| implementation)
     } else if observation.module() == metadata.name {
-        metadata.main.as_deref()
+        Some(metadata.main.as_deref().unwrap_or("index.js"))
     } else {
         None
     };
@@ -129,7 +126,11 @@ fn checked_names(file: &SelectedFile<'_>) -> BTreeSet<String> {
         .collect()
 }
 
-fn relative_target(path: &ProjectPath, relative: &str) -> Option<ProjectPath> {
+fn relative_target(
+    path: &ProjectPath,
+    relative: &str,
+    inventory: &BTreeMap<&ProjectPath, &SelectedFile<'_>>,
+) -> Option<ProjectPath> {
     let relative = relative.strip_prefix("./")?;
     if !export_subpath_is_valid(relative) {
         return None;
@@ -138,7 +139,15 @@ fn relative_target(path: &ProjectPath, relative: &str) -> Option<ProjectPath> {
         || relative.to_owned(),
         |(directory, _)| format!("{directory}/{relative}"),
     );
-    ProjectPath::new(target).ok()
+    let exact = ProjectPath::new(&target).ok()?;
+    if inventory.contains_key(&exact) {
+        return Some(exact);
+    }
+    if Path::new(relative).extension().is_some() {
+        return None;
+    }
+    let javascript = ProjectPath::new(format!("{target}.js")).ok()?;
+    inventory.contains_key(&javascript).then_some(javascript)
 }
 
 fn is_mjs(path: &ProjectPath) -> bool {

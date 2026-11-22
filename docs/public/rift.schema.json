@@ -1630,7 +1630,7 @@
         "retained_size": {
           "$ref": "#/$defs/ByteSize",
           "default": "8gb",
-          "description": "Most material the retained views hold together, 1mb to 64gb. A new view past\nthe bound releases the least recently used ones; a view larger than the bound\nalone is refused.",
+          "description": "Most material kept alive by retained views, 1mb to 64gb. Counts query results,\ncapture metadata, and index data kept alive beyond the current publication.\nA capture or publication past the bound releases the least recently used views.\nA new view whose own charge exceeds the bound is refused.",
           "rift:range": {
             "max": "64gb",
             "min": "1mb"

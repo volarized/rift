@@ -15,6 +15,7 @@ use crate::extract::{Visited, byte_range};
 
 pub(super) struct EdgePythonKinds {
     identifier: u16,
+    none: u16,
     call: u16,
     attribute: u16,
     definitions: [u16; 2],
@@ -61,6 +62,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
         let definitions = [id("function_definition"), id("class_definition")];
         EdgePythonKinds {
             identifier: id("identifier"),
+            none: id("none"),
             call: id("call"),
             attribute: id("attribute"),
             definitions,
@@ -579,9 +581,8 @@ impl EdgePythonKinds {
                 let kind = self.edge_assignment_kind(visited, target)?;
                 let available = match kind {
                     StaticBindingKind::PythonInstance { .. }
-                    | StaticBindingKind::PythonAlias { .. } => {
-                        byte_range(visited.syntax_element())?.end
-                    }
+                    | StaticBindingKind::PythonAlias { .. }
+                    | StaticBindingKind::PythonNone => byte_range(visited.syntax_element())?.end,
                     // The loop body reads each element after the iterated value.
                     StaticBindingKind::PythonElement { iterable } => iterable.end,
                     _ => byte_range(scope)?.start,
@@ -642,6 +643,14 @@ impl EdgePythonKinds {
             return Ok(StaticBindingKind::PythonAnnotation {
                 annotation: byte_range(annotation)?,
             });
+        }
+        let mut assigned = assignment.child_by_field_id(self.right);
+        // Chained assignments have one value. Each step descends within the admitted tree.
+        while let Some(next) = assigned.filter(|value| value.kind_id() == self.assignment[0]) {
+            assigned = next.child_by_field_id(self.right);
+        }
+        if assigned.is_some_and(|value| value.kind_id() == self.none && !value.is_missing()) {
+            return Ok(StaticBindingKind::PythonNone);
         }
         let constructor = assignment
             .child_by_field_id(self.right)

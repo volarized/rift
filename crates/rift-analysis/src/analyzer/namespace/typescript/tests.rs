@@ -1288,3 +1288,53 @@ fn commonjs_literal_forwarding_missing_dynamic_shadow_and_cycles_stay_bounded() 
     assert!(prepared.anchors["child.js"].contains_key("open"));
     assert!(prepared.unresolved_exports);
 }
+
+#[test]
+fn commonjs_package_default_entry_and_extensionless_forwarder_are_checked_independently() {
+    let default = r#"{"name":"react","version":"19.3.0"}"#;
+    let selected = r#"{"name":"react","version":"19.3.0","main":"index.js"}"#;
+    let other_entry = r#"{"name":"react","version":"19.3.0","main":"other.js"}"#;
+    let exports = r#"{"name":"react","version":"19.3.0","main":"index.js","exports":{".":{"require":"./other.js"}}}"#;
+    for (metadata, literal, accepted) in [
+        (default, "./lib/child.js", true),
+        (selected, "./lib/child", true),
+        (default, "./lib/child", true),
+        (other_entry, "./lib/child.js", false),
+        (exports, "./lib/child", false),
+    ] {
+        let forward = format!("module.exports = require('{literal}');");
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[
+                ("index.js", &forward),
+                ("lib/child.js", "exports.open = function open() {};"),
+            ],
+            "index.js",
+            &["node", "require"],
+        );
+        assert_eq!(
+            prepared
+                .anchors
+                .get("lib/child.js")
+                .is_some_and(|anchors| anchors.contains_key("open")),
+            accepted,
+            "{metadata} {literal}"
+        );
+    }
+}
+
+#[test]
+fn commonjs_forwarding_checks_the_exact_file_before_adding_a_javascript_extension() {
+    let (prepared, _) = commonjs_prepared(
+        r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
+        &[
+            ("index.js", "module.exports = require('./lib/child');"),
+            ("lib/child", "exports.exact = function exact() {};"),
+            ("lib/child.js", "exports.fallback = function fallback() {};"),
+        ],
+        "index.js",
+        &["node", "require"],
+    );
+    assert!(prepared.anchors["lib/child"].contains_key("exact"));
+    assert!(!prepared.anchors.contains_key("lib/child.js"));
+}

@@ -70,11 +70,9 @@ impl PreparedProjectSemantics<'_> {
         previous: Option<&NormalizedGraph>,
         resolve_static: bool,
     ) -> Result<BuiltSemantics, RiftError> {
-        let mut built = self.prepared.build(edges_max, previous)?;
-        built.semantics.outside_namespaces = self.outside_namespaces;
-        if built.beyond_declaration_bound.is_empty() && built.refused_contributions.is_empty() {
-            let sources = self
-                .documents
+        let admitted_all = self.admitted_all();
+        let sources = if admitted_all {
+            self.documents
                 .iter()
                 .zip(&self.placements)
                 .map(|(document, placed)| StaticSource {
@@ -83,14 +81,17 @@ impl PreparedProjectSemantics<'_> {
                     facts: document.syntax(),
                     placement: &placed.placement,
                 })
-                .collect::<Vec<_>>();
-            if resolve_static {
-                built
-                    .semantics
-                    .add_static_resolution(&sources, &self.input, edges_max);
-            } else {
-                built.semantics.defer_static_resolution(&sources);
-            }
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let static_inputs = resolve_static.then_some((sources.as_slice(), &self.input));
+        let mut built =
+            self.prepared
+                .build_with_external(edges_max, previous, None, static_inputs)?;
+        built.semantics.outside_namespaces = self.outside_namespaces;
+        if !resolve_static && admitted_all {
+            built.semantics.defer_static_resolution(&sources);
         }
         Ok(built)
     }

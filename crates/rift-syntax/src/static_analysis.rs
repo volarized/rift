@@ -144,6 +144,8 @@ pub enum StaticBindingKind {
         /// Authored value path.
         value: ByteRange,
     },
+    /// A Python name assigned the `None` literal.
+    PythonNone,
     /// A Python `for` loop target bound to each element of the iterated value.
     PythonElement {
         /// Authored iterated expression.
@@ -374,6 +376,8 @@ pub struct StaticFactsParts {
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
     /// after later statements of the enclosing scope.
     pub expression_scopes: Vec<ByteRange>,
+    /// Python names checked for a non-`None` value and the bodies the checks admit.
+    pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
     /// relate the closure's parameters to the callee's declared parameters.
     pub closure_calls: Vec<(ByteRange, Vec<ByteRange>)>,
@@ -609,6 +613,12 @@ impl StaticFacts {
         &self.0.expression_scopes
     }
 
+    /// Python names checked for a non-`None` value and the bodies the checks admit.
+    #[must_use]
+    pub fn non_none_guards(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.non_none_guards
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         [
             vector_capacity(&self.0.references),
@@ -644,6 +654,7 @@ impl StaticFacts {
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
+            vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.closure_calls),
         ]
         .into_iter()
@@ -699,6 +710,7 @@ impl StaticFacts {
             self.receiver_arguments().len(),
             self.loops().len(),
             self.expression_scopes().len(),
+            self.non_none_guards().len(),
             self.closure_calls().len(),
         ];
         if lengths
@@ -891,7 +903,11 @@ impl StaticFacts {
             && unsupported
             && implementations
             && rust
-            && flow)
+            && flow
+            && self
+                .non_none_guards()
+                .iter()
+                .all(|(name, body)| valid(*name) && valid(*body) && name.end <= body.start))
         {
             return errors::syntax::facts_range_invalid().fail();
         }
@@ -950,6 +966,7 @@ impl StaticBinding {
             StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
+            | StaticBindingKind::PythonNone
             | StaticBindingKind::PythonGlobal
             | StaticBindingKind::PythonNonlocal
             | StaticBindingKind::RustTypeParameter => true,

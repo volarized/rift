@@ -400,6 +400,8 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     /// Python annotation ranges by start, which can be evaluated after later statements.
     python_annotations: BTreeMap<u64, u64>,
+    /// Python names with a non-None check and the branch it admits.
+    python_non_none: BTreeMap<&'source str, Vec<(ByteRange, ByteRange)>>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     /// Declaration name to the named element type its written array type states.
@@ -533,6 +535,7 @@ impl<'source> File<'source> {
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
             python_annotations: BTreeMap::new(),
+            python_non_none: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             element_types: BTreeMap::new(),
@@ -574,6 +577,16 @@ impl<'source> File<'source> {
     }
 
     fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
+        for &(name, body) in self.facts.non_none_guards() {
+            if !work.charge() {
+                return None;
+            }
+            let written = self.text(name)?;
+            self.python_non_none
+                .entry(written)
+                .or_default()
+                .push((name, body));
+        }
         for binding in self.facts.bindings() {
             if !work.charge() {
                 return None;

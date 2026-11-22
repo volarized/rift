@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use rift_error::{RiftError, errors};
@@ -18,8 +18,8 @@ const RELEASED_KEYS_MAX: usize = 4096;
 
 /// Count and material bounds on the views one store retains.
 ///
-/// A capture past either bound releases the least recently used views first; only a view
-/// whose own material exceeds `bytes_max` is refused.
+/// Captures and publications release least recently used views when they exceed a bound.
+/// A capture whose own additional material exceeds `bytes_max` is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetainedViewLimits {
     views_max: usize,
@@ -50,7 +50,7 @@ impl RetainedViewLimits {
         self.views_max
     }
 
-    /// Most material the retained views hold together.
+    /// Most material the views hold beyond the current publication.
     #[must_use]
     pub fn bytes_max(&self) -> usize {
         self.bytes_max
@@ -493,6 +493,8 @@ struct State {
     expired: BTreeSet<String>,
     serial: u64,
     uses: u64,
+    current: Weak<ReadService>,
+    current_limits: Option<RetainedViewLimits>,
 }
 
 impl State {
@@ -542,8 +544,11 @@ impl State {
     }
 
     /// Material one view charges when it is the only one retained.
-    fn single_view_bytes(key: &str, held: &HeldView, bytes_max: usize) -> usize {
-        let mut alone = Self::default();
+    fn single_view_bytes(&self, key: &str, held: &HeldView, bytes_max: usize) -> usize {
+        let mut alone = Self {
+            current: Weak::clone(&self.current),
+            ..Self::default()
+        };
         alone.views.insert(key.to_owned(), held.clone());
         alone.admitted_material_bytes(bytes_max)
     }
@@ -559,7 +564,7 @@ impl State {
 
     fn admitted_material_bytes(&self, bytes_max: usize) -> usize {
         let cached = self.material_bytes();
-        if cached != usize::MAX && cached > bytes_max {
+        if self.current.strong_count() == 0 && cached != usize::MAX && cached > bytes_max {
             self.material_bytes_with_shared_indexes(true)
         } else {
             cached
@@ -567,7 +572,11 @@ impl State {
     }
 
     fn material_bytes_with_shared_indexes(&self, shared: bool) -> usize {
-        let mut charged = get_size2::StandardTracker::default();
+        let (publication, charged) = self.published_allocations();
+        self.held_bytes(shared || publication.is_some(), charged)
+    }
+
+    fn held_bytes(&self, shared: bool, mut charged: get_size2::StandardTracker) -> usize {
         let mut total = self.store_bytes(self.views.len());
         for (key, held) in &self.views {
             let (bytes, next) = Self::view_bytes(key.capacity(), held, shared, charged);
@@ -575,6 +584,41 @@ impl State {
             total = total.saturating_add(bytes);
         }
         total
+    }
+
+    /// Counts each distinct retired index at its cached standalone size. Distinct indexes
+    /// can share allocations, so this can prove a fit but cannot decide a release.
+    fn cached_upper_bytes(&self, current: &ReadService) -> usize {
+        use get_size2::GetSizeTracker;
+        let mut charged = get_size2::StandardTracker::default();
+        if let Some(view) = current.index().cached_symbol_view() {
+            charged.track(Arc::as_ptr(view));
+        }
+        self.held_bytes(false, charged)
+    }
+
+    /// Starts an exact shared measure with the allocations the current publication owns.
+    /// Keeps that publication alive for the duration of the measure.
+    fn published_allocations(&self) -> (Option<Arc<ReadService>>, get_size2::StandardTracker) {
+        use get_size2::GetSizeTracker;
+
+        let mut indexes = self.views.values().map(|held| &held.material.index);
+        let mut charged = get_size2::StandardTracker::default();
+        let Some((first, current)) = indexes.next().zip(self.current.upgrade()) else {
+            return (None, charged);
+        };
+        let index = current.index();
+        if let Some(view) = index.cached_symbol_view()
+            && Arc::ptr_eq(first, view)
+            && indexes.all(|held| Arc::ptr_eq(held, view))
+        {
+            charged.track(Arc::as_ptr(view));
+        } else {
+            #[cfg(test)]
+            tests::PUBLICATION_WALKS.set(tests::PUBLICATION_WALKS.get() + 1);
+            charged = index.retained_view_baseline();
+        }
+        (Some(current), charged)
     }
 
     /// Material the store itself charges while it holds `views` views: the two maps and
@@ -629,8 +673,9 @@ impl State {
     /// shows cannot stay under `bytes_max`, answering how many it released and whether
     /// the measure it took settles that the views left fit.
     ///
-    /// It acts only when the cached charges pass the bound. The shared material is then
-    /// measured once, the most recently used view first: each view adds what the views
+    /// A finite cached upper bound can prove every view fits. A larger bound needs a
+    /// shared measure before it can release a view.
+    /// The shared measure runs most recently used view first. Each view adds what the views
     /// before it do not already hold, so the views that fit are a prefix of that order
     /// and the rest are the least recently used. Measuring stops at the first view that
     /// passes the bound. Measuring every remaining view again after each release answered
@@ -639,14 +684,32 @@ impl State {
     /// The views left after the releases are the ones measured to fit, so their material
     /// is known; the releases changed only the released keys the store charges. The
     /// measure settles when that sum fits, with no second walk.
-    fn release_measured(&mut self, kept: &str, bytes_max: usize) -> (usize, bool) {
-        let cached = self.material_bytes();
-        if cached == usize::MAX || cached <= bytes_max {
-            return (0, false);
+    fn release_measured(&mut self, kept: Option<&str>, bytes_max: usize) -> (usize, bool) {
+        if let Some(current) = self.current.upgrade() {
+            let upper = self.cached_upper_bytes(&current);
+            let fits = upper != usize::MAX && upper <= bytes_max;
+            if kept.is_none() {
+                rift_tracing::debug!(
+                    component = "server",
+                    rows = self.views.len(),
+                    upper_bytes = upper,
+                    bytes_max,
+                    exact = !fits,
+                    "checking retained views at publication"
+                );
+            }
+            if fits {
+                return (0, true);
+            }
+        } else {
+            let cached = self.material_bytes();
+            if cached == usize::MAX || cached <= bytes_max {
+                return (0, false);
+            }
         }
         let mut order = self.views.iter().collect::<Vec<_>>();
-        order.sort_by_key(|(key, held)| (key.as_str() != kept, std::cmp::Reverse(held.used)));
-        let mut charged = get_size2::StandardTracker::default();
+        order.sort_by_key(|(key, held)| (Some(key.as_str()) != kept, std::cmp::Reverse(held.used)));
+        let (_publication, mut charged) = self.published_allocations();
         let mut views_bytes = 0_usize;
         let mut fits = 0_usize;
         let mut fit_bytes = 0_usize;
@@ -655,25 +718,22 @@ impl State {
             charged = next;
             views_bytes = views_bytes.saturating_add(bytes);
             let total = self.store_bytes(position + 1).saturating_add(views_bytes);
-            if position > 0 && (total == usize::MAX || total > bytes_max) {
+            if (position > 0 || kept.is_none()) && (total == usize::MAX || total > bytes_max) {
                 break;
             }
             fits = position + 1;
             fit_bytes = views_bytes;
         }
-        let released = self.views.len() - fits.max(1);
+        let released = self.views.len() - fits.max(usize::from(kept.is_some()));
         for _ in 0..released {
-            self.release_least_recent(Some(kept));
+            self.release_least_recent(kept);
         }
         // With nothing released the measure is the one `exceeds` takes. A release grows
         // the released keys by a few bytes: the views left are charged what the walk
         // measured for them, and the store is charged again with the keys it now holds.
         // Only when those few bytes pass the bound does the caller measure once more.
         let left = self.store_bytes(self.views.len()).saturating_add(fit_bytes);
-        (
-            released,
-            released == 0 || (left != usize::MAX && left <= bytes_max),
-        )
+        (released, left != usize::MAX && left <= bytes_max)
     }
 }
 
@@ -697,10 +757,52 @@ impl LocalSymbolViews {
         }
     }
 
+    /// Sets the current publication and charges the material this store now retains.
+    ///
+    /// The store keeps only a weak reference to the publication. A newly retired view
+    /// may exceed the retained bound, so publication can release older views even when
+    /// no request has captured a new one.
+    pub fn publish_current(&self, reads: &Arc<ReadService>, limits: Option<RetainedViewLimits>) {
+        self.publish_current_at(reads, limits, SystemTime::now());
+    }
+
+    fn publish_current_at(
+        &self,
+        reads: &Arc<ReadService>,
+        limits: Option<RetainedViewLimits>,
+        now: SystemTime,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let publication = Arc::downgrade(reads);
+        let limits = limits.or(state.current_limits);
+        if Weak::ptr_eq(&state.current, &publication) && limits == state.current_limits {
+            return;
+        }
+        state.current = publication;
+        state.current_limits = limits;
+        if let Some(limits) = limits {
+            state.expire(now);
+            while state.views.len() > limits.views_max && state.release_least_recent(None) {}
+            rift_tracing::traced!(
+                component = "server",
+                operation = "retained_views.publish",
+                {
+                    let (_, settled) = state.release_measured(None, limits.bytes_max);
+                    if !settled {
+                        while state.exceeds(limits.bytes_max) && state.release_least_recent(None) {}
+                    }
+                }
+            );
+        }
+    }
+
     /// Captures one exact publication under `limits`, releasing least recently used views.
     ///
-    /// Refuses admission, keeping every retained view, only when the publication's own
-    /// material exceeds the byte bound.
+    /// Refuses a capture whose own additional material passes the configured bound before
+    /// releasing existing views.
     ///
     /// # Errors
     /// Returns a registered read failure if the service-issued key cannot be constructed.
@@ -750,6 +852,12 @@ impl LocalSymbolViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expire(now);
+        let limits = state
+            .current_limits
+            .map_or(limits, |current| RetainedViewLimits {
+                views_max: limits.views_max.min(current.views_max),
+                bytes_max: limits.bytes_max.min(current.bytes_max),
+            });
         let retained_bytes = input.retained_bytes;
         let index_bytes = input.material.index.retained_material_bytes();
         let ready = input.ready;
@@ -777,13 +885,13 @@ impl LocalSymbolViews {
             query: input.query,
             used: state.next_use(),
         };
-        let alone = State::single_view_bytes(&id, &held, limits.bytes_max);
+        let alone = state.single_view_bytes(&id, &held, limits.bytes_max);
         if alone == usize::MAX || alone > limits.bytes_max {
             refuse_material(&state, limits, retained_bytes, index_bytes, ready, alone);
             return Ok(None);
         }
-        let released = Self::admit_material(&mut state, &id, held, limits);
-        if state.exceeds(limits.bytes_max) {
+        let (released, fits) = Self::admit_material(&mut state, &id, held, limits);
+        if !fits {
             // Every other view is released; the released keys alone push past the bound.
             state.views.remove(&id);
             refuse_material(&state, limits, retained_bytes, index_bytes, ready, alone);
@@ -839,28 +947,31 @@ impl LocalSymbolViews {
 
     /// Inserts `held` under `id`, releasing least recently used views past either bound.
     ///
-    /// Returns the released count. At most every previously retained view is released, so
-    /// the loops run at most `views_max` times; each byte check costs one walk of the views.
+    /// Returns the released count and whether the result fits the bound. At most every
+    /// previous view is released, so the loops run at most `views_max` times.
     fn admit_material(
         state: &mut State,
         id: &str,
         held: HeldView,
         limits: RetainedViewLimits,
-    ) -> usize {
+    ) -> (usize, bool) {
         let mut released = 0;
         while state.views.len() >= limits.views_max && state.release_least_recent(None) {
             released += 1;
         }
         state.views.insert(id.to_owned(), held);
-        let (measured, settled) = state.release_measured(id, limits.bytes_max);
+        let (measured, settled) = state.release_measured(Some(id), limits.bytes_max);
         released += measured;
         if settled {
-            return released;
+            return (released, true);
         }
-        while state.exceeds(limits.bytes_max) && state.release_least_recent(Some(id)) {
+        while state.exceeds(limits.bytes_max) {
+            if !state.release_least_recent(Some(id)) {
+                return (released, false);
+            }
             released += 1;
         }
-        released
+        (released, true)
     }
 
     fn next_key(&self, state: &mut State) -> Result<String, RiftError> {

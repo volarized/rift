@@ -29,7 +29,7 @@ use rift_protocol::read::EdgeKind;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 
 use crate::EnclosingDefinitions;
-use crate::static_resolution::{ExternalOccurrence, StaticOccurrence};
+use crate::static_resolution::{ExternalOccurrence, StaticOccurrence, StaticResolution};
 
 /// Most edges one [`EdgeStore`] holds across both directions combined.
 ///
@@ -120,22 +120,21 @@ impl Edge {
 /// Complexity is proportional to the graph's own record and contribution count, both
 /// already bounded by [`PublicationLimits`](rift_provider::PublicationLimits).
 struct UnitDefinitions {
-    by_unit: BTreeMap<SourceUnitId, EnclosingDefinitions<SymbolId>>,
+    spans: DefinitionSpans,
     edge_modules: BTreeMap<SourceUnitId, SymbolId>,
+}
+
+struct DefinitionSpans(BTreeMap<SourceUnitId, EnclosingDefinitions<SymbolId>>);
+
+#[cfg(test)]
+thread_local! {
+    static DEFINITION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl UnitDefinitions {
     fn build(graph: &NormalizedGraph) -> Self {
-        Self::build_with(graph, None)
-    }
-
-    /// `known` carries the source modules an earlier build over the same `graph` derived;
-    /// they depend on the graph alone, so a later build reads them instead of parsing
-    /// every record identity again.
-    fn build_with(
-        graph: &NormalizedGraph,
-        known: Option<&BTreeMap<SourceUnitId, SymbolId>>,
-    ) -> Self {
+        #[cfg(test)]
+        DEFINITION_BUILDS.set(DEFINITION_BUILDS.get() + 1);
         let mut by_unit: BTreeMap<SourceUnitId, Vec<(u64, u64, SymbolId)>> = BTreeMap::new();
         let mut edge_modules = BTreeMap::<SourceUnitId, Option<SymbolId>>::new();
         let mut declared_edge_modules = BTreeMap::<SourceUnitId, SymbolId>::new();
@@ -158,29 +157,27 @@ impl UnitDefinitions {
                 .filter_map(|contribution| contribution.source())
             {
                 let range = binding.range();
-                if known.is_none() {
-                    let (is_module, parent) = declared.get_or_insert_with(|| {
-                        let is_module = contributions
-                            .iter()
-                            .filter_map(|contribution| contribution.facts())
-                            .any(|facts| {
-                                facts.language().name == "python" && facts.kind().0 == "module"
-                            });
-                        (is_module, edge_module_parent(identity))
-                    });
-                    if *is_module {
-                        declared_edge_modules.insert(binding.unit().clone(), identity.clone());
-                    }
-                    edge_modules
-                        .entry(binding.unit().clone())
-                        .and_modify(|current| {
-                            *current = current
-                                .as_ref()
-                                .zip(parent.as_ref())
-                                .and_then(|(left, right)| common_modules.common(left, right));
-                        })
-                        .or_insert_with(|| parent.clone());
+                let (is_module, parent) = declared.get_or_insert_with(|| {
+                    let is_module = contributions
+                        .iter()
+                        .filter_map(|contribution| contribution.facts())
+                        .any(|facts| {
+                            facts.language().name == "python" && facts.kind().0 == "module"
+                        });
+                    (is_module, edge_module_parent(identity))
+                });
+                if *is_module {
+                    declared_edge_modules.insert(binding.unit().clone(), identity.clone());
                 }
+                edge_modules
+                    .entry(binding.unit().clone())
+                    .and_modify(|current| {
+                        *current = current
+                            .as_ref()
+                            .zip(parent.as_ref())
+                            .and_then(|(left, right)| common_modules.common(left, right));
+                    })
+                    .or_insert_with(|| parent.clone());
                 by_unit.entry(binding.unit().clone()).or_default().push((
                     range.start(),
                     range.end(),
@@ -192,31 +189,30 @@ impl UnitDefinitions {
             .into_iter()
             .map(|(unit, spans)| (unit, EnclosingDefinitions::new(spans)))
             .collect();
-        let edge_modules = if let Some(known) = known {
-            known.clone()
-        } else {
-            let mut edge_modules = edge_modules
-                .into_iter()
-                .filter_map(|(unit, identity)| identity.map(|identity| (unit, identity)))
-                .collect::<BTreeMap<_, _>>();
-            edge_modules.extend(declared_edge_modules);
-            edge_modules
-        };
+        let mut edge_modules = edge_modules
+            .into_iter()
+            .filter_map(|(unit, identity)| identity.map(|identity| (unit, identity)))
+            .collect::<BTreeMap<_, _>>();
+        edge_modules.extend(declared_edge_modules);
         Self {
-            by_unit,
+            spans: DefinitionSpans(by_unit),
             edge_modules,
         }
     }
+}
 
-    /// The innermost definition whose range contains `occurrence`'s range in its unit,
-    /// answered by [`EnclosingDefinitions::resolve`]; `None` when no definition in that
-    /// unit encloses it.
-    fn resolve(&self, occurrence: &DeclarationBinding) -> Option<&SymbolId> {
+impl DefinitionSpans {
+    /// The innermost definition enclosing the occurrence, then its unit's module.
+    fn resolve<'definitions>(
+        &'definitions self,
+        edge_modules: &'definitions BTreeMap<SourceUnitId, SymbolId>,
+        occurrence: &DeclarationBinding,
+    ) -> Option<&'definitions SymbolId> {
         let range = occurrence.range();
-        self.by_unit
+        self.0
             .get(occurrence.unit())
             .and_then(|definitions| definitions.resolve(range.start(), range.end()))
-            .or_else(|| self.edge_modules.get(occurrence.unit()))
+            .or_else(|| edge_modules.get(occurrence.unit()))
     }
 }
 
@@ -411,14 +407,15 @@ impl get_size2::GetSize for EdgeStore {
 /// Edges of static occurrences whose targets a dependency or standard library owns.
 fn admit_external<'a>(
     external: &'a [ExternalOccurrence],
-    enclosing: &'a UnitDefinitions,
+    spans: &'a DefinitionSpans,
+    edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     admitted: &mut BTreeMap<&'a SymbolId, Vec<Edge>>,
 ) {
     for occurrence in external {
         let Some(from) = occurrence
             .edge_from
             .as_ref()
-            .or_else(|| enclosing.resolve(&occurrence.binding))
+            .or_else(|| spans.resolve(edge_modules, &occurrence.binding))
         else {
             continue;
         };
@@ -443,9 +440,9 @@ fn admit_external<'a>(
 }
 
 impl EdgeStore {
-    pub(crate) fn add_static(
+    fn add_static(
         &mut self,
-        graph: &NormalizedGraph,
+        spans: &DefinitionSpans,
         occurrences: &[StaticOccurrence],
         external: &[ExternalOccurrence],
         edges_max: usize,
@@ -453,9 +450,6 @@ impl EdgeStore {
         if occurrences.is_empty() && external.is_empty() {
             return;
         }
-        // `graph` is the graph this store was built from (`WorkspaceSemantics` builds its
-        // store from its own graph and passes that graph here), so its source modules hold.
-        let enclosing = UnitDefinitions::build_with(graph, Some(&self.edge_modules));
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
@@ -470,7 +464,7 @@ impl EdgeStore {
             let Some(from) = occurrence
                 .edge_from
                 .as_ref()
-                .or_else(|| enclosing.resolve(&occurrence.binding))
+                .or_else(|| spans.resolve(&self.edge_modules, &occurrence.binding))
             else {
                 continue;
             };
@@ -492,7 +486,7 @@ impl EdgeStore {
             };
             admitted.entry(from).or_default().push(edge);
         }
-        admit_external(external, &enclosing, &mut admitted);
+        admit_external(external, spans, &self.edge_modules, &mut admitted);
         for (from, mut edges) in admitted {
             edges.sort_by(edge_order);
             edges.dedup();
@@ -543,13 +537,37 @@ impl EdgeStore {
     /// A zero cap publishes no edges.
     #[must_use]
     pub fn build_capped(graph: &NormalizedGraph, edges_max: usize) -> Self {
-        let enclosing = UnitDefinitions::build(graph);
+        Self::build_with_spans(graph, edges_max).0
+    }
+
+    /// Builds graph adjacency and adds static edges with the same definition spans.
+    pub(crate) fn build_resolving(
+        graph: &NormalizedGraph,
+        edges_max: usize,
+        resolve: impl FnOnce() -> StaticResolution,
+    ) -> (Self, StaticResolution) {
+        let (mut store, spans) = Self::build_with_spans(graph, edges_max);
+        let resolution = resolve();
+        store.add_static(
+            &spans,
+            &resolution.occurrences,
+            &resolution.external,
+            edges_max,
+        );
+        (store, resolution)
+    }
+
+    fn build_with_spans(graph: &NormalizedGraph, edges_max: usize) -> (Self, DefinitionSpans) {
+        let UnitDefinitions {
+            spans,
+            edge_modules,
+        } = UnitDefinitions::build(graph);
         let mut outgoing: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut incoming: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut budget = LoopBudget::new(edges_max);
         let mut dropped_edges: u64 = 0;
         for reference in graph.references() {
-            let Some(from) = enclosing.resolve(reference.binding()) else {
+            let Some(from) = spans.resolve(&edge_modules, reference.binding()) else {
                 continue;
             };
             let kind = role_kind(reference.role());
@@ -605,12 +623,15 @@ impl EdgeStore {
         for edges in incoming.values_mut() {
             edges.sort_by(edge_order);
         }
-        Self {
-            outgoing,
-            incoming,
-            dropped_edges,
-            edge_modules: enclosing.edge_modules,
-        }
+        (
+            Self {
+                outgoing,
+                incoming,
+                dropped_edges,
+                edge_modules,
+            },
+            spans,
+        )
     }
 
     /// Canonical source module used by references outside every declaration.
@@ -994,6 +1015,112 @@ mod tests {
         ];
         let normalized = graph(contributions);
         assert_eq!(EdgeStore::build(&normalized), EdgeStore::build(&normalized));
+    }
+
+    #[test]
+    fn shared_definitions_preserve_capped_graph_and_static_edge_admission() {
+        use super::{
+            DEFINITION_BUILDS, ExternalOccurrence, StaticOccurrence, StaticResolution,
+            UnitDefinitions,
+        };
+        use rift_provider::NormalizedTarget;
+
+        let containing_function = fixture_symbol("caller");
+        let call_target = fixture_symbol("called");
+        let tied = fixture_symbol("tied");
+        let path = "src/lib.rs";
+        let graph = graph(vec![
+            definition("caller", containing_function.as_str(), path, (10, 40)),
+            definition("called", call_target.as_str(), path, (40, 60)),
+            definition("tied", tied.as_str(), path, (10, 40)),
+            reference(
+                "graph_call",
+                binding(path, 20, 25),
+                ReferenceRole::Call,
+                "called",
+            ),
+            reference(
+                "graph_import",
+                binding(path, 62, 66),
+                ReferenceRole::Import,
+                "called",
+            ),
+        ]);
+        let resolution = || {
+            let occurrence = |start, end| StaticOccurrence {
+                binding: binding(path, start, end),
+                target: NormalizedTarget::Symbol(call_target.clone()),
+                target_binding: None,
+                source_digest: rift_core::FileDigest::of(b"fixture"),
+                callee_range: rift_syntax::ByteRange { start, end },
+                role: ReferenceRole::Call,
+                edge_from: None,
+                edge_kind: None,
+            };
+            StaticResolution {
+                occurrences: vec![occurrence(20, 25), occurrence(27, 32), occurrence(2, 6)],
+                external: vec![ExternalOccurrence {
+                    binding: binding(path, 31, 37),
+                    target: fixture_symbol("external"),
+                    callee_range: rift_syntax::ByteRange { start: 31, end: 37 },
+                    role: ReferenceRole::Call,
+                    edge_from: None,
+                    edge_kind: None,
+                    declared: true,
+                }],
+                ..StaticResolution::default()
+            }
+        };
+        let module = symbol("rift://symbol/local/rust/fixture");
+        for cap in 0..=6 {
+            let before = DEFINITION_BUILDS.get();
+            let (shared, _) = EdgeStore::build_resolving(&graph, cap, resolution);
+            assert_eq!(DEFINITION_BUILDS.get() - before, 1, "cap {cap}");
+
+            let mut separate = EdgeStore::build_capped(&graph, cap);
+            let fresh = UnitDefinitions::build(&graph);
+            let separate_resolution = resolution();
+            separate.add_static(
+                &fresh.spans,
+                &separate_resolution.occurrences,
+                &separate_resolution.external,
+                cap,
+            );
+            assert_eq!(DEFINITION_BUILDS.get() - before, 3, "cap {cap}");
+            assert_eq!(
+                shared, separate,
+                "ordered edges in both directions at cap {cap}"
+            );
+            assert_eq!(shared.edges().count(), cap.min(5), "cap {cap}");
+            // At zero, the graph edge that would filter the duplicate static call
+            // never enters the store. Once both graph edges fit, only five edges remain.
+            if cap == 0 {
+                assert_eq!(shared.dropped_edges(), 6);
+            } else if cap >= 2 {
+                assert_eq!(shared.dropped_edges(), 5_u64.saturating_sub(cap as u64));
+            }
+            assert_eq!(shared.edge_module(&source_unit(path)), Some(&module));
+            if cap == 5 {
+                let rows = shared.incoming(&call_target);
+                let inner = rows
+                    .iter()
+                    .find(|edge| edge.occurrence().range().start() == 20)
+                    .expect("graph call resolves within tied spans")
+                    .from();
+                assert!(inner == &containing_function || inner == &tied);
+                assert!(rows.iter().any(|edge| edge.from() == inner && edge.occurrence().range().start() == 27));
+                assert!(
+                    rows.iter().any(
+                        |edge| edge.from() == &module && edge.occurrence().range().start() == 2
+                    )
+                );
+                assert!(
+                    rows.iter()
+                        .any(|edge| edge.from() == &module
+                            && edge.occurrence().range().start() == 62)
+                );
+            }
+        }
     }
 
     #[test]
