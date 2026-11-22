@@ -689,7 +689,7 @@ impl EdgeStore {
                 &resolution.occurrences,
                 &resolution.external,
                 edges_max,
-            )
+            );
         });
         (store, resolution)
     }
