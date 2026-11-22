@@ -1804,6 +1804,78 @@ fn javascript_js_modules_follow_the_nearest_explicit_package_mode() {
 }
 
 #[test]
+fn test_typescript_merged_type_alias_keeps_raw_property_containment() {
+    let source = "declare namespace Config {
+  namespace Options { export type Mode = 'strict'; }
+  export type Options = {
+    charset?: string;
+    allowArbitraryExtensions?: boolean;
+  };
+  namespace Ambiguous { export type Yes = true; }
+  namespace Ambiguous { export type No = false; }
+  export type Ambiguous = { other?: string };
+}
+";
+    let path = "main.d.ts";
+    let result = resolution("typescript", &[(path, source)], &[], WORK_MAX);
+    for (container, name, declaration) in [
+        ("Options", "charset", "charset?: string"),
+        (
+            "Options",
+            "allowArbitraryExtensions",
+            "allowArbitraryExtensions?: boolean",
+        ),
+    ] {
+        let child = format!("/Config/{container}/{name}");
+        let expected_parent = format!("/Config/{container}");
+        let mut matches = result.occurrences.iter().filter(|edge| {
+            edge.edge_kind == Some(rift_protocol::read::EdgeKind::Contains)
+                && target(edge).ends_with(&child)
+        });
+        let edge = matches.next().expect("stored containment occurrence");
+        assert!(matches.next().is_none());
+        assert!(
+            edge.edge_from
+                .as_ref()
+                .expect("authored alias container")
+                .as_str()
+                .ends_with(&expected_parent)
+        );
+        assert_eq!(source_of(edge, source), name);
+        let binding = edge
+            .target_binding
+            .as_ref()
+            .expect("authored property binding");
+        assert_eq!(binding.unit().key().as_str(), path);
+        let start = usize::try_from(binding.range().start()).expect("property start");
+        let end = usize::try_from(binding.range().end()).expect("property end");
+        assert_eq!(&source[start..end], declaration);
+    }
+
+    for (suffix, name) in [
+        ("/Config/Options/Mode", "Mode"),
+        ("/Config/Ambiguous/other", "other"),
+    ] {
+        let edge = result
+            .occurrences
+            .iter()
+            .find(|edge| {
+                edge.edge_kind == Some(rift_protocol::read::EdgeKind::Contains)
+                    && target(edge).ends_with(suffix)
+                    && source_of(edge, source) == name
+            })
+            .expect("existing fallback containment");
+        assert!(
+            edge.edge_from
+                .as_ref()
+                .expect("file module")
+                .as_str()
+                .ends_with("main.d.ts")
+        );
+    }
+}
+
+#[test]
 fn javascript_empty_analysis_completes_without_an_unresolved_site() {
     let result = resolution(
         "javascript",

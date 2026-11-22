@@ -242,7 +242,9 @@ impl<'source> Index<'source> {
                         .or_else(|| file.qualified_target(container))
                 })
                 .and_then(|target| self.javascript_identity(target));
-            let from = from.or_else(|| module.clone());
+            let from = from
+                .or_else(|| self.javascript_merged_alias_property_parent(file, target, work))
+                .or_else(|| module.clone());
             if let Some(from) = from {
                 result.record(self.javascript_declaration_edge(
                     file,
@@ -255,6 +257,48 @@ impl<'source> Index<'source> {
                 self.javascript_overrides(file, symbol, work, result);
             }
         }
+    }
+
+    /// A property written inside the alias facet of one local namespace and type alias.
+    fn javascript_merged_alias_property_parent(
+        &self,
+        file: &File<'source>,
+        child: Target<'source>,
+        work: &mut Work,
+    ) -> Option<SymbolId> {
+        if child.symbol.syntax_element_kind != Some("property_signature") {
+            return None;
+        }
+        let [left, right] = file
+            .by_qualified_name
+            .get(child.symbol.container.as_deref()?)?
+            .as_slice()
+        else {
+            return None;
+        };
+        if !work.charge() || !work.charge() {
+            return None;
+        }
+        let (alias, namespace) = match (left.syntax_element_kind, right.syntax_element_kind) {
+            (Some("type_alias_declaration"), Some("internal_module")) => (*left, *right),
+            (Some("internal_module"), Some("type_alias_declaration")) => (*right, *left),
+            _ => return None,
+        };
+        if alias.container != namespace.container
+            || !alias.item_range.encloses(child.symbol.item_range)
+            || (alias.item_range.start < namespace.item_range.end
+                && namespace.item_range.start < alias.item_range.end)
+        {
+            return None;
+        }
+        let target = |symbol| Target {
+            file: file.document,
+            symbol,
+        };
+        let identity = self.javascript_identity(target(alias))?;
+        (self.javascript_identity(target(namespace))? == identity
+            && self.javascript_identity(child)? != identity)
+            .then_some(identity)
     }
 
     fn javascript_module_reference(
