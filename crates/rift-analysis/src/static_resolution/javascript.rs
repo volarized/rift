@@ -363,7 +363,7 @@ impl<'source> Index<'source> {
     /// declaration whose own shape is the signature: a function or constructor type alias,
     /// or an interface with a call or construct signature. The call then targets the
     /// binding itself; no function body is chosen for it.
-    fn javascript_declared_signature(
+    pub(super) fn javascript_declared_signature(
         &self,
         target: Target<'source>,
         constructs: bool,
@@ -481,7 +481,8 @@ impl<'source> Index<'source> {
                     symbol,
                 })
             }),
-            StaticBindingKind::JavaScriptInstance { .. } => file.target_at(binding.name),
+            StaticBindingKind::JavaScriptInstance { .. }
+            | StaticBindingKind::JavaScriptConstInstance { .. } => file.target_at(binding.name),
             StaticBindingKind::JavaScriptImport { module, export } => {
                 let name = match export {
                     Some(range) => file.text(range)?,
@@ -606,7 +607,8 @@ impl<'source> Index<'source> {
                 role,
                 work,
             ),
-            StaticBindingKind::JavaScriptInstance { constructor } => {
+            StaticBindingKind::JavaScriptInstance { constructor }
+            | StaticBindingKind::JavaScriptConstInstance { constructor } => {
                 let class = self.javascript_target(
                     file,
                     constructor,

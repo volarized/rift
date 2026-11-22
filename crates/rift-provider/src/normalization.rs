@@ -205,7 +205,6 @@ pub struct NormalizedGraph {
     publications: Arc<PublicationSet>,
     records: Vec<SymbolRecord>,
     records_by_contribution: BTreeMap<ContributionReference, usize>,
-    contribution_positions: BTreeMap<ContributionKey, usize>,
     candidates: Vec<AssociationCandidate>,
     references: Vec<NormalizedReference>,
     edges: Vec<NormalizedEdge>,
@@ -272,16 +271,10 @@ impl NormalizedGraph {
         self.record_for(reference).and_then(SymbolRecord::identity)
     }
 
-    /// Returns captured Contribution by immutable key, through the position
-    /// index assembly built: the workspace map resolves a contribution per
-    /// record and per reference, and a scan per lookup made one map build
-    /// cost O(records x contributions).
+    /// Returns the Contribution at the position its provider publication admitted.
     #[must_use]
     pub fn contribution(&self, key: &ContributionKey) -> Option<&Contribution> {
-        let position = *self.contribution_positions.get(key)?;
-        self.publications
-            .provider(key.reference().provider())
-            .and_then(|publication| publication.contributions().get(position))
+        self.publications.contribution(key)
     }
 
     /// Returns normalized References.
@@ -791,7 +784,6 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         external,
     );
 
-    let contribution_positions = contribution_positions(&publications);
     Ok(NormalizedGraph {
         index_revision,
         source_revision,
@@ -799,24 +791,10 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         publications,
         records,
         records_by_contribution,
-        contribution_positions,
         candidates,
         references,
         edges,
     })
-}
-
-/// Positions every publication's contributions by key, once per assembled
-/// graph. Each key already names its provider, so the position within that
-/// provider's contribution list is the only fact a lookup still needs.
-fn contribution_positions(publications: &PublicationSet) -> BTreeMap<ContributionKey, usize> {
-    let mut positions = BTreeMap::new();
-    for publication in publications.publications() {
-        for (position, contribution) in publication.contributions().iter().enumerate() {
-            positions.insert(contribution.key().clone(), position);
-        }
-    }
-    positions
 }
 
 #[derive(Debug)]
@@ -976,11 +954,6 @@ impl get_size2::GetSize for NormalizedGraph {
         let mut bytes = rift_protocol::btree_material_bytes::<ContributionReference, usize>(
             self.records_by_contribution.len(),
         )
-        .saturating_add(
-            rift_protocol::btree_material_bytes::<ContributionKey, usize>(
-                self.contribution_positions.len(),
-            ),
-        )
         .saturating_add(2 * std::mem::size_of::<usize>());
         let (field, next) = rift_protocol::retained_arc_material(
             &self.publications,
@@ -994,10 +967,6 @@ impl get_size2::GetSize for NormalizedGraph {
         tracker = next;
         let (field, next) =
             get_size2::GetSize::get_heap_size_with_tracker(&self.records_by_contribution, tracker);
-        bytes = bytes.saturating_add(field);
-        tracker = next;
-        let (field, next) =
-            get_size2::GetSize::get_heap_size_with_tracker(&self.contribution_positions, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         let (field, next) =
@@ -1376,26 +1345,34 @@ mod tests {
                 let answered = graph
                     .contribution(contribution.key())
                     .expect("every published key resolves");
-                assert_eq!(
-                    answered.key(),
-                    contribution.key(),
-                    "the lookup answers the exact key it was asked for"
+                assert!(
+                    std::ptr::eq(answered, contribution),
+                    "the lookup answers from the provider publication that admitted the key"
                 );
             }
         }
-        let unpublished = exact(
-            "syntax",
-            2,
-            "one",
-            1,
-            binding("src/lib.rs", 0),
-            None,
-            vec![],
+        let old = ContributionKey::new(
+            provider("syntax"),
+            provider_revision(1),
+            ProviderSymbolId::new("one").expect("provider symbol"),
         );
-        assert!(
-            graph.contribution(unpublished.key()).is_none(),
-            "a key the set never published resolves to nothing"
+        let new = independent("syntax", 2, "one", vec![]);
+        let new_key = new.key().clone();
+        let missing = independent("syntax", 1, "missing", vec![]);
+        let other = independent("other", 1, "one", vec![]);
+        for key in [&new_key, missing.key(), other.key()] {
+            assert!(graph.contribution(key).is_none());
+        }
+
+        let next_set = Arc::new(
+            set.replaced(publication("syntax", 2, vec![new]))
+                .expect("replacement"),
         );
+        let next = normalize(&next_set, 1, Some(&graph));
+        assert!(next.contribution(&old).is_none());
+        assert!(next.contribution(&new_key).is_some());
+        assert!(graph.contribution(&old).is_some());
+        assert!(graph.contribution(&new_key).is_none());
     }
 
     #[test]
@@ -1429,6 +1406,14 @@ mod tests {
         assert_eq!(graph.records().len(), 2);
         assert!(graph.record_for(&reference("syntax", "one")).is_some());
         assert!(graph.record_for(&reference("syntax", "two")).is_none());
+        let captured = &set
+            .provider(&provider("syntax"))
+            .expect("syntax")
+            .contributions()[1];
+        assert!(std::ptr::eq(
+            graph.contribution(captured.key()).expect("captured row"),
+            captured
+        ));
         assert!(graph.record_for(&reference("syntax", "guide")).is_some());
     }
 

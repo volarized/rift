@@ -110,6 +110,74 @@ fn test_commonjs_local_object_members_store_distinct_lexical_identities() {
 }
 
 #[test]
+fn test_commonjs_callable_assignment_chain_keeps_the_inner_body_and_outer_alias() {
+    let source = "var req = Object.create(null);
+module.exports = req;
+function value() { return 1; }
+req.get =
+req.header = function header() { return value(); };
+function read() { return req.get(); }
+function shadow() { const req = {}; req.get = 0; }
+
+const different = {};
+const other = {};
+different.alias = other.inner = function inner() { return value(); };
+function parameter(different) {
+    different.alias = other.nested = function nested() { return value(); };
+}
+const changed = {};
+changed.alias = changed.inner = function inner() { return value(); };
+changed.alias = 0;
+const replaced = {};
+replaced.alias = replaced.inner = function inner() { return value(); };
+replaced.inner = 0;
+const computed = {};
+const key = ['alias'].join('');
+computed[key] = computed.inner = function inner() { return value(); };
+const continued = {};
+continued.alias = (continued.inner = function inner() { return value(); }, 0);
+const returned = {};
+returned.alias = returned.inner = value();
+";
+    for path in ["main.cjs", "main.cts"] {
+        let (_directory, index) = workspace(&[(path, source)]);
+        let from = format!("{path}/req/get");
+        let to = format!("{path}/req/header");
+        let aliases = index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Aliases)
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 1, "{path} aliases");
+        let edge = aliases[0];
+        assert!(edge.from().as_str().ends_with(&from));
+        assert!(edge.to().as_str().ends_with(&to));
+        let range = edge.occurrence().range();
+        let start = usize::try_from(range.start()).expect("start");
+        let end = usize::try_from(range.end()).expect("end");
+        assert_eq!(&source[start..end], "get");
+        assert!(has_edge(
+            &index,
+            EdgeKind::Calls,
+            &to,
+            &format!("{path}/value")
+        ));
+        assert!(has_edge(
+            &index,
+            EdgeKind::Calls,
+            &format!("{path}/read"),
+            &from
+        ));
+        assert!(!has_edge(
+            &index,
+            EdgeKind::Calls,
+            &from,
+            &format!("{path}/value")
+        ));
+    }
+}
+
+#[test]
 fn test_commonjs_prototype_methods_keep_hoisted_constructor_identities() {
     for path in ["main.cjs", "main.cts"] {
         let (_directory, index) = workspace(&[(
@@ -2602,6 +2670,193 @@ export class Untyped {
     assert!(!index.edges().edges().any(|edge| {
         edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.ts/Untyped/use")
     }));
+}
+
+#[test]
+fn test_written_callable_fields_keep_their_call_and_read_after_assignment() {
+    let source = "export type Handler = (value: string) => number
+export class Owner {
+  readonly named: Handler
+  inline: (value: string) => number
+  constructor(handle: Handler) { this.named = handle; this.inline = handle }
+  invoke() { return this.named('named') + this.inline('inline') }
+}
+export class Patched {
+  leaf() { return 1 }
+  use() { return this.leaf() }
+  patch(value: () => number) { this.leaf = value }
+}
+export class Inferred {
+  handle = (value: string) => value.length
+  use() { return this.handle('inferred') }
+  patch(handle: Handler) { this.handle = handle }
+}
+export class Unknown {
+  handle: unknown
+  constructor(handle: unknown) { this.handle = handle }
+  use() {
+    if (typeof this.handle === 'function') return this.handle('unknown')
+  }
+}
+export class Replaced {
+  handle: Handler
+  constructor(handle: Handler) { this.handle = handle }
+  use() { return this.handle('written') }
+}
+export function replace(target: Replaced, handle: Handler) { target.handle = handle }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for field in ["named", "inline"] {
+        let target = format!("main.ts/Owner/{field}");
+        let callee = format!("this.{field}");
+        let call = format!("{callee}('{field}')");
+        for (kind, expected) in [(EdgeKind::Calls, &call), (EdgeKind::Reads, &callee)] {
+            let mut edges = index.edges().edges().filter(|edge| {
+                edge.kind() == kind
+                    && edge.from().as_str().ends_with("main.ts/Owner/invoke")
+                    && edge.to().as_str().ends_with(&target)
+            });
+            let edge = edges.next().unwrap_or_else(|| panic!("{kind:?} {target}"));
+            let range = edge.occurrence().range();
+            let start = usize::try_from(range.start()).expect("start");
+            let end = usize::try_from(range.end()).expect("end");
+            assert_eq!(&source[start..end], expected);
+            assert!(edges.next().is_none());
+        }
+    }
+    for name in ["Patched", "Inferred", "Unknown", "Replaced"] {
+        let owner = format!("main.ts/{name}/use");
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(&owner)
+            }),
+            "{owner}"
+        );
+    }
+}
+
+const CALLABLE_FIELD_COPY_SOURCE: &str = "
+export type Handler = (value: string) => string
+
+export class DirectCopy {
+  handle: Handler = value => value
+  clone() {
+    const clone = new DirectCopy()
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() { return this.handle('direct') }
+}
+
+export class ContinuedExpression {
+  handle: Handler = value => value
+  clone() {
+    const clone = new ContinuedExpression()
+    clone.handle = this.handle
+      .bind(this)
+    return clone
+  }
+  invoke() { return this.handle('continued') }
+}
+
+export class Parenthesized {
+  handle: Handler = value => value
+  clone() {
+    const clone = new Parenthesized()
+    clone.handle = (this.handle)
+    return clone
+  }
+  invoke() { return this.handle('wrapped') }
+}
+
+export class OtherField {
+  handle: Handler = value => value
+  other: Handler = value => value.toUpperCase()
+  clone() {
+    const clone = new OtherField()
+    clone.handle = this.other
+    return clone
+  }
+  invoke() { return this.handle('different') }
+}
+
+export class Rebound {
+  handle: Handler = value => value
+  clone(replacement: Rebound) {
+    let clone = new Rebound()
+    clone = replacement
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() { return this.handle('rebound') }
+}
+
+export class Method {
+  handle(value: string): string { return value }
+  clone() {
+    const clone = new Method()
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() { return this.handle('method') }
+}
+
+export class Unknown {
+  handle: unknown
+  clone() {
+    const clone = new Unknown()
+    clone.handle = this.handle
+    return clone
+  }
+  invoke() {
+    if (typeof this.handle === 'function') return this.handle('unknown')
+  }
+}
+";
+
+#[test]
+fn test_written_callable_field_copy_needs_the_complete_value_and_const_instance() {
+    let source = CALLABLE_FIELD_COPY_SOURCE;
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for owner in [
+        "DirectCopy",
+        "ContinuedExpression",
+        "Parenthesized",
+        "OtherField",
+        "Rebound",
+        "Method",
+        "Unknown",
+    ] {
+        let caller = format!("main.ts/{owner}/invoke");
+        let field = format!("main.ts/{owner}/handle");
+        let occurrences = |kind| {
+            index
+                .edges()
+                .edges()
+                .filter(|edge| {
+                    edge.kind() == kind
+                        && edge.from().as_str().ends_with(&caller)
+                        && edge.to().as_str().ends_with(&field)
+                })
+                .map(|edge| {
+                    let range = edge.occurrence().range();
+                    let start = usize::try_from(range.start()).expect("start");
+                    let end = usize::try_from(range.end()).expect("end");
+                    &source[start..end]
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            occurrences(EdgeKind::Reads).contains(&"this.handle"),
+            "{owner} read"
+        );
+        let expected: &[_] = if owner == "DirectCopy" {
+            &["this.handle('direct')"]
+        } else {
+            &[]
+        };
+        assert_eq!(occurrences(EdgeKind::Calls), expected, "{owner} call");
+    }
 }
 
 #[test]

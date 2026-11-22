@@ -1988,7 +1988,7 @@ pub(crate) fn analyze_included(
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
     };
-    let assignments = commonjs::record(
+    let (assignments, commonjs_export) = commonjs::record(
         tree.root_node(),
         source,
         limits,
@@ -2008,6 +2008,12 @@ pub(crate) fn analyze_included(
             crate::static_analysis::Capture::for_javascript(source.text)
         }
     });
+    if let Some(capture) = &mut capture
+        && !recovered
+        && !tree.root_node().has_error()
+    {
+        capture.record_commonjs_export(commonjs_export);
+    }
     let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),
         source,
@@ -2016,9 +2022,9 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
-    let static_facts = capture.map(crate::static_analysis::Capture::finish);
-    if let Some(facts) = &static_facts {
-        members::record(
+    let mut static_facts = capture.map(crate::static_analysis::Capture::finish);
+    if let Some(facts) = &mut static_facts {
+        let aliases = members::record(
             &rules,
             source.text,
             language,
@@ -2027,6 +2033,7 @@ pub(crate) fn analyze_included(
             &assignments,
             &mut symbols,
         )?;
+        facts.set_member_aliases(aliases);
     }
     symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(

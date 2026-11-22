@@ -5,8 +5,8 @@ use tree_sitter::Node;
 
 use super::{
     StaticBinding, StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts,
-    StaticFunctionContext, StaticMember, StaticParameter, StaticReexport, StaticReference, binding,
-    call, enclosing, field, identifier, kind,
+    StaticFunctionContext, StaticMember, StaticMemberCopy, StaticParameter, StaticReexport,
+    StaticReference, binding, call, enclosing, field, identifier, kind,
 };
 use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
@@ -394,7 +394,7 @@ impl Kinds {
         } else if id == self.export_specifier {
             self.record_reexport(visited, source, facts)?;
         } else {
-            self.record_shadow_or_mutation(visited, facts)?;
+            self.record_shadow_or_mutation(visited, source, facts)?;
         }
         Ok(())
     }
@@ -1592,6 +1592,16 @@ impl Kinds {
             Some(value) => self.initializer(value, source)?,
             _ => StaticBindingKind::Local,
         };
+        let kind = match kind {
+            StaticBindingKind::JavaScriptInstance { constructor }
+                if parent
+                    .child_by_field_id(self.loop_kind)
+                    .is_some_and(|kind| kind.kind() == "const" && !kind.is_missing()) =>
+            {
+                StaticBindingKind::JavaScriptConstInstance { constructor }
+            }
+            _ => kind,
+        };
         if let Some(call) = syntax_element
             .child_by_field_id(self.value)
             .filter(|value| value.kind_id() == self.call)
@@ -1942,6 +1952,7 @@ impl Kinds {
     fn record_shadow_or_mutation(
         &self,
         visited: Visited<'_, '_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
@@ -1955,10 +1966,13 @@ impl Kinds {
                     .child_by_field_id(self.left)
                     .filter(|left| [self.identifier, self.member].contains(&left.kind_id()))
                 && let Some(value) = syntax_element.child_by_field_id(self.right)
-                && (self.function_value(value).is_some()
-                    || (left.kind_id() == self.member && value.kind_id() == self.object_literal[0]))
             {
-                facts.function_writes.push(byte_range(left)?);
+                if self.function_value(value).is_some()
+                    || (left.kind_id() == self.member && value.kind_id() == self.object_literal[0])
+                {
+                    facts.function_writes.push(byte_range(left)?);
+                }
+                self.record_member_copy(syntax_element, left, value, source, facts)?;
             }
         } else if id == self.update {
             self.record_mutation(syntax_element, self.argument, facts)?;
@@ -1989,6 +2003,40 @@ impl Kinds {
                     name: byte_range(parameter)?,
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn record_member_copy(
+        &self,
+        assignment: Node<'_>,
+        target: Node<'_>,
+        value: Node<'_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let direct_member = |expression: Node<'_>, receiver| {
+            expression.kind_id() == self.member
+                && expression.child_by_field_name("optional_chain").is_none()
+                && expression
+                    .child_by_field_id(self.object)
+                    .is_some_and(|object| object.kind_id() == receiver)
+        };
+        let property = |expression: Node<'_>| {
+            expression
+                .child_by_field_id(self.property)
+                .and_then(|name| text(name, source))
+        };
+        if direct_member(target, self.identifier)
+            && direct_member(value, self.receivers[0])
+            && !assignment.has_error()
+            && property(target).is_some_and(|name| property(value) == Some(name))
+        {
+            facts.member_copies.push(StaticMemberCopy {
+                assignment: byte_range(assignment)?,
+                target: byte_range(target)?,
+                value: byte_range(value)?,
+            });
         }
         Ok(())
     }

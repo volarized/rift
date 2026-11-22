@@ -136,6 +136,22 @@ impl<'source> Index<'source> {
                 result.record(self.javascript_namespace_import(file, export.range, module, work));
             }
         }
+        for alias in file.facts.member_aliases() {
+            if !work.charge() {
+                return;
+            }
+            let occurrence = || {
+                let source = file.target_at(alias.name)?.callable()?;
+                let target = file.target_at(alias.target)?.callable()?;
+                let from = self.javascript_identity(source)?;
+                let mut occurrence =
+                    self.occurrence(file, alias.name, alias.name, ReferenceRole::Unknown, target)?;
+                occurrence.edge_from = Some(from);
+                occurrence.edge_kind = Some(EdgeKind::Aliases);
+                Some(occurrence)
+            };
+            result.record(occurrence());
+        }
         self.javascript_contains(file, work, result);
     }
 
