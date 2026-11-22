@@ -2137,6 +2137,10 @@ impl RiftMcp {
                 spawn_lexical(index, blocking.clone(), cancellation, analyzer_revision)
             },
         );
+        let local_views = Arc::new(std::sync::OnceLock::from(
+            rift_server::LocalSymbolViews::new(crate::http::token_entropy("captured view key")?),
+        ));
+        validation.feed_local_views(Arc::clone(&local_views), &published);
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
@@ -2161,9 +2165,6 @@ impl RiftMcp {
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
         validation.feed_engines(Arc::clone(&engines));
-        let local_views = std::sync::OnceLock::from(rift_server::LocalSymbolViews::new(
-            crate::http::token_entropy("captured view key")?,
-        ));
         let server = Self {
             root: root.clone(),
             identity,
@@ -2184,7 +2185,7 @@ impl RiftMcp {
             #[cfg(test)]
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
-            local_views: Arc::new(local_views),
+            local_views,
             candidate_responses: Arc::default(),
         };
         Ok(AssembledServer {

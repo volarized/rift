@@ -1,4 +1,7 @@
-use super::{ReadableSymbol, SymbolDeclarations, SymbolId, TextSourceFile, WorkspaceSymbolView};
+use super::{
+    ReadableSymbol, SymbolDeclarations, SymbolId, TextSourceFile, WorkspaceIndex,
+    WorkspaceSymbolView,
+};
 use get_size2::{GetSize, GetSizeTracker, StandardTracker};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -156,6 +159,48 @@ impl WorkspaceSymbolView {
     #[must_use]
     pub fn retained_material_bytes(&self) -> usize {
         self.retained_bytes
+    }
+}
+
+impl WorkspaceIndex {
+    /// The existing symbol view, if a read has already built it for this publication.
+    #[must_use]
+    pub fn cached_symbol_view(&self) -> Option<&Arc<WorkspaceSymbolView>> {
+        self.symbol_view.get().and_then(|view| view.as_ref().ok())
+    }
+
+    /// Records the published allocations a retained read can share with this index.
+    ///
+    /// Accounts for the live index even before a read builds its cached symbol view.
+    /// The tracker holds allocation identities without taking ownership of the index.
+    #[must_use]
+    pub fn retained_view_baseline(&self) -> StandardTracker {
+        let (_, tracker) = map(&self.files, StandardTracker::default());
+        let (_, tracker) = map(&self.text_files, tracker);
+        let (_, tracker) = map(&self.framework_sources, tracker);
+        let (_, tracker) = map(&self.raw_syntax, tracker);
+        let (_, tracker) = map(&self.notebooks, tracker);
+        let (_, tracker) = arc(&self.semantics, tracker);
+        let (_, mut tracker) = arc(&self.documentation, tracker);
+        if let Some(Ok(declarations)) = self.symbol_declarations.get() {
+            (_, tracker) = arc(declarations, tracker);
+        }
+        for (path, file) in &self.files {
+            if let Some(framework) = self.frameworks.for_source(path, &file.digest()) {
+                (_, tracker) = framework.get_heap_size_with_tracker(tracker);
+            }
+        }
+        let documents = self
+            .symbol_documents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for file in documents.values() {
+            (_, tracker) = rift_protocol::retained_arc_slice_material(&file.documents, tracker);
+        }
+        if let Some(view) = self.cached_symbol_view() {
+            (_, tracker) = arc(view, tracker);
+        }
+        tracker
     }
 }
 

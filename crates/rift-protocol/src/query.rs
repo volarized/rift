@@ -203,9 +203,10 @@ pub struct QueryConfiguration {
     /// the bound releases the least recently used one.
     #[schemars(range(min = 1, max = QUERY_RETAINED_VIEWS_MAX))]
     pub retained_views: u64,
-    /// Most material the retained views hold together, 1mb to 64gb. A new view past
-    /// the bound releases the least recently used ones; a view larger than the bound
-    /// alone is refused.
+    /// Most material kept alive by retained views, 1mb to 64gb. Counts query results,
+    /// capture metadata, and index data kept alive beyond the current publication.
+    /// A capture or publication past the bound releases the least recently used views.
+    /// A new view whose own charge exceeds the bound is refused.
     pub retained_size: crate::configuration::ByteSize,
 }
 

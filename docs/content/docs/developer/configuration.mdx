@@ -1162,13 +1162,16 @@ retained_views = 256
 retained_size = "8gb"
 ```
 
-- `retained_views` caps the views one server retains, 1 to 4096, default `256`
-- `retained_size` caps the bytes those views hold together, 1mb to 64gb, default `8gb`. Views
-  that read one index share it and count it once
+- `retained_views` caps the views one server retains, 1 to 4096, default `256`.
+- `retained_size` caps the bytes kept alive by retained views, 1mb to 64gb, default `8gb`.
+  The charge includes encoded query results and capture metadata. A workspace server
+  counts shared index allocations once when retained views keep them alive beyond the
+  current publication.
 
-A new view past either bound releases the least recently used views first; an answer and each
-later page read from its view count as a use. A later page of a released view evaluates the query
-again. Only a view whose own bytes pass `retained_size` is refused, with `read_unavailable`.
+A new capture or publication that passes a bound releases the least recently used views first.
+An answer and each later page from its view count as a use. A later page of a released view
+evaluates the query again. A new view whose own charge exceeds `retained_size` is refused with
+`read_unavailable`.
 
 
 <VersionBadge version="v0.0.25" />
