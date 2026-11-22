@@ -48,6 +48,8 @@ pub(crate) struct ExportBinding {
 pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
+    /// Observed `CommonJS` files with a checked synchronized export object.
+    pub(crate) commonjs_modules: BTreeSet<String>,
     pub(crate) mappings: BTreeMap<String, BTreeMap<String, rift_syntax::LogicalDeclaration>>,
     pub(crate) exports: Vec<ExportBinding>,
     pub(crate) alias_visibilities: BTreeMap<SymbolId, String>,

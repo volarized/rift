@@ -362,14 +362,6 @@ impl<'source> Index<'source> {
                 continue;
             }
             let file = self.files.get(class.file.path.as_str())?;
-            if role == ReferenceRole::Call
-                && class.symbol.kind != "interface"
-                && self.javascript_member_replaced(file, class, member, work)
-            {
-                // A call to the written member itself has no target.
-                tail?;
-                replaced = true;
-            }
             let target = file.javascript_declared_member(
                 &format!("{}.{}", class.symbol.qualified_name, member),
                 class.symbol.range,
@@ -377,6 +369,16 @@ impl<'source> Index<'source> {
                 role,
                 work,
             );
+            if role == ReferenceRole::Call && class.symbol.kind != "interface" {
+                let field = target.filter(|target| {
+                    tail.is_none()
+                        && target.symbol.syntax_element_kind == Some("public_field_definition")
+                });
+                if self.javascript_member_replaced(file, class, member, field, work) {
+                    tail?;
+                    replaced = true;
+                }
+            }
             match target {
                 // A member assigned through `this` names the declaration an ancestor
                 // makes when one resolves (D46); otherwise it is the class's own facet.
@@ -434,6 +436,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         class: Target<'source>,
         member: &str,
+        field: Option<Target<'source>>,
         work: &mut Work,
     ) -> bool {
         for &(start, target) in &file.assignments.member_writes {
@@ -465,11 +468,97 @@ impl<'source> Index<'source> {
             {
                 continue;
             }
-            if self.javascript_receiver_denotes(file, class, receiver, start, work) {
-                return true;
+            if !self.javascript_receiver_denotes(file, class, receiver, start, work) {
+                continue;
             }
+            // The written signature establishes a direct call after a write through
+            // `this` or a checked copy of the same field between instances.
+            if property == member
+                && !matches!(property, "constructor" | "prototype")
+                && field.is_some_and(|field| {
+                    (receiver.trim() == "this"
+                        || (!field.symbol.kinds.contains(&SymbolKind::Static)
+                            && self
+                                .javascript_same_field_copy(
+                                    file,
+                                    class,
+                                    rift_syntax::ByteRange { start, end },
+                                    member,
+                                    work,
+                                )
+                                .is_some()))
+                        && self.javascript_declared_signature(field, false, work)
+                })
+            {
+                continue;
+            }
+            return true;
         }
         false
+    }
+
+    /// Whether this write copies the same declared field between instances of one class.
+    fn javascript_same_field_copy(
+        &self,
+        file: &File<'source>,
+        class: Target<'source>,
+        target: rift_syntax::ByteRange,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<()> {
+        let copies = file.facts.member_copies();
+        let position = copies
+            .binary_search_by_key(&target.start, |copy| copy.target.start)
+            .ok()?;
+        let copy = copies.get(position).filter(|copy| copy.target == target)?;
+        if file.blocked(target.start, work) {
+            return None;
+        }
+        let written = file.members.get(&copy.target).copied().flatten()?;
+        let value = file.members.get(&copy.value).copied().flatten()?;
+        if file.text(value.receiver)? != "this"
+            || file.text(written.member?)? != member
+            || file.text(value.member?)? != member
+        {
+            return None;
+        }
+        let name = file.text(written.receiver)?;
+        let binding = super::javascript::js_binding(
+            file,
+            &self.javascript,
+            name,
+            written.receiver.start,
+            ReferenceRole::Read,
+            work,
+        )?;
+        let rift_syntax::StaticBindingKind::JavaScriptConstInstance { constructor } = binding.kind
+        else {
+            return None;
+        };
+        if file
+            .assignments
+            .name_writes
+            .get(name)
+            .is_some_and(|writes| {
+                writes
+                    .iter()
+                    .any(|&write| !work.charge() || binding.scope.contains(write))
+            })
+        {
+            return None;
+        }
+        let (source, MemberMode::Instance) =
+            self.javascript_class_receiver(file, value.receiver.start, work)?
+        else {
+            return None;
+        };
+        let destination = self.javascript_target(file, constructor, ReferenceRole::Call, work)?;
+        [source, destination]
+            .into_iter()
+            .all(|owner| {
+                owner.file.path == class.file.path && std::ptr::eq(owner.symbol, class.symbol)
+            })
+            .then_some(())
     }
 
     fn javascript_receiver_denotes(
@@ -530,7 +619,8 @@ impl<'source> Index<'source> {
                 .is_some_and(same);
         }
         match binding.kind {
-            rift_syntax::StaticBindingKind::JavaScriptInstance { constructor } => self
+            rift_syntax::StaticBindingKind::JavaScriptInstance { constructor }
+            | rift_syntax::StaticBindingKind::JavaScriptConstInstance { constructor } => self
                 .javascript_target(file, constructor, ReferenceRole::Call, work)
                 .is_some_and(same),
             _ => false,

@@ -10,6 +10,201 @@ use rift_syntax::ShippedLanguage;
 use super::StubForm;
 use super::fixture::{package_analysis, package_analysis as analyzed};
 
+const COMMONJS_FORWARDED_EXPORT: &str = "exports.request = req";
+const COMMONJS_PACKAGE_ENTRY: &str = "var req = require('./request');
+exports = module.exports = create;
+function create() {}
+exports.request = req;";
+const COMMONJS_PACKAGE_TARGET: &str = "var requestRoot = {};
+module.exports = requestRoot;";
+
+fn named_commonjs_analysis(
+    entry: &str,
+    target: &str,
+    conflicting_subpath: bool,
+    retained: &mut std::collections::BTreeMap<rift_core::ProjectPath, crate::PackageSyntax>,
+) -> super::PackageAnalysis {
+    let package = rift_protocol::read::PackageIdentity {
+        manager: "npm".to_owned(),
+        registry: "registry.npmjs.org".to_owned(),
+        name: "beacon".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("fixture package owner");
+    let origin = super::fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let paths = ["index.js", "lib/entry.js", "lib/request.js", "lib/other.js"]
+        .map(|path| rift_core::ProjectPath::new(path).expect("fixture path"));
+    let sources = paths
+        .iter()
+        .zip([
+            "module.exports = require('./lib/entry');",
+            entry,
+            target,
+            "exports.check = function () {};",
+        ])
+        .map(|(path, source)| crate::PackageSource::new(path, source))
+        .collect::<Vec<_>>();
+    let metadata_path = rift_core::ProjectPath::new("package.json").expect("metadata path");
+    let metadata_source = if conflicting_subpath {
+        r#"{"name":"beacon","version":"1.0.0","exports":{".":{"require":"./index.js"},"./lib/request.js":{"require":"./lib/other.js"}}}"#
+    } else {
+        r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#
+    };
+    let metadata = [crate::PackageSource::new(&metadata_path, metadata_source)];
+    let mut modules = vec![crate::NamespaceModule::new(
+        "beacon",
+        sources[0],
+        &[],
+        &["node", "require"],
+    )];
+    if conflicting_subpath {
+        modules.push(crate::NamespaceModule::new(
+            "beacon/lib/request.js",
+            sources[3],
+            &[],
+            &["node", "require"],
+        ));
+    }
+    let input = crate::ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        crate::ExactPackageLimits::new(5, 4096),
+    )
+    .expect("bounded fixture input")
+    .with_framework_context(&metadata, &[])
+    .expect("captured CommonJS metadata")
+    .with_modules(&modules)
+    .expect("observed CommonJS entry");
+    super::PackageAnalyzer::analyze_with_syntax(input, 1, |source| {
+        let path = source.path();
+        Some(
+            retained
+                .entry(path.clone())
+                .or_insert_with(|| source.parse().expect("fixture source"))
+                .clone(),
+        )
+    })
+    .expect("CommonJS package analyzed")
+}
+
+#[test]
+fn named_commonjs_forwarding_places_the_declaration_and_exact_export_edge() {
+    let mut retained = std::collections::BTreeMap::new();
+    let cold = named_commonjs_analysis(
+        COMMONJS_PACKAGE_ENTRY,
+        COMMONJS_PACKAGE_TARGET,
+        false,
+        &mut retained,
+    );
+    let cached = named_commonjs_analysis(
+        COMMONJS_PACKAGE_ENTRY,
+        COMMONJS_PACKAGE_TARGET,
+        false,
+        &mut retained,
+    );
+    assert_eq!(cold.publication(), cached.publication());
+    let root = symbol_at(&cold, "lib/request.js", "requestRoot")
+        .expect("named forwarding admits the exact local declaration");
+    let root_id = rift_protocol::identity::SymbolIdentity::parse(root.symbol.as_str())
+        .expect("defining package identity");
+    assert_eq!(
+        root_id.qualified_path(),
+        ["beacon/lib/request.js", "requestRoot"]
+    );
+    let alias = cold
+        .publication()
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/request"))
+        .expect("named forward published");
+    let alias_id = rift_protocol::identity::SymbolIdentity::parse(alias.symbol.as_str())
+        .expect("forwarded package identity");
+    assert_eq!(
+        alias_id.qualified_path(),
+        ["beacon/lib/entry.js", "request"]
+    );
+    assert!(alias.public);
+    assert_eq!(alias.source, COMMONJS_FORWARDED_EXPORT);
+    assert!(cold.publication().edges.iter().any(|edge| {
+        edge.from == alias.symbol
+            && edge.to == root.symbol
+            && edge.kinds.contains(&rift_protocol::read::EdgeKind::Aliases)
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|at| at.unit == alias.unit && at.range == alias.range)
+    }));
+    let changed = COMMONJS_PACKAGE_ENTRY.replace("'./request'", "selected");
+    let reopened = named_commonjs_analysis(&changed, COMMONJS_PACKAGE_TARGET, false, &mut retained);
+    let fresh = named_commonjs_analysis(
+        &changed,
+        COMMONJS_PACKAGE_TARGET,
+        false,
+        &mut std::collections::BTreeMap::new(),
+    );
+    assert_eq!(reopened.publication(), fresh.publication());
+    assert!(
+        !reopened
+            .publication()
+            .edges
+            .iter()
+            .any(|edge| edge.from == alias.symbol)
+    );
+}
+
+#[test]
+fn named_commonjs_forwarding_refuses_unproved_or_colliding_owners() {
+    let rebound = COMMONJS_PACKAGE_ENTRY.replace(
+        COMMONJS_FORWARDED_EXPORT,
+        "req = function () {}; exports.request = req",
+    );
+    let shadowed = format!("function require() {{ return {{}}; }}{COMMONJS_PACKAGE_ENTRY}");
+    let conditional = COMMONJS_PACKAGE_TARGET.replace(
+        "module.exports = requestRoot;",
+        "if (enabled) module.exports = requestRoot;",
+    );
+    let conditional_require = format!("if (enabled) {COMMONJS_PACKAGE_ENTRY}");
+    let conditional_initialization = format!("if (enabled) {COMMONJS_PACKAGE_TARGET}");
+    let esm = format!("{COMMONJS_PACKAGE_TARGET} export const marker = 1;");
+    let dynamic = COMMONJS_PACKAGE_ENTRY.replace("'./request'", "selected");
+    let lexical_collision = format!("let request; {COMMONJS_PACKAGE_ENTRY}");
+    for (entry, target, conflict) in [
+        (rebound.as_str(), COMMONJS_PACKAGE_TARGET, false),
+        (shadowed.as_str(), COMMONJS_PACKAGE_TARGET, false),
+        (COMMONJS_PACKAGE_ENTRY, conditional.as_str(), false),
+        (conditional_require.as_str(), COMMONJS_PACKAGE_TARGET, false),
+        (
+            COMMONJS_PACKAGE_ENTRY,
+            conditional_initialization.as_str(),
+            false,
+        ),
+        (COMMONJS_PACKAGE_ENTRY, esm.as_str(), false),
+        (dynamic.as_str(), COMMONJS_PACKAGE_TARGET, false),
+        (lexical_collision.as_str(), COMMONJS_PACKAGE_TARGET, false),
+        (COMMONJS_PACKAGE_ENTRY, COMMONJS_PACKAGE_TARGET, true),
+    ] {
+        let result = named_commonjs_analysis(
+            entry,
+            target,
+            conflict,
+            &mut std::collections::BTreeMap::new(),
+        );
+        assert!(
+            symbol_at(&result, "lib/request.js", "requestRoot").is_none(),
+            "{entry:?}, {target:?}, conflicting subpath={conflict}"
+        );
+        assert!(
+            !result.publication().declarations.iter().any(|row| {
+                row.symbol.as_str().ends_with("/request") && row.source == COMMONJS_FORWARDED_EXPORT
+            }),
+            "{entry:?}, {target:?}, conflicting subpath={conflict}"
+        );
+    }
+}
+
 fn conditional_analysis(files: Vec<(&str, &str)>) -> super::PackageAnalysis {
     let package = rift_protocol::read::PackageIdentity {
         manager: "npm".to_owned(),

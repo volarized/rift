@@ -44,22 +44,18 @@ pub(super) fn prepare(
             prepared.unresolved_exports = true;
             continue;
         };
-        let public = checked_names(file);
-        let anchors = declaration_anchors_with_public(input, file, Some(&module), &public);
-        if prepared.anchors.get(path.as_str()).is_some_and(|previous| {
-            previous
-                .iter()
-                .any(|(name, identity)| anchors.get(name) != Some(identity))
-        }) {
+        if !admit_file(input, file, &module, None, prepared) {
             prepared.unresolved_exports = true;
             continue;
         }
-        prepared.anchors.insert(path.as_str().to_owned(), anchors);
-        prepared
-            .public_names
-            .entry(path.as_str().to_owned())
-            .or_default()
-            .extend(public);
+        if file
+            .syntax
+            .static_facts()
+            .and_then(rift_syntax::StaticFacts::commonjs_export)
+            .is_some_and(|export| export.synchronized)
+        {
+            prepared.commonjs_modules.insert(path.as_str().to_owned());
+        }
         let Some(bindings) = file.syntax.export_bindings() else {
             prepared.unresolved_exports = true;
             continue;
@@ -75,7 +71,9 @@ pub(super) fn prepare(
                 prepared.unresolved_exports = true;
                 continue;
             };
-            let Some(target) = relative_target(file.path, &relative, &inventory) else {
+            let Some(target) =
+                relative_target(file.path, &relative, |path| inventory.contains_key(path))
+            else {
                 prepared.unresolved_exports = true;
                 continue;
             };
@@ -87,6 +85,34 @@ pub(super) fn prepare(
             }
         }
     }
+}
+
+pub(crate) fn admit_file(
+    input: &NamespaceInput<'_>,
+    file: &SelectedFile<'_>,
+    module: &str,
+    required: Option<&str>,
+    prepared: &mut PreparedNamespace,
+) -> bool {
+    let path = file.path.as_str();
+    let public = checked_names(file);
+    let anchors = declaration_anchors_with_public(input, file, Some(module), &public);
+    if required.is_some_and(|name| !anchors.contains_key(name))
+        || prepared.anchors.get(path).is_some_and(|previous| {
+            previous
+                .iter()
+                .any(|(name, identity)| anchors.get(name) != Some(identity))
+        })
+    {
+        return false;
+    }
+    prepared.anchors.insert(path.to_owned(), anchors);
+    prepared
+        .public_names
+        .entry(path.to_owned())
+        .or_default()
+        .extend(public);
+    true
 }
 
 fn entry_matches(metadata: &PackageMetadata, observation: &NamespaceModule<'_>) -> bool {
@@ -126,10 +152,10 @@ fn checked_names(file: &SelectedFile<'_>) -> BTreeSet<String> {
         .collect()
 }
 
-fn relative_target(
+pub(crate) fn relative_target(
     path: &ProjectPath,
     relative: &str,
-    inventory: &BTreeMap<&ProjectPath, &SelectedFile<'_>>,
+    exists: impl Fn(&ProjectPath) -> bool,
 ) -> Option<ProjectPath> {
     let relative = relative.strip_prefix("./")?;
     if !export_subpath_is_valid(relative) {
@@ -140,14 +166,14 @@ fn relative_target(
         |(directory, _)| format!("{directory}/{relative}"),
     );
     let exact = ProjectPath::new(&target).ok()?;
-    if inventory.contains_key(&exact) {
+    if exists(&exact) {
         return Some(exact);
     }
     if Path::new(relative).extension().is_some() {
         return None;
     }
     let javascript = ProjectPath::new(format!("{target}.js")).ok()?;
-    inventory.contains_key(&javascript).then_some(javascript)
+    exists(&javascript).then_some(javascript)
 }
 
 fn is_mjs(path: &ProjectPath) -> bool {

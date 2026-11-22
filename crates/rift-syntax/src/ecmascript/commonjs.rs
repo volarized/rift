@@ -1,5 +1,8 @@
 use super::{EcmaScriptGrammarField, EcmaScriptKinds, ExportTarget, named_children};
-use crate::{SyntaxExportBinding, SyntaxExportKind, SyntaxLimits, SyntaxSource, extract};
+use crate::{
+    StaticCommonJsExport, SyntaxExportBinding, SyntaxExportKind, SyntaxLimits, SyntaxSource,
+    extract,
+};
 use rift_error::{RiftError, errors};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
@@ -10,11 +13,84 @@ pub(super) fn record<'tree>(
     limits: SyntaxLimits,
     kinds: &EcmaScriptKinds,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
-) -> Result<Vec<Node<'tree>>, RiftError> {
+) -> Result<(Vec<Node<'tree>>, Option<StaticCommonJsExport>), RiftError> {
+    let CapturedAssignments {
+        assignments,
+        mut blocked,
+        replaced,
+        synchronized,
+        direct_default,
+    } = capture_assignments(root, source, limits, kinds)?;
+    let synchronized = synchronized.and_then(|(outer, inner)| {
+        if !blocked.contains(&root.id())
+            && closed_wrapper_uses(root, Some(outer), inner, source.text, kinds)
+        {
+            Some(inner)
+        } else {
+            blocked.insert(root.id());
+            None
+        }
+    });
+    let mut closed_export = None;
+    let synchronized_scope = synchronized.map(|inner| (root.id(), inner.end_byte()));
+    for &syntax_element in &assignments {
+        if synchronized != Some(syntax_element) && !module_execution(syntax_element, &blocked) {
+            continue;
+        }
+        let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
+            continue;
+        };
+        if binding.kind == SyntaxExportKind::Named
+            && !kept_after_replacement(syntax_element, source.text, &replaced, synchronized_scope)
+        {
+            continue;
+        }
+        if binding.kind == SyntaxExportKind::Default
+            && binding.local.is_some()
+            && kinds
+                .child(syntax_element, EcmaScriptGrammarField::Right)
+                .is_some_and(|value| value.kind_id() == kinds.identifier)
+            && (synchronized == Some(syntax_element)
+                || (direct_default == Some(syntax_element)
+                    && closed_wrapper_uses(root, None, syntax_element, source.text, kinds)))
+        {
+            closed_export = Some((binding.range, synchronized == Some(syntax_element)));
+        }
+        bindings.insert(syntax_element.id(), binding);
+    }
+    let closed_export = if let Some((assignment, synchronized)) = closed_export {
+        Some(StaticCommonJsExport {
+            assignment,
+            synchronized,
+            initialized: initialized_exports(root, source.text, kinds, bindings)?,
+        })
+    } else {
+        None
+    };
+    Ok((assignments, closed_export))
+}
+
+struct CapturedAssignments<'tree> {
+    assignments: Vec<Node<'tree>>,
+    blocked: BTreeSet<usize>,
+    replaced: BTreeMap<usize, usize>,
+    synchronized: Option<(Node<'tree>, Node<'tree>)>,
+    direct_default: Option<Node<'tree>>,
+}
+
+/// Captures assignments and wrapper rebindings in the bounded syntax walk.
+fn capture_assignments<'tree>(
+    root: Node<'tree>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    kinds: &EcmaScriptKinds,
+) -> Result<CapturedAssignments<'tree>, RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut blocked = BTreeSet::new();
     // Scope of each `module.exports = value`, with the end of its last write there.
     let mut replaced: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut synchronized = None;
+    let mut direct_default = None;
     let mut assignments = Vec::new();
     let mut visited = 0_usize;
     let mut cursor = root.walk();
@@ -35,7 +111,16 @@ pub(super) fn record<'tree>(
         if blocked_binding(syntax_element, source.text)
             && let Some(scope) = lexical_scope(syntax_element)
         {
-            blocked.insert(scope.id());
+            if let Some(module_write) = synchronization(syntax_element, root, source.text, kinds) {
+                if synchronized
+                    .replace((syntax_element, module_write))
+                    .is_some()
+                {
+                    blocked.insert(root.id());
+                }
+            } else {
+                blocked.insert(scope.id());
+            }
         }
         if syntax_element.kind_id() == kinds.assignment_expression {
             assignments.push(syntax_element);
@@ -47,6 +132,12 @@ pub(super) fn record<'tree>(
             {
                 let end = replaced.entry(scope.id()).or_default();
                 *end = (*end).max(syntax_element.end_byte());
+                if syntax_element.parent().is_some_and(|statement| {
+                    statement.kind_id() == kinds.expression_statement
+                        && statement.parent() == Some(root)
+                }) {
+                    direct_default = Some(syntax_element);
+                }
             }
         }
         if visited
@@ -63,46 +154,182 @@ pub(super) fn record<'tree>(
             (child, depth + 1)
         });
     }
-    for &syntax_element in &assignments {
-        if !module_execution(syntax_element, &blocked) {
-            continue;
-        }
-        let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
-            continue;
-        };
-        if binding.kind == SyntaxExportKind::Named
-            && !kept_after_replacement(syntax_element, source.text, &replaced)
+    Ok(CapturedAssignments {
+        assignments,
+        blocked,
+        replaced,
+        synchronized,
+        direct_default,
+    })
+}
+
+/// Finds the authored bindings that supply these exports directly from the module body.
+fn initialized_exports(
+    root: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+    bindings: &BTreeMap<usize, SyntaxExportBinding>,
+) -> Result<Vec<crate::ByteRange>, RiftError> {
+    let exported = bindings
+        .values()
+        .filter(|binding| binding.container.is_none() && binding.source.is_none())
+        .filter_map(|binding| {
+            let range = binding.local?;
+            source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut initialized = Vec::new();
+    let mut record = |declaration| -> Result<(), RiftError> {
+        if let Some(name) = kinds.child(declaration, EcmaScriptGrammarField::Name)
+            && name.kind_id() == kinds.identifier
+            && source
+                .get(name.byte_range())
+                .is_some_and(|name| exported.contains(name))
         {
-            continue;
+            initialized.push(extract::byte_range(name)?);
         }
-        bindings.insert(syntax_element.id(), binding);
+        Ok(())
+    };
+    // The main capture walk bounded this tree. Only direct children can run
+    // unconditionally in the module, regardless of their lexical hoisting scope.
+    for statement in named_children(root) {
+        match statement.kind() {
+            "function_declaration" => record(statement)?,
+            "variable_declaration" | "lexical_declaration" => {
+                for declaration in named_children(statement) {
+                    if declaration.kind_id() == kinds.variable_declarator
+                        && kinds
+                            .child(declaration, EcmaScriptGrammarField::Value)
+                            .is_some()
+                    {
+                        record(declaration)?;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    Ok(assignments)
+    Ok(initialized)
+}
+
+/// Inner write of one unconditional `exports = module.exports = name` statement.
+fn synchronization<'tree>(
+    outer: Node<'tree>,
+    root: Node<'tree>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+) -> Option<Node<'tree>> {
+    if outer.kind_id() != kinds.assignment_expression {
+        return None;
+    }
+    let left = kinds.child(outer, EcmaScriptGrammarField::Left)?;
+    if source.get(left.byte_range())? != "exports" {
+        return None;
+    }
+    let statement = outer.parent()?;
+    if outer.has_error()
+        || statement.kind_id() != kinds.expression_statement
+        || statement.parent() != Some(root)
+    {
+        return None;
+    }
+    let inner = kinds.child(outer, EcmaScriptGrammarField::Right)?;
+    if inner.kind_id() != kinds.assignment_expression {
+        return None;
+    }
+    let module = kinds.child(inner, EcmaScriptGrammarField::Left)?;
+    let value = kinds.child(inner, EcmaScriptGrammarField::Right)?;
+    (source.get(module.byte_range())? == "module.exports" && value.kind_id() == kinds.identifier)
+        .then_some(inner)
+}
+
+/// The wrapper names stay inside the synchronized writes and direct root export writes.
+fn closed_wrapper_uses(
+    root: Node<'_>,
+    outer: Option<Node<'_>>,
+    inner: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+) -> bool {
+    let outer_left = outer.and_then(|outer| kinds.child(outer, EcmaScriptGrammarField::Left));
+    let module = kinds
+        .child(inner, EcmaScriptGrammarField::Left)
+        .and_then(|left| kinds.child(left, EcmaScriptGrammarField::Object));
+    let mut pending = vec![root];
+    let mut cursor = root.walk();
+    // The capture walk has already admitted the element count and depth of this tree.
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+        ) && source.get(node.byte_range()).is_some_and(|name| {
+            name.contains('\\')
+                || (matches!(name, "module" | "exports" | "eval")
+                    && Some(node) != outer_left
+                    && Some(node) != module
+                    && !(outer.is_some() && direct_exports_write(node, root, source, kinds)))
+        }) {
+            return false;
+        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
+    }
+    true
+}
+
+fn direct_exports_write(
+    receiver: Node<'_>,
+    root: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+) -> bool {
+    if source.get(receiver.byte_range()) != Some("exports") {
+        return false;
+    }
+    receiver.parent().is_some_and(|member| {
+        member.kind_id() == kinds.member_expression
+            && kinds.child(member, EcmaScriptGrammarField::Object) == Some(receiver)
+            && kinds
+                .child(member, EcmaScriptGrammarField::Property)
+                .is_some_and(|name| name.kind_id() == kinds.property_identifier)
+            && member.parent().is_some_and(|assignment| {
+                assignment.kind_id() == kinds.assignment_expression
+                    && !assignment.has_error()
+                    && kinds.child(assignment, EcmaScriptGrammarField::Left) == Some(member)
+                    && assignment.parent().is_some_and(|statement| {
+                        statement.kind_id() == kinds.expression_statement
+                            && statement.parent() == Some(root)
+                    })
+            })
+    })
 }
 
 /// Whether a named export survives every `module.exports = value` of the scopes around it.
 ///
 /// A replacement written later replaces the object the name was added to. One written
-/// earlier is the object `module.exports.name = ...` adds to; `exports` no longer names
-/// it, so `exports.name = ...` after it exports nothing. `module.exports.default` keeps
-/// colliding with the default slot the replacement writes.
+/// earlier is the object `module.exports.name = ...` adds to. A checked synchronization
+/// also establishes that `exports` names that same object. The default slot stays ambiguous.
 fn kept_after_replacement(
     syntax_element: Node<'_>,
     source: &str,
     replaced: &BTreeMap<usize, usize>,
+    synchronized: Option<(usize, usize)>,
 ) -> bool {
-    let through_module = syntax_element
+    let left = syntax_element
         .child_by_field_name("left")
         .and_then(|left| source.get(left.byte_range()))
-        .is_some_and(|left| {
-            left.starts_with("module.exports.") && left != "module.exports.default"
-        });
+        .unwrap_or_default();
+    let through_module = left.starts_with("module.exports.") && left != "module.exports.default";
     let mut scope = syntax_element;
     while let Some(parent) = scope.parent() {
-        if let Some(&end) = replaced.get(&parent.id())
-            && (!through_module || end > syntax_element.start_byte())
-        {
-            return false;
+        if let Some(&end) = replaced.get(&parent.id()) {
+            let through_synchronized = synchronized == Some((parent.id(), end))
+                && left.starts_with("exports.")
+                && left != "exports.default";
+            if end > syntax_element.start_byte() || !(through_module || through_synchronized) {
+                return false;
+            }
         }
         scope = parent;
     }
