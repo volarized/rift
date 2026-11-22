@@ -93,6 +93,15 @@ pub struct AnalyzedFile {
 }
 
 impl AnalyzedFile {
+    fn static_source(&self) -> crate::static_resolution::StaticSource<'_> {
+        crate::static_resolution::StaticSource {
+            path: self.file.path(),
+            source: self.file.source(),
+            facts: self.file.syntax(),
+            placement: &self.placement,
+        }
+    }
+
     fn placed_facts(&self) -> PlacedFacts<'_> {
         PlacedFacts {
             facts: self.file.syntax(),
@@ -372,7 +381,11 @@ impl PackageAnalyzer {
             .map(AnalyzedFile::placed_facts)
             .collect::<Vec<_>>();
         let (external_work, external_work_max) = external_work_limits(&input);
-        let mut built = WorkspaceSemantics::build_facts_placed_with_external(
+        let static_sources = analyzed
+            .iter()
+            .map(AnalyzedFile::static_source)
+            .collect::<Vec<_>>();
+        let built = WorkspaceSemantics::build_facts_placed_with_external(
             &placed,
             input.limits().declarations_max(),
             input.limits().edges_max(),
@@ -401,6 +414,7 @@ impl PackageAnalyzer {
                     (reference.symbol() == &target).then(|| export.target.clone())
                 })
             },
+            (&static_sources, &input.namespace_input()),
         )
         .map_err(|error| {
             errors::analysis::package_provider_failed()
@@ -414,7 +428,6 @@ impl PackageAnalyzer {
                 .path(path.as_str())
                 .fail();
         }
-        resolve_package_static(&input, &analyzed, &mut built.semantics);
         let (publication, notebook_cells) = publish(
             &input,
             &analyzed,
@@ -430,27 +443,6 @@ impl PackageAnalyzer {
             warnings,
         })
     }
-}
-
-fn resolve_package_static(
-    input: &ExactPackageInput<'_>,
-    analyzed: &[AnalyzedFile],
-    semantics: &mut WorkspaceSemantics,
-) {
-    let sources = analyzed
-        .iter()
-        .map(|held| crate::static_resolution::StaticSource {
-            path: held.file.path(),
-            source: held.file.source(),
-            facts: held.file.syntax(),
-            placement: &held.placement,
-        })
-        .collect::<Vec<_>>();
-    semantics.add_static_resolution(
-        &sources,
-        &input.namespace_input(),
-        input.limits().edges_max(),
-    );
 }
 
 pub(crate) fn edge_kind(kind: rift_core::EdgeKind) -> rift_protocol::read::EdgeKind {

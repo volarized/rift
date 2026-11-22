@@ -96,7 +96,7 @@ impl PreparedSemantics {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with_external(edges_max, previous, None)
+        self.build_with_external(edges_max, previous, None, None)
     }
 
     fn build_with_external(
@@ -104,6 +104,7 @@ impl PreparedSemantics {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
         external: Option<&ExternalTarget<'_>>,
+        static_inputs: Option<StaticInputs<'_, '_>>,
     ) -> Result<BuiltSemantics, RiftError> {
         let index_revision = IndexRevision::new(self.revision)?;
         let source_revision = SourceRevision::new(self.revision)?;
@@ -124,16 +125,37 @@ impl PreparedSemantics {
                 previous,
             )?,
         };
-        let edges = EdgeStore::build_capped(&graph, edges_max);
+        let syntax_provider = ProviderId::new(SYNTAX_PROVIDER_ID)?;
+        let (edges, static_resolution) = match static_inputs {
+            Some((sources, input))
+                if self.beyond_declaration_bound.is_empty()
+                    && self.refused_contributions.is_empty() =>
+            {
+                EdgeStore::build_resolving(&graph, edges_max, || {
+                    crate::static_resolution::resolve(
+                        &graph,
+                        sources,
+                        input,
+                        edges_max.saturating_mul(16),
+                    )
+                })
+            }
+            _ => (
+                EdgeStore::build_capped(&graph, edges_max),
+                StaticResolution::default(),
+            ),
+        };
+        let mut semantics = WorkspaceSemantics {
+            graph,
+            edges,
+            syntax_provider,
+            static_resolution: StaticResolution::default(),
+            static_occurrence_order: Vec::new(),
+            outside_namespaces: std::collections::BTreeSet::new(),
+        };
+        semantics.hold_static_resolution(static_resolution);
         Ok(BuiltSemantics {
-            semantics: WorkspaceSemantics {
-                graph,
-                edges,
-                syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
-                static_resolution: StaticResolution::default(),
-                static_occurrence_order: Vec::new(),
-                outside_namespaces: std::collections::BTreeSet::new(),
-            },
+            semantics,
             beyond_declaration_bound: self.beyond_declaration_bound,
             refused_contributions: self.refused_contributions,
         })
@@ -142,6 +164,10 @@ impl PreparedSemantics {
 
 type ExternalTarget<'input> =
     dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
+type StaticInputs<'call, 'source> = (
+    &'call [StaticSource<'source>],
+    &'call crate::NamespaceInput<'source>,
+);
 
 impl StaticResolution {
     fn retained_size<T: get_size2::GetSizeTracker>(&self, mut tracker: T) -> (usize, T) {
@@ -388,15 +414,8 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::build_facts_placed_inner(
-            documents,
-            declarations_max,
-            edges_max,
-            revision,
-            previous,
-            false,
-            None,
-        )
+        Self::prepare_facts_placed(documents, declarations_max, revision, false)?
+            .build(edges_max, previous)
     }
 
     pub(crate) fn build_facts_placed_with_external(
@@ -404,35 +423,11 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         edges_max: usize,
         revision: u64,
-        external: &dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId>,
+        external: &ExternalTarget<'_>,
+        static_inputs: StaticInputs<'_, '_>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::build_facts_placed_inner(
-            documents,
-            declarations_max,
-            edges_max,
-            revision,
-            None,
-            false,
-            Some(external),
-        )
-    }
-
-    fn build_facts_placed_inner(
-        documents: &[PlacedFacts<'_>],
-        declarations_max: usize,
-        edges_max: usize,
-        revision: u64,
-        previous: Option<&NormalizedGraph>,
-        collect_refused_contributions: bool,
-        external: Option<&ExternalTarget<'_>>,
-    ) -> Result<BuiltSemantics, RiftError> {
-        Self::prepare_facts_placed(
-            documents,
-            declarations_max,
-            revision,
-            collect_refused_contributions,
-        )?
-        .build_with_external(edges_max, previous, external)
+        Self::prepare_facts_placed(documents, declarations_max, revision, false)?
+            .build_with_external(edges_max, None, Some(external), Some(static_inputs))
     }
 
     fn prepare_facts_placed(
@@ -521,21 +516,7 @@ impl WorkspaceSemantics {
         &self.edges
     }
 
-    pub(crate) fn add_static_resolution(
-        &mut self,
-        sources: &[StaticSource<'_>],
-        input: &crate::NamespaceInput<'_>,
-        edges_max: usize,
-    ) {
-        let work_max = edges_max.saturating_mul(16);
-        let mut resolution =
-            crate::static_resolution::resolve(&self.graph, sources, input, work_max);
-        self.edges.add_static(
-            &self.graph,
-            &resolution.occurrences,
-            &resolution.external,
-            edges_max,
-        );
+    fn hold_static_resolution(&mut self, mut resolution: StaticResolution) {
         resolution.occurrences.retain(|occurrence| {
             !matches!(
                 occurrence.edge_kind,
