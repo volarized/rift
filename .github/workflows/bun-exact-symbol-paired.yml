@@ -1,0 +1,102 @@
+name: Bun exact symbol paired read
+
+on:
+  push:
+    branches: [diagnostic/bun-exact-symbol-paired-v092-loader]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: bun-exact-symbol-paired
+  cancel-in-progress: false
+
+env:
+  BASE: 1a3803a3356e13b12830d2d143f7687dc9116871
+  PACKET: b4cc1212fa01977aa37bfddc94e4bae13e038038
+  PACKET_TREE: 1812d242a45c52af95c8c33070a259c59f94f267
+  PACKET_DIR: dev/diagnostics/exact-symbol-paired
+  WORKFLOW_PATH: .github/workflows/bun-exact-symbol-paired.yml
+  RAYON_NUM_THREADS: "2"
+  TOKIO_WORKER_THREADS: "2"
+
+jobs:
+  paired:
+    if: >-
+      github.repository == 'volarized/rift' &&
+      github.ref == 'refs/heads/diagnostic/bun-exact-symbol-paired-v092-loader' &&
+      github.event.created &&
+      !github.event.deleted &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.sender.type == 'User' &&
+      github.event.sender.login == 'renardeinside' &&
+      github.actor == 'renardeinside' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the signed packet and exact diagnostic source
+        env:
+          PUSHED_HEAD: ${{ github.event.after }}
+          GH_TOKEN: ${{ github.token }}
+          XDG_STATE_HOME: ${{ runner.temp }}/exact-symbol-state
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/exact-symbol-proof"
+          receipts="$RUNNER_TEMP/exact-symbol-proof"
+          git show -s --format='%H %T %P' HEAD > "$receipts/source.txt"
+          test "$PUSHED_HEAD" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PACKET"
+          test "$(git show -s --format=%P "$PACKET")" = "$BASE"
+          test "$(git show -s --format=%T "$PACKET")" = "$PACKET_TREE"
+          test "$(git diff --name-only "$PACKET" HEAD)" = "$WORKFLOW_PATH"
+          git fetch --no-tags origin refs/heads/main
+          main_sha="$(git rev-parse FETCH_HEAD)"
+          git merge-base --is-ancestor "$BASE" "$main_sha"
+          git show -s --format='%H %T %P' "$main_sha" > "$receipts/public-main.txt"
+          test "$(git ls-remote origin "$GITHUB_REF" | cut -f1)" = "$GITHUB_SHA"
+          for sha in "$BASE" "$main_sha" "$PACKET" "$GITHUB_SHA"; do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$sha" |
+              jq -e --arg sha "$sha" '.sha == $sha and .commit.verification.verified and .commit.verification.reason == "valid"'
+          done
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&event=push" |
+            jq -e --arg path "$WORKFLOW_PATH" --argjson run "$GITHUB_RUN_ID" '
+              [.workflow_runs[] | select(.path == $path) | .id] == [$run]'
+          git show -s --format='%H %T %P' "$PACKET" > "$receipts/packet.txt"
+          sha256sum "$PACKET_DIR"/attest.py "$PACKET_DIR"/measure.py "$PACKET_DIR"/pair.lock.json "$PACKET_DIR"/bun-edit-paths.txt > "$receipts/packet-sha256.txt"
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+      - name: Run the paired reads on the pinned Bun corpus
+        timeout-minutes: 40
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RIFT_CORPUS_DIR: ${{ runner.temp }}/exact-symbol-corpus
+          XDG_STATE_HOME: ${{ runner.temp }}/exact-symbol-state
+          XDG_CACHE_HOME: ${{ runner.temp }}/exact-symbol-cache
+        run: |
+          set -euo pipefail
+          command -v zstd
+          uv sync --locked --project dev
+          corpus="$(uv run --locked --project dev rift-dev corpus sync bun)"
+          cpus="$(python3 -c 'import os; cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2; print(",".join(map(str, cpus[:2])))')"
+          taskset -c "$cpus" uv run --locked --project dev python "$PACKET_DIR/measure.py" \
+            --workspace "$corpus" --output "$RUNNER_TEMP/exact-symbol-proof/results"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bun-exact-symbol-paired-results
+          path: |
+            ${{ runner.temp }}/exact-symbol-proof/*.txt
+            ${{ runner.temp }}/exact-symbol-proof/results/*.json
+            ${{ runner.temp }}/exact-symbol-proof/results/*/*.json
+            ${{ runner.temp }}/exact-symbol-proof/results/*/*.jsonl
+            ${{ runner.temp }}/exact-symbol-proof/results/*/*.log
+          if-no-files-found: warn
+          retention-days: 7
