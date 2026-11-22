@@ -1025,13 +1025,13 @@ mod tests {
         };
         use rift_provider::NormalizedTarget;
 
-        let caller = fixture_symbol("caller");
-        let called = fixture_symbol("called");
+        let containing_function = fixture_symbol("caller");
+        let call_target = fixture_symbol("called");
         let tied = fixture_symbol("tied");
         let path = "src/lib.rs";
         let graph = graph(vec![
-            definition("caller", caller.as_str(), path, (10, 40)),
-            definition("called", called.as_str(), path, (40, 60)),
+            definition("caller", containing_function.as_str(), path, (10, 40)),
+            definition("called", call_target.as_str(), path, (40, 60)),
             definition("tied", tied.as_str(), path, (10, 40)),
             reference(
                 "graph_call",
@@ -1049,7 +1049,7 @@ mod tests {
         let resolution = || {
             let occurrence = |start, end| StaticOccurrence {
                 binding: binding(path, start, end),
-                target: NormalizedTarget::Symbol(called.clone()),
+                target: NormalizedTarget::Symbol(call_target.clone()),
                 target_binding: None,
                 source_digest: rift_core::FileDigest::of(b"fixture"),
                 callee_range: rift_syntax::ByteRange { start, end },
@@ -1101,13 +1101,13 @@ mod tests {
             }
             assert_eq!(shared.edge_module(&source_unit(path)), Some(&module));
             if cap == 5 {
-                let rows = shared.incoming(&called);
+                let rows = shared.incoming(&call_target);
                 let inner = rows
                     .iter()
                     .find(|edge| edge.occurrence().range().start() == 20)
                     .expect("graph call resolves within tied spans")
                     .from();
-                assert!(inner == &caller || inner == &tied);
+                assert!(inner == &containing_function || inner == &tied);
                 assert!(rows.iter().any(|edge| edge.from() == inner && edge.occurrence().range().start() == 27));
                 assert!(
                     rows.iter().any(
