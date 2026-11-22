@@ -4120,6 +4120,102 @@ impl WorkspaceIndex {
         Some(SymbolMatch { file, symbol, rank })
     }
 
+    /// Reads a directly owned ECMAScript symbol and its single physical declaration.
+    ///
+    /// A caller can use the ordinary directory for other identities or additional
+    /// projections. The direct read uses only an established graph record and its
+    /// admitted contribution at the exact captured physical source.
+    #[must_use]
+    pub fn exact_relative_singleton(
+        &self,
+        key: &SymbolId,
+    ) -> Option<(
+        ReadableSymbol,
+        rift_protocol::symbol_read::SymbolDeclaration,
+    )> {
+        if self.symbol_declarations.get().is_some() {
+            return None;
+        }
+        let identity = rift_protocol::identity::SymbolIdentity::parse(key.as_str()).ok()?;
+        if identity.owner() != &self.owner
+            || !identity.owner().is_local()
+            || !matches!(
+                identity.language().name.as_str(),
+                "javascript" | "typescript"
+            )
+        {
+            return None;
+        }
+        let [namespace, _] = identity.qualified_path() else {
+            return None;
+        };
+        let path = ProjectPath::new(namespace.strip_prefix("./")?).ok()?;
+        let file = self.file(&path)?;
+        let syntax = file.syntax();
+        if !syntax.left_out_symbols().is_empty()
+            || syntax.language() != identity.language()
+            || syntax.symbols().len() > 4_096
+        {
+            return None;
+        }
+        let language = syntax.language().identity_segment();
+        let graph = self.semantics.graph();
+        let mut matches = syntax
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, symbol)| {
+                let provider = symbol.provider_address(&language, path.as_str());
+                let position = self.semantics.record_position(&provider)?;
+                let record = graph.records().get(position)?;
+                (record.identity() == Some(key)).then_some((index, provider, record))
+            });
+        let (selected, provider, record) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let [member] = record.contributions() else {
+            return None;
+        };
+        let contribution = self.semantics.syntax_contribution(&provider)?;
+        let source = contribution.source()?;
+        let matched = self.declaration_match(&path, selected)?;
+        let range = matched.symbol.item_range;
+        if contribution.key() != member
+            || contribution.identity_anchor() != Some(key)
+            || !contribution.references().is_empty()
+            || !contribution.edges().is_empty()
+            || source.unit() != &rift_syntax::source_unit_for_path(&path).ok()?
+            || source.range().start() != range.start
+            || source.range().end() != range.end
+            || !file
+                .source()
+                .is_char_boundary(usize::try_from(range.start).ok()?)
+            || !file
+                .source()
+                .is_char_boundary(usize::try_from(range.end).ok()?)
+            || !Self::unique_coordinate(syntax.symbols(), selected, range)
+        {
+            return None;
+        }
+        let readable = ReadableSymbol::new(self.semantics.assembled_record(record)?)?;
+        if !rift_protocol::read::symbol_name_is_public(readable.facts().name()) {
+            return None;
+        }
+        let starts = rift_core::line::line_starts(file.source());
+        let declaration = self
+            .declaration_facts(matched, &provider, &readable, &starts)
+            .ok()?;
+        Some((readable, declaration))
+    }
+
+    fn unique_coordinate(symbols: &[SyntaxSymbol], index: usize, range: ByteRange) -> bool {
+        !symbols
+            .iter()
+            .enumerate()
+            .any(|(position, symbol)| position != index && symbol.item_range == range)
+    }
+
     /// Resolves one established object from this immutable normalized graph.
     ///
     /// Objects without source bindings remain readable. This lookup retains full facts;

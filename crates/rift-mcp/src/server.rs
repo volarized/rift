@@ -842,6 +842,8 @@ struct RevisionRead {
 /// request-time capture that resolved it took.
 struct ResolvedWorkspace {
     published: Arc<PublishedWorkspace>,
+    /// True only when request-time validation accepted this publication.
+    verified_current: bool,
     stale: Option<ReadWarning>,
     /// The request-time capture's time, worker admission included. A traversal checks
     /// the same tree once more after its engine walk, and sizes the time it reserves
@@ -855,6 +857,7 @@ impl ResolvedWorkspace {
     const fn current(published: Arc<PublishedWorkspace>, capture_elapsed: Duration) -> Self {
         Self {
             published,
+            verified_current: true,
             stale: None,
             capture_elapsed,
         }
@@ -881,6 +884,7 @@ impl ResolvedWorkspace {
         let stale = moved.map(|moved| stale_index_warning(&published, captured, moved, reason));
         Ok(Self {
             published,
+            verified_current: false,
             stale,
             capture_elapsed,
         })

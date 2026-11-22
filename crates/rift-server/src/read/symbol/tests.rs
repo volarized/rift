@@ -61,6 +61,103 @@ fn request(id: SymbolId) -> GetSymbolParams {
 }
 
 #[test]
+fn current_singleton_reads_its_revision_without_initializing_the_directory() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("index.ts");
+    std::fs::write(&path, "export function known(x: number) { return x; }\n")?;
+    let held = build(directory.path())?;
+    let id = SymbolId::parse("rift://symbol/local/typescript/.%2Findex.ts/known")?;
+    let key = rift_core::SymbolId::new(id.as_str())?;
+    let mut params = request(id);
+    params.include = GetSymbolInclude::default();
+
+    let first = held.exact_current_symbol(&params)?;
+    assert!(matches!(first, GetSymbolResult::Found { .. }));
+    assert!(held.index.exact_relative_singleton(&key).is_some());
+    assert_eq!(first, held.exact_symbol(&params, true)?);
+    assert!(held.index.exact_relative_singleton(&key).is_none());
+    assert_eq!(first, held.exact_current_symbol(&params)?);
+
+    std::fs::write(&path, "\nexport function known(x: number) { return x; }\n")?;
+    let cold = build(directory.path())?;
+    let changes =
+        rift_index::PathChanges::between(&held.workspace_digests(), &cold.workspace_digests());
+    let current = held.rebuilt(&changes)?;
+    let fresh = current.exact_current_symbol(&params)?;
+    assert_ne!(first, fresh);
+    assert_eq!(fresh, cold.exact_symbol(&params, true)?);
+    assert!(current.index.exact_relative_singleton(&key).is_some());
+    assert_eq!(first, held.exact_current_symbol(&params)?);
+
+    params.revision = Some(held.served_revision()?);
+    assert_eq!(
+        current
+            .exact_current_symbol(&params)
+            .expect_err("the old tree is not served")
+            .slug(),
+        errors::server::read_revision_unserved::SLUG
+    );
+    assert!(current.index.exact_relative_singleton(&key).is_some());
+    params.revision = Some(current.served_revision()?);
+    assert_eq!(fresh, current.exact_current_symbol(&params)?);
+    assert!(current.index.exact_relative_singleton(&key).is_none());
+    Ok(())
+}
+
+#[test]
+fn current_exact_symbol_falls_back_for_docs_continuations_and_unavailable_identity() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("index.ts"),
+        "export function known() { return 1; }\n",
+    )?;
+    std::fs::write(directory.path().join("unavailable.ts"), b"\0binary")?;
+    std::fs::write(
+        directory.path().join("guide.md"),
+        "Use [known](rift://symbol/local/typescript/.%2Findex.ts/known).\n",
+    )?;
+    let id = SymbolId::parse("rift://symbol/local/typescript/.%2Findex.ts/known")?;
+    let key = rift_core::SymbolId::new(id.as_str())?;
+
+    let with_docs = build(directory.path())?;
+    let mut params = request(id.clone());
+    let result = with_docs.exact_current_symbol(&params)?;
+    let GetSymbolResult::Found {
+        documentation: Some(documentation),
+        ..
+    } = &result
+    else {
+        return Err("documentation must reach the ordinary owner".into());
+    };
+    assert_eq!(documentation.references.len(), 1);
+    assert_eq!(result, with_docs.exact_symbol(&params, true)?);
+    assert!(with_docs.index.exact_relative_singleton(&key).is_none());
+
+    let continued = build(directory.path())?;
+    params.include = GetSymbolInclude::default();
+    params.page = 2;
+    let result = continued.exact_current_symbol(&params)?;
+    let GetSymbolResult::Found { declarations, .. } = &result else {
+        return Err("an established empty continuation is still found".into());
+    };
+    assert!(declarations.is_empty());
+    assert_eq!(result, continued.exact_symbol(&params, true)?);
+    assert!(continued.index.exact_relative_singleton(&key).is_none());
+
+    let unavailable = build(directory.path())?;
+    params.id = SymbolId::parse("rift://symbol/local/typescript/.%2Funavailable.ts/unknown")?;
+    params.page = 1;
+    assert!(matches!(
+        unavailable.exact_current_symbol(&params)?,
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::InsufficientCoverage,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
 fn exact_hit_after_edit_matches_cold_pages_without_building_lexical_units() -> TestResult {
     let directory = tempfile::tempdir()?;
     let previous = service(directory.path(), true)?;

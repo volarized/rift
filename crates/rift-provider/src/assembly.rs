@@ -384,6 +384,12 @@ impl SymbolAssembler {
                     .cloned()
                     .collect(),
             ),
+            None if contributions.iter().all(|(_, contribution)| {
+                contribution.references().is_empty() && contribution.edges().is_empty()
+            }) =>
+            {
+                (Vec::new(), Vec::new())
+            }
             None => (
                 graph
                     .references()
