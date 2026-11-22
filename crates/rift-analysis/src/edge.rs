@@ -1167,6 +1167,20 @@ mod tests {
         serde_json::from_str(record.fields()).expect("finalization counters are JSON")
     }
 
+    fn assert_static_only_counts(counts: &serde_json::Value) {
+        assert_eq!(counts["mode"], "static_only");
+        assert_eq!(counts["static_drops"], "0");
+        assert_eq!(counts["graph_drops"], "0");
+        assert_eq!(counts["remaining"], "1");
+        assert_eq!(counts["edges_max"], "7");
+        assert_eq!(counts["skipped_outgoing_lists"], "2");
+        assert_eq!(counts["skipped_outgoing_rows"], "3");
+        assert_eq!(counts["skipped_incoming_lists"], "1");
+        assert_eq!(counts["skipped_incoming_rows"], "3");
+        assert_eq!(counts["outgoing_rows"], "3");
+        assert_eq!(counts["incoming_rows"], "3");
+    }
+
     #[test]
     fn static_only_adjacency_matches_full_finalization_in_both_directions() {
         use crate::static_resolution::EdgeCallCoverage;
@@ -1236,17 +1250,7 @@ mod tests {
         let (reused, coverage) = EdgeStore::build_resolving(&normalized, 7, resolution);
         drop(recorder);
         let counts = finalization_fields(&mut drain);
-        assert_eq!(counts["mode"], "static_only");
-        assert_eq!(counts["static_drops"], "0");
-        assert_eq!(counts["graph_drops"], "0");
-        assert_eq!(counts["remaining"], "1");
-        assert_eq!(counts["edges_max"], "7");
-        assert_eq!(counts["skipped_outgoing_lists"], "2");
-        assert_eq!(counts["skipped_outgoing_rows"], "3");
-        assert_eq!(counts["skipped_incoming_lists"], "1");
-        assert_eq!(counts["skipped_incoming_rows"], "3");
-        assert_eq!(counts["outgoing_rows"], "3");
-        assert_eq!(counts["incoming_rows"], "3");
+        assert_static_only_counts(&counts);
         assert_eq!(coverage.unavailable_sources, 1);
         assert_eq!(coverage.omitted[&EdgeKind::Calls], 1);
         assert!(coverage.edge_calls[&unavailable].unavailable);
