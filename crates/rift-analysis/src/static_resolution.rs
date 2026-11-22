@@ -11,11 +11,12 @@ mod javascript_reexports;
 mod javascript_scopes;
 mod python_edges;
 mod rust;
+mod rust_calls;
 #[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use rift_core::{
     ContributionReference, DeclarationBinding, FileDigest, LoopBudget, ProjectPath, ProviderId,
@@ -29,6 +30,10 @@ use rift_syntax::{
 };
 
 pub(crate) use external::ExternalOccurrence;
+use rust_calls::{
+    RUST_CALL_FILES_MAX, RUST_CALL_SLOTS_MAX, RUST_FILE_CALL_SLOTS_MAX, RustCall, RustCallRun,
+};
+pub(crate) use rust_calls::{RustCallCache, RustCallCapture};
 
 use crate::{EnclosingDefinitions, NamespaceInput};
 
@@ -70,6 +75,7 @@ pub(crate) struct StaticResolution {
     pub(crate) unresolved_sites: usize,
     pub(crate) exhausted: bool,
     pub(crate) edge_calls: BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
+    pub(crate) rust_calls: Option<Arc<RustCallCache>>,
 }
 
 #[derive(Debug)]
@@ -132,17 +138,29 @@ pub(crate) fn deferred(documents: &[StaticSource<'_>]) -> StaticResolution {
 }
 
 /// Runs one static pass over a captured source selection.
+#[cfg(test)]
 pub(crate) fn resolve(
     graph: &NormalizedGraph,
     documents: &[StaticSource<'_>],
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
+    resolve_with_rust_calls(graph, documents, namespace, work_max, None)
+}
+
+pub(crate) fn resolve_with_rust_calls(
+    graph: &NormalizedGraph,
+    documents: &[StaticSource<'_>],
+    namespace: &NamespaceInput<'_>,
+    work_max: usize,
+    rust_calls: Option<&RustCallCapture>,
+) -> StaticResolution {
     resolve_by(
         graph,
         documents,
         namespace,
         work_max,
+        rust_calls,
         |index, work, resolution| index.resolve_files(FileWork::CAPTURED, work, resolution),
     )
 }
@@ -153,6 +171,7 @@ fn resolve_by<'source>(
     documents: &'source [StaticSource<'source>],
     namespace: &NamespaceInput<'_>,
     work_max: usize,
+    rust_calls: Option<&'source RustCallCapture>,
     files: impl FnOnce(&Index<'source>, &mut Work, &mut StaticResolution),
 ) -> StaticResolution {
     let mut edge_calls: BTreeMap<_, _> = documents
@@ -166,7 +185,7 @@ fn resolve_by<'source>(
         })
         .collect();
     let mut work = Work::new(work_max);
-    let Some(index) = Index::new(graph, documents, namespace, &mut work) else {
+    let Some(index) = Index::new(graph, documents, namespace, rust_calls, &mut work) else {
         for coverage in edge_calls.values_mut() {
             coverage.unavailable = true;
         }
@@ -194,6 +213,17 @@ struct FileResolution {
     used: usize,
     /// Whether the pass ended on its budget.
     exhausted: bool,
+    rust_calls: Option<Arc<[Option<RustCall>]>>,
+    rust_call_counts: RustCallCounts,
+}
+
+#[derive(Debug, Default)]
+struct RustCallCounts {
+    native: usize,
+    reused: usize,
+    charged: usize,
+    occurrences: usize,
+    recorded: usize,
 }
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
@@ -255,6 +285,8 @@ struct Work {
     exhausted: bool,
     python_depth: u8,
     javascript_depth: u8,
+    rust_calls: RustCallRun,
+    rust_call_counts: RustCallCounts,
 }
 
 impl Work {
@@ -264,6 +296,8 @@ impl Work {
             exhausted: false,
             python_depth: 0,
             javascript_depth: 0,
+            rust_calls: RustCallRun::Disabled,
+            rust_call_counts: RustCallCounts::default(),
         }
     }
 
@@ -419,6 +453,8 @@ struct File<'source> {
     conditions: Conditions,
     /// Rust modules this file's conditional item chains declare, with their admission.
     chain_modules: BTreeMap<&'source str, Option<bool>>,
+    rust_file: Option<usize>,
+    rust_call_slots: usize,
 }
 
 #[derive(Default)]
@@ -549,6 +585,8 @@ impl<'source> File<'source> {
             unknown_member_writes: BTreeSet::new(),
             conditions: Conditions::default(),
             chain_modules: BTreeMap::new(),
+            rust_file: None,
+            rust_call_slots: 0,
         };
         if document.facts.language().name == "rust" {
             file.chain_modules = crate::analyzer::namespace::rust_chain_modules(
@@ -956,6 +994,8 @@ struct Index<'source> {
     python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
+    rust_calls: Option<&'source RustCallCapture>,
+    rust_call_files: Vec<&'source str>,
     /// Budget every file pass consumed, joined or not.
     #[cfg(test)]
     performed: std::sync::atomic::AtomicUsize,
@@ -966,11 +1006,15 @@ impl<'source> Index<'source> {
         graph: &'source NormalizedGraph,
         documents: &'source [StaticSource<'source>],
         namespace: &NamespaceInput<'_>,
+        rust_calls: Option<&'source RustCallCapture>,
         work: &mut Work,
     ) -> Option<Self> {
         let mut files = BTreeMap::new();
         let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
+        let mut rust_call_files = Vec::new();
+        let mut rust_slots_left = RUST_CALL_SLOTS_MAX;
+        let mut rust_files_left = RUST_CALL_FILES_MAX;
         for document in documents {
             if !work.charge() {
                 return None;
@@ -989,12 +1033,26 @@ impl<'source> Index<'source> {
                 }
                 EMPTY_STATIC_FACTS.get_or_init(StaticFacts::default)
             };
-            let file = File::new(
+            let mut file = File::new(
                 document,
                 facts,
                 Some(&configurations.file(document.path.as_str())),
                 work,
             )?;
+            if rust_calls.is_some() && document.facts.language().name == "rust" {
+                file.rust_file = Some(rust_call_files.len());
+                rust_call_files.push(document.path.as_str());
+                let slots = facts.calls().len();
+                if rust_files_left > 0
+                    && slots != 0
+                    && slots <= RUST_FILE_CALL_SLOTS_MAX
+                    && let Some(left) = rust_slots_left.checked_sub(slots)
+                {
+                    file.rust_call_slots = slots;
+                    rust_slots_left = left;
+                    rust_files_left -= 1;
+                }
+            }
             if files.insert(document.path.as_str(), file).is_some() {
                 return None;
             }
@@ -1034,6 +1092,8 @@ impl<'source> Index<'source> {
             python_writes,
             syntax_publication,
             unavailable_sources,
+            rust_calls,
+            rust_call_files,
             #[cfg(test)]
             performed: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1059,7 +1119,11 @@ impl<'source> Index<'source> {
     ) {
         let files = self.files.values().collect::<Vec<_>>();
         let mut pending = files.as_slice();
-        while !pending.is_empty() && !work.exhausted {
+        let mut rust_calls = BTreeMap::new();
+        let mut rust_call_counts = RustCallCounts::default();
+        let mut seen_rust_slots = 0_usize;
+        let mut retained_rust_slots = 0_usize;
+        'runs: while !pending.is_empty() && !work.exhausted {
             let run = file_work.run(pending, work.budget.remaining());
             let (run, rest) = pending.split_at(run.max(1));
             pending = rest;
@@ -1087,7 +1151,7 @@ impl<'source> Index<'source> {
             );
             for (file, apart) in run.iter().zip(resolved) {
                 if !work.charge() {
-                    return;
+                    break 'runs;
                 }
                 let left = work.budget.remaining();
                 // Only a file running alone can end on the pass budget: a run reserves
@@ -1095,8 +1159,37 @@ impl<'source> Index<'source> {
                 work.exhausted = apart.exhausted && left < file_work.max(file);
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+                if let Some(ordinal) = file.rust_file {
+                    seen_rust_slots += file.facts.calls().len();
+                    if let Some(calls) = apart.rust_calls {
+                        retained_rust_slots += calls.len();
+                        rust_call_counts.recorded += apart.rust_call_counts.recorded;
+                        rust_calls.insert(ordinal, calls);
+                    }
+                    rust_call_counts.native += apart.rust_call_counts.native;
+                    rust_call_counts.reused += apart.rust_call_counts.reused;
+                    rust_call_counts.charged += apart.rust_call_counts.charged;
+                    rust_call_counts.occurrences += apart.rust_call_counts.occurrences;
+                }
                 resolution.join(file, apart.resolution, over_share);
             }
+        }
+        if let Some(capture) = self.rust_calls {
+            rift_tracing::traced!(
+                component = "analysis",
+                operation = "Index::rust_call_lookups",
+                native = rust_call_counts.native,
+                reused = rust_call_counts.reused,
+                charged = rust_call_counts.charged,
+                occurrences = rust_call_counts.occurrences,
+                recorded = rust_call_counts.recorded,
+                retained_slots = retained_rust_slots,
+                pruned_slots = seen_rust_slots - retained_rust_slots,
+                slot_bytes = std::mem::size_of::<Option<RustCall>>(),
+                witness_files = capture.files(),
+                witness_rows = capture.placement_rows(),
+                { resolution.rust_calls = Some(capture.finish(rust_calls)) }
+            );
         }
     }
 
@@ -1108,6 +1201,11 @@ impl<'source> Index<'source> {
         edge_calls: &BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
     ) -> FileResolution {
         let mut work = Work::new(budget);
+        if let Some((capture, ordinal)) = self.rust_calls.zip(file.rust_file)
+            && file.rust_call_slots != 0
+        {
+            work.rust_calls = capture.file(ordinal, file.rust_call_slots);
+        }
         let mut resolution = StaticResolution::default();
         let unit = file.document.placement.unit();
         if let Some(coverage) = edge_calls.get(unit) {
@@ -1129,6 +1227,12 @@ impl<'source> Index<'source> {
             resolution,
             used,
             exhausted: work.exhausted,
+            rust_calls: if work.exhausted {
+                None
+            } else {
+                work.rust_calls.finish()
+            },
+            rust_call_counts: work.rust_call_counts,
         }
     }
 
@@ -1139,14 +1243,14 @@ impl<'source> Index<'source> {
         work: &mut Work,
         result: &mut StaticResolution,
     ) -> bool {
-        for call in file.facts.calls() {
+        for (slot, call) in file.facts.calls().iter().enumerate() {
             if file.inactive(call.range, work) {
                 continue;
             }
             if !work.charge() {
                 return false;
             }
-            let mut occurrence = self.call_occurrence(file, call, work);
+            let mut occurrence = self.call_occurrence(file, slot, call, work);
             if matches!(
                 file.document.facts.language().name.as_str(),
                 "javascript" | "typescript"
@@ -1277,10 +1381,14 @@ impl<'source> Index<'source> {
     fn call_occurrence(
         &self,
         file: &File<'source>,
+        slot: usize,
         call: &StaticCall,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
-        let target = self.call_target(file, call, work)?;
+        let target = self.call_target(file, slot, call, work)?;
+        if file.rust_file.is_some() {
+            work.rust_call_counts.occurrences += 1;
+        }
         let mut occurrence = self.occurrence(
             file,
             call.range,
@@ -1451,6 +1559,7 @@ impl<'source> Index<'source> {
     fn call_target(
         &self,
         file: &File<'source>,
+        slot: usize,
         call: &StaticCall,
         work: &mut Work,
     ) -> Option<Target<'source>> {
@@ -1459,10 +1568,62 @@ impl<'source> Index<'source> {
         }
         match file.document.facts.language().name.as_str() {
             "javascript" | "typescript" => self.javascript_call(file, call, work),
+            "rust" if file.rust_file.is_some() => self.rust_call(file, slot, call, work),
             "rust" => self.rust.call(file, call, work),
             "python" => self.edge_python_call(file, call, work),
             _ => None,
         }
+    }
+
+    fn rust_call(
+        &self,
+        file: &File<'source>,
+        slot: usize,
+        call: &StaticCall,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if let Some(cached) = work.rust_calls.lookup(slot)
+            && !work.exhausted
+            && let Some(available) = work.budget.remaining().checked_sub(cached.charged)
+            && let Some(target) = self
+                .rust_call_files
+                .get(cached.target_file)
+                .and_then(|path| self.files.get(path))
+                .and_then(|file| file.target_at(cached.target_range))
+        {
+            work.budget = LoopBudget::new(available);
+            work.rust_call_counts.reused += 1;
+            work.rust_call_counts.charged += cached.charged;
+            return Some(target);
+        }
+        let before = work.budget.remaining();
+        let target = self.rust.call(file, call, work);
+        let charged = before - work.budget.remaining();
+        work.rust_call_counts.native += 1;
+        work.rust_call_counts.charged += charged;
+        if let Some(target) = target
+            && !work.exhausted
+            && matches!(work.rust_calls, RustCallRun::Record { .. })
+        {
+            let range = target.symbol.name_range.unwrap_or(target.symbol.item_range);
+            if let Some(file) = self.files.get(target.file.path.as_str())
+                && let Some(ordinal) = file.rust_file
+                && file
+                    .target_at(range)
+                    .is_some_and(|captured| std::ptr::eq(target.symbol, captured.symbol))
+            {
+                work.rust_calls.record(
+                    slot,
+                    RustCall {
+                        charged,
+                        target_file: ordinal,
+                        target_range: range,
+                    },
+                );
+                work.rust_call_counts.recorded += 1;
+            }
+        }
+        target
     }
 
     fn import_target(

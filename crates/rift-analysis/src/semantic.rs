@@ -17,7 +17,7 @@ use rift_syntax::{
 };
 
 use crate::edge::EdgeStore;
-use crate::static_resolution::{StaticOccurrence, StaticResolution, StaticSource};
+use crate::static_resolution::{RustCallCapture, StaticOccurrence, StaticResolution, StaticSource};
 
 /// Publication bounds for a build that holds at most `declarations_max` declarations.
 ///
@@ -96,7 +96,7 @@ impl PreparedSemantics {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with_external(edges_max, previous, None, None)
+        self.build_with_external(edges_max, previous, None, None, None)
     }
 
     fn build_with_external(
@@ -105,6 +105,7 @@ impl PreparedSemantics {
         previous: Option<&NormalizedGraph>,
         external: Option<&ExternalTarget<'_>>,
         static_inputs: Option<StaticInputs<'_, '_>>,
+        rust_calls: Option<&RustCallCapture>,
     ) -> Result<BuiltSemantics, RiftError> {
         let index_revision = IndexRevision::new(self.revision)?;
         let source_revision = SourceRevision::new(self.revision)?;
@@ -132,11 +133,12 @@ impl PreparedSemantics {
                     && self.refused_contributions.is_empty() =>
             {
                 EdgeStore::build_resolving(&graph, edges_max, || {
-                    crate::static_resolution::resolve(
+                    crate::static_resolution::resolve_with_rust_calls(
                         &graph,
                         sources,
                         input,
                         edges_max.saturating_mul(16),
+                        rust_calls,
                     )
                 })
             }
@@ -224,7 +226,17 @@ impl StaticResolution {
                     tracker,
                 )
             });
-        (bytes.saturating_add(coverage), tracker)
+        let (rust_calls, tracker) = if let Some(rust_calls) = &self.rust_calls {
+            rift_protocol::retained_arc_material(rust_calls, tracker, |calls, tracker| {
+                get_size2::GetSize::get_heap_size_with_tracker(calls, tracker)
+            })
+        } else {
+            (0, tracker)
+        };
+        (
+            bytes.saturating_add(coverage).saturating_add(rust_calls),
+            tracker,
+        )
     }
 }
 
@@ -427,7 +439,7 @@ impl WorkspaceSemantics {
         static_inputs: StaticInputs<'_, '_>,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::prepare_facts_placed(documents, declarations_max, revision, false)?
-            .build_with_external(edges_max, None, Some(external), Some(static_inputs))
+            .build_with_external(edges_max, None, Some(external), Some(static_inputs), None)
     }
 
     fn prepare_facts_placed(

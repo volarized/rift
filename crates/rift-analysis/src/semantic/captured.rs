@@ -5,10 +5,15 @@ use rift_provider::NormalizedGraph;
 use rift_syntax::DocumentPlacement;
 
 use crate::analyzer::namespace::{SelectedFile, placed_aliases, prepare_context};
-use crate::static_resolution::StaticSource;
+use crate::static_resolution::{RustCallCapture, StaticSource};
 use crate::{IndexedFile, NamespaceInput};
 
 use super::{BuiltSemantics, PlacedFacts, PreparedSemantics, WorkspaceSemantics};
+
+enum StaticHistory<'previous> {
+    Disabled,
+    Captured(Option<&'previous WorkspaceSemantics>),
+}
 
 /// Source and namespace evidence waiting beside an admitted project publication.
 #[derive(Debug)]
@@ -42,7 +47,27 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with(edges_max, previous, true)
+        self.build_with(edges_max, previous, true, StaticHistory::Disabled)
+    }
+
+    /// Builds complete captured facts and carries bounded Rust lookup outcomes from this
+    /// workspace's direct predecessor. The caller supplies the previously published
+    /// semantics of the same root, owner, and unchanged capture policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when graph validation fails.
+    pub fn build_with_static_history(
+        self,
+        edges_max: usize,
+        previous: Option<&WorkspaceSemantics>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        self.build_with(
+            edges_max,
+            previous.map(WorkspaceSemantics::graph),
+            true,
+            StaticHistory::Captured(previous),
+        )
     }
 
     /// Builds semantic adjacency for a source inventory that is still growing, leaving
@@ -61,7 +86,7 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with(edges_max, previous, false)
+        self.build_with(edges_max, previous, false, StaticHistory::Disabled)
     }
 
     fn build_with(
@@ -69,6 +94,7 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
         resolve_static: bool,
+        history: StaticHistory<'_>,
     ) -> Result<BuiltSemantics, RiftError> {
         let admitted_all = self.admitted_all();
         let sources = if admitted_all {
@@ -86,9 +112,24 @@ impl PreparedProjectSemantics<'_> {
             Vec::new()
         };
         let static_inputs = resolve_static.then_some((sources.as_slice(), &self.input));
-        let mut built =
-            self.prepared
-                .build_with_external(edges_max, previous, None, static_inputs)?;
+        let rust_calls = match history {
+            StaticHistory::Captured(previous) if admitted_all => RustCallCapture::new(
+                self.input,
+                self.documents
+                    .iter()
+                    .copied()
+                    .zip(self.placements.iter().map(|file| &file.placement)),
+                previous.and_then(|semantics| semantics.static_resolution.rust_calls.as_ref()),
+            ),
+            _ => None,
+        };
+        let mut built = self.prepared.build_with_external(
+            edges_max,
+            previous,
+            None,
+            static_inputs,
+            rust_calls.as_ref(),
+        )?;
         built.semantics.outside_namespaces = self.outside_namespaces;
         if !resolve_static && admitted_all {
             built.semantics.defer_static_resolution(&sources);
