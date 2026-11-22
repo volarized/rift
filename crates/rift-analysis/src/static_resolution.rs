@@ -1175,7 +1175,8 @@ impl<'source> Index<'source> {
             }
         }
         if let Some(capture) = self.rust_calls {
-            rift_tracing::traced!(
+            resolution.rust_calls = Some(capture.finish(rust_calls));
+            rift_tracing::info!(
                 component = "analysis",
                 operation = "Index::rust_call_lookups",
                 native = rust_call_counts.native,
@@ -1188,7 +1189,7 @@ impl<'source> Index<'source> {
                 slot_bytes = std::mem::size_of::<Option<RustCall>>(),
                 witness_files = capture.files(),
                 witness_rows = capture.placement_rows(),
-                { resolution.rust_calls = Some(capture.finish(rust_calls)) }
+                "Index::rust_call_lookups"
             );
         }
     }
