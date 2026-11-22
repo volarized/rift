@@ -1,0 +1,138 @@
+name: Bun normalization activation
+
+on:
+  pull_request:
+    types: [labeled]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  BASE: 587c50e9ecce8a2cf24fd5f22de6278f2b075b0b
+  PRODUCT: c786e083913e0215c58ad746b9d6ef313b2af34c
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  build:
+    if: >-
+      github.event.label.name == 'bun-normalization-activation' &&
+      github.event.pull_request.head.ref == 'perf/bun-normalization-activation' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.sender.type == 'User'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    outputs:
+      fingerprint: ${{ steps.archive.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify signed inputs and the exact merge tree
+        env:
+          APPROVED_HEAD: ${{ github.event.pull_request.head.sha }}
+          APPROVED_BASE: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$APPROVED_BASE" = "$BASE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$BASE $APPROVED_HEAD"
+          test "$(git show -s --format=%P "$APPROVED_HEAD")" = "$PRODUCT"
+          test "$(git show -s --format=%P "$PRODUCT")" = "$BASE"
+          test "$(git rev-parse HEAD^{tree})" = "$(git rev-parse "$APPROVED_HEAD^{tree}")"
+          for sha in "$PRODUCT" "$APPROVED_HEAD"; do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$sha" |
+              jq -e --arg sha "$sha" '.sha == $sha and .commit.verification.verified == true and .commit.verification.reason == "valid"'
+          done
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: integration-cli
+          cache-targets: false
+          save-if: false
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.90.3
+        with:
+          tool: just
+      - name: Build the corpus-profile CLI and the separate physical witness
+        timeout-minutes: 29
+        run: |
+          set -euo pipefail
+          just integration-cli
+          cargo build --locked --profile corpus -p rift-index --example bun_normalization_witness
+          mkdir transfer
+          cp target/integration-cli.tar.zst transfer/
+          cp target/corpus/examples/bun_normalization_witness transfer/
+      - name: Bind artifact bytes to the reviewed tree
+        id: archive
+        run: |
+          set -euo pipefail
+          git show -s --format='%H %T %P' HEAD > transfer/source.txt
+          (
+            cd transfer
+            sha256sum integration-cli.tar.zst bun_normalization_witness source.txt > sha256.txt
+            printf 'fingerprint=%s\n' "$(sha256sum sha256.txt | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          )
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bun-normalization-inputs
+          path: transfer/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  activation:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAYON_NUM_THREADS: "2"
+      TOKIO_WORKER_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: bun-normalization-inputs
+          path: transfer
+      - name: Verify and extract the same-run CLI
+        env:
+          FINGERPRINT: ${{ needs.build.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          (cd transfer && test "$(sha256sum sha256.txt | cut -d ' ' -f 1)" = "$FINGERPRINT" && sha256sum -c sha256.txt)
+          test "$(git show -s --format='%H %T %P' HEAD)" = "$(cat transfer/source.txt)"
+          test "$(tar --zstd -tf transfer/integration-cli.tar.zst)" = rift
+          test "$(tar --zstd -tvf transfer/integration-cli.tar.zst | cut -c1)" = -
+          tar --zstd -xf transfer/integration-cli.tar.zst -C transfer --no-same-owner --no-same-permissions
+          test -f transfer/rift && test ! -L transfer/rift
+          chmod +x transfer/rift transfer/bun_normalization_witness
+          readelf -h transfer/rift | grep -F 'Advanced Micro Devices X86-64'
+      - name: Fetch the pinned corpus and run the activation oracle
+        run: |
+          set -euo pipefail
+          uv sync --locked --project dev
+          uv run --locked --project dev rift-dev corpus sync bun
+          cpus="$(python3 -c 'import os; cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=2; print(",".join(map(str, cpus[:2])))')"
+          taskset -c "$cpus" uv run --locked --project dev python dev/check_bun_normalization.py             transfer/rift transfer/bun_normalization_witness normalization-results
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bun-normalization-results
+          path: |
+            normalization-results/
+            transfer/source.txt
+            transfer/sha256.txt
+          if-no-files-found: error
+          retention-days: 7

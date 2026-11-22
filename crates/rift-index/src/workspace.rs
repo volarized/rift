@@ -59,7 +59,9 @@ use crate::capture::{
     CaptureBoundary, CaptureSelection, CapturedPath, DiscoveryInputs, LastCapture, RootIdentity,
     SelectionInputs, capture_io_error, capture_path, path_was_removed, root_identity,
 };
-use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
+use crate::change_set::{
+    FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests, tree_revision_of,
+};
 use crate::chunk::text_chunks;
 use crate::content_cache::WorkspaceContentCache;
 use crate::documentation::NotebookFiles;
@@ -3097,6 +3099,69 @@ impl WorkspaceIndex {
         (same_bytes && same_mode).then(|| Arc::clone(held))
     }
 
+    /// Limits record membership reuse to the admitted rows of an ordinary named rebuild.
+    /// Unrelated excluded bytes must keep the same declaration warnings.
+    fn normalization_edits<'path>(
+        &self,
+        contents: &IndexContents,
+        changes: &'path PathChanges,
+    ) -> Option<Vec<&'path ProjectPath>> {
+        const MAX_EDITED_PATHS: usize = 64;
+        const MAX_EXCLUSION_ROWS: usize = 8_192;
+        let exclusion_rows = [
+            self.left_out.len(),
+            contents.left_out.len(),
+            self.warnings.len(),
+            contents.warnings.len(),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add);
+        if changes.is_empty()
+            || changes.len() > MAX_EDITED_PATHS
+            || exclusion_rows > MAX_EXCLUSION_ROWS
+            || self.build_path_requests != contents.build_path_requests
+            || self.build_paths != contents.build_paths
+            || self.left_out != contents.left_out
+            || self.warnings.iter().any(|warning| {
+                matches!(
+                    warning,
+                    WorkspaceIndexWarning::Contribution { .. }
+                        | WorkspaceIndexWarning::DeclarationsBeyondBound(_)
+                )
+            })
+            || !self
+                .warnings
+                .iter()
+                .filter(|warning| warning.leaves_declarations_out())
+                .eq(contents
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.leaves_declarations_out()))
+        {
+            return None;
+        }
+        changes
+            .iter()
+            .map(|(path, change)| {
+                let old = self.files.get(path)?;
+                let current = contents.files.get(path)?;
+                let language = old.syntax().language();
+                (change == PathChange::Modified
+                    && language == current.syntax().language()
+                    && matches!(
+                        language.name.as_str(),
+                        "javascript" | "typescript" | "python" | "rust"
+                    )
+                    && !self.left_out.contains_key(path)
+                    && self
+                        .warnings
+                        .binary_search_by(|warning| warning.path().cmp(path))
+                        .is_err())
+                .then_some(path)
+            })
+            .collect()
+    }
+
     /// Builds the next index by reading only the paths `changes` names, sharing every
     /// other file with this one.
     ///
@@ -3150,6 +3215,10 @@ impl WorkspaceIndex {
             cancelled,
         )?;
         contents.capture_build_paths(&self.root, self.limits, cancelled)?;
+        let edited_paths = self.normalization_edits(&contents, changes);
+        let normalization_edit = edited_paths
+            .as_deref()
+            .map(|paths| (&*self.semantics, paths));
         let BuiltContents {
             files,
             text_files,
@@ -3161,11 +3230,12 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = built_contents_with_owner(
+        } = built_contents_with_normalization_edit(
             (&self.root, &self.owner),
             contents.sorted(),
             self.limits,
             Some(self.semantics.graph()),
+            normalization_edit,
         )?;
         check_cancelled(cancelled)?;
         let (declarations, canonical_examples) =
@@ -5036,6 +5106,7 @@ fn captured_project_semantics(
     limits: WorkspaceIndexLimits,
     fingerprint: &WorkspaceFingerprint,
     previous: Option<&NormalizedGraph>,
+    normalization_edit: Option<(&WorkspaceSemantics, &[&ProjectPath])>,
 ) -> Result<ProjectSemanticsAdmission, RiftError> {
     let revision = captured_semantic_revision(fingerprint, root, owner)?;
     let revision = captured_build_paths_revision(
@@ -5109,6 +5180,13 @@ fn captured_project_semantics(
         {
             if contents.partial {
                 prepared.build_deferring_static(limits.edges_max(), previous)
+            } else if let Some((predecessor, paths)) = normalization_edit {
+                prepared.build_after_modified_paths(
+                    limits.edges_max(),
+                    previous,
+                    predecessor,
+                    paths,
+                )
             } else {
                 prepared.build(limits.edges_max(), previous)
             }
@@ -5239,9 +5317,19 @@ fn built_contents(
 
 fn built_contents_with_owner(
     (root, owner): (&Path, &SymbolOwner),
+    contents: IndexContents,
+    limits: WorkspaceIndexLimits,
+    previous: Option<&NormalizedGraph>,
+) -> Result<BuiltContents, RiftError> {
+    built_contents_with_normalization_edit((root, owner), contents, limits, previous, None)
+}
+
+fn built_contents_with_normalization_edit(
+    (root, owner): (&Path, &SymbolOwner),
     mut contents: IndexContents,
     limits: WorkspaceIndexLimits,
     previous: Option<&NormalizedGraph>,
+    normalization_edit: Option<(&WorkspaceSemantics, &[&ProjectPath])>,
 ) -> Result<BuiltContents, RiftError> {
     validate_project_owner(owner)?;
     validate_captured_source_bytes(&contents)?;
@@ -5265,6 +5353,7 @@ fn built_contents_with_owner(
                     limits,
                     &fingerprint,
                     previous,
+                    normalization_edit.filter(|_| passes == 0),
                 );
                 match built {
                     Ok(ProjectSemanticsAdmission::Omitted {

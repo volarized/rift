@@ -1,14 +1,57 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::sync::Arc;
+
+use get_size2::GetSize;
+use rift_core::ProjectPath;
 
 use rift_error::{RiftError, errors};
-use rift_provider::NormalizedGraph;
-use rift_syntax::DocumentPlacement;
+use rift_provider::{ModifiedContributionRun, NormalizedGraph};
+use rift_syntax::{DocumentPlacement, SyntaxFacts};
 
 use crate::analyzer::namespace::{SelectedFile, placed_aliases, prepare_context};
 use crate::static_resolution::StaticSource;
 use crate::{IndexedFile, NamespaceInput};
 
 use super::{BuiltSemantics, PlacedFacts, PreparedSemantics, WorkspaceSemantics};
+
+#[derive(Debug)]
+pub(super) struct CapturedRuns {
+    scope: String,
+    declarations_max: usize,
+    rows: Box<[DocumentRun]>,
+}
+
+#[derive(Debug)]
+struct DocumentRun {
+    syntax: Arc<SyntaxFacts>,
+    placement: Arc<DocumentPlacement>,
+    positions: Range<usize>,
+}
+
+impl GetSize for CapturedRuns {
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (rows, tracker) = rift_protocol::retained_sequence_material(
+            self.rows.iter(),
+            std::mem::size_of_val(self.rows.as_ref()),
+            tracker,
+            |run, tracker| {
+                let (placement, tracker) = rift_protocol::retained_arc_material(
+                    &run.placement,
+                    tracker,
+                    GetSize::get_heap_size_with_tracker,
+                );
+                let (syntax, tracker) = rift_protocol::retained_arc_material(
+                    &run.syntax,
+                    tracker,
+                    GetSize::get_heap_size_with_tracker,
+                );
+                (placement.saturating_add(syntax), tracker)
+            },
+        );
+        (rows.saturating_add(self.scope.capacity()), tracker)
+    }
+}
 
 /// Source and namespace evidence waiting beside an admitted project publication.
 #[derive(Debug)]
@@ -18,6 +61,8 @@ pub struct PreparedProjectSemantics<'source> {
     documents: Vec<&'source IndexedFile>,
     placements: Vec<PlacedFacts<'source>>,
     outside_namespaces: BTreeSet<rift_core::SourceUnitId>,
+    positions: Vec<Range<usize>>,
+    declarations_max: usize,
 }
 
 impl PreparedProjectSemantics<'_> {
@@ -42,7 +87,21 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with(edges_max, previous, true)
+        self.build_with(edges_max, previous, true, None)
+    }
+
+    /// Builds a named rebuild after the supplied predecessor's selected paths changed.
+    ///
+    /// # Errors
+    /// Returns the ordinary graph validation errors.
+    pub fn build_after_modified_paths(
+        self,
+        edges_max: usize,
+        previous: Option<&NormalizedGraph>,
+        predecessor: &WorkspaceSemantics,
+        paths: &[&ProjectPath],
+    ) -> Result<BuiltSemantics, RiftError> {
+        self.build_with(edges_max, previous, true, Some((predecessor, paths)))
     }
 
     /// Builds semantic adjacency for a source inventory that is still growing, leaving
@@ -61,7 +120,7 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with(edges_max, previous, false)
+        self.build_with(edges_max, previous, false, None)
     }
 
     fn build_with(
@@ -69,6 +128,7 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
         resolve_static: bool,
+        edit: Option<(&WorkspaceSemantics, &[&ProjectPath])>,
     ) -> Result<BuiltSemantics, RiftError> {
         let admitted_all = self.admitted_all();
         let sources = if admitted_all {
@@ -85,15 +145,106 @@ impl PreparedProjectSemantics<'_> {
         } else {
             Vec::new()
         };
+        let scope =
+            (resolve_static && admitted_all && self.positions.len() == self.documents.len())
+                .then(|| self.input.owner().local_scope().ok())
+                .flatten();
+        let modification = scope.as_deref().and_then(|scope| {
+            let (predecessor, paths) = edit?;
+            let graph = previous.filter(|graph| std::ptr::eq(*graph, predecessor.graph()))?;
+            let captured = predecessor.captured_runs.as_ref()?;
+            let runs = self.modified_runs(scope, paths, captured)?;
+            Some((graph, captured, runs))
+        });
         let static_inputs = resolve_static.then_some((sources.as_slice(), &self.input));
-        let mut built =
+        let mut built = if let Some(static_inputs) = static_inputs.filter(|_| scope.is_some()) {
+            self.prepared.build_captured(
+                edges_max,
+                static_inputs,
+                modification
+                    .as_ref()
+                    .map(|(graph, _, runs)| (*graph, runs.as_slice())),
+            )?
+        } else {
             self.prepared
-                .build_with_external(edges_max, previous, None, static_inputs)?;
+                .build_with_external(edges_max, previous, None, static_inputs)?
+        };
         built.semantics.outside_namespaces = self.outside_namespaces;
         if !resolve_static && admitted_all {
             built.semantics.defer_static_resolution(&sources);
         }
+        if let Some(scope) = scope {
+            built.semantics.captured_runs = Some(CapturedRuns {
+                scope,
+                declarations_max: self.declarations_max,
+                rows: self
+                    .documents
+                    .iter()
+                    .zip(self.placements)
+                    .zip(self.positions)
+                    .enumerate()
+                    .map(|(position, ((document, placed), positions))| DocumentRun {
+                        syntax: Arc::clone(document.syntax_facts()),
+                        placement: modification
+                            .as_ref()
+                            .and_then(|(_, captured, _)| {
+                                let old = &captured.rows[position];
+                                let (_, paths) = edit?;
+                                paths
+                                    .binary_search(&document.path())
+                                    .is_err()
+                                    .then(|| Arc::clone(&old.placement))
+                            })
+                            .unwrap_or_else(|| Arc::new(placed.placement)),
+                        positions,
+                    })
+                    .collect(),
+            });
+        }
         Ok(built)
+    }
+
+    fn modified_runs(
+        &self,
+        scope: &str,
+        paths: &[&ProjectPath],
+        captured: &CapturedRuns,
+    ) -> Option<Vec<ModifiedContributionRun>> {
+        const MAX_EDITS: usize = 64;
+        if paths.is_empty()
+            || paths.len() > MAX_EDITS
+            || !paths.windows(2).all(|pair| pair[0] < pair[1])
+            || scope != captured.scope
+            || self.declarations_max != captured.declarations_max
+            || self.documents.len() != captured.rows.len()
+        {
+            return None;
+        }
+        let mut modified = Vec::with_capacity(paths.len());
+        for (((document, placed), positions), old) in self
+            .documents
+            .iter()
+            .zip(&self.placements)
+            .zip(&self.positions)
+            .zip(&captured.rows)
+        {
+            let unit = placed.placement.unit();
+            if old.placement.unit() != unit {
+                return None;
+            }
+            if paths.binary_search(&document.path()).is_ok() {
+                modified.push(ModifiedContributionRun {
+                    unit: unit.clone(),
+                    previous: old.positions.clone(),
+                    current: positions.clone(),
+                });
+            } else if !Arc::ptr_eq(document.syntax_facts(), &old.syntax)
+                || placed.placement != *old.placement
+            {
+                return None;
+            }
+        }
+        (modified.len() == paths.len()).then_some(modified)
     }
 
     /// Whether every supplied document survived publication admission.
@@ -197,13 +348,19 @@ impl WorkspaceSemantics {
                 .with_logical_declarations(namespace.mappings.remove(path).unwrap_or_default())
                 .with_aliases(aliases.remove(path).unwrap_or_default());
         }
-        let prepared = Self::prepare_facts_placed(&placed, declarations_max, revision, true)?;
+        let mut positions = Vec::with_capacity(placed.len());
+        let prepared =
+            Self::prepare_facts_placed(&placed, declarations_max, revision, true, |range| {
+                positions.push(range)
+            })?;
         Ok(PreparedProjectSemantics {
             prepared,
             input,
             documents: documents.to_vec(),
             placements: placed,
             outside_namespaces,
+            positions,
+            declarations_max,
         })
     }
 }

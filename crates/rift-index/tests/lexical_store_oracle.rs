@@ -336,3 +336,144 @@ async fn an_incremental_store_equals_a_cold_build_of_the_same_tree() -> TestResu
     }
     Ok(())
 }
+
+fn assert_publication_equals_cold(current: &WorkspaceIndex, cold: &WorkspaceIndex) {
+    let graph = current.normalized_graph();
+    let expected = cold.normalized_graph();
+    assert_eq!(graph.index_revision(), expected.index_revision());
+    assert_eq!(graph.source_revision(), expected.source_revision());
+    assert_eq!(graph.tree_revision(), expected.tree_revision());
+    assert_eq!(graph.records(), expected.records());
+    assert_eq!(graph.candidates(), expected.candidates());
+    assert_eq!(graph.references(), expected.references());
+    assert_eq!(graph.edges(), expected.edges());
+    assert_eq!(
+        graph.publications().provider_count(),
+        expected.publications().provider_count()
+    );
+    for (actual, expected) in graph
+        .publications()
+        .publications()
+        .zip(expected.publications().publications())
+    {
+        assert_eq!(actual.provider(), expected.provider());
+        assert_eq!(actual.revision(), expected.revision());
+        assert_eq!(actual.contributions(), expected.contributions());
+    }
+    assert_eq!(current.edges(), cold.edges());
+    assert_eq!(
+        current.static_targets_omitted(),
+        cold.static_targets_omitted()
+    );
+    assert_eq!(current.warnings(), cold.warnings());
+}
+
+fn observed_membership_edit(
+    root: &Path,
+    before: &WorkspaceIndex,
+    paths: usize,
+    reuse: bool,
+) -> TestResult<WorkspaceIndex> {
+    let (captured, _) = capture_digests_with_languages(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &text_inclusion(),
+        &LanguageFileSelections::default(),
+        &LastCapture::default(),
+    )?;
+    let changes = PathChanges::between(&before.digests(), &captured);
+    assert_eq!(changes.len(), paths);
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let next = before.rebuilt_cancellable(&changes, &|| false)?;
+    drop(recorder);
+    let mut rebuilt = 0;
+    let mut projected = 0;
+    for event in drain.queued_records() {
+        if event.message() != event.operation() {
+            continue;
+        }
+        match event.operation() {
+            "Normalizer::normalize_project" => rebuilt += 1,
+            "Normalizer::projected_records" => projected += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(projected, usize::from(reuse));
+    assert_eq!(rebuilt, usize::from(!reuse));
+    Ok(next)
+}
+
+#[test]
+fn named_typescript_edits_project_normalized_records_and_keep_held_publication() -> TestResult {
+    const SOURCE: &str =
+        "function seed() { return 1; }\nexport function choose() { return seed(); }\n";
+    const MARKER: &str = "\nexport function editMarker() { return 61; }\n";
+    for unrelated in [8, 80] {
+        let directory = TempDir::new()?;
+        let root = directory.path();
+        let target = root.join("target.ts");
+        std::fs::write(&target, SOURCE)?;
+        std::fs::write(root.join("opaque.ts"), b"\0undecodable \xff")?;
+        for suffix in 0..unrelated {
+            std::fs::write(
+                root.join(format!("unit_{suffix}.ts")),
+                format!("export function relay_{suffix}() {{ return 0; }}\n"),
+            )?;
+        }
+        let burst_paths = (0..49)
+            .map(|suffix| root.join(format!("edited_{suffix}.ts")))
+            .collect::<Vec<_>>();
+        for path in &burst_paths {
+            std::fs::write(path, SOURCE)?;
+        }
+        let initial = index_of(root)?;
+        assert!(initial.warnings().iter().any(|warning| {
+            warning.path().as_str() == "opaque.ts" && warning.leaves_declarations_out()
+        }));
+        let held_revision = initial.normalized_graph().source_revision();
+        let held_digests = initial.digests();
+        let held_records = initial.normalized_graph().records().to_vec();
+        let held_references = initial.normalized_graph().references().to_vec();
+        let held_edges = initial.edges().edges().cloned().collect::<Vec<_>>();
+        assert!(
+            !held_edges.is_empty(),
+            "the fixture contributes live static calls"
+        );
+
+        std::fs::write(&target, format!("{SOURCE}{MARKER}"))?;
+        let seed = observed_membership_edit(root, &initial, 1, true)?;
+        assert_publication_equals_cold(&seed, &index_of(root)?);
+        std::fs::write(&target, SOURCE)?;
+        let restored = observed_membership_edit(root, &seed, 1, true)?;
+        assert_publication_equals_cold(&restored, &initial);
+
+        std::fs::write(&target, format!("{SOURCE}{MARKER}"))?;
+        for path in &burst_paths {
+            std::fs::write(path, format!("\n{SOURCE}"))?;
+        }
+        let burst = observed_membership_edit(root, &restored, 50, true)?;
+        assert_publication_equals_cold(&burst, &index_of(root)?);
+        std::fs::write(&target, SOURCE)?;
+        for path in &burst_paths {
+            std::fs::write(path, SOURCE)?;
+        }
+        let reverted = observed_membership_edit(root, &burst, 50, true)?;
+        assert_publication_equals_cold(&reverted, &initial);
+        assert_eq!(initial.normalized_graph().source_revision(), held_revision);
+        assert_eq!(initial.digests(), held_digests);
+        assert_eq!(initial.normalized_graph().records(), held_records);
+        assert_eq!(initial.normalized_graph().references(), held_references);
+        assert_eq!(
+            initial.edges().edges().cloned().collect::<Vec<_>>(),
+            held_edges
+        );
+        std::fs::write(
+            root.join("opaque.ts"),
+            "export function newlyAdmitted() {}\n",
+        )?;
+        let new_file = observed_membership_edit(root, &reverted, 1, false)?;
+        assert_publication_equals_cold(&new_file, &index_of(root)?);
+    }
+    Ok(())
+}
