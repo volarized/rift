@@ -974,32 +974,16 @@ jobs:
       github.event.pull_request.draft &&
       github.head_ref == 'perf/selected-document-burst' &&
       github.base_ref == 'perf/selected-document-burst-base'
-    needs: [integration-cli, rust]
+    needs: [integration-cli]
     permissions:
       actions: read
       contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 15
     env:
       BASE: 63f8f208432915805b989c8d38f326a8c457653c
-      CONTROL_PRODUCT: 54ae618213378e71c0a7187a2f65adec66a24f53
-      CONTROL_HEAD: 43e6f697b2c4c9a28712e623afefe193b8e44305
-      CONTROL_MERGE: f7d734abf55c07f9d7e743d077c77374eb90aa6c
-      CONTROL_TREE: 4f7bb598334dccfa4409906c98a977442eab3ced
-      CONTROL_RUN: '45027537358'
-      CONTROL_JOB: '137223730704'
-      CONTROL_ARTIFACT: '14756532089'
-      CONTROL_ARCHIVE: f3774734e255d01cc6f4ce8cd7a6230a45545cee1cdfd2085e3358f2e461f279
-      CONTROL_EXECUTABLE: 48611b03f9e382717b13f31462178dc7819c030184de4bdc1f8bda6524483a13
-      ADJACENCY_PRODUCT: 02169d4ba821a39ea4e146ac20bc180518ecdddf
-      ADJACENCY_HEAD: df498cba2fad3a3f46c630a3448f3dc8ec2f32ae
-      ADJACENCY_MERGE: 50d1dfaf36a6504701e24e26497573345b59fdfe
-      ADJACENCY_TREE: fccf7ac71480f3537b2d4adae04ba4e8af29f12c
-      ADJACENCY_RUN: '45032043140'
-      ADJACENCY_JOB: '137237549724'
-      ADJACENCY_ARTIFACT: '14758796092'
-      ADJACENCY_ARCHIVE: b5106436cbe785e7187175891d4d31c8d6947993b269039b55e235dec51303b3
-      ADJACENCY_EXECUTABLE: 80378e75300bb0280a7bfe6d2a8042cae50819d286d11b4314dc273a177c7353
+      PAIRED_HEAD: 6f1c38724ba8dd69cf39ca1f8f1c82d8bf9b501b
+      PAIRED_TREE: 7c05cfdf9fa81b07f98c7f44ba7437488a0d8335
       HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
       BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
     steps:
@@ -1007,81 +991,60 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 12
-      - name: Verify the compared trees
+      - name: Verify the candidate tree
         run: |
           set -euo pipefail
           test "$BASE_COMMIT" = "$BASE"
-          test "$(git rev-parse "$CONTROL_PRODUCT^")" = "$BASE"
-          test "$(git rev-parse "$CONTROL_HEAD^")" = "$CONTROL_PRODUCT"
-          test "$(git rev-parse "$ADJACENCY_PRODUCT^")" = "$CONTROL_HEAD"
-          test "$(git rev-parse "$ADJACENCY_HEAD^")" = "$ADJACENCY_PRODUCT"
-          fixture=$(git rev-parse "$HEAD_COMMIT^")
-          test "$(git rev-parse "$fixture^")" = "$ADJACENCY_HEAD"
-          test "$(git rev-parse "$CONTROL_HEAD^{tree}")" = "$CONTROL_TREE"
-          test "$(git rev-parse "$ADJACENCY_HEAD^{tree}")" = "$ADJACENCY_TREE"
+          test "$(git rev-parse "$HEAD_COMMIT^")" = "$PAIRED_HEAD"
+          test "$(git rev-parse "$PAIRED_HEAD^{tree}")" = "$PAIRED_TREE"
+          git merge-base --is-ancestor "$BASE" "$PAIRED_HEAD"
+          test "$(git show --no-patch --format=%P "$GITHUB_SHA")" = "$BASE $HEAD_COMMIT"
           git diff --exit-code "$GITHUB_SHA" "$HEAD_COMMIT"
-          edge=crates/rift-analysis/src/edge.rs
-          manifest=crates/rift-analysis/src/analyzer-manifest.json
-          git diff --exit-code "$CONTROL_HEAD" "$ADJACENCY_PRODUCT" -- . ":(exclude)$edge" ":(exclude)$manifest"
-          git diff --exit-code "$ADJACENCY_HEAD" "$fixture" -- . ":(exclude)$edge" ":(exclude)$manifest"
-          root=target/burst-proof
-          mkdir -p "$root/reports"
-          git show "$ADJACENCY_HEAD:$edge" | sed -n '1,/^mod tests {/p' > "$root/archived-edge.rs"
-          git show "$fixture:$edge" | sed -n '1,/^mod tests {/p' > "$root/fixture-edge.rs"
-          cmp "$root/archived-edge.rs" "$root/fixture-edge.rs"
-          git diff --exit-code "$fixture" "$HEAD_COMMIT" -- . \
-            ':(exclude).github/workflows/ci.yml' \
-            ':(exclude)dev/check_burst_pair.py' ':(exclude)dev/check_static_activation.py' \
-            ':(exclude)dev/src/rift_dev/check_corpus.py' ':(exclude)dev/src/rift_dev/config.py' \
-            ':(exclude)dev/src/rift_dev/corpus_burst.py'
+          git diff --exit-code "$PAIRED_HEAD" "$HEAD_COMMIT" -- . \
+            ':(exclude).github/workflows/ci.yml' ':(exclude)dev/check_static_activation.py' \
+            ':(exclude)crates/rift-analysis/src/analyzer-manifest.json' \
+            ':(exclude)crates/rift-analysis/src/edge.rs' \
+            ':(exclude)crates/rift-analysis/src/semantic.rs' \
+            ':(exclude)crates/rift-analysis/src/static_resolution.rs'
+          mkdir -p target/burst-proof/reports
           echo "RIFT_CORPUS_DIR=$RUNNER_TEMP/rift-corpus-cache" >> "$GITHUB_ENV"
-          git show --no-patch --format='%H %T' "$BASE" "$CONTROL_PRODUCT" "$CONTROL_HEAD" "$ADJACENCY_PRODUCT" "$ADJACENCY_HEAD" "$fixture" "$HEAD_COMMIT" "$GITHUB_SHA" > "$root/reports/trees.txt"
-      - name: Retrieve both approved corpus profile executables
+          git show --no-patch --format='%H %T' "$BASE" "$PAIRED_HEAD" "$HEAD_COMMIT" "$GITHUB_SHA" > target/burst-proof/reports/trees.txt
+      - name: Retrieve the candidate corpus profile executable
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           root="$GITHUB_WORKSPACE/target/burst-proof"
-          for variant in base candidate; do
-            if [[ "$variant" == base ]]; then
-              run=$CONTROL_RUN job=$CONTROL_JOB id=$CONTROL_ARTIFACT head=$CONTROL_HEAD
-              merge=$CONTROL_MERGE tree=$CONTROL_TREE archive=$CONTROL_ARCHIVE binary=$CONTROL_EXECUTABLE
-            else
-              run=$ADJACENCY_RUN job=$ADJACENCY_JOB id=$ADJACENCY_ARTIFACT head=$ADJACENCY_HEAD
-              merge=$ADJACENCY_MERGE tree=$ADJACENCY_TREE archive=$ADJACENCY_ARCHIVE binary=$ADJACENCY_EXECUTABLE
-            fi
-            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" > "$root/reports/$variant-run.json"
-            jq -e --argjson run "$run" --arg head "$head" '
-              .id==$run and .head_sha==$head and .event=="pull_request" and .path==".github/workflows/ci.yml"
-            ' "$root/reports/$variant-run.json"
-            gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job" > "$root/reports/$variant-job.json"
-            jq -e --argjson job "$job" --argjson run "$run" --arg head "$head" '
-              .id==$job and .run_id==$run and .head_sha==$head and .name=="integration-cli" and .conclusion=="success"
-            ' "$root/reports/$variant-job.json"
-            gh api "repos/$GITHUB_REPOSITORY/git/commits/$merge" --jq '{sha,tree:.tree.sha,parents:[.parents[].sha]}' > "$root/reports/$variant-tree.json"
-            jq -e --arg merge "$merge" --arg tree "$tree" --arg base "$BASE" --arg head "$head" '
-              .sha==$merge and .tree==$tree and .parents==[$base,$head]
-            ' "$root/reports/$variant-tree.json"
-            meta="$root/reports/$variant-artifact.json"
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --jq '{id,name,digest,expired,workflow_run}' > "$meta"
-            jq -e --argjson run "$run" --argjson id "$id" --arg head "$head" --arg digest "sha256:$archive" '
-              .id==$id and .workflow_run.id==$run and .workflow_run.head_sha==$head and .name=="integration-cli"
-              and (.expired|not) and .digest==$digest
-            ' "$meta"
-            mkdir "$root/$variant"
-            cd "$root/$variant"
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > artifact.zip
-            echo "$archive  artifact.zip" | sha256sum --check
-            test "$(unzip -Z1 artifact.zip)" = "integration-cli.tar.zst"
-            unzip -p artifact.zip integration-cli.tar.zst > integration-cli.tar.zst
-            test "$(tar --zstd -tf integration-cli.tar.zst)" = rift
-            test "$(tar --zstd -tvf integration-cli.tar.zst | cut -c1)" = -
-            tar --zstd -xOf integration-cli.tar.zst rift > rift
-            echo "$binary  rift" | sha256sum --check
-            chmod +x rift
-            sha256sum artifact.zip integration-cli.tar.zst rift > "$root/reports/$variant-sha256.txt"
-            ./rift --version | tee "$root/reports/$variant-version.txt"
-          done
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > "$root/reports/candidate-run.json"
+          jq -e --argjson run "$GITHUB_RUN_ID" --arg head "$HEAD_COMMIT" '
+            .id==$run and .head_sha==$head and .event=="pull_request" and .path==".github/workflows/ci.yml"
+          ' "$root/reports/candidate-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" --paginate --slurp \
+            --jq '[.[].jobs[] | select(.name=="integration-cli")]' > "$root/reports/candidate-jobs.json"
+          jq -e --argjson run "$GITHUB_RUN_ID" --arg head "$HEAD_COMMIT" '
+            length==1 and .[0].run_id==$run and .[0].head_sha==$head and .[0].conclusion=="success"
+          ' "$root/reports/candidate-jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > "$root/current.json"
+          id=$(jq -er '[.artifacts[] | select(.name=="integration-cli" and (.expired|not))] | select(length==1) | .[0].id' "$root/current.json")
+          meta="$root/reports/candidate-artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --jq '{id,name,digest,expired,workflow_run}' > "$meta"
+          jq -e --argjson run "$GITHUB_RUN_ID" --argjson id "$id" --arg head "$HEAD_COMMIT" --arg merge "$GITHUB_SHA" '
+            .id==$id and .workflow_run.id==$run and .name=="integration-cli" and (.expired|not)
+            and (.workflow_run.head_sha==$head or .workflow_run.head_sha==$merge)' "$meta"
+          mkdir "$root/candidate"
+          cd "$root/candidate"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > artifact.zip
+          digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:";"")' "$meta")
+          echo "$digest  artifact.zip" | sha256sum --check
+          test "$(unzip -Z1 artifact.zip)" = "integration-cli.tar.zst"
+          unzip -p artifact.zip integration-cli.tar.zst > integration-cli.tar.zst
+          test "$(tar --zstd -tf integration-cli.tar.zst)" = rift
+          test "$(tar --zstd -tvf integration-cli.tar.zst | cut -c1)" = -
+          tar --zstd -xOf integration-cli.tar.zst rift > rift
+          chmod +x rift
+          sha256sum artifact.zip integration-cli.tar.zst rift > "$root/reports/candidate-sha256.txt"
+          ./rift --version | tee "$root/reports/candidate-version.txt"
+          test "$(cat "$root/reports/candidate-version.txt")" = "rift 0.0.90"
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
@@ -1090,14 +1053,142 @@ jobs:
         run: |
           uv sync --locked --project dev
           uv run --locked --project dev rift-dev corpus sync bun
-      - name: Compare the one-file and 50-file publications
+      - name: Attribute project facts for one 50-file publication
+        env:
+          RIFT_OTLP_FILTER: rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info,rift_measure=debug
         run: |
           uv run --locked --project dev python dev/check_static_activation.py \
-            target/burst-proof/base/rift target/burst-proof/candidate/rift target/burst-proof/reports
+            --project-facts target/burst-proof/candidate/rift target/burst-proof/reports
       - uses: actions/upload-artifact@v7.0.2
         if: ${{ always() }}
         with:
-          name: static-adjacency-pair
+          name: project-facts-attribution
           path: target/burst-proof/reports
           if-no-files-found: warn
+          retention-days: 7
+
+  native-cli-extraction:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.number == 910 &&
+      github.event.pull_request.draft &&
+      github.head_ref == 'perf/selected-document-burst' &&
+      github.base_ref == 'perf/selected-document-burst-base' &&
+      github.event.pull_request.base.sha == '63f8f208432915805b989c8d38f326a8c457653c'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: declaration-imports
+            run: '45034125678'
+            job: '137243968091'
+            artifact: '14759730641'
+            head: 7215dbe139ff3ef059ad509ed0aefdf5789c44fb
+            base: 627e7355d0f7ec2821cf17dbb83b24fe8340163c
+            merge: ea07b1e858561b981e3580d190b74d63c3b1f305
+            tree: db8569b3faf6354c8b1611e8b6471102694829c6
+            size: '3024048139'
+            digest: 27a8099fb67c304feb99ced923c1c6511138c88eb563eed48cefa6dc04e03a2c
+          - variant: declaration-type-stars
+            run: '45036907684'
+            job: '137252758665'
+            artifact: '14759789524'
+            head: 9d86472fb49a5a45f80fb210d9d36f636135a571
+            base: 7215dbe139ff3ef059ad509ed0aefdf5789c44fb
+            merge: c55083cc5be62c7005c43293db5a20e2b67d908d
+            tree: 7b2f509dbddf44f7632f20f5934914509852f0fa
+            size: '3023574113'
+            digest: c6756782aff54c44f9ba814bf13a463c35013507c30550ef09f4a5f55b8e4341
+    steps:
+      - name: Verify and extract the macOS ARM64 CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ matrix.run }}
+          JOB: ${{ matrix.job }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_HEAD: ${{ matrix.head }}
+          SOURCE_BASE: ${{ matrix.base }}
+          SOURCE_MERGE: ${{ matrix.merge }}
+          SOURCE_TREE: ${{ matrix.tree }}
+          ARCHIVE_SIZE: ${{ matrix.size }}
+          ARCHIVE_DIGEST: ${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          test "$(df -P -B1 . | awk 'NR==2 {print $4}')" -ge $((7 * 1024 * 1024 * 1024))
+          mkdir extracted-native-cli
+          out="$RUNNER_TEMP/extracted-native-cli"
+          api="repos/$GITHUB_REPOSITORY"
+          gh api "$api/actions/runs/$RUN" --jq '{id,head_sha,event,path}' > "$out/run.json"
+          jq -e --argjson run "$RUN" --arg head "$SOURCE_HEAD" '
+            .id==$run and .head_sha==$head and .event=="pull_request" and .path==".github/workflows/ci.yml"
+          ' "$out/run.json"
+          gh api "$api/actions/jobs/$JOB" --jq '{id,head_sha,run_id,name,conclusion,labels}' > "$out/job.json"
+          jq -e --argjson run "$RUN" --argjson job "$JOB" --arg head "$SOURCE_HEAD" '
+            .id==$job and .run_id==$run and .head_sha==$head and .conclusion=="success"
+            and .name=="native (macos-15, aarch64-apple-darwin, true)" and .labels==["macos-15"]
+          ' "$out/job.json"
+          gh api "$api/git/commits/$SOURCE_HEAD" --jq '{sha,verified:.verification.verified}' > "$out/head.json"
+          jq -e --arg head "$SOURCE_HEAD" '.sha==$head and .verified' "$out/head.json"
+          gh api "$api/git/commits/$SOURCE_MERGE" --jq '{sha,tree:.tree.sha,parents:[.parents[].sha]}' > "$out/tree.json"
+          jq -e --arg merge "$SOURCE_MERGE" --arg tree "$SOURCE_TREE" --arg base "$SOURCE_BASE" --arg head "$SOURCE_HEAD" '
+            .sha==$merge and .tree==$tree and .parents==[$base,$head]
+          ' "$out/tree.json"
+          gh api "$api/actions/artifacts/$ARTIFACT" --jq '{id,name,size_in_bytes,digest,expired,workflow_run}' > "$out/artifact.json"
+          jq -e --argjson id "$ARTIFACT" --argjson run "$RUN" --argjson size "$ARCHIVE_SIZE" \
+            --arg head "$SOURCE_HEAD" --arg digest "sha256:$ARCHIVE_DIGEST" '
+              .id==$id and .name=="native-live" and (.expired|not) and .size_in_bytes==$size and .digest==$digest
+              and .workflow_run.id==$run and .workflow_run.head_sha==$head
+            ' "$out/artifact.json"
+          gh api "$api/actions/artifacts/$ARTIFACT/zip" > native-live.zip
+          test "$(stat -c %s native-live.zip)" = "$ARCHIVE_SIZE"
+          echo "$ARCHIVE_DIGEST  native-live.zip" | sha256sum --check
+          test "$(unzip -Z1 native-live.zip)" = "native-live.tar.zst"
+          cat > extract-cli.py <<'PY'
+          import shutil
+          import sys
+          import tarfile
+          from pathlib import Path
+
+          output = Path(sys.argv[1])
+          member_name = None
+          with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+              for member in archive:
+                  if member.name.removeprefix("./") != "target/debug/rift":
+                      continue
+                  if member_name is not None or not member.isfile() or not 0 < member.size <= 2**30:
+                      raise ValueError("invalid or repeated native CLI member")
+                  source = archive.extractfile(member)
+                  if source is None:
+                      raise ValueError("missing native CLI payload")
+                  with source, (output / "rift").open("xb") as binary:
+                      shutil.copyfileobj(source, binary)
+                  member_name = member.name
+          while sys.stdin.buffer.read(2**20):
+              pass
+          if member_name is None:
+              raise ValueError("native CLI member not found")
+          (output / "member.txt").write_text(member_name + "\n")
+          PY
+          unzip -p native-live.zip native-live.tar.zst | zstd -dc | python3 extract-cli.py "$out"
+          cd "$out"
+          file -b rift | tee executable-format.txt
+          grep -q 'Mach-O 64-bit executable arm64' executable-format.txt
+          zstd -T1 -3 --quiet rift -o rift.zst
+          sha256sum rift rift.zst > checksums.txt
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: native-cli-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/extracted-native-cli/*.json
+            ${{ runner.temp }}/extracted-native-cli/*.txt
+            ${{ runner.temp }}/extracted-native-cli/rift.zst
+          if-no-files-found: error
+          compression-level: 0
           retention-days: 7

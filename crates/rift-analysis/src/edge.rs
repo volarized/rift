@@ -669,14 +669,28 @@ impl EdgeStore {
         edges_max: usize,
         resolve: impl FnOnce() -> StaticResolution,
     ) -> (Self, StaticResolution) {
-        let (mut store, spans) = Self::build_with_spans(graph, edges_max);
+        let (mut store, spans) = rift_tracing::debug_span!(
+            target: "rift_measure",
+            "analysis.graph_admission",
+            component = "measurement",
+            operation = "analysis.graph_admission",
+        )
+        .in_scope(|| Self::build_with_spans(graph, edges_max));
         let resolution = resolve();
-        store.add_static(
-            &spans,
-            &resolution.occurrences,
-            &resolution.external,
-            edges_max,
-        );
+        rift_tracing::debug_span!(
+            target: "rift_measure",
+            "analysis.static_admission",
+            component = "measurement",
+            operation = "analysis.static_admission",
+        )
+        .in_scope(|| {
+            store.add_static(
+                &spans,
+                &resolution.occurrences,
+                &resolution.external,
+                edges_max,
+            )
+        });
         (store, resolution)
     }
 
@@ -684,7 +698,13 @@ impl EdgeStore {
         let UnitDefinitions {
             spans,
             edge_modules,
-        } = UnitDefinitions::build(graph);
+        } = rift_tracing::debug_span!(
+            target: "rift_measure",
+            "analysis.enclosing_definitions",
+            component = "measurement",
+            operation = "analysis.enclosing_definitions",
+        )
+        .in_scope(|| UnitDefinitions::build(graph));
         let mut outgoing: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut incoming: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut budget = LoopBudget::new(edges_max);
