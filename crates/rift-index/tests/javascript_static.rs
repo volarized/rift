@@ -31,6 +31,53 @@ fn workspace_with_manifest(
 }
 
 #[test]
+fn test_typescript_merged_alias_type_uses_preserve_the_value_namespace() {
+    let source = "export namespace Result { export function make() { return 1; } }
+export type Result<T> = { value: T };
+export interface Work {
+    andThen<R extends Result<number>>(run: () => R): Result<R>;
+}
+export type Runtime = typeof Result;
+export type Shadow<Result> = Result;
+export function create() { return Result.make(); }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", source)],
+        r#"{"name":"fixture","version":"1.0.0","type":"module"}"#,
+    );
+    let identity = "rift://symbol/local/typescript/.%2Fmain.ts/Result";
+    let mut actual = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::HasType && edge.to().as_str() == identity)
+        .map(|edge| {
+            let binding = edge.occurrence();
+            assert_eq!(binding.unit().key().as_str(), "main.ts");
+            let range = binding.range();
+            let start = usize::try_from(range.start()).expect("type start");
+            let end = usize::try_from(range.end()).expect("type end");
+            assert_eq!(&source[start..end], "Result");
+            start
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        [
+            source.find("Result<number>").expect("constraint"),
+            source.find("Result<R>").expect("return type"),
+        ]
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/create",
+        "main.ts/Result/make"
+    ));
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
 fn test_typescript_export_overloads_store_one_identity_and_call() {
     let (_directory, index) = workspace_with_manifest(
         &[
