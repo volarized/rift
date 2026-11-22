@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::{ReferenceRole, SymbolId};
+use rift_core::{ProjectPath, ReferenceRole, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_syntax::{DocumentPlacement, StaticBindingKind, SyntaxExportBinding, SyntaxExportKind};
 
@@ -84,9 +84,102 @@ pub(super) fn prepare(
         .retain(|export| !refused.contains(export.identity.as_str()));
 }
 
-fn collect_commonjs_modules<'source>(
+struct CommonJsModules<'input> {
+    package_name: &'input str,
+    physical_paths: BTreeSet<&'input ProjectPath>,
+    module_owners: BTreeMap<SymbolId, Option<String>>,
+    alias_ids: BTreeSet<SymbolId>,
+}
+
+impl CommonJsModules<'_> {
+    fn collect_forward<'source>(
+        &mut self,
+        input: &NamespaceInput<'_>,
+        resolver: &Exports<'_, 'source>,
+        file: &File<'source>,
+        binding: &SyntaxExportBinding,
+        prepared: &mut PreparedNamespace,
+        work: &mut Work,
+    ) {
+        let Some((exported, module)) = commonjs_forward(resolver, file, binding, work) else {
+            return;
+        };
+        let Some(identity) = export_identity(file, exported, prepared)
+            .filter(|identity| !self.alias_ids.contains(identity))
+        else {
+            prepared.unresolved_exports = true;
+            return;
+        };
+        let Some(path) = commonjs::relative_target(file.document.path, module, |path| {
+            self.physical_paths.contains(path)
+        }) else {
+            return;
+        };
+        let Some(imported) = resolver
+            .imported(file, module, work)
+            .filter(|imported| imported.document.path == &path)
+            .filter(|imported| commonjs_file(resolver, imported, work))
+        else {
+            return;
+        };
+        let Some(target) = commonjs_value(resolver, imported, false, work) else {
+            return;
+        };
+        let label = format!("{}/{path}", self.package_name);
+        let Some(module_identity) = identity_for(
+            input.owner(),
+            imported.document.facts.language(),
+            vec![label.clone()],
+        ) else {
+            return;
+        };
+        if self
+            .module_owners
+            .get(&module_identity)
+            .is_some_and(|owner| owner.as_deref() != Some(path.as_str()))
+        {
+            prepared.unresolved_exports = true;
+            return;
+        }
+        let selected = SelectedFile {
+            path: imported.document.path,
+            source: imported.document.source,
+            syntax: imported.document.facts,
+        };
+        let already_placed = prepared.anchors.get(path.as_str()).is_some_and(|anchors| {
+            anchors.get(".") == Some(&module_identity)
+                && anchors.contains_key(&target.symbol.qualified_name)
+        });
+        if !already_placed
+            && !commonjs::admit_file(
+                input,
+                &selected,
+                &label,
+                Some(&target.symbol.qualified_name),
+                prepared,
+            )
+        {
+            prepared.unresolved_exports = true;
+            return;
+        }
+        let declaration = ResolvedExport::Declaration {
+            target,
+            member: None,
+        };
+        if let Some(export) =
+            placed_target(file, binding, exported, identity, declaration, prepared)
+        {
+            self.module_owners
+                .insert(module_identity, Some(path.as_str().to_owned()));
+            self.alias_ids.insert(export.identity.clone());
+            prepared.exports.push(export);
+        }
+    }
+}
+
+fn collect_commonjs_modules(
     input: &NamespaceInput<'_>,
-    resolver: &Exports<'_, 'source>,
+    resolver: &Exports<'_, '_>,
     prepared: &mut PreparedNamespace,
     aliases_max: usize,
     work: &mut Work,
@@ -124,6 +217,12 @@ fn collect_commonjs_modules<'source>(
         }
         alias_ids.insert(export.identity.clone());
     }
+    let mut modules = CommonJsModules {
+        package_name: name,
+        physical_paths,
+        module_owners,
+        alias_ids,
+    };
     for source_path in root_files {
         if !work.charge() {
             return;
@@ -139,7 +238,12 @@ fn collect_commonjs_modules<'source>(
         let Some(source) = module_id(file.document, prepared) else {
             continue;
         };
-        if module_owners.get(&source).and_then(Option::as_deref) != Some(source_path.as_str()) {
+        if modules
+            .module_owners
+            .get(&source)
+            .and_then(Option::as_deref)
+            != Some(source_path.as_str())
+        {
             continue;
         }
         for binding in file.document.facts.export_bindings().unwrap_or_default() {
@@ -147,77 +251,7 @@ fn collect_commonjs_modules<'source>(
                 prepared.unresolved_exports = true;
                 return;
             }
-            let Some((exported, module)) = commonjs_forward(resolver, file, binding, work) else {
-                continue;
-            };
-            let Some(identity) = export_identity(file, exported, prepared)
-                .filter(|identity| !alias_ids.contains(identity))
-            else {
-                prepared.unresolved_exports = true;
-                continue;
-            };
-            let Some(path) = commonjs::relative_target(file.document.path, module, |path| {
-                physical_paths.contains(path)
-            }) else {
-                continue;
-            };
-            let Some(imported) = resolver
-                .imported(file, module, work)
-                .filter(|imported| imported.document.path == &path)
-                .filter(|imported| commonjs_file(resolver, imported, work))
-            else {
-                continue;
-            };
-            let Some(target) = commonjs_value(resolver, imported, false, work) else {
-                continue;
-            };
-            let label = format!("{name}/{path}");
-            let Some(module_identity) = identity_for(
-                input.owner(),
-                imported.document.facts.language(),
-                vec![label.clone()],
-            ) else {
-                continue;
-            };
-            if module_owners
-                .get(&module_identity)
-                .is_some_and(|owner| owner.as_deref() != Some(path.as_str()))
-            {
-                prepared.unresolved_exports = true;
-                continue;
-            }
-            let selected = SelectedFile {
-                path: imported.document.path,
-                source: imported.document.source,
-                syntax: imported.document.facts,
-            };
-            let already_placed = prepared.anchors.get(path.as_str()).is_some_and(|anchors| {
-                anchors.get(".") == Some(&module_identity)
-                    && anchors.contains_key(&target.symbol.qualified_name)
-            });
-            if !already_placed
-                && !commonjs::admit_file(
-                    input,
-                    &selected,
-                    &label,
-                    Some(&target.symbol.qualified_name),
-                    prepared,
-                )
-            {
-                prepared.unresolved_exports = true;
-                continue;
-            }
-            let resolved = ResolvedExport::Declaration {
-                target,
-                member: None,
-            };
-            if let Some(export) =
-                placed_target(file, binding, exported, identity, resolved, prepared)
-            {
-                module_owners.insert(module_identity, Some(path.as_str().to_owned()));
-                alias_ids.insert(export.identity.clone());
-                prepared.exports.push(export);
-            }
+            modules.collect_forward(input, resolver, file, binding, prepared, work);
         }
     }
 }
