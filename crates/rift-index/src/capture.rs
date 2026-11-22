@@ -600,6 +600,27 @@ pub(crate) fn capture_io_error(path: &Path, source: std::io::Error) -> RiftError
     }
 }
 
+/// Rechecks a denied path once the parallel capture has closed its file handles.
+#[cfg(any(windows, test))]
+pub(crate) fn recheck_denied_capture(path: &Path, error: RiftError) -> RiftError {
+    use std::error::Error as _;
+    use std::io::{Error, ErrorKind};
+
+    if error.slug() == errors::index::workspace_filesystem::SLUG
+        && error
+            .source()
+            .and_then(|source| source.downcast_ref::<Error>())
+            .is_some_and(|source| source.kind() == ErrorKind::PermissionDenied)
+        && path_was_removed(path)
+    {
+        return errors::index::workspace_changed_during_capture()
+            .path(path)
+            .source(error)
+            .error();
+    }
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -708,6 +729,38 @@ mod tests {
             .and_then(|source| source.downcast_ref::<std::io::Error>())
             .expect("original capture error");
         assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_denied_capture_retries_only_after_the_path_disappears() {
+        use std::error::Error as _;
+        use std::io::{Error, ErrorKind};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let removed = directory.path().join("b");
+        let nested = removed.join("nested");
+        let path = nested.join("gone.rs");
+        fs::create_dir_all(nested).expect("nested directory");
+        fs::write(&path, b"pub fn source() {}\n").expect("source file");
+        let denied = super::capture_io_error(&path, Error::from(ErrorKind::PermissionDenied));
+        let present = super::recheck_denied_capture(&path, denied.clone());
+        assert_eq!(present.slug(), errors::index::workspace_filesystem::SLUG);
+        assert_eq!(present.to_string(), denied.to_string());
+        assert_eq!(
+            present
+                .source()
+                .and_then(|source| source.downcast_ref::<Error>())
+                .expect("original denial")
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        fs::remove_dir_all(removed).expect("remove directory before the capture joins");
+        let changed = super::recheck_denied_capture(&path, denied);
+        assert_eq!(
+            changed.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
+        );
     }
 
     #[test]

@@ -53,6 +53,8 @@ use sha2::{Digest as _, Sha256};
 use walk::{projected_walk, selected_walk};
 
 use crate::LocatedSyntax;
+#[cfg(windows)]
+use crate::capture::recheck_denied_capture;
 use crate::capture::{
     CaptureBoundary, CaptureSelection, CapturedPath, DiscoveryInputs, LastCapture, RootIdentity,
     SelectionInputs, capture_io_error, capture_path, path_was_removed, root_identity,
@@ -6253,6 +6255,10 @@ fn recorded_capture_visible_attempt(
                         .collect();
                     for (path, capture) in batch.iter().zip(read) {
                         check_cancelled(cancelled)?;
+                        #[cfg(windows)]
+                        let capture = capture.map_err(|error| {
+                            recheck_denied_capture(&root.join(path.as_str()), error)
+                        });
                         let (absolute, capture, was_read) = capture?;
                         if next.captured(&absolute).is_none() {
                             next.record(&absolute, capture, was_read);
@@ -6510,6 +6516,8 @@ impl PathCapture<'_> {
         }
         for (path, capture) in paths.iter().zip(read) {
             check_cancelled(cancelled)?;
+            #[cfg(windows)]
+            let capture = capture.map_err(|error| recheck_denied_capture(path, error));
             let (capture, _, project) = capture?;
             let Some(file) = capture.file() else {
                 continue;
