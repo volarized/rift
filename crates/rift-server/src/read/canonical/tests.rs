@@ -3,6 +3,10 @@ use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::HistoryConfiguration;
 
+std::thread_local! {
+    pub(super) static PUBLICATION_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn fixture(
     metadata: bool,
 ) -> (
@@ -471,6 +475,92 @@ fn prepared_reads(index: rift_index::WorkspaceIndex) -> Arc<ReadService> {
         HistoryConfiguration::default(),
         rift_protocol::dependencies::DependenciesConfiguration::default(),
     ))
+}
+
+#[test]
+fn publishing_many_pages_of_one_old_index_can_prove_they_fit_without_a_publication_walk() {
+    let (_directory, mut indexes, _) = distinct_text_generations();
+    let current = prepared_reads(indexes.pop().expect("third generation"));
+    let old = prepared_reads(indexes.remove(0));
+    let now = SystemTime::now();
+    let store = BoundedViews::new(usize::MAX, [65; 32]);
+    store.publish_at(&old, now);
+    let mut pages = Vec::new();
+    for page in 0..25 {
+        let input = captured_input(&old).with_query([page; 32], vec![page], None);
+        pages.push(
+            store
+                .capture_at(input, now)
+                .expect("capture")
+                .expect("fits"),
+        );
+    }
+    let owner_bytes = old
+        .index
+        .cached_symbol_view()
+        .expect("old view")
+        .retained_material_bytes();
+    let (budget, exact) = {
+        let mut state = store.state.lock().expect("state");
+        let upper = state.cached_upper_bytes(&current);
+        let previous = std::mem::replace(&mut state.current, Arc::downgrade(&current));
+        let exact = state.material_bytes();
+        state.current = previous;
+        assert!(exact <= upper);
+        let budget = upper + owner_bytes / 2;
+        assert!(budget < 25 * owner_bytes);
+        (budget, exact)
+    };
+    let limits = RetainedViewLimits::new(VIEWS_DEFAULT, budget);
+    let before = PUBLICATION_WALKS.get();
+    store.publish_current_at(&current, Some(limits), now);
+    assert_eq!(PUBLICATION_WALKS.get(), before);
+    assert_eq!(store.state.lock().expect("state").material_bytes(), exact);
+    for (key, page) in (0..25).zip(pages) {
+        let (held, bytes) = store.query_at(&[key; 32], now).expect("original page");
+        assert_eq!(held, page);
+        assert_eq!(&*bytes, &[key]);
+    }
+
+    let before = PUBLICATION_WALKS.get();
+    capture(&store, &current, now);
+    assert_eq!(
+        PUBLICATION_WALKS.get(),
+        before,
+        "the current capture also fits"
+    );
+    assert_eq!(store.state.lock().expect("state").views.len(), 26);
+}
+
+#[test]
+fn a_cached_upper_bound_over_budget_uses_the_exact_shared_charge() {
+    let (_directory, mut indexes, _) = distinct_text_generations();
+    let current = prepared_reads(indexes.pop().expect("third generation"));
+    let now = SystemTime::now();
+    let store = BoundedViews::new(usize::MAX, [66; 32]);
+    for index in indexes {
+        store
+            .capture_at(text_generation_input(&index), now)
+            .expect("capture")
+            .expect("fits");
+    }
+    let mut state = store.state.lock().expect("state");
+    state.current = Arc::downgrade(&current);
+    let exact = state.material_bytes();
+    assert!(exact < state.cached_upper_bytes(&current));
+    let before = PUBLICATION_WALKS.get();
+    assert_eq!(state.release_measured(None, exact), (0, true));
+    assert!(PUBLICATION_WALKS.get() > before);
+    assert_eq!(state.material_bytes(), exact);
+
+    for held in state.views.values_mut() {
+        held.retained_bytes = usize::MAX;
+    }
+    assert_eq!(state.cached_upper_bytes(&current), usize::MAX);
+    let before = PUBLICATION_WALKS.get();
+    assert_eq!(state.release_measured(None, usize::MAX), (2, true));
+    assert!(PUBLICATION_WALKS.get() > before);
+    assert_eq!(state.expired.len(), 2);
 }
 
 #[test]
@@ -964,7 +1054,7 @@ impl HeldBefore {
         );
         let mut wider = State {
             views: state.views.clone(),
-            current: state.current.clone(),
+            current: Weak::clone(&state.current),
             ..State::default()
         };
         wider.views.insert((*last_key).clone(), (*last).clone());

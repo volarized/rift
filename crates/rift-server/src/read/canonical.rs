@@ -546,7 +546,7 @@ impl State {
     /// Material one view charges when it is the only one retained.
     fn single_view_bytes(&self, key: &str, held: &HeldView, bytes_max: usize) -> usize {
         let mut alone = Self {
-            current: self.current.clone(),
+            current: Weak::clone(&self.current),
             ..Self::default()
         };
         alone.views.insert(key.to_owned(), held.clone());
@@ -572,8 +572,11 @@ impl State {
     }
 
     fn material_bytes_with_shared_indexes(&self, shared: bool) -> usize {
-        let (publication, mut charged) = self.published_allocations();
-        let shared = shared || publication.is_some();
+        let (publication, charged) = self.published_allocations();
+        self.held_bytes(shared || publication.is_some(), charged)
+    }
+
+    fn held_bytes(&self, shared: bool, mut charged: get_size2::StandardTracker) -> usize {
         let mut total = self.store_bytes(self.views.len());
         for (key, held) in &self.views {
             let (bytes, next) = Self::view_bytes(key.capacity(), held, shared, charged);
@@ -581,6 +584,17 @@ impl State {
             total = total.saturating_add(bytes);
         }
         total
+    }
+
+    /// Counts each distinct retired index at its cached standalone size. Distinct indexes
+    /// can share allocations, so this can prove a fit but cannot decide a release.
+    fn cached_upper_bytes(&self, current: &ReadService) -> usize {
+        use get_size2::GetSizeTracker;
+        let mut charged = get_size2::StandardTracker::default();
+        if let Some(view) = current.index().cached_symbol_view() {
+            charged.track(Arc::as_ptr(view));
+        }
+        self.held_bytes(false, charged)
     }
 
     /// Starts an exact shared measure with the allocations the current publication owns.
@@ -600,6 +614,8 @@ impl State {
         {
             charged.track(Arc::as_ptr(view));
         } else {
+            #[cfg(test)]
+            tests::PUBLICATION_WALKS.set(tests::PUBLICATION_WALKS.get() + 1);
             charged = index.retained_view_baseline();
         }
         (Some(current), charged)
@@ -657,8 +673,8 @@ impl State {
     /// shows cannot stay under `bytes_max`, answering how many it released and whether
     /// the measure it took settles that the views left fit.
     ///
-    /// A live publication needs an exact shared measure. Without one, the cached
-    /// charge can show that every view fits without walking individual indexes.
+    /// A finite cached upper bound can prove every view fits. A larger bound needs a
+    /// shared measure before it can release a view.
     /// The shared measure runs most recently used view first. Each view adds what the views
     /// before it do not already hold, so the views that fit are a prefix of that order
     /// and the rest are the least recently used. Measuring stops at the first view that
@@ -669,7 +685,23 @@ impl State {
     /// is known; the releases changed only the released keys the store charges. The
     /// measure settles when that sum fits, with no second walk.
     fn release_measured(&mut self, kept: Option<&str>, bytes_max: usize) -> (usize, bool) {
-        if self.current.strong_count() == 0 {
+        if let Some(current) = self.current.upgrade() {
+            let upper = self.cached_upper_bytes(&current);
+            let fits = upper != usize::MAX && upper <= bytes_max;
+            if kept.is_none() {
+                rift_tracing::debug!(
+                    component = "server",
+                    rows = self.views.len(),
+                    upper_bytes = upper,
+                    bytes_max,
+                    exact = !fits,
+                    "checking retained views at publication"
+                );
+            }
+            if fits {
+                return (0, true);
+            }
+        } else {
             let cached = self.material_bytes();
             if cached == usize::MAX || cached <= bytes_max {
                 return (0, false);
@@ -754,10 +786,16 @@ impl LocalSymbolViews {
         if let Some(limits) = limits {
             state.expire(now);
             while state.views.len() > limits.views_max && state.release_least_recent(None) {}
-            let (_, settled) = state.release_measured(None, limits.bytes_max);
-            if !settled {
-                while state.exceeds(limits.bytes_max) && state.release_least_recent(None) {}
-            }
+            rift_tracing::traced!(
+                component = "server",
+                operation = "retained_views.publish",
+                {
+                    let (_, settled) = state.release_measured(None, limits.bytes_max);
+                    if !settled {
+                        while state.exceeds(limits.bytes_max) && state.release_least_recent(None) {}
+                    }
+                }
+            );
         }
     }
 
