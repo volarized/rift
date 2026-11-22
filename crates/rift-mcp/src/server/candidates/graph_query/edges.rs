@@ -830,7 +830,7 @@ impl<'request> AdjacencyWalk<'request> {
             seed,
             self.selected
                 .is_some_and(AdjacencySelection::requires_enclosing),
-            deadline,
+            rift_server::EngineWalkDeadline::AdmitBefore(deadline),
         ))
         .await;
         let references = match references {

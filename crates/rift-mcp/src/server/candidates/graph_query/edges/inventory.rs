@@ -455,9 +455,10 @@ impl RiftMcp {
             let roots = roots.clone();
             let sources = sources.clone();
             async move {
+                let cutoff = rift_server::EngineWalkDeadline::AdmitBefore(end);
                 let answer = tokio::time::timeout_at(
                     end + crate::server::ENGINE_READ_GRACE,
-                    file.read(engines, (selection, &sources), end),
+                    file.read(engines, (selection, &sources), cutoff),
                 )
                 .await
                 .map_err(|_| {

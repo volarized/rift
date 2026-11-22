@@ -21,7 +21,7 @@ use super::{
     CallGraphSource, CalleeReport, CapturedCalls, GraphCalls, GraphReferences, ReferenceReport,
     ReferenceTarget, all_edge_declarations, graph_call_coverage, map_graph_calls,
 };
-use crate::engine::OutgoingAnswer;
+use crate::engine::{EngineWalkDeadline, OutgoingAnswer};
 use crate::traversal::TRAVERSAL_SYMBOLS_MAX;
 use crate::{CalleeRoots, EnginePool, ReadService};
 
@@ -304,7 +304,7 @@ impl EngineInventoryFile {
         &self,
         engines: &EnginePool,
         (selection, sources): (EngineInventorySelection, &super::DocumentSources),
-        deadline: Instant,
+        deadline: impl Into<EngineWalkDeadline>,
     ) -> Result<Option<EngineInventoryAnswer>, RiftError> {
         let sources = sources.clone();
         let Some(slot) = engines.engine_for(&self.language) else {
