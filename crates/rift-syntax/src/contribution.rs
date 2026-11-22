@@ -170,6 +170,50 @@ impl DocumentPlacement {
     }
 }
 
+impl get_size2::GetSize for DocumentPlacement {
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (origin, tracker) = self.origin.get_heap_size_with_tracker(tracker);
+        let (unit, tracker) = self.unit.get_heap_size_with_tracker(tracker);
+        let (anchors, tracker) = rift_protocol::retained_map_material(
+            &self.identity_anchors,
+            tracker,
+            get_size2::GetSize::get_heap_size_with_tracker,
+        );
+        let (declarations, tracker) = rift_protocol::retained_map_material(
+            &self.logical_declarations,
+            tracker,
+            |declaration, tracker| {
+                let (identity, tracker) = declaration.identity.get_heap_size_with_tracker(tracker);
+                let (language, tracker) = declaration.language.get_heap_size_with_tracker(tracker);
+                (identity.saturating_add(language), tracker)
+            },
+        );
+        let (aliases, tracker) = rift_protocol::retained_sequence_material(
+            &self.aliases,
+            self.aliases
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PlacedAlias>()),
+            tracker,
+            |alias, tracker| {
+                let (identity, tracker) = alias.identity.get_heap_size_with_tracker(tracker);
+                let bytes = [
+                    alias.name.capacity(),
+                    alias.qualified_name.capacity(),
+                    alias.target_identity.capacity(),
+                    alias.visibility.as_ref().map_or(0, String::capacity),
+                ]
+                .into_iter()
+                .fold(identity, usize::saturating_add);
+                (bytes, tracker)
+            },
+        );
+        let bytes = [origin, unit, anchors, declarations, aliases]
+            .into_iter()
+            .fold(self.identity_path.capacity(), usize::saturating_add);
+        (bytes, tracker)
+    }
+}
+
 /// Collects syntax documents into one atomic provider publication.
 #[derive(Debug)]
 pub struct SyntaxPublicationBuilder {

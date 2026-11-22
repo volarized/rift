@@ -11,6 +11,9 @@ use rift_error::RiftError;
 
 use crate::PublicationSet;
 
+mod project;
+pub use project::ModifiedContributionRun;
+
 /// Result of one association rule that did not establish identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssociationState {
@@ -208,6 +211,7 @@ pub struct NormalizedGraph {
     candidates: Vec<AssociationCandidate>,
     references: Vec<NormalizedReference>,
     edges: Vec<NormalizedEdge>,
+    project_roots: Option<Box<[u32]>>,
 }
 
 impl NormalizedGraph {
@@ -371,6 +375,24 @@ impl Normalizer {
         publications: &Arc<PublicationSet>,
         external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
     ) -> Result<NormalizedGraph, RiftError> {
+        Self::normalize_publications(
+            (index_revision, source_revision, tree_revision),
+            publications,
+            external,
+            false,
+        )
+    }
+
+    fn normalize_publications(
+        (index_revision, source_revision, tree_revision): (
+            IndexRevision,
+            SourceRevision,
+            TreeRevision,
+        ),
+        publications: &Arc<PublicationSet>,
+        external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
+        retain_roots: bool,
+    ) -> Result<NormalizedGraph, RiftError> {
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
         let references = reference_index(&contributions);
@@ -403,6 +425,7 @@ impl Normalizer {
             groups,
             conflicting: &conflicting,
             candidates,
+            retain_roots,
             external,
         })
     }
@@ -649,6 +672,7 @@ struct GraphBuild<'a> {
     groups: UnionFind,
     conflicting: &'a BTreeSet<usize>,
     candidates: Vec<AssociationCandidate>,
+    retain_roots: bool,
     external: &'a dyn Fn(&ContributionReference) -> Option<SymbolId>,
 }
 
@@ -658,6 +682,7 @@ fn build_records(
     anchors: &[BTreeSet<SymbolId>],
     groups: &mut UnionFind,
     conflicting: &BTreeSet<usize>,
+    roots: &mut Option<Vec<u32>>,
 ) -> Result<(Vec<SymbolRecord>, BTreeMap<ContributionReference, usize>), RiftError> {
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
     for index in 0..contributions.len() {
@@ -667,6 +692,9 @@ fn build_records(
     let mut records = Vec::with_capacity(members.len());
     let mut records_by_contribution = BTreeMap::new();
     for (root, indexes) in members {
+        if let Some(roots) = roots {
+            roots.push(u32::try_from(root).expect("bounded contribution position fits"));
+        }
         let mut identities = BTreeSet::new();
         let mut keys = Vec::with_capacity(indexes.len());
         for &index in &indexes {
@@ -694,9 +722,9 @@ fn build_records(
     Ok((records, records_by_contribution))
 }
 
-fn normalize_edges(
+fn normalize_edges<'a>(
     index_revision: IndexRevision,
-    contributions: &[&Contribution],
+    contributions: impl IntoIterator<Item = &'a Contribution>,
     records: &[SymbolRecord],
     records_by_contribution: &BTreeMap<ContributionReference, usize>,
     external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
@@ -753,14 +781,17 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         mut groups,
         conflicting,
         mut candidates,
+        retain_roots,
         external,
     } = input;
+    let mut roots = (retain_roots && u32::try_from(contributions.len()).is_ok()).then(Vec::new);
     let (records, records_by_contribution) = build_records(
         index_revision,
         contributions,
         anchors,
         &mut groups,
         conflicting,
+        &mut roots,
     )?;
     candidates.sort_by(|left, right| {
         (
@@ -778,7 +809,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
     });
     let (references, edges) = normalize_edges(
         index_revision,
-        contributions,
+        contributions.iter().copied(),
         &records,
         &records_by_contribution,
         external,
@@ -794,6 +825,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         candidates,
         references,
         edges,
+        project_roots: roots.map(Vec::into_boxed_slice),
     })
 }
 
@@ -980,6 +1012,11 @@ impl get_size2::GetSize for NormalizedGraph {
         let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.edges, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
+        bytes = bytes.saturating_add(
+            self.project_roots
+                .as_deref()
+                .map_or(0, std::mem::size_of_val),
+        );
         (bytes, tracker)
     }
 }

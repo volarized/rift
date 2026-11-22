@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 mod captured;
@@ -9,8 +10,8 @@ use rift_core::{
 };
 use rift_error::{ErrorContext, ErrorValue, RiftError};
 use rift_provider::{
-    AssembledSymbol, NormalizedGraph, Normalizer, PROVIDERS_MAX_DEFAULT, PublicationLimits,
-    PublicationSet, SymbolAssembler,
+    AssembledSymbol, ModifiedContributionRun, NormalizedGraph, Normalizer, PROVIDERS_MAX_DEFAULT,
+    PublicationLimits, PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
     DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxFacts, SyntaxPublicationBuilder,
@@ -61,6 +62,7 @@ pub struct WorkspaceSemantics {
     static_resolution: StaticResolution,
     static_occurrence_order: Vec<usize>,
     outside_namespaces: std::collections::BTreeSet<rift_core::SourceUnitId>,
+    captured_runs: Option<captured::CapturedRuns>,
 }
 
 /// One build's captured semantics and documents not included in publication.
@@ -125,6 +127,72 @@ impl PreparedSemantics {
                 previous,
             )?,
         };
+        self.build_with_graph(graph, edges_max, static_inputs)
+    }
+
+    fn build_captured(
+        self,
+        edges_max: usize,
+        static_inputs: StaticInputs<'_, '_>,
+        edit: Option<(&NormalizedGraph, &[ModifiedContributionRun])>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        let revisions = (
+            IndexRevision::new(self.revision)?,
+            SourceRevision::new(self.revision)?,
+            TreeRevision::new(self.revision)?,
+        );
+        let projected = if let Some((previous, edits)) = edit {
+            let selected_rows = edits.iter().fold(0_usize, |sum, run| {
+                sum.saturating_add(run.previous.len())
+                    .saturating_add(run.current.len())
+            });
+            rift_tracing::traced!(
+                component = "analysis",
+                operation = "Normalizer::project_records_after_edit",
+                modified_units = edits.len(),
+                selected_rows = selected_rows,
+                {
+                    Normalizer::project_records_after_edit(
+                        revisions,
+                        &self.publications,
+                        previous,
+                        edits,
+                    )
+                }
+            )?
+        } else {
+            None
+        };
+        let graph = if let Some(graph) = projected {
+            rift_tracing::traced!(
+                component = "analysis",
+                operation = "Normalizer::projected_records",
+                projected_records = graph.records().len(),
+                current_references = graph.references().len(),
+                current_edges = graph.edges().len(),
+                survivor_anchor_checks = self.publications.contribution_count()
+                    - usize::from(edit.is_some_and(|(previous, _)| {
+                        previous.publications().contribution_count()
+                            < self.publications.contribution_count()
+                    })),
+                { graph }
+            )
+        } else {
+            rift_tracing::traced!(
+                component = "analysis",
+                operation = "Normalizer::normalize_project",
+                { Normalizer::normalize_project(revisions, &self.publications) }
+            )?
+        };
+        self.build_with_graph(graph, edges_max, Some(static_inputs))
+    }
+
+    fn build_with_graph(
+        self,
+        graph: NormalizedGraph,
+        edges_max: usize,
+        static_inputs: Option<StaticInputs<'_, '_>>,
+    ) -> Result<BuiltSemantics, RiftError> {
         let syntax_provider = ProviderId::new(SYNTAX_PROVIDER_ID)?;
         let (edges, static_resolution) = match static_inputs {
             Some((sources, input))
@@ -152,6 +220,7 @@ impl PreparedSemantics {
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
+            captured_runs: None,
         };
         semantics.hold_static_resolution(static_resolution);
         Ok(BuiltSemantics {
@@ -380,7 +449,7 @@ impl WorkspaceSemantics {
                 })
             })
             .collect::<Result<Vec<_>, RiftError>>()?;
-        Self::prepare_facts_placed(&placed, declarations_max, revision, true)
+        Self::prepare_facts_placed(&placed, declarations_max, revision, true, |_| {})
     }
 
     /// Builds one publication and graph over compact syntax facts with explicit source paths.
@@ -414,7 +483,7 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::prepare_facts_placed(documents, declarations_max, revision, false)?
+        Self::prepare_facts_placed(documents, declarations_max, revision, false, |_| {})?
             .build(edges_max, previous)
     }
 
@@ -426,7 +495,7 @@ impl WorkspaceSemantics {
         external: &ExternalTarget<'_>,
         static_inputs: StaticInputs<'_, '_>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::prepare_facts_placed(documents, declarations_max, revision, false)?
+        Self::prepare_facts_placed(documents, declarations_max, revision, false, |_| {})?
             .build_with_external(edges_max, None, Some(external), Some(static_inputs))
     }
 
@@ -435,6 +504,7 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         revision: u64,
         collect_refused_contributions: bool,
+        mut admitted: impl FnMut(Range<usize>),
     ) -> Result<PreparedSemantics, RiftError> {
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
@@ -449,12 +519,13 @@ impl WorkspaceSemantics {
         let mut beyond_declaration_bound = Vec::new();
         let mut refused_contributions = Vec::new();
         for (offered, placed) in documents.iter().enumerate() {
+            let before = builder.declarations_remaining();
             if placed
                 .facts
                 .symbols()
                 .len()
                 .saturating_add(placed.placement.aliases_count())
-                > builder.declarations_remaining()
+                > before
             {
                 beyond_declaration_bound = documents[offered..]
                     .iter()
@@ -463,7 +534,9 @@ impl WorkspaceSemantics {
                 break;
             }
             match builder.add_facts_placed(placed.facts, &placed.placement) {
-                Ok(()) => {}
+                Ok(()) => admitted(
+                    declarations_max - before..declarations_max - builder.declarations_remaining(),
+                ),
                 Err(error)
                     if collect_refused_contributions
                         && error.slug().as_str().starts_with("rift.core.contribution_") =>
@@ -614,6 +687,7 @@ impl WorkspaceSemantics {
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
+            captured_runs: None,
         }
     }
 
@@ -734,6 +808,9 @@ impl get_size2::GetSize for WorkspaceSemantics {
             get_size2::GetSize::get_heap_size_with_tracker(&self.outside_namespaces, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
+        let (runs, tracker) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.captured_runs, tracker);
+        bytes = bytes.saturating_add(runs);
         let (static_resolution, tracker) = self.static_resolution.retained_size(tracker);
         let ordering = self
             .static_occurrence_order

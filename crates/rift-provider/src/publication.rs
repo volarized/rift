@@ -255,6 +255,10 @@ impl PublicationSet {
         self.publications.len()
     }
 
+    pub(super) const fn limits(&self) -> PublicationLimits {
+        self.limits
+    }
+
     /// Returns total Contribution count.
     #[must_use]
     pub const fn contribution_count(&self) -> usize {
