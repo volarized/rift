@@ -732,7 +732,7 @@ impl<'request> AdjacencyWalk<'request> {
             kind,
             selected,
             None,
-            self.deadline.walk_end(self.resolved.capture_elapsed),
+            self.deadline.graph_walk_end(self.resolved.capture_elapsed),
         ))
         .await?;
         self.acquired.admit_package_details(&inventory)?;
@@ -774,7 +774,7 @@ impl<'request> AdjacencyWalk<'request> {
     ) -> Result<(), RiftError> {
         let direction = self.step.direction;
         let selected = (direction == TraversalDirection::Outgoing).then_some(seed);
-        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let deadline = self.deadline.graph_walk_end(self.resolved.capture_elapsed);
         let inventory = Box::pin(self.server.inventory_for_kind(
             self.resolved,
             EdgeKind::HasType,
@@ -823,14 +823,14 @@ impl<'request> AdjacencyWalk<'request> {
     ) -> Result<(), RiftError> {
         let reads = &self.resolved.published.reads;
         let (engines, _) = self.local.as_ref().ok_or_else(coverage_failure)?;
-        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let deadline = self.deadline.graph_walk_end(self.resolved.capture_elapsed);
         let references = Box::pin(rift_server::graph_references(
             reads,
             engines,
             seed,
             self.selected
                 .is_some_and(AdjacencySelection::requires_enclosing),
-            deadline,
+            rift_server::EngineWalkDeadline::AdmitBefore(deadline),
         ))
         .await;
         let references = match references {
@@ -856,7 +856,7 @@ impl<'request> AdjacencyWalk<'request> {
         seed: &SymbolId,
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
-        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let deadline = self.deadline.graph_walk_end(self.resolved.capture_elapsed);
         let inventory = Box::pin(self.server.inventory_for_kind(
             self.resolved,
             EdgeKind::References,
@@ -907,7 +907,7 @@ impl<'request> AdjacencyWalk<'request> {
         let reads = &self.resolved.published.reads;
         let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
         let direction = self.step.direction;
-        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let deadline = self.deadline.graph_walk_end(self.resolved.capture_elapsed);
         let answer = if let Some(target) = self.acquired.installed.get(seed) {
             if direction != TraversalDirection::Outgoing {
                 return Err(coverage_failure());
@@ -1114,7 +1114,7 @@ impl<'request> AdjacencyWalk<'request> {
                     .semantic_seeds(maximum)
             })
             .await?;
-        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let deadline = self.deadline.graph_walk_end(self.resolved.capture_elapsed);
         let mut callers = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
         for seed in seeds {
             claim_request(&mut self.remaining, &mut self.reached)?;

@@ -320,7 +320,7 @@ impl RiftMcp {
         let engine = if served.is_empty() || skipped.is_some() {
             None
         } else {
-            let end = deadline.walk_end(resolved.capture_elapsed);
+            let end = deadline.graph_walk_end(resolved.capture_elapsed);
             match Box::pin(self.engine_inventory(resolved, &engines, &inventory, end)).await {
                 Ok(engine) => Some(engine),
                 Err(error) if super::super::lacks_coverage(&error) => None,
@@ -455,9 +455,10 @@ impl RiftMcp {
             let roots = roots.clone();
             let sources = sources.clone();
             async move {
+                let cutoff = rift_server::EngineWalkDeadline::AdmitBefore(end);
                 let answer = tokio::time::timeout_at(
                     end + crate::server::ENGINE_READ_GRACE,
-                    file.read(engines, (selection, &sources), end),
+                    file.read(engines, (selection, &sources), cutoff),
                 )
                 .await
                 .map_err(|_| {

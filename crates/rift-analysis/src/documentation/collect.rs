@@ -53,7 +53,7 @@ pub fn collect_documentation_incremental(
     declarations: &[DocumentationDeclaration<'_>],
 ) -> Result<DocumentationCollection, RiftError> {
     super::references::validate_reference_counts(declarations.len(), 0)?;
-    let attached = attached_declaration_facts(declarations);
+    let attached = attached_declaration_facts(sources, declarations);
     let (mut output, cache) = collect_source_facts(previous, sources, &attached)?;
     let records = sources
         .sources()
@@ -367,6 +367,48 @@ mod attachment_tests {
     use super::{AttachedSymbols, attached_identity};
 
     #[test]
+    fn attachment_groups_match_selected_owners_and_keep_repeated_declarations() {
+        use crate::documentation::collect_tests::{canonical_symbol, input};
+        use crate::documentation::{DocumentationDeclaration, DocumentationSourceSet};
+        use rift_protocol::documentation::{NotebookCell, NotebookCellIdentity, NotebookCellKind};
+        use rift_protocol::read::TextRange;
+
+        let sources =
+            DocumentationSourceSet::new(vec![input("guide.md", "Guide")]).expect("selected source");
+        let selected = &sources.sources()[0].source().identity;
+        let mut cell = selected.clone();
+        cell.cell = Some(NotebookCell {
+            identity: NotebookCellIdentity::Indexed { index: 0 },
+            kind: NotebookCellKind::Markdown,
+        });
+        let language = rift_syntax::ShippedLanguage::Rust.language();
+        let first = canonical_symbol("rust", "example", "First");
+        let second = canonical_symbol("rust", "example", "Second");
+        let range = TextRange { start: 0, end: 4 };
+        let declaration = |symbol, owner| {
+            DocumentationDeclaration::new(symbol, &language, "item", "item", owner, range.clone())
+                .expect("declaration")
+        };
+        let declarations = [
+            declaration(&second, selected),
+            declaration(&first, &cell),
+            declaration(&first, selected),
+            declaration(&first, selected),
+        ];
+
+        let attached = super::attached_declaration_facts(&sources, &declarations);
+        assert_eq!(attached.len(), 1);
+        assert_eq!(
+            attached[selected],
+            [
+                (first.clone(), range.clone()),
+                (first, range.clone()),
+                (second, range)
+            ]
+        );
+    }
+
+    #[test]
     fn attached_identity_accepts_original_item_range_and_refuses_distinct_ids() {
         let language = rift_syntax::ShippedLanguage::Rust.language();
         let path = rift_core::ProjectPath::new("src/lib.rs").expect("source path");
@@ -415,14 +457,26 @@ mod attachment_tests {
 }
 
 fn attached_declaration_facts(
+    sources: &DocumentationSourceSet<'_>,
     declarations: &[DocumentationDeclaration<'_>],
 ) -> AttachedDeclarations {
     let mut attached = BTreeMap::new();
-    for declaration in declarations {
-        attached
-            .entry(declaration.source().clone())
-            .or_insert_with(Vec::new)
-            .push((declaration.symbol().clone(), declaration.range().clone()));
+    // Source extraction reads only selected owners. Reference resolution uses every declaration.
+    for group in declarations.chunk_by(|left, right| left.source() == right.source()) {
+        let owner = group[0].source();
+        if sources
+            .sources()
+            .binary_search_by(|input| input.source().identity.cmp(owner))
+            .is_err()
+        {
+            continue;
+        }
+        let facts = attached.entry(owner.clone()).or_insert_with(Vec::new);
+        facts.extend(
+            group
+                .iter()
+                .map(|declaration| (declaration.symbol().clone(), declaration.range().clone())),
+        );
     }
     for facts in attached.values_mut() {
         facts.sort_by(|left, right| {

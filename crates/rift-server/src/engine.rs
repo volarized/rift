@@ -56,6 +56,29 @@ use rift_lsp::session::EngineReadiness;
 pub(crate) type SessionFuture<'session, T> =
     std::pin::Pin<Box<dyn Future<Output = T> + Send + 'session>>;
 
+/// Where one engine walk stops waiting for an answer.
+#[derive(Clone, Copy, Debug)]
+pub enum EngineWalkDeadline {
+    /// An exchange may make its first attempt when the slot is free. The instant bounds retries.
+    RetryUntil(Instant),
+    /// The slot must be acquired before the instant. The same instant bounds retries.
+    AdmitBefore(Instant),
+}
+
+impl EngineWalkDeadline {
+    const fn end(self) -> Instant {
+        match self {
+            Self::RetryUntil(end) | Self::AdmitBefore(end) => end,
+        }
+    }
+}
+
+impl From<Instant> for EngineWalkDeadline {
+    fn from(end: Instant) -> Self {
+        Self::RetryUntil(end)
+    }
+}
+
 /// How many distinct changed paths one slot holds for its live session before it
 /// replaces the session instead: a replacement reads every file from disk at its start.
 const OWED_CHANGES_MAX: usize = 16_384;
@@ -821,6 +844,23 @@ impl EngineSlot {
             .await
     }
 
+    async fn hold_for_walk(
+        &self,
+        deadline: Option<EngineWalkDeadline>,
+    ) -> Result<rift_tracing::Held<tokio::sync::MutexGuard<'_, SlotState>>, RiftError> {
+        let Some(EngineWalkDeadline::AdmitBefore(cutoff)) = deadline else {
+            return Ok(self.hold().await);
+        };
+        if Instant::now() >= cutoff {
+            return errors::lsp::engine_analyzing().attempts(0_u64).fail();
+        }
+        // A timeout polls the lock first, so also check the clock after acquisition.
+        match tokio::time::timeout_at(cutoff, self.hold()).await {
+            Ok(held) if Instant::now() < cutoff => Ok(held),
+            _ => errors::lsp::engine_analyzing().attempts(0_u64).fail(),
+        }
+    }
+
     /// Ends the running session under the slot's lock and reports the slot stopped.
     ///
     /// A start still in flight is aborted, and a start that already finished is shut
@@ -1057,7 +1097,7 @@ impl EngineSlot {
                 begin,
                 operation,
                 finish,
-                Some(deadline),
+                Some(deadline.into()),
                 |session| {
                     (analyzing.load(Ordering::Relaxed) && !session.is_analyzing())
                         || (awaiting_quiet.load(Ordering::Relaxed)
@@ -1108,6 +1148,8 @@ impl EngineSlot {
     /// live, and the answer is `OutgoingAnswer::Unsettled` instead of a
     /// dropped request that refuses the caller. A retry still in flight at
     /// `deadline` is abandoned there and ends the walk the same way.
+    /// [`EngineWalkDeadline::AdmitBefore`] also bounds admission to the slot.
+    /// [`EngineWalkDeadline::RetryUntil`] permits a first probe when no retry time remains.
     ///
     /// # Errors
     ///
@@ -1131,7 +1173,7 @@ impl EngineSlot {
         )
             -> SessionFuture<'session, Result<Option<T>, RiftError>>,
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
-        deadline: Instant,
+        deadline: impl Into<EngineWalkDeadline>,
     ) -> Result<OutgoingAnswer<T>, RiftError> {
         let mut settled = OutgoingSettlement::Retry;
         let answer = self
@@ -1139,7 +1181,7 @@ impl EngineSlot {
                 begin,
                 operation,
                 finish,
-                Some(deadline),
+                Some(deadline.into()),
                 walk_settled,
                 |session, _session_generation, answer, _final_attempt| {
                     settled =
@@ -1194,12 +1236,13 @@ impl EngineSlot {
         )
             -> SessionFuture<'session, Result<T, RiftError>>,
         mut finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
-        deadline: Option<Instant>,
+        deadline: Option<EngineWalkDeadline>,
         wake: impl Fn(&EngineSession) -> bool,
         mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
     ) -> Result<T, RiftError> {
         let retry = self.configuration.retry;
-        let mut held = self.hold().await;
+        let mut held = Box::pin(self.hold_for_walk(deadline)).await?;
+        let deadline = deadline.map(EngineWalkDeadline::end);
         let mut guarded = RequestSessionGuard {
             state: &mut held,
             reported_state: &self.reported_state,
@@ -2677,6 +2720,63 @@ done
         assert!(retrying.is_none(), "the spent retry has no later exchange");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn graph_slot_expiry_never_starts_an_exchange() {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        fn unexpected_request(
+            _session: &mut EngineSession,
+        ) -> SessionFuture<'_, Result<Option<()>, RiftError>> {
+            panic!("the elapsed walk sent its first request");
+        }
+
+        let key = LspProcessKey::named("rust");
+        let pool = EnginePool::new(
+            Path::new("/rift-test-root"),
+            BTreeMap::from([(key.clone(), table("unlaunched-test-engine"))]),
+            BTreeMap::new(),
+        );
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let held = slot.state.lock().await;
+        let cutoff = Instant::now() + Duration::from_millis(100);
+        let mut queued = Box::pin(slot.request_outgoing(
+            begin_immediately,
+            unexpected_request,
+            finish_immediately,
+            EngineWalkDeadline::AdmitBefore(cutoff),
+        ));
+        poll_fn(|context| {
+            assert!(queued.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            queued.await,
+            Ok(OutgoingAnswer::Unsettled { attempts: 0 })
+        ));
+        assert_eq!(Instant::now(), cutoff);
+        let late = slot
+            .request_outgoing(
+                begin_immediately,
+                unexpected_request,
+                finish_immediately,
+                EngineWalkDeadline::AdmitBefore(cutoff),
+            )
+            .await;
+        assert!(matches!(
+            late,
+            Ok(OutgoingAnswer::Unsettled { attempts: 0 })
+        ));
+        drop(held);
+
+        let state = slot.state.lock().await;
+        assert!(state.session.is_none() && state.starting.is_none());
+        assert!(!state.restarts.started && state.restarts.spent.is_empty());
+        assert!(!state.discarded);
+    }
+
     /// The default retry table spends 8 attempts over 9.75 s of waits; a walk
     /// under the 30 s `readiness_timeout` keeps asking at `delay_limit` and
     /// makes 18 attempts, the last at 29.75 s.
@@ -2852,9 +2952,10 @@ done
                 begin_immediately,
                 counted_references(&attempts),
                 finish_immediately,
-                Instant::now(),
+                EngineWalkDeadline::RetryUntil(Instant::now()),
             )
             .await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             slot.state.lock().await.session.is_some(),
             "the engine runs once its first walk ends: {started:?}"

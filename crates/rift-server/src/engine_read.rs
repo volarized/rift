@@ -30,7 +30,7 @@ use tokio::time::Instant;
 use crate::callee::{
     CalleeDeclaration, CalleeFile, CalleeRoots, NamedCallee, PackageCallee, callee_file,
 };
-use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer, SessionFuture};
+use crate::engine::{EnginePool, EngineSlot, EngineWalkDeadline, OutgoingAnswer, SessionFuture};
 use crate::read::{ReadService, RiftError, symbol_id};
 use crate::traversal::{
     TRAVERSAL_SYMBOLS_MAX, engine_kind, resolve_graph_symbol, validate_traversal,
@@ -1847,7 +1847,7 @@ async fn references_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
     (resolve_targets, sources): (bool, &DocumentSources),
-    deadline: Instant,
+    deadline: impl Into<EngineWalkDeadline>,
 ) -> Result<(ReferenceReport, bool), RiftError> {
     let request_path = target.path.clone();
     let sources = sources.clone();
@@ -1949,7 +1949,7 @@ pub async fn graph_references(
     engines: &EnginePool,
     target: &SymbolId,
     require_caller: bool,
-    deadline: Instant,
+    deadline: impl Into<EngineWalkDeadline>,
 ) -> Result<GraphReferences, RiftError> {
     let identity =
         CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| graph_reference_coverage())?;
@@ -2105,7 +2105,7 @@ async fn engine_graph_references(
     engines: &EnginePool,
     target: &SymbolId,
     require_caller: bool,
-    deadline: Instant,
+    deadline: impl Into<EngineWalkDeadline>,
 ) -> Result<GraphReferences, RiftError> {
     let unavailable = graph_reference_coverage;
     let identity = CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| unavailable())?;
@@ -2118,6 +2118,7 @@ async fn engine_graph_references(
     let mut edges = Vec::new();
     let mut edge_warnings = Vec::new();
     let sources = DocumentSources::of(reads);
+    let deadline = deadline.into();
     for declaration in declarations {
         let file = declaration.file;
         let slot = engines

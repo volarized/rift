@@ -23,7 +23,7 @@ pub use change::search_change;
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, configuration_file, load_configuration, profile_roots,
 };
-pub use engine::{EnginePool, EngineSlot, LspProcessKey};
+pub use engine::{EnginePool, EngineSlot, EngineWalkDeadline, LspProcessKey};
 pub use engine_read::{
     CallCorroboration, CallDestination, CallProvider, DocumentSources, EngineInventory,
     EngineInventoryAnswer, EngineInventoryFile, EngineInventorySelection, EngineReferences,
