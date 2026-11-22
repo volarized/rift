@@ -41,10 +41,11 @@ import threading
 import time
 import zlib
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import uvicorn
 from google.protobuf.message import DecodeError
@@ -103,6 +104,10 @@ LOOPBACK = "127.0.0.1"
 COLLECTOR_START_SECONDS = 5.0
 COLLECTOR_STOP_SECONDS = 5.0
 START_POLL_SECONDS = 0.005
+# Windows reports this when a peer disconnects during AcceptEx. Retry once after a
+# brief pause so a discarded connection cannot close the collector's listening socket.
+WINDOWS_ERROR_NETNAME_DELETED = 64
+ACCEPT_RETRY_SECONDS = 0.01
 # uvicorn's bound on open connections draining at stop, in whole seconds.
 GRACEFUL_STOP_SECONDS = 2
 # The attribute that names a span's MCP request; a printed log record names it `req`.
@@ -1406,6 +1411,40 @@ def resource_attribute(key: str, value: str) -> str:
     return f"{key}={encoded}"
 
 
+async def _accept_after_windows_disconnect[Accepted](
+    accept: Callable[[socket.socket], Awaitable[Accepted]],
+    listener: socket.socket,
+) -> Accepted:
+    try:
+        return await accept(listener)
+    except OSError as error:
+        if (
+            getattr(error, "winerror", None) != WINDOWS_ERROR_NETNAME_DELETED
+            or listener.fileno() < 0
+        ):
+            raise
+        await asyncio.sleep(ACCEPT_RETRY_SECONDS)
+        if listener.fileno() < 0:
+            raise
+    return await accept(listener)
+
+
+if sys.platform == "win32":
+
+    class _CollectorProactor(asyncio.IocpProactor):
+        def accept(
+            self, listener: socket.socket
+        ) -> asyncio.Future[tuple[socket.socket, Any]]:
+            return asyncio.get_running_loop().create_task(
+                _accept_after_windows_disconnect(super().accept, listener)
+            )
+
+    def _collector_loop() -> asyncio.AbstractEventLoop:
+        loop = asyncio.ProactorEventLoop(proactor=_CollectorProactor())
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 @contextmanager
 def collector(
     points_max: int = POINTS_MAX,
@@ -1452,7 +1491,12 @@ def collector(
 
         def serve() -> None:
             try:
-                server.run(sockets=[listener])
+                if sys.platform == "win32":
+                    asyncio.run(
+                        server.serve(sockets=[listener]), loop_factory=_collector_loop
+                    )
+                else:
+                    server.run(sockets=[listener])
             except BaseException as failure:  # noqa: BLE001 - the start wait reports it.
                 failures.append(failure)
 
