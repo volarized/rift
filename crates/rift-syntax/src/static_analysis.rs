@@ -322,7 +322,7 @@ pub struct StaticMemberCallback {
     pub intersection: Option<ByteRange>,
 }
 
-/// A direct CommonJS default write whose wrapper uses were checked in the same file.
+/// A direct `CommonJS` default write whose wrapper uses were checked in the same file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticCommonJsExport {
     /// The complete `module.exports = name` assignment.
@@ -338,7 +338,7 @@ pub struct StaticCommonJsExport {
 pub struct StaticFactsParts {
     /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
     pub javascript_module_syntax: bool,
-    /// The single direct default write in a file with closed CommonJS wrapper uses.
+    /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
@@ -436,7 +436,7 @@ impl StaticFacts {
         self.0.javascript_module_syntax
     }
 
-    /// The direct default write, if the CommonJS wrapper remains closed.
+    /// The direct default write, if the `CommonJS` wrapper remains closed.
     #[must_use]
     pub const fn commonjs_export(&self) -> Option<&StaticCommonJsExport> {
         self.0.commonjs_export.as_ref()

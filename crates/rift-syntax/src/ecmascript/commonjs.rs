@@ -14,6 +14,77 @@ pub(super) fn record<'tree>(
     kinds: &EcmaScriptKinds,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
 ) -> Result<(Vec<Node<'tree>>, Option<StaticCommonJsExport>), RiftError> {
+    let CapturedAssignments {
+        assignments,
+        mut blocked,
+        replaced,
+        synchronized,
+        direct_default,
+    } = capture_assignments(root, source, limits, kinds)?;
+    let synchronized = synchronized.and_then(|(outer, inner)| {
+        if !blocked.contains(&root.id())
+            && closed_wrapper_uses(root, Some(outer), inner, source.text, kinds)
+        {
+            Some(inner)
+        } else {
+            blocked.insert(root.id());
+            None
+        }
+    });
+    let mut closed_export = None;
+    let synchronized_scope = synchronized.map(|inner| (root.id(), inner.end_byte()));
+    for &syntax_element in &assignments {
+        if synchronized != Some(syntax_element) && !module_execution(syntax_element, &blocked) {
+            continue;
+        }
+        let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
+            continue;
+        };
+        if binding.kind == SyntaxExportKind::Named
+            && !kept_after_replacement(syntax_element, source.text, &replaced, synchronized_scope)
+        {
+            continue;
+        }
+        if binding.kind == SyntaxExportKind::Default
+            && binding.local.is_some()
+            && kinds
+                .child(syntax_element, EcmaScriptGrammarField::Right)
+                .is_some_and(|value| value.kind_id() == kinds.identifier)
+            && (synchronized == Some(syntax_element)
+                || (direct_default == Some(syntax_element)
+                    && closed_wrapper_uses(root, None, syntax_element, source.text, kinds)))
+        {
+            closed_export = Some((binding.range, synchronized == Some(syntax_element)));
+        }
+        bindings.insert(syntax_element.id(), binding);
+    }
+    let closed_export = if let Some((assignment, synchronized)) = closed_export {
+        Some(StaticCommonJsExport {
+            assignment,
+            synchronized,
+            initialized: initialized_exports(root, source.text, kinds, bindings)?,
+        })
+    } else {
+        None
+    };
+    Ok((assignments, closed_export))
+}
+
+struct CapturedAssignments<'tree> {
+    assignments: Vec<Node<'tree>>,
+    blocked: BTreeSet<usize>,
+    replaced: BTreeMap<usize, usize>,
+    synchronized: Option<(Node<'tree>, Node<'tree>)>,
+    direct_default: Option<Node<'tree>>,
+}
+
+/// Captures assignments and wrapper rebindings in the bounded syntax walk.
+fn capture_assignments<'tree>(
+    root: Node<'tree>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    kinds: &EcmaScriptKinds,
+) -> Result<CapturedAssignments<'tree>, RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut blocked = BTreeSet::new();
     // Scope of each `module.exports = value`, with the end of its last write there.
@@ -83,53 +154,13 @@ pub(super) fn record<'tree>(
             (child, depth + 1)
         });
     }
-    let synchronized = synchronized.and_then(|(outer, inner)| {
-        if !blocked.contains(&root.id())
-            && closed_wrapper_uses(root, Some(outer), inner, source.text, kinds)
-        {
-            Some(inner)
-        } else {
-            blocked.insert(root.id());
-            None
-        }
-    });
-    let mut closed_export = None;
-    let synchronized_scope = synchronized.map(|inner| (root.id(), inner.end_byte()));
-    for &syntax_element in &assignments {
-        if synchronized != Some(syntax_element) && !module_execution(syntax_element, &blocked) {
-            continue;
-        }
-        let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
-            continue;
-        };
-        if binding.kind == SyntaxExportKind::Named
-            && !kept_after_replacement(syntax_element, source.text, &replaced, synchronized_scope)
-        {
-            continue;
-        }
-        if binding.kind == SyntaxExportKind::Default
-            && binding.local.is_some()
-            && kinds
-                .child(syntax_element, EcmaScriptGrammarField::Right)
-                .is_some_and(|value| value.kind_id() == kinds.identifier)
-            && (synchronized == Some(syntax_element)
-                || (direct_default == Some(syntax_element)
-                    && closed_wrapper_uses(root, None, syntax_element, source.text, kinds)))
-        {
-            closed_export = Some((binding.range, synchronized == Some(syntax_element)));
-        }
-        bindings.insert(syntax_element.id(), binding);
-    }
-    let closed_export = if let Some((assignment, synchronized)) = closed_export {
-        Some(StaticCommonJsExport {
-            assignment,
-            synchronized,
-            initialized: initialized_exports(root, source.text, kinds, bindings)?,
-        })
-    } else {
-        None
-    };
-    Ok((assignments, closed_export))
+    Ok(CapturedAssignments {
+        assignments,
+        blocked,
+        replaced,
+        synchronized,
+        direct_default,
+    })
 }
 
 /// Finds the authored bindings that supply these exports directly from the module body.
