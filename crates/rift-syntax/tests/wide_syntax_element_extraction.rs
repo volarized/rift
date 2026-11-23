@@ -52,7 +52,8 @@ fn ratio_max() -> f64 {
     (linear * quadratic).sqrt()
 }
 
-/// Samples per size. The fastest counts, reducing incidental work inside the test process.
+/// Samples of the smaller file, and at most as many of the larger one. The fastest counts,
+/// reducing incidental work inside the test process.
 const REPEATS: usize = 3;
 
 /// Target CPU time of one smaller-file analysis, within the existing input bounds.
@@ -217,7 +218,10 @@ fn calibrated_lines(
 /// and refuses a time ratio at or above [`ratio_max`]; returns the larger file's document and
 /// count.
 ///
-/// The two sizes alternate; their CPU work is compared under the same process conditions.
+/// The larger file runs between two runs of the smaller one, so their CPU work is compared
+/// under the same process conditions. A larger run counts by its fastest sample, so another
+/// sample can only lower the ratio: once the ratio is below the bound the larger file is not
+/// analyzed again, and a ratio at or above it is refused after [`REPEATS`] samples of each.
 fn analyze_linearly(
     provider: &dyn SyntaxProvider,
     build: impl Fn(usize) -> String,
@@ -227,17 +231,21 @@ fn analyze_linearly(
     let lines = small_lines * usize::from(GROWTH_FACTOR);
     let small_text = build(small_lines);
     let large_text = build(lines);
-    let mut small = Duration::MAX;
-    let mut large = Duration::MAX;
-    let mut document = None;
-    for _ in 0..REPEATS {
+    let ratio_max = ratio_max();
+    let mut small = timed_analysis(provider, &small_text).1;
+    let (mut document, mut large) = timed_analysis(provider, &large_text);
+    for _ in 1..REPEATS {
         small = small.min(timed_analysis(provider, &small_text).1);
+    }
+    for _ in 1..REPEATS {
+        if large.as_secs_f64() / small.as_secs_f64() < ratio_max {
+            break;
+        }
         let (analysis, elapsed) = timed_analysis(provider, &large_text);
         large = large.min(elapsed);
-        document = Some(analysis);
+        document = analysis;
     }
     let ratio = large.as_secs_f64() / small.as_secs_f64();
-    let ratio_max = ratio_max();
     assert!(
         ratio < ratio_max,
         "analysis CPU time must grow linearly with the sibling count: language={:?}, \
@@ -245,7 +253,7 @@ fn analyze_linearly(
          ratio_max={ratio_max:.2}",
         provider.language(),
     );
-    (document.expect("at least one measured run"), lines)
+    (document, lines)
 }
 
 /// The aggregate case from main: every registered provider inside one test deadline and one
