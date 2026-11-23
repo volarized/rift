@@ -26,6 +26,91 @@ fn build(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
 }
 
 #[test]
+fn test_python_reexports_keep_the_written_module_and_terminal_import() {
+    let source = "from __future__ import annotations\nimport typing\n\nif typing.TYPE_CHECKING:\n    from .barrel import Settings as Selected, Other\n\ndef enabled(record: Selected) -> bool:\n    return record.enabled\n";
+    let refused = "from .shadowed import Settings as Shadowed\nfrom .cycle_a import Settings as Cyclic\nfrom .ambiguous import Settings as Ambiguous\n";
+    let (_directory, index) = build(&[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/model.py",
+            "class Settings:\n    enabled: bool = True\nclass Other: pass\n",
+        ),
+        (
+            "pkg/barrel.py",
+            "from .model import Settings as Settings, Other as Other\n",
+        ),
+        ("pkg/use.py", source),
+        ("pkg/direct.py", "from .model import Settings\n"),
+        (
+            "pkg/shadowed.py",
+            "from .model import Settings as Settings\nSettings = []\n",
+        ),
+        (
+            "pkg/cycle_a.py",
+            "from .cycle_b import Settings as Settings\n",
+        ),
+        (
+            "pkg/cycle_b.py",
+            "from .cycle_a import Settings as Settings\n",
+        ),
+        (
+            "pkg/ambiguous.py",
+            "from .model import Settings as Settings\n",
+        ),
+        (
+            "pkg/ambiguous/__init__.py",
+            "from ..model import Settings as Settings\n",
+        ),
+        ("pkg/refused.py", refused),
+    ]);
+    let prefix = "rift://symbol/local/python/pkg/";
+    for (kind, owner, target, spelling) in [
+        ("imports", "use", "barrel", ".barrel"),
+        ("imports", "use", "model/Settings", "Selected"),
+        ("imports", "use", "model/Other", "Other"),
+        ("has_type", "use/enabled", "model/Settings", "Selected"),
+        (
+            "reads",
+            "use/enabled",
+            "model/Settings/enabled",
+            "record.enabled",
+        ),
+    ] {
+        let from = format!("{prefix}{owner}");
+        let to = format!("{prefix}{target}");
+        let mut matches = index.edges().edges().filter(|edge| {
+            edge.kind().as_ref() == kind && edge.from().as_str() == from && edge.to().as_str() == to
+        });
+        let edge = matches.next().expect("stored authored edge");
+        assert!(matches.next().is_none());
+        let binding = edge.occurrence();
+        assert_eq!(binding.unit().key().as_str(), "pkg/use.py");
+        let start = usize::try_from(binding.range().start()).expect("source start");
+        let end = usize::try_from(binding.range().end()).expect("source end");
+        assert_eq!(&source[start..end], spelling);
+    }
+    let mut direct = index.edges().edges().filter(|edge| {
+        edge.kind().as_ref() == "imports"
+            && edge.occurrence().unit().key().as_str() == "pkg/direct.py"
+    });
+    assert_eq!(
+        direct.next().expect("stored direct import").to().as_str(),
+        format!("{prefix}model/Settings")
+    );
+    assert!(direct.next().is_none());
+    for edge in index.edges().edges().filter(|edge| {
+        edge.kind().as_ref() == "imports"
+            && edge.occurrence().unit().key().as_str() == "pkg/refused.py"
+    }) {
+        let range = edge.occurrence().range();
+        let start = usize::try_from(range.start()).expect("source start");
+        let end = usize::try_from(range.end()).expect("source end");
+        assert!(![".shadowed", ".cycle_a", ".ambiguous"].contains(&&refused[start..end]));
+    }
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
 fn test_python_generic_mro_stores_the_ordered_local_target() {
     let source = "from typing import Generic, TypeVar\nT = TypeVar('T')\nclass Root:\n    def leaf(self): return 1\nclass Left(Generic[T], Root): pass\nclass Right(Generic[T]):\n    def leaf(self): return 2\nclass Child(Left[T], Right[T]):\n    def use(self): return self.leaf()\n";
     let (_directory, index) = build(&[("main.py", source)]);

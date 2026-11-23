@@ -1211,6 +1211,7 @@ impl<'source> Index<'source> {
             }
             result.record_kind(occurrence, edge.kind);
         }
+        let mut written_python_imports = BTreeSet::new();
         for binding in file.facts.bindings() {
             if file.inactive(binding.name, work) {
                 continue;
@@ -1219,6 +1220,7 @@ impl<'source> Index<'source> {
                 return;
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
+                let mut written = None;
                 let occurrence = target.and_then(|target| {
                     if file.document.facts.language().name == "rust" {
                         return self.rust_import_occurrence(file, range, target, work);
@@ -1228,6 +1230,8 @@ impl<'source> Index<'source> {
                     if file.document.facts.language().name == "python" {
                         occurrence.edge_from =
                             Some(self.python_identity(file, range, file.qualified_target(".")?)?);
+                        written =
+                            self.python_written_import(file, binding, target, &occurrence, work);
                     } else if matches!(
                         file.document.facts.language().name.as_str(),
                         "javascript" | "typescript"
@@ -1253,6 +1257,11 @@ impl<'source> Index<'source> {
                     continue;
                 }
                 result.record_kind(occurrence, rift_protocol::read::EdgeKind::Imports);
+                if let Some(written) = written
+                    && written_python_imports.insert(written.callee_range)
+                {
+                    result.record_kind(Some(written), rift_protocol::read::EdgeKind::Imports);
+                }
             }
         }
         if matches!(

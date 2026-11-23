@@ -2466,12 +2466,13 @@ fn test_python_static_imports_keep_submodules_and_captured_external_exports() {
 
 #[test]
 fn test_python_static_reexports_keep_module_import_owners() {
+    let source = "from pkg import Value\n";
     let result = resolution(
         "python",
         &[
             ("pkg/__init__.py", "from .models import Value as Value\n"),
             ("pkg/models.py", "class Value: pass\n"),
-            ("main.py", "from pkg import Value\n"),
+            ("main.py", source),
         ],
         &[],
         WORK_MAX,
@@ -2481,14 +2482,28 @@ fn test_python_static_reexports_keep_module_import_owners() {
         .iter()
         .filter(|edge| edge.role == ReferenceRole::Import)
         .collect::<Vec<_>>();
-    assert_eq!(imports.len(), 2, "{result:?}");
-    assert_eq!(
-        imports[1]
-            .edge_from
-            .as_ref()
-            .map(rift_core::SymbolId::as_str),
-        Some("rift://symbol/local/python/pkg")
-    );
+    assert_eq!(imports.len(), 3, "{result:?}");
+    let written = imports
+        .iter()
+        .find(|edge| {
+            edge.binding.unit().key().as_str() == "main.py"
+                && target(edge) == "rift://symbol/local/python/pkg"
+        })
+        .expect("written package import");
+    assert_eq!(source_of(written, source), "pkg");
+    for (unit, owner) in [("main.py", "main"), ("pkg/__init__.py", "pkg")] {
+        let edge = imports
+            .iter()
+            .find(|edge| {
+                edge.binding.unit().key().as_str() == unit
+                    && target(edge) == "rift://symbol/local/python/pkg/models/Value"
+            })
+            .expect("terminal value import");
+        assert_eq!(
+            edge.edge_from.as_ref().expect("import owner").as_str(),
+            format!("rift://symbol/local/python/{owner}")
+        );
+    }
 }
 
 #[test]

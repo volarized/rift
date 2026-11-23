@@ -35,7 +35,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [Self::exact_symbol].
+    /// Returns the same errors as [`Self::exact_symbol`].
     pub fn exact_current_symbol(
         &self,
         request: &GetSymbolParams,

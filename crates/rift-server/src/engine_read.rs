@@ -582,13 +582,19 @@ fn callee_hops(
     seed: &SymbolId,
     callees: impl IntoIterator<Item = SymbolId>,
     provider: EdgeProvider,
+    mut corroborated: BTreeMap<SymbolId, SourceUnitSpan>,
 ) -> Vec<GraphHop> {
     callees
         .into_iter()
         .filter(|callee| callee != seed)
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|callee| call_hop(seed, callee, provider))
+        .map(|callee| {
+            let occurrence = corroborated.remove(&callee);
+            let mut hop = call_hop(seed, callee, provider);
+            hop.edge.occurrence = occurrence;
+            hop
+        })
         .collect()
 }
 
@@ -628,6 +634,7 @@ async fn extend_callees(
         let (edges, held, language) = match resolved {
             SymbolCallees::Resolved {
                 callees,
+                corroborated,
                 held,
                 dropped,
                 language,
@@ -637,7 +644,11 @@ async fn extend_callees(
                 references.dropped_callees = references.dropped_callees.saturating_add(dropped);
                 references.unconfirmed.extend(unconfirmed);
                 let seed = SymbolId(identity.as_str().to_owned());
-                (callee_hops(&seed, callees, provider), held, language)
+                (
+                    callee_hops(&seed, callees, provider, corroborated),
+                    held,
+                    language,
+                )
             }
             SymbolCallees::NotServed => continue,
             SymbolCallees::Unprepared { kind } if identity == *walk.seed => {
@@ -692,6 +703,8 @@ enum SymbolCallees {
         provider: EdgeProvider,
         /// Callee declarations, one per call the engine named, repeats included.
         callees: Vec<SymbolId>,
+        /// Exact stored occurrences independently reported at the selected caller.
+        corroborated: BTreeMap<SymbolId, SourceUnitSpan>,
         /// Callees in package files, waiting for the global API to name them.
         held: Vec<PackageCallee>,
         /// Callees under no root, or outside every declaration of a project file.
@@ -765,14 +778,17 @@ async fn resolve_symbol_callees(
         identity,
         (walk.roots, &trees),
         slot.edge_provider(),
+        Some(file),
     ) {
         Ok(MappedCallees {
             callees,
+            corroborated,
             held,
             dropped,
         }) => Ok(SymbolCallees::Resolved {
             provider: slot.edge_provider(),
             callees,
+            corroborated,
             held,
             dropped,
             language,
@@ -830,14 +846,15 @@ async fn calls_on_engine(
                     }));
                 }
                 let mut calls = Vec::new();
+                let mut exact_caller = true;
                 for item in items {
-                    if exact_seed
-                        && (!(item.uri == uri || item.uri == canonical_uri)
-                            || !(item.selection_range.start <= position
-                                && position < item.selection_range.end))
-                    {
+                    let selected = (item.uri == uri || item.uri == canonical_uri)
+                        && item.selection_range.start <= position
+                        && position < item.selection_range.end;
+                    if exact_seed && !selected {
                         return Err(graph_call_coverage());
                     }
+                    exact_caller &= selected;
                     match direction {
                         TraversalDirection::Outgoing => {
                             calls.extend(session.outgoing_calls(item).await?);
@@ -851,6 +868,13 @@ async fn calls_on_engine(
                             calls: Err(calls.len()),
                             encoding,
                         }));
+                    }
+                }
+                // The legacy walk can use neighbors from a prepared item outside the
+                // selected declaration. Its ranges cannot verify occurrences in this file.
+                if !exact_caller {
+                    for call in &mut calls {
+                        call.from_ranges.clear();
                     }
                 }
                 Ok(Some(CalleeReport {
@@ -937,6 +961,7 @@ fn edge_call_ranges_overlap(left: &Range, right: &Range) -> bool {
 struct MappedCallees {
     /// The project declarations holding each callee's name, one per call.
     callees: Vec<SymbolId>,
+    corroborated: BTreeMap<SymbolId, SourceUnitSpan>,
     /// The callees in package files, one per call.
     held: Vec<PackageCallee>,
     /// The callees under no root, or outside every declaration of a project file.
@@ -953,6 +978,7 @@ fn map_callees(
     caller: &CoreSymbolId,
     (roots, trees): (&CalleeRoots, &[&std::path::Path]),
     provider: EdgeProvider,
+    caller_file: Option<&IndexedFile>,
 ) -> Result<MappedCallees, RiftError> {
     let calls =
         report.calls.map_err(|observed| {
@@ -962,19 +988,21 @@ fn map_callees(
         })?;
     let mut mapped = MappedCallees {
         callees: Vec::new(),
+        corroborated: BTreeMap::new(),
         held: Vec::new(),
         dropped: 0,
     };
+    let mut observations = caller_file.map(|file| WalkCallSites::new(file, report.encoding));
     for call in &calls {
         let item = &call.to;
-        let call = NamedCallee {
+        let named = NamedCallee {
             provider,
             uri: &item.uri,
             name: &item.name,
             position: item.selection_range.start,
             encoding: report.encoding,
         };
-        let file = callee_file(roots, trees, caller, call).map_err(|error| {
+        let file = callee_file(roots, trees, caller, named).map_err(|error| {
             errors::server::read_task()
                 .operation("callee URI conversion")
                 .detail(error.detail())
@@ -988,17 +1016,116 @@ fn map_callees(
                 "engine calls",
             )?,
             CalleeFile::Package(held) => {
+                if let Some(sites) = &mut observations {
+                    sites.record(&call.from_ranges, None);
+                }
                 mapped.held.push(held);
                 continue;
             }
             CalleeFile::Unaddressed => None,
         };
+        if let Some(sites) = &mut observations {
+            sites.record(&call.from_ranges, declaration.as_ref());
+        }
         match declaration {
             Some(declaration) => mapped.callees.push(declaration),
             None => mapped.dropped += 1,
         }
     }
+    if let Some(sites) = observations {
+        mapped.corroborated = sites.corroborate(reads.edges().outgoing(caller));
+    }
     Ok(mapped)
+}
+
+/// Location evidence from one prepared caller, independent of traversal reachability.
+struct WalkCallSites<'source> {
+    text: &'source str,
+    index: Option<LineIndex<'source>>,
+    unit: SourceUnitId,
+    encoding: PositionEncoding,
+    remaining: Option<usize>,
+    targets: BTreeMap<(u64, u64), Option<SymbolId>>,
+}
+
+impl<'source> WalkCallSites<'source> {
+    fn new(file: &'source IndexedFile, encoding: PositionEncoding) -> Self {
+        Self {
+            text: file.source(),
+            index: None,
+            unit: crate::read::source_unit_id(file.path()),
+            encoding,
+            remaining: Some(TRAVERSAL_SYMBOLS_MAX),
+            targets: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, ranges: &[Range], target: Option<&SymbolId>) {
+        if ranges.is_empty() {
+            return;
+        }
+        self.remaining = self
+            .remaining
+            .and_then(|remaining| remaining.checked_sub(ranges.len()));
+        if self.remaining.is_none() {
+            return;
+        }
+        let index = self.index.get_or_insert_with(|| LineIndex::new(self.text));
+        for range in ranges {
+            let (Ok(start), Ok(end)) = (
+                index.byte_offset(self.encoding, range.start),
+                index.byte_offset(self.encoding, range.end),
+            ) else {
+                self.remaining = None;
+                return;
+            };
+            if start >= end {
+                continue;
+            }
+            // Repeated reports of the same target agree. A different or unresolved
+            // target at these bytes cannot independently verify a stored attribution.
+            self.targets
+                .entry((start as u64, end as u64))
+                .and_modify(|prior| {
+                    if prior.as_ref() != target {
+                        *prior = None;
+                    }
+                })
+                .or_insert_with(|| target.cloned());
+        }
+    }
+
+    fn corroborate(self, outgoing: &[rift_index::Edge]) -> BTreeMap<SymbolId, SourceUnitSpan> {
+        let mut corroborated = BTreeMap::new();
+        if self.remaining.is_none() || self.targets.is_empty() {
+            return corroborated;
+        }
+        let mut seen = BTreeSet::new();
+        // The walk uses the first stored edge of this kind for a neighbor.
+        for edge in outgoing.iter().take(TRAVERSAL_SYMBOLS_MAX) {
+            if edge.kind() != EdgeKind::Calls || !seen.insert(edge.to()) {
+                continue;
+            }
+            let span = edge.occurrence();
+            let (start, end) = (span.range().start(), span.range().end());
+            if self
+                .targets
+                .get(&(start, end))
+                .and_then(Option::as_ref)
+                .is_some_and(|target| target.as_str() == edge.to().as_str())
+                && span.unit().to_string() == self.unit.0
+            {
+                corroborated.insert(
+                    SymbolId(edge.to().as_str().to_owned()),
+                    SourceUnitSpan {
+                        unit: self.unit.clone(),
+                        range: TextRange { start, end },
+                    },
+                );
+            }
+        }
+        corroborated
+    }
 }
 
 mod call_evidence;
@@ -2819,6 +2946,7 @@ mod tests {
             &id("seed"),
             ["max", "maximum", "max", "join", "seed", "maximum"].map(id),
             EdgeProvider::Engine,
+            BTreeMap::new(),
         );
         let reached: Vec<_> = hops
             .iter()
@@ -2830,6 +2958,139 @@ mod tests {
             assert_eq!(hop.edge.from, id("seed"));
             assert_eq!(hop.edge.kinds, [rift_protocol::read::EdgeKind::Calls]);
         }
+    }
+
+    #[test]
+    fn outgoing_walk_attributes_only_the_exact_selected_engine_call() -> TestResult {
+        use rift_lsp::position::LineIndex;
+        use rift_protocol::read::{EdgeKind, SearchTraversal, TraversalDirection};
+
+        let directory = tempfile::tempdir()?;
+        let source =
+            "pub fn beacon() {}\npub fn caller() { beacon(); beacon(); }\npub fn decoy() {}\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = reads(directory.path())?;
+        let caller = symbol(&reads, "caller");
+        let target = symbol(&reads, "beacon");
+        let caller_id = rift_core::SymbolId::new(caller.0.clone())?;
+        let target_id = rift_core::SymbolId::new(target.0.clone())?;
+        let file = reads
+            .index()
+            .file(&ProjectPath::new("lib.rs")?)
+            .ok_or("caller file")?;
+        let store = reads.edges();
+        let selected: Vec<_> = store
+            .outgoing(&caller_id)
+            .iter()
+            .filter(|edge| edge.to() == &target_id && edge.kind() == EdgeKind::Calls)
+            .collect();
+        let [first, second] = selected.as_slice() else {
+            return Err("two distinct authored calls expected".into());
+        };
+        let line = LineIndex::new(source);
+        let mut exact = item(location(directory.path(), "lib.rs", 0, 7, 13), "beacon");
+        exact.from_ranges.push(utf16_call_range(&line, first)?);
+        let mut other = exact.clone();
+        other.from_ranges = vec![utf16_call_range(&line, second)?];
+        let mut neighbor = exact.clone();
+        neighbor.from_ranges.clear();
+        let mut ambiguous = item(location(directory.path(), "lib.rs", 2, 7, 12), "decoy");
+        ambiguous.from_ranges.clone_from(&exact.from_ranges);
+        let mut overflow = exact.clone();
+        overflow.from_ranges.resize(
+            super::TRAVERSAL_SYMBOLS_MAX + 1,
+            utf16_call_range(&line, first)?,
+        );
+        let traversal: SearchTraversal = serde_json::from_value(json!({
+            "seed": caller, "direction": TraversalDirection::Outgoing, "kinds": ["calls"], "depth": 1
+        }))?;
+        let roots = CalleeRoots::default();
+        for (label, calls, lsp) in [
+            ("same occurrence", vec![exact.clone()], true),
+            ("different occurrence", vec![other], false),
+            ("neighbor only", vec![neighbor], false),
+            ("multiple destinations", vec![exact, ambiguous], false),
+            (
+                "all locations exceed the corroboration budget",
+                vec![overflow],
+                false,
+            ),
+            ("ready empty", Vec::new(), false),
+        ] {
+            let mapped = map_callees(
+                &reads,
+                CalleeReport {
+                    calls: Ok(calls),
+                    encoding: PositionEncoding::Utf16,
+                },
+                &caller_id,
+                (&roots, &[directory.path()]),
+                EdgeProvider::Lsp,
+                Some(file),
+            )?;
+            let hops = super::callee_hops(
+                &caller,
+                mapped.callees,
+                EdgeProvider::Lsp,
+                mapped.corroborated,
+            );
+            let engine =
+                EngineReferences::from_outgoing(BTreeMap::from([(caller_id.clone(), hops)]));
+            let walk = crate::traversal::walk_traversal_with_references(
+                store,
+                &caller_id,
+                &traversal,
+                super::TRAVERSAL_SYMBOLS_MAX,
+                &engine,
+            );
+            assert_selected_call_providers(&walk, first, label, lsp);
+        }
+        let walk = crate::traversal::walk_traversal_with_references(
+            store,
+            &caller_id,
+            &traversal,
+            super::TRAVERSAL_SYMBOLS_MAX,
+            &EngineReferences::default(),
+        );
+        assert_selected_call_providers(&walk, first, "no engine", false);
+        Ok(())
+    }
+
+    fn utf16_call_range(
+        line: &rift_lsp::position::LineIndex<'_>,
+        edge: &rift_index::Edge,
+    ) -> Result<Range, Box<dyn std::error::Error>> {
+        let bytes = edge.occurrence().range();
+        Ok(Range::new(
+            line.position(PositionEncoding::Utf16, usize::try_from(bytes.start())?)?,
+            line.position(PositionEncoding::Utf16, usize::try_from(bytes.end())?)?,
+        ))
+    }
+
+    fn assert_selected_call_providers(
+        walk: &rift_index::TraversalWalk,
+        stored: &rift_index::Edge,
+        label: &str,
+        lsp: bool,
+    ) {
+        let mut paths = walk.discovered.iter().filter(|(id, _)| id == stored.to());
+        let Some((_, path)) = paths.next() else {
+            panic!("{label}: target expected")
+        };
+        assert!(paths.next().is_none(), "{label}: one target expected");
+        let [hop] = path.as_slice() else {
+            panic!("{label}: one hop expected")
+        };
+        assert_eq!(
+            hop.edge.occurrence,
+            stored.to_protocol().occurrence,
+            "{label}"
+        );
+        let mut expected = std::collections::BTreeSet::from([EdgeProvider::Static]);
+        if lsp {
+            expected.insert(EdgeProvider::Lsp);
+        }
+        assert_eq!(hop.edge.providers, expected, "{label}");
     }
 
     #[test]
@@ -3081,6 +3342,7 @@ mod tests {
             &caller,
             (&roots, &[directory.path()]),
             EdgeProvider::Lsp,
+            None,
         )?;
         assert_eq!(mapped.callees, [symbol(&reads, "beacon")]);
         assert_eq!(mapped.dropped, 2);
@@ -3141,6 +3403,7 @@ mod tests {
                 &caller,
                 (&roots, &[directory.path()]),
                 EdgeProvider::Lsp,
+                None,
             ) else {
                 panic!("an unmappable answer is refused");
             };

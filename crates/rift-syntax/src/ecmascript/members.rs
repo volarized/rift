@@ -70,15 +70,25 @@ impl<'source> Bindings<'source> {
         }
     }
 
-    fn owner(&self, function: MemberFunction<'_, '_>, source: &str) -> Option<usize> {
+    fn owner(
+        &self,
+        function: MemberFunction<'_, '_>,
+        source: &str,
+        rules: &EcmaScriptRules<'_>,
+        visits: &Visits<'_>,
+        symbols: &[SyntaxSymbol],
+    ) -> Option<usize> {
         let receiver = function.receiver;
         let prototype = function.prototype;
         let name = source.get(receiver.byte_range())?;
         if prototype && self.replaced.contains(name) {
             return None;
         }
-        self.lexical_owner(function.visited, name)
-            .map(|(_, owner)| owner)
+        let (binding, owner) = self.lexical_owner(function.visited, name)?;
+        if prototype && symbols[owner].kind == "variable" {
+            direct_constructor_initializer(rules, visits, binding, function)?;
+        }
+        Some(owner)
     }
 
     fn lexical_owner(
@@ -180,6 +190,41 @@ fn member_function<'walk, 'tree>(
         })
 }
 
+/// A prototype receiver initialized by an ordinary function earlier in the same statement list.
+fn direct_constructor_initializer(
+    rules: &EcmaScriptRules<'_>,
+    visits: &Visits<'_>,
+    binding: &StaticBinding,
+    function: MemberFunction<'_, '_>,
+) -> Option<()> {
+    let name = visits.containing(binding.name)?.syntax_element();
+    let declaration = name.parent()?;
+    let kinds = rules.kinds;
+    if declaration.kind() != "variable_declarator"
+        || kinds.child(declaration, EcmaScriptGrammarField::Name) != Some(name)
+        || declaration.has_error()
+    {
+        return None;
+    }
+    let value = kinds.child(declaration, EcmaScriptGrammarField::Value)?;
+    if value.kind() != "function_expression" {
+        return None;
+    }
+    let mut cursor = value.walk();
+    let ordinary = value
+        .children(&mut cursor)
+        .find(|child| !child.is_extra())
+        .is_some_and(|child| child.kind() == "function" && !child.is_missing());
+    let declaration = declaration.parent()?;
+    let assignment = function.assignment.parent()?;
+    (ordinary
+        && kinds.is_declaration_statement(declaration)
+        && assignment.kind() == "expression_statement"
+        && declaration.parent()? == assignment.parent()?
+        && declaration.end_byte() <= assignment.start_byte())
+    .then_some(())
+}
+
 /// The declaration `this` names at a `this.name = value` assignment: the class whose
 /// method or constructor holds it, or the function declaration that holds it. Arrow
 /// functions keep the surrounding `this`; any other function binds its own, and then the
@@ -260,13 +305,12 @@ pub(super) fn record<'tree>(
         let owner = if function.this_member {
             this_owner(function, &bindings.symbols)
         } else {
-            bindings.owner(function, source)
+            bindings.owner(function, source, rules, visits, symbols)
         };
         let Some(owner) = owner else {
             continue;
         };
-        if ((function.prototype || function.this_member)
-            && !matches!(symbols[owner].kind, "function" | "class"))
+        if (function.this_member && !matches!(symbols[owner].kind, "function" | "class"))
             || !matches!(symbols[owner].kind, "function" | "class" | "variable")
             || !declarations.unique(owner, symbols)
         {
