@@ -1635,6 +1635,17 @@ impl RequestDeadline {
             .saturating_add(evaluation);
         self.at - reserve.min(self.budget)
     }
+
+    /// The instant a graph query stops acquiring engine facts and evaluates the captured
+    /// ones.
+    ///
+    /// [`RequestDeadline::graph_walk_end`] ends the engine's own waits. Mapping an answer,
+    /// naming its package targets, and revalidating the tree follow those waits and take as
+    /// long as the workspace and the worker pool make them, so this instant holds the
+    /// evaluation share of the budget for the graph evaluation itself.
+    fn graph_acquisition_end(self) -> tokio::time::Instant {
+        self.at - self.budget / WALK_BUDGET_RESERVE_DIVISOR
+    }
 }
 
 /// Why one read of the full-text store produced no ranking.
@@ -8036,8 +8047,8 @@ done
         Ok(())
     }
 
-    /// Gives the first capture its normal answer and makes a second capture outlast the
-    /// request's 1 s budget.
+    /// Gives the first capture its normal answer and makes a second capture outlast what is
+    /// left of the request's budget of at most 2 s.
     #[cfg(unix)]
     fn delay_inventory_revalidation(server: &RiftMcp, root: std::path::PathBuf) {
         let hook = Arc::downgrade(&server.forced_capture.0);
@@ -8139,6 +8150,99 @@ done
             )));
             server.engine_pool().await.shutdown().await;
         }
+        Ok(())
+    }
+
+    /// A `sh` engine serving call hierarchy over `lib.rs` that reads ready at once: the
+    /// declaration at any position is prepared as `caller` and calls nothing.
+    #[cfg(unix)]
+    const READY_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"$/cancelRequest"'*) ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"caller\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":29}},\"selectionRange\":{\"start\":{\"line\":1,\"character\":7},\"end\":{\"line\":1,\"character\":13}}}]}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+    /// A graph query whose tree check outlasts the budget after its engine answered still
+    /// answers inside it, from the captured calls: the engine's facts cannot be served
+    /// unchecked, and the request does not wait for that check up to its own deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inventory_revalidation_past_the_budget_answers_the_captured_calls() -> TestResult {
+        use rift_protocol::query::{QueryAnswer, QueryParams, QueryReadResult, RdfTerm};
+        use rift_protocol::read::ReadWarning;
+
+        let engine = tempfile::tempdir()?;
+        let script = engine.path().join("engine.sh");
+        fs::write(&script, READY_CALLS_ENGINE)?;
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\npub fn caller() { beacon(); }\n",
+        )?;
+        captured_rust_traversal_metadata(directory.path())?;
+        super::hermetic_workspace(
+            directory.path(),
+            &format!(
+                concat!(
+                    "[server]\nreadiness_timeout = '2s'\n",
+                    "[languages.rust.lsp]\nsettle_delay = '10ms'\ncommand = ['sh', {}]\n",
+                ),
+                serde_json::to_string(&script)?,
+            ),
+        )?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        let published = Arc::clone(&server.published.read().await.current);
+        let from = captured_traversal_seed(&published.reads, "caller")?;
+        let to = captured_traversal_seed(&published.reads, "beacon")?;
+        delay_inventory_revalidation(server, directory.path().canonicalize()?);
+        let result = server
+            .graph_query(QueryParams {
+                query: "SELECT ?s ?t { ?s :calls ?t }".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|failure| format!("the query must answer inside its budget: {failure:?}"))?
+            .0
+            .result;
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!("unexpected graph result: {result:?}").into());
+        };
+        assert!(
+            matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if bindings.len() == 1
+                    && bindings[0].get("s") == Some(&RdfTerm::Iri { value: from })
+                    && bindings[0].get("t") == Some(&RdfTerm::Iri { value: to })),
+            "{:?}",
+            result.answer
+        );
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::EngineAnalysisUnavailable { language: Some(_), detail }
+                    if detail.contains("readiness_timeout")
+            )),
+            "{:?}",
+            result.warnings
+        );
+        server.engine_pool().await.shutdown().await;
         Ok(())
     }
 
