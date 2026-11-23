@@ -78,6 +78,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKi
 mod commonjs;
 mod members;
 pub(crate) mod recovery;
+mod variance;
 
 use tree_sitter::{Node, Parser};
 
@@ -2040,6 +2041,11 @@ pub(crate) fn analyze_included(
         facts.set_member_aliases(aliases);
     }
     symbols.sort_by_key(|symbol| symbol.range.start);
+    let variance_errors_only = language.name == "typescript"
+        && ranges.is_empty()
+        && !recovered
+        && tree.root_node().has_error()
+        && variance::accounts_for_parse_errors(&mut parser, tree.root_node(), source.text, limits);
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
@@ -2049,6 +2055,7 @@ pub(crate) fn analyze_included(
         recovered || tree.root_node().has_error(),
     )
     .with_source_witness(source.text)
+    .with_variance_errors_only(variance_errors_only)
     .with_export_bindings(export_bindings)
     .with_static_facts(static_facts)
     .with_syntax_limits(limits))
