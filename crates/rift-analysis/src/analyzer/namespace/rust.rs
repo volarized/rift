@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rift_core::{FileDigest, ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
+use rift_protocol::read::Language;
 use rift_syntax::{ShippedLanguage, SyntaxFacts, SyntaxLimits};
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
@@ -115,37 +116,16 @@ pub(super) fn prepare(
             path.clone(),
             super::retain_valid_declarations(input, file, declared),
         );
-        for (child, local, child_scope) in children {
-            let mut child_namespace = namespace.clone();
-            child_namespace.extend(local);
-            if SymbolIdentity::new(
-                input.owner().clone(),
-                file.syntax.language().clone(),
-                child_namespace.clone(),
-            )
-            .is_err()
-            {
-                continue;
-            }
-            if let Some(previous) = assigned.get(&child) {
-                if previous != &child_namespace {
-                    return super::PreparedNamespace::default();
-                }
-                continue;
-            }
-            assigned.insert(child.clone(), child_namespace.clone());
-            let child_directory = child
-                .strip_suffix("/mod.rs")
-                .or_else(|| child.strip_suffix(".rs"))
-                .unwrap_or(&child)
-                .to_owned();
-            pending.push_back((
-                child,
-                child_namespace,
-                child_directory,
-                child_scope,
-                library,
-            ));
+        if !queue_module_children(
+            input.owner(),
+            file.syntax.language(),
+            &namespace,
+            library,
+            children,
+            &mut assigned,
+            &mut pending,
+        ) {
+            return super::PreparedNamespace::default();
         }
     }
     let mut prepared = super::PreparedNamespace {
@@ -157,6 +137,45 @@ pub(super) fn prepare(
     local_exports(input, selected, &requested, &admitted, &mut prepared);
     retain_root_anchor(input, root, &inventory, &assigned, &mut prepared);
     prepared
+}
+
+/// Queues children with valid namespaces. A competing assignment refuses the inventory.
+fn queue_module_children(
+    owner: &SymbolOwner,
+    language: &Language,
+    parent: &[String],
+    library: bool,
+    children: Vec<(String, Vec<String>, macros::Scope)>,
+    assigned: &mut BTreeMap<String, Vec<String>>,
+    pending: &mut Pending,
+) -> bool {
+    for (child, local, child_scope) in children {
+        let mut child_namespace = parent.to_vec();
+        child_namespace.extend(local);
+        if SymbolIdentity::new(owner.clone(), language.clone(), child_namespace.clone()).is_err() {
+            continue;
+        }
+        if let Some(previous) = assigned.get(&child) {
+            if previous != &child_namespace {
+                return false;
+            }
+            continue;
+        }
+        assigned.insert(child.clone(), child_namespace.clone());
+        let child_directory = child
+            .strip_suffix("/mod.rs")
+            .or_else(|| child.strip_suffix(".rs"))
+            .unwrap_or(&child)
+            .to_owned();
+        pending.push_back((
+            child,
+            child_namespace,
+            child_directory,
+            child_scope,
+            library,
+        ));
+    }
+    true
 }
 
 /// Retains the accepted Cargo root namespace for package imports.
