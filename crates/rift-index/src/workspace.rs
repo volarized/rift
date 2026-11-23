@@ -14182,6 +14182,7 @@ mod tests {
             &SymbolOwner::NamedLocal {
                 name: "cloud".to_owned(),
             },
+            crate::documentation::AttachmentSelection::Scan,
         );
         assert!(foreign.is_empty());
     }
