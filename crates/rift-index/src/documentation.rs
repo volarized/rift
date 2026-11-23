@@ -74,6 +74,7 @@ pub(crate) struct AcceptedDeclarations<'source> {
     attachment_sources: Option<Vec<AttachmentSource<'source>>>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct DeclarationInputs<'facts, 'source> {
     facts: &'facts [DeclarationFacts],
     attachment_sources: Option<&'facts [AttachmentSource<'source>]>,
