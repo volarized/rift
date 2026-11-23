@@ -47,6 +47,90 @@ fn only_readiness_refusals_skip_live_inventory_validation() -> Result<(), RiftEr
     Ok(())
 }
 
+#[tokio::test]
+async fn a_seeded_readiness_only_walk_keeps_its_accepted_capture()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use rift_search::sparql::GraphQuery;
+
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='seeded_inventory'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+    )?;
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn target() {}\npub fn caller() { target(); }\n",
+    )?;
+    crate::server::hermetic_workspace(
+        root,
+        "[global]\nenabled=false\n[languages.rust.lsp]\ncommand=['unlaunched-test-engine']\n",
+    )?;
+    let server = RiftMcp::build_settled(root, rift_index::WorkspaceIndexLimits::default()).await?;
+    let published = Arc::clone(&server.published.read().await.current);
+    let seed = published
+        .reads
+        .get_symbol(&serde_json::from_value(
+            serde_json::json!({"name":"caller","scope":"local"}),
+        )?)?
+        .hits
+        .into_iter()
+        .find(|hit| hit.symbol.name == "caller")
+        .and_then(|hit| hit.symbol.id)
+        .ok_or("captured caller")?;
+    // The graph reserve consumes the whole engine admission window, independently of the
+    // test host's scheduling. Request-time publication acceptance has already run.
+    let budget = Duration::from_secs(1);
+    let deadline = RequestDeadline::starting(budget);
+    let resolved = ResolvedWorkspace::current(published, budget);
+    let limits = GraphLimits::default();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&captures);
+    server.force_capture(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Err(coverage_failure())
+    });
+
+    let query = GraphQuery::parse(
+        &format!("SELECT ?t {{ <{}> :calls ?t }}", seed.as_str()),
+        &limits,
+    )?;
+    let selected = query.adjacency_selection().ok_or("seeded calls")?;
+    let acquired = server
+        .acquire_adjacency(&resolved, &selected, limits, deadline)
+        .await?
+        .map_err(|failure| format!("{failure:?}"))?;
+    assert!(
+        acquired
+            .local_edges
+            .iter()
+            .any(|(from, kind, _)| { from == &seed && *kind == SymbolRelation::Calls })
+    );
+    assert!(acquired.warnings.iter().any(|warning| matches!(
+        warning, ReadWarning::EngineAnalysisUnavailable { detail, .. }
+            if detail.contains("readiness_timeout")
+    )));
+    assert_eq!(captures.load(Ordering::Relaxed), 0);
+
+    let query = GraphQuery::parse(
+        &format!("SELECT ?t {{ <{}> :calls/:reads ?t }}", seed.as_str()),
+        &limits,
+    )?;
+    let selected = query.adjacency_selection().ok_or("mixed local walk")?;
+    let result = server
+        .acquire_adjacency(&resolved, &selected, limits, deadline)
+        .await;
+    assert_eq!(
+        result.err().as_ref().map(RiftError::slug),
+        Some(coverage_failure().slug())
+    );
+    assert_eq!(captures.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
 fn references() -> (SymbolId, Vec<QueryOccurrence>) {
     let target = SymbolId("rift://symbol/local/rust/test/target".to_owned());
     let caller = SymbolId("rift://symbol/local/rust/test/caller".to_owned());

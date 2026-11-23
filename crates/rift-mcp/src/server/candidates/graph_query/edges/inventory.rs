@@ -47,6 +47,8 @@ pub(super) struct InventoryRead {
     pub(super) warnings: Vec<ReadWarning>,
     pub(super) partial: bool,
     pub(super) records: usize,
+    /// Every engine observation was a readiness refusal and the capture supplied all facts.
+    pub(super) captured_readiness_only: bool,
     missing: MissingKinds,
     reference_pairs: BTreeSet<(SymbolId, SymbolId)>,
 }
@@ -395,12 +397,12 @@ impl RiftMcp {
         if let Some(read) = cache.get(inventory.facts, tokio::time::Instant::now()) {
             return Ok(read);
         }
-        let (read, captured_only) = self
+        let read = self
             .read_engine_inventory(resolved, engines, inventory, end)
             .await?;
         // The request already accepted this publication. Every engine file refused
         // readiness, so there are no live facts or new source positions to validate.
-        if captured_only {
+        if read.captured_readiness_only {
             return Ok(Arc::new(read));
         }
         if !self
@@ -421,7 +423,7 @@ impl RiftMcp {
         engines: &Arc<rift_server::EnginePool>,
         inventory: &InventorySelection<'_>,
         end: tokio::time::Instant,
-    ) -> Result<(InventoryRead, bool), RiftError> {
+    ) -> Result<InventoryRead, RiftError> {
         let reads = Arc::clone(&resolved.published.reads);
         let seeds = inventory.seeds.to_vec();
         let capture = Arc::clone(&reads);
@@ -497,8 +499,8 @@ impl RiftMcp {
         while let Some(answer) = requests.next().await {
             coverage.admit(&mut read, answer)?;
         }
-        let captured_only = coverage.finish(&mut read);
-        if !captured_only {
+        read.captured_readiness_only = coverage.finish(&mut read);
+        if !read.captured_readiness_only {
             self.name_inventory_targets(
                 resolved,
                 engines,
@@ -510,7 +512,7 @@ impl RiftMcp {
             .await?;
         }
         read.report_missing();
-        Ok((read, captured_only))
+        Ok(read)
     }
 
     async fn name_inventory_targets(
@@ -646,7 +648,7 @@ impl RiftMcp {
                     end,
                 )
                 .await
-                .map(|(read, _)| Arc::new(read));
+                .map(Arc::new);
         }
         let capture = Arc::clone(&resolved.published.reads);
         let seeds = self

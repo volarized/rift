@@ -1103,6 +1103,33 @@ mod tests {
         }
     }
 
+    /// One call the batch processor made to an [`ObservedExporter`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ExporterStep {
+        Resource,
+        Export,
+    }
+
+    /// An exporter whose export never finishes and which reports each call it receives.
+    #[derive(Debug)]
+    struct ObservedExporter {
+        steps: std::sync::mpsc::Sender<ExporterStep>,
+    }
+
+    impl SpanExporter for ObservedExporter {
+        fn export(
+            &self,
+            _batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            let _ = self.steps.send(ExporterStep::Export);
+            std::future::pending()
+        }
+
+        fn set_resource(&mut self, _resource: &opentelemetry_sdk::Resource) {
+            let _ = self.steps.send(ExporterStep::Resource);
+        }
+    }
+
     #[derive(Clone, Debug, Default)]
     struct RecordingLogExporter {
         bodies: Arc<Mutex<Vec<AnyValue>>>,
@@ -1268,13 +1295,21 @@ mod tests {
         let runtime = runtime();
         let _entered = runtime.enter();
         let batch = BatchConfigBuilder::default().with_max_queue_size(1).build();
-        let provider = tracer_provider(StalledExporter, batch, resource());
+        let (steps, exporter_steps) = std::sync::mpsc::channel();
+        let provider = tracer_provider(ObservedExporter { steps }, batch, resource());
         let stderr = Reports::default();
         let filter = crate::runtime::stderr_filter(EnvFilter::new("rift=info"));
         let subscriber = tracing_subscriber::registry().with(stderr.clone().with_filter(filter));
         tracing::subscriber::with_default(subscriber, || {
             let tracer = provider.tracer("queue");
-            for _ in 0..SPANS {
+            // The provider hands the processor its resource through the span queue, so the
+            // queue has room for a span once the export task has read the resource.
+            assert_eq!(exporter_steps.recv(), Ok(ExporterStep::Resource));
+            tracer.start("queued").end();
+            // The export holds the first span and never finishes, so the queue keeps the
+            // second span and refuses every later one.
+            assert_eq!(exporter_steps.recv(), Ok(ExporterStep::Export));
+            for _ in 1..SPANS {
                 tracer.start("queued").end();
             }
             // The full queue refuses the shutdown request too; the total is reported first.
@@ -1282,17 +1317,11 @@ mod tests {
         });
         assert_eq!(stderr.count("BatchSpanProcessor.SpanDroppingStarted"), 1);
         assert_eq!(stderr.count("BatchSpanProcessor.Shutdown"), 1);
-        // The export task takes at most one span off the queue before the stalled export
-        // holds it, and the queue keeps at most one more. The provider hands the processor
-        // its resource through that same queue when it is built, so a queue the export task
-        // has not polled yet still holds the resource and refuses every span.
-        let dropped = stderr
-            .dropped_spans()
-            .expect("the shutdown reports its dropped total");
         let spans = u64::try_from(SPANS).expect("the span count fits in u64");
-        assert!(
-            (spans - 2..=spans).contains(&dropped),
-            "a queue of one behind a stalled export keeps at most two spans: dropped={dropped}, spans={spans}"
+        assert_eq!(
+            stderr.dropped_spans(),
+            Some(spans - 2),
+            "a queue of one behind a stalled export keeps two spans"
         );
     }
 

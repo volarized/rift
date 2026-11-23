@@ -589,6 +589,7 @@ impl RiftMcp {
             budget.record();
         }
         if walk.local.is_some()
+            && (!walk.captured_readiness_only || walk.reached.is_some())
             && !self
                 .engine_tree_matches(&resolved.published)
                 .await
@@ -626,6 +627,8 @@ struct AdjacencyWalk<'request> {
     )>,
     neighbors: BTreeMap<(SymbolId, AdjacencyStep), Vec<SymbolId>>,
     local_reverse: Option<BTreeMap<SymbolId, BTreeSet<SymbolId>>>,
+    /// Each local step has proved it used only its accepted capture after a readiness refusal.
+    captured_readiness_only: bool,
     use_installed: Option<bool>,
     /// Package analyses this walk's installed targets were placed in, one per source set.
     installed_analyses: InstalledAnalyses,
@@ -668,6 +671,7 @@ impl<'request> AdjacencyWalk<'request> {
             local: None,
             neighbors: BTreeMap::new(),
             local_reverse: None,
+            captured_readiness_only: true,
             use_installed: None,
             installed_analyses: InstalledAnalyses::default(),
         }
@@ -701,6 +705,7 @@ impl<'request> AdjacencyWalk<'request> {
     ) -> Result<(), RiftError> {
         self.ensure_local().await?;
         claim_request(&mut self.remaining, &mut self.reached)?;
+        self.captured_readiness_only &= self.step.kind == EdgeKind::Calls;
         let direction = self.step.direction;
         match (direction, self.step.kind) {
             (TraversalDirection::Incoming, EdgeKind::References) => {
@@ -909,6 +914,7 @@ impl<'request> AdjacencyWalk<'request> {
         let direction = self.step.direction;
         let deadline = self.deadline.graph_walk_end(self.resolved.capture_elapsed);
         let answer = if let Some(target) = self.acquired.installed.get(seed) {
+            self.captured_readiness_only = false;
             if direction != TraversalDirection::Outgoing {
                 return Err(coverage_failure());
             }
@@ -938,11 +944,13 @@ impl<'request> AdjacencyWalk<'request> {
                 deadline,
             ))
             .await?;
+            self.captured_readiness_only &= inventory.captured_readiness_only;
             self.acquired
                 .warnings
                 .extend(inventory.warnings.iter().cloned());
             Ok(inventory.calls.get(seed).cloned().unwrap_or_default())
         } else {
+            self.captured_readiness_only = false;
             Box::pin(rift_server::graph_calls(
                 reads, engines, roots, seed, direction, deadline,
             ))
@@ -1102,6 +1110,7 @@ impl<'request> AdjacencyWalk<'request> {
             return Ok(());
         }
         self.ensure_local().await?;
+        self.captured_readiness_only = false;
         let reads = &self.resolved.published.reads;
         let capture = Arc::clone(reads);
         let maximum = usize::try_from(self.remaining.requests_max).unwrap_or(usize::MAX);

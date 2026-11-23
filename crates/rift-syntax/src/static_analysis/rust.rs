@@ -189,19 +189,13 @@ impl Kinds {
             }
         } else if id == self.use_declaration {
             self.record_import(visited, facts, budget)?;
-        } else if id == self.self_parameter {
-            self.record_receiver(visited, facts)?;
-        } else if id == self.parameter
-            && syntax_element
-                .child_by_field_id(self.pattern)
-                .is_some_and(|pattern| pattern.kind_id() == self.self_value)
+        } else if id == self.self_parameter
+            || (id == self.parameter
+                && syntax_element
+                    .child_by_field_id(self.pattern)
+                    .is_some_and(|pattern| pattern.kind_id() == self.self_value))
         {
-            if syntax_element
-                .child_by_field_id(self.value_type)
-                .is_some_and(|value_type| self.self_receiver_type(value_type, source))
-            {
-                self.record_receiver(visited, facts)?;
-            }
+            self.record_receiver(visited, source, facts)?;
         } else if id == self.let_declaration || id == self.parameter {
             self.record_value(visited, facts)?;
         } else if id == self.identifier
@@ -475,6 +469,7 @@ impl Kinds {
     fn record_receiver(
         &self,
         visited: Visited<'_, '_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let element = visited.syntax_element();
@@ -497,6 +492,16 @@ impl Kinds {
         else {
             return Ok(());
         };
+        let reference_implementation = value_type.kind_id() == self.reference_type;
+        if element.kind_id() == self.parameter
+            && !element
+                .child_by_field_id(self.value_type)
+                .is_some_and(|receiver| {
+                    self.self_receiver_type(receiver, source, reference_implementation)
+                })
+        {
+            return Ok(());
+        }
         let mut cursor = element.walk();
         if let Some(name) = element
             .named_children(&mut cursor)
@@ -516,8 +521,14 @@ impl Kinds {
 
     /// Whether a typed `self` parameter's type is a receiver of the implementation type:
     /// `Self`, a reference to a receiver, or one of the standard receiver wrappers `Box`,
-    /// `Rc`, `Arc` and `Pin` around one. Any other type is not the implementation type.
-    fn self_receiver_type(&self, mut element: Node<'_>, source: &str) -> bool {
+    /// `Rc`, `Arc` and `Pin` around one. Boxed and pinned receivers of reference
+    /// implementations need the wrapper itself to resolve their members.
+    fn self_receiver_type(
+        &self,
+        mut element: Node<'_>,
+        source: &str,
+        reference_implementation: bool,
+    ) -> bool {
         // Each step removes one wrapper from the bounded syntax tree.
         loop {
             if element.kind_id() == self.reference_type {
@@ -540,7 +551,9 @@ impl Kinds {
                 return false;
             };
             let name = name.rsplit("::").next().unwrap_or(name).trim();
-            if !["Box", "Rc", "Arc", "Pin"].contains(&name) {
+            if !["Box", "Rc", "Arc", "Pin"].contains(&name)
+                || (reference_implementation && matches!(name, "Box" | "Pin"))
+            {
                 return false;
             }
             let Some(arguments) = element.child_by_field_id(self.type_arguments) else {

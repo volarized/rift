@@ -1,5 +1,6 @@
 //! Resolves Rust paths admitted by the captured crate and module inventory.
 
+mod deref;
 mod references;
 
 // Exhausting initializer lookup depth leaves the authored site unresolved.
@@ -26,7 +27,8 @@ pub(super) struct Namespaces<'source> {
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
     unavailable: BTreeSet<(&'source str, ByteRange)>,
-    return_owners: BTreeMap<(&'source str, ByteRange), Target<'source>>,
+    return_owners: BTreeMap<(&'source str, ByteRange), CallableReturn<'source>>,
+    local_deref: BTreeMap<deref::WrapperKey<'source>, Option<deref::Implementation<'source>>>,
     referents: BTreeMap<(&'source str, ByteRange), (Target<'source>, Target<'source>)>,
     initializers: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     conditional_modules: BTreeSet<Vec<String>>,
@@ -59,6 +61,12 @@ struct Method<'source> {
 enum Namespace {
     Type,
     Value,
+}
+
+#[derive(Clone, Copy)]
+struct CallableReturn<'source> {
+    owner: Target<'source>,
+    written: ByteRange,
 }
 
 impl<'source> Namespaces<'source> {
@@ -312,7 +320,13 @@ impl<'source> Namespaces<'source> {
                         .filter(|target| target.symbol.kind == "trait" && self.available(*target))
                 });
                 if let Some(owner) = owner {
-                    self.return_owners.insert((path, name), owner);
+                    self.return_owners.insert(
+                        (path, name),
+                        CallableReturn {
+                            owner,
+                            written: result,
+                        },
+                    );
                 }
             }
         }
@@ -330,9 +344,13 @@ impl<'source> Namespaces<'source> {
             .iter()
             .filter(|(_, file)| file.document.facts.language().name == "rust")
         {
+            let deref_traits = deref::trait_headers(file, work)?;
             for implementation in file.facts.inherent_impls() {
                 if !work.charge() {
                     return None;
+                }
+                if !deref_traits.is_empty() {
+                    self.index_local_deref(file, implementation, &deref_traits, work);
                 }
                 let Some(owner) = file
                     .target_at(implementation.type_path)
