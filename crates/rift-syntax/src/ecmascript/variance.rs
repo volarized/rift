@@ -40,9 +40,12 @@ pub(super) fn accounts_for_parse_errors(
     let mut cursor = root.walk();
     while let Some((node, depth)) = pending.pop() {
         visited += 1;
+        let Ok(children) = usize::try_from(node.child_count()) else {
+            return false;
+        };
         if node.is_missing()
             || depth > limits.syntax_depth_max()
-            || visited + pending.len() + node.child_count() > limits.syntax_elements_max()
+            || visited + pending.len() + children > limits.syntax_elements_max()
         {
             return false;
         }
