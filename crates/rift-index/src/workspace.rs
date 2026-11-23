@@ -1922,9 +1922,53 @@ impl WorkspaceIndexPreparation {
         visibility: &SourceVisibility,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool, RiftError> {
+        Ok(self.matching_discovery(visibility, cancelled)?.is_some())
+    }
+
+    /// Verifies the complete preparation's selected paths and retains its discovery inputs.
+    /// The first request still checks current root, policy inputs and every selected path.
+    ///
+    /// # Errors
+    /// Returns the ordinary discovery or cancellation refusal.
+    pub fn retain_complete_capture_selection(
+        &self,
+        visibility: &SourceVisibility,
+        last: &mut LastCapture,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, RiftError> {
+        let Some(current) = self.matching_discovery(visibility, cancelled)? else {
+            return Ok(false);
+        };
+        if self.total() == Some(self.prepared())
+            && last.selection_for(self.limits).is_some()
+            && let Some(boundary) = last.boundary()
+            && let Some(inputs) = current.inputs
+            && let Some(selection) = &mut last.selection
+            && selection.root == self.root
+            && selection
+                .source
+                .iter()
+                .eq(current.source.iter().map(|(path, _)| path))
+            && selection
+                .other
+                .iter()
+                .eq(current.text.iter().chain(&current.lockfiles))
+        {
+            let selection = Arc::make_mut(selection);
+            selection.inputs = Some(inputs);
+            selection.boundary = Some(boundary);
+        }
+        Ok(true)
+    }
+
+    fn matching_discovery(
+        &self,
+        visibility: &SourceVisibility,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<DiscoveredPaths>, RiftError> {
         check_cancelled(cancelled)?;
         let Some(original) = &self.discovered else {
-            return Ok(false);
+            return Ok(None);
         };
         let current = discover_cancellable(
             &self.root,
@@ -1933,7 +1977,7 @@ impl WorkspaceIndexPreparation {
             &self.language,
             cancelled,
         )?;
-        Ok(original
+        let matches = original
             .source
             .iter()
             .map(|(path, provider)| (path, provider.language()))
@@ -1942,7 +1986,8 @@ impl WorkspaceIndexPreparation {
                 .iter()
                 .map(|(path, provider)| (path, provider.language())))
             && original.text == current.text
-            && original.lockfiles == current.lockfiles)
+            && original.lockfiles == current.lockfiles;
+        Ok(matches.then_some(current))
     }
 
     /// Project-relative paths discovered under this preparation's visibility policy, split
@@ -14966,6 +15011,132 @@ mod tests {
                 .expect("new limits request discovery")
                 .is_none()
         );
+    }
+
+    fn completed_capture_seed(root: &Path) -> (WorkspaceIndex, WorkspaceDigests, LastCapture) {
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let cancelled = || false;
+        let mut preparation = WorkspaceIndexPreparation::new(
+            root,
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )
+        .expect("preparation");
+        let total = preparation
+            .discover(&visibility, &cancelled)
+            .expect("discovery");
+        let (_, mut partial) = preparation
+            .capture_prepared_paths(&LastCapture::default(), &cancelled)
+            .expect("partial capture");
+        assert!(
+            preparation
+                .retain_complete_capture_selection(&visibility, &mut partial, &cancelled)
+                .expect("match partial discovery")
+        );
+        assert!(
+            partial
+                .recapture_selected_cancellable(root, limits, &cancelled)
+                .expect("partial selection check")
+                .is_none()
+        );
+        let index = preparation
+            .advance_to(total, &cancelled)
+            .expect("complete index");
+        let (verified, mut seeded) = preparation
+            .capture_prepared_paths(&LastCapture::default(), &cancelled)
+            .expect("final physical capture");
+        assert_eq!(verified, index.digests());
+        let cancelled_error = preparation
+            .retain_complete_capture_selection(&visibility, &mut seeded, &|| true)
+            .expect_err("cancelled selection verification");
+        assert_eq!(
+            cancelled_error.slug(),
+            errors::index::workspace_cancelled::SLUG
+        );
+        assert!(
+            seeded
+                .recapture_selected_cancellable(root, limits, &cancelled)
+                .expect("unseeded selection check")
+                .is_none()
+        );
+        assert!(
+            preparation
+                .retain_complete_capture_selection(&visibility, &mut seeded, &cancelled)
+                .expect("same complete discovery")
+        );
+        (index, verified, seeded)
+    }
+
+    #[test]
+    fn completed_preparation_seeds_the_first_capture_and_detects_silent_changes() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let source = root.join("index.ts");
+        let ignore = root.join(".gitignore");
+        let delayed = root.join("candidate.ts");
+        let original = "export { leaf } from './candidate.js';\n";
+        fs::write(&source, original).expect("initial source");
+        fs::write(&ignore, "").expect("initial ignore policy");
+        advance_capture_clock(&root, &[root.clone(), source.clone(), ignore.clone()]);
+        let (index, verified, seeded) = completed_capture_seed(&root);
+        let limits = WorkspaceIndexLimits::default();
+        let cancelled = || false;
+        if selection_needs_discovery(&root, &seeded) {
+            return;
+        }
+        let (same, unchanged) = seeded
+            .recapture_selected_cancellable(&root, limits, &cancelled)
+            .expect("first request metadata")
+            .expect("builder selection retained");
+        assert_eq!(same, verified);
+        assert_eq!(unchanged.read_paths(), 0);
+
+        fs::write(&source, original.replace("leaf", "twig")).expect("silent existing-file edit");
+        let (changed, changed_capture) = seeded
+            .recapture_selected_cancellable(&root, limits, &cancelled)
+            .expect("changed capture")
+            .expect("file edit keeps selection");
+        assert_eq!(changed_capture.read_paths(), 1);
+        assert_eq!(changed, captured_after(&root, &LastCapture::default()).0);
+        fs::write(&source, original).expect("restore source bytes");
+        let (restored, _) = seeded
+            .recapture_selected_cancellable(&root, limits, &cancelled)
+            .expect("restored capture")
+            .expect("restore keeps selection");
+        assert_eq!(restored, verified);
+        assert_eq!(index.digests(), verified, "held index stays exact");
+
+        fs::write(&delayed, "export function leaf() {}\n")
+            .expect("silent earlier module candidate");
+        assert!(
+            seeded
+                .recapture_selected_cancellable(&root, limits, &cancelled)
+                .expect("recheck directory metadata")
+                .is_none()
+        );
+        let (added, rediscovered) = captured_after(&root, &seeded);
+        assert_eq!(added, captured_after(&root, &LastCapture::default()).0);
+        assert!(
+            added
+                .get(&ProjectPath::new("candidate.ts").expect("path"))
+                .is_some()
+        );
+        fs::write(&ignore, "candidate.ts\n").expect("silent policy edit");
+        assert!(
+            rediscovered
+                .recapture_selected_cancellable(&root, limits, &cancelled)
+                .expect("recheck ignore metadata")
+                .is_none()
+        );
+        assert_eq!(
+            captured_after(&root, &rediscovered).0,
+            captured_after(&root, &LastCapture::default()).0
+        );
+        fs::remove_file(&delayed).expect("remove late candidate");
+        fs::write(&ignore, "").expect("restore ignore input");
+        assert_eq!(captured_after(&root, &LastCapture::default()).0, verified);
     }
 
     #[test]
