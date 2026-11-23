@@ -1,0 +1,40 @@
+{
+  "bun_pin": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "corpus_paths_sha256": "8e7bf05a11d7feaadcdb3d02232e8306c44aebbe24d2cd575e72769c50abb9ec",
+  "documentation_revisions": {
+    "A": "9467a70c",
+    "B": "6f712891"
+  },
+  "arms": {
+    "A": {
+      "run": 45219756193,
+      "job": 137850578101,
+      "artifact": 14840915300,
+      "pr": 946,
+      "base": "9c4d6a0a7fecd917a54c34ca2638d9acfc75a7b5",
+      "head": "590cafe1c81b5616e172e94df15abc8a14ce2ba3",
+      "synth": "9a72479dcb25128bb39fa86684a35b2feabcf9ec",
+      "tree": "3761ead1dd279c7aa706a48450f95bdbbe4cbb2d",
+      "sha256": {
+        "outer.zip": "f9850c932cd2e6f35731d30d24320c75398aa48824f261ab95a70508c4aa433e",
+        "integration-cli.tar.zst": "17dde73b100668888d7b606f6071d500a7c6d781ad6f40edbeb204bdc6b078fd",
+        "rift": "a663b41b87ef9fe1e7842b1ae969eac5e71fd07082fcaa9636c643a903136614"
+      }
+    },
+    "B": {
+      "run": 45224334526,
+      "job": 137866668727,
+      "artifact": 14841644860,
+      "pr": 947,
+      "base": "590cafe1c81b5616e172e94df15abc8a14ce2ba3",
+      "head": "9317a9238031dfc17f571e875448ba622e2adbd2",
+      "synth": "00b645ec2f684427f4fb85b5a0c25695e3c1c9f7",
+      "tree": "527e62d0261c70ed3e11691434599f39cf8899cf",
+      "sha256": {
+        "outer.zip": "d8e11ad56838186bff4123256483ac4bf6f4a6d808eeaa611905b04e4275d666",
+        "integration-cli.tar.zst": "64c567b6cd81d54853194b1a210952c7fb222b86b961941a1d1e935b53becd33",
+        "rift": "00cfe996ee501c74660bbdbf192c6f57842f0f6df09ca35c55aad1038eb5e83a"
+      }
+    }
+  }
+}
