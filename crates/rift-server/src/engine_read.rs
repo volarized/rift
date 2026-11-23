@@ -1480,6 +1480,7 @@ fn map_graph_calls(
         complete: true,
         ..GraphCalls::default()
     };
+    let seed = SymbolId(identity.as_str().to_owned());
     let mut locations = 0usize;
     let captured = held
         .unit
@@ -1487,6 +1488,11 @@ fn map_graph_calls(
         .map(ProjectPath::new)
         .transpose()?
         .and_then(|path| reads.index().file(&path));
+    let outgoing = if held.direction == TraversalDirection::Outgoing {
+        captured.map(|file| (file, identity))
+    } else {
+        None
+    };
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
         let at = NamedCallee {
@@ -1497,14 +1503,18 @@ fn map_graph_calls(
             encoding: report.encoding,
         };
         let neighbor = callee_file(roots, &held.trees, identity, at)?;
-        let (source, unit) = match (&neighbor, held.direction) {
-            (_, TraversalDirection::Outgoing) => (held.source, held.unit.clone()),
+        let (source, unit, incoming_file) = match (&neighbor, held.direction) {
+            (_, TraversalDirection::Outgoing) => (held.source, held.unit.clone(), None),
             (CalleeFile::Project(path), TraversalDirection::Incoming) => {
                 let Some(file) = reads.index().file(path) else {
                     result.complete = false;
                     continue;
                 };
-                (file.source(), crate::read::source_unit_id(file.path()))
+                (
+                    file.source(),
+                    crate::read::source_unit_id(file.path()),
+                    Some(file),
+                )
             }
             _ => {
                 result.complete = false;
@@ -1512,69 +1522,185 @@ fn map_graph_calls(
             }
         };
         let index = LineIndex::new(source);
-        let mut occurrences = Vec::new();
         let located = !call.from_ranges.is_empty();
-        for range in call.from_ranges {
-            locations = locations
-                .checked_add(1)
-                .filter(|count| *count <= TRAVERSAL_SYMBOLS_MAX)
-                .ok_or_else(unavailable)?;
-            let start = index.byte_offset(report.encoding, range.start)?;
-            let end = index.byte_offset(report.encoding, range.end)?;
-            if source.get(start..end).is_none() {
-                return Err(unavailable());
-            }
-            if held.direction == TraversalDirection::Outgoing
-                && let Some(file) = captured
-                && edge_enclosing_symbol(reads, file, start as u64, end as u64)?
-                    .is_some_and(|caller| caller.as_str() != identity.as_str())
-            {
-                continue;
-            }
-            occurrences.push(SourceUnitSpan {
-                unit: unit.clone(),
-                range: TextRange {
-                    start: start as u64,
-                    end: end as u64,
-                },
-            });
-        }
+        let occurrences = graph_call_site_spans(
+            reads,
+            (source, &unit, &index),
+            (report.encoding, call.from_ranges),
+            outgoing,
+            &mut locations,
+        )?;
         if located && occurrences.is_empty() {
             continue;
         }
-        match neighbor {
-            CalleeFile::Project(path) => {
-                let target = match held.direction {
-                    TraversalDirection::Outgoing => project_definition(
-                        reads,
-                        &path,
-                        (item.selection_range, report.encoding),
-                        false,
-                    )?,
-                    TraversalDirection::Incoming => project_declaration(
-                        reads,
-                        &path,
-                        (item.selection_range, report.encoding),
-                        "graph calls",
-                    )?,
-                };
-                if let Some(target) = target {
-                    result.push_local(
-                        &SymbolId(identity.as_str().to_owned()),
-                        target,
-                        occurrences,
-                        held.direction,
-                        held.provider,
-                    );
-                } else {
-                    result.complete = false;
-                }
+        if let Some(file) = incoming_file
+            && located
+        {
+            let range = item.selection_range;
+            let start = index.byte_offset(report.encoding, range.start)? as u64;
+            let end = index.byte_offset(report.encoding, range.end)? as u64;
+            if start > end {
+                return Err(unavailable());
             }
-            CalleeFile::Package(target) => result.packages.push((target, occurrences)),
-            CalleeFile::Unaddressed => result.complete = false,
+            place_incoming_call_sites(
+                reads,
+                file,
+                (start, end),
+                &seed,
+                held.provider,
+                occurrences,
+                &mut result,
+            )?;
+            continue;
         }
+        push_reported_graph_call(
+            reads,
+            neighbor,
+            &seed,
+            (item.selection_range, report.encoding),
+            held,
+            occurrences,
+            &mut result,
+        )?;
     }
     Ok(result)
+}
+
+fn push_reported_graph_call(
+    reads: &ReadService,
+    neighbor: CalleeFile,
+    seed: &SymbolId,
+    selection: (Range, PositionEncoding),
+    held: &CallGraphSource<'_>,
+    occurrences: Vec<SourceUnitSpan>,
+    result: &mut GraphCalls,
+) -> Result<(), RiftError> {
+    match neighbor {
+        CalleeFile::Project(path) => {
+            let target = match held.direction {
+                TraversalDirection::Outgoing => project_definition(reads, &path, selection, false)?,
+                TraversalDirection::Incoming => {
+                    project_declaration(reads, &path, selection, "graph calls")?
+                }
+            };
+            if let Some(target) = target {
+                result.push_local(seed, target, occurrences, held.direction, held.provider);
+            } else {
+                result.complete = false;
+            }
+        }
+        CalleeFile::Package(target) => result.packages.push((target, occurrences)),
+        CalleeFile::Unaddressed => result.complete = false,
+    }
+    Ok(())
+}
+
+/// Converts provider locations once and keeps the report-wide location ceiling.
+fn graph_call_site_spans(
+    reads: &ReadService,
+    (source, unit, index): (&str, &SourceUnitId, &LineIndex),
+    (encoding, ranges): (PositionEncoding, Vec<Range>),
+    outgoing: Option<(&IndexedFile, &CoreSymbolId)>,
+    locations: &mut usize,
+) -> Result<Vec<SourceUnitSpan>, RiftError> {
+    let mut occurrences = Vec::new();
+    for range in ranges {
+        *locations = locations
+            .checked_add(1)
+            .filter(|count| *count <= TRAVERSAL_SYMBOLS_MAX)
+            .ok_or_else(graph_call_coverage)?;
+        let start = index.byte_offset(encoding, range.start)?;
+        let end = index.byte_offset(encoding, range.end)?;
+        if source.get(start..end).is_none() {
+            return Err(graph_call_coverage());
+        }
+        if let Some((file, identity)) = outgoing
+            && edge_enclosing_symbol(reads, file, start as u64, end as u64)?
+                .is_some_and(|caller| caller.as_str() != identity.as_str())
+        {
+            continue;
+        }
+        occurrences.push(SourceUnitSpan {
+            unit: unit.clone(),
+            range: TextRange {
+                start: start as u64,
+                end: end as u64,
+            },
+        });
+    }
+    Ok(occurrences)
+}
+
+fn place_incoming_call_sites(
+    reads: &ReadService,
+    file: &IndexedFile,
+    (selection_start, selection_end): (u64, u64),
+    seed: &SymbolId,
+    provider: EdgeProvider,
+    occurrences: Vec<SourceUnitSpan>,
+    result: &mut GraphCalls,
+) -> Result<(), RiftError> {
+    let direction = TraversalDirection::Incoming;
+    let Some(reported) = file.enclosing_symbol(selection_start, selection_end) else {
+        result.complete = false;
+        return Ok(());
+    };
+    let Some(reported_id) = symbol_id(reads.index(), crate::search::declared(file, reported))?
+    else {
+        result.complete = false;
+        return Ok(());
+    };
+    let mut callers = BTreeMap::<_, Vec<_>>::new();
+    for occurrence in occurrences {
+        let Some(scope) = incoming_call_scope(file, reported, &occurrence.range) else {
+            result.complete = false;
+            continue;
+        };
+        let caller = if !std::ptr::eq(scope, reported)
+            && scope
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Callable)
+        {
+            if scope.name_range.is_none() {
+                result.complete = false;
+                continue;
+            }
+            symbol_id(reads.index(), crate::search::declared(file, scope))?
+        } else {
+            // Static call evidence can establish a non-callable initializer as the caller.
+            Some(reported_id.clone())
+        };
+        let Some(caller) = caller else {
+            result.complete = false;
+            continue;
+        };
+        callers.entry(caller).or_default().push(occurrence);
+    }
+    for (caller, occurrences) in callers {
+        result.push_local(seed, caller, occurrences, direction, provider);
+    }
+    Ok(())
+}
+
+fn incoming_call_scope<'file>(
+    file: &'file IndexedFile,
+    reported: &SyntaxSymbol,
+    range: &TextRange,
+) -> Option<&'file SyntaxSymbol> {
+    if range.start >= range.end {
+        return None;
+    }
+    // An engine can group sites from a nested callable into its parent's item.
+    // The same captured declaration must hold both ends of the call range.
+    let first = file.enclosing_symbol(range.start, range.start + 1)?;
+    let last = file.enclosing_symbol(range.end - 1, range.end)?;
+    (std::ptr::eq(first, last)
+        && first.item_range.start <= range.start
+        && range.end <= first.item_range.end
+        && (std::ptr::eq(first, reported)
+            || first.item_range != reported.item_range
+                && reported.item_range.encloses(first.item_range)))
+    .then_some(first)
 }
 
 fn graph_engine_method_missing(error: &RiftError) -> bool {
@@ -3291,6 +3417,135 @@ mod tests {
             assert!(graph.complete);
         }
 
+        Ok(())
+    }
+
+    const INCOMING_CALLERS_SOURCE: &str = r"pub fn leaf() {}
+
+pub fn only_nested() {
+    let nested = || { leaf(); };
+    nested();
+}
+
+pub fn both() {
+    let inner = || { leaf(); };
+    inner();
+    leaf();
+}
+
+pub fn direct() {
+    leaf();
+}
+
+pub fn siblings() {
+    let first = || { leaf(); };
+    let second = || { leaf(); };
+    first();
+    second();
+}
+
+pub fn unlocated() {}
+";
+
+    #[test]
+    fn incoming_graph_calls_keep_the_physical_caller_of_each_site() -> TestResult {
+        use rift_protocol::read::TraversalDirection;
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let source = INCOMING_CALLERS_SOURCE;
+        fs::write(root.join("lib.rs"), source)?;
+        let reads = reads(root)?;
+        let target = symbol(&reads, "leaf");
+        let seed = rift_core::SymbolId::new(target.as_str())?;
+        let unit = crate::read::source_unit_id(&ProjectPath::new("lib.rs")?);
+        // Rust-analyzer groups a named closure into its enclosing function's call item.
+        let nested_site = Range::new(Position::new(3, 22), Position::new(3, 26));
+        let inner_site = Range::new(Position::new(8, 21), Position::new(8, 25));
+        let both_site = Range::new(Position::new(10, 4), Position::new(10, 8));
+        let direct_site = Range::new(Position::new(14, 4), Position::new(14, 8));
+        let first_site = Range::new(Position::new(18, 21), Position::new(18, 25));
+        let second_site = Range::new(Position::new(19, 22), Position::new(19, 26));
+        let mut only_nested = item(location(root, "lib.rs", 2, 7, 18), "only_nested");
+        only_nested.from_ranges = vec![nested_site];
+        let mut both = item(location(root, "lib.rs", 7, 7, 11), "both");
+        both.from_ranges = vec![inner_site, both_site];
+        let mut direct = item(location(root, "lib.rs", 13, 7, 13), "direct");
+        direct.from_ranges = vec![direct_site];
+        let mut siblings = item(location(root, "lib.rs", 17, 7, 15), "siblings");
+        siblings.from_ranges = vec![first_site, second_site];
+        let mut crossing = siblings.clone();
+        crossing.from_ranges = vec![Range::new(first_site.start, second_site.end)];
+        let mut unrelated = direct.clone();
+        unrelated.from_ranges = vec![nested_site];
+        let mut empty = direct.clone();
+        empty.from_ranges = vec![Range::new(direct_site.start, direct_site.start)];
+        let missing = item(location(root, "missing.rs", 0, 7, 14), "missing");
+        let unlocated = item(location(root, "lib.rs", 24, 7, 16), "unlocated");
+        let held = super::CallGraphSource {
+            trees: [root, root],
+            source,
+            unit: unit.clone(),
+            direction: TraversalDirection::Incoming,
+            provider: EdgeProvider::Lsp,
+        };
+        let index = rift_lsp::LineIndex::new(source);
+        let mut expected = BTreeMap::from([(symbol(&reads, "unlocated"), Vec::new())]);
+        for (caller, range) in [
+            ("nested", nested_site),
+            ("inner", inner_site),
+            ("both", both_site),
+            ("direct", direct_site),
+            ("first", first_site),
+            ("second", second_site),
+        ] {
+            let start = index.byte_offset(PositionEncoding::Utf16, range.start)?;
+            let end = index.byte_offset(PositionEncoding::Utf16, range.end)?;
+            assert_eq!(source.get(start..end), Some("leaf"));
+            expected.insert(
+                symbol(&reads, caller),
+                vec![rift_protocol::read::SourceUnitSpan {
+                    unit: unit.clone(),
+                    range: rift_protocol::read::TextRange {
+                        start: u64::try_from(start)?,
+                        end: u64::try_from(end)?,
+                    },
+                }],
+            );
+        }
+        let valid = [only_nested, both, direct, siblings, unlocated];
+        for omitted in [
+            None,
+            Some(crossing),
+            Some(unrelated),
+            Some(empty),
+            Some(missing),
+        ] {
+            let complete = omitted.is_none();
+            let calls = valid.iter().cloned().chain(omitted).collect();
+            let answer = super::map_graph_calls(
+                &reads,
+                &CalleeRoots::default(),
+                &seed,
+                CalleeReport {
+                    calls: Ok(calls),
+                    encoding: PositionEncoding::Utf16,
+                },
+                &held,
+            )?;
+            assert_eq!(
+                answer.local.into_iter().collect::<BTreeMap<_, _>>(),
+                expected
+            );
+            assert_eq!(answer.edges.len(), expected.len());
+            for edge in answer.edges {
+                assert_eq!(edge.to, target);
+                assert_eq!(edge.provider, EdgeProvider::Lsp);
+                let sites = expected.get(&edge.from).ok_or("stored call owner")?;
+                assert_eq!(edge.occurrence.as_ref(), sites.first());
+            }
+            assert_eq!(answer.complete, complete);
+        }
         Ok(())
     }
 
