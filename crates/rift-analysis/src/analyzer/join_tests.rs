@@ -574,7 +574,7 @@ fn test_a_module_repeating_its_overloads_answers_at_the_implementation_form() {
 
 #[test]
 fn python_package_visibility_keeps_protocol_methods_of_public_classes() {
-    let source = r#"def __module__(): pass
+    let source = r"def __module__(): pass
 def _helper(): pass
 
 class Session:
@@ -598,7 +598,7 @@ class _ValidatedRequest:
 
     class Nested:
         def open(self): pass
-"#;
+";
     let analysis = analyzed(ShippedLanguage::Python, vec![("mod.py", source)]);
     for (name, public) in [
         ("Session", true),
@@ -655,7 +655,7 @@ class _ValidatedRequest:
 
 #[test]
 fn python_package_visibility_distinguishes_reopened_classes_from_mixed_owners() {
-    let source = r#"class Reopened:
+    let source = r"class Reopened:
     def __enter__(self): return self
 
 class Reopened:
@@ -667,7 +667,7 @@ class Mixed:
 def Mixed():
     def __enter__(): pass
     return __enter__
-"#;
+";
     let analysis = analyzed(ShippedLanguage::Python, vec![("mod.py", source)]);
     let held = &analysis.files()[0];
     let first = declaration_at(&analysis, "mod.py", ("Reopened.__enter__", 0))

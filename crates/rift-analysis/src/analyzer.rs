@@ -3266,7 +3266,7 @@ mod tests {
 
     #[test]
     fn test_cython_protocol_methods_use_the_actual_class_scope() {
-        let source = r#"def __module__(): pass
+        let source = r"def __module__(): pass
 
 class Session:
     def __enter__(self): return self
@@ -3279,7 +3279,7 @@ class Session:
 class _Private:
     def visible(self): pass
     def __exit__(self, *args): pass
-"#;
+";
         let analysis = package_analysis(ShippedLanguage::Cython, vec![("mod.pyx", source)]);
         let held = &analysis.files()[0];
         let symbols = held.file().syntax().symbols();
