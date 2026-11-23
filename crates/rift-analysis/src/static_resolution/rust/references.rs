@@ -228,7 +228,11 @@ impl<'source> Namespaces<'source> {
         }
         let type_path = match self.receiver_owner_at_depth(file, receiver, work, depth)? {
             ReceiverOwner::Target(owner) => {
-                return self.receiver_method_of(file, receiver.start, owner, member, work);
+                return self
+                    .receiver_method_of(file, receiver.start, owner, member, work)
+                    .or_else(|| {
+                        self.returned_deref_member(file, receiver, owner, member, work, depth)
+                    });
             }
             ReceiverOwner::TypePath(type_path) => type_path,
         };
@@ -383,8 +387,7 @@ impl<'source> Namespaces<'source> {
             return self
                 .return_owners
                 .get(&(callable.file.path.as_str(), callable.symbol.name_range?))
-                .copied()
-                .map(ReceiverOwner::Target);
+                .map(|returned| ReceiverOwner::Target(returned.owner));
         }
         self.receiver_owner_at_depth(file, initializer, work, depth - 1)
     }
@@ -752,12 +755,15 @@ fn tuple_element_range(file: &File<'_>, range: ByteRange, element: usize) -> Opt
     None
 }
 
-fn source_text(source: &str, range: ByteRange) -> Option<&str> {
+pub(super) fn source_text(source: &str, range: ByteRange) -> Option<&str> {
     source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
 }
 
 /// The declared parameters of a callee in order, without `self` for a method call.
-fn callee_parameters(callee: Target<'_>, member: bool) -> Option<Vec<&rift_syntax::StaticBinding>> {
+pub(super) fn callee_parameters(
+    callee: Target<'_>,
+    member: bool,
+) -> Option<Vec<&rift_syntax::StaticBinding>> {
     let facts = callee.file.facts.static_facts()?;
     let body = callee.symbol.body_range?;
     let mut parameters = facts
