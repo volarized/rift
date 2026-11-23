@@ -12,6 +12,15 @@ type Span = (usize, usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct Modifiers(Span, Option<Span>);
 
+impl Modifiers {
+    fn blank(self, source: &mut [u8]) {
+        let Self(first, second) = self;
+        for (start, end) in std::iter::once(first).chain(second) {
+            source[start..end].fill(b' ');
+        }
+    }
+}
+
 /// A single incomplete parse cannot claim file identity from a partial recovery proof.
 const VARIANCE_ERROR_SPANS_MAX: usize = 1024;
 
@@ -62,10 +71,8 @@ pub(super) fn accounts_for_parse_errors(
         return false;
     }
     let mut checked = source.as_bytes().to_vec();
-    for Modifiers(first, second) in matched {
-        for (start, end) in std::iter::once(first).chain(second) {
-            checked[start..end].fill(b' ');
-        }
+    for modifiers in matched {
+        modifiers.blank(&mut checked);
     }
     parser
         .parse(&checked, None)
@@ -173,6 +180,30 @@ mod tests {
     use crate::{
         SyntaxLimits, SyntaxProvider, SyntaxSource, TypeScriptDialect, TypeScriptSyntaxProvider,
     };
+
+    #[test]
+    fn comparison_parse_blanks_only_the_matched_words() {
+        let original = "interface Hold<in out T extends Box<U> = Base> { item: T }";
+        let boundary = original.find('<').expect("parameter opening") + 1;
+        let (modifiers, (start, end)) =
+            super::prefix(original, boundary, original.len()).expect("exact variance prefix");
+        assert_eq!(&original[start..end], "T");
+        let mut checked = original.as_bytes().to_vec();
+        modifiers.blank(&mut checked);
+        assert_eq!(
+            &checked,
+            b"interface Hold<       T extends Box<U> = Base> { item: T }"
+        );
+        for parameter in [
+            "<in in T>",
+            "<out in T>",
+            "<out>",
+            "<out/**/T>",
+            "<outer T>",
+        ] {
+            assert!(super::prefix(parameter, 1, parameter.len()).is_none());
+        }
+    }
 
     #[test]
     fn exact_variance_prefixes_explain_only_matched_syntax_errors() {
