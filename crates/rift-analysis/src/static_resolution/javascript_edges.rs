@@ -68,8 +68,8 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            let target = self
-                .javascript_target(file, reference.target, reference.role, work)
+            let local = self.javascript_target(file, reference.target, reference.role, work);
+            let target = local
                 .filter(|target| {
                     reference.role != ReferenceRole::Type
                         || target.symbol.kinds.contains(&SymbolKind::Type)
@@ -98,6 +98,14 @@ impl<'source> Index<'source> {
                         work,
                     )
                     .or_else(|| self.javascript_module_from(file, reference.target, work));
+            } else if local.is_none()
+                && reference.role == ReferenceRole::Type
+                && file.document.facts.language().name == "typescript"
+                && self
+                    .record_external_typescript_type_use(file, reference.target, work, result)
+                    .is_some()
+            {
+                continue;
             }
             result.record(occurrence);
         }

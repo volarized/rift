@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rift_core::{FileDigest, ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
+use rift_protocol::read::Language;
 use rift_syntax::{ShippedLanguage, SyntaxFacts, SyntaxLimits};
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
@@ -64,7 +65,7 @@ pub(super) fn prepare(
         return super::PreparedNamespace::default();
     }
     let originals = original_sources(input);
-    let Some((mut assigned, mut pending)) = library_roots_pending(input, &inventory) else {
+    let Some((mut assigned, mut pending, root)) = library_roots_pending(input, &inventory) else {
         return super::PreparedNamespace::default();
     };
     let mut anchors = BTreeMap::new();
@@ -115,37 +116,16 @@ pub(super) fn prepare(
             path.clone(),
             super::retain_valid_declarations(input, file, declared),
         );
-        for (child, local, child_scope) in children {
-            let mut child_namespace = namespace.clone();
-            child_namespace.extend(local);
-            if SymbolIdentity::new(
-                input.owner().clone(),
-                file.syntax.language().clone(),
-                child_namespace.clone(),
-            )
-            .is_err()
-            {
-                continue;
-            }
-            if let Some(previous) = assigned.get(&child) {
-                if previous != &child_namespace {
-                    return super::PreparedNamespace::default();
-                }
-                continue;
-            }
-            assigned.insert(child.clone(), child_namespace.clone());
-            let child_directory = child
-                .strip_suffix("/mod.rs")
-                .or_else(|| child.strip_suffix(".rs"))
-                .unwrap_or(&child)
-                .to_owned();
-            pending.push_back((
-                child,
-                child_namespace,
-                child_directory,
-                child_scope,
-                library,
-            ));
+        if !queue_module_children(
+            input.owner(),
+            file.syntax.language(),
+            &namespace,
+            library,
+            children,
+            &mut assigned,
+            &mut pending,
+        ) {
+            return super::PreparedNamespace::default();
         }
     }
     let mut prepared = super::PreparedNamespace {
@@ -155,7 +135,72 @@ pub(super) fn prepare(
     };
     let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
     local_exports(input, selected, &requested, &admitted, &mut prepared);
+    retain_root_anchor(input, root, &inventory, &assigned, &mut prepared);
     prepared
+}
+
+/// Queues children with valid namespaces. A competing assignment refuses the inventory.
+fn queue_module_children(
+    owner: &SymbolOwner,
+    language: &Language,
+    parent: &[String],
+    library: bool,
+    children: Vec<(String, Vec<String>, macros::Scope)>,
+    assigned: &mut BTreeMap<String, Vec<String>>,
+    pending: &mut Pending,
+) -> bool {
+    for (child, local, child_scope) in children {
+        let mut child_namespace = parent.to_vec();
+        child_namespace.extend(local);
+        if SymbolIdentity::new(owner.clone(), language.clone(), child_namespace.clone()).is_err() {
+            continue;
+        }
+        if let Some(previous) = assigned.get(&child) {
+            if previous != &child_namespace {
+                return false;
+            }
+            continue;
+        }
+        assigned.insert(child.clone(), child_namespace.clone());
+        let child_directory = child
+            .strip_suffix("/mod.rs")
+            .or_else(|| child.strip_suffix(".rs"))
+            .unwrap_or(&child)
+            .to_owned();
+        pending.push_back((
+            child,
+            child_namespace,
+            child_directory,
+            child_scope,
+            library,
+        ));
+    }
+    true
+}
+
+/// Retains the accepted Cargo root namespace for package imports.
+fn retain_root_anchor(
+    input: &NamespaceInput<'_>,
+    root: Option<String>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    assigned: &BTreeMap<String, Vec<String>>,
+    prepared: &mut super::PreparedNamespace,
+) {
+    if let Some(path) = root
+        && let Some(file) = inventory.get(path.as_str())
+        && !file.syntax.has_errors()
+        && file.syntax.left_out_declaration_count() == 0
+        && prepared.anchors.contains_key(&path)
+        && let Some(namespace) = assigned.get(&path)
+        && let Ok(identity) = SymbolIdentity::new(
+            input.owner().clone(),
+            file.syntax.language().clone(),
+            namespace.clone(),
+        )
+        && let Ok(identity) = SymbolId::new(identity.wire_identity())
+    {
+        prepared.rust_package_root = Some((path, identity));
+    }
 }
 
 /// Whether the configuration admits each module file: its declaring `mod` items and every
@@ -349,13 +394,14 @@ fn target_roots(
 }
 
 type Pending = VecDeque<(String, Vec<String>, String, macros::Scope, bool)>;
+type LibraryRoots = (BTreeMap<String, Vec<String>>, Pending, Option<String>);
 
 /// The selected library roots, assigned to their crate namespaces and queued for the
 /// module walk. Two roots of one path refuse the whole inventory.
 fn library_roots_pending(
     input: &NamespaceInput<'_>,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
-) -> Option<(BTreeMap<String, Vec<String>>, Pending)> {
+) -> Option<LibraryRoots> {
     let mut assigned = BTreeMap::new();
     let mut pending = VecDeque::new();
     for (root, name) in selected_libraries(input, inventory) {
@@ -373,7 +419,11 @@ fn library_roots_pending(
             library,
         ));
     }
-    Some((assigned, pending))
+    let package_root = pending
+        .front()
+        .filter(|_| matches!(input.owner(), SymbolOwner::Package { .. }))
+        .map(|(path, ..)| path.clone());
+    Some((assigned, pending, package_root))
 }
 
 fn library_root(
