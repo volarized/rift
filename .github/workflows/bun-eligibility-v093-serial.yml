@@ -1,0 +1,116 @@
+name: Bun eligibility observation
+
+on:
+  push:
+    branches: [diagnostic/bun-eligibility-v093-serial-20261123]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bun-eligibility-v093-serial
+  cancel-in-progress: false
+
+env:
+  BASE: da38628da2d2613f63fb65f3ffb3eb703ed1d7d9
+  BASE_TREE: 345747e13e159e484c63491e2d09871124635253
+  SIGNED_TAG: 1a862af9f83dc2b0010aec8b35f40100b605e7e9
+  OBSERVER: 1233f47735ee0fd926f090dc9ff26bd8493b7773
+  PACKET: 5b58e068cc387b52fa37eba14ec63b01acdfd906
+  PACKET_TREE: c34af8cb7c112562acca4001f8d325ee5bf22543
+  SIGNER: FC08DDCFB56DB97D06926EDD4BF8B94B2A499B8A
+  PACKET_DIR: dev/diagnostics/bun-eligibility
+  WORKFLOW_PATH: .github/workflows/bun-eligibility-v093-serial.yml
+
+jobs:
+  observe:
+    if: >-
+      github.repository == 'volarized/rift' &&
+      github.ref == 'refs/heads/diagnostic/bun-eligibility-v093-serial-20261123' &&
+      github.event.created &&
+      !github.event.deleted &&
+      !github.event.forced &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.sender.type == 'User' &&
+      github.event.sender.login == 'renardeinside' &&
+      github.actor == 'renardeinside' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Verify signed release and observer packet
+        env:
+          PUSHED_HEAD: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          receipts="$RUNNER_TEMP/bun-eligibility-evidence"
+          mkdir "$receipts"
+          exec 2> >(tee "$receipts/source.stderr.log" >&2)
+          git show -s --format='%H %T %P' HEAD > "$receipts/workflow-source.txt"
+          test "$PUSHED_HEAD" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PACKET"
+          test "$(git show -s --format=%P "$PACKET")" = "$OBSERVER"
+          test "$(git show -s --format=%P "$OBSERVER")" = "$BASE"
+          test "$(git show -s --format=%T "$BASE")" = "$BASE_TREE"
+          test "$(git show -s --format=%T "$PACKET")" = "$PACKET_TREE"
+          test "$(git diff --name-only "$PACKET" HEAD)" = "$WORKFLOW_PATH"
+          git diff --exit-code "$BASE" HEAD -- Cargo.lock Cargo.toml rust-toolchain.toml dev/uv.lock
+          test "$(git ls-remote --exit-code origin "$GITHUB_REF" | cut -f1)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin refs/tags/v0.0.93:refs/tags/v0.0.93
+          test "$(git rev-parse 'refs/tags/v0.0.93^{tag}')" = "$SIGNED_TAG"
+          test "$(git rev-parse 'refs/tags/v0.0.93^{commit}')" = "$BASE"
+          export GNUPGHOME="$RUNNER_TEMP/bun-eligibility-gnupg"
+          install -m 700 -d "$GNUPGHOME"
+          key="$PACKET_DIR/signing-key.asc"
+          test "$(gpg --batch --with-colons --show-keys "$key" | awk -F: '$1=="fpr" {print $10}')" = "$SIGNER"
+          gpg --batch --import "$key"
+          git verify-tag --raw "$SIGNED_TAG" > "$receipts/tag-signature.txt" 2>&1
+          for commit in "$OBSERVER" "$PACKET" "$GITHUB_SHA"; do
+            git verify-commit --raw "$commit" > "$receipts/$commit.signature.txt" 2>&1
+          done
+          for status in "$receipts"/tag-signature.txt "$receipts"/*.signature.txt; do
+            grep -F "[GNUPG:] VALIDSIG $SIGNER " "$status"
+          done
+          git show -s --format='%H %T %P' "$OBSERVER" "$PACKET" "$BASE" "$SIGNED_TAG" > "$receipts/source-chain.txt"
+          sha256sum Cargo.lock rust-toolchain.toml dev/uv.lock "$PACKET_DIR"/* > "$receipts/input-sha256.txt"
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: integration
+          cache-targets: false
+          save-if: false
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+      - name: Prepare locked corpus inputs
+        timeout-minutes: 5
+        env:
+          RIFT_CORPUS_DIR: ${{ runner.temp }}/bun-eligibility-corpus
+        run: |
+          set -euo pipefail
+          receipts="$RUNNER_TEMP/bun-eligibility-evidence"
+          exec 2> >(tee "$receipts/setup.stderr.log" >&2)
+          uv sync --locked --python 3.12 --project dev
+          corpus="$(uv run --locked --project dev rift-dev corpus sync bun)"
+          printf 'BUN_CORPUS_PATH=%s\n' "$corpus" >> "$GITHUB_ENV"
+          rustc +1.98 -vV > "$receipts/toolchain.txt"
+      - name: Build the observer and run ordinary comparisons
+        timeout-minutes: 42
+        run: |
+          set -euo pipefail
+          receipts="$RUNNER_TEMP/bun-eligibility-evidence"
+          exec 2> >(tee "$receipts/runner.stderr.log" >&2)
+          uv run --locked --project dev python "$PACKET_DIR/hosted.py" \
+            --source "$GITHUB_WORKSPACE" --workflow-head "$GITHUB_SHA" \
+            --bun "$BUN_CORPUS_PATH" --scratch "$RUNNER_TEMP/bun-eligibility-scratch" --output "$receipts"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bun-eligibility-v093-serial
+          path: ${{ runner.temp }}/bun-eligibility-evidence
+          if-no-files-found: warn
+          retention-days: 7
