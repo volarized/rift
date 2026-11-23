@@ -1,0 +1,44 @@
+{
+  "repository": "volarized/rift",
+  "profile": "corpus",
+  "platform": "ubuntu-24.04/x86_64",
+  "bun_pin": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "corpus_paths_sha256": "8e7bf05a11d7feaadcdb3d02232e8306c44aebbe24d2cd575e72769c50abb9ec",
+  "base": {
+    "run": 45107450373,
+    "job": 137471868011,
+    "artifact": 14787748146,
+    "event": "push",
+    "workflow_head": "1ddff885a04bf7fac506dc58284ea339835fffce",
+    "built_commit": "1ddff885a04bf7fac506dc58284ea339835fffce",
+    "tree": "9f0d2f34bc7c29604b0688cfe05effe1c5c71e03",
+    "archive_sha256": "03347e14d9901b791bb52628e66407f2421c09b8f7f13c713d8637d768c4b429",
+    "binary_sha256": "ac4c87798201cbdbf7c9718964b8294dab75a46ea80e360b75f707461f94a124",
+    "zst_sha256": "e5c82c7b4c621e02e8c3fdc0aaec6dff3f1fdf7f672ba37ca6979ee400c3abb7",
+    "binary_size": 849556624
+  },
+  "candidate": {
+    "event": "pull_request",
+    "workflow_head": "a1f304adfb7e17d6f0389547c7a95c9f6b699b73",
+    "built_commit": "2ce17272aee51516af09d482ae0e0e61973d9ca4",
+    "tree": "3535da104c13787ef60eb7ef52962c025a6bc870",
+    "parents": [
+      "1ddff885a04bf7fac506dc58284ea339835fffce",
+      "a1f304adfb7e17d6f0389547c7a95c9f6b699b73"
+    ],
+    "run": 45109853120,
+    "job": 137479466564,
+    "artifact": 14789723172,
+    "archive_sha256": "b915dfb7cb52017f971d529abd1f7987b7426f93e5ffef5da78ead86c6111ec4",
+    "binary_sha256": "6049aac392ce98b55731ceec620efecc73198e65373c80183b3e9bd0f5522157",
+    "inputs": {
+      "Cargo.toml": "15038dd174eabcd07a2a8722167ac3377c4ad9ac",
+      "Cargo.lock": "a4014d42c9b8e31f4166a5be145655e96da22d72",
+      "rust-toolchain.toml": "d3126bac834d2883f98c9b588356c087e1ed00d0",
+      "justfile": "2551eef87ad00e657eb316e40dd7e64e6fda2248",
+      ".github/workflows/ci.yml": "f426ff29c78758f0a40350eec216e3c5015f102c"
+    },
+    "zst_sha256": "8a3b45045f815dfcd792225289e9c187ada6a928e622f1e46f76424f613d36d3",
+    "binary_size": 849558984
+  }
+}
