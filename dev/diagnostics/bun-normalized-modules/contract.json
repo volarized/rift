@@ -1,0 +1,10 @@
+{
+  "bun_pin": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "corpus_paths_sha256": "8e7bf05a11d7feaadcdb3d02232e8306c44aebbe24d2cd575e72769c50abb9ec",
+  "prior_run": 45177822193,
+  "prior_artifact": 14822348486,
+  "prior_head": "7b2710f70693b6dc15dcb66f9763cfcf4d583f83",
+  "prior_sha256": "e71ca454d50526c9d2c016c7ebbdf6a730e5c0f2d58fe003f0bb18fcae2d6987",
+  "prior_candidate_sha256": "267d0111ccc891f8f6f11b5efcb7e4680b37e22b00475f19a932fae1e6eb900c",
+  "prior_oracle": "9655b088f14fd1f7f9d90ba05d5902cda389a962c0d4955acd38b1170be58e7d"
+}
