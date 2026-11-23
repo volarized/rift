@@ -1,0 +1,13 @@
+{
+  "bun_pin": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "corpus_paths_sha256": "8e7bf05a11d7feaadcdb3d02232e8306c44aebbe24d2cd575e72769c50abb9ec",
+  "base_run": 45186097687,
+  "base_artifact": 14824496002,
+  "base_sha256": {
+    "outer.zip": "6d0a0a53117ad7893b5b9a62173b5f80d79da4773b15e9b5d66de034f820aab9",
+    "integration-cli.tar.zst": "db3e392e47622956e360852fd709fe7fc5c0fa8c96eab05caf0ebadb1edacbfd",
+    "rift": "fb0787f5a42257416083970a228160e6f6a28524bf8fb6cc5b92d74057c776b7"
+  },
+  "base_job": 137731989253,
+  "base_synth": "5d64583b376661a564caf0abe5195e16900faa3e"
+}

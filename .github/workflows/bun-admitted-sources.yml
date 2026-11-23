@@ -1,0 +1,97 @@
+name: Bun admitted source comparison
+on:
+  push:
+    branches: [diagnostic/bun-admitted-sources-20261123]
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compare:
+    if: >-
+      github.repository == 'volarized/rift' &&
+      github.event.created && !github.event.deleted && !github.event.forced &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.sender.login == 'renardeinside' && github.actor == 'renardeinside' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      BASE: 69e4ef16c2220a51467e54b688aafcbffcca702f
+      CANDIDATE_TREE: cf48af53dba83ae5f7da5fb2bfaadf5dd69ccbaf
+      BUN: 744846f844374847c902b5e7fd59b4342a51ef99
+      SIGNER: FC08DDCFB56DB97D06926EDD4BF8B94B2A499B8A
+      PACKET: dev/diagnostics/bun-admitted-sources
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify signed diagnostic and production trees
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/cli"
+          candidate=$(git rev-parse HEAD^)
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P "$candidate")" = "$BASE"
+          test "$(git rev-parse "$candidate^{tree}")" = "$CANDIDATE_TREE"
+          test "$(git rev-parse "$BASE^{tree}")" = f46be0ab948f0bd6065510c297d2f38d9027f161
+          test -z "$(git diff --name-only "$candidate" HEAD | grep -vE '^(dev/diagnostics/bun-admitted-sources/|\.github/workflows/bun-admitted-sources\.yml$)' || true)"
+          test "$(git diff --name-only "$BASE" "$candidate" | wc -l)" = 11
+          export GNUPGHOME="$RUNNER_TEMP/keys"
+          install -m700 -d "$GNUPGHOME"
+          gpg --batch --import "$PACKET/signing-key.asc"
+          for revision in "$BASE" "$candidate" "$GITHUB_SHA"; do
+            git verify-commit --raw "$revision" > "$RUNNER_TEMP/evidence/$revision.signature" 2>&1
+            grep -F "[GNUPG:] VALIDSIG $SIGNER " "$RUNNER_TEMP/evidence/$revision.signature"
+          done
+          git show -s --format='%H %T %P' "$BASE" "$candidate" "$GITHUB_SHA" > "$RUNNER_TEMP/evidence/source-chain.txt"
+          git worktree add --detach "$RUNNER_TEMP/candidate" "$candidate"
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: false
+      - uses: taiki-e/install-action@v2.90.6
+        with:
+          tool: just
+      - name: Run owner tests and build the exact candidate with the ordinary corpus recipe
+        timeout-minutes: 85
+        run: |
+          set -euo pipefail
+          uv sync --locked --python 3.12 --project dev
+          cd "$RUNNER_TEMP/candidate"
+          uv sync --locked --python 3.12 --project dev
+          {
+            rustc -Vv
+            cargo -Vv
+            printf 'RUSTFLAGS=%s\nCARGO_ENCODED_RUSTFLAGS=%s\n' "${RUSTFLAGS:-}" "${CARGO_ENCODED_RUSTFLAGS:-}"
+            sha256sum Cargo.lock Cargo.toml rust-toolchain.toml justfile dev/uv.lock
+          } > "$RUNNER_TEMP/evidence/build-inputs.txt"
+          uv run --locked --project dev python "$GITHUB_WORKSPACE/$PACKET/bounded_build.py" "$RUNNER_TEMP/evidence/build"
+      - name: Authenticate official base and check both ELF profiles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          uv run --locked --project dev python "$PACKET/verify_cli.py" "$RUNNER_TEMP/cli" "$RUNNER_TEMP/candidate/target/corpus/rift"
+          cp "$RUNNER_TEMP/cli/"*.readelf "$RUNNER_TEMP/cli/producer.json" "$RUNNER_TEMP/cli/verified.json" "$RUNNER_TEMP/evidence/"
+      - name: Measure both CLIs serially on fresh workspace state
+        timeout-minutes: 22
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/bun"
+          git -C "$RUNNER_TEMP/bun" fetch --no-tags --depth 1 https://github.com/oven-sh/bun.git "$BUN"
+          git -C "$RUNNER_TEMP/bun" -c core.hooksPath=/dev/null checkout --detach "$BUN"
+          test "$(git -C "$RUNNER_TEMP/bun" rev-parse 'HEAD^{tree}')" = 22bf02488635ecf658474da0264016217f3064e8
+          /usr/bin/time -v -o "$RUNNER_TEMP/evidence/process-time.txt" uv run --locked --project dev python "$PACKET/paired_saved_edits.py" \
+            --baseline "$RUNNER_TEMP/cli/rift" --candidate "$RUNNER_TEMP/candidate/target/corpus/rift" \
+            --root "$RUNNER_TEMP/bun" --paths "$PACKET/bun-edit-paths.txt" --lock "$PACKET/contract.json" \
+            --output "$RUNNER_TEMP/evidence/measurements"
+          git -C "$RUNNER_TEMP/bun" diff --exit-code
+          test -z "$(git -C "$RUNNER_TEMP/bun" status --porcelain --untracked-files=all)"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bun-admitted-source-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 7
