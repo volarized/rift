@@ -4,7 +4,9 @@ use super::*;
 use rift_protocol::index::StoredEdge;
 use rift_protocol::read::{EdgeDerivation, EdgeKind, EdgeProvider};
 
-const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"index.js"}"#;
+const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","exports":{".":"./index.js","./literal":"./literal.js","./values":"./values.js","./forward":"./forward.js"}}"#;
+const ROOT_ONLY_MANIFEST: &str =
+    r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"index.js"}"#;
 const OWNER: &str = "function checkExistence() { return 1 }
 module.exports = { exist: checkExistence }
 ";
@@ -22,6 +24,10 @@ const VALUES: &str = "module.exports = { kDirect: Symbol('direct') }
 ";
 
 fn analyze(user: &str, owner: &str) -> PackageAnalysis {
+    analyze_with_manifest(user, owner, MANIFEST)
+}
+
+fn analyze_with_manifest(user: &str, owner: &str, manifest: &str) -> PackageAnalysis {
     fixture::package_result_with_metadata(
         ShippedLanguage::JavaScript,
         vec![
@@ -31,9 +37,21 @@ fn analyze(user: &str, owner: &str) -> PackageAnalysis {
             ("forward.js", "module.exports = require('./literal')"),
         ],
         None,
-        Some(("package.json", MANIFEST)),
+        Some(("package.json", manifest)),
     )
     .expect("selected CommonJS package")
+}
+
+#[test]
+fn direct_literal_without_a_published_module_identity_keeps_its_edges_unresolved() {
+    let analyzed = analyze_with_manifest(USER, OWNER, ROOT_ONLY_MANIFEST);
+    assert!(!analyzed.publication().edges.iter().any(|edge| {
+        (edge.kinds == [EdgeKind::Calls]
+            && (occurrence(edge, USER, "library.exist()") || occurrence(edge, USER, "exist()")))
+            || (edge.kinds == [EdgeKind::Reads]
+                && occurrence(edge, USER, "library.exist")
+                && edge.to.as_str().ends_with("/default/exist"))
+    }));
 }
 
 fn occurrence(edge: &StoredEdge, source: &str, written: &str) -> bool {
