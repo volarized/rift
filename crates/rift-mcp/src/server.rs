@@ -4032,11 +4032,11 @@ impl RiftMcp {
                 let selection = seed.map_or(recorded.selection, |(epoch, _)| {
                     Some((*epoch, configuration))
                 });
-                let reuse_selection = selection == Some((observed_epoch, configuration))
+                let selection_current = selection == Some((observed_epoch, configuration))
                     && !validation.watch_failed.load(Ordering::Acquire);
                 drop(recorded);
                 let cancelled = || cancellation.is_cancelled();
-                let recaptured = if reuse_selection {
+                let recaptured = if selection_current {
                     last.recapture_selected_cancellable(&root, limits, &cancelled)?
                 } else {
                     None
@@ -4070,7 +4070,7 @@ impl RiftMcp {
                         (observed_epoch, configuration),
                         request_capture.as_ref(),
                         reused_selection,
-                        &cancellation,
+                        cancellation,
                     )?;
                 let configuration = rift_tracing::traced!(
                     component = "index",
@@ -9038,7 +9038,13 @@ done
         else {
             return Err(format!("canonical beacon must be found: {first:?}").into());
         };
-        assert_eq!(symbol.id.as_ref().map(|id| id.as_str()), Some(id.as_str()));
+        assert_eq!(
+            symbol
+                .id
+                .as_ref()
+                .map(rift_protocol::read::SymbolId::as_str),
+            Some(id.as_str())
+        );
         assert_eq!(declarations.len(), 1);
         assert!(
             !warnings
