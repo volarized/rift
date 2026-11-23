@@ -216,3 +216,83 @@ fn retained_refused_heading_requires_original_utf8_ranges() {
             .inventory_complete
     );
 }
+
+const VARIANCE_SOURCE: &str = "export interface Base<T> { base: T }
+export interface Mid<out T = unknown, in U = string> extends Base<T> { value: T; run(input: U): T }
+export interface Leaf extends Mid<string> { leaf: number }
+export class Box<in out T> { item!: T }
+export type T = number
+export interface Held<out T = unknown> { held: T }
+";
+
+#[test]
+fn checked_typescript_variance_completes_package_identities_and_preserves_edges() {
+    use rift_protocol::read::EdgeKind;
+
+    let package = super::fixture::package_result_with_metadata(
+        rift_syntax::ShippedLanguage::TypeScript,
+        vec![("probe.ts", VARIANCE_SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./probe.ts"}"#,
+        )),
+    )
+    .expect("original package source");
+    assert!(package.files()[0].file().syntax().has_errors());
+    let publication = package.publication();
+    let coverage = &publication.coverage[0];
+    assert!(coverage.inventory_complete && coverage.identity_complete);
+    assert!(!coverage.applicability_complete);
+    assert_eq!(publication.declarations.len(), 12);
+    let stored = |from: &str, kind, to: &str| {
+        publication.edges.iter().find(|edge| {
+            edge.from.0.ends_with(from) && edge.kinds.contains(&kind) && edge.to.0.ends_with(to)
+        })
+    };
+    for (from, kind, to, text) in [
+        ("/Mid", EdgeKind::Extends, "/Base", "Base"),
+        ("/Leaf", EdgeKind::Extends, "/Mid", "Mid"),
+        ("/Mid", EdgeKind::Contains, "/Mid/value", "value"),
+        ("/Box", EdgeKind::Contains, "/Box/item", "item"),
+        ("/Held", EdgeKind::Contains, "/Held/held", "held"),
+    ] {
+        let span = &stored(from, kind, to)
+            .expect("retained package edge")
+            .occurrence
+            .as_ref()
+            .expect("written occurrence")
+            .range;
+        let start = usize::try_from(span.start).expect("fixture start");
+        let end = usize::try_from(span.end).expect("fixture end");
+        assert_eq!(&VARIANCE_SOURCE[start..end], text);
+    }
+    assert!(stored("/Held", EdgeKind::HasType, "/T").is_none());
+    assert!(stored("/Held/held", EdgeKind::HasType, "/T").is_none());
+}
+
+#[test]
+fn variance_proof_keeps_other_package_identity_refusals() {
+    const TYPES: &str = r#"{"name":"beacon","version":"1.0.0","types":"./probe.ts"}"#;
+    const CONDITIONAL: &str =
+        r#"{"name":"beacon","version":"1.0.0","exports":{".":{"types":"./probe.ts"}}}"#;
+
+    for (source, metadata) in [
+        (VARIANCE_SOURCE, CONDITIONAL),
+        ("export interface Bad<out T extends > { item: T }", TYPES),
+        ("export interface Bad<out T> extends { item: T }", TYPES),
+        ("export interface 1Bad<out T> { item: T }", TYPES),
+        ("export type Bad<out T> = ;", TYPES),
+    ] {
+        let package = super::fixture::package_result_with_metadata(
+            rift_syntax::ShippedLanguage::TypeScript,
+            vec![("probe.ts", source)],
+            None,
+            Some(("package.json", metadata)),
+        )
+        .expect("source inventory is retained");
+        let coverage = &package.publication().coverage[0];
+        assert!(!coverage.identity_complete, "{source}");
+        assert!(!coverage.applicability_complete, "{source}");
+    }
+}

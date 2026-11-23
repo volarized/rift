@@ -220,6 +220,7 @@ pub struct SyntaxFacts {
     scope: Option<Vec<Scope>>,
     static_facts: Option<crate::StaticFacts>,
     has_errors: bool,
+    variance_errors_only: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
     source_digest: Option<FileDigest>,
@@ -271,6 +272,7 @@ impl PartialEq for SyntaxFacts {
             scope,
             static_facts,
             has_errors,
+            variance_errors_only,
             left_out_declarations,
             markdown_facts,
             source_digest,
@@ -286,6 +288,7 @@ impl PartialEq for SyntaxFacts {
             && *scope == other.scope
             && *static_facts == other.static_facts
             && *has_errors == other.has_errors
+            && *variance_errors_only == other.variance_errors_only
             && *left_out_declarations == other.left_out_declarations
             && *markdown_facts == other.markdown_facts
             && *source_digest == other.source_digest
@@ -483,6 +486,7 @@ impl SyntaxDocument {
                 scope: None,
                 static_facts: None,
                 has_errors,
+                variance_errors_only: false,
                 left_out_declarations,
                 markdown_facts: None,
                 source_digest: None,
@@ -502,6 +506,14 @@ impl SyntaxDocument {
             path,
             facts: Arc::clone(&self.facts),
         }
+    }
+
+    /// Keeps the provider's checked variance coverage separate from raw parser errors.
+    pub(crate) fn with_variance_errors_only(mut self, proven: bool) -> Self {
+        if proven {
+            Arc::make_mut(&mut self.facts).variance_errors_only = true;
+        }
+        self
     }
 
     /// Attaches facts extracted from the same Markdown tree.
@@ -746,6 +758,13 @@ impl SyntaxFacts {
         }
     }
 
+    /// Whether the provider parsed the declaration inventory or explained each parser error
+    /// by a checked TypeScript variance annotation.
+    #[must_use]
+    pub const fn declaration_syntax_complete(&self) -> bool {
+        !self.has_errors || self.variance_errors_only
+    }
+
     /// Returns Markdown block and inline facts when the Markdown provider produced them.
     #[must_use]
     pub const fn markdown_facts(&self) -> Option<&MarkdownFacts> {
@@ -811,6 +830,8 @@ impl SyntaxFacts {
             scope: parts.scope,
             static_facts: parts.static_facts,
             has_errors: parts.has_errors,
+            // Restored syntax facts do not carry the provider's comparison parse.
+            variance_errors_only: false,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,
             source_digest: Some(parts.source_digest),
