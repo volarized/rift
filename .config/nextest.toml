@@ -77,10 +77,10 @@ global-timeout = "480s"
 fail-fast = false
 failure-output = "immediate-final"
 
-# The wide syntax cases compare process CPU time. On native Windows Arm64,
+# The wide syntax cases compare process CPU time. On native Windows,
 # run them early and one at a time so they can overlap the rest of the suite.
 [[profile.ci.overrides]]
-platform = { host = "aarch64-pc-windows-msvc", target = "aarch64-pc-windows-msvc" }
+platform = { host = "cfg(windows)", target = "cfg(windows)" }
 filter = 'binary(=wide_syntax_element_extraction)'
 threads-required = 1
 test-group = 'wide-syntax'
