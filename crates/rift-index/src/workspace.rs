@@ -62,7 +62,7 @@ use crate::capture::{
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::content_cache::WorkspaceContentCache;
-use crate::documentation::NotebookFiles;
+use crate::documentation::{AcceptedDeclarations, AttachmentSelection, NotebookFiles};
 use crate::edge::EdgeStore;
 use crate::language::{ClassifiedPath, WorkspaceLanguagePolicy};
 use crate::semantic::{BuiltSemantics, WorkspaceSemantics};
@@ -3041,12 +3041,12 @@ impl WorkspaceIndex {
             operation = "accepted_declarations",
             phase = "accepted_declarations",
             files = files.len(),
-            { accepted_declarations(&files, &semantics, &owner) }
+            { accepted_declarations(&files, &semantics, &owner, AttachmentSelection::Scan) }
         );
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
-            &declarations,
+            declarations.inputs(),
             &documentation_selection(text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             &rift_analysis::documentation::DocumentationLimits::from_configuration(
@@ -3168,13 +3168,17 @@ impl WorkspaceIndex {
             Some(self.semantics.graph()),
         )?;
         check_cancelled(cancelled)?;
-        let (declarations, canonical_examples) =
-            accepted_declarations(&files, &semantics, &self.owner);
+        let (declarations, canonical_examples) = accepted_declarations(
+            &files,
+            &semantics,
+            &self.owner,
+            AttachmentSelection::DuringAdmission,
+        );
         check_cancelled(cancelled)?;
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
-            &declarations,
+            declarations.inputs(),
             &documentation_selection(&self.text_inclusion)?,
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
             &rift_analysis::documentation::DocumentationLimits::from_configuration(
@@ -3312,11 +3316,12 @@ impl WorkspaceIndex {
             limits,
             previous.map(|index| index.semantics.graph()),
         )?;
-        let (declarations, canonical_examples) = accepted_declarations(&files, &semantics, &owner);
+        let (declarations, canonical_examples) =
+            accepted_declarations(&files, &semantics, &owner, AttachmentSelection::Scan);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
-            &declarations,
+            declarations.inputs(),
             &documentation_selection(&text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             &rift_analysis::documentation::DocumentationLimits::from_configuration(
@@ -5422,16 +5427,17 @@ fn built_contents_with_owner(
 }
 
 /// Collects the declarations the semantics graph accepted, as one stage of an index build.
-fn accepted_declarations(
-    files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
+fn accepted_declarations<'source>(
+    files: &'source BTreeMap<ProjectPath, Arc<IndexedFile>>,
     semantics: &WorkspaceSemantics,
     owner: &SymbolOwner,
-) -> (Vec<crate::documentation::DeclarationFacts>, Vec<SymbolId>) {
+    attachments: AttachmentSelection,
+) -> (AcceptedDeclarations<'source>, Vec<SymbolId>) {
     rift_tracing::traced!(
         component = "documentation",
         operation = "documentation.declarations",
         files = files.len(),
-        { crate::documentation::declarations(files, semantics, owner) }
+        { crate::documentation::declarations(files, semantics, owner, attachments) }
     )
 }
 
@@ -14176,6 +14182,7 @@ mod tests {
             &SymbolOwner::NamedLocal {
                 name: "cloud".to_owned(),
             },
+            crate::documentation::AttachmentSelection::Scan,
         );
         assert!(foreign.is_empty());
     }
