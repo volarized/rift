@@ -13,7 +13,7 @@ use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::{EdgeKind, Language};
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
 
-use super::{Binding, File, Index, Work};
+use super::{Binding, File, Index, StaticResolution, Work};
 use crate::NamespaceInput;
 
 mod names;
@@ -183,7 +183,7 @@ impl Owners {
 
     /// Owner and module segment of an ECMAScript module specifier.
     fn javascript(&self, file: &str, specifier: &str) -> Option<(SymbolOwner, String)> {
-        if specifier.is_empty() || specifier.starts_with(['.', '/', '#']) {
+        if !dependency_specifier(specifier) {
             return None;
         }
         if let Some(module) = specifier.strip_prefix(NODE_SCHEME) {
@@ -225,6 +225,10 @@ impl Owners {
         let identity = SymbolIdentity::new(owner, language, path).ok()?;
         rift_core::SymbolId::new(identity.wire_identity()).ok()
     }
+}
+
+fn dependency_specifier(specifier: &str) -> bool {
+    !specifier.is_empty() && !specifier.starts_with(['.', '/', '#'])
 }
 
 fn runtime(name: &str) -> SymbolOwner {
@@ -637,7 +641,66 @@ impl<'source> Index<'source> {
         let Binding::Found(binding) = file.binding(head, position, |_| true, work) else {
             return None;
         };
-        let (specifier, export) = self.javascript_binding_path(file, binding, work)?;
+        self.javascript_import_target(
+            file,
+            self.javascript_binding_path(file, binding, work)?,
+            tail,
+        )
+    }
+
+    /// Resolves a written TypeScript type through its nearest import binding.
+    ///
+    /// An imported type with no established package target keeps its unresolved coverage.
+    /// A local or ambiguous binding supplies no external observation.
+    pub(super) fn record_external_typescript_type_use(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) -> Option<()> {
+        let parts = identifier_path(file.text(range)?, ".", work)?;
+        let (head, tail) = parts.split_first()?;
+        let binding = super::javascript::js_binding(
+            file,
+            &self.javascript,
+            head,
+            range.start,
+            ReferenceRole::Type,
+            work,
+        )?;
+        if !matches!(
+            binding.kind,
+            StaticBindingKind::JavaScriptImport { .. }
+                | StaticBindingKind::JavaScriptEdgeNamespace { .. }
+        ) || file.javascript_reassigned(head, tail.first().map(String::as_str))
+        {
+            return None;
+        }
+        let import @ (specifier, _) = self.javascript_binding_path(file, binding, work)?;
+        // A directory specifier is also eligible for the relative module resolver.
+        if !dependency_specifier(specifier) || specifier.ends_with('/') {
+            return None;
+        }
+        let occurrence = self
+            .javascript_import_target(file, import, tail)
+            .and_then(|target| {
+                Self::external_occurrence(file, range, range, ReferenceRole::Type, target)
+            });
+        if let Some(occurrence) = occurrence {
+            result.external.push(occurrence);
+        } else {
+            result.record_kind(None, EdgeKind::HasType);
+        }
+        Some(())
+    }
+
+    fn javascript_import_target(
+        &self,
+        file: &File<'source>,
+        (specifier, export): (&str, Option<&str>),
+        tail: &[String],
+    ) -> Option<rift_core::SymbolId> {
         let (owner, module) = self
             .owners
             .javascript(file.document.path.as_str(), specifier)?;

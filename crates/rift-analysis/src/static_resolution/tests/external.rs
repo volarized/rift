@@ -186,6 +186,71 @@ fn typescript_sites_name_packages_and_node_modules() {
 }
 
 #[test]
+fn typescript_type_uses_name_external_imports_after_local_resolution() {
+    let source = r#"import type { ZodType as Imported } from "shape";
+import type * as node from "node:util";
+import type * as sibling from "./near";
+import type { Missing } from "undeclared";
+import type { Linked } from "linked";
+import type { ZodType as Contested } from "shape";
+import type { Missing as Contested } from "undeclared";
+export type Schema = Imported;
+export type Encoder = node.TextEncoder;
+export type Neighbor = sibling.Local;
+export type Unknown = Missing | Linked;
+export type Ambiguous = Contested;
+export type ValueQuery = typeof Imported;
+export function scoped<Imported>(value: Imported): Imported { return value; }
+"#;
+    let sources = [
+        ("index.ts", source),
+        ("near.ts", "export interface Local {}\n"),
+    ];
+    let metadata = [(
+        "package.json",
+        r#"{"name":"app","dependencies":{"shape":"npm:zod@^4","linked":"workspace:*"}}"#,
+    )];
+    let result = resolution("typescript", &sources, &metadata, WORK_MAX);
+    let external = result
+        .external
+        .iter()
+        .filter(|occurrence| occurrence.role == ReferenceRole::Type)
+        .map(|occurrence| {
+            let range = occurrence.binding.range();
+            let start = usize::try_from(range.start()).expect("type use start");
+            let end = usize::try_from(range.end()).expect("type use end");
+            (start, &source[start..end], occurrence.target.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    let schema = source.find("= Imported;").expect("schema type") + 2;
+    let encoder = source.find("node.TextEncoder").expect("namespace type");
+    assert_eq!(
+        external,
+        BTreeSet::from([
+            (
+                schema,
+                "Imported",
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType",
+            ),
+            (
+                encoder,
+                "node.TextEncoder",
+                "rift://symbol/stdlib/node/typescript/util/TextEncoder",
+            ),
+        ])
+    );
+    assert!(result.occurrences.iter().any(|occurrence| {
+        occurrence.role == ReferenceRole::Type
+            && matches!(&occurrence.target, rift_provider::NormalizedTarget::Symbol(id)
+                if id.as_str() == "rift://symbol/local/typescript/.%2Fnear.ts/Local")
+    }));
+    assert_eq!(result.omitted.get(&EdgeKind::HasType), Some(&2));
+    let exhausted = resolution("typescript", &sources, &metadata, 0);
+    assert!(exhausted.exhausted);
+    assert!(exhausted.external.is_empty());
+}
+
+#[test]
 fn python_annotation_sites_name_owned_types_without_crossing_generic_bindings() {
     let source = "from greeting import Base, T\nimport greeting as pkg\nclass Holder:\n    item: Base\n    other: pkg.Base\n\ndef generic[T](value: T) -> T:\n    pass\n";
     let result = resolution(

@@ -11,6 +11,75 @@ use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, Publicat
 
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
 
+#[test]
+fn package_stores_typescript_imported_type_uses_at_each_written_site() {
+    use rift_protocol::read::EdgeProvider;
+
+    let source = "import type { ZodType as Imported } from 'shape';\n\
+                  export type Schema = Imported;\n\
+                  export function accept(value: Imported): Imported { return value; }\n";
+    let analysis = fixture::package_result_with_metadata(
+        rift_syntax::ShippedLanguage::TypeScript,
+        vec![("index.ts", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"index.ts","dependencies":{"shape":"npm:zod@^4"}}"#,
+        )),
+    )
+    .expect("admitted TypeScript package");
+    let (publication, files, semantics, _) = analysis.into_parts();
+    let unit = files[0].placement.unit().to_string();
+    let target = "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType";
+    let rows = |edges: &[rift_protocol::index::StoredEdge]| {
+        let mut rows = edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::HasType] && edge.to.as_str() == target)
+            .map(|edge| {
+                let span = edge.occurrence.as_ref().expect("written type use");
+                assert_eq!(span.unit.as_str(), unit.as_str());
+                let start = usize::try_from(span.range.start).expect("type use start");
+                let end = usize::try_from(span.range.end).expect("type use end");
+                assert_eq!(&source[start..end], "Imported");
+                assert_eq!(edge.provider, EdgeProvider::Static);
+                assert_eq!(edge.derivation, EdgeDerivation::Syntax);
+                (edge.from.0.clone(), start)
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    let positions = source
+        .match_indices("Imported")
+        .skip(1)
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    let [alias, parameter, returns] = positions.as_slice() else {
+        panic!("one alias, parameter and return type use")
+    };
+    let expected = [
+        (
+            "rift://symbol/npm/registry.npmjs.org/beacon/typescript/beacon/Schema".to_owned(),
+            *alias,
+        ),
+        (
+            "rift://symbol/npm/registry.npmjs.org/beacon/typescript/beacon/accept".to_owned(),
+            *parameter,
+        ),
+        (
+            "rift://symbol/npm/registry.npmjs.org/beacon/typescript/beacon/accept".to_owned(),
+            *returns,
+        ),
+    ];
+    let stored = semantics
+        .edges()
+        .edges()
+        .map(crate::edge::Edge::to_protocol)
+        .collect::<Vec<_>>();
+    assert_eq!(rows(&stored), expected);
+    assert_eq!(rows(&publication.edges), expected);
+}
+
 struct GraphFixture {
     analysis: PackageAnalysis,
     owner: SymbolOwner,
