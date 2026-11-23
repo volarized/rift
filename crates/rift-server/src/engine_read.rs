@@ -3420,7 +3420,7 @@ mod tests {
         Ok(())
     }
 
-    const INCOMING_CALLERS_SOURCE: &str = r#"pub fn leaf() {}
+    const INCOMING_CALLERS_SOURCE: &str = r"pub fn leaf() {}
 
 pub fn only_nested() {
     let nested = || { leaf(); };
@@ -3445,7 +3445,7 @@ pub fn siblings() {
 }
 
 pub fn unlocated() {}
-"#;
+";
 
     #[test]
     fn incoming_graph_calls_keep_the_physical_caller_of_each_site() -> TestResult {
