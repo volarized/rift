@@ -1,6 +1,8 @@
 //! Resolves authored local destinations without fetching source bytes.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "collector")]
+use std::collections::HashSet;
 
 use percent_encoding::percent_decode_str;
 use rift_protocol::documentation::{
@@ -118,13 +120,21 @@ pub(super) struct DeclarationLinkNames<'declaration> {
 
 #[cfg(feature = "collector")]
 impl<'declaration> DeclarationLinkNames<'declaration> {
-    pub(super) fn new(declarations: &'declaration [super::DocumentationDeclaration<'_>]) -> Self {
+    pub(super) fn requested(
+        declarations: &'declaration [super::DocumentationDeclaration<'_>],
+        direct_names: &HashSet<&str>,
+        fragments: &HashSet<String>,
+    ) -> Self {
         let symbols = declarations
             .iter()
+            .filter(|declaration| direct_names.contains(declaration.symbol().0.as_str()))
             .map(|declaration| (declaration.symbol().0.as_str(), declaration.symbol()))
             .collect();
         let mut qualified = BTreeMap::new();
         for declaration in declarations {
+            if !fragments.contains(declaration.qualified_name()) {
+                continue;
+            }
             qualified
                 .entry((
                     declaration.source(),
@@ -134,6 +144,10 @@ impl<'declaration> DeclarationLinkNames<'declaration> {
                 .or_insert(Some(declaration.symbol()));
         }
         Self { symbols, qualified }
+    }
+
+    pub(super) fn bucket_count(&self) -> usize {
+        self.symbols.len() + self.qualified.len()
     }
 
     pub(super) fn direct(
@@ -181,26 +195,12 @@ impl<'declaration> DeclarationLinkNames<'declaration> {
 /// No spelling is inferred from prose or a generated heading fragment.
 #[cfg(feature = "collector")]
 pub(super) fn resolve_declaration_links(
-    sources: &[DocumentationSource],
-    blocks: &[DocumentationBlock],
+    sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
+    blocks: &BTreeMap<&rift_protocol::documentation::DocumentationDigest, &DocumentationBlock>,
     links: &mut [DocumentationLink],
-    declarations: &[super::DocumentationDeclaration<'_>],
+    names: &DeclarationLinkNames<'_>,
 ) -> Result<Vec<rift_protocol::documentation::DocumentationReference>, RiftError> {
     use rift_protocol::documentation::{DocumentationReference, DocumentationReferenceEvidence};
-    if declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_CEILING as usize {
-        return errors::analysis::documentation_limit_exceeded()
-            .field("declarations")
-            .fail();
-    }
-    let sources: BTreeMap<_, _> = sources
-        .iter()
-        .map(|source| (&source.identity, source))
-        .collect();
-    let blocks: BTreeMap<_, _> = blocks
-        .iter()
-        .map(|block| (&block.identity, block))
-        .collect();
-    let names = DeclarationLinkNames::new(declarations);
     let mut references = Vec::new();
     let mut occurrences = BTreeMap::new();
     for link in links {
