@@ -3974,6 +3974,11 @@ impl RiftMcp {
         let cancellation = self.validation.cancellation.clone();
         let validation = Arc::clone(&self.validation);
         let configuration = current.configuration.fingerprint;
+        let prepared_capture = current
+            .prepared_read_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         rift_tracing::debug_span!(
             "index.reconcile",
             component = "index",
@@ -3988,8 +3993,15 @@ impl RiftMcp {
                 let recorded = last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let last = Arc::clone(&recorded.files);
-                let reuse_selection = recorded.selection == Some((observed_epoch, configuration))
+                let request_capture = Arc::clone(&recorded.files);
+                let seed = prepared_capture
+                    .as_ref()
+                    .filter(|_| recorded.selection.is_none());
+                let (last, selection) = match seed {
+                    Some((epoch, capture)) => (Arc::clone(capture), Some((*epoch, configuration))),
+                    None => (Arc::clone(&request_capture), recorded.selection),
+                };
+                let reuse_selection = selection == Some((observed_epoch, configuration))
                     && !validation.watch_failed.load(Ordering::Acquire);
                 drop(recorded);
                 let cancelled = || cancellation.is_cancelled();
@@ -3998,6 +4010,7 @@ impl RiftMcp {
                 } else {
                     None
                 };
+                let reused_selection = recaptured.is_some();
                 let (digests, next) = match recaptured {
                     Some(captured) => captured,
                     None => rift_index::capture_digests_with_languages_cancellable(
@@ -4018,12 +4031,30 @@ impl RiftMcp {
                         .detail("captured build paths changed during validation")
                         .fail();
                 }
-                *last_capture
+                let mut recorded = last_capture
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = RequestCapture {
-                    files: Arc::new(next),
-                    selection: Some((observed_epoch, configuration)),
-                };
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut install = true;
+                if seed.is_some() {
+                    if cancelled() {
+                        return errors::server::read_cancelled().fail();
+                    }
+                    install = Arc::ptr_eq(&recorded.files, &request_capture);
+                    rift_tracing::debug!(
+                        component = "index",
+                        operation = "fingerprint.prepared_capture",
+                        reused_selection,
+                        install,
+                        capture = ?next,
+                    );
+                }
+                if install {
+                    *recorded = RequestCapture {
+                        files: Arc::new(next),
+                        selection: Some((observed_epoch, configuration)),
+                    };
+                }
+                drop(recorded);
                 let configuration = rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.configuration",
@@ -8950,6 +8981,76 @@ done
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .files
             .reuses_unchanged_paths()
+    }
+
+    #[tokio::test]
+    async fn complete_startup_capture_is_offered_to_one_current_symbol_read() -> TestResult {
+        let (directory, assembled) = Box::pin(unsupervised_fixture()).await?;
+        let server = &assembled.server;
+        let current = current_publication(server).await;
+        assert!(current.preparation.is_none());
+
+        let configuration = &current.configuration;
+        let (_, independent) = super::capture_digests_with_languages(
+            directory.path(),
+            configuration.index_limits(WorkspaceIndexLimits::default())?,
+            &configuration.source_visibility(),
+            &configuration.text_inclusion(),
+            &configuration.language_file_selections(),
+            &super::LastCapture::default(),
+        )?;
+        let offered = current
+            .prepared_read_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|(_, capture)| Arc::clone(capture));
+        assert_eq!(offered.is_some(), independent.reuses_unchanged_paths());
+
+        let id = captured_traversal_seed(&current.reads, "beacon")?;
+        let params: rift_protocol::symbol_read::GetSymbolParams =
+            serde_json::from_value(json!({"id": id}))?;
+        let read = || server.get_symbol(Parameters(params.clone()), rmcp::model::Extensions::new());
+        let first = read().await?.0;
+        let rift_protocol::symbol_read::GetSymbolResult::Found {
+            symbol,
+            declarations,
+            warnings,
+            ..
+        } = &first
+        else {
+            return Err(format!("canonical beacon must be found: {first:?}").into());
+        };
+        assert_eq!(symbol.id.as_ref().map(|id| id.as_str()), Some(id.as_str()));
+        assert_eq!(declarations.len(), 1);
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. }))
+        );
+        assert!(
+            current
+                .prepared_read_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+        {
+            let recorded = server
+                .last_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(recorded.selection.is_some());
+            if let Some(offered) = offered {
+                assert!(!Arc::ptr_eq(&recorded.files, &offered));
+            }
+        }
+        let repeated = read().await?.0;
+        assert_eq!(
+            serde_json::to_value(first)?,
+            serde_json::to_value(repeated)?
+        );
+        Ok(())
     }
 
     #[tokio::test]

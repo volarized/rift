@@ -317,6 +317,8 @@ pub(crate) struct PublishedWorkspace {
     pub(crate) fingerprint: WorkspaceFingerprint,
     pub(crate) source_policy: Option<Arc<WorkspaceSourcePolicy>>,
     pub(crate) preparation: Option<LocalIndexPreparation>,
+    /// The complete startup capture and its discovery epoch, offered to one request.
+    pub(crate) prepared_read_capture: std::sync::Mutex<Option<(u64, Arc<LastCapture>)>>,
     /// Workspace resource digests captured with this publication. Prepared publications
     /// carry the indexed batch; complete publications carry every visible file.
     pub(crate) visible_digests: Arc<WorkspaceDigests>,
@@ -373,6 +375,7 @@ impl PublishedWorkspace {
             fingerprint: self.fingerprint.clone(),
             source_policy: self.source_policy.as_ref().map(Arc::clone),
             preparation: self.preparation.clone(),
+            prepared_read_capture: std::sync::Mutex::default(),
             visible_digests: Arc::clone(&self.visible_digests),
             visible_refused: Arc::clone(&self.visible_refused),
             map,
@@ -2308,6 +2311,7 @@ pub(crate) fn empty_workspace_preparation_with_owner(
         configuration,
         source_policy: None,
         preparation: Some(preparation_state),
+        prepared_read_capture: std::sync::Mutex::default(),
         visible_digests: Arc::new(WorkspaceDigests::default()),
         visible_refused: Arc::new(BTreeMap::new()),
         map,
@@ -2757,6 +2761,7 @@ fn whole_workspace_candidate(
         configuration,
         source_policy,
         preparation: None,
+        prepared_read_capture: std::sync::Mutex::default(),
         visible_digests: visible_files.digests,
         visible_refused: visible_files.refused,
         map,
@@ -2857,6 +2862,7 @@ fn shared_workspace_candidate(
         configuration,
         source_policy: previous.source_policy.as_ref().map(Arc::clone),
         preparation: previous.preparation.clone(),
+        prepared_read_capture: std::sync::Mutex::default(),
         visible_digests: visible_files.digests,
         visible_refused: visible_files.refused,
         map,
@@ -4350,7 +4356,7 @@ async fn publish_initial_empty(
                     &root,
                     &state,
                     &validation,
-                    &candidate,
+                    &Arc::new(candidate),
                     lexical,
                 ))
             },
@@ -4559,7 +4565,7 @@ fn prepare_initial_batch(
         map_source_paths: batch.map_source_paths,
         map_text_paths: batch.map_text_paths,
     });
-    let candidate = preparation_publication(
+    let mut candidate = preparation_publication(
         &batch.root,
         index,
         Arc::clone(&batch.source_policy),
@@ -4578,19 +4584,32 @@ fn prepare_initial_batch(
             candidate.reads.prepare_reads();
         });
     }
-    if batch.complete
-        && !complete_preparation_matches(
+    if batch.complete {
+        let discovery_epoch = batch.validation.discovery_epoch();
+        if !complete_preparation_matches(
             &batch.root,
             &batch.configuration,
             &batch.source_policy,
             &preparation,
             candidate.reads.workspace_limits(),
+            &mut last,
             &cancelled,
-        )?
-    {
-        let pending = batch.validation.locked_pending();
-        trace_preparation_superseded(candidate.epoch, batch.validation.observed_epoch(), &pending);
-        return Ok((preparation, last, RebuildOutcome::Superseded));
+        )? {
+            let pending = batch.validation.locked_pending();
+            trace_preparation_superseded(
+                candidate.epoch,
+                batch.validation.observed_epoch(),
+                &pending,
+            );
+            return Ok((preparation, last, RebuildOutcome::Superseded));
+        }
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
+        if last.reuses_unchanged_paths() {
+            candidate.prepared_read_capture =
+                std::sync::Mutex::new(Some((discovery_epoch, Arc::new(std::mem::take(&mut last)))));
+        }
     }
     let handoff = if batch.complete {
         batch
@@ -4603,7 +4622,7 @@ fn prepare_initial_batch(
         &batch.root,
         &batch.state,
         &batch.validation,
-        &candidate,
+        &Arc::new(candidate),
         handoff,
     );
     Ok((preparation, last, outcome))
@@ -4616,10 +4635,11 @@ fn complete_preparation_matches(
     source_policy: &WorkspaceSourcePolicy,
     preparation: &WorkspaceIndexPreparation,
     limits: WorkspaceIndexLimits,
+    last: &mut LastCapture,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<bool, RiftError> {
     let visibility = configuration.source_visibility();
-    if !preparation.discovered_paths_unchanged(&visibility, cancelled)? {
+    if !preparation.retain_complete_capture_selection(&visibility, last, cancelled)? {
         return Ok(false);
     }
     let current = WorkspaceSourcePolicy::build_with_languages_cancellable(
@@ -4648,7 +4668,7 @@ fn preparation_publication(
     preparation: Option<LocalIndexPreparation>,
     epoch: u64,
     cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<Arc<PublishedWorkspace>, RiftError> {
+) -> Result<PublishedWorkspace, RiftError> {
     if cancelled() {
         return errors::server::read_cancelled().fail();
     }
@@ -4680,18 +4700,19 @@ fn preparation_publication(
         complete_visible_digests(root, &reads, &source_policy)?
     };
     let map = publication_map(&reads, preparation.as_ref(), configuration);
-    Ok(Arc::new(PublishedWorkspace {
+    Ok(PublishedWorkspace {
         engine_inventory: Arc::default(),
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration: configuration.clone(),
         source_policy: Some(source_policy),
         preparation,
+        prepared_read_capture: std::sync::Mutex::default(),
         visible_digests: visible_files.digests,
         visible_refused: visible_files.refused,
         map,
         epoch,
-    }))
+    })
 }
 
 /// Publishes one preparation batch's candidate under the publication lane, unless the
@@ -4726,6 +4747,9 @@ fn publish_preparation_after(
         return RebuildOutcome::Superseded;
     };
     let mut state = write_published(published);
+    if validation.cancellation.is_cancelled() {
+        return RebuildOutcome::Cancelled;
+    }
     if state.current.preparation.is_none() || answer.epoch < state.current.epoch {
         drop(state);
         drop(pending);
