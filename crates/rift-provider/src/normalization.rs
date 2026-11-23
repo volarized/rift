@@ -374,15 +374,10 @@ impl Normalizer {
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
         let references = reference_index(&contributions);
-        let mut anchors = contributions
-            .iter()
-            .map(|contribution| contribution_anchors(contribution))
-            .collect::<Vec<_>>();
+        let mut groups = UnionFind::new(contributions.len());
+        let mut anchors = initial_anchors(&contributions, &mut groups);
         let mut candidates = Vec::new();
         let edges = association_edges(&contributions, &references, &mut candidates);
-        let mut groups = UnionFind::new(contributions.len());
-
-        union_established_anchors(&mut groups, &anchors);
         union_compatible_edges(&mut groups, &edges, &anchors);
         anchors = component_anchors(&mut groups, &anchors);
         let conflicting = attach_unanchored_components(
@@ -408,20 +403,27 @@ impl Normalizer {
     }
 }
 
-fn union_established_anchors(groups: &mut UnionFind, anchors: &[BTreeSet<SymbolId>]) {
+fn initial_anchors(
+    contributions: &[&Contribution],
+    groups: &mut UnionFind,
+) -> Vec<BTreeSet<SymbolId>> {
     let mut identities = BTreeMap::new();
-    for (index, values) in anchors.iter().enumerate() {
-        if values.len() != 1 {
-            continue;
-        }
-        let identity = values.iter().next().expect("one identity");
-        if rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).is_err() {
-            continue;
-        }
-        if let Some(previous) = identities.insert(identity, index) {
-            groups.union(previous, index);
-        }
-    }
+    contributions
+        .iter()
+        .enumerate()
+        .map(|(index, contribution)| {
+            let mut anchors = BTreeSet::new();
+            if let Some(identity) = contribution.identity_anchor()
+                && rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).is_ok()
+            {
+                if let Some(previous) = identities.insert(identity, index) {
+                    groups.union(previous, index);
+                }
+                anchors.insert(identity.clone());
+            }
+            anchors
+        })
+        .collect()
 }
 
 fn applicable_contributions(
@@ -446,16 +448,6 @@ fn reference_index(contributions: &[&Contribution]) -> BTreeMap<ContributionRefe
         .enumerate()
         .map(|(index, contribution)| (contribution.key().reference().clone(), index))
         .collect()
-}
-
-fn contribution_anchors(contribution: &Contribution) -> BTreeSet<SymbolId> {
-    let mut anchors = BTreeSet::new();
-    if let Some(identity) = contribution.identity_anchor()
-        && rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).is_ok()
-    {
-        anchors.insert(identity.clone());
-    }
-    anchors
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1689,6 +1681,63 @@ mod tests {
             assert_eq!(
                 graph.identity_for(&reference(provider, "Beacon")),
                 Some(record.identity().expect("identity"))
+            );
+        }
+        assert!(graph.candidates().is_empty());
+    }
+
+    #[test]
+    fn canonical_anchor_union_preserves_record_and_member_order() {
+        let shared = "rift://symbol/local/rust/app/Shared";
+        let distinct = "rift://symbol/local/rust/app/Distinct";
+        let invalid = "rift://symbol/rust/app/Legacy";
+        let rows = [
+            ("z-first", shared),
+            ("intervening", distinct),
+            ("a-later", shared),
+            ("invalid", invalid),
+            ("m-last", shared),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (symbol, identity))| {
+            exact(
+                "syntax",
+                1,
+                symbol,
+                1,
+                binding(
+                    "src/lib.rs",
+                    u64::try_from(index).expect("fixture index") * 16,
+                ),
+                Some(identity),
+                vec![],
+            )
+        })
+        .collect();
+        let set = publications(vec![publication("syntax", 1, rows)]);
+        let graph = normalize(&set, 1, None);
+        assert_eq!(graph.records().len(), 3);
+        let combined = &graph.records()[0];
+        assert_eq!(combined.identity().map(SymbolId::as_str), Some(shared));
+        let members = combined
+            .contributions()
+            .iter()
+            .map(|key| key.reference().symbol().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(members, ["a-later", "m-last", "z-first"]);
+        assert_eq!(
+            graph.records()[1].identity().map(SymbolId::as_str),
+            Some(distinct)
+        );
+        assert_eq!(
+            graph.records()[2].resolution(),
+            SymbolResolution::Unresolved
+        );
+        for symbol in ["z-first", "a-later", "m-last"] {
+            assert_eq!(
+                graph.record_position_for(&reference("syntax", symbol)),
+                Some(0)
             );
         }
         assert!(graph.candidates().is_empty());
