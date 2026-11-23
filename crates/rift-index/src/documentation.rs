@@ -58,12 +58,44 @@ impl HeldNotebook {
     }
 }
 
+/// Where attachment eligibility is checked for this publication.
+#[derive(Clone, Copy)]
+pub(crate) enum AttachmentSelection {
+    Scan,
+    DuringAdmission,
+}
+
+type AttachmentSource<'source> = (&'source CoreProjectPath, &'source IndexedFile);
+type PhysicalDeclaration<'name> = (&'name str, u64, u64);
+
+/// The accepted documentation facts and optional exact ordered attachment sources.
+pub(crate) struct AcceptedDeclarations<'source> {
+    facts: Vec<DeclarationFacts>,
+    attachment_sources: Option<Vec<AttachmentSource<'source>>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DeclarationInputs<'facts, 'source> {
+    facts: &'facts [DeclarationFacts],
+    attachment_sources: Option<&'facts [AttachmentSource<'source>]>,
+}
+
+impl<'source> AcceptedDeclarations<'source> {
+    pub(crate) fn inputs(&self) -> DeclarationInputs<'_, 'source> {
+        DeclarationInputs {
+            facts: &self.facts,
+            attachment_sources: self.attachment_sources.as_deref(),
+        }
+    }
+}
+
 /// Collects declarations the semantic publication accepted.
-pub(crate) fn declarations(
-    files: &BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
+pub(crate) fn declarations<'source>(
+    files: &'source BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
     semantics: &WorkspaceSemantics,
     owner: &rift_protocol::identity::SymbolOwner,
-) -> (Vec<DeclarationFacts>, Vec<rift_core::SymbolId>) {
+    selection: AttachmentSelection,
+) -> (AcceptedDeclarations<'source>, Vec<rift_core::SymbolId>) {
     let mut declarations = Vec::new();
     let mut examples = Vec::new();
     // Declarations sharing one identity share one record. Assembling the record once per
@@ -71,18 +103,27 @@ pub(crate) fn declarations(
     // reference and edge in the graph: quadratic in the number of colliding declarations.
     // Each record's readable identity is answered once and reused.
     let mut records = BTreeMap::<usize, Option<ReadableIdentity>>::new();
-    for file in files.values() {
+    let collect_attachments = matches!(selection, AttachmentSelection::DuringAdmission);
+    let mut attachment_sources = collect_attachments.then(Vec::new);
+    let mut attachment_candidate_rows = 0_usize;
+    for (path, file) in files {
         let language = file.syntax().language();
+        let initial = declarations.len();
+        let mut attachment = AttachmentAdmission::default();
         for symbol in file.syntax().symbols() {
             let identity =
                 symbol.provider_address(&language.identity_segment(), file.path().as_str());
-            let Some(position) = semantics.record_position(&identity) else {
-                continue;
+            let readable = match semantics.record_position(&identity) {
+                Some(position) => records
+                    .entry(position)
+                    .or_insert_with(|| ReadableIdentity::at(semantics, position, owner))
+                    .as_ref(),
+                None => None,
             };
-            let Some(readable) = records
-                .entry(position)
-                .or_insert_with(|| ReadableIdentity::at(semantics, position, owner))
-            else {
+            if collect_attachments && !symbol.documentation_ranges.is_empty() {
+                attachment.consider(symbol, readable.is_some());
+            }
+            let Some(readable) = readable else {
                 continue;
             };
             if readable.owned
@@ -95,9 +136,67 @@ pub(crate) fn declarations(
             declaration.language = readable.language.clone();
             declarations.push(declaration);
         }
+        if let Some(sources) = &mut attachment_sources
+            && attachment.applies(&declarations[initial..], &mut attachment_candidate_rows)
+        {
+            sources.push((path, file.as_ref()));
+        }
+    }
+    if let Some(sources) = &attachment_sources {
+        rift_tracing::debug!(
+            component = "documentation",
+            operation = "documentation.attachment_admission",
+            declaration_rows = declarations.len(),
+            attachment_sources = sources.len(),
+            attachment_candidate_rows,
+        );
     }
     examples.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    (declarations, examples)
+    (
+        AcceptedDeclarations {
+            facts: declarations,
+            attachment_sources,
+        },
+        examples,
+    )
+}
+
+#[derive(Default)]
+struct AttachmentAdmission<'file> {
+    confirmed: bool,
+    unresolved: BTreeSet<PhysicalDeclaration<'file>>,
+}
+
+impl<'file> AttachmentAdmission<'file> {
+    fn consider(&mut self, symbol: &'file rift_syntax::SyntaxSymbol, readable: bool) {
+        if self.confirmed {
+            return;
+        }
+        if readable {
+            self.confirmed = true;
+        } else {
+            self.unresolved.insert(physical_symbol(symbol));
+        }
+    }
+
+    fn applies(&self, accepted: &[DeclarationFacts], examined: &mut usize) -> bool {
+        // Provider ordinals differ even when two syntax rows share a name and range.
+        // The ordinary collector admits the physical tuple if either row was accepted.
+        self.confirmed
+            || (!self.unresolved.is_empty()
+                && accepted.iter().any(|declaration| {
+                    *examined += 1;
+                    self.unresolved.contains(&declaration.physical_key())
+                }))
+    }
+}
+
+fn physical_symbol(symbol: &rift_syntax::SyntaxSymbol) -> PhysicalDeclaration<'_> {
+    (
+        symbol.qualified_name.as_str(),
+        symbol.range.start,
+        symbol.range.end,
+    )
 }
 
 /// One record's established identity, parsed once for every declaration the record holds.
@@ -129,10 +228,10 @@ impl ReadableIdentity {
 
 /// Builds a validated documentation collection and decoded notebook cells from the text
 /// files `selection` collects as documentation.
-pub(crate) fn build(
-    files: &BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
-    text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
-    declarations: &[DeclarationFacts],
+pub(crate) fn build<'source>(
+    files: &'source BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
+    text_files: &'source BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
+    declarations: DeclarationInputs<'_, 'source>,
     selection: &DocumentationSelection,
     chunk_bytes_max: usize,
     limits: &DocumentationLimits,
@@ -186,19 +285,11 @@ pub(crate) fn build(
                 )?;
             }
 
-            append_attached_inputs(
-                files,
-                declarations,
-                chunk_bytes_max,
-                &mut collected.input_bytes,
-                &mut collected.omissions,
-                &mut collected.inputs,
-                limits,
-            )?;
+            append_attached_inputs(files, &declarations, chunk_bytes_max, &mut collected)?;
 
             let collection = finish_collection(
                 collected.inputs,
-                declarations,
+                declarations.facts,
                 collected.omissions,
                 previous.map(|(documentation, _)| documentation),
                 limits,
@@ -389,41 +480,67 @@ fn decode_notebooks(
 
 fn append_attached_inputs<'source>(
     files: &'source BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
-    declarations: &[DeclarationFacts],
+    declarations: &DeclarationInputs<'_, 'source>,
     chunk_bytes_max: usize,
-    input_bytes: &mut u64,
-    omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
-    inputs: &mut Vec<DocumentationInput<'source>>,
-    limits: &DocumentationLimits,
+    collected: &mut CollectedInputs<'source>,
 ) -> Result<(), RiftError> {
-    let attached_symbols = attached_symbols(declarations);
+    if let Some(sources) = declarations.attachment_sources {
+        for &(path, file) in sources {
+            append_attached_input(
+                path,
+                file,
+                project_owner(path, None),
+                chunk_bytes_max,
+                collected,
+            )?;
+        }
+        return Ok(());
+    }
+    let attached_symbols = attached_symbols(declarations.facts);
     for (path, file) in files {
         let identity = project_owner(path, None);
-        if !has_attached_declaration(file, path, &identity, &attached_symbols) {
-            continue;
+        if has_attached_declaration(file, path, &identity, &attached_symbols) {
+            append_attached_input(path, file, identity, chunk_bytes_max, collected)?;
         }
-        check_next_source_count(path, inputs.len(), omissions.len(), limits)?;
-        let text = file.source();
-        let source_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        if source_bytes > limits.source_bytes_max()
-            || (*input_bytes).saturating_add(source_bytes) > limits.total_bytes_max()
-        {
-            omissions.push((identity, DocumentationWarningKind::SourceUnavailable));
-            continue;
+    }
+    Ok(())
+}
+
+fn append_attached_input<'source>(
+    path: &CoreProjectPath,
+    file: &'source IndexedFile,
+    identity: DocumentationContentIdentity,
+    chunk_bytes_max: usize,
+    collected: &mut CollectedInputs<'source>,
+) -> Result<(), RiftError> {
+    check_next_source_count(
+        path,
+        collected.inputs.len(),
+        collected.omissions.len(),
+        &collected.limits,
+    )?;
+    let text = file.source();
+    let source_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if source_bytes > collected.limits.source_bytes_max()
+        || collected.input_bytes.saturating_add(source_bytes) > collected.limits.total_bytes_max()
+    {
+        collected
+            .omissions
+            .push((identity, DocumentationWarningKind::SourceUnavailable));
+        return Ok(());
+    }
+    let mut source = source_text(&identity, text, DocumentationSourceFormat::AttachedComment);
+    source.language = Some(file.syntax().language().clone());
+    let chunks = regular_chunks(path, text, chunk_bytes_max);
+    let input = DocumentationInput::with_limits(source, text, &collected.limits)
+        .and_then(|input| input.with_chunks(chunks))
+        .and_then(|input| input.with_indexed_syntax(file.path(), file.syntax_facts()));
+    match input {
+        Ok(input) => {
+            collected.input_bytes = collected.input_bytes.saturating_add(source_bytes);
+            collected.inputs.push(input);
         }
-        let mut source = source_text(&identity, text, DocumentationSourceFormat::AttachedComment);
-        source.language = Some(file.syntax().language().clone());
-        let chunks = regular_chunks(path, text, chunk_bytes_max);
-        let input = DocumentationInput::with_limits(source, text, limits)
-            .and_then(|input| input.with_chunks(chunks))
-            .and_then(|input| input.with_indexed_syntax(file.path(), file.syntax_facts()));
-        match input {
-            Ok(input) => {
-                *input_bytes = (*input_bytes).saturating_add(source_bytes);
-                inputs.push(input);
-            }
-            Err(error) => omissions.push((identity, warning_kind(&error))),
-        }
+        Err(error) => collected.omissions.push((identity, warning_kind(&error))),
     }
     Ok(())
 }
@@ -440,11 +557,7 @@ fn attached_symbols(declarations: &[DeclarationFacts]) -> AttachedSymbols<'_> {
         by_source
             .entry(&declaration.source)
             .or_insert_with(BTreeSet::new)
-            .insert((
-                declaration.qualified_name.as_str(),
-                declaration.range.start,
-                declaration.range.end,
-            ));
+            .insert(declaration.physical_key());
     }
     by_source
 }
@@ -460,11 +573,7 @@ fn has_attached_declaration(
     };
     file.syntax().symbols().iter().any(|symbol| {
         !symbol.documentation_ranges.is_empty()
-            && accepted_symbols.contains(&(
-                symbol.qualified_name.as_str(),
-                symbol.range.start,
-                symbol.range.end,
-            ))
+            && accepted_symbols.contains(&physical_symbol(symbol))
     })
 }
 
@@ -623,6 +732,14 @@ impl DeclarationFacts {
         }
     }
 
+    fn physical_key(&self) -> PhysicalDeclaration<'_> {
+        (
+            self.qualified_name.as_str(),
+            self.range.start,
+            self.range.end,
+        )
+    }
+
     fn validated(&self) -> Result<DocumentationDeclaration<'_>, RiftError> {
         DocumentationDeclaration::new(
             &self.symbol,
@@ -777,7 +894,7 @@ fn warning_kind(error: &RiftError) -> DocumentationWarningKind {
 mod tests {
     use super::{NotebookFiles, cell_documents, cell_documents_for, decode_notebooks, errors};
     use crate::workspace::TextSourceFile;
-    use crate::{WorkspaceIndex, WorkspaceIndexLimits};
+    use crate::{FileDigest, FileRecord, PathChanges, WorkspaceIndex, WorkspaceIndexLimits};
     use rift_core::{SourceVisibility, TextFileInclusion};
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -858,6 +975,13 @@ mod tests {
         );
     }
 
+    fn scanned_declarations(facts: &[super::DeclarationFacts]) -> super::DeclarationInputs<'_, '_> {
+        super::DeclarationInputs {
+            facts,
+            attachment_sources: None,
+        }
+    }
+
     fn default_selection() -> rift_analysis::DocumentationSelection {
         rift_analysis::DocumentationSelection::new(
             &rift_protocol::documentation::DocumentationConfiguration::default(),
@@ -883,7 +1007,7 @@ mod tests {
         let (collection, _) = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             1_024,
             &limits,
@@ -899,7 +1023,7 @@ mod tests {
         let (collection, _) = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             1_024,
             &limits,
@@ -966,7 +1090,7 @@ mod tests {
         let (collection, _) = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             5,
             &limits,
@@ -985,7 +1109,7 @@ mod tests {
         let (collection, _) = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             5,
             &limits,
@@ -1034,7 +1158,7 @@ mod tests {
         let (collection, notebooks) = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             1_024,
             &limits,
@@ -1054,7 +1178,7 @@ mod tests {
         let error = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             1_024,
             &limits,
@@ -1089,7 +1213,7 @@ mod tests {
         let (collection, notebooks) = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             1_024,
             &rift_analysis::documentation::DocumentationLimits::default(),
@@ -1134,7 +1258,7 @@ mod tests {
         let error = super::build(
             &BTreeMap::new(),
             &text_files,
-            &[],
+            scanned_declarations(&[]),
             &default_selection(),
             1_024,
             &rift_analysis::documentation::DocumentationLimits::default(),
@@ -1254,7 +1378,7 @@ mod tests {
         let (collection, _) = super::build(
             &files,
             &BTreeMap::new(),
-            std::slice::from_ref(&accepted_facts),
+            scanned_declarations(std::slice::from_ref(&accepted_facts)),
             &default_selection(),
             1_024,
             &rift_analysis::documentation::DocumentationLimits::default(),
@@ -1313,6 +1437,202 @@ mod tests {
             &owner,
             &no_comment
         ));
+        assert_attachment_admission_for_duplicate(file, accepted, plain, &canonical);
+    }
+
+    fn assert_attachment_admission_for_duplicate(
+        file: &crate::IndexedFile,
+        documented: &rift_syntax::SyntaxSymbol,
+        other: &rift_syntax::SyntaxSymbol,
+        canonical: &impl Fn(&str) -> rift_protocol::read::SymbolId,
+    ) {
+        // The documented row had no accepted identity. Another physical row can
+        // supply its tuple despite having a distinct provider declaration ordinal.
+        let mut accepted = documented.clone();
+        accepted.declaration_ordinal += 1;
+        accepted.documentation_ranges.clear();
+        let matching = super::DeclarationFacts::new(file, &accepted, canonical("accepted"));
+        let different = super::DeclarationFacts::new(file, other, canonical("plain"));
+        let mut admission = super::AttachmentAdmission::default();
+        admission.consider(documented, false);
+        let mut examined = 0;
+        assert!(!admission.applies(&[], &mut examined));
+        assert!(!admission.applies(std::slice::from_ref(&different), &mut examined));
+        assert!(admission.applies(&[different, matching], &mut examined));
+        assert_eq!(examined, 3);
+    }
+
+    fn write_attachment_library(root: &std::path::Path, modules: &str) {
+        std::fs::create_dir(root.join("src")).expect("Cargo source directory");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )
+        .expect("captured Cargo library owner");
+        std::fs::write(root.join("src/lib.rs"), modules).expect("declared library modules");
+    }
+
+    fn assert_attachment_paths(index: &rift_protocol::documentation::DocumentationIndex) {
+        use rift_protocol::documentation::{
+            DocumentationSourceFormat, DocumentationSourceIdentity,
+        };
+        let paths = index
+            .sources
+            .iter()
+            .filter(|source| source.format == DocumentationSourceFormat::AttachedComment)
+            .map(|source| match &source.identity.source {
+                DocumentationSourceIdentity::Project { path } => path.0.as_str(),
+                other @ DocumentationSourceIdentity::Package { .. } => {
+                    panic!("unexpected attached owner {other:?}")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["src/a.rs", "src/z.rs"]);
+    }
+
+    fn attachment_workspace(
+        root: &std::path::Path,
+        inclusion: &TextFileInclusion,
+    ) -> WorkspaceIndex {
+        WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            inclusion,
+        )
+        .expect("cold attachment workspace")
+    }
+
+    fn save_for_attachment_rebuild(
+        index: &WorkspaceIndex,
+        root: &std::path::Path,
+        name: &str,
+        content: &str,
+    ) -> PathChanges {
+        std::fs::write(root.join(name), content).expect("save source");
+        let path = rift_core::ProjectPath::new(name).expect("source path");
+        let current = FileRecord::Digest(FileDigest::of(content.as_bytes()));
+        let changes = PathChanges::resolve([(path, Some(current))], |path| index.record(path));
+        assert_eq!(changes.len(), 1);
+        changes
+    }
+
+    #[test]
+    fn named_attachments_preserve_full_documentation_and_wake_missing_names() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        write_attachment_library(root, "pub mod a;\npub mod z;\n");
+        let original = "/// The original comment.\npub fn original() {}\n";
+        let changed = "/// The new comment.\npub fn newly_visible() {}\n";
+        std::fs::write(root.join("src/a.rs"), original).expect("first source");
+        std::fs::write(
+            root.join("src/z.rs"),
+            "/// Another comment.\npub fn another() {}\n",
+        )
+        .expect("other source");
+        std::fs::write(root.join("guide.md"), "# Guide\n\nSee `newly_visible`.\n")
+            .expect("unchanged guide");
+        let inclusion = TextFileInclusion::default();
+        let initial = attachment_workspace(root, &inclusion);
+        let held = initial.documentation_snapshot();
+        let initial_rows = held.index().clone();
+        assert!(
+            initial_rows
+                .unresolved_references
+                .iter()
+                .any(|row| row.authored == "newly_visible")
+        );
+        assert_attachment_paths(&initial_rows);
+        assert_eq!(initial_rows.sources.len(), 3);
+
+        let input = save_for_attachment_rebuild(&initial, root, "src/a.rs", changed);
+        let current = initial.rebuilt(&input).expect("named documentation edit");
+        let cold = attachment_workspace(root, &inclusion);
+        assert_eq!(
+            current.documentation().index(),
+            cold.documentation().index()
+        );
+        assert_eq!(held.index(), &initial_rows);
+        assert_attachment_paths(current.documentation().index());
+        assert!(
+            current
+                .documentation()
+                .index()
+                .references
+                .iter()
+                .any(|row| row.authored == "newly_visible")
+        );
+        assert_ne!(
+            current.documentation().index().selection_digest,
+            initial_rows.selection_digest
+        );
+
+        let input = save_for_attachment_rebuild(&current, root, "src/a.rs", original);
+        let restored = current
+            .rebuilt(&input)
+            .expect("named documentation restore");
+        assert_eq!(restored.documentation().index(), &initial_rows);
+        assert_eq!(held.index(), &initial_rows);
+        assert_eq!(
+            restored.documentation().index(),
+            attachment_workspace(root, &inclusion)
+                .documentation()
+                .index()
+        );
+    }
+
+    #[test]
+    fn named_attachments_preserve_the_first_source_over_the_cap() {
+        use rift_protocol::documentation::DocumentationConfiguration;
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        write_attachment_library(root, "pub mod a;\npub mod b;\npub mod z;\n");
+        std::fs::write(root.join("src/a.rs"), "/// First.\npub fn first() {}\n")
+            .expect("first source");
+        std::fs::write(root.join("src/z.rs"), "/// Last.\npub fn last() {}\n")
+            .expect("last source");
+        let inclusion =
+            TextFileInclusion::default().with_documentation(DocumentationConfiguration {
+                enabled: false,
+                max_sources: 2,
+                ..Default::default()
+            });
+        let initial = attachment_workspace(root, &inclusion);
+        let held = initial.documentation_snapshot();
+        assert_attachment_paths(held.index());
+        assert_eq!(held.index().sources.len(), 2);
+        let input = save_for_attachment_rebuild(
+            &initial,
+            root,
+            "src/b.rs",
+            "/// Middle.\npub fn middle() {}\n",
+        );
+        let Err(named) = initial.rebuilt(&input) else {
+            panic!("named cap refusal");
+        };
+        let Err(cold) = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &inclusion,
+        ) else {
+            panic!("cold cap refusal");
+        };
+        assert_eq!(
+            named.slug(),
+            errors::index::workspace_documentation_limit::SLUG
+        );
+        assert_eq!(named.slug(), cold.slug());
+        assert_eq!(
+            named.context().collect::<Vec<_>>(),
+            cold.context().collect::<Vec<_>>()
+        );
+        assert!(
+            named
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/z.rs")
+        );
+        assert_eq!(held.index(), initial.documentation().index());
     }
 
     #[test]
