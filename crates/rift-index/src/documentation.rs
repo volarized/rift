@@ -1482,7 +1482,9 @@ mod tests {
             .filter(|source| source.format == DocumentationSourceFormat::AttachedComment)
             .map(|source| match &source.identity.source {
                 DocumentationSourceIdentity::Project { path } => path.0.as_str(),
-                other => panic!("unexpected attached owner {other:?}"),
+                other @ DocumentationSourceIdentity::Package { .. } => {
+                    panic!("unexpected attached owner {other:?}")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(paths, ["src/a.rs", "src/z.rs"]);
@@ -1605,15 +1607,17 @@ mod tests {
             "src/b.rs",
             "/// Middle.\npub fn middle() {}\n",
         );
-        let named = initial.rebuilt(&input).err().expect("named cap refusal");
-        let cold = WorkspaceIndex::build(
+        let Err(named) = initial.rebuilt(&input) else {
+            panic!("named cap refusal");
+        };
+        let Err(cold) = WorkspaceIndex::build(
             root,
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &inclusion,
-        )
-        .err()
-        .expect("cold cap refusal");
+        ) else {
+            panic!("cold cap refusal");
+        };
         assert_eq!(
             named.slug(),
             errors::index::workspace_documentation_limit::SLUG
