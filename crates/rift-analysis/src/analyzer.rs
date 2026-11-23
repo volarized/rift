@@ -705,7 +705,7 @@ fn publication_coverage(
                 inventory_complete &= units.get(&held.placement.unit().to_string()) == Some(&true);
                 inventory_complete &= held.file.syntax().left_out_declaration_count() == 0
                     || retained_syntax_complete;
-                syntax_complete &= !held.file.syntax().has_errors()
+                syntax_complete &= held.file.syntax().declaration_syntax_complete()
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
             let mut facts = vec![FactCoverage {
