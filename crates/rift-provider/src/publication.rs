@@ -124,6 +124,10 @@ impl ProviderPublication {
         self.revision
     }
 
+    pub(crate) fn ordinal(&self, symbol: &ProviderSymbolId) -> Option<usize> {
+        self.positions.get(symbol).copied()
+    }
+
     /// Returns immutable Contributions in provider order.
     #[must_use]
     pub const fn contributions(&self) -> &[Contribution] {

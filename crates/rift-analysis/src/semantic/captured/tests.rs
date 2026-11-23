@@ -46,16 +46,84 @@ fn static_project(
         ExactPackageLimits::new(16, 32_768),
     )
     .expect("captured context");
-    WorkspaceSemantics::build_captured_project_facts(
-        input,
-        files,
-        64,
-        64,
-        revision,
-        previous.map(WorkspaceSemantics::graph),
+    WorkspaceSemantics::prepare_captured_project_facts_after(input, files, 64, revision, previous)
+        .expect("captured admission")
+        .build(64, previous.map(WorkspaceSemantics::graph))
+        .expect("captured static semantics")
+        .semantics
+}
+
+#[test]
+fn unchanged_admitted_files_share_placements_and_facts_across_held_revisions() {
+    use get_size2::{GetSize, StandardTracker};
+    let stable = source_file("stable.mjs", "export function stable() {}");
+    let old = source_file("changed.mjs", "export function initial() {}");
+    let changed = source_file("changed.mjs", "/* moved */ export function fresh() {}");
+    let first = static_project(&[&stable, &old], 1, None);
+    let second = static_project(&[&stable, &changed], 2, Some(&first));
+    let third = static_project(&[&stable, &old], 3, Some(&second));
+    let cold = static_project(&[&stable, &old], 3, None);
+    let first_stable = &first.captured_sources.0[stable.path()];
+    for view in [&second, &third] {
+        let current = &view.captured_sources.0[stable.path()];
+        assert!(Arc::ptr_eq(&first_stable.placement, &current.placement));
+        assert!(first_stable.facts.ptr_eq(&current.facts));
+        let row = |view: &WorkspaceSemantics| {
+            let key = &view.graph().records()[0].contributions()[0];
+            view.graph()
+                .contribution(key)
+                .expect("provider row")
+                .facts()
+                .expect("facts")
+                .name()
+                .as_ptr()
+        };
+        assert_eq!(row(&first), row(view));
+    }
+    assert!(!Arc::ptr_eq(
+        &first.captured_sources.0[old.path()].placement,
+        &second.captured_sources.0[changed.path()].placement,
+    ));
+    assert_eq!(third.graph().records(), cold.graph().records());
+    assert_eq!(third.graph().references(), cold.graph().references());
+    assert_eq!(third.graph().edges(), cold.graph().edges());
+    let (first_bytes, tracker) = first.get_heap_size_with_tracker(StandardTracker::new());
+    let (second_bytes, tracker) = second.get_heap_size_with_tracker(tracker);
+    let (third_bytes, _) = third.get_heap_size_with_tracker(tracker);
+    eprintln!(
+        "held semantic material bytes by generation: {first_bytes}, {second_bytes}, {third_bytes}"
+    );
+    assert!(first_bytes > 0 && second_bytes > 0 && third_bytes > 0);
+    assert!(third_bytes < cold.get_heap_size_with_tracker(StandardTracker::new()).0);
+    let bounded_files = [&stable, &old];
+    let sources = bounded_files.map(|f| PackageSource::new(f.path(), f.source()));
+    let language = Language::from_identity_segment("javascript").expect("language");
+    let namespace = NamespaceInput::project(
+        &SymbolOwner::Local,
+        &language,
+        &sources,
+        &[],
+        &[],
+        ExactPackageLimits::new(16, 32_768),
     )
-    .expect("captured static semantics")
-    .semantics
+    .expect("namespace");
+    let bounded = WorkspaceSemantics::prepare_captured_project_facts_after(
+        namespace,
+        &bounded_files,
+        first_stable.rows.len(),
+        4,
+        Some(&third),
+    )
+    .expect("bounded admission");
+    assert_eq!(
+        bounded.beyond_declaration_bound(),
+        std::slice::from_ref(old.path())
+    );
+    assert!(!bounded.admitted_all());
+    drop(bounded);
+    let weak = Arc::downgrade(stable.syntax_facts());
+    drop(stable);
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
@@ -201,15 +269,18 @@ fn changed_captured_metadata_changes_identity_without_changing_source_or_history
             ExactPackageLimits::new(2, 256),
         )
         .expect("captured context");
-        let built = WorkspaceSemantics::build_captured_project_facts(
+        let prepared = WorkspaceSemantics::prepare_captured_project_facts_after(
             input,
             &[&file],
             16,
-            16,
             revision,
-            captured.as_ref().map(WorkspaceSemantics::graph),
+            captured.as_ref(),
         )
-        .expect("captured semantics");
+        .expect("admission with current metadata");
+        assert!(prepared.admitted[0].1.is_none());
+        let built = prepared
+            .build(16, captured.as_ref().map(WorkspaceSemantics::graph))
+            .expect("captured semantics");
         let assembled = built
             .semantics
             .assembled("rift://symbol/rust/src/lib.rs/start")
