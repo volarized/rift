@@ -1439,6 +1439,27 @@ impl EngineSession {
         deadline_cut: bool,
     ) -> RiftError {
         let working = deadline_cut || self.progress.is_working(Instant::now(), timeout);
+        static INVENTORY_DIAGNOSTIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if matches!(
+            method,
+            "textDocument/prepareCallHierarchy" | "callHierarchy/outgoingCalls"
+        ) && *INVENTORY_DIAGNOSTIC.get_or_init(|| {
+            std::env::var_os("RIFT_DIAG_INVENTORY_PHASES").is_some()
+                && std::env::var("NEXTEST_TEST_NAME").as_deref()
+                    == Ok("test_edge_inventory_reads_cut_at_their_deadline_keep_the_engine")
+        }) {
+            rift_tracing::info!(
+                component = "engine",
+                method,
+                deadline_cut,
+                working,
+                outstanding_progress = self.progress.is_outstanding(),
+                frame_in_flight = self.frame_in_flight,
+                ended = self.ended,
+                pending = self.correlation.pending_count(),
+                "inventory unanswered phase"
+            );
+        }
         if working && !self.frame_in_flight && !self.ended {
             if let Err(error) = self.cancel_pending().await {
                 return error;

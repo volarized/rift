@@ -1,0 +1,86 @@
+name: diagnose Intel inventory phases
+
+on:
+  push:
+    branches: [diagnostic/intel-inventory-phases]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-intel-inventory-phases-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OTEL_SDK_DISABLED: "false"
+
+jobs:
+  intel-inventory-phases:
+    if: >-
+      github.event.created && github.run_attempt == 1
+      && github.ref == 'refs/heads/diagnostic/intel-inventory-phases'
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the diagnostic source
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = 69e4ef16c2220a51467e54b688aafcbffcca702f
+          test "$(git rev-parse HEAD^1^{tree})" = "$EXPECTED_PARENT_TREE"
+          printf '%s  %s\n' "$FIXTURE_SHA256" crates/rift-mcp/tests/edge_query.rs | shasum -a 256 -c
+          gh api "repos/${GITHUB_REPOSITORY}/git/commits/${GITHUB_SHA}" --jq '.verification.verified' | grep -Fx true
+        env:
+          EXPECTED_PARENT_TREE: f46be0ab948f0bd6065510c297d2f38d9027f161
+          FIXTURE_SHA256: 8f71f38cb6a0707ffc5d5aeca8954bdb5b34cabf3ed5bd91137f36a5b8fb264e
+          GH_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: native-x86_64-apple-darwin
+          cache-targets: false
+          save-if: false
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.90.6
+        with:
+          tool: cargo-nextest@0.9.145,sccache@0.18.0
+      - name: Install the Intel toolchain
+        run: |
+          rustup target add x86_64-apple-darwin
+          rustup component add rust-src
+          rustc --print host-tuple | grep -Fx x86_64-apple-darwin
+      - name: Start the build cache
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+        run: uv run --locked --project dev rift-dev build-cache
+      - name: Run the ordinary Intel suite with the selected inventory phases
+        env:
+          RIFT_DIAG_INVENTORY_PHASES: "1"
+          RIFT_UPDATE_TEST_BINARY: ${{ github.workspace }}/target/debug/rift
+          RUSTFLAGS: ""
+        run: >-
+          uv run --locked --project dev rift-dev test nextest run --locked
+          --workspace --all-targets --all-features --profile ci-macos-intel --no-tests fail
+          -E 'not test(/_probe$/)'
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: intel-inventory-phases
+          path: |
+            target/nextest/ci-macos-intel/junit.xml
+            target/integration/nextest/**/*test_edge_inventory_reads_cut_at_their_deadline_keep_the_engine*.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats

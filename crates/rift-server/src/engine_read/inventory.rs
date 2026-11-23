@@ -521,7 +521,7 @@ async fn read_positions(
             read_heritage(session, chunk, &requests, selection, &mut report).await?;
         }
         if selection.calls && session.capabilities().call_hierarchy {
-            read_calls(session, chunk, &requests, maximum, &mut report).await?;
+            read_calls(session, path, chunk, &requests, maximum, &mut report).await?;
         }
     }
     let locations: Vec<_> = report
@@ -536,14 +536,50 @@ async fn read_positions(
     Ok(report)
 }
 
+/// Emits only fixture roles and state for the exact Intel inventory diagnosis.
+fn trace_inventory_phase(
+    session: &EngineSession,
+    path: &ProjectPath,
+    phase: &'static str,
+    complete: bool,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("RIFT_DIAG_INVENTORY_PHASES").is_some()
+            && std::env::var("NEXTEST_TEST_NAME").as_deref()
+                == Ok("test_edge_inventory_reads_cut_at_their_deadline_keep_the_engine")
+    }) {
+        return;
+    }
+    let role = match path.as_str() {
+        "lib.rs" => "first",
+        "one.rs" => "second",
+        "two.rs" => "third",
+        _ => return,
+    };
+    rift_tracing::info!(
+        component = "engine",
+        role,
+        phase,
+        complete,
+        readiness = ?session.walk_readiness(),
+        intact = session.is_intact(),
+        "inventory batch phase"
+    );
+}
+
 async fn read_calls(
     session: &mut EngineSession,
+    path: &ProjectPath,
     positions: &[InventoryPosition],
     requests: &[(ProjectPath, Position)],
     maximum: usize,
     report: &mut InventoryReport,
 ) -> Result<(), RiftError> {
-    let prepared = session.prepare_call_hierarchy_batch(requests).await?;
+    trace_inventory_phase(session, path, "prepare_begin", false);
+    let prepared = session.prepare_call_hierarchy_batch(requests).await;
+    trace_inventory_phase(session, path, "prepare_end", prepared.is_ok());
+    let prepared = prepared?;
     let mut items = Vec::new();
     for ((position, (path, at)), prepared) in positions.iter().zip(requests).zip(prepared) {
         report.charge(1)?;
@@ -570,9 +606,12 @@ async fn read_calls(
         );
     }
     for chunk in items.chunks(maximum) {
+        trace_inventory_phase(session, path, "outgoing_begin", false);
         let answers = session
             .outgoing_calls_batch(chunk.iter().map(|(_, item)| item.clone()).collect())
-            .await?;
+            .await;
+        trace_inventory_phase(session, path, "outgoing_end", answers.is_ok());
+        let answers = answers?;
         for ((position, _), calls) in chunk.iter().zip(answers) {
             report.charge(calls.len())?;
             let stored = report.calls[*position]
