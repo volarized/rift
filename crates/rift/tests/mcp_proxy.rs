@@ -1998,7 +1998,7 @@ async fn proxy_query_refuses_a_revision_after_index_removal() -> TestResult {
             ("Cargo.toml", harness::RUST_PROJECT_MANIFEST),
             ("lib.rs", LIBRARY),
         ],
-        "[dependencies]\nresolution = \"static\"\n",
+        "",
     )?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);

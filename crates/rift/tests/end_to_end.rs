@@ -227,9 +227,12 @@ const DECLARATION_READS: &[(&str, &str, Option<&str>)] = &[
 ];
 
 /// Declaration facts retain their containers and public import paths through the CLI.
+///
+/// The one served fixture here that keeps the shipped `[dependencies]` table, so each
+/// native runner starts a server over its own `rustc`, Node.js, and Python.
 #[tokio::test]
 async fn declaration_members_bound_names_and_module_exports_are_addressable() -> TestResult {
-    let directory = laid_out_workspace(
+    let directory = harness::bounded_workspace(
         &[
             ("Cargo.toml", harness::RUST_PROJECT_MANIFEST),
             (
@@ -253,6 +256,7 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
                 "A, B = 1, 2\ntype Pair = tuple[int, int]\nif True:\n    FLAG = 1\nclass Model:\n    def __init__(self):\n        self.name = 'x'\n    def save(self):\n        pass\n",
             ),
         ],
+        "",
         &assigned_port_key()?,
     )?;
     let root = directory.path();

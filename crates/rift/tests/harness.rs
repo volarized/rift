@@ -132,6 +132,7 @@ pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
     fixture_workspace(
         &rust_project(),
         "",
+        "",
         &format!(
             "{}{}",
             assigned_port_key()?,
@@ -150,13 +151,35 @@ pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
 /// `live_vector_search` suite is the one place the shipped default is exercised.
 const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
+/// The `[dependencies]` table of every fixture but the ones [`bounded_workspace`] lays out
+/// without it.
+///
+/// Rift runs the standard library version probes by default, and a workspace stays in
+/// preparation until they answer: each server start spawns `rustup` and `rustc`, which
+/// took 1.1 s of the start on a Windows runner. They answer from the machine's own
+/// toolchain, so a fixture that reads none of their answers pins its package context, as
+/// `rift-mcp`'s `tests/hermetic_search.rs` does.
+const PROBES_DISABLED: &str = "[dependencies]\nresolution = \"static\"\n";
+
 /// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
 /// vector ranking, the orphan-safety idle timeout, the request bounds
 /// [`FIXTURE_READINESS_TIMEOUT`] and [`FIXTURE_WORKER_QUEUE_TIMEOUT`], and
 /// `extra_toml` - an LSP configuration, a `[source]` policy, or another
-/// table a case needs beyond what every fixture already carries.
+/// table a case needs beyond what every fixture already carries. It runs no
+/// version probe; see [`PROBES_DISABLED`].
 pub(crate) fn laid_out_workspace(
     files: &[(&str, &str)],
+    extra_toml: &str,
+) -> TestResult<tempfile::TempDir> {
+    bounded_workspace(files, PROBES_DISABLED, extra_toml)
+}
+
+/// The fixture [`laid_out_workspace`] lays out, with `tables` ahead of its `[server]`
+/// table in place of [`PROBES_DISABLED`]. With no table, its server start runs the version
+/// probes of the machine's own toolchains.
+pub(crate) fn bounded_workspace(
+    files: &[(&str, &str)],
+    tables: &str,
     extra_toml: &str,
 ) -> TestResult<tempfile::TempDir> {
     let request_bounds = format!(
@@ -164,13 +187,14 @@ pub(crate) fn laid_out_workspace(
         String::from(FIXTURE_READINESS_TIMEOUT),
         String::from(FIXTURE_WORKER_QUEUE_TIMEOUT)
     );
-    fixture_workspace(files, &request_bounds, extra_toml)
+    fixture_workspace(files, tables, &request_bounds, extra_toml)
 }
 
-/// The fixture [`laid_out_workspace`] lays out, with `server_keys` in its
-/// `[server]` table ahead of `extra_toml`.
+/// The fixture [`laid_out_workspace`] lays out, with `tables` ahead of its `[server]`
+/// table and `server_keys` in that table ahead of `extra_toml`.
 fn fixture_workspace(
     files: &[(&str, &str)],
+    tables: &str,
     server_keys: &str,
     extra_toml: &str,
 ) -> TestResult<tempfile::TempDir> {
@@ -184,7 +208,9 @@ fn fixture_workspace(
     }
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{server_keys}{extra_toml}"),
+        format!(
+            "{VECTOR_DISABLED}{tables}[server]\nidle_timeout = \"60s\"\n{server_keys}{extra_toml}"
+        ),
     )?;
     Ok(directory)
 }

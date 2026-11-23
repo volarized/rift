@@ -822,8 +822,11 @@ impl ConfigurationState {
     /// Accepts the workspace's current `rift.toml`.
     pub(crate) fn accept(root: &Path) -> Self {
         let fingerprint = configuration_fingerprint(root);
+        let accepted = load_configuration(root);
+        #[cfg(test)]
+        let accepted = accepted.map(without_version_probes);
         Self {
-            accepted: load_configuration(root).map_err(Arc::new),
+            accepted: accepted.map_err(Arc::new),
             fingerprint,
         }
     }
@@ -1037,6 +1040,20 @@ impl ConfigurationState {
             .map(|configuration| configuration.logs.clone())
             .unwrap_or_default()
     }
+}
+
+/// Keeps a unit test's workspace on its package pins, whether or not it writes a
+/// `rift.toml`.
+///
+/// Every publication a test builds reads the standard library versions first, and the
+/// default probes answer from the machine's own `rustup` and `rustc`: on a Windows runner
+/// 101 tests of this module spent 47 of their 92 s in them and read none of their answers.
+/// `rift-server`'s own tests and `rift`'s end-to-end suite run the probes.
+#[cfg(test)]
+fn without_version_probes(mut configuration: WorkspaceConfiguration) -> WorkspaceConfiguration {
+    configuration.dependencies.resolution =
+        rift_protocol::dependencies::DependencyResolution::Static;
+    configuration
 }
 
 /// Exact bounded identity of the configuration policy source.
