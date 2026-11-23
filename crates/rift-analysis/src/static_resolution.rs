@@ -1057,9 +1057,17 @@ impl<'source> Index<'source> {
         work: &mut Work,
         resolution: &mut StaticResolution,
     ) {
+        use std::io::Write;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        let absolute = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let start = Instant::now();
         let files = self.files.values().collect::<Vec<_>>();
+        let mut timings = Vec::with_capacity(files.len());
         let mut pending = files.as_slice();
-        while !pending.is_empty() && !work.exhausted {
+        'runs: while !pending.is_empty() && !work.exhausted {
             let run = file_work.run(pending, work.budget.remaining());
             let (run, rest) = pending.split_at(run.max(1));
             pending = rest;
@@ -1068,7 +1076,9 @@ impl<'source> Index<'source> {
             let resolve = |file: &&File<'source>| {
                 let share = file_work.max(file);
                 let budget = if alone { share.min(left) } else { share };
-                self.resolve_file_apart(file, budget, &resolution.edge_calls)
+                let began = Instant::now();
+                let result = self.resolve_file_apart(file, budget, &resolution.edge_calls);
+                (result, began.duration_since(start), start.elapsed(), budget)
             };
             #[cfg(feature = "parallel")]
             let resolved = {
@@ -1082,12 +1092,23 @@ impl<'source> Index<'source> {
             resolution.occurrences.reserve(
                 resolved
                     .iter()
-                    .map(|apart| apart.resolution.occurrences.len())
+                    .map(|(apart, _, _, _)| apart.resolution.occurrences.len())
                     .fold(0, usize::saturating_add),
             );
-            for (file, apart) in run.iter().zip(resolved) {
+            for (file, (apart, began, ended, budget)) in run.iter().zip(resolved) {
+                timings.push((
+                    file.document.path.as_str(),
+                    file.document.facts.language().name.as_str(),
+                    began,
+                    ended,
+                    budget,
+                    apart.used,
+                    apart.exhausted,
+                    apart.resolution.occurrences.len(),
+                    apart.resolution.external.len(),
+                ));
                 if !work.charge() {
-                    return;
+                    break 'runs;
                 }
                 let left = work.budget.remaining();
                 // Only a file running alone can end on the pass budget: a run reserves
@@ -1097,6 +1118,20 @@ impl<'source> Index<'source> {
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
                 resolution.join(file, apart.resolution, over_share);
             }
+        }
+        let wall = start.elapsed().as_nanos();
+        if let Some(directory) = std::env::var_os("RIFT_STATIC_TIMINGS") {
+            let path = std::path::PathBuf::from(directory)
+                .join(format!("{}-{absolute}.tsv", std::process::id()));
+            let mut output = std::io::BufWriter::new(std::fs::File::create_new(path).unwrap());
+            writeln!(output, "wall_ns\t{wall}\tabs_start_ns\t{absolute}").unwrap();
+            for (path, language, began, ended, budget, used, exhausted, local, external) in timings
+            {
+                writeln!(output, "{language}\t{}\t{}\t{budget}\t{used}\t{exhausted}\t{local}\t{external}\t{path}",
+                    began.as_nanos(), ended.as_nanos()).unwrap();
+            }
+            output.flush().unwrap();
+            writeln!(output, "write_ns\t{}", start.elapsed().as_nanos() - wall).unwrap();
         }
     }
 
