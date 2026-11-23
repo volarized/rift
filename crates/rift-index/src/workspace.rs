@@ -1461,7 +1461,7 @@ impl IndexContents {
             (root, owner),
             self.sorted(),
             limits,
-            previous.map(|index| index.semantics.graph()),
+            previous.map(|index| index.semantics.as_ref()),
         )
         .map(|built| (built, context))
     }
@@ -3165,7 +3165,7 @@ impl WorkspaceIndex {
             (&self.root, &self.owner),
             contents.sorted(),
             self.limits,
-            Some(self.semantics.graph()),
+            Some(self.semantics.as_ref()),
         )?;
         check_cancelled(cancelled)?;
         let (declarations, canonical_examples) = accepted_declarations(
@@ -3314,7 +3314,7 @@ impl WorkspaceIndex {
             (&root, &owner),
             contents.sorted(),
             limits,
-            previous.map(|index| index.semantics.graph()),
+            previous.map(|index| index.semantics.as_ref()),
         )?;
         let (declarations, canonical_examples) =
             accepted_declarations(&files, &semantics, &owner, AttachmentSelection::Scan);
@@ -5136,7 +5136,7 @@ fn captured_project_semantics(
     contents: &IndexContents,
     limits: WorkspaceIndexLimits,
     fingerprint: &WorkspaceFingerprint,
-    previous: Option<&NormalizedGraph>,
+    previous: Option<&WorkspaceSemantics>,
 ) -> Result<ProjectSemanticsAdmission, RiftError> {
     let revision = captured_semantic_revision(fingerprint, root, owner)?;
     let revision = captured_build_paths_revision(
@@ -5157,7 +5157,7 @@ fn captured_project_semantics(
                     limits.declarations_max(),
                     limits.edges_max(),
                     revision,
-                    previous,
+                    previous.map(WorkspaceSemantics::graph),
                 )
             }
         )
@@ -5190,11 +5190,12 @@ fn captured_project_semantics(
         ),
     )?
     .with_build_paths(&contents.build_paths)?;
-    let mut prepared = WorkspaceSemantics::prepare_captured_project_facts(
+    let mut prepared = WorkspaceSemantics::prepare_captured_project_facts_after(
         input,
         &documents,
         limits.declarations_max(),
         revision,
+        previous,
     )?;
     if !prepared.admitted_all() {
         return Ok(ProjectSemanticsAdmission::Omitted {
@@ -5209,9 +5210,12 @@ fn captured_project_semantics(
         files = documents.len(),
         {
             if contents.partial {
-                prepared.build_deferring_static(limits.edges_max(), previous)
+                prepared.build_deferring_static(
+                    limits.edges_max(),
+                    previous.map(WorkspaceSemantics::graph),
+                )
             } else {
-                prepared.build(limits.edges_max(), previous)
+                prepared.build(limits.edges_max(), previous.map(WorkspaceSemantics::graph))
             }
         }
     )
@@ -5333,7 +5337,7 @@ fn built_contents(
     root: &Path,
     contents: IndexContents,
     limits: WorkspaceIndexLimits,
-    previous: Option<&NormalizedGraph>,
+    previous: Option<&WorkspaceSemantics>,
 ) -> Result<BuiltContents, RiftError> {
     built_contents_with_owner((root, &SymbolOwner::Local), contents, limits, previous)
 }
@@ -5342,7 +5346,7 @@ fn built_contents_with_owner(
     (root, owner): (&Path, &SymbolOwner),
     mut contents: IndexContents,
     limits: WorkspaceIndexLimits,
-    previous: Option<&NormalizedGraph>,
+    previous: Option<&WorkspaceSemantics>,
 ) -> Result<BuiltContents, RiftError> {
     validate_project_owner(owner)?;
     validate_captured_source_bytes(&contents)?;
@@ -13616,7 +13620,7 @@ mod tests {
             root.path(),
             contents,
             WorkspaceIndexLimits::default(),
-            Some(first.semantics.graph()),
+            Some(&first.semantics),
         )
         .expect("empty source directory publication");
         assert_eq!(first.fingerprint, second.fingerprint);
@@ -13872,7 +13876,7 @@ mod tests {
             root.path(),
             captured_rust_contents(root.path(), "[package]\nname='compass'\nversion='1.0.0'"),
             WorkspaceIndexLimits::default(),
-            Some(first.semantics.graph()),
+            Some(&first.semantics),
         )
         .expect("changed metadata publication");
         let provider = symbol_identity("rust", "src/lib.rs", "beacon_0");

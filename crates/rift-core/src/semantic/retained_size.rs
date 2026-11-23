@@ -96,14 +96,23 @@ impl GetSize for PortableSymbolFacts {
             };
         }
         field!(language);
-        field!(name);
-        field!(qualified_name);
         field!(kind);
-        field!(kinds);
         field!(container);
-        field!(modifiers);
-        field!(visibility);
-        let (field, next) = rift_protocol::retained_vector_material(&self.types, tracker);
+        let (field, next) =
+            rift_protocol::retained_arc_material(&self.material, tracker, |material, tracker| {
+                let (name, tracker) = material.name.get_heap_size_with_tracker(tracker);
+                let (qualified, tracker) =
+                    material.qualified_name.get_heap_size_with_tracker(tracker);
+                let (kinds, tracker) = material.kinds.get_heap_size_with_tracker(tracker);
+                let (modifiers, tracker) = material.modifiers.get_heap_size_with_tracker(tracker);
+                let (visibility, tracker) = material.visibility.get_heap_size_with_tracker(tracker);
+                let (types, tracker) =
+                    rift_protocol::retained_vector_material(&material.types, tracker);
+                let total = [name, qualified, kinds, modifiers, visibility, types]
+                    .into_iter()
+                    .fold(0usize, usize::saturating_add);
+                (total, tracker)
+            });
         bytes = bytes.saturating_add(field);
         tracker = next;
         let (field, next) = rift_protocol::retained_arc_slice_material(&self.signatures, tracker);
