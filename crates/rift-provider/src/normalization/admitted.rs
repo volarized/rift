@@ -103,7 +103,7 @@ impl Layout {
                 }
                 match layout.matched.last_mut() {
                     Some(run) if i == run.before + run.len && j == run.after + run.len => {
-                        run.len += 1
+                        run.len += 1;
                     }
                     _ => layout.matched.push(Run {
                         before: i,
