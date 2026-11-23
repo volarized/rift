@@ -672,6 +672,7 @@ pub fn append_framework_symbols(
     )
     .with_source_witness(source.text)
     .with_syntax_limits(limits)
+    .with_variance_errors_only(document.facts().variance_errors_only())
     .with_static_facts(document.facts().static_facts().cloned())
     .with_left_out_declarations(omitted - document.facts().left_out_symbols().len())
     .with_framework_context();
@@ -684,6 +685,7 @@ pub fn append_framework_symbols(
         symbols: result.symbols().to_vec(),
         left_out_symbols: result.facts().left_out_symbols().to_vec(),
         has_errors: result.has_errors(),
+        variance_errors_only: result.facts().variance_errors_only(),
         left_out_declarations: result.left_out_declaration_count(),
         markdown_facts: None,
         export_bindings: result.facts().export_bindings().map(<[_]>::to_vec),

@@ -30,6 +30,7 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         symbols: facts.symbols().to_vec(),
         left_out_symbols: facts.left_out_symbols().to_vec(),
         has_errors: facts.has_errors(),
+        variance_errors_only: facts.variance_errors_only(),
         left_out_declarations: facts.left_out_declaration_count(),
         markdown_facts: facts.markdown_facts().cloned(),
         export_bindings: facts.export_bindings().map(<[_]>::to_vec),
@@ -2600,4 +2601,49 @@ fn literal_function_headers_refuse_bounds_malformed_and_truncated_tokens() {
             "{source}"
         );
     }
+}
+
+const VARIANCE_SOURCE: &str = "export interface Base<T> { base: T }
+export interface Mid<out T = unknown, in U = string> extends Base<T> { value: T; run(input: U): T }
+export class Box<in out T> { item!: T }
+";
+
+#[test]
+fn checked_variance_state_restores_equal_to_a_fresh_parse() {
+    let limits = SyntaxLimits::default();
+    for shipped in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
+        let fresh = parsed(shipped, VARIANCE_SOURCE);
+        assert!(fresh.has_errors());
+        assert!(fresh.facts().declaration_syntax_complete());
+
+        let restored = SyntaxFacts::from_parts(VARIANCE_SOURCE, limits, parts(fresh.facts()))
+            .expect("checked variance facts");
+        assert!(restored.has_errors());
+        assert!(restored.declaration_syntax_complete());
+        assert_eq!(&restored, fresh.facts());
+    }
+
+    let fresh = parsed(ShippedLanguage::TypeScript, VARIANCE_SOURCE);
+    let mut without_errors = parts(fresh.facts());
+    without_errors.has_errors = false;
+    let mut other_language = parts(parsed(ShippedLanguage::JavaScript, "let = ;").facts());
+    assert!(other_language.has_errors);
+    other_language.variance_errors_only = true;
+    for (source, invalid) in [
+        (VARIANCE_SOURCE, without_errors),
+        ("let = ;", other_language),
+    ] {
+        assert_eq!(
+            SyntaxFacts::from_parts(source, limits, invalid).map_err(|error| error.slug()),
+            Err(errors::syntax::facts_structure_invalid::SLUG)
+        );
+    }
+
+    let source = "export interface Bad<out T> extends { item: T }";
+    let fresh = parsed(ShippedLanguage::TypeScript, source);
+    let restored = SyntaxFacts::from_parts(source, limits, parts(fresh.facts()))
+        .expect("facts beside other parser errors");
+    assert!(restored.has_errors());
+    assert!(!restored.declaration_syntax_complete());
+    assert_eq!(&restored, fresh.facts());
 }

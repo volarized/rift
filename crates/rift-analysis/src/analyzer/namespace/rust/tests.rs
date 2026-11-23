@@ -154,14 +154,9 @@ fn prepared_for_context(
         .iter()
         .map(|file| {
             let source = file.text();
+            let (path, text) = (file.path(), source);
             let facts = RustSyntaxProvider::default()
-                .analyze(
-                    SyntaxSource {
-                        path: file.path(),
-                        text: source,
-                    },
-                    input.syntax(),
-                )
+                .analyze(SyntaxSource { path, text }, input.syntax())
                 .expect("parsed Rust source")
                 .into_facts();
             if qualified_name.is_none() && !restored_paths {
@@ -185,6 +180,7 @@ fn prepared_for_context(
                     symbols,
                     left_out_symbols: facts.left_out_symbols().to_vec(),
                     has_errors: facts.has_errors(),
+                    variance_errors_only: facts.variance_errors_only(),
                     left_out_declarations: 0,
                     markdown_facts: None,
                     export_bindings: None,
