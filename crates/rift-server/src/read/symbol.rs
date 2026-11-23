@@ -4,8 +4,8 @@ use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{ReadWarning, SymbolHistory};
 use rift_protocol::symbol_read::{
-    GetSymbolParams, GetSymbolResult, SymbolAlternative, SymbolMatchContext, SymbolNotFound,
-    SymbolUnavailableReason,
+    GetSymbolParams, GetSymbolResult, SymbolAlternative, SymbolDeclaration, SymbolMatchContext,
+    SymbolNotFound, SymbolUnavailableReason,
 };
 
 use rift_index::{WorkspaceIndex, WorkspaceSymbolView};
@@ -28,6 +28,27 @@ impl ReadService {
         request: &GetSymbolParams,
         ready: bool,
     ) -> Result<GetSymbolResult, RiftError> {
+        self.read_exact_symbol(request, ready, false)
+    }
+
+    /// Reads one symbol from the complete publication a request accepted as current.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::exact_symbol`].
+    pub fn exact_current_symbol(
+        &self,
+        request: &GetSymbolParams,
+    ) -> Result<GetSymbolResult, RiftError> {
+        self.read_exact_symbol(request, true, self.revision().is_none())
+    }
+
+    fn read_exact_symbol(
+        &self,
+        request: &GetSymbolParams,
+        ready: bool,
+        verified_current: bool,
+    ) -> Result<GetSymbolResult, RiftError> {
         let identity = SymbolIdentity::parse(request.id.as_str())?;
         let limit = super::accepted_max_results(
             request.max_results,
@@ -47,7 +68,24 @@ impl ReadService {
             ));
         }
         let key = rift_core::SymbolId::new(request.id.as_str())?;
-        let Some(readable) = self.index.object_by_identity(&key)? else {
+        let direct = (verified_current
+            && request.revision.is_none()
+            && request.include.is_empty()
+            && offset == 0)
+            .then(|| self.index.exact_relative_singleton(&key))
+            .flatten();
+        let (readable, direct_declaration) = match direct {
+            Some((readable, declaration)) => {
+                rift_tracing::debug!(
+                    component = "index",
+                    operation = "read.symbol.current_direct",
+                    "read exact current symbol from its admitted file"
+                );
+                (Some(readable), Some(declaration))
+            }
+            None => (self.index.object_by_identity(&key)?, None),
+        };
+        let Some(readable) = readable else {
             let index = self.index.symbol_view()?;
             if !covers_exact_identity(&index, &identity) {
                 return Ok(unavailable(
@@ -73,7 +111,7 @@ impl ReadService {
             offset,
             limit,
         };
-        self.found_symbol(request, &readable, &key, page, warnings)
+        self.found_symbol(request, &readable, &key, page, warnings, direct_declaration)
     }
 
     /// The answer for a symbol the index holds: its facts, one page of its declarations, and
@@ -85,6 +123,7 @@ impl ReadService {
         key: &rift_core::SymbolId,
         page: DeclarationPage,
         mut warnings: Vec<ReadWarning>,
+        direct_declaration: Option<SymbolDeclaration>,
     ) -> Result<GetSymbolResult, RiftError> {
         let symbol = readable.to_protocol_symbol();
         if !symbol.name_is_public() {
@@ -111,7 +150,10 @@ impl ReadService {
         } else {
             None
         };
-        let (declarations, total) = declarations_page(&self.index, key, page.offset, page.limit)?;
+        let (declarations, total) = match direct_declaration {
+            Some(declaration) => (vec![declaration], 1),
+            None => declarations_page(&self.index, key, page.offset, page.limit)?,
+        };
         let documentation = request
             .include
             .documentation
