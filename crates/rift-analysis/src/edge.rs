@@ -450,6 +450,7 @@ impl EdgeStore {
         if occurrences.is_empty() && external.is_empty() {
             return;
         }
+        let observation_started = rift_core::bun_eligibility::start();
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
@@ -523,6 +524,23 @@ impl EdgeStore {
                 edges.sort_by(edge_order);
                 edges.dedup();
             }
+        }
+        if observation_started.is_some() {
+            let admitted = edges_max.saturating_sub(existing).saturating_sub(remaining);
+            let dropped = usize::try_from(self.dropped_edges).unwrap_or(usize::MAX);
+            rift_core::bun_eligibility::note(
+                "admission_prefix",
+                &[
+                    ("provider_edges", existing),
+                    ("static_edges", admitted),
+                    ("edge_cap", edges_max),
+                    ("edge_drops", dropped),
+                ],
+                existing.saturating_add(admitted),
+                dropped,
+                (dropped > 0).then_some(("edge admission crossed the cap", None, None)),
+                observation_started,
+            );
         }
     }
 
@@ -622,6 +640,21 @@ impl EdgeStore {
         }
         for edges in incoming.values_mut() {
             edges.sort_by(edge_order);
+        }
+        if rift_core::bun_eligibility::active() {
+            let admitted = edges_max.saturating_sub(budget.remaining());
+            let dropped = usize::try_from(dropped_edges).unwrap_or(usize::MAX);
+            rift_core::bun_eligibility::note(
+                "admission_prefix",
+                &[
+                    ("base_edges_admitted", admitted),
+                    ("base_edges_dropped", dropped),
+                ],
+                admitted,
+                dropped,
+                (dropped > 0).then_some(("base edge admission crossed the cap", None, None)),
+                None,
+            );
         }
         (
             Self {

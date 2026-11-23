@@ -437,7 +437,39 @@ fn collect_binding<'source>(
     else {
         return;
     };
-    let Some(imported) = resolver.imported(file, module, work) else {
+    let imported = resolver.imported(file, module, work);
+    if rift_core::bun_eligibility::active() {
+        let reason = if imported.is_none() {
+            "absent module candidate has no retained inverse witness"
+        } else {
+            "module selector has no retained inverse witness"
+        };
+        let family = match binding.kind {
+            SyntaxExportKind::All => "star_selectors",
+            SyntaxExportKind::Named => "named_selectors",
+            SyntaxExportKind::Namespace => "namespace_selectors",
+            SyntaxExportKind::Default => "default_selectors",
+        };
+        let selected = imported.map(|file| file.document.path.as_str());
+        let owner = file.document.path.as_str();
+        let affected = rift_core::bun_eligibility::requested(owner)
+            || selected.is_some_and(rift_core::bun_eligibility::requested);
+        rift_core::bun_eligibility::note_affected(
+            "alias_selector",
+            &[
+                (family, 1),
+                ("selectors_reaching_named_paths", usize::from(affected)),
+                ("module_present", usize::from(imported.is_some())),
+                ("module_absent", usize::from(imported.is_none())),
+            ],
+            1,
+            1,
+            Some((reason, Some(owner), selected.or(Some(module)))),
+            affected,
+            None,
+        );
+    }
+    let Some(imported) = imported else {
         return;
     };
     let names = match binding.kind {
@@ -455,6 +487,19 @@ fn collect_binding<'source>(
             return;
         }
         let target = target(resolver, file, imported, binding, name, work);
+        if rift_core::bun_eligibility::active() {
+            rift_core::bun_eligibility::note(
+                "alias_selector",
+                &[
+                    ("slots_present", usize::from(target.is_some())),
+                    ("slots_unresolved", usize::from(target.is_none())),
+                ],
+                1,
+                0,
+                None,
+                None,
+            );
+        }
         if let Some(target) =
             target.and_then(|target| placed(file, binding, name, target, prepared))
         {

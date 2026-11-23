@@ -1,6 +1,8 @@
 //! Pure domain vocabulary and correctness primitives for Rift.
 
 pub mod acceptance;
+#[doc(hidden)]
+pub mod bun_eligibility;
 mod capture;
 mod configuration;
 mod digest;

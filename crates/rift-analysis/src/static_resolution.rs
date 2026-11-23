@@ -167,6 +167,14 @@ fn resolve_by<'source>(
         .collect();
     let mut work = Work::new(work_max);
     let Some(index) = Index::new(graph, documents, namespace, &mut work) else {
+        rift_core::bun_eligibility::note(
+            "admission_prefix",
+            &[("static_index_refusals", 1)],
+            1,
+            1,
+            Some(("static index setup did not finish", None, None)),
+            None,
+        );
         for coverage in edge_calls.values_mut() {
             coverage.unavailable = true;
         }
@@ -184,6 +192,16 @@ fn resolve_by<'source>(
     files(&index, &mut work, &mut resolution);
     external::admit_declared(namespace, &mut resolution.external, work_max);
     resolution.exhausted = work.exhausted;
+    if work.exhausted {
+        rift_core::bun_eligibility::note(
+            "admission_prefix",
+            &[("static_pass_exhausted", 1)],
+            1,
+            1,
+            Some(("static pass exhausted the work budget", None, None)),
+            None,
+        );
+    }
     resolution
 }
 
@@ -1094,6 +1112,27 @@ impl<'source> Index<'source> {
                 // every share before it starts.
                 work.exhausted = apart.exhausted && left < file_work.max(file);
                 let over_share = apart.exhausted && !work.exhausted;
+                if rift_core::bun_eligibility::active() {
+                    let shortened = left < file_work.max(file);
+                    let unproved = shortened || apart.exhausted;
+                    rift_core::bun_eligibility::note(
+                        "admission_prefix",
+                        &[
+                            ("static_file_passes", 1),
+                            ("shortened_shares", usize::from(shortened)),
+                            ("exhausted_shares", usize::from(apart.exhausted)),
+                            ("static_work_used", apart.used),
+                        ],
+                        1,
+                        usize::from(unproved),
+                        unproved.then_some((
+                            "file work share or exhaustion changes the admission prefix",
+                            Some(file.document.path.as_str()),
+                            None,
+                        )),
+                        None,
+                    );
+                }
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
                 resolution.join(file, apart.resolution, over_share);
             }

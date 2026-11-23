@@ -161,6 +161,7 @@ impl WorkspaceSemantics {
                 syntax: document.syntax(),
             });
         }
+        let observation_started = rift_core::bun_eligibility::start();
         let mut namespace = prepare_context(&input, &selected);
         let mut placed = documents
             .iter()
@@ -184,6 +185,59 @@ impl WorkspaceSemantics {
             declarations_max,
             || errors::analysis::package_input_identity_invalid().error(),
         )?;
+        if observation_started.is_some() {
+            let frameworks = selected
+                .iter()
+                .filter(|file| file.syntax.origin() == rift_syntax::SyntaxOrigin::Framework);
+            let framework_count = frameworks.clone().count();
+            let framework_first = frameworks.map(|file| file.path.as_str()).next();
+            let outside_count = namespace.outside_namespaces.len();
+            let alias_count = aliases.values().map(Vec::len).sum::<usize>();
+            let unresolved_exports = usize::from(namespace.unresolved_exports);
+            rift_core::bun_eligibility::note(
+                "framework_context",
+                &[
+                    ("framework_sources", framework_count),
+                    ("outside_namespaces", outside_count),
+                    ("source_documents", selected.len()),
+                ],
+                selected.len(),
+                framework_count + outside_count,
+                framework_first
+                    .map(|path| {
+                        (
+                            "framework context lacks a retained ownership witness",
+                            Some(path),
+                            None,
+                        )
+                    })
+                    .or_else(|| {
+                        namespace.outside_namespaces.iter().next().map(|path| {
+                            (
+                                "source outside established namespace",
+                                Some(path.as_str()),
+                                None,
+                            )
+                        })
+                    }),
+                observation_started,
+            );
+            rift_core::bun_eligibility::note(
+                "alias_selector",
+                &[
+                    ("placed_aliases", alias_count),
+                    ("unresolved_exports", unresolved_exports),
+                ],
+                0,
+                unresolved_exports,
+                namespace.unresolved_exports.then_some((
+                    "namespace reports unresolved exports",
+                    None,
+                    None,
+                )),
+                None,
+            );
+        }
         let mut outside_namespaces = BTreeSet::new();
         for document in &mut placed {
             let path = document.path.as_str();
@@ -198,6 +252,35 @@ impl WorkspaceSemantics {
                 .with_aliases(aliases.remove(path).unwrap_or_default());
         }
         let prepared = Self::prepare_facts_placed(&placed, declarations_max, revision, true)?;
+        if rift_core::bun_eligibility::active() {
+            let denied = prepared.beyond_declaration_bound.len();
+            let refused = prepared.refused_contributions.len();
+            let first = prepared
+                .beyond_declaration_bound
+                .first()
+                .map(|path| ("declaration cap prefixes files", Some(path.as_str()), None))
+                .or_else(|| {
+                    prepared.refused_contributions.first().map(|(path, _)| {
+                        (
+                            "declaration contribution refused",
+                            Some(path.as_str()),
+                            None,
+                        )
+                    })
+                });
+            rift_core::bun_eligibility::note(
+                "admission_prefix",
+                &[
+                    ("declarations_max", declarations_max),
+                    ("declaration_owners_truncated", denied),
+                    ("declaration_owners_refused", refused),
+                ],
+                placed.len(),
+                denied + refused,
+                first,
+                None,
+            );
+        }
         Ok(PreparedProjectSemantics {
             prepared,
             input,

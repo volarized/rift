@@ -371,6 +371,7 @@ impl Normalizer {
         publications: &Arc<PublicationSet>,
         external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
     ) -> Result<NormalizedGraph, RiftError> {
+        let observation_started = rift_core::bun_eligibility::start();
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
         let references = reference_index(&contributions);
@@ -393,6 +394,33 @@ impl Normalizer {
             &mut candidates,
         );
 
+        if observation_started.is_some() {
+            let first_candidate = candidates
+                .first()
+                .map(|claim| claim.source().symbol().as_str());
+            let first_association = edges
+                .first()
+                .map(|(index, _)| contributions[*index].key().reference().symbol().as_str());
+            rift_core::bun_eligibility::note(
+                "provider_claim",
+                &[
+                    ("applicable_contributions", contributions.len()),
+                    ("association_candidates", candidates.len()),
+                    ("association_edges", edges.len()),
+                    ("conflicting_components", conflicting.len()),
+                ],
+                contributions.len(),
+                candidates.len() + edges.len(),
+                first_candidate.or(first_association).map(|address| {
+                    (
+                        "provider association lacks a retained inverse witness",
+                        None,
+                        Some(address),
+                    )
+                }),
+                observation_started,
+            );
+        }
         build_graph(GraphBuild {
             index_revision,
             source_revision,
@@ -784,6 +812,90 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         external,
     );
 
+    if rift_core::bun_eligibility::active() {
+        let alias = edges
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Alias)
+            .count();
+        let unresolved = edges
+            .iter()
+            .filter(|edge| matches!(edge.target(), NormalizedTarget::Contribution(_)))
+            .count();
+        let mut inverse_aliases = 0;
+        let mut first_inverse = None;
+        for relation in &edges {
+            let Some(owner) = publications.contribution(relation.source()) else {
+                continue;
+            };
+            let Some(source_path) = owner.source().map(|source| source.unit().key().as_str())
+            else {
+                continue;
+            };
+            if rift_core::bun_eligibility::requested(source_path) {
+                continue;
+            }
+            for declared in owner.edges() {
+                let target = declared.target();
+                let Some(publication) = publications.provider(target.provider()) else {
+                    continue;
+                };
+                let key = ContributionKey::new(
+                    target.provider().clone(),
+                    publication.revision(),
+                    target.symbol().clone(),
+                );
+                let destination = publications.contribution(&key).and_then(|row| row.source());
+                if let Some(path) = destination.map(|source| source.unit().key().as_str())
+                    && rift_core::bun_eligibility::requested(path)
+                {
+                    first_inverse.get_or_insert((source_path, path));
+                    inverse_aliases += 1;
+                }
+            }
+        }
+        if let Some((from, to)) = first_inverse {
+            rift_core::bun_eligibility::note_affected(
+                "provider_claim",
+                &[(
+                    "unchanged_provider_owners_reaching_named_paths",
+                    inverse_aliases,
+                )],
+                0,
+                0,
+                Some((
+                    "unchanged provider relation reaches a named path",
+                    Some(from),
+                    Some(to),
+                )),
+                true,
+                None,
+            );
+        }
+        let first = edges
+            .first()
+            .map(|edge| edge.source())
+            .or_else(|| references.first().map(|reference| reference.source()))
+            .map(|key| key.reference().symbol().as_str());
+        rift_core::bun_eligibility::note(
+            "provider_claim",
+            &[
+                ("provider_references", references.len()),
+                ("provider_edges", edges.len()),
+                ("provider_alias_edges", alias),
+                ("provider_unresolved_edges", unresolved),
+            ],
+            references.len() + edges.len(),
+            references.len() + edges.len(),
+            first.map(|address| {
+                (
+                    "provider relation lacks a retained inverse witness",
+                    None,
+                    Some(address),
+                )
+            }),
+            None,
+        );
+    }
     Ok(NormalizedGraph {
         index_revision,
         source_revision,

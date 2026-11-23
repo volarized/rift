@@ -1273,6 +1273,23 @@ struct OmittedFileRecords {
 impl OmittedFileRecords {
     /// Names one file this build read and did not parse, or counts it past the bound.
     fn record(&mut self, warning: &WorkspaceIndexWarning) {
+        if rift_core::bun_eligibility::active() {
+            rift_core::bun_eligibility::note(
+                "omitted_input",
+                &[
+                    ("held_text", usize::from(warning.holds_text())),
+                    ("left_out", usize::from(!warning.holds_text())),
+                ],
+                1,
+                1,
+                Some((
+                    "omitted source lacks a retained dependency witness",
+                    Some(warning.path().as_str()),
+                    Some(&warning.reason()),
+                )),
+                None,
+            );
+        }
         if self.named >= OMITTED_FILE_RECORDS_MAX {
             self.counted = self.counted.saturating_add(1);
             return;
@@ -3134,6 +3151,14 @@ impl WorkspaceIndex {
         changes: &PathChanges,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
+        rift_core::bun_eligibility::note(
+            "capture",
+            &[("named_paths", changes.len())],
+            changes.len(),
+            0,
+            None,
+            None,
+        );
         let mut contents = IndexContents::carried_from(self, changes);
         let mut workspace_bytes =
             Self::indexed_bytes(&contents.files, &contents.text_files, &contents.left_out);
@@ -3900,6 +3925,21 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn static_targets_omitted(&self) -> &BTreeMap<rift_protocol::read::EdgeKind, u64> {
         self.semantics.static_targets_omitted()
+    }
+
+    /// Returns held coverage rows for the local Bun observer.
+    #[doc(hidden)]
+    pub fn bun_observed_coverage(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &rift_core::SourceUnitId,
+            &rift_protocol::read::Language,
+            bool,
+            &[rift_syntax::ByteRange],
+        ),
+    > {
+        self.semantics.bun_observed_coverage()
     }
 
     /// Whether captured static calls cover the selected declaration or incoming language set.

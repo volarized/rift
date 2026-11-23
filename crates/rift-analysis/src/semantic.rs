@@ -229,6 +229,31 @@ impl StaticResolution {
 }
 
 impl WorkspaceSemantics {
+    /// Returns held coverage rows for the local Bun observer.
+    #[doc(hidden)]
+    pub fn bun_observed_coverage(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &rift_core::SourceUnitId,
+            &rift_protocol::read::Language,
+            bool,
+            &[rift_syntax::ByteRange],
+        ),
+    > {
+        self.static_resolution
+            .edge_calls
+            .iter()
+            .map(|(unit, coverage)| {
+                (
+                    unit,
+                    &coverage.language,
+                    coverage.unavailable,
+                    coverage.unresolved.as_slice(),
+                )
+            })
+    }
+
     /// Whether static capture establishes every call edge in the selected source range.
     ///
     /// Incoming reads require every captured source of the same language, across its dialects.
