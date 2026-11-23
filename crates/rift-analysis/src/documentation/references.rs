@@ -540,7 +540,7 @@ mod tests {
                 (Ok(a), Ok(b)) => {
                     assert_eq!(a.symbol(), b.symbol());
                     assert_eq!(a.source(), b.source());
-                    assert!(std::ptr::eq(b.source(), &unit));
+                    assert!(std::ptr::eq(b.source(), &raw const unit));
                     assert_eq!(a.range(), b.range());
                 }
                 (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
