@@ -584,13 +584,14 @@ impl<'source> Index<'source> {
     /// The member `member` of the value a name bound to a call holds, read from the object
     /// literals the callee returns (D38): the callee declares no return type, every one of
     /// its `return`s returns an object literal, and each of them writes the member. The
-    /// member of the first literal is the target. One level only: a returned call is no
-    /// object literal.
+    /// member of the first literal is the read target. A checked direct pair can name
+    /// its local callable value at a call site.
     pub(super) fn javascript_returned_member<'index>(
         &'index self,
         file: &'index File<'source>,
         binding: &StaticBinding,
         member: &str,
+        role: ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let &(None, call) = file.callbacks.destructured.get(&binding.name)? else {
@@ -615,7 +616,20 @@ impl<'source> Index<'source> {
                 let target = Self::javascript_literal_member(declared, (*object)?, member, work)?;
                 first.get_or_insert(target);
             }
-            first
+            let target = first?;
+            if role == ReferenceRole::Call
+                && file.document.facts.language().name == "javascript"
+                && declared.document.facts.language().name == "javascript"
+                && let [Some(object)] = objects.as_slice()
+                && file
+                    .text(binding.name)
+                    .is_some_and(|receiver| !file.javascript_reassigned(receiver, Some(member)))
+                && let Some(callable) =
+                    self.javascript_returned_pair_value(declared, target, *object, work)
+            {
+                return Some(callable);
+            }
+            Some(target)
         })
     }
 
