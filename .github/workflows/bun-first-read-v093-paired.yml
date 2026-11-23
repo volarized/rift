@@ -1,0 +1,105 @@
+name: Bun first read artifact pair
+
+on:
+  push:
+    branches: [diagnostic/bun-first-read-v093-paired-20261123]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: bun-first-read-v093-paired
+  cancel-in-progress: false
+
+env:
+  BASE: 449424582a1960707bd9b62aa8cae8d5c4230664
+  BASE_TREE: 9c058a03a0a58ac9a8cbeb7fe9553622ba7ae219
+  SIGNER: FC08DDCFB56DB97D06926EDD4BF8B94B2A499B8A
+  PACKET: dev/diagnostics/bun-first-read
+
+jobs:
+  pair:
+    if: >-
+      github.repository == 'volarized/rift' &&
+      github.ref == 'refs/heads/diagnostic/bun-first-read-v093-paired-20261123' &&
+      github.event.created &&
+      !github.event.deleted &&
+      !github.event.forced &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.sender.type == 'User' &&
+      github.event.sender.login == 'renardeinside' &&
+      github.actor == 'renardeinside' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 29
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the signed source-only packet
+        env:
+          PUSHED_HEAD: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          receipts="$RUNNER_TEMP/bun-first-read-evidence"
+          mkdir "$receipts"
+          test "$PUSHED_HEAD" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$BASE"
+          test "$(git show -s --format=%T "$BASE")" = "$BASE_TREE"
+          git diff --name-only "$BASE" HEAD > "$receipts/changed-paths.txt"
+          test "$(wc -l < "$receipts/changed-paths.txt")" = 5
+          test -z "$(grep -Ev '^(\.github/workflows/bun-first-read-v093-paired\.yml|dev/diagnostics/bun-first-read/(artifact_gate\.py|contract\.json|paired_first_read\.py|signing-key\.asc))$' "$receipts/changed-paths.txt")"
+          git diff --exit-code "$BASE" HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml justfile dev/uv.lock
+          export GNUPGHOME="$RUNNER_TEMP/bun-first-read-gnupg"
+          install -m 700 -d "$GNUPGHOME"
+          key="$PACKET/signing-key.asc"
+          test "$(gpg --batch --with-colons --show-keys "$key" | awk -F: '$1=="fpr" {print $10; exit}')" = "$SIGNER"
+          gpg --batch --import "$key"
+          git verify-commit --raw "$GITHUB_SHA" > "$receipts/packet-signature.txt" 2>&1
+          grep -F "[GNUPG:] VALIDSIG $SIGNER " "$receipts/packet-signature.txt"
+          git show -s --format='%H %T %P' "$BASE" "$GITHUB_SHA" > "$receipts/source-chain.txt"
+          sha256sum "$PACKET"/* > "$receipts/packet-inputs.txt"
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+      - name: Prepare the locked Python harness and Bun input
+        timeout-minutes: 3
+        env:
+          RIFT_CORPUS_DIR: ${{ runner.temp }}/bun-first-read-corpus
+        run: |
+          set -euo pipefail
+          uv sync --locked --python 3.12 --project dev
+          bun="$(uv run --locked --project dev rift-dev corpus sync bun)"
+          printf 'PAIR_BUN_PATH=%s\n' "$bun" >> "$GITHUB_ENV"
+      - name: Verify and extract the two ordinary CLI artifacts
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/bun-first-read-scratch"
+          receipts="$RUNNER_TEMP/bun-first-read-evidence"
+          uv run --locked --project dev python "$PACKET/artifact_gate.py" "$PACKET/contract.json" "$scratch"
+          cp "$scratch"/verified-pair.json "$receipts/"
+          for arm in base candidate; do
+            mkdir "$receipts/$arm"
+            cp "$scratch/$arm/"*.json "$receipts/$arm/"
+          done
+      - name: Observe six sequential paired starts and two correctness controls
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          receipts="$RUNNER_TEMP/bun-first-read-evidence"
+          uv run --locked --project dev python "$PACKET/paired_first_read.py" \
+            --bun "$PAIR_BUN_PATH" --scratch "$RUNNER_TEMP/bun-first-read-scratch" \
+            --evidence "$receipts"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bun-first-read-v093-paired
+          path: ${{ runner.temp }}/bun-first-read-evidence
+          if-no-files-found: warn
+          retention-days: 7

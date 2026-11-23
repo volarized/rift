@@ -1,0 +1,32 @@
+{
+  "repository": "volarized/rift",
+  "profile": "corpus",
+  "platform": "ubuntu-24.04/x86_64",
+  "bun_pin": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "base": {
+    "workflow_head": "449424582a1960707bd9b62aa8cae8d5c4230664",
+    "built_commit": "449424582a1960707bd9b62aa8cae8d5c4230664",
+    "tree": "9c058a03a0a58ac9a8cbeb7fe9553622ba7ae219",
+    "event": "push",
+    "run": 45094616362,
+    "job": 137431543871,
+    "artifact": 14783066217,
+    "archive_sha256": "bc2ed06d1282d3fdea1316e0f62527e61c46d84de42f8137fef126be065bf3d0",
+    "binary_sha256": "460c39160907e71721434613a6c82824f0e05d35452f8d86c49f6cf8cfdfd174"
+  },
+  "candidate": {
+    "workflow_head": "70e229d23dd9c8ff1c857525e319a8d25fd45c0a",
+    "built_commit": "a9cf5316b023f6857a331fa6ab4bc6541afd2f96",
+    "tree": "32aeea7cc6ae3ab5a9f2bc5e8d521408d1b51f79",
+    "parents": [
+      "449424582a1960707bd9b62aa8cae8d5c4230664",
+      "70e229d23dd9c8ff1c857525e319a8d25fd45c0a"
+    ],
+    "event": "pull_request",
+    "run": 45098528895,
+    "job": 137443727966,
+    "artifact": 14784726587,
+    "archive_sha256": "cf519e023c8229af2bb7e22adf18bab1523c30b990fb4d757e99893ab27b3486",
+    "binary_sha256": "7f8eb2a030665b14118aa3e15887fddf7eea98bfd0e2baedb7e1358b6c2e1b63"
+  }
+}
