@@ -64,13 +64,9 @@ pub(super) fn prepare(
         return super::PreparedNamespace::default();
     }
     let originals = original_sources(input);
-    let Some((mut assigned, mut pending)) = library_roots_pending(input, &inventory) else {
+    let Some((mut assigned, mut pending, root)) = library_roots_pending(input, &inventory) else {
         return super::PreparedNamespace::default();
     };
-    let package_root = pending
-        .front()
-        .filter(|_| matches!(input.owner(), SymbolOwner::Package { .. }))
-        .map(|(path, ..)| path.clone());
     let mut anchors = BTreeMap::new();
     let mut requested = Vec::new();
     let configurations = configuration::Configurations::new(input);
@@ -159,8 +155,19 @@ pub(super) fn prepare(
     };
     let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
     local_exports(input, selected, &requested, &admitted, &mut prepared);
-    // Cargo assigns the library-root namespace independently of authored declarations.
-    if let Some(path) = package_root
+    retain_root_anchor(input, root, &inventory, &assigned, &mut prepared);
+    prepared
+}
+
+/// Retains the accepted Cargo root namespace for package imports.
+fn retain_root_anchor(
+    input: &NamespaceInput<'_>,
+    root: Option<String>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    assigned: &BTreeMap<String, Vec<String>>,
+    prepared: &mut super::PreparedNamespace,
+) {
+    if let Some(path) = root
         && let Some(file) = inventory.get(path.as_str())
         && !file.syntax.has_errors()
         && file.syntax.left_out_declaration_count() == 0
@@ -175,7 +182,6 @@ pub(super) fn prepare(
     {
         prepared.rust_package_root = Some((path, identity));
     }
-    prepared
 }
 
 /// Whether the configuration admits each module file: its declaring `mod` items and every
@@ -369,13 +375,14 @@ fn target_roots(
 }
 
 type Pending = VecDeque<(String, Vec<String>, String, macros::Scope, bool)>;
+type LibraryRoots = (BTreeMap<String, Vec<String>>, Pending, Option<String>);
 
 /// The selected library roots, assigned to their crate namespaces and queued for the
 /// module walk. Two roots of one path refuse the whole inventory.
 fn library_roots_pending(
     input: &NamespaceInput<'_>,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
-) -> Option<(BTreeMap<String, Vec<String>>, Pending)> {
+) -> Option<LibraryRoots> {
     let mut assigned = BTreeMap::new();
     let mut pending = VecDeque::new();
     for (root, name) in selected_libraries(input, inventory) {
@@ -393,7 +400,11 @@ fn library_roots_pending(
             library,
         ));
     }
-    Some((assigned, pending))
+    let package_root = pending
+        .front()
+        .filter(|_| matches!(input.owner(), SymbolOwner::Package { .. }))
+        .map(|(path, ..)| path.clone());
+    Some((assigned, pending, package_root))
 }
 
 fn library_root(
