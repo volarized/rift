@@ -25,8 +25,8 @@ use crate::source::IndexedFile;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::line::{line_of, line_starts};
 use rift_core::{
-    ContributionOrigin, ProjectPath as CoreProjectPath, SourceKind,
-    SourceUnitId as CoreSourceUnitId,
+    ContributionOrigin, PortableSymbolFacts, ProjectPath as CoreProjectPath, SourceKind,
+    SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId,
 };
 use rift_error::{RiftError, errors};
 use rift_protocol::canonical::canonical_json;
@@ -35,7 +35,7 @@ use rift_protocol::documentation::{
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
     DocumentationWarningKind, NotebookCellKind,
 };
-use rift_protocol::identity::SymbolOwner;
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::{
     PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning,
     PackageCoverage, PackageDocument, PackageDocumentKind, PackageOccurrence, PackagePublication,
@@ -43,8 +43,8 @@ use rift_protocol::index::{
 };
 use rift_protocol::producer::{FactCoverage, FactKind};
 use rift_protocol::read::{
-    Digest, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolKind,
-    SymbolOrigin, TextRange,
+    Digest, EdgeKind, ExactKind, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol,
+    SymbolId, SymbolKind, SymbolOrigin, TextRange,
 };
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
@@ -1579,38 +1579,43 @@ impl Records {
         let units = self
             .units
             .iter()
-            .map(|unit| unit.unit.0.clone())
-            .collect::<BTreeSet<_>>();
+            .map(|unit| (unit.unit.0.clone(), unit.source_complete))
+            .collect::<BTreeMap<_, _>>();
+        let mut importers = BTreeMap::new();
         let sources = analyzed
             .iter()
-            .map(|held| (held.placement.unit().to_string(), held.file.source()))
+            .map(|held| {
+                let unit = held.placement.unit().to_string();
+                let syntax = held.file.syntax();
+                if !self.symbols_truncated
+                    && syntax.language().name == "typescript"
+                    && let Some(module) = held.placement.logical_identity(".")
+                    && !objects.contains(module.as_str())
+                    && !semantics.edges().outgoing(module).is_empty()
+                {
+                    let proven = units.get(&unit) == Some(&true)
+                        && !syntax.has_errors()
+                        && syntax.left_out_declaration_count() == 0
+                        && semantics.edges().edge_module(held.placement.unit()) == Some(module);
+                    importers
+                        .entry(module)
+                        .and_modify(|held| *held = None)
+                        .or_insert(proven.then_some(held));
+                }
+                (unit, held.file.source())
+            })
             .collect::<BTreeMap<_, _>>();
-        if self.outgoing_edges(owner, semantics, &objects, &units, &sources, limit)? {
-            return Ok(());
-        }
-        self.graph_edges(owner, semantics, &objects, &units, &sources, limit)?;
-        if semantics.edges().dropped_edges() > 0 {
-            self.warn(truncation(
-                "edges",
-                u64::try_from(limit).unwrap_or(u64::MAX),
-            ));
-        }
-        Ok(())
-    }
-
-    fn outgoing_edges(
-        &mut self,
-        owner: &SymbolOwner,
-        semantics: &WorkspaceSemantics,
-        objects: &BTreeSet<String>,
-        units: &BTreeSet<String>,
-        sources: &BTreeMap<String, &str>,
-        limit: usize,
-    ) -> Result<bool, RiftError> {
         for record in semantics.graph().records() {
-            let Some(id) = record.identity().filter(|id| objects.contains(id.as_str())) else {
+            let Some(id) = record.identity() else {
                 continue;
             };
+            if !importers.is_empty() {
+                // Even a graph record refused by object publication owns this identity.
+                importers.remove(id);
+            }
+            if !objects.contains(id.as_str()) {
+                continue;
+            }
             for edge in semantics
                 .edges()
                 .outgoing(id)
@@ -1622,7 +1627,7 @@ impl Records {
                         "edges",
                         u64::try_from(limit).unwrap_or(u64::MAX),
                     ));
-                    return Ok(true);
+                    return Ok(());
                 }
                 let edge = edge.to_protocol();
                 if SymbolId::parse(&edge.from.0).is_err() || SymbolId::parse(&edge.to.0).is_err() {
@@ -1636,7 +1641,7 @@ impl Records {
                         .filter(|(start, end)| start <= end)
                         .and_then(|(start, end)| sources.get(&span.unit.0)?.get(start..end))
                         .is_some();
-                    if !units.contains(&span.unit.0) {
+                    if !units.contains_key(&span.unit.0) {
                         self.identity_incomplete = true;
                         continue;
                     }
@@ -1649,7 +1654,100 @@ impl Records {
                 self.edges.push(edge);
             }
         }
-        Ok(false)
+        self.graph_edges(owner, semantics, &objects, &units, &sources, limit)?;
+        self.module_imports(owner, semantics, &objects, importers, limit);
+        if semantics.edges().dropped_edges() > 0 {
+            self.warn(truncation(
+                "edges",
+                u64::try_from(limit).unwrap_or(u64::MAX),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A checked file-module can own an import without a written module declaration.
+    fn module_imports(
+        &mut self,
+        owner: &SymbolOwner,
+        semantics: &WorkspaceSemantics,
+        objects: &BTreeSet<String>,
+        importers: BTreeMap<&CoreSymbolId, Option<&AnalyzedFile>>,
+        limit: usize,
+    ) {
+        for (module, held) in importers {
+            let Some(held) = held else {
+                continue;
+            };
+            let language = held.file.syntax().language();
+            let Ok(identity) = SymbolIdentity::parse(module.as_str()) else {
+                continue;
+            };
+            let [name] = identity.qualified_path() else {
+                continue;
+            };
+            if identity.owner() != owner || identity.language() != language {
+                continue;
+            }
+            let mut published = false;
+            for edge in semantics.edges().outgoing(module) {
+                let occurrence = edge.occurrence();
+                let range = occurrence.range();
+                if edge.is_graph_edge()
+                    || edge.kind() != EdgeKind::Imports
+                    || occurrence.unit() != held.placement.unit()
+                    || held
+                        .file
+                        .source()
+                        .get(offset_in(range.start())..offset_in(range.end()))
+                        .is_none_or(str::is_empty)
+                {
+                    continue;
+                }
+                // A local target must already have an object. An accepted dependency or
+                // runtime identity is portable without its object in this publication.
+                if !objects.contains(edge.to().as_str())
+                    && !SymbolIdentity::parse(edge.to().as_str()).is_ok_and(|target| {
+                        target.owner() != owner
+                            && matches!(
+                                target.owner(),
+                                SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+                            )
+                    })
+                {
+                    self.identity_incomplete = true;
+                    continue;
+                }
+                if self.edges.len() >= limit {
+                    self.warn(truncation(
+                        "edges",
+                        u64::try_from(limit).unwrap_or(u64::MAX),
+                    ));
+                    return;
+                }
+                if !published {
+                    if self.objects.len() >= bound(self.publication.symbols) {
+                        self.symbols_truncated = true;
+                        self.warn(truncation("objects", u64::from(self.publication.symbols)));
+                        return;
+                    }
+                    let facts = PortableSymbolFacts::new(
+                        language.clone(),
+                        name.as_str(),
+                        name.as_str(),
+                        ExactKind("module".to_owned()),
+                    )
+                    .kinds(vec![SymbolKind::Module]);
+                    let origin = ContributionOrigin::new(None, SourceKind::Synthetic)
+                        .expect("source-less module origin");
+                    let mut object = rift_provider::AssembledSymbol::wire_facts(&facts, &origin);
+                    object.id = Some(SymbolId(module.as_str().to_owned()));
+                    self.object_unavailable(&object, name, None);
+                    self.objects.push(object);
+                    published = true;
+                }
+                self.edges.push(edge.to_protocol());
+            }
+        }
     }
 
     fn graph_edges(
@@ -1657,7 +1755,7 @@ impl Records {
         owner: &SymbolOwner,
         semantics: &WorkspaceSemantics,
         objects: &BTreeSet<String>,
-        units: &BTreeSet<String>,
+        units: &BTreeMap<String, bool>,
         sources: &BTreeMap<String, &str>,
         limit: usize,
     ) -> Result<(), RiftError> {
@@ -1704,7 +1802,7 @@ impl Records {
                     .filter(|(start, end)| start < end)
                     .and_then(|(start, end)| sources.get(&span.unit.0)?.get(start..end))
                     .is_some();
-                if !units.contains(&span.unit.0) {
+                if !units.contains_key(&span.unit.0) {
                     self.identity_incomplete = true;
                     continue;
                 }

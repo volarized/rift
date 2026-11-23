@@ -10,6 +10,7 @@ use rift_core::ProjectPath;
 mod aliases;
 mod facts;
 mod graph;
+mod module_imports;
 
 fn publication(
     files: &[(&str, &str)],
