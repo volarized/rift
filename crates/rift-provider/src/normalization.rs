@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -373,13 +374,12 @@ impl Normalizer {
     ) -> Result<NormalizedGraph, RiftError> {
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
-        let references = reference_index(&contributions);
         let mut anchors = contributions
             .iter()
             .map(|contribution| contribution_anchors(contribution))
             .collect::<Vec<_>>();
         let mut candidates = Vec::new();
-        let edges = association_edges(&contributions, &references, &mut candidates);
+        let edges = association_edges(&contributions, &OnceCell::new(), &mut candidates);
         let mut groups = UnionFind::new(contributions.len());
 
         union_established_anchors(&mut groups, &anchors);
@@ -475,7 +475,7 @@ fn binding_key(binding: &rift_core::DeclarationBinding) -> BindingKey {
 
 fn association_edges(
     contributions: &[&Contribution],
-    references: &BTreeMap<ContributionReference, usize>,
+    references: &OnceCell<BTreeMap<ContributionReference, usize>>,
     candidates: &mut Vec<AssociationCandidate>,
 ) -> Vec<(usize, usize)> {
     let mut edges = BTreeSet::new();
@@ -508,16 +508,20 @@ fn association_edges(
                         }
                     }
                 }
-                EquivalenceEvidence::Explicit(target) => match references.get(target) {
-                    Some(&target_index) => {
-                        edges.insert(ordered_edge(index, target_index));
+                EquivalenceEvidence::Explicit(target) => {
+                    let index_by_reference =
+                        references.get_or_init(|| reference_index(contributions));
+                    match index_by_reference.get(target) {
+                        Some(&target_index) => {
+                            edges.insert(ordered_edge(index, target_index));
+                        }
+                        None => candidates.push(AssociationCandidate::new(
+                            contribution.key().reference().clone(),
+                            target.clone(),
+                            AssociationState::TargetUnavailable,
+                        )),
                     }
-                    None => candidates.push(AssociationCandidate::new(
-                        contribution.key().reference().clone(),
-                        target.clone(),
-                        AssociationState::TargetUnavailable,
-                    )),
-                },
+                }
                 EquivalenceEvidence::Candidate(target) => {
                     candidates.push(AssociationCandidate::new(
                         contribution.key().reference().clone(),
@@ -986,6 +990,7 @@ impl get_size2::GetSize for NormalizedGraph {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::OnceCell;
     use std::sync::Arc;
 
     use rift_core::{
@@ -996,7 +1001,7 @@ mod tests {
         SourceResolverId, SourceRevision, SourceUnitId, SymbolId, SymbolResolution, TreeRevision,
     };
 
-    use super::{AssociationState, NormalizedGraph, Normalizer};
+    use super::{AssociationState, NormalizedGraph, Normalizer, association_edges};
     use crate::{ProviderPublication, PublicationLimits, PublicationSet};
 
     fn provider(value: &str) -> ProviderId {
@@ -1449,6 +1454,31 @@ mod tests {
     }
 
     #[test]
+    fn associations_without_explicit_equivalence_skip_the_reference_index() {
+        let declaration = binding("src/lib.rs", 0);
+        let syntax = exact("syntax", 1, "Beacon", 1, declaration.clone(), None, vec![]);
+        let native = exact("native", 1, "Beacon", 1, declaration, None, vec![]);
+        let docs = independent(
+            "docs",
+            1,
+            "Beacon",
+            vec![EquivalenceEvidence::Candidate(reference(
+                "syntax", "Beacon",
+            ))],
+        );
+        for contributions in [&[&native, &syntax][..], &[&native, &syntax, &docs]] {
+            let references = OnceCell::new();
+            let mut candidates = Vec::new();
+            assert_eq!(
+                association_edges(contributions, &references, &mut candidates),
+                [(0, 1)]
+            );
+            assert!(references.get().is_none());
+            assert_eq!(candidates.len(), contributions.len() - 2);
+        }
+    }
+
+    #[test]
     fn explicit_equivalence_attaches_revision_independent_facts() {
         let target = reference("syntax", "Beacon");
         let set = publications(vec![
@@ -1479,6 +1509,15 @@ mod tests {
         let graph = normalize(&set, 1, None);
         assert_eq!(graph.records().len(), 1);
         assert_eq!(graph.records()[0].contributions().len(), 2);
+
+        let next = normalize(&set, 2, Some(&graph));
+        assert_eq!(next.records().len(), 1);
+        assert_eq!(next.records()[0].contributions().len(), 1);
+        let [missing] = next.candidates() else {
+            panic!("the independently applicable facts name one unavailable target");
+        };
+        assert_eq!(missing.state(), AssociationState::TargetUnavailable);
+        assert_eq!(missing.target(), &reference("syntax", "Beacon"));
     }
 
     #[test]
