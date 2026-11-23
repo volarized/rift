@@ -1,3 +1,5 @@
+mod admitted;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -205,12 +207,20 @@ pub struct NormalizedGraph {
     publications: Arc<PublicationSet>,
     records: Vec<SymbolRecord>,
     records_by_contribution: BTreeMap<ContributionReference, usize>,
+    ordinals: Option<admitted::RecordOrdinals>,
+    group_work: (&'static str, usize),
     candidates: Vec<AssociationCandidate>,
     references: Vec<NormalizedReference>,
     edges: Vec<NormalizedEdge>,
 }
 
 impl NormalizedGraph {
+    /// Membership decision and number of records carried from the previous publication.
+    #[must_use]
+    pub const fn group_work(&self) -> (&'static str, usize) {
+        self.group_work
+    }
+
     /// Returns captured index revision.
     #[must_use]
     pub const fn index_revision(&self) -> IndexRevision {
@@ -250,9 +260,8 @@ impl NormalizedGraph {
     /// Returns record associated with provider-local reference.
     #[must_use]
     pub fn record_for(&self, reference: &ContributionReference) -> Option<&SymbolRecord> {
-        self.records_by_contribution
-            .get(reference)
-            .and_then(|index| self.records.get(*index))
+        self.record_position_for(reference)
+            .and_then(|index| self.records.get(index))
     }
 
     /// Returns the position in [`Self::records`] of the record associated with a
@@ -262,7 +271,10 @@ impl NormalizedGraph {
     /// declaration can answer a question about the record once.
     #[must_use]
     pub fn record_position_for(&self, reference: &ContributionReference) -> Option<usize> {
-        self.records_by_contribution.get(reference).copied()
+        match &self.ordinals {
+            Some(ordinals) => ordinals.position(&self.publications, reference),
+            None => self.records_by_contribution.get(reference).copied(),
+        }
     }
 
     /// Returns established identity associated with provider-local reference.
@@ -346,15 +358,31 @@ impl Normalizer {
         source_revision: SourceRevision,
         tree_revision: TreeRevision,
         publications: &Arc<PublicationSet>,
-        _previous: Option<&NormalizedGraph>,
+        previous: Option<&NormalizedGraph>,
     ) -> Result<NormalizedGraph, RiftError> {
-        Self::normalize_with(
+        let reason = if let Some(held) = previous {
+            match admitted::rebuild(
+                held,
+                publications,
+                index_revision,
+                source_revision,
+                tree_revision,
+            )? {
+                Ok(current) => return Ok(current),
+                Err(reason) => reason,
+            }
+        } else {
+            "first_publication"
+        };
+        let mut graph = Self::normalize_with(
             index_revision,
             source_revision,
             tree_revision,
             publications,
             &|_| None,
-        )
+        )?;
+        graph.group_work = (reason, 0);
+        Ok(graph)
     }
 
     /// Normalizes edges with explicitly supplied, source-checked external targets.
@@ -650,6 +678,7 @@ fn build_records(
     anchors: &[BTreeSet<SymbolId>],
     groups: &mut UnionFind,
     conflicting: &BTreeSet<usize>,
+    mut ordinals: Option<&mut admitted::RecordOrdinals>,
 ) -> Result<(Vec<SymbolRecord>, BTreeMap<ContributionReference, usize>), RiftError> {
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
     for index in 0..contributions.len() {
@@ -677,9 +706,16 @@ fn build_records(
         };
         let record = SymbolRecord::new(index_revision, identity, resolution, keys)?;
         let record_index = records.len();
-        for &index in &indexes {
-            records_by_contribution
-                .insert(contributions[index].key().reference().clone(), record_index);
+        if let Some(ordinals) = ordinals.as_deref_mut() {
+            ordinals.roots.push(root);
+            for index in indexes {
+                ordinals.records[index] = record_index;
+            }
+        } else {
+            for index in indexes {
+                records_by_contribution
+                    .insert(contributions[index].key().reference().clone(), record_index);
+            }
         }
         records.push(record);
     }
@@ -690,15 +726,12 @@ fn normalize_edges(
     index_revision: IndexRevision,
     contributions: &[&Contribution],
     records: &[SymbolRecord],
-    records_by_contribution: &BTreeMap<ContributionReference, usize>,
+    record_position: impl Fn(&ContributionReference) -> Option<usize>,
     external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
 ) -> (Vec<NormalizedReference>, Vec<NormalizedEdge>) {
     let normalize_target = |target: &ContributionReference| {
-        let identity = if let Some(index) = records_by_contribution.get(target) {
-            records
-                .get(*index)
-                .and_then(SymbolRecord::identity)
-                .cloned()
+        let identity = if let Some(index) = record_position(target) {
+            records.get(index).and_then(SymbolRecord::identity).cloned()
         } else {
             external(target)
         };
@@ -747,12 +780,15 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         mut candidates,
         external,
     } = input;
+    let mut ordinals =
+        admitted::RecordOrdinals::for_publication(&publications, contributions.len());
     let (records, records_by_contribution) = build_records(
         index_revision,
         contributions,
         anchors,
         &mut groups,
         conflicting,
+        ordinals.as_mut(),
     )?;
     candidates.sort_by(|left, right| {
         (
@@ -772,7 +808,10 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         index_revision,
         contributions,
         &records,
-        &records_by_contribution,
+        |reference| match &ordinals {
+            Some(ordinals) => ordinals.position(&publications, reference),
+            None => records_by_contribution.get(reference).copied(),
+        },
         external,
     );
 
@@ -783,6 +822,8 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         publications,
         records,
         records_by_contribution,
+        ordinals,
+        group_work: ("full", 0),
         candidates,
         references,
         edges,
@@ -947,6 +988,9 @@ impl get_size2::GetSize for NormalizedGraph {
             self.records_by_contribution.len(),
         )
         .saturating_add(2 * std::mem::size_of::<usize>());
+        if let Some(ordinals) = &self.ordinals {
+            bytes = bytes.saturating_add(ordinals.retained_bytes());
+        }
         let (field, next) = rift_protocol::retained_arc_material(
             &self.publications,
             tracker,
@@ -1160,6 +1204,125 @@ mod tests {
             previous,
         )
         .expect("normalized graph")
+    }
+
+    fn check_admitted(
+        set: &Arc<PublicationSet>,
+        revision: u64,
+        previous: &NormalizedGraph,
+        eligible: bool,
+    ) -> NormalizedGraph {
+        let reused = super::admitted::rebuild(
+            previous,
+            set,
+            index_revision(revision),
+            source_revision(1),
+            tree_revision(revision),
+        )
+        .expect("valid normalization");
+        assert_eq!(reused.is_ok(), eligible);
+        let warm = normalize(set, revision, Some(previous));
+        let cold = normalize(set, revision, None);
+        assert_eq!(warm.records(), cold.records());
+        assert_eq!(warm.candidates(), cold.candidates());
+        assert_eq!(warm.references(), cold.references());
+        assert_eq!(warm.edges(), cold.edges());
+        for row in set
+            .publications()
+            .flat_map(ProviderPublication::contributions)
+        {
+            let key = row.key();
+            assert_eq!(
+                warm.record_position_for(key.reference()),
+                cold.record_position_for(key.reference())
+            );
+            assert_eq!(warm.contribution(key), cold.contribution(key));
+        }
+        warm
+    }
+
+    fn moving_publication(
+        revision: u64,
+        marker: Option<(&str, u64)>,
+        split: bool,
+    ) -> Arc<PublicationSet> {
+        let start = 10 * revision;
+        let row = |symbol, offset, anchor| {
+            exact(
+                "syntax",
+                revision,
+                symbol,
+                revision,
+                binding("main.ts", offset),
+                anchor,
+                vec![],
+            )
+        };
+        let caller = row("caller", start, None);
+        let caller = Contribution::builder(
+            caller.key().clone(),
+            caller.applicability(),
+            caller.facts().expect("facts").clone(),
+            caller.origin().clone(),
+        )
+        .source(caller.source().expect("binding").clone())
+        .edges(vec![ContributionEdge::new(
+            EdgeKind::Alias,
+            reference("syntax", "marker"),
+        )])
+        .build()
+        .expect("caller");
+        let mut rows = vec![caller, row("overlap", start + u64::from(split), None)];
+        if let Some((identity, offset)) = marker {
+            rows.push(row("marker", offset, Some(identity)));
+        }
+        rows.push(row(
+            "retained",
+            100,
+            Some("rift://symbol/local/rust/app/Retained"),
+        ));
+        publications(vec![publication("syntax", revision, rows)])
+    }
+
+    #[test]
+    fn admitted_range_moves_and_singular_insert_wake_a_missing_alias_until_restoration() {
+        let first = normalize(&moving_publication(1, None, false), 1, None);
+        let target = || reference("syntax", "marker");
+        assert!(first.record_for(&target()).is_none());
+        let with_marker =
+            moving_publication(2, Some(("rift://symbol/local/rust/app/Marker", 150)), false);
+        let second = check_admitted(&with_marker, 2, &first, true);
+        assert!(second.identity_for(&target()).is_some());
+        assert_ne!(first.edges()[0].target(), second.edges()[0].target());
+        let third = check_admitted(&moving_publication(3, None, false), 3, &second, true);
+        assert_eq!(third.edges()[0].target(), first.edges()[0].target());
+        assert!(second.identity_for(&target()).is_some());
+        assert!(first.record_for(&target()).is_none());
+    }
+
+    #[test]
+    fn changed_equality_classes_claimant_collisions_and_additional_providers_rebuild() {
+        let first = normalize(&moving_publication(1, None, false), 1, None);
+        for changed in [
+            moving_publication(2, None, true),
+            moving_publication(
+                2,
+                Some(("rift://symbol/local/rust/app/Retained", 150)),
+                false,
+            ),
+            moving_publication(2, Some(("rift://symbol/local/rust/app/Marker", 20)), false),
+            Arc::new(
+                moving_publication(2, None, false)
+                    .replaced(publication(
+                        "external",
+                        2,
+                        vec![independent("external", 2, "imported", vec![])],
+                    ))
+                    .expect("additional provider"),
+            ),
+        ] {
+            check_admitted(&changed, 2, &first, false);
+        }
     }
 
     #[test]

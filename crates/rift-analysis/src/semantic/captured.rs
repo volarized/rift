@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::sync::{Arc, Weak};
 
 use rift_error::{RiftError, errors};
 use rift_provider::NormalizedGraph;
@@ -10,6 +12,37 @@ use crate::{IndexedFile, NamespaceInput};
 
 use super::{BuiltSemantics, PlacedFacts, PreparedSemantics, WorkspaceSemantics};
 
+/// Input witness and provider ordinals for one completely admitted file.
+#[derive(Debug)]
+struct AdmittedSource {
+    facts: Weak<rift_syntax::SyntaxFacts>,
+    placement: Arc<DocumentPlacement>,
+    rows: Range<usize>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct AdmittedSources(BTreeMap<rift_core::ProjectPath, AdmittedSource>);
+
+impl AdmittedSources {
+    pub(super) fn retained_size<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        rift_protocol::retained_map_material(&self.0, tracker, |source, tracker| {
+            let (placement, mut tracker) = rift_protocol::retained_arc_material(
+                &source.placement,
+                tracker,
+                DocumentPlacement::retained_heap,
+            );
+            let released = if source.facts.strong_count() == 0
+                && tracker.track(source.facts.as_ptr().cast::<()>())
+            {
+                std::mem::size_of::<rift_syntax::SyntaxFacts>() + 2 * std::mem::size_of::<usize>()
+            } else {
+                0
+            };
+            (placement.saturating_add(released), tracker)
+        })
+    }
+}
+
 /// Source and namespace evidence waiting beside an admitted project publication.
 #[derive(Debug)]
 pub struct PreparedProjectSemantics<'source> {
@@ -17,6 +50,7 @@ pub struct PreparedProjectSemantics<'source> {
     input: NamespaceInput<'source>,
     documents: Vec<&'source IndexedFile>,
     placements: Vec<PlacedFacts<'source>>,
+    admitted: Vec<(Range<usize>, Option<Arc<DocumentPlacement>>)>,
     outside_namespaces: BTreeSet<rift_core::SourceUnitId>,
 }
 
@@ -93,13 +127,50 @@ impl PreparedProjectSemantics<'_> {
         if !resolve_static && admitted_all {
             built.semantics.defer_static_resolution(&sources);
         }
+        let (group_path, carried_records) = built.semantics.graph().group_work();
+        let (carried_files, carried_rows) = self
+            .admitted
+            .iter()
+            .filter(|(_, placement)| placement.is_some())
+            .fold((0usize, 0usize), |(files, rows), (range, _)| {
+                (files + 1, rows + range.len())
+            });
+        rift_tracing::info!(
+            component = "analysis",
+            operation = "analysis.captured_admission",
+            files = self.admitted.len(),
+            carried_files,
+            carried_rows,
+            group_path,
+            carried_records,
+            records = built.semantics.graph().records().len(),
+            "Admitted captured declarations"
+        );
+        if resolve_static && admitted_all {
+            for ((document, placed), (rows, held)) in self
+                .documents
+                .iter()
+                .zip(self.placements)
+                .zip(self.admitted)
+            {
+                built.semantics.captured_sources.0.insert(
+                    document.path().clone(),
+                    AdmittedSource {
+                        facts: Arc::downgrade(document.syntax_facts()),
+                        placement: held.unwrap_or_else(|| Arc::new(placed.placement)),
+                        rows,
+                    },
+                );
+            }
+        }
         Ok(built)
     }
 
     /// Whether every supplied document survived publication admission.
     #[must_use]
     pub fn admitted_all(&self) -> bool {
-        self.prepared.beyond_declaration_bound.is_empty()
+        self.admitted.len() == self.documents.len()
+            && self.prepared.beyond_declaration_bound.is_empty()
             && self.prepared.refused_contributions.is_empty()
     }
 }
@@ -133,6 +204,27 @@ impl WorkspaceSemantics {
         documents: &[&'source IndexedFile],
         declarations_max: usize,
         revision: u64,
+    ) -> Result<PreparedProjectSemantics<'source>, RiftError> {
+        Self::prepare_captured_project_facts_after(
+            input,
+            documents,
+            declarations_max,
+            revision,
+            None,
+        )
+    }
+
+    /// Admits current project declarations using unchanged syntax and placement from a
+    /// previous captured workspace when available.
+    ///
+    /// # Errors
+    /// Returns the same context, placement and publication errors as fresh admission.
+    pub fn prepare_captured_project_facts_after<'source>(
+        input: NamespaceInput<'source>,
+        documents: &[&'source IndexedFile],
+        declarations_max: usize,
+        revision: u64,
+        previous: Option<&Self>,
     ) -> Result<PreparedProjectSemantics<'source>, RiftError> {
         if !input.owner().is_local() {
             return errors::analysis::package_input_identity_invalid().fail();
@@ -197,12 +289,55 @@ impl WorkspaceSemantics {
                 .with_logical_declarations(namespace.mappings.remove(path).unwrap_or_default())
                 .with_aliases(aliases.remove(path).unwrap_or_default());
         }
-        let prepared = Self::prepare_facts_placed(&placed, declarations_max, revision, true)?;
+        let held = previous.and_then(|prior| {
+            let publication = prior
+                .graph
+                .publications()
+                .provider(&prior.syntax_provider)?;
+            Some((
+                &prior.captured_sources.0,
+                publication,
+                (prior.graph.source_revision(), prior.graph.tree_revision()),
+            ))
+        });
+        let mut admitted = Vec::with_capacity(documents.len());
+        let prepared = Self::prepare_facts_with(
+            &placed,
+            declarations_max,
+            revision,
+            true,
+            |index, placed, builder| {
+                let start = builder.admitted_len();
+                let reused = held.and_then(|(sources, publication, revision)| {
+                    let source = sources.get(placed.path)?;
+                    if !std::ptr::eq(
+                        source.facts.as_ptr(),
+                        documents[index].syntax_facts().as_ref(),
+                    ) || *source.placement != placed.placement
+                        || !builder.add_unchanged_source(
+                            publication,
+                            source.rows.clone(),
+                            placed.placement.unit(),
+                            revision,
+                        )
+                    {
+                        return None;
+                    }
+                    Some(Arc::clone(&source.placement))
+                });
+                if reused.is_none() {
+                    builder.add_facts_placed(placed.facts, &placed.placement)?;
+                }
+                admitted.push((start..builder.admitted_len(), reused));
+                Ok(())
+            },
+        )?;
         Ok(PreparedProjectSemantics {
             prepared,
             input,
             documents: documents.to_vec(),
             placements: placed,
+            admitted,
             outside_namespaces,
         })
     }
