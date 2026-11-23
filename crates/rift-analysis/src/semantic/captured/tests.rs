@@ -186,6 +186,58 @@ fn unsupported_rust_use_keeps_independent_static_calls() {
 }
 
 #[test]
+fn external_targets_keep_their_physical_usages_and_omissions_by_unit() {
+    let text = "import { readFileSync } from 'node:fs'; import { lost } from 'undeclared'; export function load() { readFileSync('a'); }";
+    let load = source_file("load.mjs", text);
+    let other = source_file("other.mjs", "export function other() {}");
+    let view = static_project(&[&load, &other], 7, None);
+    let target = rift_core::SymbolId::new("rift://symbol/stdlib/node/javascript/fs/readFileSync")
+        .expect("runtime identity");
+    let usages = view
+        .static_usages(&target)
+        .map(|(binding, range, digest, role)| {
+            let start = usize::try_from(range.start).expect("start");
+            let end = usize::try_from(range.end).expect("end");
+            assert_eq!(binding.unit().key().as_str(), "load.mjs");
+            assert_eq!(digest, load.digest());
+            (&text[start..end], role)
+        })
+        .collect::<Vec<_>>();
+    for role in [
+        rift_core::ReferenceRole::Import,
+        rift_core::ReferenceRole::Call,
+        rift_core::ReferenceRole::Read,
+    ] {
+        assert!(usages.contains(&("readFileSync", role)), "{usages:?}");
+    }
+    assert_eq!(usages.len(), 3, "{usages:?}");
+    let absent = rift_core::SymbolId::new("rift://symbol/stdlib/node/javascript/fs")
+        .expect("runtime identity");
+    assert_eq!(view.static_usages(&absent).count(), 0);
+
+    let omitted = |path: &str| {
+        let unit = rift_core::SourceUnitId::new(
+            rift_core::SourceResolverId::new("project").expect("project resolver"),
+            rift_core::SourcePath::new(path).expect("source path"),
+        )
+        .expect("project unit");
+        view.static_targets_omitted_in(&unit).cloned()
+    };
+    assert_eq!(
+        omitted("load.mjs"),
+        Some(
+            [(rift_protocol::read::EdgeKind::Imports, 1)]
+                .into_iter()
+                .collect()
+        )
+    );
+    assert_eq!(
+        omitted("other.mjs"),
+        Some(std::collections::BTreeMap::new())
+    );
+}
+
+#[test]
 fn static_call_targets_follow_edits_and_held_views_keep_original_occurrences() {
     let original = source_file(
         "main.mjs",
