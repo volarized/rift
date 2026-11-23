@@ -182,9 +182,11 @@ declaration's
 [call hierarchy](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy),
 and syntax identifies the declaration that holds each callee's name.
 
-A callee in a standard library or an OSS package has no declaration in the local index, so the
-walk stops there and the answer counts the callees it dropped. At the next depth, each callee in
-the project becomes the declaration whose calls Rift requests.
+A callee in a standard library or an OSS package has no declaration in the local index. When
+its package or runtime is known, the answer names it with that symbol identity, such as
+`rift://symbol/stdlib/cpython/python/builtins/len`, and the walk stops there. Otherwise a
+warning counts it. At the next depth, each callee in the project becomes the declaration whose
+calls Rift requests.
 
 <VersionBadge version="planned" inline /> The global index will support traversal within and
 between OSS packages.

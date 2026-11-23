@@ -106,6 +106,7 @@ fn unretained_refused_heading_count_keeps_inventory_incomplete() {
         scope: None,
         static_facts: original.static_facts().cloned(),
         has_errors: original.has_errors(),
+        variance_errors_only: original.variance_errors_only(),
         left_out_declarations: original.left_out_declaration_count() + 1,
         markdown_facts: original.markdown_facts().cloned(),
         source_digest: *original.source_digest().expect("captured digest"),

@@ -60,6 +60,8 @@ pub struct WorkspaceSemantics {
     syntax_provider: ProviderId,
     static_resolution: StaticResolution,
     static_occurrence_order: Vec<usize>,
+    /// External occurrences by target, then position.
+    external_occurrence_order: Vec<usize>,
     outside_namespaces: std::collections::BTreeSet<rift_core::SourceUnitId>,
     captured_sources: captured::AdmittedSources,
 }
@@ -152,6 +154,7 @@ impl PreparedSemantics {
             syntax_provider,
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
+            external_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
             captured_sources: captured::AdmittedSources::default(),
         };
@@ -217,12 +220,16 @@ impl StaticResolution {
                 let (language, tracker) =
                     get_size2::GetSize::get_heap_size_with_tracker(&coverage.language, tracker);
                 (
-                    language.saturating_add(
-                        coverage
-                            .unresolved
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<rift_syntax::ByteRange>()),
-                    ),
+                    language
+                        .saturating_add(
+                            coverage
+                                .unresolved
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<rift_syntax::ByteRange>()),
+                        )
+                        .saturating_add(coverage.omitted.len().saturating_mul(
+                            std::mem::size_of::<(rift_protocol::read::EdgeKind, u64)>(),
+                        )),
                     tracker,
                 )
             });
@@ -558,6 +565,9 @@ impl WorkspaceSemantics {
                 *index,
             )
         });
+        self.external_occurrence_order = (0..resolution.external.len()).collect();
+        self.external_occurrence_order
+            .sort_by_key(|index| &resolution.external[*index].target);
         self.static_resolution = resolution;
     }
 
@@ -566,6 +576,7 @@ impl WorkspaceSemantics {
     pub(crate) fn defer_static_resolution(&mut self, sources: &[StaticSource<'_>]) {
         self.static_resolution = crate::static_resolution::deferred(sources);
         self.static_occurrence_order = Vec::new();
+        self.external_occurrence_order = Vec::new();
     }
 
     pub(crate) fn static_occurrences(&self) -> &[StaticOccurrence] {
@@ -593,7 +604,7 @@ impl WorkspaceSemantics {
         let end = self
             .static_occurrence_order
             .partition_point(|index| matches(index) <= Some(target));
-        self.static_occurrence_order[start..end]
+        let declared = self.static_occurrence_order[start..end]
             .iter()
             .map(|index| {
                 let occurrence = &self.static_resolution.occurrences[*index];
@@ -603,7 +614,26 @@ impl WorkspaceSemantics {
                     occurrence.source_digest,
                     occurrence.role,
                 )
-            })
+            });
+        let external = &self.static_resolution.external;
+        let start = self
+            .external_occurrence_order
+            .partition_point(|index| external[*index].target < *target);
+        let end = self
+            .external_occurrence_order
+            .partition_point(|index| external[*index].target <= *target);
+        let external = self.external_occurrence_order[start..end]
+            .iter()
+            .map(|index| {
+                let occurrence = &external[*index];
+                (
+                    &occurrence.binding,
+                    occurrence.callee_range,
+                    occurrence.source_digest,
+                    occurrence.role,
+                )
+            });
+        declared.chain(external)
     }
 
     /// Sites the static pass left without a target, counted per edge kind. A site counts
@@ -614,6 +644,20 @@ impl WorkspaceSemantics {
         &self,
     ) -> &std::collections::BTreeMap<rift_protocol::read::EdgeKind, u64> {
         &self.static_resolution.omitted
+    }
+
+    /// Sites of one source unit the static pass left without a target, counted per edge
+    /// kind. Absent for a unit whose call coverage is unavailable.
+    #[must_use]
+    pub fn static_targets_omitted_in(
+        &self,
+        unit: &rift_core::SourceUnitId,
+    ) -> Option<&std::collections::BTreeMap<rift_protocol::read::EdgeKind, u64>> {
+        self.static_resolution
+            .edge_calls
+            .get(unit)
+            .filter(|coverage| !coverage.unavailable)
+            .map(|coverage| &coverage.omitted)
     }
 
     /// Number of captured sources that could not supply static evidence.
@@ -635,6 +679,7 @@ impl WorkspaceSemantics {
             syntax_provider,
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
+            external_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
             captured_sources: captured::AdmittedSources::default(),
         }
@@ -763,6 +808,7 @@ impl get_size2::GetSize for WorkspaceSemantics {
         let ordering = self
             .static_occurrence_order
             .capacity()
+            .saturating_add(self.external_occurrence_order.capacity())
             .saturating_mul(std::mem::size_of::<usize>());
         (
             bytes

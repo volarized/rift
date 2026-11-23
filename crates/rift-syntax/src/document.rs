@@ -758,6 +758,13 @@ impl SyntaxFacts {
         }
     }
 
+    /// Whether the provider explained every parser error by a checked TypeScript variance
+    /// annotation.
+    #[must_use]
+    pub const fn variance_errors_only(&self) -> bool {
+        self.variance_errors_only
+    }
+
     /// Whether the provider parsed the declaration inventory or explained each parser error
     /// by a checked TypeScript variance annotation.
     #[must_use]
@@ -830,8 +837,7 @@ impl SyntaxFacts {
             scope: parts.scope,
             static_facts: parts.static_facts,
             has_errors: parts.has_errors,
-            // Restored syntax facts do not carry the provider's comparison parse.
-            variance_errors_only: false,
+            variance_errors_only: parts.variance_errors_only,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,
             source_digest: Some(parts.source_digest),

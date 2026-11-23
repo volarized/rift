@@ -77,6 +77,8 @@ pub(crate) struct EdgeCallCoverage {
     pub(crate) language: rift_protocol::read::Language,
     pub(crate) unavailable: bool,
     pub(crate) unresolved: Vec<ByteRange>,
+    /// Edge kinds of this unit's sites left without a target.
+    pub(crate) omitted: BTreeMap<rift_protocol::read::EdgeKind, u64>,
 }
 
 impl EdgeCallCoverage {
@@ -85,6 +87,7 @@ impl EdgeCallCoverage {
             language: document.facts.language().clone(),
             unavailable: admitted_facts(document).is_none(),
             unresolved: Vec::new(),
+            omitted: BTreeMap::new(),
         };
         if document.facts.has_errors()
             && matches!(
@@ -774,6 +777,19 @@ impl<'source> File<'source> {
         })
     }
 
+    /// The callable, class or module a Python call runs in.
+    fn python_caller(&self, range: ByteRange) -> Option<Target<'source>> {
+        self.enclosing_callable(range).or_else(|| {
+            self.classes
+                .resolve(range.start, range.end)
+                .map(|symbol| Target {
+                    file: self.document,
+                    symbol,
+                })
+                .or_else(|| self.qualified_target("."))
+        })
+    }
+
     fn parent_callable(&self, symbol: &SyntaxSymbol) -> Option<Target<'source>> {
         self.enclosing_callable(ByteRange {
             start: symbol.range.start.checked_sub(1)?,
@@ -1117,6 +1133,7 @@ impl<'source> Index<'source> {
                     language: coverage.language.clone(),
                     unavailable: coverage.unavailable,
                     unresolved: Vec::new(),
+                    omitted: BTreeMap::new(),
                 },
             );
         }
@@ -1156,12 +1173,13 @@ impl<'source> Index<'source> {
             }
             if occurrence.is_none()
                 && let Some(external) = self.external_call(file, call, work).and_then(|target| {
-                    Self::external_occurrence(
+                    self.external_occurrence(
                         file,
                         call.range,
                         call.callee_range,
                         ReferenceRole::Call,
                         target,
+                        work,
                     )
                 })
             {
@@ -1244,12 +1262,13 @@ impl<'source> Index<'source> {
                     && let Some(external) =
                         self.external_import(file, binding, work)
                             .and_then(|target| {
-                                Self::external_occurrence(
+                                self.external_occurrence(
                                     file,
                                     range,
                                     range,
                                     ReferenceRole::Import,
                                     target,
+                                    work,
                                 )
                             })
                 {
@@ -1275,8 +1294,6 @@ impl<'source> Index<'source> {
         }
         if file.document.facts.language().name == "rust" {
             self.rust_references(file, work, result);
-        } else if file.document.facts.language().name == "python" {
-            self.named_type_references(file, work, result);
         }
         if !work.exhausted {
             result.analyzed_sources += 1;
@@ -1298,15 +1315,7 @@ impl<'source> Index<'source> {
             target,
         )?;
         if file.document.facts.language().name == "python"
-            && let Some(caller) = file.enclosing_callable(call.range).or_else(|| {
-                file.classes
-                    .resolve(call.range.start, call.range.end)
-                    .map(|symbol| Target {
-                        file: file.document,
-                        symbol,
-                    })
-                    .or_else(|| file.qualified_target("."))
-            })
+            && let Some(caller) = file.python_caller(call.range)
         {
             let caller = self.occurrence(
                 file,
@@ -1372,75 +1381,17 @@ impl<'source> Index<'source> {
             return None;
         };
         let target = self.external_type(file, edge.target, work)?;
-        let mut occurrence =
-            Self::external_occurrence(file, edge.target, edge.target, ReferenceRole::Type, target)?;
+        let mut occurrence = self.external_occurrence(
+            file,
+            edge.target,
+            edge.target,
+            ReferenceRole::Type,
+            target,
+            work,
+        )?;
         occurrence.edge_from = Some(from);
         occurrence.edge_kind = Some(edge.kind);
         Some(occurrence)
-    }
-
-    pub(super) fn external_occurrence(
-        file: &File<'source>,
-        range: ByteRange,
-        callee_range: ByteRange,
-        role: ReferenceRole,
-        target: rift_core::SymbolId,
-    ) -> Option<ExternalOccurrence> {
-        file.text(range)?;
-        file.text(callee_range)?;
-        let range = SourceRange::new(range.start, range.end).ok()?;
-        Some(ExternalOccurrence {
-            binding: DeclarationBinding::new(file.document.placement.unit().clone(), range),
-            target,
-            callee_range,
-            role,
-            edge_from: None,
-            edge_kind: None,
-            declared: false,
-        })
-    }
-
-    /// Python annotation sites without a local target that name a dependency or
-    /// standard-library type. Local annotation targets are recorded by `python_references`.
-    fn named_type_references(
-        &self,
-        file: &File<'source>,
-        work: &mut Work,
-        result: &mut StaticResolution,
-    ) {
-        for reference in file
-            .facts
-            .references()
-            .iter()
-            .filter(|reference| reference.role == ReferenceRole::Type)
-        {
-            if !work.charge() {
-                return;
-            }
-            if self
-                .edge_type_target(file, reference.target, work)
-                .is_some()
-            {
-                continue;
-            }
-            if let Some(target) = self.external_type(file, reference.target, work)
-                && let Some(external) = Self::external_occurrence(
-                    file,
-                    reference.target,
-                    reference.target,
-                    reference.role,
-                    target,
-                )
-            {
-                result.external.push(external);
-                continue;
-            }
-            let count = result
-                .omitted
-                .entry(rift_protocol::read::EdgeKind::HasType)
-                .or_default();
-            *count = count.saturating_add(1);
-        }
     }
 
     fn edge_type_target(
@@ -1555,9 +1506,9 @@ impl StaticResolution {
     fn join(&mut self, file: &File<'_>, mut apart: Self, over_share: bool) {
         self.occurrences.append(&mut apart.occurrences);
         self.external.append(&mut apart.external);
-        for (kind, count) in apart.omitted {
-            let total = self.omitted.entry(kind).or_default();
-            *total = total.saturating_add(count);
+        for (kind, count) in &apart.omitted {
+            let total = self.omitted.entry(*kind).or_default();
+            *total = total.saturating_add(*count);
         }
         self.analyzed_sources += apart.analyzed_sources;
         self.unresolved_sites += apart.unresolved_sites;
@@ -1565,12 +1516,14 @@ impl StaticResolution {
             self.unavailable_sources += 1;
         }
         let unit = file.document.placement.unit();
+        let omitted = std::mem::take(&mut apart.omitted);
         if let Some((coverage, apart)) = self
             .edge_calls
             .get_mut(unit)
             .zip(apart.edge_calls.get_mut(unit))
         {
             coverage.unresolved.append(&mut apart.unresolved);
+            coverage.omitted = omitted;
             coverage.unavailable |= over_share;
         }
     }

@@ -77,24 +77,7 @@ impl<'source> Index<'source> {
                 continue;
             }
             let occurrence = self.rust_reference_occurrence(file, reference, work);
-            if occurrence.is_none()
-                && reference.role == ReferenceRole::Type
-                && let Some(external) =
-                    self.external_type(file, reference.target, work)
-                        .and_then(|target| {
-                            Self::external_occurrence(
-                                file,
-                                reference.target,
-                                reference.target,
-                                reference.role,
-                                target,
-                            )
-                        })
-            {
-                result.external.push(external);
-                continue;
-            }
-            result.record(occurrence);
+            self.record_reference(file, reference, (occurrence, false), work, result);
         }
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
@@ -133,7 +116,11 @@ impl<'source> Index<'source> {
             };
             let occurrence = target
                 .and_then(|target| self.rust_import_occurrence(file, imported.range, target, work));
-            result.record(occurrence);
+            if imported.glob {
+                self.record_glob_import(file, imported, occurrence, work, result);
+            } else {
+                result.record(occurrence);
+            }
         }
     }
 

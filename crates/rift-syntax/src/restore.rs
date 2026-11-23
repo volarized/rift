@@ -39,6 +39,9 @@ pub struct SyntaxFactsParts {
     pub static_facts: Option<crate::StaticFacts>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
+    /// Whether the provider explained every parser error by a checked TypeScript variance
+    /// annotation.
+    pub variance_errors_only: bool,
     /// Number of extracted declarations the provider omitted.
     pub left_out_declarations: usize,
     /// Complete Markdown structure, when present.
@@ -829,6 +832,10 @@ impl SyntaxFacts {
         limits: SyntaxLimits,
         parts: SyntaxFactsParts,
     ) -> Result<Self, RiftError> {
+        if parts.variance_errors_only && (!parts.has_errors || parts.language.name != "typescript")
+        {
+            return errors::syntax::facts_structure_invalid().fail();
+        }
         validate_symbols(source, limits, &parts)?;
         validate_export_bindings(source, limits, &parts)?;
         validate_macro_invocations(source, limits, &parts)?;

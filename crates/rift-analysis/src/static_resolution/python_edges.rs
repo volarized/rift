@@ -47,6 +47,17 @@ impl EdgePythonModules {
         self.0.get(name)?.as_deref()
     }
 
+    /// Whether a selected module is named `root` or lies in a package named `root`.
+    pub(super) fn declares_root(&self, root: &str) -> bool {
+        let package = format!("{root}.");
+        self.0.contains_key(root)
+            || self
+                .0
+                .range(package.clone()..)
+                .next()
+                .is_some_and(|(name, _)| name.starts_with(&package))
+    }
+
     fn name(from: &File<'_>, module: &str) -> Option<String> {
         let anchor = from.qualified_target(".")?.admitted_path()?;
         let package = from

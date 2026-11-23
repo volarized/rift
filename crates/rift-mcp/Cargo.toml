@@ -99,6 +99,10 @@ name = "edge_query"
 path = "tests/edge_query.rs"
 
 [[test]]
+name = "external_edges"
+path = "tests/external_edges.rs"
+
+[[test]]
 name = "global_routing"
 path = "tests/global_routing.rs"
 
