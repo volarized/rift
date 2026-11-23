@@ -492,10 +492,15 @@ fn place_namespace(
                 .remove(held.file.path().as_str())
                 .unwrap_or_default(),
         );
-        let assigned = namespace
+        let mut assigned = namespace
             .anchors
             .remove(held.file.path().as_str())
             .unwrap_or_default();
+        if let Some((path, root)) = namespace.rust_package_root.as_ref()
+            && path == held.file.path().as_str()
+        {
+            assigned.insert(".".to_owned(), root.clone());
+        }
         held.placement = held
             .placement
             .clone()
@@ -1588,7 +1593,7 @@ impl Records {
                 let unit = held.placement.unit().to_string();
                 let syntax = held.file.syntax();
                 if !self.symbols_truncated
-                    && syntax.language().name == "typescript"
+                    && matches!(syntax.language().name.as_str(), "typescript" | "rust")
                     && let Some(module) = held.placement.logical_identity(".")
                     && !objects.contains(module.as_str())
                     && !semantics.edges().outgoing(module).is_empty()
@@ -1703,17 +1708,20 @@ impl Records {
                 {
                     continue;
                 }
-                // A local target must already have an object. An accepted dependency or
-                // runtime identity is portable without its object in this publication.
-                if !objects.contains(edge.to().as_str())
-                    && !SymbolIdentity::parse(edge.to().as_str()).is_ok_and(|target| {
+                let local = objects.contains(edge.to().as_str());
+                let external = !local
+                    && SymbolIdentity::parse(edge.to().as_str()).is_ok_and(|target| {
                         target.owner() != owner
                             && matches!(
                                 target.owner(),
                                 SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
                             )
-                    })
-                {
+                    });
+                // The crate-root projection is limited to imports owned outside this package.
+                if language.name == "rust" && !external {
+                    continue;
+                }
+                if !local && !external {
                     self.identity_incomplete = true;
                     continue;
                 }

@@ -67,6 +67,10 @@ pub(super) fn prepare(
     let Some((mut assigned, mut pending)) = library_roots_pending(input, &inventory) else {
         return super::PreparedNamespace::default();
     };
+    let package_root = pending
+        .front()
+        .filter(|_| matches!(input.owner(), SymbolOwner::Package { .. }))
+        .map(|(path, ..)| path.clone());
     let mut anchors = BTreeMap::new();
     let mut requested = Vec::new();
     let configurations = configuration::Configurations::new(input);
@@ -155,6 +159,22 @@ pub(super) fn prepare(
     };
     let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
     local_exports(input, selected, &requested, &admitted, &mut prepared);
+    // Cargo assigns the library-root namespace independently of authored declarations.
+    if let Some(path) = package_root
+        && let Some(file) = inventory.get(path.as_str())
+        && !file.syntax.has_errors()
+        && file.syntax.left_out_declaration_count() == 0
+        && prepared.anchors.contains_key(&path)
+        && let Some(namespace) = assigned.get(&path)
+        && let Ok(identity) = SymbolIdentity::new(
+            input.owner().clone(),
+            file.syntax.language().clone(),
+            namespace.clone(),
+        )
+        && let Ok(identity) = SymbolId::new(identity.wire_identity())
+    {
+        prepared.rust_package_root = Some((path, identity));
+    }
     prepared
 }
 

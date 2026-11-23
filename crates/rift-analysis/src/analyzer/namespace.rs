@@ -47,6 +47,8 @@ pub(crate) struct ExportBinding {
 #[derive(Default)]
 pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
+    /// The source path and accepted crate namespace of a Cargo library root.
+    pub(crate) rust_package_root: Option<(String, SymbolId)>,
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     /// Observed `CommonJS` files with a checked synchronized export object.
     pub(crate) commonjs_modules: BTreeSet<String>,
@@ -146,6 +148,7 @@ pub(crate) fn prepare_context(
     let mut prepared = typescript::prepare(input, selected);
     let rust = rust::prepare(input, selected);
     prepared.anchors.extend(rust.anchors);
+    prepared.rust_package_root = rust.rust_package_root;
     prepared.exports.extend(rust.exports);
     prepared.alias_visibilities.extend(rust.alias_visibilities);
     prepared.unresolved_exports |= rust.unresolved_exports;
