@@ -11,6 +11,7 @@ mod aliases;
 mod facts;
 mod graph;
 mod module_imports;
+mod returned_callables;
 mod rust_root_imports;
 
 fn publication(
