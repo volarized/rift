@@ -69,7 +69,7 @@ fn member_pair(source: &str, caller: &str, site: &str, target: Option<&str>) {
         let stored = semantics
             .edges()
             .edges()
-            .map(|edge| edge.to_protocol())
+            .map(crate::edge::Edge::to_protocol)
             .filter(complete)
             .collect::<Vec<_>>();
         let published = publication
