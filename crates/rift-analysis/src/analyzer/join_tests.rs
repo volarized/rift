@@ -572,6 +572,123 @@ fn test_a_module_repeating_its_overloads_answers_at_the_implementation_form() {
     }
 }
 
+#[test]
+fn python_package_visibility_keeps_protocol_methods_of_public_classes() {
+    let source = r#"def __module__(): pass
+def _helper(): pass
+
+class Session:
+    def __init__(self): pass
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def __mangled(self): pass
+    __data__ = 'metadata'
+
+    class PublicNested:
+        def __iter__(self): pass
+
+    class _PrivateNested:
+        def open(self): pass
+
+class _ValidatedRequest:
+    url: str
+    method: str
+
+    def __call__(self): pass
+
+    class Nested:
+        def open(self): pass
+"#;
+    let analysis = analyzed(ShippedLanguage::Python, vec![("mod.py", source)]);
+    for (name, public) in [
+        ("Session", true),
+        ("Session.__init__", true),
+        ("Session.__enter__", true),
+        ("Session.__exit__", true),
+        ("Session.__mangled", false),
+        ("Session.__data__", false),
+        ("Session.PublicNested", true),
+        ("Session.PublicNested.__iter__", true),
+        ("Session._PrivateNested", false),
+        ("Session._PrivateNested.open", false),
+        ("_ValidatedRequest", false),
+        ("_ValidatedRequest.url", false),
+        ("_ValidatedRequest.method", false),
+        ("_ValidatedRequest.__call__", false),
+        ("_ValidatedRequest.Nested", false),
+        ("_ValidatedRequest.Nested.open", false),
+        ("__module__", false),
+        ("_helper", false),
+    ] {
+        let declaration = symbol_at(&analysis, "mod.py", name).expect(name);
+        assert_eq!(declaration.public, public, "{name}");
+        assert_eq!(
+            analysis
+                .publication()
+                .documents
+                .iter()
+                .any(|document| document.identity == declaration.symbol.as_str()),
+            public,
+            "{name}",
+        );
+    }
+    let constructor = symbol_at(&analysis, "mod.py", "Session.__init__").expect("constructor");
+    let session = symbol_at(&analysis, "mod.py", "Session").expect("class");
+    assert_eq!(
+        object_for(&analysis, constructor).container.as_ref(),
+        Some(&session.symbol)
+    );
+    assert!(
+        object_for(&analysis, constructor)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Constructor)
+    );
+    let field =
+        symbol_at(&analysis, "mod.py", "_ValidatedRequest.url").expect("retained private field");
+    let private =
+        symbol_at(&analysis, "mod.py", "_ValidatedRequest").expect("retained private owner");
+    assert_eq!(
+        object_for(&analysis, field).container.as_ref(),
+        Some(&private.symbol)
+    );
+}
+
+#[test]
+fn python_package_visibility_distinguishes_reopened_classes_from_mixed_owners() {
+    let source = r#"class Reopened:
+    def __enter__(self): return self
+
+class Reopened:
+    def __enter__(self): return self
+
+class Mixed:
+    def __enter__(self): return self
+
+def Mixed():
+    def __enter__(): pass
+    return __enter__
+"#;
+    let analysis = analyzed(ShippedLanguage::Python, vec![("mod.py", source)]);
+    let held = &analysis.files()[0];
+    let first = declaration_at(&analysis, "mod.py", ("Reopened.__enter__", 0))
+        .expect("first authored class method");
+    let second = declaration_at(&analysis, "mod.py", ("Reopened.__enter__", 1))
+        .expect("second authored class method");
+    assert_eq!(first.symbol, second.symbol);
+    assert_ne!(first.range, second.range);
+    assert!(first.public && second.public);
+    let mixed = held
+        .file()
+        .syntax()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.qualified_name == "Mixed.__enter__")
+        .map(|symbol| symbol.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(mixed, ["method", "function"]);
+    assert!(!held.is_public("Mixed.__enter__"));
+}
+
 /// A stub member whose class joined the module names the class the module declares as its
 /// container.
 #[test]

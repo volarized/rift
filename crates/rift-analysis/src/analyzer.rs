@@ -2486,7 +2486,7 @@ pub enum PackageLanguage {
     /// Rust declarations use `pub`; items of a public trait and variants of a public enum
     /// also count.
     Rust,
-    /// Python names without a leading underscore count.
+    /// Python public declarations and protocol methods of visible classes.
     Python,
     /// TypeScript declarations exclude private and protected members. A TypeScript package
     /// ships its JavaScript builds beside its declaration files.
@@ -2505,7 +2505,7 @@ pub enum PackageLanguage {
     C,
     /// C++ declarations are public.
     Cpp,
-    /// Cython names without a leading underscore count.
+    /// Cython public declarations and protocol methods of visible classes.
     Cython,
     /// JSONC properties are public declarations.
     Jsonc,
@@ -2594,7 +2594,12 @@ impl PackageLanguage {
         }
     }
 
-    fn is_public(self, symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+    fn is_public(
+        self,
+        symbol: &SyntaxSymbol,
+        by_name: &BTreeMap<&str, &SyntaxSymbol>,
+        python_scopes: Option<&crate::EnclosingDefinitions<&SyntaxSymbol>>,
+    ) -> bool {
         match self {
             Self::Rust => match symbol.visibility.as_deref() {
                 Some("pub") => true,
@@ -2608,7 +2613,9 @@ impl PackageLanguage {
                     }),
                 _ => false,
             },
-            Self::Python | Self::Cython => !symbol.name.starts_with('_'),
+            Self::Python | Self::Cython => {
+                python_scopes.is_some_and(|scopes| is_python_export(symbol, scopes))
+            }
             Self::TypeScript | Self::Vue | Self::Svelte => !symbol
                 .visibility
                 .as_deref()
@@ -2639,12 +2646,46 @@ impl ExportRule {
         PackageLanguage::for_language(language).map(Self::Language)
     }
 
-    fn is_public(self, symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+    fn is_public(
+        self,
+        symbol: &SyntaxSymbol,
+        by_name: &BTreeMap<&str, &SyntaxSymbol>,
+        python_scopes: Option<&crate::EnclosingDefinitions<&SyntaxSymbol>>,
+    ) -> bool {
         match self {
-            Self::Language(rules) => rules.is_public(symbol, by_name),
+            Self::Language(rules) => rules.is_public(symbol, by_name, python_scopes),
             Self::JavaScriptModule => is_javascript_export(symbol, by_name),
         }
     }
+}
+
+/// A private class hides its subtree. A special method of a visible class is public.
+fn is_python_export(
+    symbol: &SyntaxSymbol,
+    scopes: &crate::EnclosingDefinitions<&SyntaxSymbol>,
+) -> bool {
+    let private = symbol.name.starts_with('_');
+    let Some(containing) = scopes.containing(symbol.item_range.start, symbol.item_range.end) else {
+        return !private && symbol.container.is_none();
+    };
+    let mut ancestors = containing
+        .filter(|owner| owner.item_range != symbol.item_range)
+        .peekable();
+    if private {
+        let protocol = symbol
+            .name
+            .strip_prefix("__")
+            .and_then(|name| name.strip_suffix("__"))
+            .is_some_and(|name| !name.is_empty() && !name.starts_with('_') && !name.ends_with('_'));
+        let class_member = ancestors.peek().is_some_and(|owner| {
+            owner.kind == "class"
+                && Some(owner.qualified_name.as_str()) == symbol.container.as_deref()
+        });
+        if !protocol || !class_member || !matches!(symbol.kind, "method" | "function") {
+            return false;
+        }
+    }
+    !ancestors.any(|owner| owner.kind == "class" && owner.name.starts_with('_'))
 }
 
 /// Whether a JavaScript module exports `symbol`: the provider marks it `Public`, or it is a
@@ -2681,13 +2722,46 @@ pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTree
             .map(|symbol| symbol.qualified_name.clone())
             .collect();
     };
-    let by_name: BTreeMap<&str, &SyntaxSymbol> = symbols
-        .iter()
-        .map(|symbol| (symbol.qualified_name.as_str(), symbol))
-        .collect();
+    let python_scopes = matches!(
+        rule,
+        ExportRule::Language(PackageLanguage::Python | PackageLanguage::Cython)
+    )
+    .then(|| {
+        crate::EnclosingDefinitions::new(
+            symbols
+                .iter()
+                .filter(|symbol| matches!(symbol.kind, "class" | "function" | "method"))
+                .map(|symbol| (symbol.item_range.start, symbol.item_range.end, symbol)),
+        )
+    });
+    let by_name = if python_scopes.is_some() {
+        BTreeMap::new()
+    } else {
+        symbols
+            .iter()
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol))
+            .collect()
+    };
+    let public = |symbol| rule.is_public(symbol, &by_name, python_scopes.as_ref());
+    if python_scopes.is_some() {
+        // Name-keyed visibility must hold for every physical declaration that shares it.
+        let mut visibility = BTreeMap::new();
+        for symbol in symbols {
+            let visible = public(symbol);
+            visibility
+                .entry(symbol.qualified_name.as_str())
+                .and_modify(|previous| *previous &= visible)
+                .or_insert(visible);
+        }
+        return visibility
+            .into_iter()
+            .filter(|(_, visible)| *visible)
+            .map(|(name, _)| name.to_owned())
+            .collect();
+    }
     symbols
         .iter()
-        .filter(|symbol| rule.is_public(symbol, &by_name))
+        .filter(|symbol| public(symbol))
         .map(|symbol| symbol.qualified_name.clone())
         .collect()
 }
@@ -3188,6 +3262,44 @@ mod tests {
                     .map(|symbol| symbol.qualified_name.clone())
             })
             .collect()
+    }
+
+    #[test]
+    fn test_cython_protocol_methods_use_the_actual_class_scope() {
+        let source = r#"def __module__(): pass
+
+class Session:
+    def __enter__(self): return self
+    def __mangled(self): pass
+
+    def run(self):
+        def __nested__(): pass
+        return __nested__()
+
+class _Private:
+    def visible(self): pass
+    def __exit__(self, *args): pass
+"#;
+        let analysis = package_analysis(ShippedLanguage::Cython, vec![("mod.pyx", source)]);
+        let held = &analysis.files()[0];
+        let symbols = held.file().syntax().symbols();
+        for (name, public) in [
+            ("__module__", false),
+            ("Session", true),
+            ("Session::__enter__", true),
+            ("Session::__mangled", false),
+            ("Session::run", true),
+            ("Session::__nested__", false),
+            ("_Private", false),
+            ("_Private::visible", false),
+            ("_Private::__exit__", false),
+        ] {
+            assert!(
+                symbols.iter().any(|symbol| symbol.qualified_name == name),
+                "{name}"
+            );
+            assert_eq!(held.is_public(name), public, "{name}");
+        }
     }
 
     /// An unpaired JavaScript module exports what an ES `export` wraps or names, a default
