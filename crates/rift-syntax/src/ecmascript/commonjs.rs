@@ -12,6 +12,7 @@ pub(super) fn record<'tree>(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
     kinds: &EcmaScriptKinds,
+    allow_literal: bool,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
 ) -> Result<(Vec<Node<'tree>>, Option<StaticCommonJsExport>), RiftError> {
     let CapturedAssignments {
@@ -37,6 +38,19 @@ pub(super) fn record<'tree>(
         if synchronized != Some(syntax_element) && !module_execution(syntax_element, &blocked) {
             continue;
         }
+        if allow_literal
+            && direct_default == Some(syntax_element)
+            && let Some(literal) = kinds
+                .child(syntax_element, EcmaScriptGrammarField::Right)
+                .filter(|value| value.kind_id() == kinds.object_literal)
+            && closed_wrapper_uses(root, None, syntax_element, source.text, kinds)
+        {
+            closed_export = Some((
+                extract::byte_range(syntax_element)?,
+                false,
+                Some(extract::byte_range(literal)?),
+            ));
+        }
         let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
             continue;
         };
@@ -54,15 +68,21 @@ pub(super) fn record<'tree>(
                 || (direct_default == Some(syntax_element)
                     && closed_wrapper_uses(root, None, syntax_element, source.text, kinds)))
         {
-            closed_export = Some((binding.range, synchronized == Some(syntax_element)));
+            closed_export = Some((binding.range, synchronized == Some(syntax_element), None));
         }
         bindings.insert(syntax_element.id(), binding);
     }
-    let closed_export = if let Some((assignment, synchronized)) = closed_export {
+    let closed_export = if let Some((assignment, synchronized, literal)) = closed_export {
+        let initialized = if literal.is_some() {
+            Vec::new()
+        } else {
+            initialized_exports(root, source.text, kinds, bindings)?
+        };
         Some(StaticCommonJsExport {
             assignment,
             synchronized,
-            initialized: initialized_exports(root, source.text, kinds, bindings)?,
+            initialized,
+            literal,
         })
     } else {
         None

@@ -8,6 +8,7 @@ use crate::{
 use rift_core::ProjectPath;
 
 mod aliases;
+mod commonjs_literals;
 mod facts;
 mod graph;
 mod module_imports;
