@@ -1,0 +1,118 @@
+name: Bun named documentation artifact pair
+
+on:
+  push:
+    branches: [diagnostic/bun-documentation-v093-paired-20261123]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: bun-documentation-v093-paired
+  cancel-in-progress: false
+
+env:
+  BASE: c72b22dc39c508f2c7932e5fbd7ae4eb659c3622
+  BASE_TREE: ce2a076e12ba3501459d7df44fe71c3f132c7cab
+  SIGNER: FC08DDCFB56DB97D06926EDD4BF8B94B2A499B8A
+  PACKET: dev/diagnostics/bun-documentation-paired
+  BUN_COMMIT: 744846f844374847c902b5e7fd59b4342a51ef99
+
+jobs:
+  pair:
+    if: >-
+      github.repository == 'volarized/rift' &&
+      github.ref == 'refs/heads/diagnostic/bun-documentation-v093-paired-20261123' &&
+      github.event.created &&
+      !github.event.deleted &&
+      !github.event.forced &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.sender.type == 'User' &&
+      github.event.sender.login == 'renardeinside' &&
+      github.actor == 'renardeinside' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 44
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the signed diagnostic packet
+        env:
+          PUSHED_HEAD: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          receipts="$RUNNER_TEMP/bun-documentation-evidence"
+          mkdir "$receipts"
+          test "$PUSHED_HEAD" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$BASE"
+          test "$(git show -s --format=%T "$BASE")" = "$BASE_TREE"
+          git diff --name-only "$BASE" HEAD > "$receipts/changed-paths.txt"
+          test "$(wc -l < "$receipts/changed-paths.txt")" = 8
+          test -z "$(grep -Ev '^(\.github/workflows/bun-documentation-v093-paired\.yml|dev/diagnostics/bun-documentation-paired/(artifact_gate\.py|host_guard\.py|wire\.py|bun-edit-paths\.txt|paired_saved_edits\.py|contract\.json|signing-key\.asc))$' "$receipts/changed-paths.txt")"
+          git diff --exit-code "$BASE" HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml justfile dev/uv.lock
+          export GNUPGHOME="$RUNNER_TEMP/bun-documentation-gnupg"
+          install -m 700 -d "$GNUPGHOME"
+          key="$PACKET/signing-key.asc"
+          test "$(gpg --batch --with-colons --show-keys "$key" | awk -F: '$1=="fpr" {print $10; exit}')" = "$SIGNER"
+          gpg --batch --import "$key"
+          git verify-commit --raw "$GITHUB_SHA" > "$receipts/packet-signature.txt" 2>&1
+          grep -F "[GNUPG:] VALIDSIG $SIGNER " "$receipts/packet-signature.txt"
+          git show -s --format='%H %T %P' "$BASE" "$GITHUB_SHA" > "$receipts/source-chain.txt"
+          sha256sum "$PACKET"/* > "$receipts/packet-inputs.txt"
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: false
+      - name: Install locked Python and freeze the Bun checkout
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          uv sync --locked --python 3.12 --project dev
+          bun="$RUNNER_TEMP/bun-documentation-corpus"
+          git init -q "$bun"
+          git -C "$bun" fetch --no-tags --depth 1 https://github.com/oven-sh/bun.git "$BUN_COMMIT"
+          git -C "$bun" checkout --detach "$BUN_COMMIT"
+          test "$(git -C "$bun" rev-parse HEAD)" = "$BUN_COMMIT"
+      - name: Authenticate the existing ordinary corpus binaries
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/bun-documentation-scratch"
+          receipts="$RUNNER_TEMP/bun-documentation-evidence"
+          uv run --locked --project dev python "$PACKET/artifact_gate.py" "$PACKET/contract.json" "$scratch"
+          cp "$scratch"/verified-pair.json "$receipts/"
+          for arm in base candidate; do
+            mkdir "$receipts/$arm"
+            cp "$scratch/$arm/"*.json "$receipts/$arm/"
+            "$scratch/$arm/rift" --version > "$receipts/$arm/version.txt"
+          done
+          cmp "$receipts/base/version.txt" "$receipts/candidate/version.txt"
+          {
+            uname -srvmo
+            ldd --version
+            uv run --locked --project dev python -V
+          } > "$receipts/runner-runtime.txt"
+      - name: Measure saved single and fifty current edits without a concurrent index
+        timeout-minutes: 34
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/bun-documentation-scratch"
+          corpus="$RUNNER_TEMP/bun-documentation-corpus"
+          receipts="$RUNNER_TEMP/bun-documentation-evidence"
+          uv run --locked --project dev python "$PACKET/paired_saved_edits.py" \
+            --baseline "$scratch/base/rift" --candidate "$scratch/candidate/rift" --root "$corpus" \
+            --lock "$PACKET/contract.json" --paths "$PACKET/bun-edit-paths.txt" \
+            --output "$receipts/measurements"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bun-documentation-v093-paired
+          path: ${{ runner.temp }}/bun-documentation-evidence
+          if-no-files-found: warn
+          retention-days: 7
