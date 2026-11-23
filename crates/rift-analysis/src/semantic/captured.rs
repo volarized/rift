@@ -43,6 +43,33 @@ impl AdmittedSources {
     }
 }
 
+type HeldAdmission<'a> = (
+    &'a BTreeMap<rift_core::ProjectPath, AdmittedSource>,
+    &'a rift_provider::ProviderPublication,
+    (rift_core::SourceRevision, rift_core::TreeRevision),
+);
+
+fn reuse_captured_source(
+    (sources, publication, revision): HeldAdmission<'_>,
+    document: &IndexedFile,
+    placed: &PlacedFacts<'_>,
+    builder: &mut rift_syntax::SyntaxPublicationBuilder,
+) -> Option<Arc<DocumentPlacement>> {
+    let source = sources.get(placed.path)?;
+    if !std::ptr::eq(source.facts.as_ptr(), document.syntax_facts().as_ref())
+        || *source.placement != placed.placement
+        || !builder.add_unchanged_source(
+            publication,
+            source.rows.clone(),
+            placed.placement.unit(),
+            revision,
+        )
+    {
+        return None;
+    }
+    Some(Arc::clone(&source.placement))
+}
+
 /// Source and namespace evidence waiting beside an admitted project publication.
 #[derive(Debug)]
 pub struct PreparedProjectSemantics<'source> {
@@ -308,22 +335,8 @@ impl WorkspaceSemantics {
             true,
             |index, placed, builder| {
                 let start = builder.admitted_len();
-                let reused = held.and_then(|(sources, publication, revision)| {
-                    let source = sources.get(placed.path)?;
-                    if !std::ptr::eq(
-                        source.facts.as_ptr(),
-                        documents[index].syntax_facts().as_ref(),
-                    ) || *source.placement != placed.placement
-                        || !builder.add_unchanged_source(
-                            publication,
-                            source.rows.clone(),
-                            placed.placement.unit(),
-                            revision,
-                        )
-                    {
-                        return None;
-                    }
-                    Some(Arc::clone(&source.placement))
+                let reused = held.and_then(|prior| {
+                    reuse_captured_source(prior, documents[index], placed, builder)
                 });
                 if reused.is_none() {
                     builder.add_facts_placed(placed.facts, &placed.placement)?;

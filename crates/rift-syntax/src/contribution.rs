@@ -112,7 +112,7 @@ impl DocumentPlacement {
         let (anchors, tracker) = rift_protocol::retained_map_material(
             &self.identity_anchors,
             tracker,
-            |identity, tracker| identity.get_heap_size_with_tracker(tracker),
+            GetSize::get_heap_size_with_tracker,
         );
         let (mappings, mut tracker) = rift_protocol::retained_map_material(
             &self.logical_declarations,
