@@ -762,7 +762,10 @@ impl<'source> Index<'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        if file.document.facts.language().name != "javascript"
+        if !matches!(
+            role,
+            rift_core::ReferenceRole::Read | rift_core::ReferenceRole::Call
+        ) || file.document.facts.language().name != "javascript"
             || self.javascript.mode(supplied.document.path.as_str(), work) != ModuleMode::CommonJs
             || supplied.facts.has_javascript_module_syntax()
         {
@@ -776,21 +779,21 @@ impl<'source> Index<'source> {
         {
             return None;
         }
-        let target = self.javascript_object_member(owner, member, role, work)?;
-        if role == rift_core::ReferenceRole::Read {
-            return (target.symbol.syntax_element_kind == Some("pair")
-                && javascript_final_pair(supplied, target, literal, work))
-            .then_some(target);
-        }
-        if role != rift_core::ReferenceRole::Call
-            || target.symbol.syntax_element_kind != Some("pair")
-            || file.javascript_binding_reassigned(binding)
-        {
+        // A new literal member can be used only while the selected receiver stays unchanged.
+        let target =
+            self.javascript_object_member(owner, member, rift_core::ReferenceRole::Call, work)?;
+        if target.symbol.syntax_element_kind != Some("pair") {
             return None;
         }
-        let callable = self.javascript_final_pair_callable(supplied, target, literal, work)?;
+        let selected = if role == rift_core::ReferenceRole::Read {
+            javascript_final_pair(supplied, target, literal, work).then_some(target)
+        } else if file.javascript_binding_reassigned(binding) {
+            None
+        } else {
+            self.javascript_final_pair_callable(supplied, target, literal, work)
+        }?;
         self.javascript_direct_require_calls(file, supplied, member, work)
-            .then_some(callable)
+            .then_some(selected)
     }
 
     /// A whole-module binding can mutate the selected literal. Every such alias in the
