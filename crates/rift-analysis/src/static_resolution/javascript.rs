@@ -1,6 +1,6 @@
 //! Resolves explicit JavaScript module paths and lexical bindings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
 
@@ -357,8 +357,8 @@ impl<'source> Index<'source> {
         .is_some()
     }
 
-    /// The immutable local function named by a final, direct property of a returned object.
-    pub(super) fn javascript_returned_pair_value(
+    /// The immutable local function named by a final, direct property of an object literal.
+    pub(super) fn javascript_final_pair_callable(
         &self,
         file: &File<'source>,
         member: Target<'source>,
@@ -367,28 +367,8 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         if member.symbol.syntax_element_kind != Some("pair")
             || member.callable().is_some()
-            || file.text(member.symbol.name_range?)? != member.symbol.name
+            || !javascript_final_pair(file, member, object, work)
         {
-            return None;
-        }
-        let tail = file
-            .text(ByteRange {
-                start: member.symbol.item_range.end,
-                end: object.end,
-            })?
-            .strip_suffix('}')?;
-        // This also proves the pair is direct and no later property can replace it.
-        let mut comma = false;
-        if !tail.chars().all(|character| {
-            if !work.charge() {
-                return false;
-            }
-            if character == ',' && !comma {
-                comma = true;
-                return true;
-            }
-            character.is_whitespace()
-        }) {
             return None;
         }
         let value = member.symbol.body_range?;
@@ -599,7 +579,9 @@ impl<'source> Index<'source> {
             // `const { name } = require(module)` reads what `require(module).name` reads.
             return self
                 .javascript_export(file, module, export, ModuleMode::CommonJs, role, work)
-                .or_else(|| self.javascript_module_value_member(file, module, export, role, work));
+                .or_else(|| {
+                    self.javascript_module_value_member(file, binding, module, export, role, work)
+                });
         }
         let value = super::javascript_exports::Exports {
             files: &self.files,
@@ -700,7 +682,9 @@ impl<'source> Index<'source> {
                 let module = file.text(module)?;
                 self.javascript_export(file, module, member, ModuleMode::CommonJs, role, work)
                     .or_else(|| {
-                        self.javascript_module_value_member(file, module, member, role, work)
+                        self.javascript_module_value_member(
+                            file, binding, module, member, role, work,
+                        )
                     })
             }
             _ => None,
@@ -747,18 +731,131 @@ impl<'source> Index<'source> {
     fn javascript_module_value_member(
         &self,
         file: &File<'source>,
+        binding: &StaticBinding,
         module: &'source str,
         member: &'source str,
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let value = super::javascript_exports::Exports {
+        let exports = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+        };
+        if let Some(value) = exports.resolve_module_value(file, module, role, work) {
+            let owner = self.javascript_export_value(value, role, work)?;
+            return self.javascript_object_member(owner, member, role, work);
         }
-        .resolve_module_value(file, module, role, work)?;
-        let target = self.javascript_export_value(value, role, work)?;
-        self.javascript_object_member(target, member, role, work)
+        if member.contains('.') {
+            return None;
+        }
+        let supplied = exports.imported(file, module, work)?;
+        self.javascript_commonjs_literal_member(file, binding, supplied, member, role, work)
+    }
+
+    /// Reads a checked direct export's property or calls the local function its final pair names.
+    fn javascript_commonjs_literal_member(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        supplied: &File<'source>,
+        member: &str,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if !matches!(
+            role,
+            rift_core::ReferenceRole::Read | rift_core::ReferenceRole::Call
+        ) || file.document.facts.language().name != "javascript"
+            || self.javascript.mode(supplied.document.path.as_str(), work) != ModuleMode::CommonJs
+            || supplied.facts.has_javascript_module_syntax()
+        {
+            return None;
+        }
+        let literal = supplied.facts.commonjs_export()?.literal?;
+        let owner = supplied.qualified_target("default")?;
+        if owner.symbol.kind != "object"
+            || owner.symbol.syntax_element_kind != Some("object")
+            || owner.symbol.body_range != Some(literal)
+        {
+            return None;
+        }
+        // A new literal member can be used only while the selected receiver stays unchanged.
+        let target =
+            self.javascript_object_member(owner, member, rift_core::ReferenceRole::Call, work)?;
+        if target.symbol.syntax_element_kind != Some("pair") {
+            return None;
+        }
+        let selected = if role == rift_core::ReferenceRole::Read {
+            javascript_final_pair(supplied, target, literal, work).then_some(target)
+        } else if file.javascript_binding_reassigned(binding) {
+            None
+        } else {
+            self.javascript_final_pair_callable(supplied, target, literal, work)
+        }?;
+        self.javascript_direct_require_calls(file, supplied, member, work)
+            .then_some(selected)
+    }
+
+    /// A whole-module binding can mutate the selected literal. Every such alias in the
+    /// caller must stay inside direct named calls of the property being resolved.
+    fn javascript_direct_require_calls(
+        &self,
+        file: &File<'source>,
+        supplied: &File<'source>,
+        property: &str,
+        work: &mut Work,
+    ) -> bool {
+        let exports = super::javascript_exports::Exports {
+            files: &self.files,
+            modes: &self.javascript,
+        };
+        let mut receiver_names = BTreeSet::new();
+        let mut receiver_ranges = BTreeSet::new();
+        let mut requires = BTreeSet::new();
+        for binding in file.facts.bindings() {
+            if !work.charge() {
+                return false;
+            }
+            let StaticBindingKind::JavaScriptRequire {
+                module,
+                export,
+                require,
+            } = binding.kind
+            else {
+                continue;
+            };
+            requires.insert(require);
+            if export.is_some() {
+                continue;
+            }
+            let Some(module) = file.text(module) else {
+                return false;
+            };
+            if !exports
+                .imported(file, module, work)
+                .is_some_and(|other| other.document.path == supplied.document.path)
+            {
+                continue;
+            }
+            let Some(name) = file.text(binding.name) else {
+                return false;
+            };
+            if !self.builtin_require(file, require.start, work)
+                || file.javascript_binding_reassigned(binding)
+                || file.javascript_reassigned(name, Some(property))
+            {
+                return false;
+            }
+            receiver_names.insert(name);
+            receiver_ranges.insert(binding.name);
+        }
+        file.javascript_closed_require_uses(
+            &receiver_names,
+            &receiver_ranges,
+            &requires,
+            property,
+            work,
+        )
     }
 
     fn javascript_imported_member(
@@ -886,12 +983,86 @@ impl<'source> Index<'source> {
     }
 }
 
+/// Proves this written key is direct and no later property can replace it.
+fn javascript_final_pair(
+    file: &File<'_>,
+    member: Target<'_>,
+    object: ByteRange,
+    work: &mut Work,
+) -> bool {
+    let Some(name) = member.symbol.name_range.and_then(|range| file.text(range)) else {
+        return false;
+    };
+    if name != member.symbol.name {
+        return false;
+    }
+    let Some(tail) = file
+        .text(ByteRange {
+            start: member.symbol.item_range.end,
+            end: object.end,
+        })
+        .and_then(|tail| tail.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let mut comma = false;
+    tail.chars().all(|character| {
+        if !work.charge() {
+            return false;
+        }
+        if character == ',' && !comma {
+            comma = true;
+            return true;
+        }
+        character.is_whitespace()
+    })
+}
+
 impl File<'_> {
     pub(super) fn javascript_reassigned(&self, name: &str, member: Option<&str>) -> bool {
         self.assignments.names.contains(name)
             || member.is_some_and(|member| {
                 self.assignments.unknown || self.assignments.members.contains(&(name, member))
             })
+    }
+
+    /// Every reference to a checked receiver must be a direct named call.
+    fn javascript_closed_require_uses(
+        &self,
+        names: &BTreeSet<&str>,
+        receivers: &BTreeSet<ByteRange>,
+        requires: &BTreeSet<ByteRange>,
+        property: &str,
+        work: &mut Work,
+    ) -> bool {
+        for reference in self.facts.references() {
+            if !work.charge() {
+                return false;
+            }
+            let range = reference.target;
+            let Some(name) = self.text(range) else {
+                return false;
+            };
+            // An unsupported use can acquire and mutate the same module value.
+            if name == "require" && !requires.contains(&range) {
+                return false;
+            }
+            if !names.contains(name) {
+                continue;
+            }
+            match self.binding(name, range.start, |_| true, work) {
+                Binding::Found(other) if !receivers.contains(&other.name) => continue,
+                Binding::Found(_) => {}
+                _ => return false,
+            }
+            if !self
+                .callbacks
+                .has_named_member_call(range, work, |member| self.text(member) == Some(property))
+            {
+                return false;
+            }
+        }
+        !work.exhausted
     }
 }
 

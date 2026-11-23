@@ -323,14 +323,17 @@ pub struct StaticMemberCallback {
 }
 
 /// A direct `CommonJS` default write whose wrapper uses were checked in the same file.
+/// A literal default has no authored local initializer in this witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticCommonJsExport {
-    /// The complete `module.exports = name` assignment.
+    /// The complete default assignment.
     pub assignment: ByteRange,
     /// The surrounding assignment also updates the original `exports` binding.
     pub synchronized: bool,
     /// Binding names that the exports use and direct module declarations initialize.
     pub initialized: Vec<ByteRange>,
+    /// The physical right-hand side of a checked direct object literal assignment.
+    pub literal: Option<ByteRange>,
 }
 
 /// Collections retained by static syntax capture.
