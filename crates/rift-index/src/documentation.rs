@@ -1461,6 +1461,32 @@ mod tests {
         assert_eq!(examined, 3);
     }
 
+    fn write_attachment_library(root: &std::path::Path, modules: &str) {
+        std::fs::create_dir(root.join("src")).expect("Cargo source directory");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )
+        .expect("captured Cargo library owner");
+        std::fs::write(root.join("src/lib.rs"), modules).expect("declared library modules");
+    }
+
+    fn assert_attachment_paths(index: &rift_protocol::documentation::DocumentationIndex) {
+        use rift_protocol::documentation::{
+            DocumentationSourceFormat, DocumentationSourceIdentity,
+        };
+        let paths = index
+            .sources
+            .iter()
+            .filter(|source| source.format == DocumentationSourceFormat::AttachedComment)
+            .map(|source| match &source.identity.source {
+                DocumentationSourceIdentity::Project { path } => path.0.as_str(),
+                other => panic!("unexpected attached owner {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["src/a.rs", "src/z.rs"]);
+    }
+
     fn attachment_workspace(
         root: &std::path::Path,
         inclusion: &TextFileInclusion,
@@ -1492,11 +1518,12 @@ mod tests {
     fn named_attachments_preserve_full_documentation_and_wake_missing_names() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();
+        write_attachment_library(root, "pub mod a;\npub mod z;\n");
         let original = "/// The original comment.\npub fn original() {}\n";
         let changed = "/// The new comment.\npub fn newly_visible() {}\n";
-        std::fs::write(root.join("a.rs"), original).expect("first source");
+        std::fs::write(root.join("src/a.rs"), original).expect("first source");
         std::fs::write(
-            root.join("z.rs"),
+            root.join("src/z.rs"),
             "/// Another comment.\npub fn another() {}\n",
         )
         .expect("other source");
@@ -1512,9 +1539,10 @@ mod tests {
                 .iter()
                 .any(|row| row.authored == "newly_visible")
         );
+        assert_attachment_paths(&initial_rows);
         assert_eq!(initial_rows.sources.len(), 3);
 
-        let input = save_for_attachment_rebuild(&initial, root, "a.rs", changed);
+        let input = save_for_attachment_rebuild(&initial, root, "src/a.rs", changed);
         let current = initial.rebuilt(&input).expect("named documentation edit");
         let cold = attachment_workspace(root, &inclusion);
         assert_eq!(
@@ -1522,6 +1550,7 @@ mod tests {
             cold.documentation().index()
         );
         assert_eq!(held.index(), &initial_rows);
+        assert_attachment_paths(current.documentation().index());
         assert!(
             current
                 .documentation()
@@ -1535,7 +1564,7 @@ mod tests {
             initial_rows.selection_digest
         );
 
-        let input = save_for_attachment_rebuild(&current, root, "a.rs", original);
+        let input = save_for_attachment_rebuild(&current, root, "src/a.rs", original);
         let restored = current
             .rebuilt(&input)
             .expect("named documentation restore");
@@ -1554,8 +1583,11 @@ mod tests {
         use rift_protocol::documentation::DocumentationConfiguration;
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();
-        std::fs::write(root.join("a.rs"), "/// First.\npub fn first() {}\n").expect("first source");
-        std::fs::write(root.join("z.rs"), "/// Last.\npub fn last() {}\n").expect("last source");
+        write_attachment_library(root, "pub mod a;\npub mod b;\npub mod z;\n");
+        std::fs::write(root.join("src/a.rs"), "/// First.\npub fn first() {}\n")
+            .expect("first source");
+        std::fs::write(root.join("src/z.rs"), "/// Last.\npub fn last() {}\n")
+            .expect("last source");
         let inclusion =
             TextFileInclusion::default().with_documentation(DocumentationConfiguration {
                 enabled: false,
@@ -1564,11 +1596,12 @@ mod tests {
             });
         let initial = attachment_workspace(root, &inclusion);
         let held = initial.documentation_snapshot();
+        assert_attachment_paths(held.index());
         assert_eq!(held.index().sources.len(), 2);
         let input = save_for_attachment_rebuild(
             &initial,
             root,
-            "b.rs",
+            "src/b.rs",
             "/// Middle.\npub fn middle() {}\n",
         );
         let named = initial.rebuilt(&input).err().expect("named cap refusal");
@@ -1592,7 +1625,7 @@ mod tests {
         assert!(
             named
                 .context()
-                .any(|(key, value)| key == "path" && value == "z.rs")
+                .any(|(key, value)| key == "path" && value == "src/z.rs")
         );
         assert_eq!(held.index(), initial.documentation().index());
     }
