@@ -2742,9 +2742,26 @@ pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTree
             .map(|symbol| (symbol.qualified_name.as_str(), symbol))
             .collect()
     };
+    let public = |symbol| rule.is_public(symbol, &by_name, python_scopes.as_ref());
+    if python_scopes.is_some() {
+        // Name-keyed visibility must hold for every physical declaration that shares it.
+        let mut visibility = BTreeMap::new();
+        for symbol in symbols {
+            let visible = public(symbol);
+            visibility
+                .entry(symbol.qualified_name.as_str())
+                .and_modify(|previous| *previous &= visible)
+                .or_insert(visible);
+        }
+        return visibility
+            .into_iter()
+            .filter(|(_, visible)| *visible)
+            .map(|(name, _)| name.to_owned())
+            .collect();
+    }
     symbols
         .iter()
-        .filter(|symbol| rule.is_public(symbol, &by_name, python_scopes.as_ref()))
+        .filter(|symbol| public(symbol))
         .map(|symbol| symbol.qualified_name.clone())
         .collect()
 }
