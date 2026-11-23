@@ -239,6 +239,7 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
             symbols,
             left_out_symbols: facts.left_out_symbols().to_vec(),
             has_errors: facts.has_errors(),
+            variance_errors_only: facts.variance_errors_only(),
             left_out_declarations: facts.left_out_declaration_count(),
             markdown_facts: facts.markdown_facts().cloned(),
             export_bindings: facts.export_bindings().map(<[_]>::to_vec),
@@ -439,6 +440,44 @@ fn captured_static_occurrences_survive_package_fact_restoration() {
             .coverage
             .iter()
             .any(|coverage| coverage.covers(FactKind::Occurrences, None))
+    );
+    assert_eq!(canonical(&first), canonical(&reused));
+}
+
+#[test]
+fn checked_variance_coverage_survives_package_fact_restoration() {
+    let source = "export interface Base<T> { base: T }
+export interface Mid<out T = unknown, in U = string> extends Base<T> { value: T; run(input: U): T }
+export class Box<in out T> { item!: T }
+";
+    let files = [("index.d.ts", source)];
+    let mut retained = Vec::new();
+    let first = analyze(
+        "1.0.0",
+        ShippedLanguage::TypeScript,
+        &files,
+        SyntaxLimits::default(),
+        |source| capture(source, &mut retained),
+    )
+    .expect("first package");
+    assert!(retained[0].facts().has_errors());
+    assert!(retained[0].facts().declaration_syntax_complete());
+    let restored = [checked_restored(&retained[0], source)];
+    let reused = analyze(
+        "1.0.0",
+        ShippedLanguage::TypeScript,
+        &files,
+        SyntaxLimits::default(),
+        |source| lookup(source, &restored),
+    )
+    .expect("restored package");
+    assert_eq!(reused.syntax_work().provider_calls, 0);
+    assert!(
+        reused
+            .publication()
+            .coverage
+            .iter()
+            .all(|coverage| coverage.inventory_complete && coverage.identity_complete)
     );
     assert_eq!(canonical(&first), canonical(&reused));
 }

@@ -16,6 +16,7 @@ use rift_core::line::{lines_inclusive, without_ending};
 use rift_protocol::dependencies::{
     PackageAvailability, PackageContextEntry, PackageSelector, REQUIREMENT_ANY,
 };
+use rift_protocol::identity::SymbolOwner;
 use rift_protocol::read::ProjectPath;
 
 use crate::context::{InstallFolder, InstallLocation, is_whole_version};
@@ -117,6 +118,52 @@ impl StandardLibrary {
             Self::Rust => "rustc",
             Self::Node => "node",
             Self::Python => "cpython",
+        }
+    }
+
+    /// Recognizes the runtime owner of an exact published release, such as `rustc`.
+    #[must_use]
+    pub fn from_runtime(runtime: &str) -> Option<Self> {
+        [Self::Rust, Self::Node, Self::Python]
+            .into_iter()
+            .find(|library| library.runtime() == runtime)
+    }
+
+    /// Recognizes the runtime that owns symbol identities, such as `rust`.
+    #[must_use]
+    pub fn from_symbol_runtime(runtime: &str) -> Option<Self> {
+        [Self::Rust, Self::Node, Self::Python]
+            .into_iter()
+            .find(|library| library.symbol_runtime() == runtime)
+    }
+
+    /// The runtime symbol identities name as this library's owner.
+    ///
+    /// A symbol identity carries no version, so the Rust library is owned by `rust` there,
+    /// while its release revisions name the `rustc` that ships it.
+    #[must_use]
+    pub const fn symbol_runtime(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Node | Self::Python => self.runtime(),
+        }
+    }
+
+    /// The owner of this library's symbol identities, such as `stdlib/rust`.
+    #[must_use]
+    pub fn symbol_owner(self) -> SymbolOwner {
+        SymbolOwner::Runtime {
+            runtime: self.symbol_runtime().to_owned(),
+        }
+    }
+
+    /// The language this library's own sources define its symbols in.
+    #[must_use]
+    pub const fn symbol_language(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Node => "javascript",
+            Self::Python => "python",
         }
     }
 
@@ -719,6 +766,28 @@ mod tests {
     use crate::fixture::RecordedInspector;
 
     const ROOT: &str = "/workspace";
+
+    #[test]
+    fn symbol_owners_are_one_table_beside_release_runtimes() {
+        for (library, release, owner, language) in [
+            (StandardLibrary::Rust, "rustc", "rust", "rust"),
+            (StandardLibrary::Node, "node", "node", "javascript"),
+            (StandardLibrary::Python, "cpython", "cpython", "python"),
+        ] {
+            assert_eq!(library.runtime(), release);
+            assert_eq!(StandardLibrary::from_runtime(release), Some(library));
+            assert_eq!(StandardLibrary::from_symbol_runtime(owner), Some(library));
+            assert_eq!(library.symbol_language(), language);
+            assert_eq!(
+                library.symbol_owner(),
+                SymbolOwner::Runtime {
+                    runtime: owner.to_owned()
+                }
+            );
+        }
+        assert_eq!(StandardLibrary::from_runtime("rust"), None);
+        assert_eq!(StandardLibrary::from_symbol_runtime("rustc"), None);
+    }
 
     fn exact(version: &str) -> Pin {
         Pin::Exact(version.to_owned())

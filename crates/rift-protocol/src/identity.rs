@@ -430,6 +430,32 @@ impl SymbolOwner {
         }
     }
 
+    /// Registry a package manifest selects when it names no other, for one package manager.
+    #[must_use]
+    pub fn default_registry(manager: &str) -> Option<&'static str> {
+        match manager {
+            "cargo" => Some("crates.io"),
+            "npm" => Some("npmjs.org"),
+            "pypi" => Some("pypi.org"),
+            _ => None,
+        }
+    }
+
+    /// Owner of one package in its defining registry.
+    ///
+    /// # Errors
+    /// Returns the violated owner or length bound. A name the identity grammar does not
+    /// spell is refused, never rewritten.
+    pub fn registry_package(manager: &str, registry: &str, name: &str) -> Result<Self, RiftError> {
+        let owner = Self::Package {
+            manager: manager.to_owned(),
+            registry: registry.to_owned(),
+            name: name.to_owned(),
+        };
+        owner.validate()?;
+        Ok(owner)
+    }
+
     /// Validates an owner before it enters a source or symbol identity.
     ///
     /// # Errors

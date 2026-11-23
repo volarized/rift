@@ -891,7 +891,7 @@ impl<'source> Namespaces<'source> {
             .or_else(|| self.lookup(file, range.start, &path, Namespace::Type, work))
     }
 
-    fn import_source(
+    pub(super) fn import_source(
         &self,
         file: &File<'source>,
         range: ByteRange,
@@ -2167,7 +2167,7 @@ fn generic_end(text: &str, work: &mut Work) -> Option<usize> {
     None
 }
 
-fn is_type_binding(kind: StaticBindingKind) -> bool {
+pub(super) fn is_type_binding(kind: StaticBindingKind) -> bool {
     // Value bindings do not shadow paths in Rust's type namespace.
     matches!(
         kind,

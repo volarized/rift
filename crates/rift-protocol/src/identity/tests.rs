@@ -636,3 +636,33 @@ fn test_construction_and_registration_use_same_acceptance() {
         Some("Language".to_owned())
     );
 }
+
+#[test]
+fn registry_packages_are_admitted_under_their_canonical_names_only() {
+    for (manager, registry, name) in [
+        ("cargo", "crates.io", "serde_json"),
+        ("npm", "npmjs.org", "@types/node"),
+        ("pypi", "pypi.org", "pyyaml"),
+    ] {
+        assert_eq!(SymbolOwner::default_registry(manager), Some(registry));
+        let owner = SymbolOwner::registry_package(manager, registry, name).expect("owner");
+        assert_eq!(
+            owner,
+            SymbolOwner::Package {
+                manager: manager.to_owned(),
+                registry: registry.to_owned(),
+                name: name.to_owned(),
+            }
+        );
+    }
+    assert_eq!(SymbolOwner::default_registry("unknown"), None);
+    for (manager, name) in [
+        ("cargo", "Inflector"),
+        ("pypi", "PyYAML"),
+        ("npm", "@types"),
+    ] {
+        let error = SymbolOwner::registry_package(manager, "registry.example", name)
+            .expect_err("a name the grammar does not spell");
+        assert_eq!(error.slug().as_str(), "rift.core.symbol_identity_invalid");
+    }
+}

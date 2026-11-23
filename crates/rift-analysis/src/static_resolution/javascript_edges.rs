@@ -98,23 +98,18 @@ impl<'source> Index<'source> {
                         work,
                     )
                     .or_else(|| self.javascript_module_from(file, reference.target, work));
-            } else if local.is_none()
-                && reference.role == ReferenceRole::Type
-                && file.document.facts.language().name == "typescript"
-                && self
-                    .record_external_typescript_type_use(file, reference.target, work, result)
-                    .is_some()
-            {
-                continue;
             }
-            result.record(occurrence);
+            let resolved = (occurrence, local.is_some());
+            self.record_reference(file, reference, resolved, work, result);
         }
         for binding in file.facts.bindings() {
             if !work.charge() {
                 return;
             }
             if let StaticBindingKind::JavaScriptEdgeNamespace { module } = binding.kind {
-                result.record(self.javascript_namespace_import(file, binding.name, module, work));
+                let imported = self.javascript_namespace_import(file, binding.name, module, work);
+                let site = (binding.name, module);
+                self.record_module_import(file, site, imported, work, result);
             }
             if let StaticBindingKind::JavaScriptImport { module, .. } = binding.kind
                 && let Some(written) = self.javascript_written_import(file, binding, module, work)
@@ -129,7 +124,9 @@ impl<'source> Index<'source> {
             } = binding.kind
                 && self.builtin_require(file, require.start, work)
             {
-                result.record(self.javascript_namespace_import(file, binding.name, module, work));
+                let imported = self.javascript_namespace_import(file, binding.name, module, work);
+                let site = (binding.name, module);
+                self.record_module_import(file, site, imported, work, result);
             }
         }
         for export in file.document.facts.export_bindings().unwrap_or_default() {
@@ -145,7 +142,8 @@ impl<'source> Index<'source> {
                     start: module.start + 1,
                     end: module.end - 1,
                 };
-                result.record(self.javascript_reexport_module(file, export, module, work));
+                let imported = self.javascript_reexport_module(file, export, module, work);
+                self.record_reexport(file, (export, module), imported, work, result);
             }
         }
         for alias in file.facts.member_aliases() {
@@ -237,7 +235,7 @@ impl<'source> Index<'source> {
         (self.javascript_identity(alias)? == self.javascript_identity(namespace)?).then_some(alias)
     }
 
-    fn javascript_assignment_reference_from(
+    pub(super) fn javascript_assignment_reference_from(
         &self,
         file: &File<'source>,
         range: ByteRange,
@@ -647,7 +645,7 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn javascript_module_identity(
+    pub(super) fn javascript_module_identity(
         &self,
         file: &File<'source>,
         work: &mut Work,

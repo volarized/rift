@@ -240,7 +240,7 @@ fn common_module_path<'a>(left: &'a str, right: &str) -> &'a str {
 /// store's edges carry. `Unknown` - a provider exposing no sharper role - and every role this
 /// mapping has no sharper kind for falls back to `References`, the kind's general-mention
 /// sense.
-const fn role_kind(role: ReferenceRole) -> EdgeKind {
+pub(crate) const fn role_kind(role: ReferenceRole) -> EdgeKind {
     match role {
         ReferenceRole::Definition => EdgeKind::Declares,
         ReferenceRole::Read => EdgeKind::Reads,
@@ -1093,6 +1093,7 @@ mod tests {
                 external: vec![ExternalOccurrence {
                     binding: binding(path, 31, 37),
                     target: fixture_symbol("external"),
+                    source_digest: rift_core::FileDigest::of(b"fixture"),
                     callee_range: rift_syntax::ByteRange { start: 31, end: 37 },
                     role: ReferenceRole::Call,
                     edge_from: None,

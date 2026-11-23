@@ -18,30 +18,31 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            let occurrence = self
+            let target = self
                 .edge_python_name(file, reference.target, work)
                 .or_else(|| {
                     (reference.role == ReferenceRole::Write)
                         .then(|| self.python_written_module_name(file, reference.target, work))
                         .flatten()
-                })
-                .and_then(|target| {
-                    let mut occurrence = self.occurrence(
-                        file,
-                        reference.target,
-                        reference.target,
-                        reference.role,
-                        target,
-                    )?;
-                    // An annotation belongs to its declaration. Accesses belong to the enclosing callable.
-                    if reference.role != ReferenceRole::Type
-                        && let Some(caller) = file.enclosing_callable(reference.target)
-                    {
-                        occurrence.edge_from = self.python_identity(file, reference.target, caller);
-                    }
-                    Some(occurrence)
                 });
-            result.record(occurrence);
+            let declared = target.is_some();
+            let occurrence = target.and_then(|target| {
+                let mut occurrence = self.occurrence(
+                    file,
+                    reference.target,
+                    reference.target,
+                    reference.role,
+                    target,
+                )?;
+                // An annotation belongs to its declaration. Accesses belong to the enclosing callable.
+                if reference.role != ReferenceRole::Type
+                    && let Some(caller) = file.enclosing_callable(reference.target)
+                {
+                    occurrence.edge_from = self.python_identity(file, reference.target, caller);
+                }
+                Some(occurrence)
+            });
+            self.record_reference(file, reference, (occurrence, declared), work, result);
         }
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
