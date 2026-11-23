@@ -2815,6 +2815,36 @@ fn test_rust_generic_impl_self_and_trait_calls_resolve() {
 }
 
 #[test]
+fn test_rust_enclosing_trait_calls_keep_the_implementation_binding() {
+    let source = "pub mod t { pub trait A { fn make(value: u8) -> Self; fn wrap(value: u8) -> Self; } pub trait B { fn make(value: u8) -> Self; } }\npub struct Error;\nimpl t::A for Error { fn make(_: u8) -> Self { Error } fn wrap(value: u8) -> Self { Error::make(value) } }\nimpl t::B for Error { fn make(_: u8) -> Self { Error } }\nmod outside { use super::t::B; pub fn build() -> super::Error { super::Error::make(1) } }\n";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let call = calls(&result, "src/lib.rs")
+        .find(|call| source_of(call, source) == "Error::make(value)")
+        .expect("call inside the trait implementation");
+    let binding = call.target_binding.as_ref().expect("target declaration");
+    let implementation = "impl t::A for Error { ";
+    let declaration = "fn make(_: u8) -> Self { Error }";
+    let start = source.find(implementation).expect("implementation") + implementation.len();
+    let end = start + declaration.len();
+    assert_eq!(&source[start..end], declaration);
+    assert_eq!(
+        binding.unit().to_string(),
+        "rift://source/project/src/lib.rs"
+    );
+    assert_eq!(
+        binding.range().start(),
+        u64::try_from(start).expect("start")
+    );
+    assert_eq!(binding.range().end(), u64::try_from(end).expect("end"));
+    assert_eq!(target(call), "rift://symbol/local/rust/fixture/Error/make");
+}
+
+#[test]
 fn test_rust_nested_use_groups_keep_module_aliases_and_globs() {
     for source in [
         "mod jobs; use crate::jobs::{self as tasks, *}; fn root() { leaf(); tasks::leaf(); }",
