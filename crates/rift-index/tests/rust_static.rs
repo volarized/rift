@@ -1856,6 +1856,79 @@ fn test_rust_typed_self_receivers_reach_the_implementation_type() {
 }
 
 #[test]
+fn test_rust_boxed_and_pinned_self_do_not_flatten_reference_impls() {
+    // Rust selects the wrapper's Pick before the implementation reference's Pick.
+    // Static lookup cannot distinguish the wrapper's generic instantiation at this site.
+    let source = r"use std::pin::Pin;
+
+pub struct Value;
+
+pub trait Pick { fn pick(self) -> u8; }
+
+impl Pick for &Value {
+    fn pick(self) -> u8 { 3 }
+}
+
+impl Pick for Box<&Value> {
+    fn pick(self) -> u8 { 103 }
+}
+
+impl Pick for Pin<&mut &Value> {
+    fn pick(self) -> u8 { 104 }
+}
+
+pub trait Through {
+    fn through(self: Box<Self>) -> u8;
+    fn through_pin(self: Pin<&mut Self>) -> u8;
+    fn through_reference(self: &Self) -> u8;
+}
+
+impl Through for &Value {
+    fn through(self: Box<Self>) -> u8 { self.pick() }
+    fn through_pin(self: Pin<&mut Self>) -> u8 { self.pick() }
+    fn through_reference(self: &Self) -> u8 { self.pick() }
+}
+";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    let file = index
+        .files()
+        .find(|file| file.path().as_str() == "src/lib.rs")
+        .expect("source file");
+    let facts = file.syntax().static_facts().expect("authored facts");
+    let starts: Vec<_> = source
+        .match_indices("self.pick()")
+        .map(|(start, _)| u64::try_from(start).expect("range start"))
+        .collect();
+    let [boxed, pinned, explicit_reference] = starts.as_slice() else {
+        panic!("three physical receiver calls");
+    };
+    for start in [boxed, pinned, explicit_reference] {
+        assert!(
+            facts
+                .calls()
+                .iter()
+                .any(|call| call.range.start == *start && call.range.end == start + 11)
+        );
+        assert!(
+            facts
+                .references()
+                .iter()
+                .any(|access| access.target.start == *start
+                    && access.target.end == start + 9
+                    && access.role == rift_core::ReferenceRole::Read)
+        );
+    }
+    for kind in [EdgeKind::Calls, EdgeKind::Reads] {
+        assert!(!index.edges().edges().any(|edge| edge.kind() == kind
+            && [*boxed, *pinned].contains(&edge.occurrence().range().start())));
+        assert!(index.edges().edges().any(|edge| edge.kind() == kind
+            && edge.occurrence().range().start() == *explicit_reference
+            && edge.from().as_str().ends_with("/&Value/through_reference")
+            && edge.to().as_str().ends_with("/&Value/pick")));
+    }
+}
+
+#[test]
 fn test_rust_paths_through_private_imports_of_a_parent_module() {
     // `use super::Bucket` names what the parent module imported as `Bucket`; the import is
     // private to the parent and its descendants, so a path from elsewhere stays unresolved.
