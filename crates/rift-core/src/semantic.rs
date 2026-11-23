@@ -238,17 +238,23 @@ impl ContributionOrigin {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PortableSymbolFacts {
     language: Language,
-    name: String,
-    qualified_name: String,
     kind: ExactKind,
-    kinds: Vec<SymbolKind>,
     container: Option<ContributionReference>,
-    modifiers: Vec<String>,
-    visibility: Option<String>,
-    types: Vec<TypeBinding>,
+    material: Arc<PortableMaterial>,
     signatures: Arc<[Signature]>,
     documentation: Arc<[Documentation]>,
     document_local: bool,
+}
+
+/// Portable values retained unchanged when an admitted declaration enters a new revision.
+#[derive(Debug, Clone, PartialEq)]
+struct PortableMaterial {
+    name: String,
+    qualified_name: String,
+    kinds: Vec<SymbolKind>,
+    modifiers: Vec<String>,
+    visibility: Option<String>,
+    types: Vec<TypeBinding>,
 }
 
 impl PortableSymbolFacts {
@@ -262,14 +268,16 @@ impl PortableSymbolFacts {
     ) -> Self {
         Self {
             language,
-            name: name.into(),
-            qualified_name: qualified_name.into(),
             kind,
-            kinds: Vec::new(),
             container: None,
-            modifiers: Vec::new(),
-            visibility: None,
-            types: Vec::new(),
+            material: Arc::new(PortableMaterial {
+                name: name.into(),
+                qualified_name: qualified_name.into(),
+                kinds: Vec::new(),
+                modifiers: Vec::new(),
+                visibility: None,
+                types: Vec::new(),
+            }),
             signatures: Arc::from([]),
             documentation: Arc::from([]),
             document_local: false,
@@ -279,7 +287,7 @@ impl PortableSymbolFacts {
     /// Sets portable kinds.
     #[must_use]
     pub fn kinds(mut self, kinds: Vec<SymbolKind>) -> Self {
-        self.kinds = kinds;
+        Arc::make_mut(&mut self.material).kinds = kinds;
         self
     }
 
@@ -293,14 +301,14 @@ impl PortableSymbolFacts {
     /// Sets language modifiers.
     #[must_use]
     pub fn modifiers(mut self, modifiers: Vec<String>) -> Self {
-        self.modifiers = modifiers;
+        Arc::make_mut(&mut self.material).modifiers = modifiers;
         self
     }
 
     /// Sets authored visibility spelling.
     #[must_use]
     pub fn visibility(mut self, visibility: impl Into<String>) -> Self {
-        self.visibility = Some(visibility.into());
+        Arc::make_mut(&mut self.material).visibility = Some(visibility.into());
         self
     }
 
@@ -321,7 +329,7 @@ impl PortableSymbolFacts {
     /// Sets type facts.
     #[must_use]
     pub fn types(mut self, types: Vec<TypeBinding>) -> Self {
-        self.types = types;
+        Arc::make_mut(&mut self.material).types = types;
         self
     }
 
@@ -355,13 +363,13 @@ impl PortableSymbolFacts {
     /// Returns short name.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        &self.material.name
     }
 
     /// Returns provider-qualified name.
     #[must_use]
     pub fn qualified_name(&self) -> &str {
-        &self.qualified_name
+        &self.material.qualified_name
     }
 
     /// Returns exact provider kind.
@@ -373,7 +381,7 @@ impl PortableSymbolFacts {
     /// Returns portable kinds.
     #[must_use]
     pub fn symbol_kinds(&self) -> &[SymbolKind] {
-        &self.kinds
+        &self.material.kinds
     }
 
     /// Returns containing symbol reference.
@@ -385,19 +393,19 @@ impl PortableSymbolFacts {
     /// Returns language modifiers.
     #[must_use]
     pub fn modifier_words(&self) -> &[String] {
-        &self.modifiers
+        &self.material.modifiers
     }
 
     /// Returns authored visibility spelling.
     #[must_use]
     pub fn visibility_spelling(&self) -> Option<&str> {
-        self.visibility.as_deref()
+        self.material.visibility.as_deref()
     }
 
     /// Returns type facts.
     #[must_use]
     pub fn type_bindings(&self) -> &[TypeBinding] {
-        &self.types
+        &self.material.types
     }
 
     /// Returns callable signatures.
@@ -668,6 +676,33 @@ impl Contribution {
         }
     }
 
+    /// Carries a previously admitted exact contribution into a new captured revision.
+    ///
+    /// The provider must establish that the source and its placement have stayed equal.
+    /// Independent or differently scoped source evidence cannot enter this path.
+    #[must_use]
+    pub fn at_exact_revision(
+        &self,
+        held: (SourceRevision, TreeRevision),
+        current: (ProviderRevision, SourceRevision, TreeRevision),
+    ) -> Option<Self> {
+        if self.applicability
+            != (SourceApplicability::Exact {
+                source_revision: held.0,
+                tree_revision: held.1,
+            })
+        {
+            return None;
+        }
+        let mut current_row = self.clone();
+        current_row.key.publication = current.0;
+        current_row.applicability = SourceApplicability::Exact {
+            source_revision: current.1,
+            tree_revision: current.2,
+        };
+        Some(current_row)
+    }
+
     /// Returns immutable Contribution key.
     #[must_use]
     pub const fn key(&self) -> &ContributionKey {
@@ -930,7 +965,8 @@ fn validate_provider_symbol(contribution: &Contribution) -> Result<(), RiftError
 }
 
 fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError> {
-    if !is_portable_name(&facts.name) || !is_portable_name(&facts.qualified_name) {
+    if !is_portable_name(&facts.material.name) || !is_portable_name(&facts.material.qualified_name)
+    {
         return errors::core::contribution_invalid_name()
             .field("facts.name")
             .fail();
@@ -946,9 +982,9 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
             .fail();
     }
     let counts = [
-        facts.kinds.len(),
-        facts.modifiers.len(),
-        facts.types.len(),
+        facts.material.kinds.len(),
+        facts.material.modifiers.len(),
+        facts.material.types.len(),
         facts.signatures.len(),
         facts.documentation.len(),
     ];
@@ -960,8 +996,8 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
             .field("facts")
             .fail();
     }
-    let unique: BTreeSet<_> = facts.kinds.iter().copied().collect();
-    if unique.len() != facts.kinds.len() {
+    let unique: BTreeSet<_> = facts.material.kinds.iter().copied().collect();
+    if unique.len() != facts.material.kinds.len() {
         return errors::core::contribution_duplicate_fact()
             .field("facts.kinds")
             .fail();
