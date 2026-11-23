@@ -584,13 +584,14 @@ impl<'source> Index<'source> {
     /// The member `member` of the value a name bound to a call holds, read from the object
     /// literals the callee returns (D38): the callee declares no return type, every one of
     /// its `return`s returns an object literal, and each of them writes the member. The
-    /// member of the first literal is the target. One level only: a returned call is no
-    /// object literal.
+    /// member of the first literal is the read target. A call through explicit pairs
+    /// uses their local callable when every literal proves the same declaration.
     pub(super) fn javascript_returned_member<'index>(
         &'index self,
         file: &'index File<'source>,
         binding: &StaticBinding,
         member: &str,
+        role: ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let &(None, call) = file.callbacks.destructured.get(&binding.name)? else {
@@ -611,11 +612,32 @@ impl<'source> Index<'source> {
             }
             let objects = declared.callbacks.returned_objects.get(&owner)?;
             let mut first = None;
+            let mut pair_target: Option<Target<'source>> = None;
+            let mut resolve_pair = role == ReferenceRole::Call
+                && file.document.facts.language().name == "javascript"
+                && declared.document.facts.language().name == "javascript";
             for object in objects {
-                let target = Self::javascript_literal_member(declared, (*object)?, member, work)?;
+                let object = (*object)?;
+                let target = Self::javascript_literal_member(declared, object, member, work)?;
+                if first.is_none() && resolve_pair {
+                    resolve_pair = target.symbol.syntax_element_kind == Some("pair")
+                        && file.text(binding.name).is_some_and(|receiver| {
+                            !file.javascript_reassigned(receiver, Some(member))
+                        });
+                }
                 first.get_or_insert(target);
+                if resolve_pair {
+                    let next = self.javascript_returned_pair_value(declared, target, object, work);
+                    resolve_pair = next.is_some_and(|callable| {
+                        // Both lexical targets are local to the callee's captured source.
+                        pair_target.is_none_or(|previous| {
+                            previous.symbol.item_range == callable.symbol.item_range
+                        })
+                    });
+                    pair_target = next;
+                }
             }
-            first
+            pair_target.filter(|_| resolve_pair).or(first)
         })
     }
 

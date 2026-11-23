@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use rift_syntax::{StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
+use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
 
 use super::{Binding, File, Index, Target, Work};
 use crate::NamespaceInput;
@@ -357,6 +357,57 @@ impl<'source> Index<'source> {
         .is_some()
     }
 
+    /// The immutable local function named by a final, direct property of a returned object.
+    pub(super) fn javascript_returned_pair_value(
+        &self,
+        file: &File<'source>,
+        member: Target<'source>,
+        object: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if member.symbol.syntax_element_kind != Some("pair")
+            || member.callable().is_some()
+            || file.text(member.symbol.name_range?)? != member.symbol.name
+        {
+            return None;
+        }
+        let tail = file
+            .text(ByteRange {
+                start: member.symbol.item_range.end,
+                end: object.end,
+            })?
+            .strip_suffix('}')?;
+        // This also proves the pair is direct and no later property can replace it.
+        let mut comma = false;
+        if !tail.chars().all(|character| {
+            if !work.charge() {
+                return false;
+            }
+            if character == ',' && !comma {
+                comma = true;
+                return true;
+            }
+            character.is_whitespace()
+        }) {
+            return None;
+        }
+        let value = member.symbol.body_range?;
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            file.text(value)?,
+            value.start,
+            rift_core::ReferenceRole::Call,
+            work,
+        )?;
+        if binding.kind != StaticBindingKind::Local || file.javascript_binding_reassigned(binding) {
+            return None;
+        }
+        let function = file.target_at(binding.name)?.callable()?;
+        (function.symbol.kind == "function" && function.symbol.body_range.is_some())
+            .then_some(function)
+    }
+
     /// Whether the binding's declared type states that its value can be called or constructed.
     ///
     /// The annotation must name, through at most `DECLARED_TYPE_DEPTH_MAX` aliases, a type
@@ -637,7 +688,9 @@ impl<'source> Index<'source> {
                                 work,
                             )
                         })
-                        .or_else(|| self.javascript_returned_member(file, binding, member, work))
+                        .or_else(|| {
+                            self.javascript_returned_member(file, binding, member, role, work)
+                        })
                 }),
             StaticBindingKind::JavaScriptRequire {
                 module,
