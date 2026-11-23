@@ -1817,6 +1817,41 @@ struct RequestCapture {
     selection: Option<(u64, ConfigurationFingerprint)>,
 }
 
+impl RequestCapture {
+    /// Installs the checked capture unless a concurrent request already supplied one
+    /// while this request was using the startup capture.
+    fn install(
+        &mut self,
+        next: LastCapture,
+        selection: (u64, ConfigurationFingerprint),
+        previous: Option<&Arc<LastCapture>>,
+        reused_selection: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RiftError> {
+        if let Some(previous) = previous {
+            if cancellation.is_cancelled() {
+                return errors::server::read_cancelled().fail();
+            }
+            let install = Arc::ptr_eq(&self.files, previous);
+            rift_tracing::debug!(
+                component = "index",
+                operation = "fingerprint.prepared_capture",
+                reused_selection,
+                install,
+                capture = ?next,
+            );
+            if !install {
+                return Ok(());
+            }
+        }
+        *self = Self {
+            files: Arc::new(next),
+            selection: Some(selection),
+        };
+        Ok(())
+    }
+}
+
 /// Workspace MCP server: reads serve an immutable snapshot rebuilt after source changes.
 ///
 /// Clones share every piece of server state. The HTTP transport clones one
@@ -3974,11 +4009,7 @@ impl RiftMcp {
         let cancellation = self.validation.cancellation.clone();
         let validation = Arc::clone(&self.validation);
         let configuration = current.configuration.fingerprint;
-        let prepared_capture = current
-            .prepared_read_capture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let prepared_capture = current.take_prepared_read_capture();
         rift_tracing::debug_span!(
             "index.reconcile",
             component = "index",
@@ -3993,14 +4024,14 @@ impl RiftMcp {
                 let recorded = last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let request_capture = Arc::clone(&recorded.files);
                 let seed = prepared_capture
                     .as_ref()
                     .filter(|_| recorded.selection.is_none());
-                let (last, selection) = match seed {
-                    Some((epoch, capture)) => (Arc::clone(capture), Some((*epoch, configuration))),
-                    None => (Arc::clone(&request_capture), recorded.selection),
-                };
+                let request_capture = seed.map(|_| Arc::clone(&recorded.files));
+                let last = Arc::clone(seed.map_or(&recorded.files, |(_, capture)| capture));
+                let selection = seed.map_or(recorded.selection, |(epoch, _)| {
+                    Some((*epoch, configuration))
+                });
                 let reuse_selection = selection == Some((observed_epoch, configuration))
                     && !validation.watch_failed.load(Ordering::Acquire);
                 drop(recorded);
@@ -4031,30 +4062,16 @@ impl RiftMcp {
                         .detail("captured build paths changed during validation")
                         .fail();
                 }
-                let mut recorded = last_capture
+                last_capture
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut install = true;
-                if seed.is_some() {
-                    if cancelled() {
-                        return errors::server::read_cancelled().fail();
-                    }
-                    install = Arc::ptr_eq(&recorded.files, &request_capture);
-                    rift_tracing::debug!(
-                        component = "index",
-                        operation = "fingerprint.prepared_capture",
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .install(
+                        next,
+                        (observed_epoch, configuration),
+                        request_capture.as_ref(),
                         reused_selection,
-                        install,
-                        capture = ?next,
-                    );
-                }
-                if install {
-                    *recorded = RequestCapture {
-                        files: Arc::new(next),
-                        selection: Some((observed_epoch, configuration)),
-                    };
-                }
-                drop(recorded);
+                        &cancellation,
+                    )?;
                 let configuration = rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.configuration",

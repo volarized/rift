@@ -15013,22 +15013,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn completed_preparation_seeds_the_first_capture_and_detects_silent_changes() {
-        let directory = tempfile::tempdir().expect("workspace");
-        let root = directory.path().canonicalize().expect("canonical root");
-        let source = root.join("index.ts");
-        let ignore = root.join(".gitignore");
-        let delayed = root.join("candidate.ts");
-        let original = "export { leaf } from './candidate.js';\n";
-        fs::write(&source, original).expect("initial source");
-        fs::write(&ignore, "").expect("initial ignore policy");
-        advance_capture_clock(&root, &[root.clone(), source.clone(), ignore.clone()]);
+    fn completed_capture_seed(root: &Path) -> (WorkspaceIndex, WorkspaceDigests, LastCapture) {
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
         let cancelled = || false;
         let mut preparation = WorkspaceIndexPreparation::new(
-            &root,
+            root,
             limits,
             &TextFileInclusion::default(),
             &LanguageFileSelections::default(),
@@ -15047,7 +15037,7 @@ mod tests {
         );
         assert!(
             partial
-                .recapture_selected_cancellable(&root, limits, &cancelled)
+                .recapture_selected_cancellable(root, limits, &cancelled)
                 .expect("partial selection check")
                 .is_none()
         );
@@ -15067,7 +15057,7 @@ mod tests {
         );
         assert!(
             seeded
-                .recapture_selected_cancellable(&root, limits, &cancelled)
+                .recapture_selected_cancellable(root, limits, &cancelled)
                 .expect("unseeded selection check")
                 .is_none()
         );
@@ -15076,6 +15066,23 @@ mod tests {
                 .retain_complete_capture_selection(&visibility, &mut seeded, &cancelled)
                 .expect("same complete discovery")
         );
+        (index, verified, seeded)
+    }
+
+    #[test]
+    fn completed_preparation_seeds_the_first_capture_and_detects_silent_changes() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let source = root.join("index.ts");
+        let ignore = root.join(".gitignore");
+        let delayed = root.join("candidate.ts");
+        let original = "export { leaf } from './candidate.js';\n";
+        fs::write(&source, original).expect("initial source");
+        fs::write(&ignore, "").expect("initial ignore policy");
+        advance_capture_clock(&root, &[root.clone(), source.clone(), ignore.clone()]);
+        let (index, verified, seeded) = completed_capture_seed(&root);
+        let limits = WorkspaceIndexLimits::default();
+        let cancelled = || false;
         if selection_needs_discovery(&root, &seeded) {
             return;
         }

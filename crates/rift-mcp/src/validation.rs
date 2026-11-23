@@ -331,6 +331,14 @@ pub(crate) struct PublishedWorkspace {
 }
 
 impl PublishedWorkspace {
+    /// Offers the complete startup capture to the first current request alone.
+    pub(crate) fn take_prepared_read_capture(&self) -> Option<(u64, Arc<LastCapture>)> {
+        self.prepared_read_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     /// The record this publication uses to compare a path capture, including visible paths
     /// the read index does not classify.
     fn file_record(&self, path: &ProjectPath) -> Option<FileRecord> {
@@ -4574,42 +4582,18 @@ fn prepare_initial_batch(
         epoch,
         &cancelled,
     )?;
-    if batch.complete {
-        // The complete publication is read as soon as it is published. What its first
-        // read builds is built here, on this worker, and not under that read's deadline.
-        if cancelled() {
-            return errors::server::read_cancelled().fail();
-        }
-        rift_tracing::traced!(component = "index", operation = "index.prepare_reads", {
-            candidate.reads.prepare_reads();
-        });
-    }
-    if batch.complete {
-        let discovery_epoch = batch.validation.discovery_epoch();
-        if !complete_preparation_matches(
+    if batch.complete
+        && !finish_initial_capture(
             &batch.root,
-            &batch.configuration,
-            &batch.source_policy,
+            &mut candidate,
             &preparation,
-            candidate.reads.workspace_limits(),
+            &batch.source_policy,
+            &batch.validation,
             &mut last,
             &cancelled,
-        )? {
-            let pending = batch.validation.locked_pending();
-            trace_preparation_superseded(
-                candidate.epoch,
-                batch.validation.observed_epoch(),
-                &pending,
-            );
-            return Ok((preparation, last, RebuildOutcome::Superseded));
-        }
-        if cancelled() {
-            return errors::server::read_cancelled().fail();
-        }
-        if last.reuses_unchanged_paths() {
-            candidate.prepared_read_capture =
-                std::sync::Mutex::new(Some((discovery_epoch, Arc::new(std::mem::take(&mut last)))));
-        }
+        )?
+    {
+        return Ok((preparation, last, RebuildOutcome::Superseded));
     }
     let handoff = if batch.complete {
         batch
@@ -4626,6 +4610,48 @@ fn prepare_initial_batch(
         handoff,
     );
     Ok((preparation, last, outcome))
+}
+
+/// Prepares the reads and verifies the complete batch before it can offer its capture.
+fn finish_initial_capture(
+    root: &Path,
+    candidate: &mut PublishedWorkspace,
+    preparation: &WorkspaceIndexPreparation,
+    source_policy: &WorkspaceSourcePolicy,
+    validation: &IndexValidation,
+    last: &mut LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<bool, RiftError> {
+    // The complete publication is read as soon as it is published. Prepare its reads
+    // on this worker instead of charging the first request's deadline.
+    if cancelled() {
+        return errors::server::read_cancelled().fail();
+    }
+    rift_tracing::traced!(component = "index", operation = "index.prepare_reads", {
+        candidate.reads.prepare_reads();
+    });
+    let discovery_epoch = validation.discovery_epoch();
+    if !complete_preparation_matches(
+        root,
+        &candidate.configuration,
+        source_policy,
+        preparation,
+        candidate.reads.workspace_limits(),
+        last,
+        cancelled,
+    )? {
+        let pending = validation.locked_pending();
+        trace_preparation_superseded(candidate.epoch, validation.observed_epoch(), &pending);
+        return Ok(false);
+    }
+    if cancelled() {
+        return errors::server::read_cancelled().fail();
+    }
+    if last.reuses_unchanged_paths() {
+        candidate.prepared_read_capture =
+            std::sync::Mutex::new(Some((discovery_epoch, Arc::new(std::mem::take(last)))));
+    }
+    Ok(true)
 }
 
 /// Proves the complete batch still owns the selected paths and inclusion rules it captured.
