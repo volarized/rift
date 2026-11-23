@@ -831,9 +831,9 @@ impl<'source> Index<'source> {
             let Some(module) = file.text(module) else {
                 return false;
             };
-            if !exports
+            if exports
                 .imported(file, module, work)
-                .is_some_and(|other| other.document.path == supplied.document.path)
+                .is_none_or(|other| other.document.path != supplied.document.path)
             {
                 continue;
             }

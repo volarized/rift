@@ -1,4 +1,4 @@
-//! Exact package calls and property reads from direct CommonJS export literals.
+//! Exact package calls and property reads from direct `CommonJS` export literals.
 
 use super::*;
 use rift_protocol::index::StoredEdge;
