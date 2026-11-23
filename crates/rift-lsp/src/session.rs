@@ -55,6 +55,15 @@ use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE};
 use crate::framing::Framing;
 use crate::uri::TreeRoot;
 
+/// This switch is built only by the diagnostic packet. Nextest starts each case in its own process.
+#[cfg(rift_test_lifecycle_trace)]
+static TRACE_LIFECYCLE_TEST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::args_os().any(|argument| {
+        argument
+            == std::ffi::OsStr::new("search_traversal_waiting_on_announced_work_keeps_the_engine")
+    })
+});
+
 /// Wall-clock bound on the shutdown request and on the exit wait.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -593,6 +602,17 @@ impl EngineSession {
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
+            #[cfg(rift_test_lifecycle_trace)]
+            if *TRACE_LIFECYCLE_TEST {
+                rift_tracing::info!(
+                    component = "engine",
+                    phase = "launch_missing_pipes",
+                    method = "initialize",
+                    slug = %errors::lsp::engine_launch_failed::SLUG,
+                    child_pid = child.id(),
+                    "engine lifecycle diagnostic"
+                );
+            }
             kill_child(&mut child).await;
             return errors::lsp::engine_launch_failed()
                 .source(std::io::Error::other("child pipes were not handed over"))
@@ -689,6 +709,14 @@ impl EngineSession {
             )
             .await
         {
+            #[cfg(rift_test_lifecycle_trace)]
+            session.trace_lifecycle(
+                "handshake_error",
+                "initialize",
+                Some(error.slug()),
+                None,
+                None,
+            );
             session.end().await;
             return error.fail();
         }
@@ -1141,6 +1169,14 @@ impl EngineSession {
                 }
                 Err(error) => {
                     if ends_session(&error) {
+                        #[cfg(rift_test_lifecycle_trace)]
+                        self.trace_lifecycle(
+                            "retry_read_error",
+                            Progress::METHOD,
+                            Some(error.slug()),
+                            None,
+                            None,
+                        );
                         self.end().await;
                     }
                     return error.fail();
@@ -1441,10 +1477,34 @@ impl EngineSession {
         let working = deadline_cut || self.progress.is_working(Instant::now(), timeout);
         if working && !self.frame_in_flight && !self.ended {
             if let Err(error) = self.cancel_pending().await {
+                #[cfg(rift_test_lifecycle_trace)]
+                self.trace_lifecycle(
+                    "cancel_pending_error",
+                    method,
+                    Some(error.slug()),
+                    Some(deadline_cut),
+                    Some(working),
+                );
                 return error;
             }
+            #[cfg(rift_test_lifecycle_trace)]
+            self.trace_lifecycle(
+                "unanswered_retained",
+                method,
+                Some(errors::lsp::engine_analyzing::SLUG),
+                Some(deadline_cut),
+                Some(working),
+            );
             return errors::lsp::engine_analyzing().attempts(1_u64).error();
         }
+        #[cfg(rift_test_lifecycle_trace)]
+        self.trace_lifecycle(
+            "unanswered_end",
+            method,
+            Some(errors::lsp::engine_timed_out::SLUG),
+            Some(deadline_cut),
+            Some(working),
+        );
         self.end().await;
         errors::lsp::engine_timed_out()
             .method(method)
@@ -1496,11 +1556,27 @@ impl EngineSession {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
                 if ends_session(&error) {
+                    #[cfg(rift_test_lifecycle_trace)]
+                    self.trace_lifecycle(
+                        "request_exchange_error",
+                        R::METHOD,
+                        Some(error.slug()),
+                        None,
+                        None,
+                    );
                     self.end().await;
                 }
                 error.fail()
             }
             Err(_elapsed) if rule == Unanswered::EndsSession => {
+                #[cfg(rift_test_lifecycle_trace)]
+                self.trace_lifecycle(
+                    "request_handshake_or_shutdown_timeout",
+                    R::METHOD,
+                    Some(errors::lsp::engine_timed_out::SLUG),
+                    Some(deadline_cut),
+                    None,
+                );
                 self.end().await;
                 errors::lsp::engine_timed_out()
                     .method(R::METHOD)
@@ -1567,6 +1643,16 @@ impl EngineSession {
                 .fail(),
         };
         if sent.is_err() {
+            #[cfg(rift_test_lifecycle_trace)]
+            if let Err(error) = &sent {
+                self.trace_lifecycle(
+                    "notify_write_error",
+                    N::METHOD,
+                    Some(error.slug()),
+                    None,
+                    None,
+                );
+            }
             self.end().await;
         }
         sent
@@ -1659,6 +1745,12 @@ impl EngineSession {
             return;
         };
         let ProgressParamsValue::WorkDone(work) = progress.value;
+        #[cfg(rift_test_lifecycle_trace)]
+        let phase = match &work {
+            WorkDoneProgress::Begin(_) => "progress_begin_received",
+            WorkDoneProgress::Report(_) => "progress_report_received",
+            WorkDoneProgress::End(_) => "progress_end_received",
+        };
         let now = Instant::now();
         match work {
             WorkDoneProgress::Begin(_) | WorkDoneProgress::Report(_) => {
@@ -1666,6 +1758,8 @@ impl EngineSession {
             }
             WorkDoneProgress::End(_) => self.progress.ended(&progress.token, now),
         }
+        #[cfg(rift_test_lifecycle_trace)]
+        self.trace_lifecycle(phase, Progress::METHOD, None, None, None);
     }
 
     /// Records what one server-initiated request reveals about the
@@ -1757,6 +1851,40 @@ impl EngineSession {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(rift_test_lifecycle_trace)]
+    fn trace_lifecycle(
+        &self,
+        phase: &'static str,
+        method: &'static str,
+        slug: Option<rift_error::ErrorSlug>,
+        deadline_cut: Option<bool>,
+        working: Option<bool>,
+    ) {
+        if !*TRACE_LIFECYCLE_TEST {
+            return;
+        }
+        let now = Instant::now();
+        let last_output_age_ms = self.progress.last_output.map(|last| {
+            u64::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(u64::MAX)
+        });
+        rift_tracing::info!(
+            component = "engine",
+            phase,
+            method,
+            slug = slug.map(rift_error::ErrorSlug::as_str).unwrap_or("none"),
+            child_pid = self.child.as_ref().and_then(Child::id),
+            deadline_cut,
+            deadline_present = self.deadline.is_some(),
+            working,
+            frame_in_flight = self.frame_in_flight,
+            progress_announced = self.progress.announced,
+            progress_outstanding = self.progress.outstanding.len(),
+            last_output_age_ms,
+            ended = self.ended,
+            "engine lifecycle diagnostic"
+        );
     }
 
     /// Kills and reaps a spawned engine; later operations are refused.
@@ -1928,6 +2056,17 @@ async fn wait_child(child: &mut Child) {
                         "refused"
                     };
                     rift_tracing::Span::current().record("error.type", outcome);
+                    #[cfg(rift_test_lifecycle_trace)]
+                    if *TRACE_LIFECYCLE_TEST {
+                        rift_tracing::info!(
+                            component = "engine",
+                            phase = "shutdown_wait",
+                            method = "exit",
+                            child_pid = pid,
+                            outcome,
+                            "engine lifecycle diagnostic"
+                        );
+                    }
                     kill_child(child).await;
                 }
             }

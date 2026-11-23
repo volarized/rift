@@ -1750,6 +1750,14 @@ async fn search_traversal_waiting_on_announced_work_keeps_the_engine() -> TestRe
     let engine = tempfile::tempdir()?;
     let script = engine.path().join("engine.sh");
     let log = engine.path().join("engine.log");
+    #[cfg(rift_test_lifecycle_trace)]
+    let _phase_receipt = announced_work::LifecycleFixtureReceipt::new(&log);
+    #[cfg(rift_test_lifecycle_trace)]
+    std::fs::write(
+        &script,
+        announced_work::loading_engine_trace(LOADING_ENGINE),
+    )?;
+    #[cfg(not(rift_test_lifecycle_trace))]
     std::fs::write(&script, LOADING_ENGINE)?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1500ms\"\n\n\
