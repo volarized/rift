@@ -1480,6 +1480,7 @@ fn map_graph_calls(
         complete: true,
         ..GraphCalls::default()
     };
+    let seed = SymbolId(identity.as_str().to_owned());
     let mut locations = 0usize;
     let captured = held
         .unit
@@ -1487,6 +1488,11 @@ fn map_graph_calls(
         .map(ProjectPath::new)
         .transpose()?
         .and_then(|path| reads.index().file(&path));
+    let outgoing = if held.direction == TraversalDirection::Outgoing {
+        captured.map(|file| (file, identity))
+    } else {
+        None
+    };
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
         let at = NamedCallee {
@@ -1516,33 +1522,14 @@ fn map_graph_calls(
             }
         };
         let index = LineIndex::new(source);
-        let mut occurrences = Vec::new();
         let located = !call.from_ranges.is_empty();
-        for range in call.from_ranges {
-            locations = locations
-                .checked_add(1)
-                .filter(|count| *count <= TRAVERSAL_SYMBOLS_MAX)
-                .ok_or_else(unavailable)?;
-            let start = index.byte_offset(report.encoding, range.start)?;
-            let end = index.byte_offset(report.encoding, range.end)?;
-            if source.get(start..end).is_none() {
-                return Err(unavailable());
-            }
-            if held.direction == TraversalDirection::Outgoing
-                && let Some(file) = captured
-                && edge_enclosing_symbol(reads, file, start as u64, end as u64)?
-                    .is_some_and(|caller| caller.as_str() != identity.as_str())
-            {
-                continue;
-            }
-            occurrences.push(SourceUnitSpan {
-                unit: unit.clone(),
-                range: TextRange {
-                    start: start as u64,
-                    end: end as u64,
-                },
-            });
-        }
+        let occurrences = graph_call_site_spans(
+            reads,
+            (source, &unit, &index),
+            (report.encoding, call.from_ranges),
+            outgoing,
+            &mut locations,
+        )?;
         if located && occurrences.is_empty() {
             continue;
         }
@@ -1559,46 +1546,89 @@ fn map_graph_calls(
                 reads,
                 file,
                 (start, end),
-                &SymbolId(identity.as_str().to_owned()),
+                &seed,
                 held.provider,
                 occurrences,
                 &mut result,
             )?;
             continue;
         }
-        match neighbor {
-            CalleeFile::Project(path) => {
-                let target = match held.direction {
-                    TraversalDirection::Outgoing => project_definition(
-                        reads,
-                        &path,
-                        (item.selection_range, report.encoding),
-                        false,
-                    )?,
-                    TraversalDirection::Incoming => project_declaration(
-                        reads,
-                        &path,
-                        (item.selection_range, report.encoding),
-                        "graph calls",
-                    )?,
-                };
-                if let Some(target) = target {
-                    result.push_local(
-                        &SymbolId(identity.as_str().to_owned()),
-                        target,
-                        occurrences,
-                        held.direction,
-                        held.provider,
-                    );
-                } else {
-                    result.complete = false;
-                }
-            }
-            CalleeFile::Package(target) => result.packages.push((target, occurrences)),
-            CalleeFile::Unaddressed => result.complete = false,
-        }
+        push_reported_graph_call(
+            reads,
+            neighbor,
+            &seed,
+            (item.selection_range, report.encoding),
+            held,
+            occurrences,
+            &mut result,
+        )?;
     }
     Ok(result)
+}
+
+fn push_reported_graph_call(
+    reads: &ReadService,
+    neighbor: CalleeFile,
+    seed: &SymbolId,
+    selection: (Range, PositionEncoding),
+    held: &CallGraphSource<'_>,
+    occurrences: Vec<SourceUnitSpan>,
+    result: &mut GraphCalls,
+) -> Result<(), RiftError> {
+    match neighbor {
+        CalleeFile::Project(path) => {
+            let target = match held.direction {
+                TraversalDirection::Outgoing => project_definition(reads, &path, selection, false)?,
+                TraversalDirection::Incoming => {
+                    project_declaration(reads, &path, selection, "graph calls")?
+                }
+            };
+            if let Some(target) = target {
+                result.push_local(seed, target, occurrences, held.direction, held.provider);
+            } else {
+                result.complete = false;
+            }
+        }
+        CalleeFile::Package(target) => result.packages.push((target, occurrences)),
+        CalleeFile::Unaddressed => result.complete = false,
+    }
+    Ok(())
+}
+
+/// Converts provider locations once and keeps the report-wide location ceiling.
+fn graph_call_site_spans(
+    reads: &ReadService,
+    (source, unit, index): (&str, &SourceUnitId, &LineIndex),
+    (encoding, ranges): (PositionEncoding, Vec<Range>),
+    outgoing: Option<(&IndexedFile, &CoreSymbolId)>,
+    locations: &mut usize,
+) -> Result<Vec<SourceUnitSpan>, RiftError> {
+    let mut occurrences = Vec::new();
+    for range in ranges {
+        *locations = locations
+            .checked_add(1)
+            .filter(|count| *count <= TRAVERSAL_SYMBOLS_MAX)
+            .ok_or_else(graph_call_coverage)?;
+        let start = index.byte_offset(encoding, range.start)?;
+        let end = index.byte_offset(encoding, range.end)?;
+        if source.get(start..end).is_none() {
+            return Err(graph_call_coverage());
+        }
+        if let Some((file, identity)) = outgoing
+            && edge_enclosing_symbol(reads, file, start as u64, end as u64)?
+                .is_some_and(|caller| caller.as_str() != identity.as_str())
+        {
+            continue;
+        }
+        occurrences.push(SourceUnitSpan {
+            unit: unit.clone(),
+            range: TextRange {
+                start: start as u64,
+                end: end as u64,
+            },
+        });
+    }
+    Ok(occurrences)
 }
 
 fn place_incoming_call_sites(
@@ -3390,13 +3420,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn incoming_graph_calls_keep_the_physical_caller_of_each_site() -> TestResult {
-        use rift_protocol::read::TraversalDirection;
-
-        let directory = tempfile::tempdir()?;
-        let root = directory.path();
-        let source = r#"pub fn leaf() {}
+    const INCOMING_CALLERS_SOURCE: &str = r#"pub fn leaf() {}
 
 pub fn only_nested() {
     let nested = || { leaf(); };
@@ -3422,6 +3446,14 @@ pub fn siblings() {
 
 pub fn unlocated() {}
 "#;
+
+    #[test]
+    fn incoming_graph_calls_keep_the_physical_caller_of_each_site() -> TestResult {
+        use rift_protocol::read::TraversalDirection;
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let source = INCOMING_CALLERS_SOURCE;
         fs::write(root.join("lib.rs"), source)?;
         let reads = reads(root)?;
         let target = symbol(&reads, "leaf");
