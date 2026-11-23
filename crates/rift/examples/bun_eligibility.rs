@@ -12,7 +12,7 @@ use rift_index::{
     PathChange, PathChanges, WorkspaceDigests, WorkspaceIndex, WorkspaceIndexLimits,
     capture_digests,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const RIFT_SOURCE: &str = "da38628da2d2613f63fb65f3ffb3eb703ed1d7d9";
@@ -267,50 +267,26 @@ fn marker(index: &WorkspaceIndex, expected: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn emit_gate(
-    phase: &str,
-    family: &str,
-    named: &BTreeMap<&'static str, bun_eligibility::Observation>,
-    cold: &BTreeMap<&'static str, bun_eligibility::Observation>,
-) {
-    if family == "capture" {
-        if let Some(named) = named.get(family) {
+fn emit_gates(phase: &str, observations: &BTreeMap<&'static str, bun_eligibility::Observation>) {
+    for family in GATES {
+        if let Some(value) = observations.get(family) {
             println!(
                 "{}",
-                json!({"event":"gate","phase":phase,"family":family,
-                "status":"closed","observed":named.observed,"unknown":0,"wall_ns":named.wall_ns,
-                "first":null,"named_counters":named.counters})
+                json!({"event":"gate","phase":phase,"family":family,"observation":value})
             );
         }
-        return;
     }
-    let Some(source) = cold.get(family).or_else(|| named.get(family)) else {
-        return;
-    };
-    let named_witness = named.get(family).and_then(|record| record.first.as_ref());
-    let affected = named
-        .get(family)
-        .and_then(|record| record.first_affected.as_ref())
-        .or(source.first_affected.as_ref());
-    let first = affected.or(named_witness).or(source.first.as_ref());
-    println!(
-        "{}",
-        json!({"event":"gate","phase":phase,"family":family,
-            "status":if first.is_some() {"unproved"} else {"closed"},"observed":source.observed,
-            "unknown":source.unknown.max(named.get(family).map_or(0, |entry| entry.unknown)),
-            "wall_ns":named.get(family).map_or(0, |entry| entry.wall_ns),"first":first,
-        "first_scope":if affected.is_some() { "named_path_dependency" } else { "complete_corpus" },
-            "named_counters":named.get(family).map(|entry| &entry.counters),
-            "independent_cold_counters":cold.get(family).map(|entry| &entry.counters),
-            "independent_cold_observation_ns":cold.get(family).map(|entry| entry.wall_ns),
-        })
-    );
 }
 
-fn arguments() -> Result<(PathBuf, PathBuf)> {
+fn arguments() -> Result<(PathBuf, PathBuf, String)> {
     let mut args = std::env::args_os().skip(1);
     let root = PathBuf::from(args.next().ok_or("expected disposable Bun root")?).canonicalize()?;
     let recipe = PathBuf::from(args.next().ok_or("expected saved recipe root")?).canonicalize()?;
+    let mode = args
+        .next()
+        .ok_or("missing named or cold phase")?
+        .into_string()
+        .map_err(|_| "invalid phase text")?;
     let sentinel = root
         .parent()
         .ok_or("missing disposable runner directory")?
@@ -322,31 +298,31 @@ fn arguments() -> Result<(PathBuf, PathBuf)> {
     {
         return Err("expected verified disposable Bun root".into());
     }
-    Ok((root, recipe))
+    Ok((root, recipe, mode))
 }
 
-fn main() -> Result<()> {
-    if !bun_eligibility::compiled() {
-        return Err("build observer with RIFT_BUN_ELIGIBILITY=1".into());
+struct Phase<'a> {
+    name: &'static str,
+    paths: &'a [ProjectPath],
+    from: &'static str,
+    to: &'static str,
+    expected: Option<&'static str>,
+}
+
+fn digest_set(captured: &WorkspaceDigests) -> Result<String> {
+    let mut output = Fingerprint(Sha256::new());
+    for (path, digest) in captured.iter() {
+        writeln!(&mut output, "{path:?} {digest:?}")?;
     }
-    let (root, recipe) = arguments()?;
-    let paths = fs::read_to_string(recipe.join("paths.txt"))?;
-    let paths = paths
-        .lines()
-        .map(ProjectPath::new)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let one = [ProjectPath::new(MARKER)?];
-    if paths.len() != 50
-        || paths.iter().collect::<BTreeSet<_>>().len() != 50
-        || !paths.contains(&one[0])
-    {
-        return Err("expected exact 50-path recipe".into());
-    }
+    Ok(hex(output.0.finalize()))
+}
+
+fn verify_original(root: &Path, recipe: &Path, paths: &[ProjectPath]) -> Result<Restore> {
     let originals = paths
         .iter()
         .map(|path| {
             let candidate = root.join(path.as_str());
-            if !candidate.canonicalize()?.starts_with(&root)
+            if !candidate.canonicalize()?.starts_with(root)
                 || !candidate.symlink_metadata()?.is_file()
             {
                 return Err(
@@ -360,103 +336,192 @@ fn main() -> Result<()> {
             Ok((path.clone(), on_disk))
         })
         .collect::<Result<_>>()?;
-    let mut restore = Restore {
-        root: root.clone(),
+    Ok(Restore {
+        root: root.to_path_buf(),
         originals,
         clean: false,
-    };
-    let binary = binary_digest()?;
-    println!(
-        "{}",
-        json!({"event":"provenance","mode":"ordinary_observer",
-        "rift_source":RIFT_SOURCE,"rift_tree":RIFT_TREE,"bun_source":BUN_SOURCE,
-        "observer_binary_sha256":binary})
-    );
-    let mut current = build(&root)?;
-    let original = capture(&root)?;
+    })
+}
+
+fn require_changes(
+    held: &WorkspaceDigests,
+    current: &WorkspaceDigests,
+    expected: &[ProjectPath],
+) -> Result<PathChanges> {
+    let changes = PathChanges::between(held, current);
+    let names = expected.iter().collect::<BTreeSet<_>>();
+    if changes.len() != names.len()
+        || changes
+            .iter()
+            .any(|(path, change)| change != PathChange::Modified || !names.contains(path))
+    {
+        return Err("actual change set differs from saved phase".into());
+    }
+    Ok(changes)
+}
+
+fn named(root: &Path, recipe: &Path, phases: &[Phase<'_>]) -> Result<()> {
+    let mut current = build(root)?;
+    let original = capture(root)?;
     if !original.iter().eq(current.digests().iter()) {
         return Err("ordinary original capture mismatch".into());
     }
     marker(&current, None)?;
-    for (phase, names, from, to, expected) in [
-        (
-            "single",
-            one.as_slice(),
-            "original",
-            "single",
-            Some("lane_incr_probe_31"),
-        ),
-        ("single_restore", one.as_slice(), "single", "original", None),
-        (
-            "burst",
-            paths.as_slice(),
-            "original",
-            "burst",
-            Some("lane_incr_probe_50"),
-        ),
-        ("burst_restore", paths.as_slice(), "burst", "original", None),
-    ] {
+    let baseline_graph = graph_digest(&current, false)?;
+    let baseline_capture = digest_set(&original)?;
+    println!(
+        "{}",
+        json!({"event":"baseline","graph_sha256":baseline_graph,
+        "capture_sha256":baseline_capture,"revision":current.tree_revision()})
+    );
+    for phase in phases {
+        println!(
+            "{}",
+            json!({"event":"progress","phase":phase.name,"operation":"named_capture"})
+        );
         let held_digest = graph_digest(&current, true)?;
         let held_sources = current.digests();
         let held_tree = current.tree_revision();
-        saved_phase(&root, &recipe, names, from, to)?;
+        saved_phase(root, recipe, phase.paths, phase.from, phase.to)?;
         let capture_started = Instant::now();
-        let requested = capture(&root)?;
+        let requested = capture(root)?;
         let capture_ns = capture_started.elapsed().as_nanos();
-        let changes = PathChanges::between(&held_sources, &requested);
-        let expected_names = names.iter().collect::<BTreeSet<_>>();
-        if changes.len() != names.len()
-            || changes.iter().any(|(path, change)| {
-                change != PathChange::Modified || !expected_names.contains(path)
-            })
-        {
-            return Err(format!("actual change set differs from {phase}").into());
-        }
-        bun_eligibility::begin(names.iter().map(|path| path.as_str().to_owned()));
+        let changes = require_changes(&held_sources, &requested, phase.paths)?;
+        bun_eligibility::begin(phase.paths.iter().map(|path| path.as_str().to_owned()));
         let started = Instant::now();
         let next = current.rebuilt(&changes)?;
         let named_rebuild_ns = started.elapsed().as_nanos();
-        let named = bun_eligibility::finish();
-        let closed_capture = capture(&root)?;
-        if !requested.iter().eq(closed_capture.iter())
-            || !requested.iter().eq(next.digests().iter())
-        {
-            return Err(format!("closing capture differs from {phase}").into());
+        let observations = bun_eligibility::finish();
+        let closed = capture(root)?;
+        if !requested.iter().eq(closed.iter()) || !requested.iter().eq(next.digests().iter()) {
+            return Err(format!("closing capture differs from {}", phase.name).into());
         }
-        marker(&next, expected)?;
+        marker(&next, phase.expected)?;
         let held_key_check =
             held_digest == graph_digest(&current, true)? && held_tree == current.tree_revision();
         drop(current);
-        bun_eligibility::begin(names.iter().map(|path| path.as_str().to_owned()));
-        let started = Instant::now();
-        let independent = build(&root)?;
-        let independent_cold_ns = started.elapsed().as_nanos();
-        let cold = bun_eligibility::finish();
-        marker(&independent, expected)?;
         let exact = graph_digest(&next, false)?;
-        let agrees = exact == graph_digest(&independent, false)?
-            && independent.digests().iter().eq(next.digests().iter());
-        drop(independent);
-        if to == "original" && !requested.iter().eq(original.iter()) {
-            return Err(format!("restore changed original inventory in {phase}").into());
+        if phase.to == "original"
+            && (!requested.iter().eq(original.iter()) || exact != baseline_graph)
+        {
+            return Err(format!("restore differs from accepted original in {}", phase.name).into());
         }
-        for family in GATES {
-            emit_gate(phase, family, &named, &cold);
-        }
+        emit_gates(phase.name, &observations);
         println!(
             "{}",
-            json!({"event":"ordinary","phase":phase,"source_paths_changed":changes.len(),
+            json!({"event":"ordinary","phase":phase.name,"source_paths_changed":changes.len(),
             "capture_verified":true,"held_key_check":held_key_check,"complete_graph":true,
-            "independent_cold_agrees":agrees,"ordered_records_and_edges_sha256":exact,
+            "ordered_records_and_edges_sha256":exact,"capture_sha256":digest_set(&requested)?,
             "accepted_files":next.file_count(),"omitted_or_unparsed":next.left_out_file_count(),
             "current_revision":next.tree_revision(),"held_revision":held_tree,
-            "capture_ns":capture_ns,"ordinary_named_ns":named_rebuild_ns,"ordinary_independent_cold_ns":independent_cold_ns})
+            "held_graph_and_keys_sha256":held_digest,"capture_ns":capture_ns,"ordinary_named_ns":named_rebuild_ns})
         );
-        if !agrees || !held_key_check {
-            return Err(format!("ordinary graph or held oracle differs in {phase}").into());
+        if !held_key_check {
+            return Err(format!("held oracle differs in {}", phase.name).into());
         }
         current = next;
     }
-    restore.clean = true;
+    Ok(())
+}
+
+fn cold(root: &Path, recipe: &Path, phase: &Phase<'_>) -> Result<()> {
+    let original = capture(root)?;
+    if phase.to != "original" {
+        saved_phase(root, recipe, phase.paths, "original", phase.to)?;
+    }
+    let expected = capture(root)?;
+    if phase.to == "original" {
+        if !original.iter().eq(expected.iter()) {
+            return Err("cold original capture changed".into());
+        }
+    } else {
+        require_changes(&original, &expected, phase.paths)?;
+    }
+    bun_eligibility::begin(phase.paths.iter().map(|path| path.as_str().to_owned()));
+    let started = Instant::now();
+    let index = build(root)?;
+    let independent_cold_ns = started.elapsed().as_nanos();
+    let observations = bun_eligibility::finish();
+    let closed = capture(root)?;
+    if !expected.iter().eq(closed.iter()) || !expected.iter().eq(index.digests().iter()) {
+        return Err(format!("independent closing capture differs from {}", phase.name).into());
+    }
+    marker(&index, phase.expected)?;
+    emit_gates(phase.name, &observations);
+    println!(
+        "{}",
+        json!({"event":"cold","phase":phase.name,
+        "capture_verified":true,"ordered_records_and_edges_sha256":graph_digest(&index,false)?,
+        "capture_sha256":digest_set(&expected)?,"accepted_files":index.file_count(),
+        "omitted_or_unparsed":index.left_out_file_count(),"current_revision":index.tree_revision(),
+        "ordinary_independent_cold_ns":independent_cold_ns})
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    if !bun_eligibility::compiled() {
+        return Err("build observer with RIFT_BUN_ELIGIBILITY=1".into());
+    }
+    let (root, recipe, mode) = arguments()?;
+    let paths = fs::read_to_string(recipe.join("paths.txt"))?
+        .lines()
+        .map(ProjectPath::new)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let one = [ProjectPath::new(MARKER)?];
+    if paths.len() != 50
+        || paths.iter().collect::<BTreeSet<_>>().len() != 50
+        || !paths.contains(&one[0])
+    {
+        return Err("expected exact 50-path recipe".into());
+    }
+    let phases = [
+        Phase {
+            name: "single",
+            paths: &one,
+            from: "original",
+            to: "single",
+            expected: Some("lane_incr_probe_31"),
+        },
+        Phase {
+            name: "single_restore",
+            paths: &one,
+            from: "single",
+            to: "original",
+            expected: None,
+        },
+        Phase {
+            name: "burst",
+            paths: &paths,
+            from: "original",
+            to: "burst",
+            expected: Some("lane_incr_probe_50"),
+        },
+        Phase {
+            name: "burst_restore",
+            paths: &paths,
+            from: "burst",
+            to: "original",
+            expected: None,
+        },
+    ];
+    let mut restore = verify_original(&root, &recipe, &paths)?;
+    println!(
+        "{}",
+        json!({"event":"provenance","mode":"ordinary_observer","pass":mode,
+        "rift_source":RIFT_SOURCE,"rift_tree":RIFT_TREE,"bun_source":BUN_SOURCE,
+        "observer_binary_sha256":binary_digest()?})
+    );
+    if mode == "named" {
+        named(&root, &recipe, &phases)?;
+        restore.clean = true;
+    } else {
+        let phase = phases
+            .iter()
+            .find(|phase| phase.name == mode)
+            .ok_or("unknown cold phase")?;
+        cold(&root, &recipe, phase)?;
+        // The process drops the build before the scratch restoration runs.
+    }
     Ok(())
 }

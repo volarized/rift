@@ -1,0 +1,259 @@
+{
+  "bun": "744846f844374847c902b5e7fd59b4342a51ef99",
+  "marker": "bench/test/isolate/setup.ts",
+  "paths": [
+    {
+      "path": "bench/bundle/index.ts",
+      "original": "2c469aba3b52deca358cc1087566942cd89f74805f1dd199073d6c1dc47e0d8b",
+      "burst": "6444621dad6002c09b70c38bd6a3eaf83515e2872c633addc573b3e3fabfe3f7"
+    },
+    {
+      "path": "packages/bun-release/scripts/npm-postinstall.ts",
+      "original": "e4c2a6f119411f072b89f1b8c603d40814c8f73a3ee8a4019422d958ff98f6ba",
+      "burst": "e43c3f09114a8ed344cbba95ef44e1bfcaf615276165e2eab48caa69bfc40708"
+    },
+    {
+      "path": "packages/bun-vscode/src/vscode-js-debug.d.ts",
+      "original": "e97daa1a926e423748d36550430ea3da5897cfc7c46bda8354433873ff010ecf",
+      "burst": "24c8622dd4415bd9d8f8609b3fd0b94a196eadcfca53206058cc47afe81a50d8"
+    },
+    {
+      "path": "scripts/darwin-ci/lib/agent.ts",
+      "original": "c91fd16eab64546fbf59970433e87a57d59c75573f6e7d9a7b95350810363c55",
+      "burst": "c6bc387c6791d1b5783a055b1d78c56bd277958322ed4572da99699642717bb9"
+    },
+    {
+      "path": "src/js/builtins/BakeSSRResponse.ts",
+      "original": "f674e4b0afe55aece30beea1b59a01975dc96ab619e0ece6677b2a02dea655bf",
+      "burst": "0d00e92b3fdd6d07adec78fec6fd54c4ed4ab911e86b132a6f34ac905696d91b"
+    },
+    {
+      "path": "src/js/internal/serialization_buffers.ts",
+      "original": "7c69b88adafa173a023c4288559b898ec126e996fc827cf78297625f0c0d4b4d",
+      "burst": "45de00ae66ce13cf0056c4ac8d932bac418712e5a747f91ca45518bdb4959a47"
+    },
+    {
+      "path": "src/js/node/_stream_passthrough.ts",
+      "original": "7ca14071d67c274789a31378be9b57f759e6a4a5d97138d855359ec526f28529",
+      "burst": "8dadf842f95cc3fea31e026039898fe3e723689ef0831aa364e609dcf555ee50"
+    },
+    {
+      "path": "src/jsc/resolve_message.classes.ts",
+      "original": "32746cd3e8b901546a88fe1a37c3e9a5620faf7798f6253dac5492c27935a296",
+      "burst": "c154dd5813bf9cc1c9cd0187bfe47da970e513b06fc21580507bff040e0abaa3"
+    },
+    {
+      "path": "src/runtime/webcore/response.classes.ts",
+      "original": "60b6af439b4e5c0d4f2aad8c459092f3dca598e412cf88011ba254c74122093e",
+      "burst": "6f4257e1a62c6bad40cafab938fb9ef5397c2f81630d75257ffd8f81bad51b8c"
+    },
+    {
+      "path": "test/bundler/bundler_loader.test.ts",
+      "original": "9aaf3fbf4df61c1af51a21e637e6d654ab8ed5c3ebc9a66ec1559c77c54e7879",
+      "burst": "3e3ccdf4715007d72f47496f94898b3438cde4fca2965fa1c8fa2c2c3c6de79a"
+    },
+    {
+      "path": "test/bundler/transpiler/fixtures/bun-pragma/fail/bun-pragma-before-hashbang.ts",
+      "original": "f67485126796c20e50abe10aca98bd57ed170a8ee83651841330a1945534a320",
+      "burst": "fbb5886e13c2d86695efafeda92306b7107759f90596ad241791356c05862c86"
+    },
+    {
+      "path": "test/bundler/transpiler/react-compiler-fixtures/lambda-array-access-member-expr-param.ts",
+      "original": "ba58ca154cbcf1c04ad3a0d0baf8c1fc0e94bd07fad03cacd531c739a6d9ffca",
+      "burst": "18c83ae78e1b956b167b3835d3aad55fc46af09ac2ba054f49d0fded5a5c9dee"
+    },
+    {
+      "path": "test/bundler/transpiler/react-compiler-fixtures/propagate-scope-deps-hir-fork/infer-non-null-destructure.ts",
+      "original": "ca0717259aa23ed3d9dc7a9375e4dcaf1593ac608a18a56359862777c1bb0c5e",
+      "burst": "df3ea62bd01054ec8dec81f7c30ed91caf4f37978344e271f89651fcca393ae6"
+    },
+    {
+      "path": "test/bundler/transpiler_constant_fold_eqeq.test.ts",
+      "original": "f650fbdb7836f3bd9928d4c035e4bb1320c6f6d1f27670da15392eaf66a946a9",
+      "burst": "f41a9f5db9fc4487524d2ac181fc70eaeeecb91a70e83ae0162398d0b8cecd7c"
+    },
+    {
+      "path": "test/cli/install/bun-security-scanner-matrix-runner.ts",
+      "original": "efa8c35c5b362c8bef3a99d94ee61fd5d85c314d4c08967879cbc3122af18255",
+      "burst": "77e453b1caacc79ee52dfd6462dfe81ab010b6141384d64cca76c0de5ad18f09"
+    },
+    {
+      "path": "test/cli/run/cpu-prof.test.ts",
+      "original": "fa03b153b7db06189f93028ca98f91bfbbaa659887f97c0826d8785c01fc23e2",
+      "burst": "286feb987be285c6fc7f005282aad3c9088c11d18293c67eb3c30838c5b02e25"
+    },
+    {
+      "path": "test/cli/update_interactive_snapshots.test.ts",
+      "original": "09b33b14687c9b0f25a5fdffb853e7c4cf06c769c55f545b1962882ed6e05b11",
+      "burst": "bf74135caf5baf8e1a27cdf47dd1feda5a3e5a51f3ecd0af6a48c1683f99468e"
+    },
+    {
+      "path": "test/integration/bun-types/fixture/readline.ts",
+      "original": "34b00fa0f0ae6a3f5f4ad9788f9c60c12b81a667c4cf2d711f584b6d62a8d8cb",
+      "burst": "92d3e7bba9af93ece75dc72ca70f558a38d69fbf9b3ba1caefc95871352655ce"
+    },
+    {
+      "path": "test/integration/vite-build/the-test-app/src/lib/components/ui/input/index.ts",
+      "original": "f324bf7c7d1e246ebd01429e9b3aafe3174a51eb20c9b3550516d9230dd555cc",
+      "burst": "3af59db839a9bce3c971b02f6fbe4c303aa8192bd464db26bc451829abc21a76"
+    },
+    {
+      "path": "test/internal/source-lints/unsound-erased-box.test.ts",
+      "original": "6b37b82e58eb599501b20e7ff94acc3f0fb0b77c7a2a11253d5c25fe83aa5625",
+      "burst": "6998cf3688922ee72a2aa3ca909cf17c6ed51e02ce939f5366a8248746b58381"
+    },
+    {
+      "path": "test/js/bun/glob/match.test.ts",
+      "original": "3531542458aa3ea8859e6e80f72e92008a258f3895833915df50ff0c2d097004",
+      "burst": "8acf62a13029e42775d59b3ba17eb5210b946264ebb23fb55db5d20727641310"
+    },
+    {
+      "path": "test/js/bun/http/serve-epoll-add-fail.test.ts",
+      "original": "5496dcbb00926201f29aff6ea379293eaa73fbe005b4dde6213a648fbda44681",
+      "burst": "f5c8162d558c7d148dafed9478bd5e4ffc71ef3fa7338283e021612e14ff4bf4"
+    },
+    {
+      "path": "test/js/bun/md/gfm-compat.test.ts",
+      "original": "5175b9caf32fcfec038bfbdf76436539382dc044384dc2d413e6a014ba160247",
+      "burst": "c667e1a3220132aaaf806f0116fdf27bdfe130ddd7d3cfbc20c2891169644f7f"
+    },
+    {
+      "path": "test/js/bun/resolve/toml/toml-parse.test.ts",
+      "original": "d19a52c3481dd9bbfeb519558724cb6c8cb31d14c081a3ab6033aefd806fae32",
+      "burst": "57961ce3830573c2b3bb7a0c9410941e21ff80d1d92d1a34f829fef6b5e91c76"
+    },
+    {
+      "path": "test/js/bun/shell/yield.test.ts",
+      "original": "bf2fbbca5435f027945c97e4c2099c142d751866779e7b9fb420bbeea502a4bc",
+      "burst": "3fab56905e3386ae88492fe502c01090056258af57273572303d873b86e94d56"
+    },
+    {
+      "path": "test/js/bun/test/concurrent.test.ts",
+      "original": "626a78dc4b0ffe9f6cf85c0d983661aaa5129162c8805b839c39695bed88a8fc",
+      "burst": "0dd873cca921581af13c319d8e922b46277aeff6089059d73f9142bc17d44710"
+    },
+    {
+      "path": "test/js/bun/test/mock/6874/B.ts",
+      "original": "c5a9042ea3bb20b2add5e913affadb15ee99a947a5a1153abe680a90ebe2419c",
+      "burst": "b4f8c56a575ff98000885ad8ac3a167f2f1e96dea24c0a67e80824bae6bd0889"
+    },
+    {
+      "path": "test/js/bun/test/parallel/test-http-should-accept-received-and-send-blank-headers.ts",
+      "original": "9fb46875809f939f542578aa9552d4ee45233f37dfc961910de4bd90339e172b",
+      "burst": "d55388b6fa90bf75ff70506d015e68674ad4416d4a82971c2a06365ffe54c683"
+    },
+    {
+      "path": "test/js/bun/transpiler/parse-error-column.test.ts",
+      "original": "77757384c3f9447d23494fa2d57930ff766efbc7339ec0b4af7a9428e1066093",
+      "burst": "7b2f395d4ee2e3e9f606e4f0dfc8a16f7b71f5fd88af623a7093584cd39562b0"
+    },
+    {
+      "path": "test/js/bun/util/sliceAnsi.test.ts",
+      "original": "74b5b08865dfbc9106ab5a174dfc3cd5a9880742f8998144a51c69c373d1015b",
+      "burst": "7058c2a0b199c51808e97d4b53c545d6de64c7c372dc35b26d970bca33ccf2c5"
+    },
+    {
+      "path": "test/js/node/assert/assert-typedarray-deepequal.test.ts",
+      "original": "7097cfbcaf3a5c18c9a5d7e5c5a69b8ca87bd95e6f30f8d82bb28399643af540",
+      "burst": "cc55e1aee2db4cd87e2d46dc0af547fb4a1cf3b17e2d34d2333fd08cf80fc724"
+    },
+    {
+      "path": "test/js/node/fs/export-from.ts",
+      "original": "d8bb6582cfe7331cddf4975e7f4793d1df5b61e82a546c3312de4fc2027d6e58",
+      "burst": "58d0d78eeb333af6a0d53fcc530258d7a5f0b0a309ab75419cce2cf6f8a3c1c5"
+    },
+    {
+      "path": "test/js/node/module/extensions-fixture/a.ts",
+      "original": "ddd3d2826194e4917bfff18177c52b2ab95f00ca076b355fa5fc0b8d81d98475",
+      "burst": "9f68a41e626518954b8f3d97f421a3012ef0855c26a566f9cfa5abacc773bf88"
+    },
+    {
+      "path": "test/js/node/test/fixtures/typescript/ts/test-import-foo.ts",
+      "original": "0b593d7247ea811199cf624dbf337a3d4def8b384e9b329668e84f38da06daa9",
+      "burst": "48f2c78ae5ebace5d208ca3e64f2b59b3d31f4204905eb82c8c5384401712ea2"
+    },
+    {
+      "path": "test/js/node/url/url-parse-ipv6.test.ts",
+      "original": "8c66f47e696864c3aadb946f202b4647f1d71066fe5912f21bf00ea7021f283e",
+      "burst": "5e5e9e9d2549c78902b6a49bd3823f557068bef57c5f91b3c2ba904f59619f3d"
+    },
+    {
+      "path": "test/js/sql/postgres-prepared-pipeline-reorder.test.ts",
+      "original": "b0be0b5939320fc6e49d475d86c14d1439455e7f1f7c4bd6686be1c4589c5a8d",
+      "burst": "a8abf6ea774c06993497d7c5bc4989fc90a18d235f9f478062551a552b21ff55"
+    },
+    {
+      "path": "test/js/third_party/comlink/comlink.test.ts",
+      "original": "9ec93423c8278b0f58e763d64a4cbeb0bc5e4048df101a13cf25a4a5832d2427",
+      "burst": "1b921328330fd9eca64ef811a24ec6700fc265d390c9ec8f2caa68c5144d995f"
+    },
+    {
+      "path": "test/js/third_party/pg/pg.test.ts",
+      "original": "5554613d7b1ce0d22b8dec2a2b1d178de0c9dcaa5170fc287e3868801cc01851",
+      "burst": "777e6f45f962113f19bf206ad7cc67670e9484b16203f7138f821feb55b90556"
+    },
+    {
+      "path": "test/js/web/broadcastchannel/broadcast-channel-worker.ts",
+      "original": "c30555977ff57eec43bfe61ff87a4fdc243a650b2b550e927692bcac2120b833",
+      "burst": "47123a6167b48551a2c9a420cb921c3008c4424de6578613716bd87161e41110"
+    },
+    {
+      "path": "test/js/web/fetch/fetch-proxy-tls-intern-race-fixture.ts",
+      "original": "fb2890680cee8b892b690e42a5208a7f7f33263f504295b30dad930bdbf3441a",
+      "burst": "fae20d222627ef4d67cc24f391ef10ec0e1f49cb46c6e34161f06e18f80dda7e"
+    },
+    {
+      "path": "test/js/web/timers/timer-heap-gc-fixture.ts",
+      "original": "64a2932047b4b227401979a52d2eaf7d994e37e773b2ef49f5ca86d16366cd62",
+      "burst": "a75632814dc34ca794ead1fde970d103c5f6934620915ba13fbddf2dcd4dadd4"
+    },
+    {
+      "path": "test/napi/node-napi-tests/test/js-native-api/4_object_factory/do.test.ts",
+      "original": "c8c7527155453e106469bda8435c695bc334a5b05a6ab6d355849375ed2c9cda",
+      "burst": "d6b2105247b638e137707402bdf17a9dccb5091e409182579866f2b9ea6bb370"
+    },
+    {
+      "path": "test/regression/issue/015201.test.ts",
+      "original": "30c1f054e5f58eb53e4514b43adfd83a65ea2a3b9d8ad16f5e13b43673af9913",
+      "burst": "b740a2692d909c8ce89b08fcc9927feb9eea43d652a56e8b477c5536dc84c3a0"
+    },
+    {
+      "path": "test/regression/issue/11297/11297.test.ts",
+      "original": "2664dcb7a2a0a29caa2c97edc9ac5741a9c18636016a6c5023055751044f337b",
+      "burst": "83073abe7c9d29df57f7f0646061a462472fddceb85954e52645e2aa2885cf32"
+    },
+    {
+      "path": "test/regression/issue/18547.test.ts",
+      "original": "6273deaf6149842162d3146e7d7ad188c0eede38da9189291fa9f9a0bc7fc2a4",
+      "burst": "dd68b85a83569cd911a525618ee51d24aca3acd98cb817272ec6f8c0154b19d5"
+    },
+    {
+      "path": "test/regression/issue/23275.test.ts",
+      "original": "fc46e7be53c7287904e3c5245da60a5248c125fdefc7a75ca9b048aac5e3fc39",
+      "burst": "de76ff4e37b1246c6e7300da4e9fb8ff4f695b78b55133a591cb30f81f66d70a"
+    },
+    {
+      "path": "test/regression/issue/26058.test.ts",
+      "original": "47a07207938583fa569585e86f9076028b999ecd0275fbbbff6c95ed6a114f5a",
+      "burst": "f2cb95e332c5948eebc744bf488998001f90ea9f15f7aeb7f8a0bbef9bb1e24b"
+    },
+    {
+      "path": "test/regression/issue/28954.test.ts",
+      "original": "b89391044f828d16115a2db64decdd8409bc4f4b2a929fa717c7ab9f08eae799",
+      "burst": "9cbe9418155d8dcc79a3df8639f7dda58b7d4e02292bfbe0cdc9a7439c6ccef7"
+    },
+    {
+      "path": "test/regression/issue/5738.fixture.ts",
+      "original": "64472285dabb8b31e6c9bc7450e851a91189aad83e6c62babd3768b3a613dcd3",
+      "burst": "713520f4326953e5ffb74978cff7ab8e4a18ab0f5a9a70d64e7a4e15e946430e"
+    },
+    {
+      "path": "bench/test/isolate/setup.ts",
+      "original": "763085a2661ea6919341c2053c3b735e865a3522f68c839682f23f7f91e9cc7d",
+      "burst": "117fd1df3795433751efa91deff16267ccbc66c54202cfe6d67bb6075bab4f6b",
+      "single": "50f353610969ce8cf22b8e7b71e2ff7d193666413adcce4eb7dd86e9f90261a0",
+      "single_suffix": "CmV4cG9ydCBmdW5jdGlvbiBsYW5lX2luY3JfcHJvYmVfMzEoKSB7IHJldHVybiAzMTsgfQo=",
+      "burst_suffix": "CmV4cG9ydCBmdW5jdGlvbiBsYW5lX2luY3JfcHJvYmVfNTAoKSB7IHJldHVybiA1MDsgfQo="
+    }
+  ]
+}
