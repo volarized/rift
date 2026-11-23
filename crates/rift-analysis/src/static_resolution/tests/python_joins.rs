@@ -102,6 +102,7 @@ fn test_python_reads_before_a_later_rebinding_refuse_loops_and_delayed_bodies() 
         "def looped(items):\n    item = make()\n    for other in items:\n        item.leaf()\n        item = other\n",
         "def waiting(items):\n    item = make()\n    while items:\n        item.leaf()\n        item = items.pop()\n",
         "def delayed(items):\n    item = make()\n    later = lambda: item.leaf()\n    item = items.pop()\n    return later\n",
+        "def comprehended(items):\n    item = make()\n    reads = [item.leaf() for _ in items]\n    item = items.pop()\n    return reads\n",
         "def generated(items):\n    item = make()\n    later = (item.leaf() for _ in items)\n    item = items.pop()\n    return later\n",
         "def outer(items):\n    item = make()\n    def inner(): return item.leaf()\n    item = items.pop()\n    return inner\n",
     ] {
