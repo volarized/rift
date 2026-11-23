@@ -114,6 +114,32 @@ fn returned_member_calls_keep_shorthand_and_resolve_an_explicit_callable_value()
 }
 
 #[test]
+fn returned_explicit_pairs_agree_on_one_callable_across_literals() {
+    let route = "function buildRouting (flag) {\n\
+        function prepareRoute (url) { return url }\n\
+        if (flag) return { prepareRoute, explicit: prepareRoute };\n\
+        return { prepareRoute, explicit: prepareRoute }; }\n\
+        module.exports = { buildRouting }";
+    let (publication, _, semantics, _) = analyze_returned_calls(ALIAS_INDEX, route).into_parts();
+    let call = publication
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.kinds == [EdgeKind::Calls] && occurrence_in_index(edge, ALIAS_INDEX, ALIAS_CALL)
+        })
+        .expect("both returned fields name the same function");
+    assert!(call.to.as_str().ends_with("/buildRouting/prepareRoute"));
+    assert_eq!(call.provider, EdgeProvider::Static);
+    assert_eq!(call.derivation, EdgeDerivation::Resolution);
+    assert!(
+        semantics
+            .edges()
+            .edges()
+            .any(|edge| &edge.to_protocol() == call)
+    );
+}
+
+#[test]
 fn returned_explicit_calls_refuse_uncertain_or_replaced_values() {
     let other_returns = "function buildRouting (flag) { function a () {} function b () {}\n\
         if (flag) return { explicit: a }; return { explicit: b }; }\n\
@@ -125,11 +151,20 @@ fn returned_explicit_calls_refuse_uncertain_or_replaced_values() {
         return { explicit: a, ...replacement }; }\nmodule.exports = { buildRouting }";
     let rebound = "function buildRouting (replacement) { function a () {}\n\
         a = replacement; return { explicit: a }; }\nmodule.exports = { buildRouting }";
+    let different_scopes = "'use strict';\nfunction buildRouting (flag) {\n\
+        if (flag) { function a () { return 1 }; return { explicit: a }; }\n\
+        else { function a () { return 2 }; return { explicit: a }; } }\n\
+        module.exports = { buildRouting }";
+    let dynamic_second = "function buildRouting (flag, replacement) { function a () {}\n\
+        if (flag) return { explicit: a };\n\
+        return { explicit: a, ...replacement }; }\nmodule.exports = { buildRouting }";
     for (index, route) in [
         (ALIAS_INDEX, other_returns),
         (ALIAS_INDEX, mutated_literal),
         (ALIAS_INDEX, dynamic_after),
         (ALIAS_INDEX, rebound),
+        (ALIAS_INDEX, different_scopes),
+        (ALIAS_INDEX, dynamic_second),
         (MUTATED_INDEX, ALIAS_ROUTE),
     ] {
         let (publication, _, semantics, _) = analyze_returned_calls(index, route).into_parts();
