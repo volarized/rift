@@ -1993,6 +1993,10 @@ pub(crate) fn analyze_included(
         source,
         limits,
         kinds,
+        language.name == "javascript"
+            && ranges.is_empty()
+            && !recovered
+            && !tree.root_node().has_error(),
         &mut rules.exports.bindings,
     )?;
     let mut capture = ranges.is_empty().then(|| {

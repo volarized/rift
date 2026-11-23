@@ -76,6 +76,26 @@ impl<'source> Callbacks<'source> {
         self.calls.contains_key(&range)
     }
 
+    /// A receiver participates directly in a written named member call.
+    pub(super) fn has_named_member_call(
+        &self,
+        receiver: ByteRange,
+        work: &mut Work,
+        accepts: impl Fn(ByteRange) -> bool,
+    ) -> bool {
+        self.calls
+            .range(receiver..)
+            .take_while(|(range, _)| range.start == receiver.start)
+            .any(|(_, call)| {
+                work.charge()
+                    && matches!(
+                        call.callee,
+                        rift_syntax::StaticCallee::Member { receiver: found, member: property }
+                            if found == receiver && accepts(property)
+                    )
+            })
+    }
+
     /// Whether the declaration `name` is written with one function type.
     pub(super) fn has_function_type(&self, name: ByteRange) -> bool {
         self.function_types.get(&name).is_some_and(Option::is_some)
@@ -627,7 +647,7 @@ impl<'source> Index<'source> {
                 }
                 first.get_or_insert(target);
                 if resolve_pair {
-                    let next = self.javascript_returned_pair_value(declared, target, object, work);
+                    let next = self.javascript_final_pair_callable(declared, target, object, work);
                     resolve_pair = next.is_some_and(|callable| {
                         // Both lexical targets are local to the callee's captured source.
                         pair_target.is_none_or(|previous| {
