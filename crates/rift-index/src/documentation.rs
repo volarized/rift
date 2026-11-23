@@ -9,8 +9,8 @@ use rift_analysis::documentation::notebook::{
 };
 use rift_analysis::documentation::{
     DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationLimits,
-    DocumentationSourceSet, collect_documentation_incremental, content_chunk_identity,
-    content_digest,
+    DocumentationSourceSet, DocumentationSymbol, collect_documentation_incremental,
+    content_chunk_identity, content_digest,
 };
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_error::{RiftError, errors};
@@ -70,13 +70,13 @@ type PhysicalDeclaration<'name> = (&'name str, u64, u64);
 
 /// The accepted documentation facts and optional exact ordered attachment sources.
 pub(crate) struct AcceptedDeclarations<'source> {
-    facts: Vec<DeclarationFacts>,
+    facts: Vec<DeclarationFacts<'source>>,
     attachment_sources: Option<Vec<AttachmentSource<'source>>>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct DeclarationInputs<'facts, 'source> {
-    facts: &'facts [DeclarationFacts],
+    facts: &'facts [DeclarationFacts<'source>],
     attachment_sources: Option<&'facts [AttachmentSource<'source>]>,
 }
 
@@ -108,6 +108,7 @@ pub(crate) fn declarations<'source>(
     let mut attachment_candidate_rows = 0_usize;
     for (path, file) in files {
         let language = file.syntax().language();
+        let source = Arc::new(project_owner(file.path(), None));
         let initial = declarations.len();
         let mut attachment = AttachmentAdmission::default();
         for symbol in file.syntax().symbols() {
@@ -132,9 +133,12 @@ pub(crate) fn declarations<'source>(
             {
                 examples.push(readable.canonical.clone());
             }
-            let mut declaration = DeclarationFacts::new(file, symbol, readable.wire.clone());
-            declaration.language = readable.language.clone();
-            declarations.push(declaration);
+            declarations.push(DeclarationFacts::from_source(
+                symbol,
+                Arc::clone(&readable.symbol),
+                Arc::clone(&source),
+                &readable.language,
+            ));
         }
         if let Some(sources) = &mut attachment_sources
             && attachment.applies(&declarations[initial..], &mut attachment_candidate_rows)
@@ -179,7 +183,7 @@ impl<'file> AttachmentAdmission<'file> {
         }
     }
 
-    fn applies(&self, accepted: &[DeclarationFacts], examined: &mut usize) -> bool {
+    fn applies(&self, accepted: &[DeclarationFacts<'_>], examined: &mut usize) -> bool {
         // Provider ordinals differ even when two syntax rows share a name and range.
         // The ordinary collector admits the physical tuple if either row was accepted.
         self.confirmed
@@ -202,7 +206,7 @@ fn physical_symbol(symbol: &rift_syntax::SyntaxSymbol) -> PhysicalDeclaration<'_
 /// One record's established identity, parsed once for every declaration the record holds.
 struct ReadableIdentity {
     canonical: rift_core::SymbolId,
-    wire: SymbolId,
+    symbol: Arc<DocumentationSymbol>,
     language: Language,
     /// Whether the identity's owner is the workspace owner.
     owned: bool,
@@ -215,13 +219,13 @@ impl ReadableIdentity {
         owner: &rift_protocol::identity::SymbolOwner,
     ) -> Option<Self> {
         let canonical = semantics.readable_identity_at(position)?;
-        let identity = rift_protocol::identity::SymbolIdentity::parse(canonical.as_str()).ok()?;
-        // `parse` accepts only the canonical spelling, so the wire identity is `canonical`.
+        let symbol = DocumentationSymbol::new(SymbolId(canonical.as_str().to_owned()));
+        let (identity_owner, language) = symbol.scope()?;
         Some(Self {
             canonical: canonical.clone(),
-            wire: SymbolId(canonical.as_str().to_owned()),
-            language: identity.language().clone(),
-            owned: identity.owner() == owner,
+            language: language.clone(),
+            owned: identity_owner == owner,
+            symbol: Arc::new(symbol),
         })
     }
 }
@@ -404,7 +408,7 @@ fn append_regular_input<'source>(
 
 fn finish_collection(
     inputs: Vec<DocumentationInput<'_>>,
-    declarations: &[DeclarationFacts],
+    declarations: &[DeclarationFacts<'_>],
     omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     previous: Option<&DocumentationCollection>,
     limits: &DocumentationLimits,
@@ -548,14 +552,14 @@ fn append_attached_input<'source>(
 type AttachedSymbols<'declarations> =
     BTreeMap<&'declarations DocumentationContentIdentity, BTreeSet<(&'declarations str, u64, u64)>>;
 
-fn attached_symbols(declarations: &[DeclarationFacts]) -> AttachedSymbols<'_> {
+fn attached_symbols<'a>(declarations: &'a [DeclarationFacts<'_>]) -> AttachedSymbols<'a> {
     let mut by_source = BTreeMap::new();
     for declaration in declarations {
-        if SymbolId::parse(&declaration.symbol.0).is_err() {
+        if SymbolId::parse(&declaration.symbol.wire().0).is_err() {
             continue;
         }
         by_source
-            .entry(&declaration.source)
+            .entry(declaration.source.as_ref())
             .or_insert_with(BTreeSet::new)
             .insert(declaration.physical_key());
     }
@@ -702,29 +706,42 @@ pub(crate) fn content<'a>(
 }
 
 /// Exact syntax declarations accepted by workspace semantic publication.
-pub(crate) struct DeclarationFacts {
-    symbol: SymbolId,
+pub(crate) struct DeclarationFacts<'source> {
+    symbol: Arc<DocumentationSymbol>,
     language: Language,
-    name: String,
-    qualified_name: String,
-    source: DocumentationContentIdentity,
+    name: &'source str,
+    qualified_name: &'source str,
+    source: Arc<DocumentationContentIdentity>,
     range: TextRange,
 }
 
-impl DeclarationFacts {
-    pub(crate) fn new(
+impl<'source> DeclarationFacts<'source> {
+    #[cfg(test)]
+    fn new(
         file: &IndexedFile,
-        symbol: &rift_syntax::SyntaxSymbol,
+        symbol: &'source rift_syntax::SyntaxSymbol,
         identity: SymbolId,
     ) -> Self {
-        let language = file.syntax().language().clone();
-        let qualified_name = symbol.qualified_name.clone();
+        Self::from_source(
+            symbol,
+            Arc::new(DocumentationSymbol::new(identity)),
+            Arc::new(project_owner(file.path(), None)),
+            file.syntax().language(),
+        )
+    }
+
+    fn from_source(
+        symbol: &'source rift_syntax::SyntaxSymbol,
+        identity: Arc<DocumentationSymbol>,
+        source: Arc<DocumentationContentIdentity>,
+        language: &Language,
+    ) -> Self {
         Self {
             symbol: identity,
-            language,
-            name: symbol.name.clone(),
-            qualified_name,
-            source: project_owner(file.path(), None),
+            language: language.clone(),
+            name: &symbol.name,
+            qualified_name: &symbol.qualified_name,
+            source,
             range: TextRange {
                 start: symbol.range.start,
                 end: symbol.range.end,
@@ -733,19 +750,14 @@ impl DeclarationFacts {
     }
 
     fn physical_key(&self) -> PhysicalDeclaration<'_> {
-        (
-            self.qualified_name.as_str(),
-            self.range.start,
-            self.range.end,
-        )
+        (self.qualified_name, self.range.start, self.range.end)
     }
 
     fn validated(&self) -> Result<DocumentationDeclaration<'_>, RiftError> {
-        DocumentationDeclaration::new(
-            &self.symbol,
+        self.symbol.declaration(
             &self.language,
-            &self.name,
-            &self.qualified_name,
+            self.name,
+            self.qualified_name,
             &self.source,
             self.range.clone(),
         )
@@ -975,7 +987,9 @@ mod tests {
         );
     }
 
-    fn scanned_declarations(facts: &[super::DeclarationFacts]) -> super::DeclarationInputs<'_, '_> {
+    fn scanned_declarations<'facts, 'source>(
+        facts: &'facts [super::DeclarationFacts<'source>],
+    ) -> super::DeclarationInputs<'facts, 'source> {
         super::DeclarationInputs {
             facts,
             attachment_sources: None,
@@ -1373,7 +1387,7 @@ mod tests {
             rift_protocol::read::Language::from_identity_segment("javascript")
                 .expect("semantic language");
         assert!(unrelated_language.validated().is_err());
-        serde_json::to_string(&accepted_facts.symbol).expect("canonical public identity");
+        serde_json::to_string(accepted_facts.symbol.wire()).expect("canonical public identity");
         let files = BTreeMap::from([(path.clone(), Arc::new(file.clone()))]);
         let (collection, _) = super::build(
             &files,
@@ -1390,7 +1404,7 @@ mod tests {
             .blocks
             .first()
             .expect("retained attached comment");
-        assert_eq!(block.symbol.as_ref(), Some(&accepted_facts.symbol));
+        assert_eq!(block.symbol.as_ref(), Some(accepted_facts.symbol.wire()));
         let source = "/// Accepted comment.\npub fn accepted() {}\nfn plain() {}\n";
         assert_eq!(
             source.get(
@@ -1420,7 +1434,9 @@ mod tests {
 
         let mut other_symbol_facts =
             super::DeclarationFacts::new(file, accepted, canonical("accepted"));
-        other_symbol_facts.symbol = rift_protocol::read::SymbolId("other-symbol".into());
+        other_symbol_facts.symbol = Arc::new(super::DocumentationSymbol::new(
+            rift_protocol::read::SymbolId("other-symbol".into()),
+        ));
         let other_symbol = super::attached_symbols(std::slice::from_ref(&other_symbol_facts));
         assert!(!super::has_attached_declaration(
             file,

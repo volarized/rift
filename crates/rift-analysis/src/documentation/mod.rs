@@ -39,7 +39,8 @@ pub use publication::{
     KeyedChanges, keyed_changes, validate_documentation_context, validate_documentation_hit,
 };
 pub use references::{
-    DocumentationDeclaration, ResolvedDocumentationReferences, resolve_references,
+    DocumentationDeclaration, DocumentationSymbol, ResolvedDocumentationReferences,
+    resolve_references,
 };
 
 pub use crate::analyzer_revision as documentation_revision;
