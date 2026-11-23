@@ -136,9 +136,8 @@ impl UnitDefinitions {
         #[cfg(test)]
         DEFINITION_BUILDS.set(DEFINITION_BUILDS.get() + 1);
         let mut by_unit: BTreeMap<SourceUnitId, Vec<(u64, u64, SymbolId)>> = BTreeMap::new();
-        let mut edge_modules = BTreeMap::<SourceUnitId, Option<SymbolId>>::new();
+        let mut parents = BTreeMap::<SourceUnitId, &str>::new();
         let mut declared_edge_modules = BTreeMap::<SourceUnitId, SymbolId>::new();
-        let mut common_modules = CommonModules::default();
         for record in graph.records() {
             let Some(identity) = record.identity() else {
                 continue;
@@ -164,20 +163,21 @@ impl UnitDefinitions {
                         .any(|facts| {
                             facts.language().name == "python" && facts.kind().0 == "module"
                         });
-                    (is_module, edge_module_parent(identity))
+                    (
+                        is_module,
+                        identity
+                            .as_str()
+                            .rsplit_once('/')
+                            .map_or("", |(parent, _)| parent),
+                    )
                 });
                 if *is_module {
                     declared_edge_modules.insert(binding.unit().clone(), identity.clone());
                 }
-                edge_modules
+                parents
                     .entry(binding.unit().clone())
-                    .and_modify(|current| {
-                        *current = current
-                            .as_ref()
-                            .zip(parent.as_ref())
-                            .and_then(|(left, right)| common_modules.common(left, right));
-                    })
-                    .or_insert_with(|| parent.clone());
+                    .and_modify(|common| *common = common_module_path(common, parent))
+                    .or_insert(*parent);
                 by_unit.entry(binding.unit().clone()).or_default().push((
                     range.start(),
                     range.end(),
@@ -189,9 +189,15 @@ impl UnitDefinitions {
             .into_iter()
             .map(|(unit, spans)| (unit, EnclosingDefinitions::new(spans)))
             .collect();
-        let mut edge_modules = edge_modules
+        // Every established identity came from a canonical anchor. A literal slash
+        // separates whole encoded segments. Validate the final prefix once per unit:
+        // a shared owner or language alone does not name a module.
+        let mut edge_modules = parents
             .into_iter()
-            .filter_map(|(unit, identity)| identity.map(|identity| (unit, identity)))
+            .filter_map(|(unit, parent)| {
+                rift_protocol::identity::SymbolIdentity::parse(parent).ok()?;
+                Some((unit, SymbolId::new(parent).ok()?))
+            })
             .collect::<BTreeMap<_, _>>();
         edge_modules.extend(declared_edge_modules);
         Self {
@@ -216,58 +222,18 @@ impl DefinitionSpans {
     }
 }
 
-fn edge_module_parent(identity: &SymbolId) -> Option<SymbolId> {
-    let identity = rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).ok()?;
-    let mut path = identity.qualified_path().to_vec();
-    path.pop()?;
-    let module = rift_protocol::identity::SymbolIdentity::new(
-        identity.owner().clone(),
-        identity.language().clone(),
-        path,
-    )
-    .ok()?;
-    SymbolId::new(module.wire_identity()).ok()
-}
-
-/// Answers of [`edge_module_common`] by identity pair. The declarations of one unit share
-/// few distinct parents, and each answer parses both identities.
-#[derive(Default)]
-struct CommonModules(BTreeMap<SymbolId, BTreeMap<SymbolId, Option<SymbolId>>>);
-
-impl CommonModules {
-    fn common(&mut self, left: &SymbolId, right: &SymbolId) -> Option<SymbolId> {
-        if let Some(known) = self.0.get(left).and_then(|answers| answers.get(right)) {
-            return known.clone();
-        }
-        let common = edge_module_common(left, right);
-        self.0
-            .entry(left.clone())
-            .or_default()
-            .insert(right.clone(), common.clone());
-        common
+/// The longest shared prefix ending at a whole encoded path segment.
+fn common_module_path<'a>(left: &'a str, right: &str) -> &'a str {
+    if left == right {
+        return left;
     }
-}
-
-fn edge_module_common(left: &SymbolId, right: &SymbolId) -> Option<SymbolId> {
-    let left = rift_protocol::identity::SymbolIdentity::parse(left.as_str()).ok()?;
-    let right = rift_protocol::identity::SymbolIdentity::parse(right.as_str()).ok()?;
-    if left.owner() != right.owner() || left.language() != right.language() {
-        return None;
-    }
-    let path = left
-        .qualified_path()
-        .iter()
-        .zip(right.qualified_path())
+    let shared_bytes = left
+        .split('/')
+        .zip(right.split('/'))
         .take_while(|(left, right)| left == right)
-        .map(|(part, _)| part.clone())
-        .collect();
-    let module = rift_protocol::identity::SymbolIdentity::new(
-        left.owner().clone(),
-        left.language().clone(),
-        path,
-    )
-    .ok()?;
-    SymbolId::new(module.wire_identity()).ok()
+        .map(|(segment, _)| segment.len() + 1)
+        .sum::<usize>();
+    &left[..shared_bytes.saturating_sub(1)]
 }
 
 /// Maps one reference's portable [`ReferenceRole`] onto the wire [`EdgeKind`] this
@@ -945,6 +911,71 @@ mod tests {
         let alpha = symbol("rift://symbol/rust/src/lib.rs/alpha");
         assert!(store.incoming(&alpha).is_empty());
         assert!(store.is_complete());
+    }
+
+    #[test]
+    fn edge_module_keeps_only_shared_qualified_segments() {
+        let path = "src/lib.rs";
+        let unit = source_unit(path);
+        let cases = [
+            (
+                "rift://symbol/local/rust/crate/a%2Fb/one",
+                "rift://symbol/local/rust/crate/a%2Fb/two",
+                Some("rift://symbol/local/rust/crate/a%2Fb"),
+            ),
+            (
+                "rift://symbol/local/rust/crate/mod/one",
+                "rift://symbol/local/rust/crate/modx/two",
+                Some("rift://symbol/local/rust/crate"),
+            ),
+            (
+                "rift://symbol/local/rust/crate/one",
+                "rift://symbol/local/rust/crate/child/two",
+                Some("rift://symbol/local/rust/crate"),
+            ),
+            (
+                "rift://symbol/local/rust/one",
+                "rift://symbol/local/rust/two",
+                None,
+            ),
+            (
+                "rift://symbol/local/rust/crate/one",
+                "rift://symbol/local@other/rust/crate/two",
+                None,
+            ),
+            (
+                "rift://symbol/local/rust/crate/one",
+                "rift://symbol/local/python/crate/two",
+                None,
+            ),
+            (
+                "rift://symbol/npm/npmjs.org/@types/node/typescript/node/one",
+                "rift://symbol/npm/npmjs.org/@types/node/typescript/node/two",
+                Some("rift://symbol/npm/npmjs.org/@types/node/typescript/node"),
+            ),
+            (
+                "rift://symbol/stdlib/cpython/python/builtins/one",
+                "rift://symbol/stdlib/cpython/python/builtins/two",
+                Some("rift://symbol/stdlib/cpython/python/builtins"),
+            ),
+            (
+                "rift://symbol/local/rust/crate/one",
+                "rift://symbol/local/rust/invalid%2fanchor/two",
+                Some("rift://symbol/local/rust/crate"),
+            ),
+        ];
+        for (left, right, expected) in cases {
+            let graph = graph(vec![
+                definition("left", left, path, (0, 4)),
+                definition("right", right, path, (5, 9)),
+            ]);
+            assert_eq!(
+                EdgeStore::build(&graph)
+                    .edge_module(&unit)
+                    .map(SymbolId::as_str),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub struct WorkspaceSemantics {
     static_resolution: StaticResolution,
     static_occurrence_order: Vec<usize>,
     outside_namespaces: std::collections::BTreeSet<rift_core::SourceUnitId>,
+    captured_sources: captured::AdmittedSources,
 }
 
 /// One build's captured semantics and documents not included in publication.
@@ -152,6 +153,7 @@ impl PreparedSemantics {
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
+            captured_sources: captured::AdmittedSources::default(),
         };
         semantics.hold_static_resolution(static_resolution);
         Ok(BuiltSemantics {
@@ -436,6 +438,26 @@ impl WorkspaceSemantics {
         revision: u64,
         collect_refused_contributions: bool,
     ) -> Result<PreparedSemantics, RiftError> {
+        Self::prepare_facts_with(
+            documents,
+            declarations_max,
+            revision,
+            collect_refused_contributions,
+            |_, placed, builder| builder.add_facts_placed(placed.facts, &placed.placement),
+        )
+    }
+
+    fn prepare_facts_with(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        revision: u64,
+        collect_refused_contributions: bool,
+        mut add: impl FnMut(
+            usize,
+            &PlacedFacts<'_>,
+            &mut SyntaxPublicationBuilder,
+        ) -> Result<(), RiftError>,
+    ) -> Result<PreparedSemantics, RiftError> {
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
         let provider_revision = ProviderRevision::new(revision)?;
@@ -462,7 +484,7 @@ impl WorkspaceSemantics {
                     .collect();
                 break;
             }
-            match builder.add_facts_placed(placed.facts, &placed.placement) {
+            match add(offered, placed, &mut builder) {
                 Ok(()) => {}
                 Err(error)
                     if collect_refused_contributions
@@ -614,6 +636,7 @@ impl WorkspaceSemantics {
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
             outside_namespaces: std::collections::BTreeSet::new(),
+            captured_sources: captured::AdmittedSources::default(),
         }
     }
 
@@ -734,6 +757,8 @@ impl get_size2::GetSize for WorkspaceSemantics {
             get_size2::GetSize::get_heap_size_with_tracker(&self.outside_namespaces, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
+        let (captured, tracker) = self.captured_sources.retained_size(tracker);
+        bytes = bytes.saturating_add(captured);
         let (static_resolution, tracker) = self.static_resolution.retained_size(tracker);
         let ordering = self
             .static_occurrence_order

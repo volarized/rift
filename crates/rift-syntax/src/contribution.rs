@@ -102,6 +102,55 @@ impl DocumentPlacement {
         ))
     }
 
+    /// Heap material held by this placement, charging shared identity allocations through
+    /// the supplied tracker.
+    #[must_use]
+    pub fn retained_heap<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        use get_size2::GetSize;
+        let (origin, tracker) = self.origin.get_heap_size_with_tracker(tracker);
+        let (unit, tracker) = self.unit.get_heap_size_with_tracker(tracker);
+        let (anchors, tracker) = rift_protocol::retained_map_material(
+            &self.identity_anchors,
+            tracker,
+            GetSize::get_heap_size_with_tracker,
+        );
+        let (mappings, mut tracker) = rift_protocol::retained_map_material(
+            &self.logical_declarations,
+            tracker,
+            |logical, tracker| {
+                let (id, tracker) = logical.identity.get_heap_size_with_tracker(tracker);
+                let (language, tracker) = logical.language.get_heap_size_with_tracker(tracker);
+                (id.saturating_add(language), tracker)
+            },
+        );
+        let mut bytes = [
+            origin,
+            unit,
+            self.identity_path.capacity(),
+            anchors,
+            mappings,
+            self.aliases
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PlacedAlias>()),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add);
+        for alias in &self.aliases {
+            let (identity, next) = alias.identity.get_heap_size_with_tracker(tracker);
+            tracker = next;
+            bytes = [
+                identity,
+                alias.name.capacity(),
+                alias.qualified_name.capacity(),
+                alias.target_identity.capacity(),
+                alias.visibility.as_ref().map_or(0, String::capacity),
+            ]
+            .into_iter()
+            .fold(bytes, usize::saturating_add);
+        }
+        (bytes, tracker)
+    }
+
     /// Where the declarations came from.
     #[must_use]
     pub const fn origin(&self) -> &ContributionOrigin {
@@ -214,6 +263,45 @@ impl SyntaxPublicationBuilder {
         self.limits
             .contributions_per_provider_max()
             .saturating_sub(self.contributions.len())
+    }
+
+    /// Number of rows already admitted in provider order.
+    #[must_use]
+    pub fn admitted_len(&self) -> usize {
+        self.contributions.len()
+    }
+
+    /// Copies a previously admitted source block under this publication's revision.
+    ///
+    /// The caller compares the captured syntax and complete placement before offering
+    /// the block. The builder checks its provider, physical unit, revisions and capacity.
+    /// A refused block leaves this builder unchanged.
+    pub fn add_unchanged_source(
+        &mut self,
+        held: &ProviderPublication,
+        range: std::ops::Range<usize>,
+        unit: &SourceUnitId,
+        revision: (SourceRevision, TreeRevision),
+    ) -> bool {
+        let Some(rows) = held.contributions().get(range) else {
+            return false;
+        };
+        if held.provider() != &self.provider || rows.len() > self.declarations_remaining() {
+            return false;
+        }
+        let start = self.admitted_len();
+        let current = (self.publication, self.source_revision, self.tree_revision);
+        for row in rows {
+            if row.source().map(rift_core::DeclarationBinding::unit) == Some(unit)
+                && let Some(row) = row.at_exact_revision(revision, current)
+            {
+                self.contributions.push(row);
+            } else {
+                self.contributions.truncate(start);
+                return false;
+            }
+        }
+        true
     }
 
     /// Adds every declaration from one project-tree syntax document.
