@@ -102,6 +102,7 @@ fn captured_parts(text: &str, document: &SyntaxDocument) -> SyntaxFactsParts {
         symbols: document.symbols().to_vec(),
         left_out_symbols: document.facts().left_out_symbols().to_vec(),
         has_errors: document.has_errors(),
+        variance_errors_only: document.facts().variance_errors_only(),
         left_out_declarations: document.left_out_declaration_count(),
         markdown_facts: document.facts().markdown_facts().cloned(),
         export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),

@@ -325,7 +325,7 @@ fn undeclared_repeated_zip_members_are_counted_and_refused() -> TestResult {
     let limits = ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?;
     assert_eq!(
         read_zip_fixture(&bytes, limits).expect_err("undeclared ZIP member exceeds bound"),
-        ArchiveError::MemberLimit
+        ArchiveBound::Members.exceeded(3, 2, None)
     );
     assert_eq!(
         read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("undeclared ZIP member"),
@@ -570,12 +570,12 @@ fn repeated_members_consume_member_and_expanded_byte_bounds() -> TestResult {
         let member_limits = ArchiveLimits::new(bytes.len(), 8192, 1024, 1, 200)?;
         assert_eq!(
             read_zip_fixture(bytes, member_limits).expect_err("repeated ZIP member count"),
-            ArchiveError::MemberLimit
+            ArchiveBound::Members.exceeded(2, 1, None)
         );
         let expanded_limits = ArchiveLimits::new(bytes.len(), 7, 4, 2, 200)?;
         assert_eq!(
             read_zip_fixture(bytes, expanded_limits).expect_err("repeated ZIP decompressed bytes"),
-            ArchiveError::ExpandedLimit
+            ArchiveBound::ExpandedBytes.exceeded(8, 7, Some(fixture_path("release/a")))
         );
         let exact_limits = ArchiveLimits::new(bytes.len(), 8, 4, 2, 200)?;
         assert_eq!(read_zip_fixture(bytes, exact_limits)?.files().len(), 1);
@@ -583,12 +583,12 @@ fn repeated_members_consume_member_and_expanded_byte_bounds() -> TestResult {
     let limits = ArchiveLimits::new(tar.len(), 8192, 1024, 1, 200)?;
     assert_eq!(
         read(&tar, limits).expect_err("repeated tar member count"),
-        ArchiveError::MemberLimit
+        ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/a")))
     );
     let limits = ArchiveLimits::new(tar.len(), 2047, 1024, 2, 200)?;
     assert_eq!(
         read(&tar, limits).expect_err("repeated tar decompressed container bytes"),
-        ArchiveError::ExpandedLimit
+        ArchiveBound::ExpandedBytes.exceeded(2048, 2047, None)
     );
     Ok(())
 }
@@ -616,6 +616,10 @@ fn tar_bytes(
     Ok(gzip.finish()?)
 }
 
+fn fixture_path(path: &str) -> ProjectPath {
+    ProjectPath::new(path).expect("fixture member path")
+}
+
 fn read(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveError> {
     read_archive(
         bytes,
@@ -627,14 +631,14 @@ fn read(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveErro
 }
 
 #[test]
-fn archive_error_messages_are_generic() {
+fn archive_error_messages_name_no_path_but_a_bounded_member() {
     let errors = [
         ArchiveError::InvalidLimits,
         ArchiveError::CompressedLimit,
         ArchiveError::DigestMismatch,
         ArchiveError::InvalidArchive,
-        ArchiveError::ExpandedLimit,
-        ArchiveError::MemberLimit,
+        ArchiveBound::ExpandedBytes.exceeded(2, 1, None),
+        ArchiveBound::Members.exceeded(2, 1, None),
         ArchiveError::WorkLimit,
         ArchiveError::UnsafePath,
         ArchiveError::DuplicatePath,
@@ -647,6 +651,10 @@ fn archive_error_messages_are_generic() {
         assert!(!message.is_empty());
         assert!(!message.contains("release/"), "{message}");
     }
+    let bounded = ArchiveBound::MemberBytes
+        .exceeded(2, 1, Some(fixture_path("release/a")))
+        .to_string();
+    assert_eq!(bounded.matches("release/a").count(), 1, "{bounded}");
 }
 
 #[test]
@@ -847,7 +855,7 @@ fn skipped_link_count_is_bounded_by_the_member_limit() -> TestResult {
     assert_eq!(
         read(&over, ArchiveLimits::new(over.len(), 16_384, 4, 2, 200)?)
             .expect_err("archive must be refused"),
-        ArchiveError::MemberLimit
+        ArchiveBound::Members.exceeded(3, 2, Some(fixture_path("release/link2")))
     );
     Ok(())
 }
@@ -960,7 +968,7 @@ fn member_and_compressed_bounds_accept_exact_and_refuse_one_over() -> TestResult
     assert_eq!(
         read(&bytes, ArchiveLimits::new(bytes.len(), 16_384, 3, 1, 200)?)
             .expect_err("archive must be refused"),
-        ArchiveError::MemberLimit
+        ArchiveBound::MemberBytes.exceeded(4, 3, Some(fixture_path("release/a")))
     );
     let two = tar_bytes(&[
         ("release/a", b"1234", tar::EntryType::Regular),
@@ -969,7 +977,7 @@ fn member_and_compressed_bounds_accept_exact_and_refuse_one_over() -> TestResult
     assert_eq!(
         read(&two, ArchiveLimits::new(two.len(), 16_384, 4, 1, 200)?)
             .expect_err("archive must be refused"),
-        ArchiveError::MemberLimit
+        ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/b")))
     );
     Ok(())
 }
@@ -994,7 +1002,11 @@ fn decompressed_bytes_ratio_and_truncated_payloads_are_refused() -> TestResult {
             ArchiveLimits::new(bytes.len(), expanded.len() - 1, 4, 1, 200)?
         )
         .expect_err("archive must be refused"),
-        ArchiveError::ExpandedLimit
+        ArchiveBound::ExpandedBytes.exceeded(
+            expanded.len() as u64,
+            expanded.len() as u64 - 1,
+            None
+        )
     );
     assert_eq!(
         read(
@@ -1002,7 +1014,7 @@ fn decompressed_bytes_ratio_and_truncated_payloads_are_refused() -> TestResult {
             ArchiveLimits::new(bytes.len(), expanded.len(), 4, 1, 1)?
         )
         .expect_err("archive must be refused"),
-        ArchiveError::ExpandedLimit
+        ArchiveBound::ExpansionRatio.exceeded(bytes.len() as u64 + 1, bytes.len() as u64, None)
     );
     assert_eq!(
         read(&bytes[..bytes.len() - 4], ArchiveLimits::default())
@@ -1132,13 +1144,14 @@ fn archive_configuration_and_environment_reach_acquisition() -> TestResult {
         Some("[package.archive]\nmember_size = '4b'\n"),
         &ConfigurationEnvironment::default(),
     )?;
-    assert!(matches!(
+    assert_eq!(
         read(
             &bytes,
             ArchiveLimits::from_configuration(&low.configuration().package.archive)?
-        ),
-        Err(ArchiveError::MemberLimit)
-    ));
+        )
+        .expect_err("configured member byte bound"),
+        ArchiveBound::MemberBytes.exceeded(5, 4, Some(fixture_path("release/guide.md")))
+    );
     let raised = accept_configuration::<WorkspaceConfiguration>(
         Some("[package.archive]\nmember_size = '4b'\n"),
         &ConfigurationEnvironment::from_variables([("RIFT_PACKAGE_ARCHIVE_MEMBER_SIZE", "5b")]),
@@ -1206,7 +1219,7 @@ fn zip_paths_modes_crc_and_declared_member_count_are_checked() -> TestResult {
     assert_eq!(
         read_zip_fixture(&bytes, ArchiveLimits::new(bytes.len(), 8192, 1024, 1, 200)?)
             .expect_err("declared count must be checked before allocation"),
-        ArchiveError::MemberLimit
+        ArchiveBound::Members.exceeded(0xfffe, 1, None)
     );
     Ok(())
 }
@@ -1251,7 +1264,7 @@ fn zip64_declared_member_allocation_is_bounded() -> TestResult {
     assert_eq!(
         read_zip_fixture(&bytes, ArchiveLimits::default())
             .expect_err("ZIP64 member bound before allocation"),
-        ArchiveError::MemberLimit
+        ArchiveBound::Members.exceeded(100_001, 100_000, None)
     );
     Ok(())
 }
@@ -1265,7 +1278,11 @@ fn tar_extended_headers_are_bounded_before_library_allocation() -> TestResult {
     ])?;
     assert_eq!(
         read(&bytes, ArchiveLimits::default()).expect_err("extended header size"),
-        ArchiveError::MemberLimit
+        ArchiveBound::ExtensionBytes.exceeded(
+            TAR_EXTENSION_BYTES_MAX + 1,
+            TAR_EXTENSION_BYTES_MAX,
+            Some(fixture_path("@LongLink"))
+        )
     );
     Ok(())
 }
@@ -1295,12 +1312,12 @@ fn configured_tar_extension_bytes_accept_exact_and_refuse_one_over_before_alloca
             .size(),
     )?;
     assert!(extension_bytes > usize::try_from(TAR_EXTENSION_BYTES_MAX)?);
-    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gzip.write_all(&tar)?;
-    let bytes = gzip.finish()?;
+    let bytes = gzip(&tar)?;
+    let exceeded =
+        |maximum| ArchiveBound::ExtensionBytes.exceeded(extension_bytes as u64, maximum, None);
     assert_eq!(
         read(&bytes, ArchiveLimits::default()).expect_err("default extension byte bound"),
-        ArchiveError::MemberLimit
+        exceeded(TAR_EXTENSION_BYTES_MAX)
     );
 
     let document = format!(
@@ -1314,7 +1331,7 @@ fn configured_tar_extension_bytes_accept_exact_and_refuse_one_over_before_alloca
     let limits = ArchiveLimits::from_configuration(&configured.configuration().package.archive)?;
     assert_eq!(
         read(&bytes, limits).expect_err("one byte past extension bound"),
-        ArchiveError::MemberLimit
+        exceeded(extension_bytes as u64 - 1)
     );
     let environment = ConfigurationEnvironment::from_variables([(
         "RIFT_PACKAGE_ARCHIVE_EXTENSION_SIZE",
@@ -1343,7 +1360,11 @@ fn configured_tar_extension_bytes_accept_exact_and_refuse_one_over_before_alloca
         .with_extension_size(extension_bytes)?;
     assert_eq!(
         read(&bytes, member_bound).expect_err("extension still passes member byte bound"),
-        ArchiveError::MemberLimit
+        ArchiveBound::MemberBytes.exceeded(
+            extension_bytes as u64,
+            extension_bytes as u64 - 1,
+            None
+        )
     );
     for value in [1, usize::try_from(ARCHIVE_EXTENSION_BYTES_MAX)?] {
         assert!(ArchiveLimits::default().with_extension_size(value).is_ok());
@@ -1433,9 +1454,13 @@ fn complete_member_inventory_preserves_original_paths_and_implicit_parents() -> 
         ("release/empty/", b"", tar::EntryType::Directory),
         ("release/hook.py", b"", tar::EntryType::Symlink),
     ];
-    for (bytes, format) in [
-        (tar_bytes(&entries)?, ArchiveFormat::TarGzip),
-        (zip_members_bytes(&entries)?, ArchiveFormat::Zip),
+    for (bytes, format, past_bound) in [
+        (
+            tar_bytes(&entries)?,
+            ArchiveFormat::TarGzip,
+            Some(fixture_path("release/hook.py")),
+        ),
+        (zip_members_bytes(&entries)?, ArchiveFormat::Zip, None),
     ] {
         let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
         let exact = ArchiveLimits::new(bytes.len(), 16_384, 16, 4, 200)?;
@@ -1477,7 +1502,7 @@ fn complete_member_inventory_preserves_original_paths_and_implicit_parents() -> 
                 ArchiveLimits::new(bytes.len(), 16_384, 16, 3, 200)?
             )
             .expect_err("complete inventory spends every admitted member"),
-            ArchiveError::MemberLimit
+            ArchiveBound::Members.exceeded(4, 3, past_bound)
         );
     }
     Ok(())
@@ -1624,7 +1649,7 @@ fn zstd_window_over_the_member_bound_is_refused_before_decoding() -> TestResult 
     for bytes in zstd_frame_zips(&zstd_frame(10, b"text")?, b"text")? {
         assert_eq!(
             read_zip_fixture(&bytes, limits).expect_err("Zstandard window over the member bound"),
-            ArchiveError::MemberLimit
+            ArchiveBound::WindowBytes.exceeded(1 << 20, 4096, Some(fixture_path("release/a")))
         );
     }
     // The default 64 MiB member bound refuses a 1 GiB window the same way.
@@ -1632,7 +1657,558 @@ fn zstd_window_over_the_member_bound_is_refused_before_decoding() -> TestResult 
         assert_eq!(
             read_zip_fixture(&bytes, ArchiveLimits::default())
                 .expect_err("Zstandard window over the default member bound"),
-            ArchiveError::MemberLimit
+            ArchiveBound::WindowBytes.exceeded(1 << 30, 64 << 20, Some(fixture_path("release/a")))
+        );
+    }
+    Ok(())
+}
+
+/// A refused window is the one its frame header asks for: a window descriptor with a
+/// mantissa, a single segment's content size in each width, and the header of a later frame
+/// that arrives one byte at a time.
+#[test]
+fn a_refused_zstd_window_reports_the_bytes_its_frame_asks_for() -> TestResult {
+    let limits = ArchiveLimits::new(64 * 1024, 64 * 1024, 1024, 16, 200)?;
+    let magic = [0x28, 0xb5, 0x2f, 0xfd];
+    let headers: [(&[u8], u64); 5] = [
+        // Exponent 1 and mantissa 5: 2 KiB and five eighths of it.
+        (&[0x00, (1 << 3) | 5], 2048 + 1280),
+        // A one-byte dictionary identifier before a two-byte content size.
+        (&[0x61, 0, 0x44, 0x0e], 0x0e44 + 256),
+        (&[0xa0, 0x39, 0x30, 0, 0], 12_345),
+        (&[0xe0, 0x01, 0, 0, 0, 1, 0, 0, 0], (1 << 32) + 1),
+        // The widest header: a four-byte dictionary identifier and an eight-byte size.
+        (&[0xe3, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0], 4096),
+    ];
+    for (header, expected) in headers {
+        for first in [Vec::new(), zstd_frame(0, b"text")?] {
+            for capacity in [1, 3, 8192] {
+                let mut frames = first.clone();
+                frames.extend_from_slice(&magic);
+                frames.extend_from_slice(header);
+                frames.extend_from_slice(&[0; 8]);
+                let reader = BufReader::with_capacity(capacity, frames.as_slice());
+                let mut member = ZstdMember::new(reader, limits, 1024)?;
+                member
+                    .read_to_end(&mut Vec::new())
+                    .expect_err("window over 1 KiB");
+                assert_eq!(
+                    member.refusal(ArchiveError::InvalidArchive, "release/a"),
+                    ArchiveBound::WindowBytes.exceeded(
+                        expected,
+                        1024,
+                        Some(fixture_path("release/a"))
+                    ),
+                    "{header:?} after {} bytes, {capacity} at a time",
+                    first.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_bound_names_its_quantities_and_member() {
+    for (bound, expected) in [
+        (ArchiveBound::Members, "member count"),
+        (ArchiveBound::MemberBytes, "member byte"),
+        (ArchiveBound::ExtensionBytes, "extended header byte"),
+        (ArchiveBound::WindowBytes, "Zstandard window byte"),
+        (ArchiveBound::ExpandedBytes, "decompressed byte"),
+        (ArchiveBound::ExpansionRatio, "expansion ratio byte"),
+    ] {
+        let ArchiveError::BoundExceeded(exceeded) =
+            bound.exceeded(5, 4, Some(fixture_path("release/a")))
+        else {
+            panic!("a bound refusal carries its quantities");
+        };
+        assert_eq!(exceeded.bound(), bound);
+        assert_eq!(exceeded.observed(), 5);
+        assert_eq!(exceeded.maximum(), 4);
+        assert_eq!(exceeded.member(), Some(&fixture_path("release/a")));
+        assert_eq!(
+            ArchiveError::BoundExceeded(exceeded).to_string(),
+            format!(
+                "archive exceeds its {expected} bound: observed 5, maximum 4, member \"release/a\""
+            )
+        );
+        assert_eq!(
+            bound.exceeded(5, 4, None).to_string(),
+            format!("archive exceeds its {expected} bound: observed 5, maximum 4")
+        );
+    }
+}
+
+const OVERSIZED_BYTES: usize = 5000;
+const SOURCE: &[u8] = b"VALUE = 1\n";
+
+fn oversized() -> Vec<u8> {
+    (0..OVERSIZED_BYTES)
+        .map(|index| u8::try_from(index * 31 % 251).expect("remainder fits a byte"))
+        .collect()
+}
+
+fn skipping(bytes: &[u8]) -> Result<ArchiveLimits, ArchiveError> {
+    Ok(ArchiveLimits::new(bytes.len(), 64 * 1024, 1024, 8, 200)?
+        .with_oversized_members(OversizedMembers::Skip))
+}
+
+fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(bytes)?;
+    gzip.finish()
+}
+
+/// Fixture name, container, and archive bytes.
+type NamedArchive = (String, ArchiveFormat, Vec<u8>);
+
+/// Every container and ZIP reader holding one source file and one oversized binary file.
+fn oversized_archives() -> Result<Vec<NamedArchive>, Box<dyn std::error::Error>> {
+    let binary = oversized();
+    let entries = [
+        ("release/__init__.py", SOURCE, tar::EntryType::Regular),
+        (
+            "release/native.so",
+            binary.as_slice(),
+            tar::EntryType::Regular,
+        ),
+        ("release/after.py", SOURCE, tar::EntryType::Regular),
+    ];
+    let mut archives = vec![(
+        "tar.gz".to_owned(),
+        ArchiveFormat::TarGzip,
+        tar_bytes(&entries)?,
+    )];
+    for method in [
+        zip::CompressionMethod::Stored,
+        zip::CompressionMethod::Deflated,
+        zip::CompressionMethod::Zstd,
+    ] {
+        // The writer's Zstandard frames ask for a 2 MiB window whatever their length, which no
+        // retained member may under these bounds, so only the oversized member is compressed.
+        let zip = |names: &[&str]| -> zip::result::ZipResult<Vec<u8>> {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for name in names {
+                let native = *name == "release/native.so";
+                let method = if native {
+                    method
+                } else {
+                    zip::CompressionMethod::Stored
+                };
+                writer.start_file(
+                    *name,
+                    zip::write::SimpleFileOptions::default().compression_method(method),
+                )?;
+                writer.write_all(if native { &binary } else { SOURCE })?;
+            }
+            Ok(writer.finish()?.into_inner())
+        };
+        let names = [
+            "release/__init__.py",
+            "release/native.so",
+            "release/after.py",
+            "release/after.pz",
+        ];
+        archives.push((
+            format!("zip {method:?}"),
+            ArchiveFormat::Zip,
+            zip(&names[..3])?,
+        ));
+        let mut repeated = zip(&names)?;
+        replace_zip_name(&mut repeated, b"release/after.pz", b"release/after.py");
+        archives.push((
+            format!("repeated zip {method:?}"),
+            ArchiveFormat::Zip,
+            repeated,
+        ));
+    }
+    Ok(archives)
+}
+
+fn read_format(
+    bytes: &[u8],
+    format: ArchiveFormat,
+    limits: ArchiveLimits,
+) -> Result<ArchiveFiles, ArchiveError> {
+    let digest = ArchiveDigest::Sha256(Sha256::digest(bytes).into());
+    read_archive(bytes, format, &digest, Some("release"), limits)
+}
+
+#[test]
+fn one_oversized_file_refuses_by_default_and_is_omitted_on_request() -> TestResult {
+    for (name, format, bytes) in oversized_archives()? {
+        let skip = skipping(&bytes)?;
+        let refuse = skip.with_oversized_members(OversizedMembers::Refuse);
+        assert_eq!(
+            refuse,
+            ArchiveLimits::new(bytes.len(), 64 * 1024, 1024, 8, 200)?
+        );
+        assert_eq!(
+            read_format(&bytes, format, refuse).expect_err(&name),
+            ArchiveBound::MemberBytes.exceeded(5000, 1024, Some(fixture_path("release/native.so"))),
+            "{name}"
+        );
+
+        let files = read_format(&bytes, format, skip)?;
+        assert_eq!(
+            files
+                .files()
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+                .collect::<Vec<_>>(),
+            [("__init__.py", SOURCE), ("after.py", SOURCE)],
+            "{name}"
+        );
+        let [omission] = files.omissions() else {
+            panic!("{name}: one omission, got {:?}", files.omissions());
+        };
+        assert_eq!(omission.path().as_str(), "native.so", "{name}");
+        assert_eq!(omission.size(), 5000, "{name}");
+        assert_eq!(
+            files.members().get("release/native.so"),
+            Some(&ArchiveMemberKind::File),
+            "{name}"
+        );
+        assert!(files.skipped_links().is_empty(), "{name}");
+
+        // A retained Zstandard member needs the writer's 2 MiB window under the member bound.
+        let wide = ArchiveLimits::new(bytes.len(), 4 << 20, 4 << 20, 8, 200)?
+            .with_oversized_members(OversizedMembers::Skip);
+        let files = read_format(&bytes, format, wide)?;
+        assert!(files.omissions().is_empty(), "{name}");
+        assert_eq!(files.files().len(), 3, "{name}");
+        assert_eq!(
+            files.files()[&ProjectPath::new("native.so")?],
+            oversized(),
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_wheel_without_one_root_omits_its_native_library() -> TestResult {
+    let binary = oversized();
+    let bytes = zip_members_bytes(&[
+        ("beacon/__init__.py", SOURCE, tar::EntryType::Regular),
+        (
+            "beacon/_native.so",
+            binary.as_slice(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "beacon-1.0.dist-info/METADATA",
+            b"Name: beacon\n",
+            tar::EntryType::Regular,
+        ),
+    ])?;
+    let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+    let files = read_archive(&bytes, ArchiveFormat::Zip, &digest, None, skipping(&bytes)?)?;
+    assert_eq!(files.files().len(), 2);
+    assert_eq!(files.omissions().len(), 1);
+    assert_eq!(files.omissions()[0].path().as_str(), "beacon/_native.so");
+    Ok(())
+}
+
+#[test]
+fn plain_tar_members_are_omitted_from_a_stream() -> TestResult {
+    let binary = oversized();
+    let bytes = tar_bytes(&[
+        ("release/a.py", SOURCE, tar::EntryType::Regular),
+        (
+            "release/native.so",
+            binary.as_slice(),
+            tar::EntryType::Regular,
+        ),
+    ])?;
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(bytes.as_slice()).read_to_end(&mut tar)?;
+    let limits = skipping(&bytes)?;
+    check_tar_headers(tar.as_slice(), limits)?;
+    let mut output = ArchiveOutput::new(Some("release"), limits, limits.expanded(tar.len()));
+    read_tar_members(tar.as_slice(), &mut output)?;
+    let files = output.into_files(FileDigest::of(&tar));
+    assert_eq!(files.files().len(), 1);
+    assert_eq!(files.omissions()[0].path().as_str(), "native.so");
+    assert_eq!(files.omissions()[0].size(), 5000);
+    Ok(())
+}
+
+#[test]
+fn omitted_files_consume_member_and_expanded_byte_bounds() -> TestResult {
+    for (name, format, bytes) in oversized_archives()? {
+        let count = skipping(&bytes)?;
+        let count = ArchiveLimits {
+            members: 2,
+            ..count
+        };
+        let error = read_format(&bytes, format, count).expect_err(&name);
+        let ArchiveError::BoundExceeded(exceeded) = error else {
+            panic!("{name}: {error:?}");
+        };
+        assert_eq!(exceeded.bound(), ArchiveBound::Members, "{name}");
+        assert_eq!(exceeded.maximum(), 2, "{name}");
+        if format == ArchiveFormat::TarGzip {
+            assert_eq!(exceeded.member(), Some(&fixture_path("release/after.py")));
+        }
+
+        let expanded = ArchiveLimits {
+            expanded_bytes: 5000,
+            ..skipping(&bytes)?
+        };
+        let expected = if format == ArchiveFormat::TarGzip {
+            ArchiveBound::ExpandedBytes.exceeded(5001, 5000, None)
+        } else {
+            ArchiveBound::ExpandedBytes.exceeded(
+                5010,
+                5000,
+                Some(fixture_path("release/native.so")),
+            )
+        };
+        assert_eq!(
+            read_format(&bytes, format, expanded).expect_err(&name),
+            expected,
+            "{name}"
+        );
+        let after = ArchiveLimits {
+            expanded_bytes: 5019,
+            ..skipping(&bytes)?
+        };
+        if format == ArchiveFormat::Zip {
+            assert_eq!(
+                read_format(&bytes, format, after).expect_err(&name),
+                ArchiveBound::ExpandedBytes.exceeded(
+                    5020,
+                    5019,
+                    Some(fixture_path("release/after.py"))
+                ),
+                "{name}: an omitted file's bytes stay charged"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn omitted_zip_files_with_false_sizes_or_bytes_are_refused() -> TestResult {
+    for (name, format, bytes) in oversized_archives()? {
+        if format != ArchiveFormat::Zip {
+            continue;
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes.clone()))?;
+        let entry = archive.by_index_raw(1)?;
+        assert_eq!(entry.name()?, "release/native.so");
+        let local = usize::try_from(entry.header_start())?;
+        let central = usize::try_from(entry.central_header_start())?;
+        drop(entry);
+        for size in [2000_u32, 4999, 5001, 9000] {
+            let mut bytes = bytes.clone();
+            for offset in [local + 22, central + 24] {
+                bytes[offset..offset + 4].copy_from_slice(&size.to_le_bytes());
+            }
+            assert_eq!(
+                read_format(&bytes, format, skipping(&bytes)?).expect_err(&name),
+                ArchiveError::InvalidArchive,
+                "{name}: declared size {size}"
+            );
+        }
+        let mut bytes = bytes.clone();
+        for offset in [local + 14, central + 16] {
+            bytes[offset] ^= 1;
+        }
+        assert_eq!(
+            read_format(&bytes, format, skipping(&bytes)?).expect_err(&name),
+            ArchiveError::InvalidArchive,
+            "{name}: CRC-32"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn omitted_tar_files_with_false_sizes_or_streams_are_refused() -> TestResult {
+    let binary = oversized();
+    let bytes = tar_bytes(&[(
+        "release/native.so",
+        binary.as_slice(),
+        tar::EntryType::Regular,
+    )])?;
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(bytes.as_slice()).read_to_end(&mut tar)?;
+    for length in [512 + 4096, 512 + 4999] {
+        let short = gzip(&tar[..length])?;
+        assert_eq!(
+            read(&short, skipping(&short)?).expect_err("file shorter than its header"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    assert_eq!(
+        read(&bytes[..bytes.len() - 4], skipping(&bytes)?).expect_err("truncated gzip"),
+        ArchiveError::InvalidArchive
+    );
+    let mut corrupt = bytes.clone();
+    let trailer = corrupt.len() - 8;
+    corrupt[trailer] ^= 1;
+    assert_eq!(
+        read(&corrupt, skipping(&corrupt)?).expect_err("gzip CRC-32"),
+        ArchiveError::InvalidArchive
+    );
+
+    for (records, accepted) in [
+        (["5000", "5000"], true),
+        (["4999", "5000"], false),
+        (["10000", "5000"], false),
+        (["5000", "10000"], false),
+    ] {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append_pax_extensions(records.map(|size| ("size", size.as_bytes())))?;
+        let mut header = tar::Header::new_ustar();
+        header.set_path("release/native.so")?;
+        header.set_size(5000);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append(&header, binary.as_slice())?;
+        let bytes = gzip(&builder.into_inner()?)?;
+        let result = read(&bytes, skipping(&bytes)?);
+        if accepted {
+            assert_eq!(result?.omissions().len(), 1);
+        } else {
+            assert_eq!(
+                result.expect_err("PAX size differs from its header"),
+                ArchiveError::InvalidArchive,
+                "{records:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn oversized_links_directories_and_extended_headers_are_refused_in_both_modes() -> TestResult {
+    let content = oversized();
+    for kind in [
+        tar::EntryType::Symlink,
+        tar::EntryType::Link,
+        tar::EntryType::Directory,
+        tar::EntryType::GNULongName,
+        tar::EntryType::XHeader,
+    ] {
+        let bytes = tar_bytes(&[
+            ("release/a", content.as_slice(), kind),
+            ("release/b", SOURCE, tar::EntryType::Regular),
+        ])?;
+        let skip = skipping(&bytes)?;
+        for limits in [skip, skip.with_oversized_members(OversizedMembers::Refuse)] {
+            assert_eq!(
+                read(&bytes, limits).expect_err("only regular files are omitted"),
+                ArchiveBound::MemberBytes.exceeded(5000, 1024, Some(fixture_path("release/a"))),
+                "{kind:?}"
+            );
+        }
+    }
+    let bytes = tar_bytes(&[("release/../a", content.as_slice(), tar::EntryType::Regular)])?;
+    assert_eq!(
+        read(&bytes, skipping(&bytes)?).expect_err("an omitted path is still checked"),
+        ArchiveError::UnsafePath
+    );
+    Ok(())
+}
+
+#[test]
+fn bound_refusals_resolve_extended_member_paths() -> TestResult {
+    let content = oversized();
+    let path = format!("release/{}/native.so", "x".repeat(120));
+    let mut gnu = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(5000);
+    header.set_mode(0o644);
+    gnu.append_data(&mut header, &path, content.as_slice())?;
+    let mut pax = tar::Builder::new(Vec::new());
+    pax.append_pax_extensions([("path", path.as_bytes())])?;
+    let mut header = tar::Header::new_ustar();
+    header.set_path("release/short")?;
+    header.set_size(5000);
+    header.set_mode(0o644);
+    header.set_cksum();
+    pax.append(&header, content.as_slice())?;
+    for tar in [gnu.into_inner()?, pax.into_inner()?] {
+        let bytes = gzip(&tar)?;
+        let skip = skipping(&bytes)?;
+        assert_eq!(
+            read(
+                &bytes,
+                skip.with_oversized_members(OversizedMembers::Refuse)
+            )
+            .expect_err("member byte bound"),
+            ArchiveBound::MemberBytes.exceeded(5000, 1024, Some(fixture_path(&path)))
+        );
+        let files = read(&bytes, skip)?;
+        assert_eq!(
+            files.omissions()[0].path().as_str(),
+            path.strip_prefix("release/").ok_or("fixture root")?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_omitted_files_compare_bytes_and_never_replace_retained_files() -> TestResult {
+    let binary = oversized();
+    let mut changed = binary.clone();
+    changed[2500] ^= 1;
+    let longer = [binary.as_slice(), b"x"].concat();
+    for (first, second, accepted) in [
+        (binary.as_slice(), binary.as_slice(), true),
+        (&binary, &changed, false),
+        (&binary, &longer, false),
+        (&binary, SOURCE, false),
+        (SOURCE, &binary, false),
+    ] {
+        let entries = [
+            ("release/a", first, tar::EntryType::Regular),
+            ("release/./a", second, tar::EntryType::Regular),
+        ];
+        let mut raw = zip_members_bytes(&[
+            ("release/a", first, tar::EntryType::Regular),
+            ("release/b", second, tar::EntryType::Regular),
+        ])?;
+        replace_zip_name(&mut raw, b"release/b", b"release/a");
+        for (bytes, format) in [
+            (tar_bytes(&entries)?, ArchiveFormat::TarGzip),
+            (zip_members_bytes(&entries)?, ArchiveFormat::Zip),
+            (raw, ArchiveFormat::Zip),
+        ] {
+            let result = read_format(&bytes, format, skipping(&bytes)?);
+            if accepted {
+                let files = result?;
+                assert_eq!(files.omissions().len(), 1);
+                assert!(files.files().is_empty());
+            } else {
+                assert_eq!(
+                    result.expect_err("conflicting repeated file"),
+                    ArchiveError::DuplicatePath
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn omitted_zstd_windows_reach_the_recommended_width_and_no_further() -> TestResult {
+    let binary = oversized();
+    // Exponents 13 and 14 ask for 8 MiB and 16 MiB over the 1 KiB member bound.
+    for bytes in zstd_frame_zips(&zstd_frame(13, &binary)?, &binary)? {
+        let files = read_zip_fixture(&bytes, skipping(&bytes)?)?;
+        assert_eq!(files.omissions().len(), 1);
+        assert_eq!(files.omissions()[0].size(), 5000);
+    }
+    for bytes in zstd_frame_zips(&zstd_frame(14, &binary)?, &binary)? {
+        assert_eq!(
+            read_zip_fixture(&bytes, skipping(&bytes)?).expect_err("window over 8 MiB"),
+            ArchiveBound::WindowBytes.exceeded(16 << 20, 8 << 20, Some(fixture_path("release/a")))
         );
     }
     Ok(())

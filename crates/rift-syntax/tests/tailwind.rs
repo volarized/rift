@@ -101,6 +101,7 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
             symbols: enriched.symbols().to_vec(),
             left_out_symbols: enriched.facts().left_out_symbols().to_vec(),
             has_errors: enriched.has_errors(),
+            variance_errors_only: enriched.facts().variance_errors_only(),
             left_out_declarations: enriched.left_out_declaration_count(),
             markdown_facts: None,
             export_bindings: enriched.facts().export_bindings().map(<[_]>::to_vec),
@@ -504,4 +505,21 @@ fn pinned_nextjs_post_body_keeps_multiline_facts_with_tailwind() {
                 .any(|symbol| symbol.name == ".content a")
         );
     }
+}
+
+#[test]
+fn contextual_facts_keep_the_checked_variance_state() {
+    let text = "export interface Box<out T> { item: T }\n";
+    let path = ProjectPath::new("src/beacon.ts").expect("fixture path");
+    let source = SyntaxSource { path: &path, text };
+    let document = TypeScriptDialect::TypeScript
+        .provider()
+        .analyze(source, SyntaxLimits::default())
+        .expect("TypeScript syntax");
+    assert!(document.has_errors());
+    assert!(document.facts().declaration_syntax_complete());
+    let enriched = append_framework_symbols(source, SyntaxLimits::default(), &document, Vec::new())
+        .expect("contextual source");
+    assert!(enriched.has_errors());
+    assert!(enriched.facts().declaration_syntax_complete());
 }
