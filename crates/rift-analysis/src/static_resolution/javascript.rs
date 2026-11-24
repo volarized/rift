@@ -18,9 +18,22 @@ pub(super) enum ModuleMode {
 /// Module-mode declarations captured from the nearest package manifest.
 pub(super) struct PackageModes<'source> {
     modes: BTreeMap<String, ModuleMode>,
+    /// What the manifest of each folder names for a specifier of the folder.
+    folders: BTreeMap<String, Folder>,
     module_syntax: std::collections::BTreeSet<&'source str>,
     pub(super) owner: rift_protocol::identity::SymbolOwner,
     pub(super) scopes: BTreeMap<&'source str, Scopes<'source>>,
+}
+
+/// What the `package.json` of a folder names for a specifier of the folder.
+#[derive(Default)]
+pub(super) struct Folder {
+    /// Whether the manifest could be read.
+    pub(super) known: bool,
+    /// The file a runtime loads, as the manifest writes it.
+    pub(super) main: Option<String>,
+    /// The declaration file, as the manifest writes it.
+    pub(super) types: Option<String>,
 }
 
 pub(super) struct Scopes<'source> {
@@ -42,6 +55,7 @@ impl<'source> PackageModes<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut modes = BTreeMap::new();
+        let mut folders = BTreeMap::new();
         for source in namespace.files().iter().chain(namespace.context_sources()) {
             if !work.charge() {
                 return None;
@@ -49,12 +63,15 @@ impl<'source> PackageModes<'source> {
             let Some(directory) = manifest_directory(source.path().as_str()) else {
                 continue;
             };
-            let mode = if source.text().len() <= namespace.syntax().source_bytes_max() {
-                package_mode(source.text())
-            } else {
-                ModuleMode::Unknown
-            };
-            modes.entry(directory.to_owned()).or_insert(mode);
+            let manifest = (source.text().len() <= namespace.syntax().source_bytes_max())
+                .then(|| serde_json::from_str(source.text()).ok())
+                .flatten();
+            modes
+                .entry(directory.to_owned())
+                .or_insert_with(|| package_mode(manifest.as_ref()));
+            folders
+                .entry(directory.to_owned())
+                .or_insert_with(|| folder(manifest.as_ref()));
         }
         let mut scopes = BTreeMap::new();
         let mut module_syntax = std::collections::BTreeSet::new();
@@ -71,10 +88,16 @@ impl<'source> PackageModes<'source> {
         }
         Some(Self {
             modes,
+            folders,
             module_syntax,
             owner: namespace.owner().clone(),
             scopes,
         })
+    }
+
+    /// What the manifest of a folder names, or `None` for a folder without one.
+    pub(super) fn folder(&self, directory: &str) -> Option<&Folder> {
+        self.folders.get(directory)
     }
 
     pub(super) fn mode(&self, path: &str, work: &mut Work) -> ModuleMode {
@@ -143,15 +166,32 @@ fn javascript_constructor_function(target: Target<'_>) -> bool {
         )
 }
 
-fn package_mode(text: &str) -> ModuleMode {
-    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text) {
-        Ok(manifest) => match manifest.get("type") {
-            Some(value) if value.as_str() == Some("module") => ModuleMode::Esm,
-            Some(value) if value.as_str() == Some("commonjs") => ModuleMode::CommonJs,
-            None => ModuleMode::NodeDefault,
-            _ => ModuleMode::Unknown,
-        },
-        Err(_) => ModuleMode::Unknown,
+type Manifest = serde_json::Map<String, serde_json::Value>;
+
+fn package_mode(manifest: Option<&Manifest>) -> ModuleMode {
+    match manifest.map(|manifest| manifest.get("type")) {
+        Some(Some(value)) if value.as_str() == Some("module") => ModuleMode::Esm,
+        Some(Some(value)) if value.as_str() == Some("commonjs") => ModuleMode::CommonJs,
+        Some(None) => ModuleMode::NodeDefault,
+        Some(Some(_)) | None => ModuleMode::Unknown,
+    }
+}
+
+fn folder(manifest: Option<&Manifest>) -> Folder {
+    let Some(manifest) = manifest else {
+        return Folder::default();
+    };
+    let written = |key| {
+        manifest
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    Folder {
+        known: true,
+        main: written("main"),
+        types: written("types").or_else(|| written("typings")),
     }
 }
 
@@ -947,7 +987,7 @@ impl<'source> Index<'source> {
     }
 
     pub(super) fn edge_javascript_module(&self, path: &str) -> Option<&File<'source>> {
-        super::javascript_exports::module_file(&self.files, path, false)
+        super::javascript_exports::module_file(&self.files, &self.javascript, path, false)
     }
 
     fn javascript_export(

@@ -56,9 +56,9 @@ impl<'source> Exports<'_, 'source> {
         let from = from.document.path.as_str();
         let path = relative_path(from, module, work)?;
         if is_declaration_file(from) {
-            return declared_file(self.files, &path);
+            return declared_file(self.files, self.modes, &path);
         }
-        module_file(self.files, &path, false)
+        module_file(self.files, self.modes, &path, false)
     }
 
     pub(super) fn resolve(
@@ -660,44 +660,91 @@ pub(crate) fn is_declaration_file(path: &str) -> bool {
 }
 
 /// The file a specifier of a declaration file names: the TypeScript source in place of the
-/// written runtime file, else the declaration file. Two of one rank name none.
+/// written runtime file, else the declaration file. Two of one rank name none. A folder names
+/// what its manifest writes as types or as `main`, else its index.
 fn declared_file<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    modes: &PackageModes<'source>,
+    path: &str,
+) -> Option<&'index File<'source>> {
+    let directory = path.strip_suffix('/');
+    let mut stems = Vec::new();
+    if directory.is_none() {
+        if let Some(file) = typed_file(files, path) {
+            return Some(file);
+        }
+        if let Some((stem, sources, declarations)) = declared_extensions(path) {
+            return first_declared(files, &[stem.to_owned()], sources, declarations);
+        }
+        stems.push(path.to_owned());
+    }
+    let folder = directory.unwrap_or(path);
+    let manifest = modes.folder(folder);
+    if manifest.is_some_and(|manifest| !manifest.known) {
+        return None;
+    }
+    let written = manifest.and_then(|manifest| manifest.types.as_ref().or(manifest.main.as_ref()));
+    if let Some(written) = written
+        && stems.iter().all(|stem| {
+            first_declared(files, std::slice::from_ref(stem), SOURCES, DECLARATIONS).is_none()
+        })
+        && let Some(file) = folder_path(folder, written).and_then(|written| {
+            typed_file(files, &written).or_else(|| {
+                let (stem, sources, declarations) = declared_extensions(&written).unwrap_or((
+                    written.as_str(),
+                    SOURCES,
+                    DECLARATIONS,
+                ));
+                first_declared(files, &[stem.to_owned()], sources, declarations)
+            })
+        })
+    {
+        return Some(file);
+    }
+    stems.push(folder_path(folder, "index")?);
+    first_declared(files, &stems, SOURCES, DECLARATIONS)
+}
+
+const SOURCES: &[&str] = &[".ts", ".tsx"];
+const DECLARATIONS: &[&str] = &[".d.ts"];
+
+/// The stem of a written runtime path, with the extensions of its sources and declarations.
+fn declared_extensions(
+    path: &str,
+) -> Option<(&str, &'static [&'static str], &'static [&'static str])> {
+    [
+        (".js", SOURCES, DECLARATIONS),
+        (".jsx", SOURCES, DECLARATIONS),
+        (".mjs", &[".mts"], &[".d.mts"]),
+        (".cjs", &[".cts"], &[".d.cts"]),
+    ]
+    .into_iter()
+    .find_map(|(written, sources, declarations)| {
+        Some((path.strip_suffix(written)?, sources, declarations))
+    })
+}
+
+fn typed_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     path: &str,
 ) -> Option<&'index File<'source>> {
-    let typed = |path: &str| {
-        files
-            .get(path)
-            .filter(|file| file.document.facts.language().name == "typescript")
-    };
-    if let Some(file) = typed(path) {
-        return Some(file);
-    }
-    let written = |extension| path.strip_suffix(extension);
-    let (stems, extensions): (Vec<String>, [&[&str]; 2]) = if let Some(directory) = written("/") {
-        let index = if directory.is_empty() {
-            "index".to_owned()
-        } else {
-            format!("{directory}/index")
-        };
-        (vec![index], [&[".ts", ".tsx"], &[".d.ts"]])
-    } else if let Some(stem) = written(".js").or_else(|| written(".jsx")) {
-        (vec![stem.to_owned()], [&[".ts", ".tsx"], &[".d.ts"]])
-    } else if let Some(stem) = written(".mjs") {
-        (vec![stem.to_owned()], [&[".mts"], &[".d.mts"]])
-    } else if let Some(stem) = written(".cjs") {
-        (vec![stem.to_owned()], [&[".cts"], &[".d.cts"]])
-    } else {
-        (
-            vec![path.to_owned(), format!("{path}/index")],
-            [&[".ts", ".tsx"], &[".d.ts"]],
-        )
-    };
-    for extensions in extensions {
+    files
+        .get(path)
+        .filter(|file| file.document.facts.language().name == "typescript")
+}
+
+/// The one source of the stems, else their one declaration file.
+fn first_declared<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    stems: &[String],
+    sources: &[&str],
+    declarations: &[&str],
+) -> Option<&'index File<'source>> {
+    for extensions in [sources, declarations] {
         let mut found = None;
-        for stem in &stems {
+        for stem in stems {
             for extension in extensions {
-                if let Some(file) = typed(&format!("{stem}{extension}"))
+                if let Some(file) = typed_file(files, &format!("{stem}{extension}"))
                     && found.replace(file).is_some()
                 {
                     return None;
@@ -711,26 +758,40 @@ fn declared_file<'index, 'source>(
     None
 }
 
+/// A path a folder's manifest writes, as Node joins it to the folder. `None` when it leaves
+/// the files of the analysis.
+fn folder_path(directory: &str, written: &str) -> Option<String> {
+    let mut segments = directory
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if written.starts_with('/') || written.contains('\\') {
+        return None;
+    }
+    for segment in written.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            segment => segments.push(segment),
+        }
+    }
+    Some(segments.join("/"))
+}
+
 pub(super) fn module_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
+    modes: &PackageModes<'source>,
     path: &str,
     declarations: bool,
 ) -> Option<&'index File<'source>> {
     if let Some(directory) = path.strip_suffix('/') {
-        // A directory specifier names only the directory's index module.
-        let mut found = None;
-        for name in ["index.ts", "index.tsx", "index.js"] {
-            let candidate = if directory.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{directory}/{name}")
-            };
-            if let Some(file) = files.get(candidate.as_str())
-                && found.replace(file).is_some()
-            {
-                return None;
-            }
-        }
+        let found = match folder_file(files, modes, directory) {
+            Candidate::File(file) => Some(file),
+            Candidate::Open => return None,
+            Candidate::Missing => None,
+        };
         return found.or_else(|| {
             declarations
                 .then(|| files.get(format!("{path}index.d.ts").as_str()))
@@ -752,25 +813,19 @@ pub(super) fn module_file<'index, 'source>(
     if let Some(stem) = path.strip_suffix(".cjs") {
         return files.get(format!("{stem}.cts").as_str());
     }
-    let mut found = None;
-    for candidate in [
-        format!("{stem}.ts"),
-        format!("{stem}.tsx"),
-        format!("{stem}.mts"),
-        format!("{stem}.cts"),
-        format!("{stem}.js"),
-        format!("{stem}.mjs"),
-        format!("{stem}.cjs"),
-        format!("{stem}/index.ts"),
-        format!("{stem}/index.tsx"),
-        format!("{stem}/index.js"),
-    ] {
-        if let Some(file) = files.get(candidate.as_str())
-            && found.replace(file).is_some()
-        {
-            return None;
-        }
-    }
+    let direct = one_file(files, stem, MODULES);
+    let candidate = match direct {
+        Candidate::File(_) if matches!(folder_index(files, stem), Candidate::Missing) => direct,
+        Candidate::File(_) | Candidate::Open => return None,
+        // `./x.js` never names a folder by its manifest.
+        Candidate::Missing if stem != path => folder_index(files, stem),
+        Candidate::Missing => folder_file(files, modes, stem),
+    };
+    let found = match candidate {
+        Candidate::File(file) => Some(file),
+        Candidate::Open => return None,
+        Candidate::Missing => None,
+    };
     if found.is_some() || !declarations || std::path::Path::new(path).extension().is_some() {
         return found;
     }
@@ -779,6 +834,83 @@ pub(super) fn module_file<'index, 'source>(
     match (direct, index) {
         (Some(file), None) | (None, Some(file)) => Some(file),
         _ => None,
+    }
+}
+
+const MODULES: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"];
+const INDEXES: &[&str] = &[".ts", ".tsx", ".js"];
+
+/// What the files of the analysis hold for a path.
+enum Candidate<'index, 'source> {
+    File(&'index File<'source>),
+    /// Several files, or one that is not read here.
+    Open,
+    Missing,
+}
+
+/// The one file of a stem.
+fn one_file<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    stem: &str,
+    extensions: &[&str],
+) -> Candidate<'index, 'source> {
+    let mut found = Candidate::Missing;
+    for extension in extensions {
+        if let Some(file) = files.get(format!("{stem}{extension}").as_str()) {
+            if matches!(found, Candidate::File(_)) {
+                return Candidate::Open;
+            }
+            found = Candidate::File(file);
+        }
+    }
+    found
+}
+
+fn folder_index<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    directory: &str,
+) -> Candidate<'index, 'source> {
+    folder_path(directory, "index")
+        .map_or(Candidate::Missing, |stem| one_file(files, &stem, INDEXES))
+}
+
+/// The file Node loads for a folder: what `main` of its manifest names, as a file or as a
+/// folder with an index, else the folder's index.
+fn folder_file<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    modes: &PackageModes<'source>,
+    directory: &str,
+) -> Candidate<'index, 'source> {
+    let index = |directory: &str| folder_index(files, directory);
+    let Some(manifest) = modes.folder(directory) else {
+        return index(directory);
+    };
+    if !manifest.known {
+        return Candidate::Open;
+    }
+    let Some(main) = &manifest.main else {
+        return index(directory);
+    };
+    let Some(path) = folder_path(directory, main) else {
+        return Candidate::Open;
+    };
+    if let Some(file) = files.get(path.as_str()) {
+        return Candidate::File(file);
+    }
+    let extension = std::path::Path::new(&path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str);
+    // A data or native file is no source of the analysis, and Node loads it when it exists.
+    if matches!(extension, Some("json" | "node" | "wasm")) {
+        return Candidate::Open;
+    }
+    let stem = path.strip_suffix(".js").unwrap_or(&path);
+    match one_file(files, stem, MODULES) {
+        Candidate::Missing => match index(&path) {
+            Candidate::Missing => index(directory),
+            found => found,
+        },
+        found => found,
     }
 }
 

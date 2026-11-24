@@ -308,3 +308,134 @@ fn calls_reach_the_declaration_behind_a_forwarded_property_or_condition() {
         );
     }
 }
+
+#[test]
+fn a_folder_names_the_file_its_own_manifest_writes() {
+    let opened = |name: &str| format!("exports.open = function {name}() {{}};\n");
+    let (main, index) = (opened("main"), opened("index"));
+    for (manifest, files, target) in [
+        (
+            r#"{"main":"main.js"}"#,
+            &["sub/main.js", "sub/index.js"][..],
+            Some("sub/main.js"),
+        ),
+        (
+            r#"{"main":"./main"}"#,
+            &["sub/main.js"],
+            Some("sub/main.js"),
+        ),
+        (
+            r#"{"main":"./lib"}"#,
+            &["sub/lib/index.js", "sub/index.js"],
+            Some("sub/lib/index.js"),
+        ),
+        (
+            r#"{"main":"../main.js"}"#,
+            &["main.js", "sub/index.js"],
+            Some("main.js"),
+        ),
+        (
+            r#"{"main":"./gone.js"}"#,
+            &["sub/index.js"],
+            Some("sub/index.js"),
+        ),
+        (r#"{"main":""}"#, &["sub/index.js"], Some("sub/index.js")),
+        (
+            r#"{"type":"commonjs"}"#,
+            &["sub/index.js"],
+            Some("sub/index.js"),
+        ),
+        (r#"{"main":"./gone.js"}"#, &["sub/other.js"], None),
+        (r#"{"main":"./data.json"}"#, &["sub/index.js"], None),
+        (r#"{"main":"./native.node"}"#, &["sub/index.js"], None),
+        (r#"{"main":"../../out.js"}"#, &["sub/index.js"], None),
+        (r#"{"main":"#, &["sub/index.js"], None),
+    ] {
+        for specifier in ["./sub", "./sub/"] {
+            let entry = format!("module.exports = require('{specifier}');\n");
+            let user = format!(
+                "var sub = require('{specifier}');\nfunction use() {{ sub.open() }}\nexports.use = use;\n"
+            );
+            let mut selected = vec![
+                ("index.js", entry.as_str()),
+                ("user.js", user.as_str()),
+                ("sub/package.json", manifest),
+            ];
+            selected.extend(files.iter().map(|path| {
+                (
+                    *path,
+                    if path.ends_with("main.js") {
+                        main.as_str()
+                    } else {
+                        index.as_str()
+                    },
+                )
+            }));
+            let analysis = analyze(MAIN, &selected);
+            let module = target.map(|path| format!("beacon/{path}"));
+            let called = edges(&analysis)
+                .into_iter()
+                .filter(|(from, kind, _)| {
+                    *kind == EdgeKind::Calls && *from == path(&["beacon/user.js", "use"])
+                })
+                .map(|(_, _, to)| to[0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                called,
+                module.iter().cloned().collect::<Vec<_>>(),
+                "{manifest} {files:?} {specifier}"
+            );
+            assert_eq!(
+                aliases(&analysis, "beacon"),
+                module
+                    .iter()
+                    .map(|module| ("open".to_owned(), format!("{module}/open")))
+                    .collect::<BTreeSet<_>>(),
+                "{manifest} {files:?} {specifier}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_declaration_file_names_the_types_of_a_folder() {
+    let declared = "export declare function u(): void;\n";
+    for (manifest, files, target) in [
+        (
+            r#"{"types":"./t.d.ts","main":"m.js"}"#,
+            &["sub/t.d.ts", "sub/m.d.ts", "sub/index.d.ts"][..],
+            Some("sub/t.d.ts"),
+        ),
+        (
+            r#"{"main":"m.js"}"#,
+            &["sub/m.d.ts", "sub/index.d.ts"],
+            Some("sub/m.d.ts"),
+        ),
+        (
+            r#"{"main":"gone.js"}"#,
+            &["sub/index.d.ts"],
+            Some("sub/index.d.ts"),
+        ),
+        (
+            r#"{"type":"commonjs"}"#,
+            &["sub/index.d.ts"],
+            Some("sub/index.d.ts"),
+        ),
+        (r#"{"main":"#, &["sub/index.d.ts"], None),
+    ] {
+        let mut selected = vec![
+            ("index.d.ts", "export { u } from './sub';\n"),
+            ("sub/package.json", manifest),
+        ];
+        selected.extend(files.iter().map(|path| (*path, declared)));
+        let analysis = analyze(TYPES, &selected);
+        assert_eq!(
+            aliases(&analysis, "beacon"),
+            target
+                .iter()
+                .map(|path| ("u".to_owned(), format!("beacon/{path}/u")))
+                .collect::<BTreeSet<_>>(),
+            "{manifest}"
+        );
+    }
+}
