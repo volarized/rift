@@ -310,6 +310,81 @@ fn calls_reach_the_declaration_behind_a_forwarded_property_or_condition() {
 }
 
 #[test]
+fn a_named_reexport_keeps_the_written_file_for_a_name_its_declaration_file_lacks() {
+    let files = [
+        // The grammar reads no declaration in an anonymous default signature (#1072).
+        ("ar.d.ts", "export default function (): { a: string };\n"),
+        (
+            "ar.js",
+            "export default function () {}\nexport function only() {}\n",
+        ),
+        (
+            "x.d.ts",
+            "declare function _catch(): void;\nexport { _catch as catch };\nexport declare function u(): void;\n",
+        ),
+        (
+            "x.js",
+            "export function _catch() {}\nexport function u() {}\n",
+        ),
+        ("via.d.ts", "export { default as ar } from './ar.js';\n"),
+    ];
+    for (entry, names) in [
+        (
+            "export { default as ar } from './ar.js';",
+            &[("ar", "beacon/ar.js/default")][..],
+        ),
+        (
+            "export * from './via.js';",
+            &[("ar", "beacon/ar.js/default")],
+        ),
+        (
+            "import ar from './ar.js';\nexport { ar };",
+            &[("ar", "beacon/ar.js/default")],
+        ),
+        ("export { u } from './x.js';", &[("u", "beacon/x.d.ts/u")]),
+        ("export * from './ar.js';", &[]),
+        (
+            "export * from './x.js';",
+            &[("catch", "beacon/x.d.ts/_catch"), ("u", "beacon/x.d.ts/u")],
+        ),
+        ("export { gone } from './x.js';", &[]),
+    ] {
+        let mut selected = vec![("index.d.ts", entry)];
+        selected.extend(files);
+        let manifest =
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"index.d.ts"}"#;
+        let analysis = analyze(manifest, &selected);
+        assert_eq!(aliases(&analysis, "beacon"), expected(names), "{entry}");
+    }
+}
+
+#[test]
+fn a_member_of_a_forwarded_namespace_stays_in_the_declaration_file() {
+    let analysis = analyze(
+        TYPES,
+        &[
+            (
+                "index.d.ts",
+                "import { util } from './core.js';\nexport declare const value: util.Fn;\n",
+            ),
+            ("core.d.ts", "export * as util from './util.js';\n"),
+            ("core.js", "exports.util = require('./util.js');\n"),
+            ("util.d.ts", "export type Fn = () => void;\n"),
+            ("util.js", "exports.run = 1;\n"),
+        ],
+    );
+    assert!(
+        edges(&analysis).contains(&(
+            path(&["beacon", "value"]),
+            EdgeKind::HasType,
+            path(&["beacon/util.d.ts", "Fn"])
+        )),
+        "{:?}",
+        edges(&analysis)
+    );
+}
+
+#[test]
 fn a_folder_names_the_file_its_own_manifest_writes() {
     let opened = |name: &str| format!("exports.open = function {name}() {{}};\n");
     let (main, index) = (opened("main"), opened("index"));

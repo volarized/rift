@@ -61,6 +61,46 @@ impl<'source> Exports<'_, 'source> {
         module_file(self.files, self.modes, &path, false)
     }
 
+    /// The file a specifier names for one export: in a declaration file the declaration file
+    /// it reaches, and the written runtime file for a name that one does not declare.
+    pub(super) fn imported_for(
+        &self,
+        from: &File<'source>,
+        module: &str,
+        name: &str,
+        work: &mut Work,
+    ) -> Option<&File<'source>> {
+        let imported = self.imported(from, module, work);
+        let from = from.document.path.as_str();
+        let (name, _) = split_name(name);
+        if !is_declaration_file(from)
+            || imported.is_some_and(|imported| self.declares(imported, name, work))
+        {
+            return imported;
+        }
+        let path = relative_path(from, module, work)?;
+        module_file(self.files, self.modes, &path, false).or(imported)
+    }
+
+    /// Whether the file exports `name`, itself or through a star.
+    fn declares(&self, file: &File<'source>, name: &str, work: &mut Work) -> bool {
+        if name != "default" {
+            return self
+                .names(file, work)
+                .is_none_or(|names| names.contains(name));
+        }
+        file.document
+            .facts
+            .export_bindings()
+            .unwrap_or_default()
+            .iter()
+            .any(|binding| {
+                binding.container.is_none()
+                    && (binding.kind == SyntaxExportKind::Default
+                        || binding.exported.and_then(|range| file.text(range)) == Some(name))
+            })
+    }
+
     pub(super) fn resolve(
         &self,
         from: &File<'source>,
@@ -70,7 +110,13 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        self.resolve_file(self.imported(from, module, work)?, name, mode, role, work)
+        self.resolve_file(
+            self.imported_for(from, module, name, work)?,
+            name,
+            mode,
+            role,
+            work,
+        )
     }
 
     pub(super) fn resolve_file(
@@ -228,7 +274,7 @@ impl<'source> Exports<'_, 'source> {
                     member,
                 }),
                 Export::Reexport { module, name } => {
-                    if let Some(imported) = self.imported(file, module, work) {
+                    if let Some(imported) = self.imported_for(file, module, name, work) {
                         pending.push((imported, ExportSlot::Named(name), member));
                     }
                     None

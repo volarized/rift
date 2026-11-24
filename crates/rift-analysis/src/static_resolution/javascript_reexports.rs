@@ -479,8 +479,8 @@ impl<'source> Forwarding<'_, '_, 'source> {
             commonjs,
         } = *self;
         if let Some(module) = self.module(binding) {
-            let imported = resolver.imported(file, module, work)?;
             if binding.kind == SyntaxExportKind::All {
+                let imported = resolver.imported(file, module, work)?;
                 let names = resolver.names(imported, work)?;
                 let default = commonjs.then_some(DEFAULT_NAME);
                 return Some(names.iter().copied().chain(default).collect());
@@ -524,14 +524,16 @@ impl<'source> Forwarding<'_, '_, 'source> {
             return own_export(resolver, file, name, work)
                 .filter(|target| target.key().0 != file.document.path);
         };
-        let imported = resolver.imported(file, module, work)?;
-        if binding.kind == SyntaxExportKind::Namespace {
-            return Some(ResolvedExport::Module(imported.document));
-        }
-        let local = if binding.kind == SyntaxExportKind::All {
-            name
-        } else {
-            file.text(binding.local?)?
+        let (imported, local) = match binding.kind {
+            SyntaxExportKind::Namespace => {
+                let imported = resolver.imported(file, module, work)?;
+                return Some(ResolvedExport::Module(imported.document));
+            }
+            SyntaxExportKind::All => (resolver.imported(file, module, work)?, name),
+            SyntaxExportKind::Named | SyntaxExportKind::Default => {
+                let local = file.text(binding.local?)?;
+                (resolver.imported_for(file, module, local, work)?, local)
+            }
         };
         let value = own_export(resolver, imported, local, work)?;
         if binding.kind == SyntaxExportKind::All
