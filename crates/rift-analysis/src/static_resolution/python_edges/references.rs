@@ -94,16 +94,12 @@ impl<'source> Index<'source> {
             return None;
         };
         let module = self.files.get(self.edge_python.path(&name)?)?;
-        let root = ByteRange {
-            start: 0,
-            end: module.document.source.len() as u64,
-        };
         let mut declaration: Option<Target<'source>> = None;
         for binding in module.by_name.get(member.trim())? {
             if !work.charge() {
                 return None;
             }
-            if binding.scope != root {
+            if !module.python_module_binding(binding) {
                 continue;
             }
             let target = module.target_at(binding.name)?;

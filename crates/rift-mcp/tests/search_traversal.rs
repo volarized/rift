@@ -1628,6 +1628,28 @@ while IFS= read -r header; do
 done
 "#;
 
+/// Longest wait for a fake engine to read what the server already wrote to it.
+#[cfg(unix)]
+const ENGINE_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Interval between two reads of a fake engine's log.
+#[cfg(unix)]
+const ENGINE_LOG_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Waits until the engine's log holds `lines` lines, or [`ENGINE_LOG_WAIT`] passes and the
+/// caller's own assertion reports what it holds.
+///
+/// A walk ends at its deadline whether or not its engine has read the frames the walk wrote,
+/// so a log read right after the walk can miss lines the engine has yet to append.
+#[cfg(unix)]
+async fn engine_log_reaches(log: &std::path::Path, lines: usize) {
+    let deadline = tokio::time::Instant::now() + ENGINE_LOG_WAIT;
+    while std::fs::read_to_string(log).map_or(0, |text| text.lines().count()) < lines
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(ENGINE_LOG_POLL).await;
+    }
+}
+
 /// A walk whose engine answers only after the request deadline ends its wait at the walk's
 /// deadline: the session cancels the request, the walk answers its static edge with
 /// `engine_analysis_unavailable`, and it keeps its engine session. The next walk is served
@@ -1686,6 +1708,7 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         json!("engine_analysis_unavailable"),
         "{structured}"
     );
+    engine_log_reaches(&log, 5).await;
     client.cancel().await?;
     let recorded = std::fs::read_to_string(&log)?;
     let lines: Vec<&str> = recorded.lines().collect();

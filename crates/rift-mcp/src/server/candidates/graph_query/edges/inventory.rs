@@ -17,6 +17,10 @@ use super::{
 mod cache;
 pub(crate) use cache::EngineInventoryCache;
 
+/// Why the captured facts answer alone when the engine answers part of the inventory.
+const ENGINE_ANSWER_INCOMPLETE: &str = "the language engine could not answer for the whole \
+     inventory, so it answers from the captured static facts alone";
+
 /// The declarations a whole-inventory read walks and the facts it reads for each.
 #[derive(Clone, Copy)]
 struct InventorySelection<'seeds> {
@@ -308,37 +312,23 @@ impl RiftMcp {
                 records_max: GraphLimits::default().triples_max(),
             },
         };
-        let skipped = if served.is_empty() {
-            None
+        let engine = if served.is_empty() {
+            Err(ENGINE_ANSWER_INCOMPLETE)
         } else if resolved.stale.is_some() {
-            Some(
+            Err(
                 "the published index lags the captured tree, so the inventory answers from \
-                 the captured static facts alone"
-                    .to_owned(),
+                 the captured static facts alone",
             )
         } else {
-            None
-        };
-        let engine = if served.is_empty() || skipped.is_some() {
-            None
-        } else {
-            let end = deadline.graph_walk_end(resolved.capture_elapsed);
-            match Box::pin(self.engine_inventory(resolved, &engines, &inventory, end)).await {
-                Ok(engine) => Some(engine),
-                Err(error) if super::super::lacks_coverage(&error) => None,
-                Err(error) => return Err(error),
-            }
-        };
-        let read = if let Some(engine) = engine {
-            engine
-        } else {
-            let detail = skipped.unwrap_or_else(|| {
-                "the language engine could not answer for the whole inventory, so it answers \
-                 from the captured static facts alone"
-                    .to_owned()
-            });
-            self.captured_fallback(reads, &inventory, served, detail)
+            self.inventory_within_budget(resolved, &engines, &inventory, deadline)
                 .await?
+        };
+        let read = match engine {
+            Ok(engine) => engine,
+            Err(detail) => {
+                self.captured_fallback(reads, &inventory, served, detail)
+                    .await?
+            }
         };
         acquired.admit_inventory(&read)?;
         // Physical usages come from the reference inventory. Stream captured facts as
@@ -356,7 +346,7 @@ impl RiftMcp {
         reads: &Arc<rift_server::ReadService>,
         inventory: &InventorySelection<'_>,
         served: BTreeMap<String, rift_protocol::read::Language>,
-        detail: String,
+        detail: &str,
     ) -> Result<Arc<InventoryRead>, RiftError> {
         let capture = Arc::clone(reads);
         let seeds = inventory.seeds.to_vec();
@@ -379,10 +369,48 @@ impl RiftMcp {
                 .warnings
                 .push(ReadWarning::EngineAnalysisUnavailable {
                     language: Some(language),
-                    detail: detail.clone(),
+                    detail: detail.to_owned(),
                 });
         }
         Ok(Arc::new(captured))
+    }
+
+    /// The engine's inventory, or the detail of why the captured facts answer alone.
+    ///
+    /// The walk's end bounds the engine's own answers. Mapping them, naming their targets,
+    /// and revalidating the tree come after it, and their cost is unknown until they run, so
+    /// the whole acquisition ends while the graph can still be evaluated from the captured
+    /// facts.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future abandons the acquisition, as its own deadline does, and retains
+    /// no inventory.
+    async fn inventory_within_budget(
+        &self,
+        resolved: &ResolvedWorkspace,
+        engines: &Arc<rift_server::EnginePool>,
+        inventory: &InventorySelection<'_>,
+        deadline: RequestDeadline,
+    ) -> Result<Result<Arc<InventoryRead>, &'static str>, RiftError> {
+        let end = deadline.graph_walk_end(resolved.capture_elapsed);
+        let acquired = tokio::time::timeout_at(
+            deadline.graph_acquisition_end(),
+            Box::pin(self.engine_inventory(resolved, engines, inventory, end)),
+        )
+        .await;
+        match acquired {
+            Ok(Ok(engine)) => Ok(Ok(engine)),
+            Ok(Err(error)) if super::super::lacks_coverage(&error) => {
+                Ok(Err(ENGINE_ANSWER_INCOMPLETE))
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_elapsed) => Ok(Err(
+                "`[server] readiness_timeout` was spent before the language engine's answer was \
+                 checked against the captured tree, so the inventory answers from the captured \
+                 static facts alone",
+            )),
+        }
     }
 
     /// Reads file groups through engine batches and maps their locations on the worker pool.

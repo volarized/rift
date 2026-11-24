@@ -3,29 +3,28 @@
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind};
 
 use super::super::{File, Index, Work};
-use super::ReceiverJoin;
+use super::{ReceiverJoin, Scope};
 
 impl<'source> Index<'source> {
     pub(super) fn python_guarded_receiver(
         &self,
         file: &File<'source>,
         name: &str,
-        scope: ByteRange,
+        scope: Scope,
         position: u64,
         candidates: impl Iterator<Item = &'source StaticBinding>,
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
         let guarded = file.python_guarded_use(name, position, work)?;
-        let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
-        if file.class_scopes.contains(&scope)
-            || (module && !self.python_module_slot_available(file, name, work))
+        if (!scope.module && file.class_scopes.contains(&scope.range))
+            || (scope.module && !self.python_module_slot_available(file, name, work))
         {
             return None;
         }
         for &binding in file.by_name.get(name)? {
             if !work.charge()
-                || (module && binding.kind == StaticBindingKind::PythonGlobal)
-                || (binding.scope == scope
+                || (scope.module && binding.kind == StaticBindingKind::PythonGlobal)
+                || (Scope::of(file, binding) == scope
                     && binding.name.start > guarded
                     && binding.name.start < position)
             {

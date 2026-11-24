@@ -60,6 +60,42 @@ impl EdgePythonModules {
     }
 }
 
+/// What covers a Python file beside its module.
+#[derive(Clone, Copy)]
+pub(super) enum WholeFile {
+    /// Nothing else.
+    Module,
+    /// The one definition of the file, by its name.
+    Definition(ByteRange),
+    /// One comprehension, generator expression or lambda.
+    Expression,
+}
+
+/// A scope that binds a name: its range, and whether it is the module.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Scope {
+    range: ByteRange,
+    module: bool,
+}
+
+impl Scope {
+    fn of(file: &File<'_>, binding: &StaticBinding) -> Self {
+        Self {
+            range: binding.scope,
+            module: file.python_module_binding(binding),
+        }
+    }
+
+    /// Whether this scope holds `other`. A module holds every other scope of its file.
+    fn holds(self, other: Self) -> bool {
+        if other.module {
+            self.module
+        } else {
+            self.module || self.range.encloses(other.range)
+        }
+    }
+}
+
 enum Value<'source> {
     Symbol(Target<'source>),
     Instance(Target<'source>),
@@ -102,12 +138,11 @@ impl<'source> Index<'source> {
     fn python_receiver_join(
         &self,
         file: &File<'source>,
-        scope: ByteRange,
+        scope: Scope,
         candidates: impl Iterator<Item = &'source StaticBinding>,
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
-        let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
-        if module || file.class_scopes.contains(&scope) {
+        if scope.module || file.class_scopes.contains(&scope.range) {
             return None;
         }
         self.python_agreed_receiver(file, candidates, ReceiverJoin::All, work)
@@ -494,9 +529,10 @@ impl<'source> Index<'source> {
             let Some(bindings) = file.by_name.get(name) else {
                 return self.module_value(&format!("{module}.{name}"));
             };
-            let root = bindings.iter().copied().filter(|binding| {
-                binding.scope.start == 0 && binding.scope.end == file.document.source.len() as u64
-            });
+            let root = bindings
+                .iter()
+                .copied()
+                .filter(|binding| file.python_module_binding(binding));
             let binding = self.python_binding_group(file, root, work)?;
             let callable = file.target_at(binding.name).is_some_and(|target| {
                 target.symbol.kinds.contains(&SymbolKind::Callable)
@@ -574,29 +610,25 @@ fn edge_python_binding<'source>(
             .is_some_and(|body| body.contains(position))
     });
     let bindings = file.by_name.get(name)?;
-    let module = ByteRange {
-        start: 0,
-        end: file.document.source.len() as u64,
-    };
     let mut excluded = BTreeSet::new();
     let mut global = false;
     let mut nonlocal = false;
     loop {
-        let mut best: Option<ByteRange> = None;
+        let mut best: Option<Scope> = None;
         for &binding in bindings {
             if !work.charge() {
                 return None;
             }
-            let scope = binding.scope;
-            if !scope.contains(position)
+            let scope = Scope::of(file, binding);
+            if !scope.range.contains(position)
                 || excluded.contains(&scope)
-                || (global && scope != module)
-                || (nonlocal && scope == module)
-                || (in_body && file.class_scopes.contains(&scope))
+                || (global && !scope.module)
+                || (nonlocal && scope.module)
+                || (in_body && !scope.module && file.class_scopes.contains(&scope.range))
             {
                 continue;
             }
-            if best.is_none_or(|best| best.encloses(scope)) {
+            if best.is_none_or(|best| best.holds(scope)) {
                 best = Some(scope);
             }
         }
@@ -607,7 +639,7 @@ fn edge_python_binding<'source>(
             if !work.charge() {
                 return None;
             }
-            if binding.scope != scope {
+            if Scope::of(file, binding) != scope {
                 continue;
             }
             match binding.kind {
@@ -627,10 +659,9 @@ fn edge_python_binding<'source>(
             nonlocal = !is_global;
         } else {
             let later = later_bindings(file, bindings, scope, position, callable, in_body, work)?;
-            let candidates = bindings
-                .iter()
-                .copied()
-                .filter(|binding| binding.scope == scope && !later.contains(&binding.name.start));
+            let candidates = bindings.iter().copied().filter(|binding| {
+                Scope::of(file, binding) == scope && !later.contains(&binding.name.start)
+            });
             let selected = match index.python_binding_group(file, candidates.clone(), work) {
                 Some(selected) => selected,
                 None => index
@@ -657,17 +688,17 @@ fn edge_python_binding<'source>(
 fn later_bindings(
     file: &File<'_>,
     bindings: &[&StaticBinding],
-    scope: ByteRange,
+    scope: Scope,
     position: u64,
     callable: Option<Target<'_>>,
     in_body: bool,
     work: &mut Work,
 ) -> Option<BTreeSet<u64>> {
     let mut later = BTreeSet::new();
-    let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
     let ordered = ((in_body
-        && callable.is_some_and(|callable| callable.symbol.item_range == scope))
-        || (module && !in_body && !file.in_python_annotation(position)))
+        && !scope.module
+        && callable.is_some_and(|callable| callable.symbol.item_range == scope.range))
+        || (scope.module && !in_body && !file.in_python_annotation(position)))
         && !file
             .facts
             .expression_scopes()
@@ -685,7 +716,7 @@ fn later_bindings(
             .loops()
             .iter()
             .any(|range| range.contains(position) && range.contains(binding.name.start));
-        if binding.scope == scope && binding.available_from > position && !repeated {
+        if Scope::of(file, binding) == scope && binding.available_from > position && !repeated {
             later.insert(binding.name.start);
         }
     }
