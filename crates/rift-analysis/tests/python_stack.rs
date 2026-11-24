@@ -278,6 +278,70 @@ fn module_imports_that_end_in_a_cycle_name_nothing() {
     assert!(!found.iter().any(|edge| edge.ends_with("/x")), "{found:?}");
 }
 
+#[test]
+fn a_class_with_many_bases_inherits_from_each() {
+    const BASES: usize = 4_000;
+    let bases = (0..BASES).fold(String::new(), |mut text, base| {
+        writeln!(text, "class B{base}:\n    def m{base}(self): pass").expect("text line");
+        text
+    });
+    let names = (0..BASES)
+        .map(|base| format!("B{base}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let last = BASES - 1;
+    let found = edges(
+        &module(format!(
+            "{bases}class K({names}): pass\nK().m0()\nK().m{last}()\n"
+        )),
+        512,
+    );
+    assert_edges(
+        &found,
+        16_007,
+        &[
+            "module -> module/B0/m0",
+            "module -> module/B3999/m3999",
+            "module/K -> module/B0",
+            "module/K -> module/B3999",
+        ],
+    );
+}
+
+#[test]
+fn many_bases_that_share_a_base_merge_in_the_c3_order() {
+    const BASES: usize = 1_000;
+    let bases = (0..BASES).fold(String::new(), |mut text, base| {
+        writeln!(text, "class B{base}(Root): pass").expect("text line");
+        text
+    });
+    let names = (0..BASES)
+        .map(|base| format!("B{base}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "class Root:\n    def m(self): pass\n    def r(self): pass\n{bases}class Last(Root):\n    \
+        def m(self): pass\nclass K({names}, Last): pass\nK().m()\nK().r()\n\
+        class Wrong(Root, B0): pass\nWrong().r()\n"
+    );
+    let found = edges(&module(text), 512);
+    let called = |name: &str| found.contains(&format!("module -> {name}"));
+    assert!(
+        called("module/Last/m"),
+        "`Last` precedes the base all share"
+    );
+    assert!(!called("module/Root/m"));
+    assert!(called("module/Root/r"));
+    let reads = found
+        .iter()
+        .filter(|edge| *edge == "module -> module/Root/r")
+        .count();
+    assert_eq!(
+        reads, 2,
+        "the call and the name of `K().r`, none of `Wrong().r`"
+    );
+}
+
 // Issue #1065.
 #[test]
 fn a_long_base_class_chain_keeps_the_edges_of_its_file() {

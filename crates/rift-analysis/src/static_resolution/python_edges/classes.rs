@@ -1161,44 +1161,172 @@ fn merge_order<'source>(
 
 /// Merges the orders of the bases of `class`, with its bases as the last sequence, by the C3
 /// rule: the next class is the first head that no sequence holds behind its own head.
+///
+/// Each class leaves each sequence once, and the next head is read from an index, so the work
+/// is the length of the sequences and does not grow with their number.
 fn merge_sequences<'source>(
     class: ClassKey<'source>,
-    mut sequences: Vec<VecDeque<ClassKey<'source>>>,
+    sequences: Vec<VecDeque<ClassKey<'source>>>,
     work: &mut Work,
 ) -> Option<ClassOrder<'source>> {
-    let mut behind = BTreeMap::<ClassKey<'source>, usize>::new();
-    for class in sequences
-        .iter()
-        .flat_map(|sequence| sequence.iter().skip(1))
-    {
-        *behind.entry(*class).or_default() += 1;
-    }
+    let mut merge = Merge::new(sequences);
     let mut order = vec![class];
-    while sequences.iter().any(|sequence| !sequence.is_empty()) {
-        let mut selected = None;
-        for head in sequences.iter().filter_map(VecDeque::front) {
-            if !work.charge() {
-                return None;
-            }
-            if behind.get(head).is_none_or(|count| *count == 0) {
-                selected = Some(*head);
-                break;
-            }
-        }
-        let selected = selected?;
-        order.push(selected);
-        for sequence in &mut sequences {
-            if !work.charge() {
-                return None;
-            }
-            if sequence.front() != Some(&selected) {
-                continue;
-            }
-            sequence.pop_front();
-            if let Some(count) = sequence.front().and_then(|head| behind.get_mut(head)) {
-                *count -= 1;
-            }
-        }
+    while !merge.heads.is_empty() {
+        order.push(merge.take_next(work)?);
     }
     Some(ClassOrder::merged(order, true))
+}
+
+/// Sequences under a C3 merge, with their heads indexed.
+struct Merge<'source> {
+    sequences: Vec<VecDeque<ClassKey<'source>>>,
+    /// How many sequences hold a class behind their head, for the classes one holds.
+    behind: BTreeMap<ClassKey<'source>, usize>,
+    /// The sequences each class heads.
+    heads: BTreeMap<ClassKey<'source>, Vec<usize>>,
+    /// The sequences whose head no sequence holds behind its own.
+    ready: BTreeSet<usize>,
+}
+
+impl<'source> Merge<'source> {
+    fn new(sequences: Vec<VecDeque<ClassKey<'source>>>) -> Self {
+        let mut behind = BTreeMap::<_, usize>::new();
+        let mut heads = BTreeMap::<_, Vec<_>>::new();
+        for (index, sequence) in sequences.iter().enumerate() {
+            for class in sequence.iter().skip(1) {
+                *behind.entry(*class).or_default() += 1;
+            }
+            if let Some(head) = sequence.front() {
+                heads.entry(*head).or_default().push(index);
+            }
+        }
+        let ready = heads
+            .iter()
+            .filter(|(head, _)| !behind.contains_key(*head))
+            .flat_map(|(_, sequences)| sequences.iter().copied())
+            .collect();
+        Self {
+            sequences,
+            behind,
+            heads,
+            ready,
+        }
+    }
+
+    /// The next class of the merged order, removed from every sequence it heads. `None` where
+    /// no order satisfies every sequence.
+    fn take_next(&mut self, work: &mut Work) -> Option<ClassKey<'source>> {
+        let first = *self.ready.first()?;
+        let selected = *self.sequences.get(first)?.front()?;
+        for index in self.heads.remove(&selected)? {
+            if !work.charge() {
+                return None;
+            }
+            self.ready.remove(&index);
+            let sequence = self.sequences.get_mut(index)?;
+            sequence.pop_front();
+            let Some(&head) = sequence.front() else {
+                continue;
+            };
+            let sequences = self.heads.entry(head).or_default();
+            sequences.push(index);
+            // The sequences a class already heads become ready when the last one behind ends.
+            match self.behind.get_mut(&head) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.behind.remove(&head);
+                    self.ready.extend(sequences.iter().copied());
+                }
+                None => {
+                    self.ready.insert(index);
+                }
+            }
+        }
+        Some(selected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+
+    fn class(index: usize) -> ClassKey<'static> {
+        ClassKey::Declaration(NAMES[index], "C")
+    }
+
+    /// The C3 rule as Python states it: scan every sequence for a head in no tail.
+    fn scanned(
+        class: ClassKey<'static>,
+        mut sequences: Vec<VecDeque<ClassKey<'static>>>,
+    ) -> Option<Vec<ClassKey<'static>>> {
+        let mut order = vec![class];
+        loop {
+            sequences.retain(|sequence| !sequence.is_empty());
+            if sequences.is_empty() {
+                return Some(order);
+            }
+            let head = sequences.iter().map(|sequence| sequence[0]).find(|head| {
+                !sequences
+                    .iter()
+                    .any(|sequence| sequence.iter().skip(1).any(|class| class == head))
+            })?;
+            order.push(head);
+            for sequence in &mut sequences {
+                if sequence[0] == head {
+                    sequence.pop_front();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_orders_equal_a_scan_over_generated_hierarchies() {
+        let mut state = 1_u64;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            usize::try_from(state >> 33).expect("31 bits") % bound
+        };
+        let (mut merged, mut refused) = (0, 0);
+        for _ in 0..2_000 {
+            let mut orders: Vec<Option<Vec<ClassKey<'static>>>> = Vec::new();
+            for index in 0..NAMES.len() {
+                let mut bases = Vec::new();
+                for _ in 0..next(4) {
+                    let base = next(index.max(1));
+                    if base < index && !bases.contains(&base) {
+                        bases.push(base);
+                    }
+                }
+                let sequences = bases
+                    .iter()
+                    .map(|base| orders[*base].clone().map(VecDeque::from))
+                    .chain([Some(bases.iter().map(|base| class(*base)).collect())])
+                    .collect::<Option<Vec<_>>>();
+                let Some(sequences) = sequences else {
+                    orders.push(None);
+                    continue;
+                };
+                let expected = scanned(class(index), sequences.clone());
+                let mut work = Work::new(10_000);
+                let found = merge_sequences(class(index), sequences, &mut work).map(|order| {
+                    let OrderedClasses::Merged(classes) = order.classes else {
+                        panic!("a merged order");
+                    };
+                    classes
+                });
+                assert_eq!(found.is_some(), expected.is_some());
+                assert!(found == expected, "class {index}");
+                match expected {
+                    Some(_) => merged += 1,
+                    None => refused += 1,
+                }
+                orders.push(expected);
+            }
+        }
+        assert!(merged > 1_000 && refused > 100, "{merged} {refused}");
+    }
 }
