@@ -1188,6 +1188,17 @@ impl SyntaxProvider for PythonSyntaxProvider {
             .filter(|symbol| symbol.kind == MODULE_KIND)
         {
             MODULE_QUALIFIED_NAME.clone_into(&mut module.qualified_name);
+            // The root of a file without tokens is an empty range after its spaces.
+            if module.item_range.start == module.item_range.end {
+                let file = crate::ByteRange {
+                    start: 0,
+                    end: u64::try_from(source.text.len()).map_err(|overflow| {
+                        crate::failure::position_overflow(tree.root_node(), overflow)
+                    })?,
+                };
+                module.range = file;
+                module.item_range = file;
+            }
         }
         rules.attach_assigned_docs(&mut symbols);
         attach_attribute_docs(&rules, tree.root_node(), source.text, &mut symbols)?;
