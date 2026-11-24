@@ -10,6 +10,7 @@ use rift_syntax::SyntaxLimits;
 
 use super::{
     ArchiveMemberKind, ExactPackageInput, ExactPackageLimits, PackageImportRoot, PackageSource,
+    RustTarget,
 };
 
 /// Captured owner, selected sources, and metadata used to place logical declarations.
@@ -18,6 +19,7 @@ pub struct NamespaceInput<'input> {
     owner: &'input SymbolOwner,
     release_version: Option<&'input str>,
     rust_configuration: Option<(&'input ProjectPath, &'input [&'input str])>,
+    rust_target: Option<RustTarget>,
     language: &'input Language,
     files: &'input [PackageSource<'input>],
     context_sources: &'input [PackageSource<'input>],
@@ -38,6 +40,7 @@ impl<'input> NamespaceInput<'input> {
             owner: input.owner,
             release_version: Some(input.release_version),
             rust_configuration: input.rust_configuration,
+            rust_target: input.rust_target,
             language: input.language,
             files: input.files,
             context_sources: input.context_sources,
@@ -133,6 +136,7 @@ impl<'input> NamespaceInput<'input> {
             owner,
             release_version: None,
             rust_configuration: None,
+            rust_target: RustTarget::host(),
             language,
             files,
             context_sources,
@@ -184,6 +188,20 @@ impl<'input> NamespaceInput<'input> {
         }
         self.rust_configuration = Some((manifest, flags));
         Ok(self)
+    }
+
+    /// Selects the target whose predicates decide conditional Rust items.
+    ///
+    /// A local workspace starts with the host target and a package with
+    /// [`RustTarget::PACKAGE`]. `None` keeps every target predicate unknown.
+    #[must_use]
+    pub const fn with_rust_target(mut self, target: Option<RustTarget>) -> Self {
+        self.rust_target = target;
+        self
+    }
+
+    pub(crate) const fn rust_target(self) -> Option<RustTarget> {
+        self.rust_target
     }
 
     pub(crate) const fn rust_configuration(

@@ -2069,3 +2069,57 @@ fn test_rust_reexports_of_dependency_items_keep_the_written_module() {
         "/alloc/inner/local/Thing"
     ));
 }
+
+#[test]
+fn test_rust_target_conditions_store_facts_of_the_host_target() {
+    // #859: a local workspace decides target predicates with the host target.
+    let (_directory, index) = fixture_index(
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\n",
+        &[(
+            "src/lib.rs",
+            "pub struct Item { pub value: usize }\npub fn leaf() -> usize { 1 }\nimpl Item {\n    #[cfg(feature = \"std\")]\n    pub fn by_feature(&self) -> usize { leaf() + self.value }\n    #[cfg(unix)]\n    pub fn by_unix(&self) -> usize { leaf() + self.value }\n    #[cfg(any(unix, windows, target_os = \"wasi\"))]\n    pub fn by_any_target(&self) -> usize { leaf() + self.value }\n    #[cfg(all(feature = \"std\", any(unix, windows)))]\n    pub fn by_feature_and_target(&self) -> usize { leaf() + self.value }\n    #[cfg(not(target_os = \"emscripten\"))]\n    pub fn by_not_target(&self) -> usize { leaf() + self.value }\n    #[cfg(windows)]\n    pub fn by_windows(&self) -> usize { leaf() + self.value }\n    #[cfg(all(unix, custom))]\n    pub fn by_unknown(&self) -> usize { leaf() + self.value }\n    pub fn plain(&self) -> usize { leaf() + self.value }\n}\n#[cfg(unix)]\npub fn native() -> usize { 1 }\n#[cfg(windows)]\npub fn native() -> usize { 2 }\npub fn caller() -> usize { native() }\n",
+        )],
+    );
+    for (method, active) in [
+        ("by_feature", true),
+        ("by_unix", cfg!(unix)),
+        ("by_any_target", true),
+        ("by_feature_and_target", true),
+        ("by_not_target", true),
+        ("by_windows", cfg!(windows)),
+        ("by_unknown", false),
+        ("plain", true),
+    ] {
+        let from = format!("/Item/{method}");
+        for (kind, from, to) in [
+            (EdgeKind::Contains, "/fixture/Item", from.as_str()),
+            (EdgeKind::Calls, from.as_str(), "/fixture/leaf"),
+            (EdgeKind::Reads, from.as_str(), "/Item/value"),
+        ] {
+            assert_eq!(
+                has_edge(&index, kind, from, to),
+                active,
+                "{kind:?} {from} -> {to}"
+            );
+        }
+    }
+    assert!(
+        has_edge(
+            &index,
+            EdgeKind::Calls,
+            "/fixture/caller",
+            "/fixture/native"
+        ),
+        "the inactive alternative leaves the active declaration as the one target"
+    );
+    let view = index.symbol_view().expect("symbols");
+    assert!(
+        view.normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some()),
+        "every declaration keeps its identity"
+    );
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}

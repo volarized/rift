@@ -1,7 +1,9 @@
 //! Static package facts selected by a captured Rust build configuration.
 #![cfg(feature = "collector")]
 
-use rift_analysis::{ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageSource};
+use rift_analysis::{
+    ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageSource, RustTarget,
+};
 use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
 use rift_protocol::read::{EdgeKind, PackageIdentity};
 use rift_syntax::ShippedLanguage;
@@ -181,11 +183,28 @@ const WINDOWS: &[&str] = &[
     "feature=\"std\"",
 ];
 
+/// The conditional methods a unix and a windows build admit.
+const UNIX_METHODS: &[&str] = &[
+    "by_feature",
+    "by_unix",
+    "by_any_target",
+    "by_feature_and_target",
+    "by_not_target",
+];
+const WINDOWS_METHODS: &[&str] = &[
+    "by_feature",
+    "by_any_target",
+    "by_feature_and_target",
+    "by_not_target",
+    "by_windows",
+];
+
 #[test]
-fn test_rust_target_conditions_follow_the_captured_configuration_only() {
-    // #859: `unix`, `windows` and `target_os` predicates are decided by the captured build
-    // configuration, the same way on every host. Without one the target stays unknown:
-    // the declarations keep their identities and no fact inside them is resolved.
+fn test_rust_target_conditions_follow_the_selected_target() {
+    // #859: `unix`, `windows` and `target_os` predicates are decided by the selected target
+    // or the captured build configuration, the same way on every host. A package without
+    // either uses one fixed target. Without a target the declarations keep their identities
+    // and no fact inside them is resolved.
     let package = PackageIdentity {
         manager: "cargo".into(),
         registry: "crates.io".into(),
@@ -214,28 +233,20 @@ fn test_rust_target_conditions_follow_the_captured_configuration_only() {
         "by_not_target",
         "by_windows",
     ];
-    for (flags, active) in [
-        (None, &["by_feature"][..]),
-        (
-            Some(UNIX),
-            &[
-                "by_feature",
-                "by_unix",
-                "by_any_target",
-                "by_feature_and_target",
-                "by_not_target",
-            ][..],
-        ),
-        (
-            Some(WINDOWS),
-            &[
-                "by_feature",
-                "by_any_target",
-                "by_feature_and_target",
-                "by_not_target",
-                "by_windows",
-            ][..],
-        ),
+    let linux_target = RustTarget::from_triple("x86_64-unknown-linux-gnu");
+    let macos_target = RustTarget::from_triple("aarch64-apple-darwin");
+    let windows_target = RustTarget::from_triple("x86_64-pc-windows-msvc");
+    assert!(linux_target.is_some() && macos_target.is_some() && windows_target.is_some());
+    for (flags, target, active) in [
+        (None, Some(None), &["by_feature"][..]),
+        (None, None, UNIX_METHODS),
+        (None, Some(linux_target), UNIX_METHODS),
+        (None, Some(macos_target), UNIX_METHODS),
+        (None, Some(windows_target), WINDOWS_METHODS),
+        (Some(UNIX), None, UNIX_METHODS),
+        (Some(WINDOWS), None, WINDOWS_METHODS),
+        // Complete captured flags decide their manifest whatever the target.
+        (Some(UNIX), Some(windows_target), UNIX_METHODS),
     ] {
         let input = ExactPackageInput::new(
             &owner,
@@ -253,6 +264,10 @@ fn test_rust_target_conditions_follow_the_captured_configuration_only() {
                 .expect("captured flags"),
             None => input,
         };
+        let input = match target {
+            Some(target) => input.with_rust_target(target),
+            None => input,
+        };
         let analysis = PackageAnalyzer::analyze(input, 1).expect("analysis");
         let publication = analysis.publication();
         for method in methods {
@@ -261,22 +276,23 @@ fn test_rust_target_conditions_follow_the_captured_configuration_only() {
                     .objects
                     .iter()
                     .any(|object| object.name == method && object.id.is_some()),
-                "{flags:?}: {method} keeps its declaration and identity"
+                "{flags:?} {target:?}: {method} keeps its declaration and identity"
             );
-            for (kind, to) in [
-                (EdgeKind::Calls, "/fixture/leaf"),
-                (EdgeKind::Reads, "/Item/value"),
+            let from = format!("/Item/{method}");
+            for (kind, from, to) in [
+                (EdgeKind::Calls, from.as_str(), "/fixture/leaf"),
+                (EdgeKind::Reads, from.as_str(), "/Item/value"),
+                (EdgeKind::Contains, "/fixture/Item", from.as_str()),
             ] {
-                let from = format!("/Item/{method}");
                 let found = publication.edges.iter().any(|edge| {
                     edge.kinds.contains(&kind)
-                        && edge.from.0.ends_with(&from)
+                        && edge.from.0.ends_with(from)
                         && edge.to.0.ends_with(to)
                 });
                 assert_eq!(
                     found,
                     active.contains(&method),
-                    "{flags:?}: {kind:?} {from} -> {to}"
+                    "{flags:?} {target:?}: {kind:?} {from} -> {to}"
                 );
             }
         }
