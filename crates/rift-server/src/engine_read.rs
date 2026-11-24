@@ -4374,9 +4374,9 @@ pub fn unlocated() {}
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
   case "$body" in
     *'"method":"initialize"'*) frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
     *'"method":"exit"'*) break ;;
@@ -4817,10 +4817,10 @@ done
     const METHOD_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
+  case "$body" in *'"uri":"'*) uri=${body#*\"uri\":\"}; uri=${uri%%\"*} ;; *) uri= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":CAPABILITIES}}" ;;
