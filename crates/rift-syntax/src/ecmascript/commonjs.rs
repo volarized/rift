@@ -92,7 +92,7 @@ pub(super) fn record<'tree>(
         bindings.insert(syntax_element.id(), binding);
     }
     if !captured.blocked.contains(&root.id()) {
-        record_aliases(&body, &captured.aliases, &captured.assignments, bindings)?;
+        record_aliases(&body, &captured, bindings)?;
         record_calls(&body, &captured.calls, bindings)?;
     }
     let closed_export = closed_export
@@ -312,8 +312,7 @@ fn alias<'tree>(
 /// Records the module value an alias names and the exports written through the alias.
 fn record_aliases(
     body: &ModuleBody<'_, '_>,
-    aliases: &[Alias<'_>],
-    assignments: &[Node<'_>],
+    captured: &CapturedAssignments<'_>,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
 ) -> Result<(), RiftError> {
     let ModuleBody {
@@ -322,18 +321,18 @@ fn record_aliases(
         kinds,
         ..
     } = *body;
+    let aliases = &captured.aliases;
+    let mut current = BTreeMap::new();
     for alias in aliases {
-        let name = source.get(alias.name.byte_range()).unwrap_or_default();
+        let name = text(source, alias.name);
+        // A name bound again anywhere can hold another value when the module body runs on.
         if !alias_is_current(body, alias)
-            || aliases
-                .iter()
-                .any(|other| other.name != alias.name && text(source, other.name) == name)
-            || assignments
-                .iter()
-                .any(|assignment| rebinds(*assignment, name, source, kinds))
+            || captured.rebound.contains(name)
+            || captured.bound.get(name) != Some(&1)
         {
             continue;
         }
+        current.insert(name, alias);
         if let Some(write) = alias.write {
             let binding = match assignment(write, source, kinds)? {
                 Some(binding) => binding,
@@ -354,10 +353,13 @@ fn record_aliases(
             };
             bindings.insert(recorded.id(), binding);
         }
-        for &assignment in assignments {
-            if let Some(binding) = alias_write(root, alias, name, assignment, source, kinds)? {
-                bindings.insert(assignment.id(), binding);
-            }
+    }
+    if current.is_empty() {
+        return Ok(());
+    }
+    for &assignment in &captured.assignments {
+        if let Some(binding) = alias_write(root, &current, assignment, source, kinds)? {
+            bindings.insert(assignment.id(), binding);
         }
     }
     Ok(())
@@ -382,23 +384,11 @@ fn alias_is_current(body: &ModuleBody<'_, '_>, alias: &Alias<'_>) -> bool {
     }
 }
 
-/// Whether an assignment writes the plain name or a pattern that binds it.
-fn rebinds(assignment: Node<'_>, name: &str, source: &str, kinds: &EcmaScriptKinds) -> bool {
-    kinds
-        .child(assignment, EcmaScriptGrammarField::Left)
-        .filter(|left| left.kind_id() != kinds.member_expression)
-        .is_some_and(|left| {
-            binding_holds(left, source, |identifier| identifier == name)
-                && left.kind() != "subscript_expression"
-        })
-}
-
 /// `app.name = value` in the module body, with `app` the checked alias. A function is
 /// declared as the member the assignment writes; an identifier names its declaration.
 fn alias_write(
     root: Node<'_>,
-    alias: &Alias<'_>,
-    name: &str,
+    aliases: &BTreeMap<&str, &Alias<'_>>,
     assignment: Node<'_>,
     source: &str,
     kinds: &EcmaScriptKinds,
@@ -414,12 +404,13 @@ fn alias_write(
     };
     let receiver = kinds
         .child(left, EcmaScriptGrammarField::Object)
-        .filter(|object| object.kind_id() == kinds.identifier && text(source, *object) == name);
+        .filter(|object| object.kind_id() == kinds.identifier)
+        .and_then(|object| aliases.get(text(source, object)));
     let property = kinds
         .child(left, EcmaScriptGrammarField::Property)
         .filter(|property| property.kind_id() == kinds.property_identifier);
     let value = kinds.child(assignment, EcmaScriptGrammarField::Right);
-    let (Some(_), Some(property), Some(value)) = (receiver, property, value) else {
+    let (Some(alias), Some(property), Some(value)) = (receiver, property, value) else {
         return Ok(None);
     };
     if assignment.start_byte() < alias.declarator.end_byte() {
@@ -629,6 +620,10 @@ struct CapturedAssignments<'tree> {
     aliases: Vec<Alias<'tree>>,
     /// Every name a declaration outside a named scope binds.
     names: BTreeSet<String>,
+    /// How many declarations outside a named scope bind each name.
+    bound: BTreeMap<String, usize>,
+    /// Names an assignment, an update or a loop gives another value.
+    rebound: BTreeSet<String>,
     blocked: BTreeSet<usize>,
     replaced: BTreeMap<usize, usize>,
     synchronized: Option<(Node<'tree>, Node<'tree>)>,
@@ -661,6 +656,7 @@ fn capture_assignments<'tree>(
                 .fail();
         }
         captured.add(syntax_element, root, source.text, kinds);
+        captured.rebind(syntax_element, source.text);
         if visited
             .saturating_add(pending.len())
             .saturating_add(syntax_element.named_child_count())
@@ -673,6 +669,7 @@ fn capture_assignments<'tree>(
         }
         if module_scope {
             declared_names(syntax_element, source.text, kinds, &mut captured.names);
+            captured.bind(syntax_element, source.text, kinds);
         }
         let module_scope =
             module_scope && !opens_named_scope(syntax_element, root, source.text, kinds);
@@ -684,6 +681,60 @@ fn capture_assignments<'tree>(
 }
 
 impl<'tree> CapturedAssignments<'tree> {
+    /// Counts the one name a variable, function or class declaration binds.
+    fn bind(&mut self, syntax_element: Node<'tree>, source: &str, kinds: &EcmaScriptKinds) {
+        if matches!(
+            kinds.symbol_kind(syntax_element),
+            Some(
+                EcmaScriptSymbolKind::Variable
+                    | EcmaScriptSymbolKind::Function
+                    | EcmaScriptSymbolKind::Class
+            )
+        ) && let Some(name) = kinds.name_syntax_element(syntax_element)
+        {
+            binding_holds(name, source, |identifier| {
+                *self.bound.entry(identifier.to_owned()).or_default() += 1;
+                false
+            });
+        }
+    }
+
+    /// Adds each name an assignment, an update or a loop head without a declaration writes,
+    /// and a replacement of `module.exports` in a form no assignment binding reads.
+    fn rebind(&mut self, syntax_element: Node<'tree>, source: &str) {
+        let written = match syntax_element.kind() {
+            "assignment_expression" | "augmented_assignment_expression" => {
+                syntax_element.child_by_field_name("left")
+            }
+            "update_expression" => syntax_element.child_by_field_name("argument"),
+            "for_in_statement" => syntax_element
+                .child_by_field_name("left")
+                .filter(|_| syntax_element.child_by_field_name("kind").is_none()),
+            _ => None,
+        };
+        let Some(written) = written else {
+            return;
+        };
+        let plain = syntax_element.kind() == "assignment_expression";
+        let replaces = match written.kind() {
+            "member_expression" => !plain && text(source, written) == "module.exports",
+            "subscript_expression" => written
+                .child_by_field_name("object")
+                .is_some_and(|object| text(source, object) == "module"),
+            _ => {
+                binding_holds(written, source, |identifier| {
+                    self.rebound.insert(identifier.to_owned());
+                    false
+                });
+                false
+            }
+        };
+        if replaces && let Some(scope) = lexical_scope(syntax_element) {
+            let end = self.replaced.entry(scope.id()).or_default();
+            *end = (*end).max(syntax_element.end_byte());
+        }
+    }
+
     /// Adds what one element writes: a rebound wrapper name, an assignment, a call of the
     /// module body or an alias of the exported object.
     fn add(
@@ -843,7 +894,7 @@ fn initialized_exports(
     Ok(initialized)
 }
 
-/// Inner write of one unconditional `exports = module.exports = name` statement.
+/// Inner write of one unconditional `exports = module.exports = value` statement.
 fn synchronization<'tree>(
     outer: Node<'tree>,
     root: Node<'tree>,
@@ -870,7 +921,8 @@ fn synchronization<'tree>(
     }
     let module = kinds.child(inner, EcmaScriptGrammarField::Left)?;
     let value = kinds.child(inner, EcmaScriptGrammarField::Right)?;
-    (source.get(module.byte_range())? == "module.exports" && value.kind_id() == kinds.identifier)
+    (source.get(module.byte_range())? == "module.exports"
+        && value.kind_id() != kinds.assignment_expression)
         .then_some(inner)
 }
 
@@ -938,12 +990,20 @@ fn direct_exports_write(
     source: &str,
     kinds: &EcmaScriptKinds,
 ) -> bool {
-    if source.get(receiver.byte_range()) != Some("exports") {
+    // `exports` and `module.exports` name the same object while both stay synchronized.
+    let object = match source.get(receiver.byte_range()) {
+        Some("exports") => Some(receiver),
+        Some("module") => receiver
+            .parent()
+            .filter(|exports| kinds.is_module_exports(*exports, source)),
+        _ => None,
+    };
+    let Some(object) = object else {
         return false;
-    }
-    receiver.parent().is_some_and(|member| {
+    };
+    object.parent().is_some_and(|member| {
         member.kind_id() == kinds.member_expression
-            && kinds.child(member, EcmaScriptGrammarField::Object) == Some(receiver)
+            && kinds.child(member, EcmaScriptGrammarField::Object) == Some(object)
             && kinds
                 .child(member, EcmaScriptGrammarField::Property)
                 .is_some_and(|name| name.kind_id() == kinds.property_identifier)

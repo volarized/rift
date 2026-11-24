@@ -369,7 +369,7 @@ fn entry_modules(
             Entry::Absent => (BTreeMap::new(), false),
         };
     };
-    let mut modules = BTreeMap::new();
+    let mut candidates = BTreeMap::<ProjectPath, Vec<EntryCandidate<'_>>>::new();
     let mut unresolved = false;
     for (key, target) in &exports.0 {
         let suffix = if key == "." {
@@ -384,36 +384,61 @@ fn entry_modules(
             unresolved = true;
             continue;
         };
-        let Some(target) = target.target(language) else {
+        let path = target
+            .target(language)
+            .and_then(|path| path.strip_prefix("./"))
+            .filter(|relative| export_subpath_is_valid(relative))
+            .and_then(|relative| ProjectPath::new(relative).ok());
+        let Some(path) = path else {
             unresolved = true;
             continue;
         };
-        let Some(relative) = target.strip_prefix("./") else {
-            unresolved = true;
-            continue;
-        };
-        if !export_subpath_is_valid(relative) {
-            unresolved = true;
-            continue;
-        }
-        let Ok(path) = ProjectPath::new(relative) else {
-            unresolved = true;
-            continue;
-        };
-        let module = format!("{}{suffix}", metadata.name);
-        match modules.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(Some(module));
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().as_ref() != Some(&module) {
-                    entry.insert(None);
-                    unresolved = true;
-                }
-            }
-        }
+        candidates.entry(path).or_default().push(EntryCandidate {
+            key,
+            module: format!("{}{suffix}", metadata.name),
+            unconditional: target.is_unconditional(language),
+        });
     }
+    let modules = candidates
+        .into_iter()
+        .map(|(path, candidates)| {
+            let module = file_module(candidates);
+            unresolved |= module.is_none();
+            (path, module)
+        })
+        .collect();
     (modules, unresolved)
+}
+
+/// One subpath whose target is a file.
+struct EntryCandidate<'metadata> {
+    key: &'metadata str,
+    module: String,
+    unconditional: bool,
+}
+
+/// The one module a file is published under. An unconditional subpath keeps the file before
+/// a conditional one, and two of them leave it unresolved. Among conditional subpaths the
+/// package entry holds it, else the first key in order; the others are aliases.
+fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> Option<String> {
+    let unconditional = candidates
+        .iter()
+        .filter(|candidate| candidate.unconditional)
+        .count();
+    if unconditional > 1 {
+        return None;
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            !candidate.unconditional,
+            candidate.key != ".",
+            candidate.key,
+        )
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.module)
 }
 
 fn export_subpath_is_valid(path: &str) -> bool {
@@ -735,9 +760,23 @@ impl Exports {
 const TYPES_CONDITION: &str = "types";
 /// The condition every consumer selects.
 const DEFAULT_CONDITION: &str = "default";
-/// Conditions of a consumer that imports or requires the package, without a bundler or a
-/// runtime of its own.
-const STATIC_CONDITIONS: [&str; 2] = ["import", "require"];
+/// How a static consumer loads a module. Node matches exactly one of `import` and `require`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loader {
+    Module,
+    CommonJs,
+}
+
+/// The conditions a consumer of `language` matches beside `types` and `default`. Custom,
+/// community and bundler conditions match none: no static consumer enables them.
+fn consumer_conditions(language: &str, loader: Loader) -> &'static [&'static str] {
+    match (language, loader) {
+        ("typescript", Loader::Module) => &["node", "import"],
+        ("typescript", Loader::CommonJs) => &["node", "require"],
+        (_, Loader::Module) => &["node", "import", "module-sync"],
+        (_, Loader::CommonJs) => &["node", "require", "module-sync"],
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -769,9 +808,34 @@ enum SelectedTarget<'metadata> {
 }
 
 impl ExportTarget {
-    /// The target a static consumer of `language` selects, in the declared order.
+    /// The target that holds the module identity for `language`: the one an ECMAScript
+    /// module consumer selects in the declared order, else the one a `require` selects.
     fn target(&self, language: &str) -> Option<&str> {
-        self.selected_target(language == "typescript", &STATIC_CONDITIONS)
+        [Loader::Module, Loader::CommonJs]
+            .into_iter()
+            .find_map(|loader| {
+                self.selected_target(
+                    language == "typescript",
+                    consumer_conditions(language, loader),
+                )
+            })
+    }
+
+    /// Whether the target was resolved by its first condition alone: a direct file, a first
+    /// `default`, or a first `types` for TypeScript. A subpath that first resolves through
+    /// the condition walk never takes a file from such a subpath.
+    fn is_unconditional(&self, language: &str) -> bool {
+        match self {
+            Self::Direct(_) => true,
+            Self::Unresolved(UnresolvedTarget) => false,
+            Self::Conditions(conditions) => {
+                conditions.0.first().is_some_and(|(condition, target)| {
+                    (condition == DEFAULT_CONDITION
+                        || (condition == TYPES_CONDITION && language == "typescript"))
+                        && target.is_unconditional(language)
+                })
+            }
+        }
     }
 
     fn selected_target(&self, types: bool, selected: &[&str]) -> Option<&str> {
@@ -791,7 +855,10 @@ impl ExportTarget {
         for (name, target) in &conditions.0 {
             // A compiler version decides this selector, and no version is captured.
             if name.starts_with("types@") {
-                return SelectedTarget::Refused;
+                if types {
+                    return SelectedTarget::Refused;
+                }
+                continue;
             }
             if name != DEFAULT_CONDITION
                 && !(types && name == TYPES_CONDITION)

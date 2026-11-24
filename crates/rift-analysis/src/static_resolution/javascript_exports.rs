@@ -410,7 +410,7 @@ impl<'source> Exports<'_, 'source> {
         let mut found: Option<Export<'source>> = None;
         let mut stars = Vec::new();
         let mut keys_are_symbols = None;
-        for binding in file.document.facts.export_bindings()? {
+        for binding in file.exports.as_ref()?.candidates(name) {
             if !work.charge() {
                 return None;
             }
@@ -609,6 +609,59 @@ enum Export<'source> {
     },
 }
 
+/// A file's export bindings, read once: a lookup charges only the bindings that can answer.
+pub(super) struct ExportBindings<'source> {
+    named: BTreeMap<&'source str, Vec<&'source rift_syntax::SyntaxExportBinding>>,
+    defaults: Vec<&'source rift_syntax::SyntaxExportBinding>,
+    stars: Vec<&'source rift_syntax::SyntaxExportBinding>,
+}
+
+impl<'source> ExportBindings<'source> {
+    fn read(
+        file: &File<'source>,
+        bindings: &'source [rift_syntax::SyntaxExportBinding],
+        work: &mut Work,
+    ) -> Option<Self> {
+        let mut read = Self {
+            named: BTreeMap::new(),
+            defaults: Vec::new(),
+            stars: Vec::new(),
+        };
+        for binding in bindings {
+            if !work.charge() {
+                return None;
+            }
+            match binding.kind {
+                SyntaxExportKind::All => read.stars.push(binding),
+                SyntaxExportKind::Default => read.defaults.push(binding),
+                SyntaxExportKind::Named | SyntaxExportKind::Namespace => {
+                    if let Some(name) = binding.exported.and_then(|range| file.text(range)) {
+                        read.named.entry(name).or_default().push(binding);
+                    }
+                }
+            }
+        }
+        Some(read)
+    }
+
+    fn candidates(
+        &self,
+        slot: ExportSlot<'source>,
+    ) -> impl Iterator<Item = &'source rift_syntax::SyntaxExportBinding> + '_ {
+        let (name, default) = match slot {
+            ExportSlot::Named(name) => (Some(name), name == "default"),
+            ExportSlot::Default => (None, true),
+            ExportSlot::Unknown => (None, false),
+        };
+        name.and_then(|name| self.named.get(name))
+            .into_iter()
+            .flatten()
+            .chain(self.defaults.iter().filter(move |_| default))
+            .chain(&self.stars)
+            .copied()
+    }
+}
+
 /// A whole-module export: `export * from`, `module.exports = require(..)` or a copy of
 /// another module's exports onto `exports`.
 struct ExportStar<'source> {
@@ -668,9 +721,14 @@ impl<'source> Export<'source> {
 
 impl<'source> File<'source> {
     pub(super) fn index_javascript_members(&mut self, work: &mut Work) -> Option<()> {
+        self.exports = match self.document.facts.export_bindings() {
+            Some(bindings) => Some(ExportBindings::read(self, bindings, work)?),
+            None => None,
+        };
         if self.facts.members().is_empty() {
             return Some(());
         }
+        let mut declared = None;
         for member in self.facts.members() {
             if !work.charge() {
                 return None;
@@ -691,7 +749,7 @@ impl<'source> File<'source> {
                 continue;
             };
             self.index_javascript_object_write(member, work);
-            self.index_exported_object_write(member, work);
+            self.index_exported_object_write(member, &mut declared, work)?;
             let Some((receiver, slot)) = self.javascript_export_slot(member) else {
                 continue;
             };
@@ -721,33 +779,61 @@ impl<'source> File<'source> {
     }
 
     /// Records a write to a member of the value an export assignment declares:
-    /// `module.exports.helpers.add = value`.
-    fn index_exported_object_write(&mut self, member: &rift_syntax::StaticMember, work: &mut Work) {
+    /// `module.exports.helpers.add = value`. `declared` holds the exports the file declares
+    /// this way, read once.
+    fn index_exported_object_write(
+        &mut self,
+        member: &rift_syntax::StaticMember,
+        declared: &mut Option<BTreeMap<&'source str, Option<rift_syntax::ByteRange>>>,
+        work: &mut Work,
+    ) -> Option<()> {
         let Some(name) = self.text(member.receiver).and_then(|receiver| {
             receiver
                 .strip_prefix("module.exports.")
                 .or_else(|| receiver.strip_prefix("exports."))
                 .filter(|name| !name.contains(['.', '[', '(']))
         }) else {
-            return;
+            return Some(());
         };
-        let written = member.member.and_then(|range| self.text(range));
+        let declared = match declared {
+            Some(declared) => declared,
+            None => declared.insert(self.declared_exports(work)?),
+        };
+        // An export declared twice is stable for no call.
+        if let Some(Some(declaration)) = declared.get(name) {
+            let written = member.member.and_then(|range| self.text(range));
+            self.member_writes
+                .entry((*declaration, written))
+                .and_modify(|position| *position = None)
+                .or_insert(Some(member.range.start));
+        }
+        Some(())
+    }
+
+    /// Each name an export assignment declares, with its one declaration.
+    fn declared_exports(
+        &self,
+        work: &mut Work,
+    ) -> Option<BTreeMap<&'source str, Option<rift_syntax::ByteRange>>> {
+        let mut declared = BTreeMap::new();
         for binding in self.document.facts.export_bindings().unwrap_or_default() {
             if !work.charge() {
-                self.unknown_member_writes.insert(None);
-                return;
+                return None;
             }
-            let declared = binding
+            let Some(exported) = binding
                 .exported
                 .filter(|&exported| binding.local == Some(exported))
-                .filter(|&exported| self.text(exported) == Some(name));
-            if let Some(declared) = declared {
-                self.member_writes
-                    .entry((declared, written))
-                    .and_modify(|position| *position = None)
-                    .or_insert(Some(member.range.start));
+            else {
+                continue;
+            };
+            if let Some(name) = self.text(exported) {
+                declared
+                    .entry(name)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(exported));
             }
         }
+        Some(declared)
     }
 
     fn javascript_export_slot(
@@ -812,8 +898,11 @@ impl<'source> File<'source> {
             .body_range
             .and_then(|range| self.text(range))
             .is_some_and(|value| {
-                let value = value.trim_start();
-                value.starts_with("Symbol(") || value.starts_with("Symbol.for(")
+                // The call is the whole value: a member of it, or an operator, gives another.
+                ["Symbol(", "Symbol.for("]
+                    .iter()
+                    .find_map(|call| value.trim().strip_prefix(call)?.strip_suffix(')'))
+                    .is_some_and(|argument| !argument.contains(['(', ')']))
             })
             && !self.by_name.contains_key("Symbol")
             && !self.javascript_reassigned("Symbol", None)
@@ -835,6 +924,7 @@ impl<'source> File<'source> {
             .is_some_and(|value| value.starts_with('{'))
             && literal.encloses(property.symbol.item_range)
             && property.symbol.syntax_element_kind == Some("pair")
+            && self.property_is_settled(literal, property)
             && !self.unknown_member_writes.contains(&None)
             && !self
                 .unknown_member_writes
@@ -842,6 +932,19 @@ impl<'source> File<'source> {
             && !self.javascript_reassigned(&owner.symbol.name, None)
             && unwritten
             && self.is_symbol_initializer(property)
+    }
+
+    /// Whether no spread and no computed key written after the property can replace it.
+    fn property_is_settled(
+        &self,
+        literal: rift_syntax::ByteRange,
+        property: Target<'source>,
+    ) -> bool {
+        self.text(rift_syntax::ByteRange {
+            start: property.symbol.item_range.end,
+            end: literal.end,
+        })
+        .is_some_and(|later| !later.contains("...") && !later.contains('['))
     }
 
     /// Whether no write through `exports` can give the export `name` a second value.
@@ -997,6 +1100,21 @@ impl<'source> File<'source> {
                 .is_some_and(Option::is_some)
     }
 
+    /// Whether the binding exports what its own assignment declares. Such a name is no
+    /// reference: a lexical declaration of the same name is another one.
+    pub(super) fn declares_its_export(&self, binding: &rift_syntax::SyntaxExportBinding) -> bool {
+        binding.local.is_some()
+            && binding.local == binding.exported
+            && self
+                .text(binding.range)
+                .is_some_and(|written| matches_export_form(written, ModuleMode::CommonJs))
+            && !binding.local.is_some_and(|local| {
+                self.target_at(local).is_some_and(|target| {
+                    target.symbol.syntax_element_kind == Some("shorthand_property_identifier")
+                })
+            })
+    }
+
     fn javascript_export_role(
         &self,
         binding: &rift_syntax::SyntaxExportBinding,
@@ -1027,6 +1145,9 @@ impl<'source> File<'source> {
         }
         let local = binding.local?;
         let declaration = self.target_at(local);
+        if declaration.is_none() && self.declares_its_export(binding) {
+            return None;
+        }
         let local_name = declaration
             .map(|target| target.symbol.name.as_str())
             .or_else(|| self.text(local))?;

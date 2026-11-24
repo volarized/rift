@@ -3950,6 +3950,38 @@ fn test_commonjs_module_value_aliases_and_assigned_values_resolve() {
     assert_eq!(index.edges().dropped_edges(), 0);
 }
 
+/// Imports that bind a key to a symbol value, and the key.
+const SYMBOL_KEYS: &[(&str, &str)] = &[
+    ("const { kInternals } = require('./keys.js')", "kInternals"),
+    ("const { kShared } = require('./keys.js')", "kShared"),
+    ("const { kState } = require('./bag.js')", "kState"),
+    ("const { kPair } = require('./literal.js')", "kPair"),
+    (
+        "const { kInternals: kKey } = require('./reexport.js')",
+        "kKey",
+    ),
+    ("const kOwn = Symbol.for('own')", "kOwn"),
+];
+
+/// Imports that bind a key to another or an unknown value, and the key.
+const OTHER_KEYS: &[(&str, &str)] = &[
+    ("const { kName } = require('./keys.js')", "kName"),
+    ("const { kLoose } = require('./keys.js')", "kLoose"),
+    ("const { kText } = require('./bag.js')", "kText"),
+    ("const { kSpread } = require('./spread.js')", "kSpread"),
+    ("const { kKeyed } = require('./spread.js')", "kKeyed"),
+    ("const kPart = Symbol('run').description", "kPart"),
+    ("const { kOther } = require('./literal.js')", "kOther"),
+    ("const { kChanged } = require('./changed.js')", "kChanged"),
+    ("const { kMissing } = require('./missing.js')", "kMissing"),
+    ("const { kExternal } = require('external')", "kExternal"),
+    (
+        "let { kInternals } = require('./keys.js'); kInternals = 'run'",
+        "kInternals",
+    ),
+    ("const Symbol = String; const kOwn = Symbol('run')", "kOwn"),
+];
+
 #[test]
 fn test_commonjs_export_keys_imported_as_symbols_name_no_export() {
     // A computed key on `module.exports` whose value is a symbol declared in another module
@@ -3965,6 +3997,10 @@ module.exports = { kInternals, kShared, kName, kLoose }
 module.exports = keys
 ";
     let literal = "module.exports = { kPair: Symbol('pair'), kOther: 'run' }
+";
+    let spread =
+        "const keys = { kSpread: Symbol('spread'), kKeyed: Symbol('keyed'), ...other, [name]: 1 }
+module.exports = keys
 ";
     let changed = "const kChanged = Symbol('changed')
 exports.kChanged = kChanged
@@ -3984,39 +4020,15 @@ module.exports[{key}] = {{ run }}
 "
         )
     };
-    let accepted = [
-        ("const { kInternals } = require('./keys.js')", "kInternals"),
-        ("const { kShared } = require('./keys.js')", "kShared"),
-        ("const { kState } = require('./bag.js')", "kState"),
-        ("const { kPair } = require('./literal.js')", "kPair"),
-        (
-            "const { kInternals: kKey } = require('./reexport.js')",
-            "kKey",
-        ),
-        ("const kOwn = Symbol.for('own')", "kOwn"),
-    ];
-    let refused = [
-        ("const { kName } = require('./keys.js')", "kName"),
-        ("const { kLoose } = require('./keys.js')", "kLoose"),
-        ("const { kText } = require('./bag.js')", "kText"),
-        ("const { kOther } = require('./literal.js')", "kOther"),
-        ("const { kChanged } = require('./changed.js')", "kChanged"),
-        ("const { kMissing } = require('./missing.js')", "kMissing"),
-        ("const { kExternal } = require('external')", "kExternal"),
-        (
-            "let { kInternals } = require('./keys.js'); kInternals = 'run'",
-            "kInternals",
-        ),
-        ("const Symbol = String; const kOwn = Symbol('run')", "kOwn"),
-    ];
     let mut files = vec![
         ("keys.js".to_owned(), keys.to_owned()),
         ("bag.js".to_owned(), bag.to_owned()),
         ("literal.js".to_owned(), literal.to_owned()),
         ("changed.js".to_owned(), changed.to_owned()),
+        ("spread.js".to_owned(), spread.to_owned()),
         ("reexport.js".to_owned(), reexport.to_owned()),
     ];
-    let owners = accepted.iter().chain(&refused).enumerate();
+    let owners = SYMBOL_KEYS.iter().chain(OTHER_KEYS).enumerate();
     let mut requires = Vec::new();
     let mut calls = Vec::new();
     for (index, (import, key)) in owners {
@@ -4035,7 +4047,7 @@ module.exports[{key}] = {{ run }}
         .map(|(path, source)| (path.as_str(), source.as_str()))
         .collect::<Vec<_>>();
     let (_directory, index) = workspace(&files);
-    for (position, (import, _)) in accepted.iter().chain(&refused).enumerate() {
+    for (position, (import, _)) in SYMBOL_KEYS.iter().chain(OTHER_KEYS).enumerate() {
         for member in ["Owner", "run"] {
             assert_eq!(
                 has_edge(
@@ -4044,9 +4056,136 @@ module.exports[{key}] = {{ run }}
                     "main.js/build",
                     &format!("owner{position}.js/{member}")
                 ),
-                position < accepted.len(),
+                position < SYMBOL_KEYS.len(),
                 "{import} {member}"
             );
         }
     }
+}
+
+/// Every way a module assigns one function or class as its value, with the declaration the
+/// package exports and the member assigned after it.
+const MODULE_VALUES: &[(&str, &str, &str)] = &[
+    (
+        "anonymous.js",
+        "module.exports = function (val, options) { return val }\n",
+        "default",
+    ),
+    (
+        "named.js",
+        "module.exports = function named (val) { return val }\n",
+        "named",
+    ),
+    ("arrow.js", "module.exports = (a) => a\n", "default"),
+    (
+        "chain.js",
+        "exports = module.exports = function (val) { return val }\n",
+        "default",
+    ),
+    (
+        "synced.js",
+        "exports = module.exports = function synced (val) { return val }\n",
+        "synced",
+    ),
+    (
+        "kit.js",
+        "module.exports = class { run () { return 1 } static make () {} }\n",
+        "default",
+    ),
+    (
+        "tool.js",
+        "module.exports = class Tool { run () { return 1 } static make () {} }\n",
+        "Tool",
+    ),
+];
+
+#[test]
+fn test_commonjs_module_values_declare_their_function_or_class() {
+    let mut files = Vec::new();
+    for (path, source, _) in MODULE_VALUES {
+        files.push((
+            (*path).to_owned(),
+            format!("{source}module.exports.x = function x () {{ return 1 }}\nmodule.exports.limit = 10\n"),
+        ));
+        let class = source.contains("class");
+        let value = if class {
+            "lib.make(), new lib()"
+        } else {
+            "lib(1)"
+        };
+        files.push((
+            format!("use-{path}"),
+            format!("const lib = require('./{path}')\nfunction use () {{ return [{value}, lib.x(), lib.limit] }}\nmodule.exports = use\n"),
+        ));
+    }
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let (_directory, index) = workspace(&files);
+    for (path, source, name) in MODULE_VALUES {
+        let class = source.contains("class");
+        let file = index
+            .files()
+            .find(|file| file.path().as_str() == *path)
+            .expect("module file");
+        let symbol = file
+            .syntax()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.qualified_name == *name)
+            .expect("declared module value");
+        assert_eq!(
+            symbol.kind,
+            if class { "class" } else { "function" },
+            "{path}"
+        );
+        assert!(
+            symbol
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Public),
+            "{path}"
+        );
+        assert!(
+            file.syntax()
+                .export_bindings()
+                .expect("bindings")
+                .iter()
+                .any(|binding| binding.exported.is_none() && binding.local == symbol.name_range),
+            "{path} binds its module value"
+        );
+        let from = format!("use-{path}/use");
+        let mut expected = vec![
+            (EdgeKind::Calls, (*name).to_owned()),
+            (EdgeKind::Calls, "x".to_owned()),
+            (EdgeKind::Reads, "x".to_owned()),
+            (EdgeKind::Reads, "limit".to_owned()),
+        ];
+        if class {
+            expected.push((EdgeKind::Calls, format!("{name}/make")));
+            for member in ["run", "make"] {
+                assert!(
+                    has_edge(
+                        &index,
+                        EdgeKind::Contains,
+                        &format!("{path}/{name}"),
+                        &format!("{path}/{name}/{member}")
+                    ),
+                    "{path} {member}"
+                );
+            }
+        }
+        for (kind, to) in expected {
+            let to = format!("%2F{path}/{to}");
+            assert!(has_edge(&index, kind, &from, &to), "{kind:?} {from} {to}");
+        }
+    }
+    let javascript =
+        rift_protocol::read::Language::from_identity_segment("javascript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&javascript)
+            .expect("identity coverage")
+    );
+    assert_eq!(index.edges().dropped_edges(), 0);
 }

@@ -489,6 +489,14 @@ fn commonjs_aliases_of_the_module_value_export_their_members() {
     }
     for source in [
         "let app = module.exports = {}; app = other; app.init = function init() {};",
+        "let app = module.exports = {}; app ||= other; app.init = function init() {};",
+        "let app = module.exports = {}; app++; app.init = function init() {};",
+        "let app = module.exports = {}; [app] = other; app.init = function init() {};",
+        "let app = module.exports = {}; for (app of other) {} app.init = function init() {};",
+        "var app = module.exports = {}; var app = other; app.init = function init() {};",
+        "var app = module.exports = {}; function app() {} app.init = function init() {};",
+        "var app = module.exports = {}; module.exports ||= other; app.init = function init() {};",
+        "var app = module.exports = {}; module['exports'] = other; app.init = function init() {};",
         "var app = module.exports = {}; module.exports = other; app.init = function init() {};",
         "var app = exports = {}; app.init = function init() {};",
         "const out = exports; module.exports = other; out.init = function init() {};",
@@ -596,6 +604,31 @@ fn ecmascript_module_syntax_leaves_assignments_to_exports_unexported() {
             symbol.name == "open",
             "{}",
             symbol.qualified_name
+        );
+    }
+}
+
+/// A generated module with many aliases and writes keeps one binding for each write.
+#[test]
+fn commonjs_generated_aliases_bind_each_write_once() {
+    use std::fmt::Write as _;
+
+    let mut source = String::new();
+    for index in 0..400 {
+        write!(
+            source,
+            "var app{index} = exports;\napp{index}.run{index} = function () {{}};\n"
+        )
+        .expect("generated source");
+    }
+    let document = analyze(&JavaScriptSyntaxProvider::default(), &source);
+    let bindings = commonjs_bindings(&source, &document);
+    assert_eq!(bindings.len(), 400);
+    for index in 0..400 {
+        let name = format!("run{index}");
+        assert!(
+            bindings.contains(&named(&name, &name)),
+            "write through alias {index}"
         );
     }
 }

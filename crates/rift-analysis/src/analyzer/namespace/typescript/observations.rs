@@ -13,7 +13,15 @@ pub(super) fn prepare(
     prepared: &mut PreparedNamespace,
 ) {
     let mut conflicts = BTreeSet::new();
+    let imported = import_builds(input, metadata);
     for observation in input.modules() {
+        // A build observed under `import` holds the module; the decision is made, not unknown.
+        if observation.declarations().is_empty()
+            && !observation.export_conditions().contains(&"import")
+            && imported.contains(observation.module())
+        {
+            continue;
+        }
         let Some(implementation) = selected_file(input, selected, observation.implementation())
         else {
             prepared.unresolved_exports = true;
@@ -96,6 +104,7 @@ pub(super) fn observed_files<'input>(
     selected: &[SelectedFile<'_>],
 ) -> BTreeMap<(&'static str, &'input str), BTreeSet<&'input ProjectPath>> {
     let mut observed = BTreeMap::<_, BTreeSet<_>>::new();
+    let imported = import_builds(input, Some(metadata));
     for observation in input.modules() {
         let Some(implementation) = selected_file(input, selected, observation.implementation())
             .filter(|file| file.syntax.language().name == "javascript")
@@ -115,7 +124,12 @@ pub(super) fn observed_files<'input>(
             .map(|source| source.path())
             .collect::<BTreeSet<_>>();
         let admitted = if observation.declarations().is_empty() {
-            commonjs::admits(files, metadata, observation, implementation)
+            let import = observation.export_conditions().contains(&"import");
+            if imported.contains(module) {
+                import && describes_build(metadata, observation)
+            } else {
+                commonjs::admits(files, metadata, observation, implementation)
+            }
         } else {
             !joined.is_empty()
         };
@@ -132,6 +146,40 @@ pub(super) fn observed_files<'input>(
     }
     observed.retain(|_, files| !files.is_empty());
     observed
+}
+
+/// Modules a build observed under `import` holds, as the manifest's conditions describe it.
+/// Observations that join declarations are judged with them.
+fn import_builds<'input>(
+    input: &NamespaceInput<'input>,
+    metadata: Option<&PackageMetadata>,
+) -> BTreeSet<&'input str> {
+    input
+        .modules()
+        .iter()
+        .filter(|observation| {
+            observation.declarations().is_empty()
+                && observation.export_conditions().contains(&"import")
+                && metadata.is_some_and(|metadata| describes_build(metadata, observation))
+        })
+        .map(|observation| observation.module())
+        .collect()
+}
+
+fn describes_build(metadata: &PackageMetadata, observation: &NamespaceModule<'_>) -> bool {
+    metadata
+        .exports
+        .as_ref()
+        .and_then(|exports| {
+            exports.observed_targets(
+                &metadata.name,
+                observation.module(),
+                observation.export_conditions(),
+            )
+        })
+        .and_then(|(_, implementation)| target_path(implementation))
+        .as_ref()
+        == Some(observation.implementation().path())
 }
 
 fn selected_file<'selected, 'source>(

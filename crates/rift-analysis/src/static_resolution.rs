@@ -418,6 +418,8 @@ struct File<'source> {
     /// Names written as computed keys of the module's exports: `name` and its position in
     /// `module.exports[name] = value`.
     export_keys: Vec<(&'source str, u64)>,
+    /// The file's export bindings by exported name; absent for facts without bindings.
+    exports: Option<javascript_exports::ExportBindings<'source>>,
     member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
     unknown_member_writes: BTreeSet<Option<&'source str>>,
     conditions: Conditions,
@@ -551,6 +553,7 @@ impl<'source> File<'source> {
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
             export_keys: Vec::new(),
+            exports: None,
             member_writes: BTreeMap::new(),
             unknown_member_writes: BTreeSet::new(),
             conditions: Conditions::default(),
