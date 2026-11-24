@@ -2343,3 +2343,33 @@ fn test_rust_associated_types_come_from_their_own_implementation() {
     assert_eq!(used.len(), 3, "{used:?}");
     assert!(used.iter().all(|from| from.ends_with("/fixture/Id/from")));
 }
+
+#[test]
+fn test_rust_implementation_headers_are_contained_where_their_owner_is() {
+    // A header of a foreign type is a symbol of its own module; one of a package type is a
+    // facet of that type, wherever the block stands.
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            (
+                "src/lib.rs",
+                "pub mod user; pub trait Say { fn say(&self); } pub struct Own;",
+            ),
+            (
+                "src/user.rs",
+                "pub mod deep { pub struct Inner; }\nimpl crate::Say for std::io::Empty { fn say(&self) {} }\nimpl crate::Say for crate::Own { fn say(&self) {} }\nimpl deep::Inner { pub fn read(&self) {} }\npub fn body() { impl crate::Say for &bool { fn say(&self) {} } }\n",
+            ),
+        ],
+    );
+    let contains = |from: &str, to: &str| has_edge(&index, EdgeKind::Contains, from, to);
+    assert!(contains("/fixture/user", "/user/std/io/Empty"));
+    assert!(contains("/user/deep", "/user/deep/Inner"));
+    assert!(!contains("/fixture/user", "/user/deep/Inner"));
+    assert!(!contains("/fixture/user", "/fixture/Own"));
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| { edge.kind() == EdgeKind::Contains && edge.from() == edge.to() })
+    );
+}

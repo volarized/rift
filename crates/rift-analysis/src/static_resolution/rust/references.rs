@@ -595,8 +595,15 @@ impl<'source> Namespaces<'source> {
             symbol,
         }
         .admitted_path()?;
-        let (_, owner) = path.split_last()?;
-        (parent.admitted_path()? == owner).then_some(parent)
+        let holder = parent.admitted_path()?;
+        let declares = path
+            .split_last()
+            .is_some_and(|(_, owner)| owner == holder.as_slice());
+        // The written path of a foreign type keeps its header below the module of the block.
+        let foreign = path.len() > holder.len()
+            && path.starts_with(&holder)
+            && !self.types.contains_key(&path);
+        (declares || foreign).then_some(parent)
     }
 
     fn parent(
