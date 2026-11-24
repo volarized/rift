@@ -2945,3 +2945,62 @@ fn members_outside_unicode_nfc_consume_every_bound() -> TestResult {
     );
     Ok(())
 }
+
+// Issue #1050.
+#[test]
+fn the_folder_that_holds_the_archive_root_is_accepted() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let directory = tar::EntryType::Directory;
+    let entries = [
+        ("./", b"".as_slice(), directory),
+        ("./release/", b"", directory),
+        ("./release/a", b"text", regular),
+    ];
+    let bytes = tar_bytes(&entries)?;
+    for limits in both_modes(ArchiveLimits::new(bytes.len(), 8192, 1024, 3, 200)?) {
+        let files = read(&bytes, limits)?;
+        assert_eq!(retained(&files), [("a", b"text".as_slice())]);
+    }
+    for limits in both_modes(ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?) {
+        assert_eq!(
+            read(&bytes, limits).expect_err("the folder counts as a member"),
+            ArchiveBound::Members.exceeded(3, 2, Some(fixture_path("release/a")))
+        );
+    }
+    let zip = zip_members_bytes(&entries)?;
+    assert_eq!(
+        read_zip_fixture(&zip, ArchiveLimits::default())?
+            .files()
+            .len(),
+        1
+    );
+    for (second, error) in [
+        (
+            ("./", b"".as_slice(), directory),
+            ArchiveError::DuplicatePath,
+        ),
+        (("other/", b"", directory), ArchiveError::RootMismatch),
+        (("./other/a", b"", regular), ArchiveError::RootMismatch),
+        (
+            ("./../", b"", directory),
+            ArchiveError::unsafe_path("./../"),
+        ),
+        (("/", b"", directory), ArchiveError::unsafe_path("/")),
+    ] {
+        let bytes = tar_bytes(&[entries[0], second])?;
+        assert_eq!(
+            read(&bytes, ArchiveLimits::default()).expect_err("outside the archive root"),
+            error,
+            "{second:?}"
+        );
+    }
+    for kind in [regular, tar::EntryType::Symlink, tar::EntryType::Link] {
+        let bytes = tar_bytes(&[("./", b"", kind)])?;
+        assert_eq!(
+            read(&bytes, ArchiveLimits::default()).expect_err("a file or link is no folder"),
+            ArchiveError::RootMismatch,
+            "{kind:?}"
+        );
+    }
+    Ok(())
+}

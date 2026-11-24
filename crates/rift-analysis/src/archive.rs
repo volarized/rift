@@ -519,7 +519,8 @@ impl std::error::Error for ArchiveError {}
 
 /// Verifies the complete archive before extracting regular files into memory.
 ///
-/// `root` names an exact top-level directory from release metadata. `None` preserves paths.
+/// `root` names an exact top-level directory from release metadata. `None` preserves paths. The
+/// directory that holds the root, `./`, lies outside no root.
 /// Directories count toward the member bound but never become files. Extended tar headers count
 /// toward both byte and member bounds before the tar library interprets them. A PAX global
 /// header is metadata under no root: it is refused only with a record that changes a member's
@@ -1555,7 +1556,8 @@ impl<'a> ArchiveOutput<'a> {
             return Err(ArchiveError::DuplicatePath);
         }
         let relative = if let Some(root) = self.root {
-            if full.as_str() == root && directory {
+            // `./` is the folder that holds the root.
+            if directory && ["", root].contains(&full.as_str()) {
                 String::new()
             } else {
                 full.as_str()
