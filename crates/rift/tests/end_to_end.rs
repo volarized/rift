@@ -270,8 +270,10 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
     )
     .await??;
     let map = harness::resource_json(&map, "rift://map")?;
+    // The server's probe ignores the toolchain cargo selected for this test run.
     let probed = std::process::Command::new("rustc")
         .arg("--version")
+        .env_remove("RUSTUP_TOOLCHAIN")
         .current_dir(root)
         .output()?;
     let probed = String::from_utf8(probed.stdout)?;
