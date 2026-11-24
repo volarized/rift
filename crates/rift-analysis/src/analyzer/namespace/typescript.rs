@@ -14,6 +14,7 @@ use crate::NamespaceInput;
 
 pub(crate) mod commonjs;
 mod entry;
+mod internal_modules;
 mod observations;
 
 pub(super) use entry::build_paths;
@@ -30,6 +31,8 @@ pub(super) fn prepare(
     // Every entry of the package is decided over the files captured once here.
     let files = PackageFiles::captured(input);
     let mut imported = BTreeSet::new();
+    // Each file an entry names, with a module or without one the entries settle.
+    let mut entry_files = BTreeSet::new();
     if let Some(metadata) = &metadata {
         let entries = ["typescript", "javascript"].map(|language| {
             let has_files = selected
@@ -57,6 +60,9 @@ pub(super) fn prepare(
                 .collect::<BTreeMap<_, _>>();
             (language, kept)
         });
+        for (language, modules) in &entries {
+            entry_files.extend(modules.keys().map(|path| (*language, path.clone())));
+        }
         let inventory = selected
             .iter()
             .map(|file| (file.path, file.syntax.language().name.as_str()))
@@ -85,22 +91,7 @@ pub(super) fn prepare(
             }
             prepare_file(input, file, module, &mut prepared);
         }
-        if matches!(input.owner(), SymbolOwner::Package { .. }) {
-            for file in selected {
-                if file.syntax.language().name == "typescript"
-                    && selected_source_is_valid(input, file)
-                {
-                    let ambient = declaration_anchors(input, file, None);
-                    if !ambient.is_empty() {
-                        prepared
-                            .anchors
-                            .entry(file.path.as_str().to_owned())
-                            .or_default()
-                            .extend(ambient);
-                    }
-                }
-            }
-        }
+        prepare_ambient_modules(input, selected, &mut prepared);
         map_declared_types(input, &files, metadata, selected, &mut prepared);
     }
     observations::prepare(
@@ -111,6 +102,9 @@ pub(super) fn prepare(
         &imported,
         &mut prepared,
     );
+    if let Some(metadata) = &metadata {
+        internal_modules::prepare(input, metadata, &entry_files, selected, &mut prepared);
+    }
     if input.owner().is_local() {
         for file in selected {
             let language = file.syntax.language();
@@ -128,6 +122,29 @@ pub(super) fn prepare(
         }
     }
     prepared
+}
+
+/// Names what the files of a package declare in ambient modules.
+fn prepare_ambient_modules(
+    input: &NamespaceInput<'_>,
+    selected: &[SelectedFile<'_>],
+    prepared: &mut PreparedNamespace,
+) {
+    if !matches!(input.owner(), SymbolOwner::Package { .. }) {
+        return;
+    }
+    for file in selected {
+        if file.syntax.language().name == "typescript" && selected_source_is_valid(input, file) {
+            let ambient = declaration_anchors(input, file, None);
+            if !ambient.is_empty() {
+                prepared
+                    .anchors
+                    .entry(file.path.as_str().to_owned())
+                    .or_default()
+                    .extend(ambient);
+            }
+        }
+    }
 }
 
 fn prepare_file(
@@ -203,6 +220,10 @@ fn export_bindings(
             continue;
         };
         let mut path = target_identity.qualified_path().to_vec();
+        if binding.container.is_some() && path.last() == Some(&name) {
+            // A declaration of an ambient module exports its own name.
+            continue;
+        }
         if path.first().map(String::as_str) != Some(module) || path.pop().is_none() {
             unresolved = true;
             continue;

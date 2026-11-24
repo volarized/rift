@@ -88,6 +88,8 @@ pub struct AnalyzedFile {
     file: IndexedFile,
     placement: DocumentPlacement,
     public_names: BTreeSet<String>,
+    /// Whether a consumer can import the file's own module.
+    reached: bool,
     item_kinds: BTreeMap<(u64, u64), &'static str>,
     role: ModuleRole,
 }
@@ -127,6 +129,24 @@ impl AnalyzedFile {
     #[must_use]
     pub const fn placement(&self) -> &DocumentPlacement {
         &self.placement
+    }
+
+    /// Withdraws the export rule's answer for a file no consumer imports, except the names
+    /// a reached module aliases or the file declares in an ambient module, with their
+    /// members.
+    fn retain_exposed(&mut self, exposed: Option<&BTreeSet<String>>) {
+        self.reached = exposed.is_some_and(|names| names.contains("."));
+        if self.reached {
+            return;
+        }
+        self.public_names.retain(|name| {
+            exposed.is_some_and(|exposed| {
+                exposed.contains(name)
+                    || name
+                        .match_indices('.')
+                        .any(|(end, _)| exposed.contains(&name[..end]))
+            })
+        });
     }
 
     /// Whether the package exports the declaration spelled by `qualified_name`.
@@ -267,6 +287,7 @@ fn analyzed_file(
         file: parsed,
         placement,
         public_names,
+        reached: true,
         item_kinds,
         role: ModuleRole::Unpaired,
     })
@@ -485,6 +506,7 @@ fn place_namespace(
                 .error()
         },
     )?;
+    let exposed = namespace.exposed_names();
     for held in analyzed {
         held.public_names.extend(
             namespace
@@ -492,6 +514,10 @@ fn place_namespace(
                 .remove(held.file.path().as_str())
                 .unwrap_or_default(),
         );
+        let path = held.file.path().clone();
+        if namespace.unreached_modules.contains_key(path.as_str()) {
+            held.retain_exposed(exposed.get(path.as_str()));
+        }
         let mut assigned = namespace
             .anchors
             .remove(held.file.path().as_str())
@@ -2101,9 +2127,10 @@ impl Records {
         let unit = wire_unit(binding.unit());
         let path = wire_path(held.file.path());
         let public = held.is_public(facts.qualified_name())
-            || (facts
-                .symbol_kinds()
-                .contains(&rift_protocol::read::SymbolKind::Alias)
+            || (held.reached
+                && facts
+                    .symbol_kinds()
+                    .contains(&rift_protocol::read::SymbolKind::Alias)
                 && facts
                     .symbol_kinds()
                     .contains(&rift_protocol::read::SymbolKind::Public));

@@ -192,8 +192,19 @@ fn named_commonjs_forwarding_refuses_unproved_or_colliding_owners() {
             conflict,
             &mut std::collections::BTreeMap::new(),
         );
-        assert!(
-            symbol_at(&result, "lib/request.js", "requestRoot").is_none(),
+        // Without a forward the file is named by its path, unless another file's entry has
+        // that name.
+        let root = symbol_at(&result, "lib/request.js", "requestRoot").map(|row| {
+            rift_protocol::identity::SymbolIdentity::parse(row.symbol.as_str())
+                .expect("package identity")
+                .qualified_path()
+                .to_vec()
+        });
+        assert_eq!(
+            root,
+            (!conflict).then(|| ["beacon/lib/request.js", "requestRoot"]
+                .map(str::to_owned)
+                .to_vec()),
             "{entry:?}, {target:?}, conflicting subpath={conflict}"
         );
         assert!(

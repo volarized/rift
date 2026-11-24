@@ -1554,6 +1554,9 @@ A declaration counts as public by its language's rule:
   `exports.name` assignments, `Object.defineProperty(exports, "name", ..)`, and the members of an
   exported class or assigned to an exported declaration other than a `#` private element
 
+An npm package with an `exports` map counts a declaration of a file the map does not name as public
+only when a named file re-exports it.
+
 In a paired module the stub defines the public set, and a stub declaration with no implementation
 answers from the stub alone.
 
