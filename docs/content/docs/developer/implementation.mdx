@@ -1500,6 +1500,10 @@ size still counts toward `expanded_size` and a size that differs from its header
 archive. `ArchiveFiles::omissions` lists each such path and size. An omitted file can be
 a source file, so the caller reads `omissions` before it treats its file selection as complete.
 
+A PAX global header, such as the one `git archive` writes, names no member and lies under no root.
+It counts toward `members`, `member_size`, and `extension_size`. A global record that changes the
+path, link target, or size of later members refuses the archive.
+
 <VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
 
 File selection decides which files of a package the analysis reads, from package-relative paths

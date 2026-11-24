@@ -383,7 +383,8 @@ pub enum ArchiveError {
     UnsafePath,
     /// Multiple members name the same normalized path.
     DuplicatePath,
-    /// Archive contains a device, FIFO, encrypted, or sparse entry.
+    /// Archive contains a device, FIFO, encrypted, or sparse entry, or a PAX global header that
+    /// changes how later members are read.
     UnsupportedEntry,
     /// Archive member lies outside the caller's exact release root.
     RootMismatch,
@@ -413,7 +414,9 @@ impl std::error::Error for ArchiveError {}
 ///
 /// `root` names an exact top-level directory from release metadata. `None` preserves paths.
 /// Directories count toward the member bound but never become files. Extended tar headers count
-/// toward both byte and member bounds before the tar library interprets them. A symbolic or
+/// toward both byte and member bounds before the tar library interprets them. A PAX global
+/// header is metadata under no root: it is refused only with a record that changes a member's
+/// path, link target, or size, or between another extended header and its member. A symbolic or
 /// hard link entry is skipped rather than refused: it never becomes a file, its target is
 /// never opened, and its path is carried in [`ArchiveFiles::skipped_links`].
 /// Repeated regular files retain one file when their normalized paths and bytes match.
@@ -503,6 +506,8 @@ fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveE
 /// Records that GNU and PAX extended headers hold for the next tar member.
 #[derive(Default)]
 struct TarExtension {
+    /// Whether an extended header of the next member was read.
+    pending: bool,
     long_name: Option<Vec<u8>>,
     path: Option<Vec<u8>>,
     sizes: Vec<Vec<u8>>,
@@ -530,6 +535,18 @@ impl TarExtension {
     }
 }
 
+/// Whether a PAX record names another path, link target, or size for a member.
+///
+/// A global header applies its records to every later member, which the tar library does
+/// not do, so such a record would let another reader see a different archive.
+fn changes_members(key: &[u8]) -> bool {
+    [b"path".as_slice(), b"linkpath", b"size"].contains(&key)
+}
+
+fn is_sparse(key: &[u8]) -> bool {
+    key.starts_with(b"GNU.sparse") || key == b"SCHILY.filetype"
+}
+
 /// Checks every raw header before the tar library allocates extended header contents.
 fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), ArchiveError> {
     let mut raw = tar::Archive::new(reader);
@@ -550,9 +567,14 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
         }
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
-        let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions();
+        let global = kind.is_pax_global_extensions();
+        let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions() || global;
         let link = kind.is_symlink() || kind.is_hard_link();
         if !kind.is_file() && !kind.is_dir() && !extension && !link {
+            return Err(ArchiveError::UnsupportedEntry);
+        }
+        // The tar library gives pending records to a global header instead of their member.
+        if global && extended.pending {
             return Err(ArchiveError::UnsupportedEntry);
         }
         let size = entry.size();
@@ -580,12 +602,11 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
         {
             for value in values {
                 let value = value.map_err(|_| ArchiveError::InvalidArchive)?;
-                if value.key_bytes().starts_with(b"GNU.sparse")
-                    || value.key_bytes() == b"SCHILY.filetype"
-                {
+                let key = value.key_bytes();
+                if is_sparse(key) || (global && changes_members(key)) {
                     return Err(ArchiveError::UnsupportedEntry);
                 }
-                match value.key_bytes() {
+                match key {
                     // The tar library reads the first path record.
                     b"path" => {
                         extended
@@ -597,7 +618,9 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
                 }
             }
         }
-        if !extension {
+        if extension {
+            extended.pending |= !global;
+        } else {
             // A PAX size over the header's would move the reader past headers checked here.
             if limits.oversized_members == OversizedMembers::Skip && extended.disagrees(size) {
                 return Err(ArchiveError::InvalidArchive);
@@ -620,10 +643,13 @@ fn read_tar_members(reader: impl Read, output: &mut ArchiveOutput<'_>) -> Result
             return Err(output.limits.members_exceeded(index as u64 + 1, None));
         }
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            continue;
+        }
         let path = std::str::from_utf8(&entry.path_bytes())
             .map_err(|_| ArchiveError::UnsafePath)?
             .to_owned();
-        let kind = entry.header().entry_type();
         if kind.is_symlink() || kind.is_hard_link() {
             output.push_skipped_link(&path)?;
             continue;

@@ -2213,3 +2213,193 @@ fn omitted_zstd_windows_reach_the_recommended_width_and_no_further() -> TestResu
     }
     Ok(())
 }
+
+/// One raw tar header of `flag` with its content, padded to whole blocks.
+fn raw_member(name: &str, flag: u8, content: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut header = tar::Header::new_ustar();
+    header
+        .as_mut_bytes()
+        .get_mut(..name.len())
+        .ok_or("fixture path exceeds raw header")?
+        .copy_from_slice(name.as_bytes());
+    header.set_size(u64::try_from(content.len())?);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::new(flag));
+    header.set_cksum();
+    let mut bytes = header.as_bytes().to_vec();
+    bytes.extend_from_slice(content);
+    bytes.resize(bytes.len().next_multiple_of(512), 0);
+    Ok(bytes)
+}
+
+/// One PAX record, whose length counts its own digits.
+fn pax_record(key: &str, value: &str) -> String {
+    let rest = format!(" {key}={value}\n");
+    let mut length = rest.len() + 1;
+    while length != rest.len() + length.to_string().len() {
+        length = rest.len() + length.to_string().len();
+    }
+    format!("{length}{rest}")
+}
+
+fn global_header(records: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    raw_member("pax_global_header", b'g', records.as_bytes())
+}
+
+/// The limits of both oversized member modes over the same bounds.
+fn both_modes(limits: ArchiveLimits) -> [ArchiveLimits; 2] {
+    [
+        limits,
+        limits.with_oversized_members(OversizedMembers::Skip),
+    ]
+}
+
+// Issue #1033.
+#[test]
+fn pax_global_headers_are_metadata_under_no_root() -> TestResult {
+    let comment = pax_record("comment", "0123456789abcdef");
+    let source = raw_member("release/a.py", b'0', SOURCE)?;
+    let other = raw_member("release/b.py", b'0', SOURCE)?;
+    let global = global_header(&comment)?;
+    for (tar, files) in [
+        ([global.as_slice(), &source].concat(), 1),
+        ([&source, global.as_slice(), &other].concat(), 2),
+        ([&source, global.as_slice()].concat(), 1),
+        ([global.as_slice(), &global, &source].concat(), 1),
+    ] {
+        let bytes = gzip(&tar)?;
+        for limits in both_modes(ArchiveLimits::default()) {
+            let read = read(&bytes, limits)?;
+            assert_eq!(read.files().len(), files);
+            assert_eq!(read.files()[&fixture_path("a.py")], SOURCE);
+            assert_eq!(read.members().len(), files);
+            assert!(read.skipped_links().is_empty());
+            assert!(read.omissions().is_empty());
+        }
+    }
+    let local = raw_member(
+        "PaxHeaders/b",
+        b'x',
+        pax_record("path", "release/c.py").as_bytes(),
+    )?;
+    let bytes = gzip(&[global.as_slice(), &local, &other].concat())?;
+    for limits in both_modes(ArchiveLimits::default()) {
+        let files = read(&bytes, limits)?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(files.files()[&fixture_path("c.py")], SOURCE);
+    }
+    Ok(())
+}
+
+#[test]
+fn pax_global_headers_consume_member_and_extension_byte_bounds() -> TestResult {
+    let comment = pax_record("comment", &"x".repeat(600));
+    let size = comment.len();
+    let bytes = gzip(
+        &[
+            global_header(&comment)?,
+            raw_member("release/a.py", b'0', SOURCE)?,
+        ]
+        .concat(),
+    )?;
+    let named = || Some(fixture_path("pax_global_header"));
+    for limits in both_modes(ArchiveLimits::new(
+        bytes.len(),
+        8192,
+        size,
+        2,
+        u32::MAX as usize,
+    )?) {
+        assert_eq!(read(&bytes, limits)?.files().len(), 1);
+        assert_eq!(
+            read(&bytes, limits.with_extension_size(size)?)?
+                .files()
+                .len(),
+            1
+        );
+        assert_eq!(
+            read(&bytes, limits.with_extension_size(size - 1)?).expect_err("extension bytes"),
+            ArchiveBound::ExtensionBytes.exceeded(size as u64, size as u64 - 1, named())
+        );
+    }
+    for limits in both_modes(ArchiveLimits::new(
+        bytes.len(),
+        8192,
+        size,
+        1,
+        u32::MAX as usize,
+    )?) {
+        assert_eq!(
+            read(&bytes, limits).expect_err("member count"),
+            ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/a.py")))
+        );
+    }
+    for limits in both_modes(ArchiveLimits::new(
+        bytes.len(),
+        8192,
+        size - 1,
+        2,
+        u32::MAX as usize,
+    )?) {
+        assert_eq!(
+            read(&bytes, limits).expect_err("member bytes"),
+            ArchiveBound::MemberBytes.exceeded(size as u64, size as u64 - 1, named())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn pax_global_headers_that_change_members_are_refused() -> TestResult {
+    let source = raw_member("release/a.py", b'0', SOURCE)?;
+    for (key, value) in [
+        ("path", "release/b.py"),
+        ("path", "../b.py"),
+        ("linkpath", "/etc/passwd"),
+        ("size", "4"),
+        ("GNU.sparse.map", "0,4"),
+        ("SCHILY.filetype", "sparse"),
+    ] {
+        let records = [pax_record("comment", "x"), pax_record(key, value)].concat();
+        let bytes = gzip(&[global_header(&records)?, source.clone()].concat())?;
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                read(&bytes, limits).expect_err("global record changes members"),
+                ArchiveError::UnsupportedEntry,
+                "{key}={value}"
+            );
+        }
+    }
+    let bytes = gzip(&[global_header("malformed\n")?, source.clone()].concat())?;
+    assert_eq!(
+        read(&bytes, ArchiveLimits::default()).expect_err("malformed global record"),
+        ArchiveError::InvalidArchive
+    );
+    // The tar library would give the local records to the global header.
+    let comment = global_header(&pax_record("comment", "x"))?;
+    let path = pax_record("path", "release/b.py");
+    let local = raw_member("PaxHeaders/a", b'x', path.as_bytes())?;
+    let long_name = raw_member("././@LongLink", b'L', b"release/b.py\0")?;
+    for extension in [&local, &long_name] {
+        let bytes = gzip(&[extension.as_slice(), &comment, &source].concat())?;
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                read(&bytes, limits).expect_err("global header between a member and its records"),
+                ArchiveError::UnsupportedEntry
+            );
+        }
+    }
+    let outside = raw_member("release/../a.py", b'0', SOURCE)?;
+    let bytes = gzip(&[comment.as_slice(), &outside].concat())?;
+    assert_eq!(
+        read(&bytes, ArchiveLimits::default()).expect_err("traversal after a global header"),
+        ArchiveError::UnsafePath
+    );
+    let outside = raw_member("other/a.py", b'0', SOURCE)?;
+    let bytes = gzip(&[comment.as_slice(), &outside].concat())?;
+    assert_eq!(
+        read(&bytes, ArchiveLimits::default()).expect_err("another root after a global header"),
+        ArchiveError::RootMismatch
+    );
+    Ok(())
+}
