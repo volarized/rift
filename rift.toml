@@ -3,13 +3,11 @@
 [source]
 include = []
 # Agent worktrees and local tooling state hold full copies of the source tree; keep them out of
-# the index even if gitignore inheritance is ever disabled. The three vendored ty crates are
-# 326,000 lines of another project's Rust, more than half of what the tree tracks otherwise;
-# their origin notes say what they are. `docs/public` holds the artifacts
+# the index even if gitignore inheritance is ever disabled. `docs/public` holds the artifacts
 # `just generate` exports from the Rust models and from `rift --help`, so every hit in them
 # restates something the same answer already carries; the generated plugin skill under
 # `plugins/claude` restates the served tool descriptions the same way.
-exclude = [".claude/**", ".agents/**", ".codex/**", "docs/public/**", "plugins/claude/skills/**", "dev/**", "docs/**", "vendor/ty_ide/**", "vendor/ty_project/**", "vendor/ty_python_semantic/**"]
+exclude = [".claude/**", ".agents/**", ".codex/**", "docs/public/**", "plugins/claude/skills/**", "dev/**", "docs/**"]
 # `.gitignore` keeps `.plans/` out of version control on purpose: campaign documents live
 # outside the tree until they become code. They are still what a reader of this repository
 # asks about, so the index reaches them here.
