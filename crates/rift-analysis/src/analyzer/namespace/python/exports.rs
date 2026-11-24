@@ -100,6 +100,8 @@ fn requests<'source>(
             .get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
     };
     let mut requests = Vec::new();
+    // A statement that lists one name twice re-exports it once.
+    let mut listed = BTreeSet::new();
     for binding in file.syntax.export_bindings().unwrap_or_default() {
         if binding.kind != SyntaxExportKind::Named {
             continue;
@@ -111,6 +113,9 @@ fn requests<'source>(
         ) else {
             continue;
         };
+        if !listed.insert((binding.range, name, target_name)) {
+            continue;
+        }
         let Some(target_module) = python_import_target(module, is_package, written) else {
             *unresolved = true;
             continue;

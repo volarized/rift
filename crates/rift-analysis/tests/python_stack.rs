@@ -301,3 +301,30 @@ fn nested_optional_annotations_name_their_class() {
         assert!(found.contains(&called), "{levels}: {found:?}");
     }
 }
+
+// Issue #1054.
+#[test]
+fn one_reexported_name_of_a_statement_is_one_record() {
+    let member = "def a(): pass\ndef c(): pass\n";
+    for (statement, aliases) in [
+        ("from .m import a as a, a as a\n", 1),
+        ("from .m import a as a, c as c, a as a\n", 2),
+        ("from .m import a as a\nfrom .m import a as a\n", 2),
+        ("from .m import a, a\n", 0),
+    ] {
+        let found = edges(
+            &[
+                ("chain/__init__", statement.to_owned()),
+                ("chain/m", member.to_owned()),
+            ],
+            512,
+        );
+        let count = found
+            .iter()
+            .filter(|edge| {
+                ["chain/a -> chain/m/a", "chain/c -> chain/m/c"].contains(&edge.as_str())
+            })
+            .count();
+        assert_eq!(count, aliases, "{statement}: {found:?}");
+    }
+}
