@@ -1019,7 +1019,42 @@ struct Modules<'configuration, 'input> {
     admitted: &'configuration BTreeMap<String, Option<bool>>,
 }
 
+/// The first byte of `range`, which no item inside it starts before.
+const fn first(range: rift_syntax::ByteRange) -> rift_syntax::ByteRange {
+    rift_syntax::ByteRange {
+        start: range.start,
+        end: range.start + 1,
+    }
+}
+
 impl Modules<'_, '_> {
+    /// The admission of a module file itself; a file no ordinary item declares is admitted.
+    fn file(&self, file: &super::SelectedFile<'_>) -> Option<bool> {
+        let module = self
+            .admitted
+            .get(file.path.as_str())
+            .copied()
+            .unwrap_or(Some(true));
+        let scope = file_scope(file.source)?;
+        and(
+            module,
+            self.configurations.file(file.path.as_str()).admitted(
+                file.syntax,
+                file.source,
+                first(scope),
+            ),
+        )
+    }
+
+    /// The admission of a declaration itself, whatever the conditions of its contents.
+    fn declared(
+        &self,
+        file: &super::SelectedFile<'_>,
+        range: rift_syntax::ByteRange,
+    ) -> Option<bool> {
+        self.admitted(file, first(range))
+    }
+
     fn admitted(
         &self,
         file: &super::SelectedFile<'_>,

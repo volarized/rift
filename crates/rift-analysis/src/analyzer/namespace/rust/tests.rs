@@ -3823,6 +3823,34 @@ fn implementations_follow_imports_past_values_modules_and_leading_lines() {
             ],
             "src/user.rs",
         ),
+        // An inactive module leaves its name to the import of the active condition.
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "#[cfg(windows)] pub mod imp { pub struct Task; } #[cfg(unix)] use crate as imp; pub struct Task; pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::imp::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        // An inactive glob competes with nothing.
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "#[cfg(custom)] pub struct Task; #[cfg(windows)] use other::*; pub mod other { pub struct Task; } pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
         // An unknown condition without a competing import names one type.
         (
             vec![
@@ -3857,6 +3885,24 @@ fn implementations_refuse_competing_names_and_blocks() {
         (
             "#[cfg(custom)] pub struct Task; #[cfg(not(custom))] use other::Task; pub mod other { pub struct Task; } pub mod user;",
             "use crate::Task; impl Task { fn a(&self) {} }",
+        ),
+        // A module of unknown condition competes with an import of its name.
+        (
+            "#[cfg(custom)] pub mod imp { pub struct Task; } #[cfg(not(custom))] use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        (
+            "#[cfg(custom)] pub mod imp { pub struct Task; } use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        // A glob can supply a name whose declaration has an unknown condition.
+        (
+            "#[cfg(custom)] pub struct Task; #[cfg(not(custom))] use other::*; pub mod other { pub struct Task; } pub mod user;",
+            "use crate::Task; impl Task { fn a(&self) {} }",
+        ),
+        (
+            "#[cfg(custom)] pub mod imp { pub struct Task; } use other::*; pub mod other { pub mod imp { pub struct Task; } } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
         ),
         // Two imports of one name refuse it, whatever a shorter path names.
         (

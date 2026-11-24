@@ -2300,15 +2300,17 @@ fn test_rust_target_conditions_on_modules_keep_every_row_of_the_active_target() 
         }
     }
     for condition in [other.to_owned(), format!("all(feature = \"std\", {other})")] {
+        let each = ITEMS
+            .map(|item| format!("#[cfg({condition})] {item}"))
+            .join("\n");
         for found in [
             rows(&format!("#[cfg({condition})] pub mod m;"), &module),
+            rows("pub mod m;", &format!("#![cfg({condition})]\n{module}")),
             rows(&format!("#[cfg({condition})] pub mod m {{ {module} }}"), ""),
             rows(&format!("#![cfg({condition})]\n{module}"), ""),
+            rows(&each, ""),
         ] {
-            assert!(
-                found.iter().all(|(kind, _, _)| *kind != EdgeKind::Calls),
-                "{condition}: {found:?}"
-            );
+            assert_eq!(found, Vec::new(), "{condition}");
         }
     }
 }

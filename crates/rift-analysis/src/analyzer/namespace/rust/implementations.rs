@@ -21,8 +21,11 @@ const PATH_SEGMENTS_MAX: usize = 64;
 struct Types {
     /// Paths of the type declarations of modules that are not inactive.
     declared: BTreeMap<Vec<String>, Declared>,
-    /// Paths of the modules. A `use` that binds a module's name binds another namespace.
-    modules: BTreeSet<Vec<String>>,
+    /// Paths of the modules with whether the configuration admits one declaration of each:
+    /// `Some(true)` when it does, `Some(false)` when every one is inactive.
+    modules: BTreeMap<Vec<String>, Option<bool>>,
+    /// Modules with a glob import that is not inactive.
+    globs: BTreeSet<Vec<String>>,
     /// What a module's `use` declarations bind; `None` when an unknown condition or a
     /// second binding of the name leaves the target open.
     bindings: BTreeMap<Vec<String>, Option<Vec<String>>>,
@@ -53,8 +56,8 @@ impl Budget {
 ///
 /// An implementation keeps the identity under its own module when the type comes from a
 /// glob import, a dependency, a type alias, a type parameter, or an import whose condition
-/// is unknown, when two bindings compete, when an import competes with a declaration whose
-/// own condition is unknown, or when it sits in a function body. The implementation's own
+/// is unknown, when two bindings compete, when an import or a glob competes with a type or a
+/// module whose own condition is unknown, or when it sits in a block. The implementation's own
 /// condition does not move it: an inactive one belongs to the type its imports name.
 /// Exhausting the work bound leaves every implementation in place.
 pub(super) fn place(
@@ -141,7 +144,8 @@ fn placements<'source>(
     }
     let mut types = Types {
         declared: BTreeMap::new(),
-        modules: file_modules.values().cloned().collect(),
+        modules: BTreeMap::new(),
+        globs: BTreeSet::new(),
         bindings: BTreeMap::new(),
     };
     for (file, facts, module, anchors) in &files {
@@ -269,6 +273,7 @@ impl Types {
         budget: &mut Budget,
     ) -> Option<()> {
         let mut scopes = BTreeMap::new();
+        self.declare_module(module.to_vec(), modules.file(file));
         for symbol in module_items(file) {
             budget.charge(1)?;
             let Some(path) = anchored_path(anchors, &symbol.qualified_name) else {
@@ -278,13 +283,13 @@ impl Types {
                 if let Some(body) = symbol.body_range {
                     scopes.insert(body, path.clone());
                 }
-                self.modules.insert(path);
+                self.declare_module(path, modules.declared(file, symbol.item_range));
                 continue;
             }
             if symbol.kind == "impl_item" || !symbol.kinds.contains(&SymbolKind::Type) {
                 continue;
             }
-            let admitted = modules.admitted(file, symbol.item_range);
+            let admitted = modules.declared(file, symbol.item_range);
             if admitted == Some(false) {
                 continue;
             }
@@ -304,7 +309,7 @@ impl Types {
                 _ => None,
             })
             .collect::<BTreeMap<_, _>>();
-        for imported in facts.rust_uses().iter().filter(|imported| !imported.glob) {
+        for imported in facts.rust_uses() {
             budget.charge(1)?;
             let admitted = modules.admitted(file, imported.range);
             if admitted == Some(false) {
@@ -317,6 +322,10 @@ impl Types {
             } else {
                 continue;
             };
+            if imported.glob {
+                self.globs.insert(module.to_vec());
+                continue;
+            }
             let Some(name) = bindings
                 .get(&imported.range)
                 .and_then(|name| macros::text_range(file.source, *name))
@@ -341,22 +350,41 @@ impl Types {
         Some(())
     }
 
+    fn declare_module(&mut self, path: Vec<String>, admitted: Option<bool>) {
+        self.modules
+            .entry(path)
+            .and_modify(|status| {
+                *status = match (*status, admitted) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            })
+            .or_insert(admitted);
+    }
+
     /// The path of the one type `path` names, followed through the modules' import bindings.
     fn named(&self, mut path: Vec<String>, budget: &mut Budget) -> Option<Vec<String>> {
         for _ in 0..IMPORTS_MAX {
             budget.charge(path.len())?;
+            // The longest bound prefix is the innermost module that imports the next name.
+            // An import that shares the name of an admitted module binds another namespace.
+            let bound = (1..=path.len()).rev().find(|length| {
+                let prefix = &path[..*length];
+                self.bindings.contains_key(prefix) && self.modules.get(prefix) != Some(&Some(true))
+            });
             if let Some(declared) = self.declared.get(&path) {
-                // An import that shares the name of an admitted type binds another
-                // namespace. Beside a declaration with an unknown condition it can be the
-                // type of the other configuration.
-                let competes = !declared.admitted && self.bindings.contains_key(&path);
+                // Beside a declaration with an unknown condition an import or a glob can be
+                // the type of the other configuration.
+                let competes = !declared.admitted
+                    && (bound.is_some()
+                        || (1..path.len()).any(|length| self.globs.contains(&path[..length])));
                 return (declared.nominal && !competes).then_some(path);
             }
-            // The longest bound prefix is the innermost module that imports the next name.
-            let length = (1..=path.len()).rev().find(|length| {
-                let prefix = &path[..*length];
-                self.bindings.contains_key(prefix) && !self.modules.contains(prefix)
-            })?;
+            let length = bound?;
+            if self.modules.get(&path[..length]) == Some(&None) {
+                return None;
+            }
             let mut next = self.bindings.get(&path[..length])?.clone()?;
             next.extend_from_slice(&path[length..]);
             if next.len() > PATH_SEGMENTS_MAX || next == path {
@@ -417,7 +445,8 @@ fn import_path(source: &str, module: &[String], ranges: &[ByteRange]) -> Option<
 }
 
 /// A written path read from `module`: `crate`, `self`, and each leading `super` as written;
-/// any other first segment is a name of the module.
+/// any other first segment is a name of the module. Edition 2015 reads such a `use` path from
+/// the crate root; there it names nothing and the implementation keeps its module.
 fn absolute_path(module: &[String], segments: &[String]) -> Option<Vec<String>> {
     let mut rest = segments;
     let mut base = module;
