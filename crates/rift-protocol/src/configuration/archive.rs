@@ -15,7 +15,8 @@ pub const ARCHIVE_MEMBER_BYTES_DEFAULT: u64 = 64 << 20;
 pub const ARCHIVE_EXTENSION_BYTES_DEFAULT: u64 = 16 << 10;
 /// Bytes in one GNU or PAX extended header, at most.
 pub const ARCHIVE_EXTENSION_BYTES_MAX: u64 = 64 << 20;
-/// Archive members accepted by default, including directories and skipped links.
+/// Archive members accepted by default, including directories and skipped links; extended
+/// headers have their own count with the same maximum.
 pub const ARCHIVE_MEMBERS_DEFAULT: u32 = 100_000;
 /// Expanded bytes per compressed byte accepted by default.
 pub const ARCHIVE_EXPANSION_RATIO_DEFAULT: u32 = 200;
@@ -40,7 +41,8 @@ pub struct ArchiveConfiguration {
     /// Most bytes accepted in one GNU or PAX extended header, 1b to 64mb, checked before
     /// the archive reader allocates its contents. An extended header must also fit `member_size`.
     pub extension_size: ByteSize,
-    /// Most archive members accepted, including directories, links, and extended headers.
+    /// Most archive members accepted, including directories and links, and separately most
+    /// GNU and PAX extended headers, which are no members.
     #[schemars(range(min = 1, max = 5_000_000))]
     pub members: u32,
     /// Most expanded bytes per compressed byte, before `expanded_size` bounds the result.

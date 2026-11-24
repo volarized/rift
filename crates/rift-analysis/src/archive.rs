@@ -3,14 +3,17 @@
 //! This module reads bytes supplied by its caller. It writes no files and starts no processes.
 
 use std::{
+    borrow::Borrow,
     cell::{Cell, OnceCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
 };
 
 use crate::input::ArchiveMemberKind;
-use rift_core::{FileDigest, ProjectPath};
+use rift_core::{FileDigest, ProjectPath, constants::PROJECT_PATH_BYTES_MAX};
+use rift_error::errors;
 use sha2::{Digest, Sha256, Sha512};
+use unicode_normalization::UnicodeNormalization;
 use zstd::stream::raw::{self, Operation};
 
 /// Registry archive container.
@@ -190,21 +193,64 @@ impl Default for ArchiveLimits {
     }
 }
 
-/// A regular file the reader validated and left out because it exceeds the member byte bound.
+/// Archive path that follows every [`ProjectPath`] rule except Unicode NFC.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ArchivePath(String);
+
+impl ArchivePath {
+    /// The path in the archive's own Unicode spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Lets an ordered map keyed by archive path be probed by its text.
+impl Borrow<str> for ArchivePath {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Why the reader left one member out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveOmissionReason {
+    /// The regular file exceeds the member byte bound under [`OversizedMembers::Skip`].
+    Oversized,
+    /// The name does not use Unicode NFC, so no [`ProjectPath`] names the member.
+    NonCanonicalUnicode,
+}
+
+/// A member the reader validated and left out.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveOmission {
-    path: ProjectPath,
+    path: ArchivePath,
+    kind: ArchiveMemberKind,
+    reason: ArchiveOmissionReason,
     size: u64,
 }
 
 impl ArchiveOmission {
     /// Path after removing the caller's exact archive root, when supplied.
     #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
+    pub const fn path(&self) -> &ArchivePath {
         &self.path
     }
 
-    /// Declared size in bytes, equal to the decoded length.
+    /// Entry kind of the member.
+    #[must_use]
+    pub const fn kind(&self) -> ArchiveMemberKind {
+        self.kind
+    }
+
+    /// Why the member was left out.
+    #[must_use]
+    pub const fn reason(&self) -> ArchiveOmissionReason {
+        self.reason
+    }
+
+    /// Declared size of a regular file in bytes, equal to its decoded length; zero for a
+    /// directory or link.
     #[must_use]
     pub const fn size(&self) -> u64 {
         self.size
@@ -219,6 +265,7 @@ pub struct ArchiveFiles {
     members: BTreeMap<String, ArchiveMemberKind>,
     skipped_links: Vec<ProjectPath>,
     omissions: Vec<ArchiveOmission>,
+    replaced: BTreeSet<ArchivePath>,
 }
 
 impl ArchiveFiles {
@@ -229,7 +276,9 @@ impl ArchiveFiles {
     }
 
     /// Admitted normalized member paths and entry kinds before source selection.
-    /// Paths retain the original archive root even when regular files remove it.
+    /// Paths retain the original archive root even when regular files remove it. A member
+    /// omitted as [`ArchiveOmissionReason::NonCanonicalUnicode`] is not admitted, so a caller
+    /// that derives the archive root from these paths reads [`Self::omissions`] too.
     #[must_use]
     pub const fn members(&self) -> &BTreeMap<String, ArchiveMemberKind> {
         &self.members
@@ -256,21 +305,34 @@ impl ArchiveFiles {
         &self.skipped_links
     }
 
-    /// Regular files left out under [`OversizedMembers::Skip`], in canonical path order.
+    /// Members left out, in path order: files over the member byte bound under
+    /// [`OversizedMembers::Skip`], and members whose name does not use Unicode NFC.
     ///
-    /// Each path remains in [`Self::members`] as a file and is absent from [`Self::files`].
+    /// Each path is absent from [`Self::files`]. An oversized path remains in
+    /// [`Self::members`] as a file.
     /// The caller decides whether an omitted path leaves its source selection incomplete.
     #[must_use]
     pub fn omissions(&self) -> &[ArchiveOmission] {
         &self.omissions
+    }
+
+    /// Paths of regular files that an earlier member named with different bytes.
+    ///
+    /// The last member of a path is the one kept, or the one omitted.
+    #[must_use]
+    pub const fn replaced(&self) -> &BTreeSet<ArchivePath> {
+        &self.replaced
     }
 }
 
 /// One quantity [`ArchiveLimits`] bounds while the reader decodes an archive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveBound {
-    /// Members in the archive, including directories, links, and extended headers.
+    /// Members in the archive, including directories and links.
     Members,
+    /// GNU and PAX extended headers in the archive, which are no members and share the member
+    /// count's maximum.
+    ExtendedHeaders,
     /// Bytes of one member.
     MemberBytes,
     /// Bytes of one GNU or PAX extended header.
@@ -288,6 +350,7 @@ impl ArchiveBound {
     const fn label(self) -> &'static str {
         match self {
             Self::Members => "member count",
+            Self::ExtendedHeaders => "extended header count",
             Self::MemberBytes => "member byte",
             Self::ExtensionBytes => "extended header byte",
             Self::WindowBytes => "Zstandard window byte",
@@ -364,6 +427,47 @@ impl std::fmt::Display for ArchiveBoundExceeded {
     }
 }
 
+/// The path an archive was refused for: a member's own name, or the caller's archive root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnsafeArchivePath {
+    name: String,
+    bytes_dropped: usize,
+}
+
+impl UnsafeArchivePath {
+    fn new(name: &str) -> Self {
+        let end = name.floor_char_boundary(PROJECT_PATH_BYTES_MAX);
+        Self {
+            name: name[..end].to_owned(),
+            bytes_dropped: name.len() - end,
+        }
+    }
+
+    /// The name as the archive or caller spells it, cut at the longest project path.
+    ///
+    /// Bytes that are not UTF-8 read as U+FFFD.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// UTF-8 bytes of the name past the cut.
+    #[must_use]
+    pub const fn bytes_dropped(&self) -> usize {
+        self.bytes_dropped
+    }
+}
+
+impl std::fmt::Display for UnsafeArchivePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "archive path is invalid: {:?}", self.name)?;
+        if self.bytes_dropped > 0 {
+            write!(f, " and {} more bytes", self.bytes_dropped)?;
+        }
+        Ok(())
+    }
+}
+
 /// Refusal while verifying or decoding an untrusted archive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArchiveError {
@@ -379,26 +483,35 @@ pub enum ArchiveError {
     BoundExceeded(ArchiveBoundExceeded),
     /// Archive metadata reads or seeks exceed their work bound.
     WorkLimit,
-    /// A path is absolute, traverses parents, or is otherwise non-canonical.
-    UnsafePath,
-    /// Multiple members name the same normalized path.
+    /// A member name or the caller's archive root is absolute, traverses parents, or is
+    /// otherwise no [`ArchivePath`].
+    UnsafePath(UnsafeArchivePath),
+    /// Members of one normalized path are not all regular files, or a file or link is the parent
+    /// of another member.
     DuplicatePath,
-    /// Archive contains a device, FIFO, encrypted, or sparse entry.
+    /// Archive contains a device, FIFO, encrypted, or sparse entry, or a PAX global header that
+    /// changes how later members are read.
     UnsupportedEntry,
     /// Archive member lies outside the caller's exact release root.
     RootMismatch,
+}
+
+impl ArchiveError {
+    fn unsafe_path(name: &str) -> Self {
+        Self::UnsafePath(UnsafeArchivePath::new(name))
+    }
 }
 
 impl std::fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::BoundExceeded(exceeded) => return std::fmt::Display::fmt(exceeded, f),
+            Self::UnsafePath(path) => return std::fmt::Display::fmt(path, f),
             Self::InvalidLimits => "archive limits are invalid",
             Self::CompressedLimit => "archive exceeds its compressed byte bound",
             Self::DigestMismatch => "archive digest differs from exact release metadata",
             Self::InvalidArchive => "archive data is invalid",
             Self::WorkLimit => "archive metadata exceeds its work bound",
-            Self::UnsafePath => "archive path is invalid",
             Self::DuplicatePath => "archive contains a duplicate path",
             Self::UnsupportedEntry => "archive entry type is unsupported",
             Self::RootMismatch => "archive member is outside its exact release root",
@@ -411,16 +524,24 @@ impl std::error::Error for ArchiveError {}
 
 /// Verifies the complete archive before extracting regular files into memory.
 ///
-/// `root` names an exact top-level directory from release metadata. `None` preserves paths.
-/// Directories count toward the member bound but never become files. Extended tar headers count
-/// toward both byte and member bounds before the tar library interprets them. A symbolic or
+/// `root` names an exact top-level directory from release metadata. `None` preserves paths. The
+/// directory that holds the root, `./`, lies outside no root.
+/// Directories count toward the member bound but never become files. Extended tar headers are no
+/// members: their own count has the member bound's maximum, and they count toward the byte bounds
+/// before the tar library interprets them. A PAX global
+/// header is metadata under no root: it is refused only with a record that changes a member's
+/// path, link target, or size, or between another extended header and its member. A symbolic or
 /// hard link entry is skipped rather than refused: it never becomes a file, its target is
 /// never opened, and its path is carried in [`ArchiveFiles::skipped_links`].
-/// Repeated regular files retain one file when their normalized paths and bytes match.
-/// Repeated directories and links, conflicting bytes, and file-parent collisions are refused.
+/// The last regular file of one normalized path is kept, in archive order for tar and in central
+/// directory order for ZIP, as tar extraction keeps it. [`ArchiveFiles::replaced`] lists the path
+/// when an earlier file of it had different bytes. Repeated directories and links, a path that
+/// changes its member type, and file-parent collisions are refused.
 /// Every repeated member consumes the same member, decompressed-byte, and work bounds.
 /// A regular file over the member byte bound refuses the archive unless the limits select
-/// [`OversizedMembers::Skip`].
+/// [`OversizedMembers::Skip`]. A member whose name does not use Unicode NFC is checked and
+/// counted as any other and listed in [`ArchiveFiles::omissions`]. Collisions compare the
+/// archive's own spelling, so two names that are equal only in Unicode NFC stay two members.
 ///
 /// # Errors
 /// Returns [`ArchiveError`] when the digest, paths, member types, container, or bounds fail.
@@ -450,9 +571,9 @@ pub fn read_archive(
         }
     };
     if let Some(root) = root {
-        let path = ProjectPath::new(root).map_err(|_| ArchiveError::UnsafePath)?;
+        let path = ProjectPath::new(root).map_err(|_| ArchiveError::unsafe_path(root))?;
         if path.as_str().is_empty() || root.contains('/') {
-            return Err(ArchiveError::UnsafePath);
+            return Err(ArchiveError::unsafe_path(root));
         }
     }
     let mut output = ArchiveOutput::new(root, limits, limits.expanded(bytes.len()));
@@ -471,16 +592,30 @@ const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTEN
 /// decodes one stream for header validation and another for the members.
 fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
     let expanded = output.expanded;
-    let gzip = || flate2::read::MultiGzDecoder::new(bytes).take(expanded.maximum as u64 + 1);
+    let read_max = expanded.maximum as u64 + 1;
+    let gzip = || GzipMembers::new(bytes).take(read_max);
+    // The gzip stream ends where its padding starts, so padding earns no expansion.
+    let check = |stream: &std::io::Take<GzipMembers<'_>>| {
+        let decoded = read_max - stream.limit();
+        if stream.limit() == 0 {
+            return Err(expanded.exceeded(decoded, None));
+        }
+        let bound = output
+            .limits
+            .expanded(bytes.len() - stream.get_ref().rest().len());
+        if decoded > bound.maximum as u64 {
+            return Err(bound.exceeded(bound.maximum as u64 + 1, None));
+        }
+        Ok(())
+    };
     match output.limits.oversized_members {
         OversizedMembers::Refuse => {
             let mut decoded = Vec::new();
-            gzip()
+            let mut stream = gzip();
+            stream
                 .read_to_end(&mut decoded)
                 .map_err(|_| ArchiveError::InvalidArchive)?;
-            if decoded.len() > expanded.maximum {
-                return Err(expanded.exceeded(decoded.len() as u64, None));
-            }
+            check(&stream)?;
             check_tar_headers(decoded.as_slice(), output.limits)?;
             read_tar_members(decoded.as_slice(), output)
         }
@@ -491,11 +626,43 @@ fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveE
             // header refusal, as decoding into memory first does.
             std::io::copy(&mut stream, &mut std::io::sink())
                 .map_err(|_| ArchiveError::InvalidArchive)?;
-            if stream.limit() == 0 {
-                return Err(expanded.exceeded(expanded.maximum as u64 + 1, None));
-            }
+            check(&stream)?;
             checked?;
             read_tar_members(gzip(), output)
+        }
+    }
+}
+
+/// Decodes every gzip member and ends at the NUL bytes that pad the last one.
+///
+/// Other bytes after a member start another member, so anything else that trails the stream
+/// is refused as an invalid member header.
+struct GzipMembers<'a>(flate2::bufread::GzDecoder<&'a [u8]>);
+
+impl<'a> GzipMembers<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self(flate2::bufread::GzDecoder::new(bytes))
+    }
+
+    /// Bytes no member has consumed; the padding, once the stream was read to its end.
+    fn rest(&self) -> &'a [u8] {
+        self.0.get_ref()
+    }
+}
+
+impl Read for GzipMembers<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        // Each pass consumes one member header, so the compressed bytes bound the loop.
+        loop {
+            let read = self.0.read(buffer)?;
+            let rest = self.rest();
+            if read != 0 || rest.iter().all(|byte| *byte == 0) {
+                return Ok(read);
+            }
+            self.0.reset(rest);
         }
     }
 }
@@ -503,6 +670,8 @@ fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveE
 /// Records that GNU and PAX extended headers hold for the next tar member.
 #[derive(Default)]
 struct TarExtension {
+    /// Whether an extended header of the next member was read.
+    pending: bool,
     long_name: Option<Vec<u8>>,
     path: Option<Vec<u8>>,
     sizes: Vec<Vec<u8>>,
@@ -516,9 +685,7 @@ impl TarExtension {
             .as_deref()
             .map(|name| name.strip_suffix(b"\0").unwrap_or(name));
         let path = name.or(self.path.as_deref()).unwrap_or(header);
-        archive_path(std::str::from_utf8(path).ok()?)
-            .ok()
-            .filter(|path| !path.as_str().is_empty())
+        member_path(std::str::from_utf8(path).ok()?).filter(|path| !path.as_str().is_empty())
     }
 
     /// Whether any PAX size names another quantity than the member's own header.
@@ -530,29 +697,51 @@ impl TarExtension {
     }
 }
 
+/// Whether a PAX record names another path, link target, or size for a member.
+///
+/// A global header applies its records to every later member, which the tar library does
+/// not do, so such a record would let another reader see a different archive.
+fn changes_members(key: &[u8]) -> bool {
+    [b"path".as_slice(), b"linkpath", b"size"].contains(&key)
+}
+
+fn is_sparse(key: &[u8]) -> bool {
+    key.starts_with(b"GNU.sparse") || key == b"SCHILY.filetype"
+}
+
 /// Checks every raw header before the tar library allocates extended header contents.
 fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), ArchiveError> {
     let mut raw = tar::Archive::new(reader);
     raw.set_ignore_zeros(true);
     let mut extended = TarExtension::default();
     // Raw iteration exposes GNU and PAX headers before the library allocates their contents.
-    for (index, entry) in raw
+    let mut members = 0_u64;
+    let mut extended_headers = 0_u64;
+    for entry in raw
         .entries()
         .map_err(|_| ArchiveError::InvalidArchive)?
         .raw(true)
-        .enumerate()
     {
-        if index >= limits.members {
-            let member = entry
-                .ok()
-                .and_then(|entry| extended.member_path(&entry.path_bytes()));
-            return Err(limits.members_exceeded(index as u64 + 1, member));
-        }
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
-        let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions();
+        let global = kind.is_pax_global_extensions();
+        let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions() || global;
+        let (bound, count) = if extension {
+            (ArchiveBound::ExtendedHeaders, &mut extended_headers)
+        } else {
+            (ArchiveBound::Members, &mut members)
+        };
+        *count += 1;
+        if *count > limits.members as u64 {
+            let member = extended.member_path(&entry.path_bytes());
+            return Err(bound.exceeded(*count, limits.members as u64, member));
+        }
         let link = kind.is_symlink() || kind.is_hard_link();
         if !kind.is_file() && !kind.is_dir() && !extension && !link {
+            return Err(ArchiveError::UnsupportedEntry);
+        }
+        // The tar library gives pending records to a global header instead of their member.
+        if global && extended.pending {
             return Err(ArchiveError::UnsupportedEntry);
         }
         let size = entry.size();
@@ -580,12 +769,11 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
         {
             for value in values {
                 let value = value.map_err(|_| ArchiveError::InvalidArchive)?;
-                if value.key_bytes().starts_with(b"GNU.sparse")
-                    || value.key_bytes() == b"SCHILY.filetype"
-                {
+                let key = value.key_bytes();
+                if is_sparse(key) || (global && changes_members(key)) {
                     return Err(ArchiveError::UnsupportedEntry);
                 }
-                match value.key_bytes() {
+                match key {
                     // The tar library reads the first path record.
                     b"path" => {
                         extended
@@ -597,9 +785,11 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
                 }
             }
         }
-        if !extension {
+        if extension {
+            extended.pending |= !global;
+        } else {
             // A PAX size over the header's would move the reader past headers checked here.
-            if limits.oversized_members == OversizedMembers::Skip && extended.disagrees(size) {
+            if extended.disagrees(size) {
                 return Err(ArchiveError::InvalidArchive);
             }
             extended = TarExtension::default();
@@ -611,19 +801,25 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
 fn read_tar_members(reader: impl Read, output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
     let mut archive = tar::Archive::new(reader);
     archive.set_ignore_zeros(true);
-    for (index, entry) in archive
+    let mut members = 0_u64;
+    for entry in archive
         .entries()
         .map_err(|_| ArchiveError::InvalidArchive)?
-        .enumerate()
     {
-        if index >= output.limits.members {
-            return Err(output.limits.members_exceeded(index as u64 + 1, None));
-        }
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
-        let path = std::str::from_utf8(&entry.path_bytes())
-            .map_err(|_| ArchiveError::UnsafePath)?
-            .to_owned();
         let kind = entry.header().entry_type();
+        // The header pass counted every global header. Its name is the writer's own and names
+        // no member: POSIX defaults it to a path below the writer's temporary directory.
+        if kind.is_pax_global_extensions() {
+            continue;
+        }
+        members += 1;
+        if members > output.limits.members as u64 {
+            return Err(output.limits.members_exceeded(members, None));
+        }
+        let path = String::from_utf8(entry.path_bytes().into_owned()).map_err(|error| {
+            ArchiveError::unsafe_path(&String::from_utf8_lossy(error.as_bytes()))
+        })?;
         if kind.is_symlink() || kind.is_hard_link() {
             output.push_skipped_link(&path)?;
             continue;
@@ -941,7 +1137,7 @@ impl<R: BufRead> ZstdMember<R> {
             return error;
         };
         let maximum = 1_u64 << self.window_log;
-        ArchiveBound::WindowBytes.exceeded(observed, maximum, archive_path(path).ok())
+        ArchiveBound::WindowBytes.exceeded(observed, maximum, member_path(path))
     }
 }
 
@@ -1128,7 +1324,7 @@ fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
 // declared counts at that read boundary, before the library can reserve member storage.
 // Container interpretation and all field decoding remain in zip; this guard only bounds
 // the count that controls its allocation. Cursor returns each fixed-size read in one call.
-// Keep that count to reject duplicate raw names, which zip otherwise collapses in its index.
+// Keep that count to find duplicate raw names, which zip otherwise collapses in its index.
 // Once metadata is decoded, file contents cannot be mistaken for a footer.
 struct ZipReadGuard<'a> {
     cursor: Cursor<&'a [u8]>,
@@ -1222,17 +1418,70 @@ impl ExpandedBound {
     }
 }
 
-/// Normalizes one untrusted archive path, keeping its archive root.
-fn archive_path(path: &str) -> Result<ProjectPath, ArchiveError> {
+/// A path that follows every project path rule, or every one except Unicode NFC.
+enum AcceptedPath {
+    Canonical(ProjectPath),
+    NonCanonicalUnicode(ArchivePath),
+}
+
+impl AcceptedPath {
+    /// The NFC form follows every project path rule too, so a name never passes a rule by
+    /// its Unicode spelling alone.
+    fn new(path: String) -> Option<Self> {
+        match ProjectPath::new(path.as_str()) {
+            Ok(path) => Some(Self::Canonical(path)),
+            Err(error) if error.slug() == errors::core::path_non_canonical_unicode::SLUG => {
+                ProjectPath::new(path.nfc().collect::<String>()).ok()?;
+                Some(Self::NonCanonicalUnicode(ArchivePath(path)))
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Canonical(path) => path.as_str(),
+            Self::NonCanonicalUnicode(path) => path.as_str(),
+        }
+    }
+}
+
+/// Normalizes the separators of one untrusted archive path, keeping its archive root.
+fn archive_path(path: &str) -> Result<AcceptedPath, ArchiveError> {
     if path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| part == "..") {
-        return Err(ArchiveError::UnsafePath);
+        return Err(ArchiveError::unsafe_path(path));
     }
     let normalized = path
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/");
-    ProjectPath::new(normalized).map_err(|_| ArchiveError::UnsafePath)
+    AcceptedPath::new(normalized).ok_or_else(|| ArchiveError::unsafe_path(path))
+}
+
+/// The project path that names one member, keeping its archive root.
+fn member_path(path: &str) -> Option<ProjectPath> {
+    match archive_path(path) {
+        Ok(AcceptedPath::Canonical(path)) => Some(path),
+        Ok(AcceptedPath::NonCanonicalUnicode(_)) | Err(_) => None,
+    }
+}
+
+/// One member's path below the archive root.
+enum RelativePath {
+    /// NFC text the root was removed from, not yet checked as a project path.
+    Canonical(String),
+    NonCanonicalUnicode(ArchivePath),
+}
+
+impl RelativePath {
+    /// The project path that names a file or link, `None` for the archive root itself or a
+    /// path that is unsafe without its root.
+    fn project_path(relative: String) -> Option<ProjectPath> {
+        ProjectPath::new(relative)
+            .ok()
+            .filter(|path| !path.as_str().is_empty())
+    }
 }
 
 struct ArchiveOutput<'a> {
@@ -1243,12 +1492,15 @@ struct ArchiveOutput<'a> {
     seen: BTreeMap<String, ArchiveMemberKind>,
     files: BTreeMap<ProjectPath, Vec<u8>>,
     skipped_links: Vec<ProjectPath>,
-    omitted: BTreeMap<ProjectPath, OmittedContent>,
+    omitted: BTreeMap<ArchivePath, OmittedContent>,
+    replaced: BTreeSet<ArchivePath>,
 }
 
-/// Length and digest of one omitted file, compared when its path repeats.
+/// One omitted member; the length and digest of a file are compared when its path repeats.
 #[derive(Eq, PartialEq)]
 struct OmittedContent {
+    kind: ArchiveMemberKind,
+    reason: ArchiveOmissionReason,
     size: u64,
     digest: [u8; 32],
 }
@@ -1279,13 +1531,18 @@ impl<'a> ArchiveOutput<'a> {
             files: BTreeMap::new(),
             skipped_links: Vec::new(),
             omitted: BTreeMap::new(),
+            replaced: BTreeSet::new(),
         }
     }
 
     /// Normalizes an archive path, registers it against paths already seen, and returns the
     /// path relative to the caller's exact archive root. Shared by regular members and
     /// skipped links, so both draw duplicate-path and root-mismatch refusals from one place.
-    fn accept_path(&mut self, path: &str, kind: ArchiveMemberKind) -> Result<String, ArchiveError> {
+    fn accept_path(
+        &mut self,
+        path: &str,
+        kind: ArchiveMemberKind,
+    ) -> Result<RelativePath, ArchiveError> {
         let directory = kind == ArchiveMemberKind::Directory;
         let full = archive_path(path)?;
         let previous = self.seen.insert(full.as_str().to_owned(), kind);
@@ -1314,7 +1571,8 @@ impl<'a> ArchiveOutput<'a> {
             return Err(ArchiveError::DuplicatePath);
         }
         let relative = if let Some(root) = self.root {
-            if full.as_str() == root && directory {
+            // `./` is the folder that holds the root.
+            if directory && ["", root].contains(&full.as_str()) {
                 String::new()
             } else {
                 full.as_str()
@@ -1326,7 +1584,15 @@ impl<'a> ArchiveOutput<'a> {
         } else {
             full.as_str().to_owned()
         };
-        Ok(relative)
+        match full {
+            AcceptedPath::Canonical(_) => Ok(RelativePath::Canonical(relative)),
+            AcceptedPath::NonCanonicalUnicode(_) => match AcceptedPath::new(relative) {
+                Some(AcceptedPath::NonCanonicalUnicode(path)) => {
+                    Ok(RelativePath::NonCanonicalUnicode(path))
+                }
+                Some(AcceptedPath::Canonical(_)) | None => Err(ArchiveError::unsafe_path(path)),
+            },
+        }
     }
 
     fn push(
@@ -1342,11 +1608,9 @@ impl<'a> ArchiveOutput<'a> {
             ArchiveMemberKind::File
         };
         let relative = self.accept_path(path, kind)?;
-        let omitted = !directory && self.limits.omits(size);
-        if size > self.limits.member_bytes as u64 && !omitted {
-            return Err(self
-                .limits
-                .member_bytes_exceeded(size, archive_path(path).ok()));
+        let oversized = !directory && self.limits.omits(size);
+        if size > self.limits.member_bytes as u64 && !oversized {
+            return Err(self.limits.member_bytes_exceeded(size, member_path(path)));
         }
         let length = usize::try_from(size)
             .ok()
@@ -1354,28 +1618,38 @@ impl<'a> ArchiveOutput<'a> {
             .ok_or_else(|| {
                 let read = (self.expanded.maximum - self.remaining) as u64;
                 self.expanded
-                    .exceeded(read.saturating_add(size), archive_path(path).ok())
+                    .exceeded(read.saturating_add(size), member_path(path))
             })?;
         if directory {
             if size != 0 {
                 return Err(ArchiveError::UnsupportedEntry);
             }
+            if let RelativePath::NonCanonicalUnicode(path) = relative {
+                self.omit_empty(path, kind);
+            }
             return Ok(());
         }
-        if relative.is_empty() {
-            return Err(ArchiveError::UnsafePath);
-        }
-        let path = ProjectPath::new(relative).map_err(|_| ArchiveError::UnsafePath)?;
-        if omitted {
-            self.omit(path, size, reader)?;
-        } else {
-            self.retain(path, size, length, reader)?;
+        match relative {
+            RelativePath::NonCanonicalUnicode(path) => {
+                let reason = ArchiveOmissionReason::NonCanonicalUnicode;
+                self.omit(path, reason, size, reader)?;
+            }
+            RelativePath::Canonical(relative) => {
+                let path = RelativePath::project_path(relative)
+                    .ok_or_else(|| ArchiveError::unsafe_path(path))?;
+                if oversized {
+                    let path = ArchivePath(path.as_str().to_owned());
+                    self.omit(path, ArchiveOmissionReason::Oversized, size, reader)?;
+                } else {
+                    self.retain(path, size, length, reader)?;
+                }
+            }
         }
         self.remaining -= length;
         Ok(())
     }
 
-    /// Retains one regular file's bytes, accepting a repeated path only with equal bytes.
+    /// Retains one regular file's bytes in place of an earlier file of its path.
     fn retain(
         &mut self,
         path: ProjectPath,
@@ -1391,26 +1665,24 @@ impl<'a> ArchiveOutput<'a> {
         if content.len() != length {
             return Err(ArchiveError::InvalidArchive);
         }
-        if self.omitted.contains_key(&path) {
-            return Err(ArchiveError::DuplicatePath);
+        let replaced = self.omitted.remove(path.as_str()).is_some()
+            || self
+                .files
+                .get(&path)
+                .is_some_and(|earlier| *earlier != content);
+        if replaced {
+            self.replaced.insert(ArchivePath(path.as_str().to_owned()));
         }
-        match self.files.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(content);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &content => {}
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(ArchiveError::DuplicatePath);
-            }
-        }
+        self.files.insert(path, content);
         Ok(())
     }
 
     /// Decodes one regular file through a fixed buffer, checking its declared size, and
-    /// records the omission. A repeated path is accepted only with equal bytes.
+    /// records the omission in place of an earlier file of its path.
     fn omit(
         &mut self,
-        path: ProjectPath,
+        path: ArchivePath,
+        reason: ArchiveOmissionReason,
         size: u64,
         reader: &mut impl Read,
     ) -> Result<(), ArchiveError> {
@@ -1421,47 +1693,65 @@ impl<'a> ArchiveOutput<'a> {
             return Err(ArchiveError::InvalidArchive);
         }
         let content = OmittedContent {
+            kind: ArchiveMemberKind::File,
+            reason,
             size,
             digest: writer.0.finalize().into(),
         };
-        if self.files.contains_key(&path) {
-            return Err(ArchiveError::DuplicatePath);
+        let replaced = self.files.remove(path.as_str()).is_some()
+            || self
+                .omitted
+                .get(&path)
+                .is_some_and(|earlier| *earlier != content);
+        if replaced {
+            self.replaced.insert(path.clone());
         }
-        match self.omitted.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(content);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &content => {}
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(ArchiveError::DuplicatePath);
-            }
-        }
+        self.omitted.insert(path, content);
         Ok(())
     }
 
     /// Registers a symbolic or hard link entry's path without reading its target or content.
     /// The link never becomes a file and its target is never opened.
     fn push_skipped_link(&mut self, path: &str) -> Result<(), ArchiveError> {
-        let relative = self.accept_path(path, ArchiveMemberKind::Link)?;
-        if relative.is_empty() {
-            return Err(ArchiveError::UnsafePath);
+        let kind = ArchiveMemberKind::Link;
+        match self.accept_path(path, kind)? {
+            RelativePath::NonCanonicalUnicode(path) => self.omit_empty(path, kind),
+            RelativePath::Canonical(relative) => {
+                let path = RelativePath::project_path(relative)
+                    .ok_or_else(|| ArchiveError::unsafe_path(path))?;
+                self.skipped_links.push(path);
+            }
         }
-        let path = ProjectPath::new(relative).map_err(|_| ArchiveError::UnsafePath)?;
-        self.skipped_links.push(path);
         Ok(())
     }
 
-    fn into_files(self, digest: FileDigest) -> ArchiveFiles {
+    /// Records a directory or link whose name does not use Unicode NFC.
+    fn omit_empty(&mut self, path: ArchivePath, kind: ArchiveMemberKind) {
+        let content = OmittedContent {
+            kind,
+            reason: ArchiveOmissionReason::NonCanonicalUnicode,
+            size: 0,
+            digest: Sha256::digest([]).into(),
+        };
+        self.omitted.insert(path, content);
+    }
+
+    fn into_files(mut self, digest: FileDigest) -> ArchiveFiles {
+        self.seen
+            .retain(|path, _| ProjectPath::new(path.as_str()).is_ok());
         ArchiveFiles {
             digest,
             files: self.files,
             members: self.seen,
             skipped_links: self.skipped_links,
+            replaced: self.replaced,
             omissions: self
                 .omitted
                 .into_iter()
                 .map(|(path, content)| ArchiveOmission {
                     path,
+                    kind: content.kind,
+                    reason: content.reason,
                     size: content.size,
                 })
                 .collect(),

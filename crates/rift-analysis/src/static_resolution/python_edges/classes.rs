@@ -158,6 +158,14 @@ fn key(target: Target<'_>) -> ClassKey<'_> {
     )
 }
 
+/// Where one binding of a name outside the selected sources leads.
+enum ExternalBinding<'index, 'source> {
+    /// A module outside the selected sources.
+    Outside,
+    /// The name a module of the selected sources re-exports.
+    Reexport(&'index File<'source>, &'index str),
+}
+
 impl<'source> Index<'source> {
     pub(in crate::static_resolution) fn python_class_orders(
         &self,
@@ -297,61 +305,82 @@ impl<'source> Index<'source> {
             return false;
         };
         let dotted = parts.next().is_some();
-        let mut visited = BTreeSet::new();
-        self.python_external_name(file, name, range.start, dotted, &mut visited, work)
+        self.python_external_name(file, name, range.start, dotted, work)
     }
 
+    /// Whether every binding the name reaches is one outside the selected sources. A name of
+    /// one file is read once, and reaching it again establishes nothing.
     fn python_external_name<'index>(
         &'index self,
         file: &'index File<'source>,
         name: &'index str,
         position: u64,
         dotted: bool,
-        visited: &mut BTreeSet<(&'index str, &'index str)>,
         work: &mut Work,
     ) -> bool {
-        if !work.charge() || !visited.insert((file.document.path.as_str(), name)) {
-            return false;
-        }
-        if file.blocked(position, work) {
-            return false;
-        }
-        let Some(bindings) = file.by_name.get(name) else {
-            // Python resolves a name no scope binds among the builtins.
-            return !dotted && BUILTIN_CLASSES.contains(&name);
-        };
-        !bindings.is_empty()
-            && bindings.iter().all(|binding| match binding.kind {
-                StaticBindingKind::PythonModule { module } => file
-                    .text(module)
-                    .and_then(|module| module.split('.').next())
-                    .is_some_and(|module| self.module_value(module).is_none()),
-                StaticBindingKind::PythonImport { module, export } => {
-                    let Some(module) = file
-                        .text(module)
-                        .and_then(|module| super::EdgePythonModules::name(file, module))
-                    else {
-                        return false;
-                    };
-                    match export.and_then(|export| file.text(export)) {
-                        Some(export) => match self.edge_python.path(&module) {
-                            // A module of the selected sources re-exports a binding it holds.
-                            Some(path) => self.files.get(path).is_some_and(|source| {
-                                source.by_name.contains_key(export)
-                                    && self.python_external_name(
-                                        source, export, 0, dotted, visited, work,
-                                    )
-                            }),
-                            None => {
-                                self.module_value(&module).is_none()
-                                    && self.module_value(&format!("{module}.{export}")).is_none()
-                            }
-                        },
-                        None => self.module_value(&module).is_none(),
-                    }
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![(file, name, position)];
+        while let Some((file, name, position)) = pending.pop() {
+            if !work.charge() || !visited.insert((file.document.path.as_str(), name)) {
+                return false;
+            }
+            if file.blocked(position, work) {
+                return false;
+            }
+            let Some(bindings) = file.by_name.get(name) else {
+                // Python resolves a name no scope binds among the builtins.
+                if dotted || !BUILTIN_CLASSES.contains(&name) {
+                    return false;
                 }
-                _ => false,
-            })
+                continue;
+            };
+            if bindings.is_empty() {
+                return false;
+            }
+            for binding in bindings {
+                match self.python_external_binding(file, binding) {
+                    Some(ExternalBinding::Outside) => {}
+                    Some(ExternalBinding::Reexport(file, name)) => pending.push((file, name, 0)),
+                    None => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Where one binding of a name outside the selected sources leads. `None` for any other
+    /// binding.
+    fn python_external_binding<'index>(
+        &'index self,
+        file: &'index File<'source>,
+        binding: &StaticBinding,
+    ) -> Option<ExternalBinding<'index, 'source>> {
+        let outside = |module: &str| {
+            let absent = self.module_value(module).is_none();
+            absent.then_some(ExternalBinding::Outside)
+        };
+        match binding.kind {
+            StaticBindingKind::PythonModule { module } => {
+                outside(file.text(module)?.split('.').next()?)
+            }
+            StaticBindingKind::PythonImport { module, export } => {
+                let module = super::EdgePythonModules::name(file, file.text(module)?)?;
+                let Some(export) = export.and_then(|export| file.text(export)) else {
+                    return outside(&module);
+                };
+                let Some(path) = self.edge_python.path(&module) else {
+                    outside(&module)?;
+                    return outside(&format!("{module}.{export}"));
+                };
+                // A module of the selected sources re-exports a binding it holds.
+                let source = self.files.get(path)?;
+                source
+                    .by_name
+                    .contains_key(export)
+                    .then_some(ExternalBinding::Reexport(source, export))
+            }
+            _ => None,
+        }
     }
 
     fn python_generic_marker(
@@ -685,6 +714,46 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// The class object a value holds through unchanged aliases.
+    ///
+    /// A value that another value constructs, iterates, or unpacks holds an instance, so the
+    /// values that construct each other need no lookup in turn.
+    fn python_held_class(
+        &self,
+        mut target: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let mut visited = BTreeSet::new();
+        loop {
+            if target.symbol.kinds.contains(&SymbolKind::Constructible) {
+                return Some(target);
+            }
+            if !work.charge() || !visited.insert(key(target)) {
+                return None;
+            }
+            let file = self.files.get(target.file.path.as_str())?;
+            let value = match *file.python_values.get(&target.symbol.name_range?.end)? {
+                StaticBindingKind::PythonAnnotation { annotation } => {
+                    return self.python_class_object_annotation(file, annotation, work);
+                }
+                StaticBindingKind::PythonAlias { value } => {
+                    work.python_lookup(|work| self.python_name(file, value, work))?
+                }
+                _ => return None,
+            };
+            target = match value {
+                Value::Symbol(target) => target,
+                // The value a class calls for an attribute is an instance of that class.
+                Value::Member { assigned, .. }
+                    if !assigned.symbol.kinds.contains(&SymbolKind::Constructible) =>
+                {
+                    assigned
+                }
+                Value::Member { .. } | Value::Instance(_) | Value::Module(_) => return None,
+            };
+        }
+    }
+
     /// The class a `type[Class]` annotation names, when `type` is the builtin.
     fn python_class_object_annotation(
         &self,
@@ -765,12 +834,7 @@ impl<'source> Index<'source> {
         }
         if !callable.symbol.kinds.contains(&SymbolKind::Callable) {
             // A value that holds a class object constructs an instance of that class.
-            return match self.python_receiver(Value::Symbol(callable), work)? {
-                Value::Symbol(class) if class.symbol.kinds.contains(&SymbolKind::Constructible) => {
-                    Some(class)
-                }
-                _ => None,
-            };
+            return self.python_held_class(callable, work);
         }
         let file = self.files.get(callable.file.path.as_str())?;
         let StaticBindingKind::PythonFunction { annotation, .. } =

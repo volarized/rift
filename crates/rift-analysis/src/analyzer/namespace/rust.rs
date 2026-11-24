@@ -370,18 +370,7 @@ fn target_roots(
         let Some(package) = metadata.get("package").and_then(toml::Value::as_table) else {
             continue;
         };
-        let joined = |relative: &str| {
-            ProjectPath::new(relative)
-                .ok()
-                .filter(|relative| !relative.as_str().is_empty())
-                .map(|relative| {
-                    if parent.is_empty() {
-                        relative.as_str().to_owned()
-                    } else {
-                        format!("{parent}/{}", relative.as_str())
-                    }
-                })
-        };
+        let joined = |relative: &str| target_path(parent, relative);
         let explicit = SECTIONS
             .iter()
             .filter_map(|section| metadata.get(*section).and_then(toml::Value::as_array))
@@ -749,22 +738,9 @@ pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
         }
         let explicit = metadata.lib.unwrap_or_default();
         let relative = explicit.path.as_deref().unwrap_or("src/lib.rs");
-        let relative = ProjectPath::new(relative).ok()?;
-        if relative.as_str().is_empty() {
-            return None;
-        }
-        let root = if parent.is_empty() {
-            relative.as_str().to_owned()
-        } else {
-            format!("{parent}/{}", relative.as_str())
-        };
-        let root = ProjectPath::new(root).ok()?;
-        let name = explicit
-            .name
-            .unwrap_or_else(|| package.name.replace('-', "_"));
-        if !crate_name_is_valid(&name)
-            || library.replace((root.as_str().to_owned(), name)).is_some()
-        {
+        let root = target_path(parent, relative)?;
+        let name = crate_name(package.name, explicit.name);
+        if !crate_name_is_valid(&name) || library.replace((root, name)).is_some() {
             return None;
         }
     }
@@ -804,26 +780,14 @@ fn library_roots(
         };
         let enabled = package.autolib != Some(false) || metadata.lib.is_some();
         let library = metadata.lib.unwrap_or_default();
-        let name = library
-            .name
-            .unwrap_or_else(|| package.name.replace('-', "_"));
+        let name = crate_name(package.name, library.name);
         if !crate_name_is_valid(&name) {
             continue;
         }
         let root = enabled
             .then(|| library.path.as_deref().unwrap_or("src/lib.rs"))
-            .and_then(|path| ProjectPath::new(path).ok())
-            .filter(|path| !path.as_str().is_empty())
-            .and_then(|relative| {
-                let path = if parent.is_empty() {
-                    relative.as_str().to_owned()
-                } else {
-                    format!("{parent}/{}", relative.as_str())
-                };
-                ProjectPath::new(path).ok()
-            })
-            .filter(|root| contains(root.as_str()))
-            .map(|root| root.as_str().to_owned());
+            .and_then(|path| target_path(parent, path))
+            .filter(|root| contains(root));
         match libraries.entry(name) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(root);
@@ -863,6 +827,33 @@ fn source_identifier(name: &str) -> Option<String> {
     }
     let name = name.nfc().collect::<String>();
     python_identifier_is_valid(&name).then_some(name)
+}
+
+/// The original path of a target a manifest in `parent` names, where `.` names the folder it
+/// stands in.
+fn target_path(parent: &str, relative: &str) -> Option<String> {
+    let relative = relative
+        .split('/')
+        .filter(|part| *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let relative = ProjectPath::new(relative).ok()?;
+    match (parent, relative.as_str()) {
+        (_, "") => None,
+        ("", relative) => Some(relative.to_owned()),
+        (parent, relative) => {
+            let path = ProjectPath::new(format!("{parent}/{relative}")).ok()?;
+            Some(path.as_str().to_owned())
+        }
+    }
+}
+
+/// The crate name Cargo derives from a library target, which is named after its package when
+/// the manifest names none.
+///
+/// Manifests published before RFC 940 spell a library name with hyphens.
+fn crate_name(package: String, library: Option<String>) -> String {
+    library.unwrap_or(package).replace('-', "_")
 }
 
 fn crate_name_is_valid(name: &str) -> bool {

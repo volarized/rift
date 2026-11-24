@@ -447,6 +447,7 @@ struct File<'source> {
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
     python_non_none: BTreeMap<&'source str, Vec<(ByteRange, ByteRange)>>,
+    /// The calls of a Python file by their first byte, the shortest first.
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     /// Declaration name to the named element type its written array type states.
@@ -710,6 +711,9 @@ impl<'source> File<'source> {
                     .entry(call.range.start)
                     .or_default()
                     .push(call);
+            }
+            for calls in self.python_calls.values_mut() {
+                calls.sort_by_key(|call| call.range.end);
             }
         }
         self.index_written_types(work)
