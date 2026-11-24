@@ -3413,3 +3413,73 @@ fn a_reader_is_bounded_before_it_is_decoded() -> TestResult {
     }
     Ok(())
 }
+
+/// A reader that reports another length than it serves.
+struct Reported<'a> {
+    cursor: Cursor<&'a [u8]>,
+    length: u64,
+}
+
+impl Read for Reported<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.cursor.read(buffer)
+    }
+}
+
+impl Seek for Reported<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let found = self.cursor.seek(position)?;
+        Ok(match position {
+            SeekFrom::End(0) => self.length,
+            _ => found,
+        })
+    }
+}
+
+#[test]
+fn a_reported_length_other_than_the_bytes_read_is_refused() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let zeros = vec![0; 4 << 20];
+    let archives = [
+        (
+            ArchiveFormat::TarGzip,
+            tar_bytes(&[("release/a", &zeros, regular)])?,
+        ),
+        (
+            ArchiveFormat::Zip,
+            zip_members_bytes(&[("release/a", SOURCE, regular)])?,
+        ),
+    ];
+    for (format, bytes) in archives {
+        let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+        let served = bytes.len() as u64;
+        let read = |length: u64, ratio: usize| {
+            let limits = ArchiveLimits::new(1 << 20, 8 << 20, 8 << 20, 4, ratio)?;
+            let reader = Reported {
+                cursor: Cursor::new(&bytes),
+                length,
+            };
+            read_archive_from(reader, format, &digest, Some("release"), limits, &|_, _| {
+                true
+            })
+        };
+        assert_eq!(read(served, 10_000)?.files().len(), 1, "{format:?}");
+        for length in [served + 100_000, served + 1, served - 1, 1] {
+            for ratio in [200, 10_000] {
+                assert_eq!(
+                    read(length, ratio).expect_err("another length than the bytes read"),
+                    ArchiveError::ReaderChanged,
+                    "{format:?} {length} of {served}"
+                );
+            }
+        }
+        for length in [0, (1 << 20) + 1] {
+            assert_eq!(
+                read(length, 10_000).expect_err("a reported length outside the bound"),
+                ArchiveError::CompressedLimit,
+                "{format:?}"
+            );
+        }
+    }
+    Ok(())
+}

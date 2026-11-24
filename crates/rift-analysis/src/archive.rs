@@ -499,6 +499,8 @@ pub enum ArchiveError {
     RootMismatch,
     /// The caller's reader failed.
     Read(ErrorKind),
+    /// The caller's reader returned other bytes, or another count of them, than it did before.
+    ReaderChanged,
 }
 
 impl ArchiveError {
@@ -521,6 +523,7 @@ impl std::fmt::Display for ArchiveError {
             Self::DuplicatePath => "archive contains a duplicate path",
             Self::UnsupportedEntry => "archive entry type is unsupported",
             Self::RootMismatch => "archive member is outside its exact release root",
+            Self::ReaderChanged => "archive reader returned other bytes than before",
         };
         f.write_str(message)
     }
@@ -634,6 +637,8 @@ fn read_source<R: Read + Seek>(
 }
 
 /// Digests the whole reader through a fixed buffer and compares it with the expected digest.
+/// The reader serves exactly the `compressed` bytes it reported, so every later bound counts
+/// the bytes the digest covers.
 fn verified_digest<R: Read + Seek>(
     source: &mut Source<'_, R>,
     compressed: usize,
@@ -653,12 +658,15 @@ fn verified_digest<R: Read + Seek>(
         };
         read += length;
         if read > compressed {
-            return Err(ArchiveError::CompressedLimit);
+            return Err(ArchiveError::ReaderChanged);
         }
         sha256.update(bytes);
         if let Some(sha512) = &mut sha512 {
             sha512.update(bytes);
         }
+    }
+    if read != compressed {
+        return Err(ArchiveError::ReaderChanged);
     }
     let actual = <[u8; 32]>::from(sha256.finalize());
     let verified = match expected {
