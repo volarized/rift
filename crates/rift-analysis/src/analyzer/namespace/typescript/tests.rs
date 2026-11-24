@@ -392,7 +392,10 @@ fn unresolved_owner_metadata_conditions_and_paths_do_not_guess_module() {
         r#"{"name":"prettier","version":"3.8.5","types":"../index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"/index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","typesVersions":{">=5":{"*": ["new/*"]}}}"#,
-        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"browser":"./browser.d.ts","types":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"browser":"./index.d.ts","@prettier/source":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":null,"default":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types@>=5.7":"./new.d.ts","types":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":"../index.d.ts"}}}"#,
         r#"{"name":"prettier","version":"3.8.5","exports":{".":["./index.d.ts"]}}"#,
         r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":"./index.d.ts","types":"./other.d.ts"}}}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","types":"./other.d.ts"}"#,
@@ -459,6 +462,140 @@ fn captured_types_and_main_map_one_explicit_export_to_its_defining_object() {
     assert_eq!(found.mappings["index.d.ts"].len(), 1);
     assert_eq!(found.exports.len(), 1);
     assert_eq!(found.exports[0].target, mapping.identity);
+}
+
+#[test]
+fn export_conditions_resolve_the_first_one_a_static_consumer_selects() {
+    for (exports, types, implementation) in [
+        // zod 4.6.7 lists a condition no published consumer resolves first.
+        (
+            r#"{".":{"@zod/source":"./src/index.ts","types":"./index.d.cts","import":"./index.js","require":"./index.cjs"}}"#,
+            "./index.d.cts",
+            "./index.js",
+        ),
+        (
+            r#"{".":{"browser":"./browser.js","types":"./index.d.ts","default":"./index.mjs"}}"#,
+            "./index.d.ts",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"import":{"types":"./index.d.mts","default":"./index.mjs"},"require":{"types":"./index.d.cts","default":"./index.cjs"}}}"#,
+            "./index.d.mts",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"require":"./index.cjs","import":"./index.mjs"}}"#,
+            "./index.cjs",
+            "./index.cjs",
+        ),
+        (
+            r#"{".":{"node":{"import":"./node.mjs"},"import":{"development":"./dev.mjs"},"default":"./index.mjs"}}"#,
+            "./index.mjs",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"default":"./index.mjs","types":"./index.d.ts"}}"#,
+            "./index.mjs",
+            "./index.mjs",
+        ),
+        (
+            r#"{"types":"./index.d.ts","import":"./index.mjs"}"#,
+            "./index.d.ts",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"types":"./index.d.ts","default":"./index.mjs"},"./internal/*":null,"./list":["./list.mjs"]}"#,
+            "./index.d.ts",
+            "./index.mjs",
+        ),
+    ] {
+        let metadata: super::PackageMetadata = serde_json::from_str(&format!(
+            r#"{{"name":"prettier","version":"3.8.5","exports":{exports}}}"#
+        ))
+        .expect("captured metadata");
+        for (language, expected) in [("typescript", types), ("javascript", implementation)] {
+            assert_eq!(
+                super::entry_path(&metadata, language)
+                    .as_ref()
+                    .map(ProjectPath::as_str),
+                expected.strip_prefix("./"),
+                "{language} {exports}"
+            );
+        }
+    }
+    let metadata: super::PackageMetadata = serde_json::from_str(
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":"./index.d.ts"}}}"#,
+    )
+    .expect("captured metadata");
+    assert!(super::entry_path(&metadata, "javascript").is_none());
+}
+
+#[test]
+fn unknown_first_conditions_establish_every_published_entry_point() {
+    let files = [
+        ("src/index.ts", "export class Source {}"),
+        (
+            "index.d.cts",
+            "export declare class ZodType { parse(): void }",
+        ),
+        (
+            "core/index.d.ts",
+            "export declare function safeParse(): void;",
+        ),
+    ];
+    let found = prepared(
+        ShippedLanguage::TypeScript,
+        &[(
+            "package.json",
+            r#"{"name":"prettier","version":"3.8.5","exports":{".":{"@zod/source":"./src/index.ts","types":"./index.d.cts","import":"./index.js","require":"./index.cjs"},"./core":{"@zod/source":"./src/core.ts","import":{"types":"./core/index.d.ts","default":"./core/index.js"}}}}"#,
+        )],
+        &files,
+    );
+    for (path, name, qualified) in [
+        ("index.d.cts", "ZodType", vec!["prettier", "ZodType"]),
+        (
+            "index.d.cts",
+            "ZodType.parse",
+            vec!["prettier", "ZodType", "parse"],
+        ),
+        (
+            "core/index.d.ts",
+            "safeParse",
+            vec!["prettier/core", "safeParse"],
+        ),
+    ] {
+        let identity = SymbolIdentity::parse(found.anchors[path][name].as_str())
+            .expect("published entry identity");
+        assert_eq!(identity.qualified_path(), qualified);
+    }
+    assert!(
+        !found.anchors.contains_key("src/index.ts"),
+        "no published consumer resolves the source condition"
+    );
+}
+
+#[test]
+fn conditions_map_declared_types_only_to_one_implementation() {
+    let types = "export declare function format(source: string): string;";
+    let implementation = "export function format(source) { return source; }";
+    let found = mixed_entries(
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"@prettier/source":"./src/index.ts","types":"./index.d.ts","default":"./index.mjs"}}}"#,
+        types,
+        implementation,
+    );
+    assert!(
+        found.mappings.is_empty(),
+        "the source condition names a second implementation"
+    );
+    let found = mixed_entries(
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"import":{"types":"./index.d.ts","default":"./index.mjs"},"default":"./index.mjs"}}}"#,
+        types,
+        implementation,
+    );
+    assert_eq!(
+        found.mappings["index.d.ts"]["format"].identity,
+        found.anchors["index.mjs"]["format"]
+    );
 }
 
 #[test]
@@ -695,7 +832,7 @@ fn explicit_export_subpaths_establish_independent_captured_modules() {
 #[test]
 fn missing_conditional_and_pattern_exports_leave_sources_unresolved() {
     for target in [
-        r#"{"./hub":{"import":"./hub.ts"}}"#,
+        r#"{"./hub":{"browser":"./hub.ts"}}"#,
         r#"{"./*":"./hub.ts"}"#,
         r#"{"./hub":"./missing.ts"}"#,
         r#"{"./hub":"../hub.ts"}"#,
@@ -1132,10 +1269,14 @@ fn commonjs_original_react_builds_keep_distinct_modules_and_public_bindings() {
             .iter()
             .find(|symbol| symbol.name == "useState")
             .expect("original raw useState");
-        assert!(
-            !declaration
+        // The production build assigns in the module body; the development build assigns
+        // inside a conditional function expression.
+        assert_eq!(
+            declaration
                 .kinds
-                .contains(&rift_protocol::read::SymbolKind::Public)
+                .contains(&rift_protocol::read::SymbolKind::Public),
+            path.ends_with("production.js"),
+            "{path}"
         );
         let anchors = prepared
             .anchors

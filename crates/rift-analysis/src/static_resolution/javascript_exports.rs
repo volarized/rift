@@ -141,17 +141,20 @@ impl<'source> Exports<'_, 'source> {
             if !self.accepts(file, mode, work) {
                 continue;
             }
-            let (direct, stars) = export_candidates(file, name, mode, role, work)?;
+            let (direct, stars) = self.export_candidates(file, name, mode, role, work)?;
             let Some(export) = direct else {
-                if mode == ModuleMode::CommonJs || name != ExportSlot::Named("default") {
-                    pending.extend(stars.into_iter().filter_map(|module| {
-                        Some((
-                            self.imported_for_role(file, module, mode, role, work)?,
-                            name,
-                            member,
-                        ))
-                    }));
-                }
+                let default = matches!(name, ExportSlot::Default | ExportSlot::Named("default"));
+                pending.extend(stars.into_iter().filter_map(|star| {
+                    // Only `module.exports = require(..)` passes the module value on.
+                    if default && !star.replaces_module {
+                        return None;
+                    }
+                    Some((
+                        self.imported_for_role(file, star.module, mode, role, work)?,
+                        name,
+                        member,
+                    ))
+                }));
                 continue;
             };
             let export = self.local_export(file, export, role, work)?;
@@ -210,7 +213,12 @@ impl<'source> Exports<'_, 'source> {
         let Export::Local { name, position } = export else {
             return Some(export);
         };
+        // `get: function () { return module.name }` exports a member of a required module.
+        let (name, member) = split_name(name);
         let binding = js_binding(file, self.modes, name, position, role, work)?;
+        if let Some(member) = member {
+            return self.required_member(file, binding, member, work);
+        }
         match binding.kind {
             StaticBindingKind::Local => Some(Export::Declaration(binding.name)),
             StaticBindingKind::JavaScriptImport { module, export } => Some(Export::Reexport {
@@ -246,6 +254,214 @@ impl<'source> Exports<'_, 'source> {
             }
             _ => None,
         }
+    }
+
+    fn required_member(
+        &self,
+        file: &File<'source>,
+        binding: &rift_syntax::StaticBinding,
+        member: &'source str,
+        work: &mut Work,
+    ) -> Option<Export<'source>> {
+        let StaticBindingKind::JavaScriptRequire {
+            require,
+            module,
+            export: None,
+        } = binding.kind
+        else {
+            return None;
+        };
+        (!file.javascript_binding_reassigned(binding)
+            && super::javascript::builtin_commonjs_name(
+                file,
+                self.modes,
+                "require",
+                require.start,
+                work,
+            ))
+        .then_some(())?;
+        Some(Export::Reexport {
+            module: file.text(module)?,
+            name: member,
+        })
+    }
+
+    /// Whether every computed key written on the file's exports is a symbol value: such a
+    /// key replaces no named export. A key whose value is not established replaces any.
+    fn export_keys_are_symbols(&self, file: &File<'source>, work: &mut Work) -> bool {
+        file.export_keys
+            .iter()
+            .all(|&(name, position)| self.is_symbol_value(file, name, position, work))
+    }
+
+    /// Whether `name` is bound to a `const` whose initializer is a `Symbol(..)` value, in
+    /// this file or, through `require`, in another file of the package.
+    fn is_symbol_value(
+        &self,
+        file: &File<'source>,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
+        if !work.charge() {
+            return false;
+        }
+        let role = rift_core::ReferenceRole::Read;
+        // The write runs after the key's declaration or fails: source order decides nothing.
+        let super::Binding::Found(binding) = file.binding(name, position, |_| true, work) else {
+            return false;
+        };
+        if file.javascript_binding_reassigned(binding) {
+            return false;
+        }
+        match binding.kind {
+            StaticBindingKind::Local => file
+                .target_at(binding.name)
+                .is_some_and(|target| file.is_symbol_declaration(target)),
+            StaticBindingKind::JavaScriptRequire {
+                require,
+                module,
+                export: Some(export),
+            } => {
+                super::javascript::builtin_commonjs_name(
+                    file,
+                    self.modes,
+                    "require",
+                    require.start,
+                    work,
+                ) && file
+                    .text(module)
+                    .zip(file.text(export))
+                    .is_some_and(|(module, export)| {
+                        self.exports_symbol(file, module, export, role, work)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the required module exports `name` as a symbol value: an exported `const`,
+    /// or a property of the object literal the module exports.
+    fn exports_symbol(
+        &self,
+        from: &File<'source>,
+        module: &str,
+        name: &'source str,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> bool {
+        let Some(supplied) = self.imported(from, module, work) else {
+            return false;
+        };
+        if !supplied.named_export_is_written_once(name) {
+            return false;
+        }
+        if let Some(resolved) = self.resolve_file(supplied, name, ModuleMode::CommonJs, role, work)
+        {
+            let ResolvedExport::Declaration {
+                target,
+                member: None,
+            } = resolved
+            else {
+                return false;
+            };
+            return self
+                .files
+                .get(target.file.path.as_str())
+                .is_some_and(|file| file.is_symbol_declaration(target));
+        }
+        let value = self.resolve_slot(
+            supplied,
+            ExportSlot::Default,
+            ModuleMode::CommonJs,
+            role,
+            work,
+        );
+        let owner = match value {
+            Some(ResolvedExport::Declaration {
+                target,
+                member: None,
+            }) => Some(target),
+            Some(_) => return false,
+            None => supplied
+                .facts
+                .commonjs_export()
+                .and_then(|export| export.literal)
+                .and_then(|_| supplied.qualified_target("default")),
+        };
+        let Some(owner) = owner else {
+            return false;
+        };
+        let Some(file) = self.files.get(owner.file.path.as_str()) else {
+            return false;
+        };
+        let property = file.qualified_target(&format!("{}.{}", owner.symbol.qualified_name, name));
+        property.is_some_and(|property| file.is_symbol_property(owner, property))
+    }
+
+    fn export_candidates(
+        &self,
+        file: &File<'source>,
+        name: ExportSlot<'source>,
+        mode: ModuleMode,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<ExportCandidates<'source>> {
+        let mut found: Option<Export<'source>> = None;
+        let mut stars = Vec::new();
+        let mut keys_are_symbols = None;
+        for binding in file.document.facts.export_bindings()? {
+            if !work.charge() {
+                return None;
+            }
+            let written = file.text(binding.range)?;
+            if !matches_export_form(written, mode)
+                || binding.container.is_some()
+                || !file.javascript_export_role(binding, role)
+                || file.exported_pair(binding).is_some()
+            {
+                continue;
+            }
+            if binding.kind == SyntaxExportKind::All {
+                stars.push(ExportStar {
+                    module: literal_contents(file.text(binding.source?)?)?,
+                    replaces_module: written.starts_with("module.exports"),
+                });
+                continue;
+            }
+            let exported = match binding.kind {
+                SyntaxExportKind::Named | SyntaxExportKind::Namespace => binding
+                    .exported
+                    .and_then(|range| file.text(range))
+                    .map(ExportSlot::Named),
+                SyntaxExportKind::Default if mode == ModuleMode::CommonJs => {
+                    Some(ExportSlot::Default)
+                }
+                SyntaxExportKind::Default => Some(ExportSlot::Named("default")),
+                SyntaxExportKind::All => None,
+            };
+            if exported != Some(name) {
+                continue;
+            }
+            if mode == ModuleMode::CommonJs && role == rift_core::ReferenceRole::Call {
+                let symbols = match keys_are_symbols {
+                    Some(symbols) => symbols,
+                    None => *keys_are_symbols.insert(self.export_keys_are_symbols(file, work)),
+                };
+                if !symbols
+                    || !file.javascript_written_export_is_stable(binding)
+                    || !file.javascript_alias_write_is_stable(binding, work)
+                {
+                    return None;
+                }
+            }
+            let target = file.javascript_export_candidate(binding, role, work)?;
+            found = Some(match found {
+                Some(previous) => previous.merge(target, file)?,
+                None => target,
+            });
+        }
+        Some((found, stars))
     }
 
     fn collect_names<'index>(
@@ -393,57 +609,14 @@ enum Export<'source> {
     },
 }
 
-type ExportCandidates<'source> = (Option<Export<'source>>, Vec<&'source str>);
-
-fn export_candidates<'source>(
-    file: &File<'source>,
-    name: ExportSlot<'source>,
-    mode: ModuleMode,
-    role: rift_core::ReferenceRole,
-    work: &mut Work,
-) -> Option<ExportCandidates<'source>> {
-    let mut found: Option<Export<'source>> = None;
-    let mut stars = Vec::new();
-    for binding in file.document.facts.export_bindings()? {
-        if !work.charge() {
-            return None;
-        }
-        if !matches_export_form(file.text(binding.range)?, mode)
-            || binding.container.is_some()
-            || !file.javascript_export_role(binding, role)
-        {
-            continue;
-        }
-        if binding.kind == SyntaxExportKind::All {
-            stars.push(literal_contents(file.text(binding.source?)?)?);
-            continue;
-        }
-        let exported = match binding.kind {
-            SyntaxExportKind::Named | SyntaxExportKind::Namespace => binding
-                .exported
-                .and_then(|range| file.text(range))
-                .map(ExportSlot::Named),
-            SyntaxExportKind::Default if mode == ModuleMode::CommonJs => Some(ExportSlot::Default),
-            SyntaxExportKind::Default => Some(ExportSlot::Named("default")),
-            SyntaxExportKind::All => None,
-        };
-        if exported != Some(name) {
-            continue;
-        }
-        if mode == ModuleMode::CommonJs
-            && role == rift_core::ReferenceRole::Call
-            && !file.javascript_export_is_stable(binding)
-        {
-            return None;
-        }
-        let target = file.javascript_export_candidate(binding, role, work)?;
-        found = Some(match found {
-            Some(previous) => previous.merge(target, file)?,
-            None => target,
-        });
-    }
-    Some((found, stars))
+/// A whole-module export: `export * from`, `module.exports = require(..)` or a copy of
+/// another module's exports onto `exports`.
+struct ExportStar<'source> {
+    module: &'source str,
+    replaces_module: bool,
 }
+
+type ExportCandidates<'source> = (Option<Export<'source>>, Vec<ExportStar<'source>>);
 
 impl<'source> Export<'source> {
     fn merge(self, incoming: Self, file: &File<'source>) -> Option<Self> {
@@ -518,17 +691,22 @@ impl<'source> File<'source> {
                 continue;
             };
             self.index_javascript_object_write(member, work);
+            self.index_exported_object_write(member, work);
             let Some((receiver, slot)) = self.javascript_export_slot(member) else {
                 continue;
             };
-            // A key bound to a `Symbol(..)` value of this file names no export (D41).
-            if slot == ExportSlot::Unknown && self.javascript_symbol_key(member, work) {
-                continue;
-            }
             if matches!(
                 self.binding(self.text(receiver)?, receiver.start, |_| true, work),
                 super::Binding::Missing
             ) {
+                // A key bound to a symbol value names no export (D41); the exports that
+                // supply the key decide it.
+                if slot == ExportSlot::Unknown
+                    && let Some(key) = self.javascript_export_key(member)
+                {
+                    self.export_keys.push((key, member.range.start));
+                    continue;
+                }
                 self.export_writes
                     .entry(slot)
                     .and_modify(|start| {
@@ -540,6 +718,36 @@ impl<'source> File<'source> {
             }
         }
         Some(())
+    }
+
+    /// Records a write to a member of the value an export assignment declares:
+    /// `module.exports.helpers.add = value`.
+    fn index_exported_object_write(&mut self, member: &rift_syntax::StaticMember, work: &mut Work) {
+        let Some(name) = self.text(member.receiver).and_then(|receiver| {
+            receiver
+                .strip_prefix("module.exports.")
+                .or_else(|| receiver.strip_prefix("exports."))
+                .filter(|name| !name.contains(['.', '[', '(']))
+        }) else {
+            return;
+        };
+        let written = member.member.and_then(|range| self.text(range));
+        for binding in self.document.facts.export_bindings().unwrap_or_default() {
+            if !work.charge() {
+                self.unknown_member_writes.insert(None);
+                return;
+            }
+            let declared = binding
+                .exported
+                .filter(|&exported| binding.local == Some(exported))
+                .filter(|&exported| self.text(exported) == Some(name));
+            if let Some(declared) = declared {
+                self.member_writes
+                    .entry((declared, written))
+                    .and_modify(|position| *position = None)
+                    .or_insert(Some(member.range.start));
+            }
+        }
     }
 
     fn javascript_export_slot(
@@ -560,53 +768,117 @@ impl<'source> File<'source> {
         Some((member.receiver, slot))
     }
 
-    /// Whether `member` is `exports[key]` or `module.exports[key]` with `key` a `const`
-    /// of this file bound to a `Symbol(..)` value: such a key is no export name. Only a
-    /// `const` declaring that one name counts.
-    fn javascript_symbol_key(&self, member: &rift_syntax::StaticMember, work: &mut Work) -> bool {
+    /// The name written as the key of `exports[key]` or `module.exports[key]`.
+    fn javascript_export_key(&self, member: &rift_syntax::StaticMember) -> Option<&'source str> {
         if member.member.is_some()
             || !matches!(
                 self.text(member.receiver),
                 Some("exports" | "module.exports")
             )
         {
-            return false;
+            return None;
         }
-        let key = self
-            .text(rift_syntax::ByteRange {
-                start: member.receiver.end,
-                end: member.range.end,
-            })
-            .map(str::trim)
-            .and_then(|key| key.strip_prefix('['))
-            .and_then(|key| key.strip_suffix(']'))
-            .map(str::trim);
-        let Some(key) = key.filter(|key| {
+        self.text(rift_syntax::ByteRange {
+            start: member.receiver.end,
+            end: member.range.end,
+        })
+        .map(str::trim)
+        .and_then(|key| key.strip_prefix('['))
+        .and_then(|key| key.strip_suffix(']'))
+        .map(str::trim)
+        .filter(|key| {
             !key.is_empty()
                 && key
                     .chars()
                     .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
-        }) else {
-            return false;
-        };
-        let super::Binding::Found(binding) = self.binding(key, member.range.start, |_| true, work)
-        else {
-            return false;
-        };
-        self.target_at(binding.name).is_some_and(|target| {
-            target.symbol.kind == "variable"
-                && self
-                    .text(rift_syntax::ByteRange {
-                        start: 0,
-                        end: target.symbol.item_range.start,
-                    })
-                    .is_some_and(|before| before.trim_end().ends_with("const"))
-                && target
-                    .symbol
-                    .body_range
-                    .and_then(|range| self.text(range))
-                    .is_some_and(|value| value.trim_start().starts_with("Symbol("))
         })
+    }
+
+    /// Whether `target` is a `const` declaring one name with a `Symbol(..)` value.
+    fn is_symbol_declaration(&self, target: Target<'source>) -> bool {
+        target.symbol.kind == "variable"
+            && self
+                .text(rift_syntax::ByteRange {
+                    start: 0,
+                    end: target.symbol.item_range.start,
+                })
+                .is_some_and(|before| before.trim_end().ends_with("const"))
+            && self.is_symbol_initializer(target)
+    }
+
+    fn is_symbol_initializer(&self, target: Target<'source>) -> bool {
+        target
+            .symbol
+            .body_range
+            .and_then(|range| self.text(range))
+            .is_some_and(|value| {
+                let value = value.trim_start();
+                value.starts_with("Symbol(") || value.starts_with("Symbol.for(")
+            })
+            && !self.by_name.contains_key("Symbol")
+            && !self.javascript_reassigned("Symbol", None)
+    }
+
+    /// Whether `property` is a `name: Symbol(..)` pair of the object literal `owner` holds
+    /// and no write of this file changes it.
+    fn is_symbol_property(&self, owner: Target<'source>, property: Target<'source>) -> bool {
+        let Some(literal) = owner.symbol.body_range else {
+            return false;
+        };
+        let unwritten = owner.symbol.name_range.is_some_and(|name| {
+            !self.member_writes.contains_key(&(name, None))
+                && !self
+                    .member_writes
+                    .contains_key(&(name, Some(property.symbol.name.as_str())))
+        });
+        self.text(literal)
+            .is_some_and(|value| value.starts_with('{'))
+            && literal.encloses(property.symbol.item_range)
+            && property.symbol.syntax_element_kind == Some("pair")
+            && !self.unknown_member_writes.contains(&None)
+            && !self
+                .unknown_member_writes
+                .contains(&Some(owner.symbol.name.as_str()))
+            && !self.javascript_reassigned(&owner.symbol.name, None)
+            && unwritten
+            && self.is_symbol_initializer(property)
+    }
+
+    /// Whether no write through `exports` can give the export `name` a second value.
+    fn named_export_is_written_once(&self, name: &str) -> bool {
+        self.export_keys.is_empty()
+            && !self.unknown_member_writes.contains(&None)
+            && !self.export_writes.contains_key(&ExportSlot::Unknown)
+            && [ExportSlot::Named(name), ExportSlot::Default]
+                .iter()
+                .all(|slot| self.export_writes.get(slot).is_none_or(Option::is_some))
+    }
+
+    /// The pair of an exported object literal a binding names. Its use is judged with the
+    /// object that holds it, never as a free-standing export.
+    pub(super) fn exported_pair(
+        &self,
+        binding: &rift_syntax::SyntaxExportBinding,
+    ) -> Option<Target<'source>> {
+        if binding.kind != SyntaxExportKind::Named || binding.container.is_some() {
+            return None;
+        }
+        self.target_at(binding.exported?)
+            .filter(|target| target.symbol.syntax_element_kind == Some("pair"))
+    }
+
+    /// Whether no later property of the exported literal can replace `pair`.
+    pub(super) fn exported_pair_is_settled(&self, pair: Target<'source>, work: &mut Work) -> bool {
+        self.document
+            .facts
+            .export_bindings()
+            .unwrap_or_default()
+            .iter()
+            .any(|binding| {
+                work.charge()
+                    && binding.exported == pair.symbol.name_range
+                    && self.exported_pair(binding).is_some()
+            })
     }
 
     fn javascript_nested_export_slot(
@@ -629,7 +901,17 @@ impl<'source> File<'source> {
         Some((parent.receiver, slot))
     }
 
+    /// Whether no other write of the file gives the export another value. A computed key
+    /// of unknown value counts as such a write.
     pub(super) fn javascript_export_is_stable(
+        &self,
+        binding: &rift_syntax::SyntaxExportBinding,
+    ) -> bool {
+        self.export_keys.is_empty() && self.javascript_written_export_is_stable(binding)
+    }
+
+    /// The same, with every computed key established as a symbol value.
+    fn javascript_written_export_is_stable(
         &self,
         binding: &rift_syntax::SyntaxExportBinding,
     ) -> bool {
@@ -647,7 +929,7 @@ impl<'source> File<'source> {
         let replaced = |slot: &ExportSlot<'_>| {
             self.export_writes
                 .get(slot)
-                .is_some_and(|start| *start != Some(binding.range.start))
+                .is_some_and(|start| start.is_none_or(|start| !binding.range.contains(start)))
         };
         if replaced(&ExportSlot::Unknown) || replaced(&slot) {
             return false;
@@ -677,8 +959,42 @@ impl<'source> File<'source> {
             .any(|binding| {
                 binding.kind == SyntaxExportKind::Default
                     && binding.container.is_none()
-                    && binding.range.start == start
+                    && binding.range.contains(start)
             })
+    }
+
+    /// Whether an export written through an alias of the exported object
+    /// (`app.name = value`) has no other write through that alias.
+    fn javascript_alias_write_is_stable(
+        &self,
+        binding: &rift_syntax::SyntaxExportBinding,
+        work: &mut Work,
+    ) -> bool {
+        let Some((written, name)) = self
+            .text(binding.range)
+            .zip(binding.exported.and_then(|range| self.text(range)))
+        else {
+            return true;
+        };
+        if ["exports", "module.exports", "Object."]
+            .iter()
+            .any(|prefix| written.starts_with(prefix))
+        {
+            return true;
+        }
+        let Some((alias, _)) = written.split_once('.') else {
+            return true;
+        };
+        let super::Binding::Found(alias) =
+            self.binding(alias.trim(), binding.range.start, |_| true, work)
+        else {
+            return false;
+        };
+        !self.member_writes.contains_key(&(alias.name, None))
+            && self
+                .member_writes
+                .get(&(alias.name, Some(name)))
+                .is_some_and(Option::is_some)
     }
 
     fn javascript_export_role(
@@ -767,9 +1083,7 @@ fn matches_export_form(source: &str, mode: ModuleMode) -> bool {
     });
     match mode {
         ModuleMode::Esm => esm,
-        ModuleMode::CommonJs => {
-            source.starts_with("module.exports") || source.starts_with("exports.")
-        }
+        ModuleMode::CommonJs => !esm,
         ModuleMode::Unknown | ModuleMode::NodeDefault => false,
     }
 }

@@ -199,7 +199,8 @@ exports.response = res;
             .export_bindings()
             .expect("captured export bindings")
             .len(),
-        2
+        3,
+        "a member value declares the property it is assigned to"
     );
 }
 

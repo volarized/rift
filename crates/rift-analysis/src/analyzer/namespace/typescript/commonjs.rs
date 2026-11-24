@@ -1,6 +1,6 @@
 use super::{
     BTreeMap, BTreeSet, Entry, NamespaceInput, PackageFiles, PackageMetadata, PreparedNamespace,
-    ProjectPath, SelectedFile, SyntaxExportKind, declaration_anchors_with_public,
+    ProjectPath, SelectedFile, SyntaxExportKind, declaration_anchors_with_public, export_container,
     export_subpath_is_valid, observations, selected_source_is_valid,
 };
 use crate::NamespaceModule;
@@ -159,7 +159,7 @@ fn checked_names(file: &SelectedFile<'_>) -> BTreeSet<String> {
                         && binding.range == symbol.item_range
                         && binding.local == symbol.name_range
                         && binding.exported == symbol.name_range
-                        && binding.container == symbol.container
+                        && binding.container.as_deref() == export_container(symbol)
                 })
         })
         .map(|symbol| symbol.qualified_name.clone())

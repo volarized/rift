@@ -415,6 +415,9 @@ struct File<'source> {
     callbacks: javascript_callbacks::Callbacks<'source>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
+    /// Names written as computed keys of the module's exports: `name` and its position in
+    /// `module.exports[name] = value`.
+    export_keys: Vec<(&'source str, u64)>,
     member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
     unknown_member_writes: BTreeSet<Option<&'source str>>,
     conditions: Conditions,
@@ -547,6 +550,7 @@ impl<'source> File<'source> {
             callbacks: javascript_callbacks::Callbacks::default(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
+            export_keys: Vec::new(),
             member_writes: BTreeMap::new(),
             unknown_member_writes: BTreeSet::new(),
             conditions: Conditions::default(),
