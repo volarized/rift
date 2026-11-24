@@ -1096,6 +1096,11 @@ message = "package source path appears more than once"
 action = "send each package source path once and retry"
 fields = { path = { type = "path", format = "display", optional = true } }
 
+[error.analysis.package_input_import_limit_exceeded]
+message = "package import roots exceed their accepted limit"
+action = "reduce package import roots below their accepted limit and retry"
+fields = { field = { type = "string" }, bound = { type = "unsigned" }, observed = { type = "unsigned" } }
+
 [error.analysis.package_input_too_many_files]
 message = "package source count exceeds its accepted limit"
 action = "reduce package source count below its accepted limit and retry"

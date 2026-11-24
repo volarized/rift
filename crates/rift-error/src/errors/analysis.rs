@@ -238,6 +238,18 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    package_input_import_limit_exceeded,
+    slug = "rift.analysis.package_input_import_limit_exceeded",
+    message = "package import roots exceed their accepted limit",
+    action = "reduce package import roots below their accepted limit and retry",
+    fields = {
+        bound: required(unsigned),
+        field: required(string),
+        observed: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
     package_input_origin_invalid,
     slug = "rift.analysis.package_input_origin_invalid",
     message = "package source origin does not identify this package",
