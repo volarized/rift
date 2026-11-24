@@ -806,7 +806,7 @@ fn first_declared<'index, 'source>(
 
 /// A path a folder's manifest writes, as Node joins it to the folder. `None` when it leaves
 /// the files of the analysis.
-fn folder_path(directory: &str, written: &str) -> Option<String> {
+pub(super) fn folder_path(directory: &str, written: &str) -> Option<String> {
     let mut segments = directory
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -950,8 +950,13 @@ fn folder_file<'index, 'source>(
     if matches!(extension, Some("json" | "node" | "wasm")) {
         return Candidate::Open;
     }
-    let stem = path.strip_suffix(".js").unwrap_or(&path);
-    match one_file(files, stem, MODULES) {
+    // Node adds `.js`; a written `.js` can be the output of a TypeScript source.
+    let candidate = match path.strip_suffix(".js") {
+        Some(stem) => one_file(files, stem, SOURCES),
+        None => one_file(files, &path, &[".js"]),
+    };
+    match candidate {
+        Candidate::Missing if manifest.data => Candidate::Open,
         Candidate::Missing => match index(&path) {
             Candidate::Missing => index(directory),
             found => found,

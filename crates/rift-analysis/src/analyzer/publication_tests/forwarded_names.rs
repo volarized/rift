@@ -365,7 +365,7 @@ fn a_member_of_a_forwarded_namespace_stays_in_the_declaration_file() {
         &[
             (
                 "index.d.ts",
-                "import { util } from './core.js';\nexport declare const value: util.Fn;\n",
+                "import * as core from './core.js';\nexport declare const value: core.util.Fn;\n",
             ),
             ("core.d.ts", "export * as util from './util.js';\n"),
             ("core.js", "exports.util = require('./util.js');\n"),
@@ -384,48 +384,82 @@ fn a_member_of_a_forwarded_namespace_stays_in_the_declaration_file() {
     );
 }
 
+/// The manifest of `sub`, the files of the package, and the one a specifier of `sub` names.
+type FolderRow = (&'static str, &'static [&'static str], Option<&'static str>);
+const FOLDERS: &[FolderRow] = &[
+    (
+        r#"{"main":"main.js"}"#,
+        &["sub/main.js", "sub/index.js"],
+        Some("sub/main.js"),
+    ),
+    (
+        r#"{"main":"./main"}"#,
+        &["sub/main.js"],
+        Some("sub/main.js"),
+    ),
+    (
+        r#"{"main":"./lib"}"#,
+        &["sub/lib/index.js", "sub/index.js"],
+        Some("sub/lib/index.js"),
+    ),
+    (
+        r#"{"main":"../main.js"}"#,
+        &["main.js", "sub/index.js"],
+        Some("main.js"),
+    ),
+    (
+        r#"{"main":"./gone.js"}"#,
+        &["sub/index.js"],
+        Some("sub/index.js"),
+    ),
+    (
+        r#"{"main":"main"}"#,
+        &["sub/main.cjs", "sub/main.mjs", "sub/index.js"],
+        Some("sub/index.js"),
+    ),
+    (
+        r#"{"main":"main"}"#,
+        &["sub/main.cjs", "sub/main.js", "sub/index.js"],
+        Some("sub/main.js"),
+    ),
+    (
+        r#"{"main":"main.js"}"#,
+        &["sub/main.cjs", "sub/index.js"],
+        Some("sub/index.js"),
+    ),
+    (
+        r#"{"main":"main.cjs"}"#,
+        &["sub/main.cjs", "sub/index.js"],
+        Some("sub/main.cjs"),
+    ),
+    (
+        r#"{"main":"main"}"#,
+        &["sub/main.json", "sub/index.js"],
+        None,
+    ),
+    (
+        r#"{"main":"main"}"#,
+        &["sub/main.cjs", "sub/other.js"],
+        None,
+    ),
+    (r#"{"main":""}"#, &["sub/index.js"], Some("sub/index.js")),
+    (
+        r#"{"type":"commonjs"}"#,
+        &["sub/index.js"],
+        Some("sub/index.js"),
+    ),
+    (r#"{"main":"./gone.js"}"#, &["sub/other.js"], None),
+    (r#"{"main":"./data.json"}"#, &["sub/index.js"], None),
+    (r#"{"main":"./native.node"}"#, &["sub/index.js"], None),
+    (r#"{"main":"../../out.js"}"#, &["sub/index.js"], None),
+    (r#"{"main":"#, &["sub/index.js"], None),
+];
+
 #[test]
 fn a_folder_names_the_file_its_own_manifest_writes() {
     let opened = |name: &str| format!("exports.open = function {name}() {{}};\n");
     let (main, index) = (opened("main"), opened("index"));
-    for (manifest, files, target) in [
-        (
-            r#"{"main":"main.js"}"#,
-            &["sub/main.js", "sub/index.js"][..],
-            Some("sub/main.js"),
-        ),
-        (
-            r#"{"main":"./main"}"#,
-            &["sub/main.js"],
-            Some("sub/main.js"),
-        ),
-        (
-            r#"{"main":"./lib"}"#,
-            &["sub/lib/index.js", "sub/index.js"],
-            Some("sub/lib/index.js"),
-        ),
-        (
-            r#"{"main":"../main.js"}"#,
-            &["main.js", "sub/index.js"],
-            Some("main.js"),
-        ),
-        (
-            r#"{"main":"./gone.js"}"#,
-            &["sub/index.js"],
-            Some("sub/index.js"),
-        ),
-        (r#"{"main":""}"#, &["sub/index.js"], Some("sub/index.js")),
-        (
-            r#"{"type":"commonjs"}"#,
-            &["sub/index.js"],
-            Some("sub/index.js"),
-        ),
-        (r#"{"main":"./gone.js"}"#, &["sub/other.js"], None),
-        (r#"{"main":"./data.json"}"#, &["sub/index.js"], None),
-        (r#"{"main":"./native.node"}"#, &["sub/index.js"], None),
-        (r#"{"main":"../../out.js"}"#, &["sub/index.js"], None),
-        (r#"{"main":"#, &["sub/index.js"], None),
-    ] {
+    for &(manifest, files, target) in FOLDERS {
         for specifier in ["./sub", "./sub/"] {
             let entry = format!("module.exports = require('{specifier}');\n");
             let user = format!(
@@ -439,7 +473,7 @@ fn a_folder_names_the_file_its_own_manifest_writes() {
             selected.extend(files.iter().map(|path| {
                 (
                     *path,
-                    if path.ends_with("main.js") {
+                    if path.contains("main.") {
                         main.as_str()
                     } else {
                         index.as_str()
