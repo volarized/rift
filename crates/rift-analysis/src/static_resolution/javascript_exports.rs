@@ -37,7 +37,14 @@ impl ResolvedExport<'_> {
 pub(super) struct Exports<'index, 'source> {
     pub(super) files: &'index BTreeMap<&'source str, File<'source>>,
     pub(super) modes: &'index PackageModes<'source>,
+    /// The names files export, for a caller that resolves every one of them.
+    pub(super) names: Option<&'index NameIndex<'source>>,
 }
+
+/// The names each file exports, read once. `None` for a file whose module value is open.
+pub(super) type NameIndex<'source> =
+    std::cell::RefCell<BTreeMap<&'source str, Option<std::rc::Rc<Names<'source>>>>>;
+pub(super) type Names<'source> = std::collections::BTreeSet<&'source str>;
 
 impl<'source> Exports<'_, 'source> {
     pub(super) fn imported(
@@ -46,25 +53,12 @@ impl<'source> Exports<'_, 'source> {
         module: &str,
         work: &mut Work,
     ) -> Option<&File<'source>> {
-        let path = relative_path(from.document.path.as_str(), module, work)?;
+        let from = from.document.path.as_str();
+        let path = relative_path(from, module, work)?;
+        if is_declaration_file(from) {
+            return declared_file(self.files, &path);
+        }
         module_file(self.files, &path, false)
-    }
-
-    fn imported_for_role(
-        &self,
-        from: &File<'source>,
-        module: &str,
-        mode: ModuleMode,
-        role: rift_core::ReferenceRole,
-        work: &mut Work,
-    ) -> Option<&File<'source>> {
-        let path = relative_path(from.document.path.as_str(), module, work)?;
-        // A declaration file's type resolution can reach another declaration file.
-        // A runtime lookup must still name a source it can execute.
-        let declarations = mode == ModuleMode::Esm
-            && role == rift_core::ReferenceRole::Type
-            && from.document.path.as_str().ends_with(".d.ts");
-        module_file(self.files, &path, declarations)
     }
 
     pub(super) fn resolve(
@@ -76,13 +70,7 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        self.resolve_file(
-            self.imported_for_role(from, module, mode, role, work)?,
-            name,
-            mode,
-            role,
-            work,
-        )
+        self.resolve_file(self.imported(from, module, work)?, name, mode, role, work)
     }
 
     pub(super) fn resolve_file(
@@ -103,13 +91,80 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        self.resolve_slot(
-            self.imported(from, module, work)?,
-            ExportSlot::Default,
-            ModuleMode::CommonJs,
-            role,
-            work,
-        )
+        self.resolve_value(self.imported(from, module, work)?, role, work)
+    }
+
+    /// The one file a forward of the whole module reaches. A condition that selects between
+    /// modules leaves one only when the others are relative paths that name no file.
+    fn forwarded_file(&self, file: &File<'source>, work: &mut Work) -> Option<&File<'source>> {
+        let mut found: Option<&File<'source>> = None;
+        for (module, member) in &file.module_value.modules {
+            if member.is_some() {
+                return None;
+            }
+            match self.imported(file, module, work) {
+                Some(imported)
+                    if found.is_some_and(|found| found.document.path != imported.document.path) =>
+                {
+                    return None;
+                }
+                Some(imported) => found = Some(imported),
+                None if names_source(module) => {}
+                None => return None,
+            }
+        }
+        found
+    }
+
+    /// The settled pair of the object literal a `CommonJS` file forwards: `name`, or for the
+    /// module value the member it takes from the module.
+    pub(super) fn literal_member(
+        &self,
+        file: &File<'source>,
+        name: Option<&'source str>,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let mut path = file.document.path.as_str();
+        let mut name = name;
+        let mut visited = std::collections::BTreeSet::new();
+        while visited.insert(path) {
+            let file = self.files.get(path)?;
+            if !work.charge() {
+                return None;
+            }
+            if file.module_value.value == ModuleValue::Forward {
+                path = match (name, file.module_value.modules.as_slice()) {
+                    (None, &[(module, Some(member))]) => {
+                        name = Some(member);
+                        self.imported(file, module, work)?
+                    }
+                    (_, _) => self.forwarded_file(file, work)?,
+                }
+                .document
+                .path
+                .as_str();
+                continue;
+            }
+            let literal = file.facts.commonjs_export()?.literal?;
+            let owner = file.qualified_target("default")?;
+            return (owner.symbol.kind == "object" && owner.symbol.body_range == Some(literal))
+                .then(|| file.qualified_target(&format!("default.{}", name?)))?
+                .filter(|member| {
+                    member.symbol.syntax_element_kind == Some("pair")
+                        && file.exported_pair_is_settled(*member, work)
+                });
+        }
+        None
+    }
+
+    /// What the module value of a `CommonJS` file is.
+    pub(super) fn resolve_value(
+        &self,
+        file: &File<'source>,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        self.resolve_slot(file, ExportSlot::Default, ModuleMode::CommonJs, role, work)
     }
 
     fn resolve_slot(
@@ -148,17 +203,22 @@ impl<'source> Exports<'_, 'source> {
                 if stars.iter().any(|star| !star.settled) {
                     return None;
                 }
-                pending.extend(stars.into_iter().filter_map(|star| {
+                for star in stars {
                     // Only `module.exports = require(..)` passes the module value on.
                     if default && !star.replaces_module {
-                        return None;
+                        continue;
                     }
-                    Some((
-                        self.imported_for_role(file, star.module, mode, role, work)?,
-                        name,
-                        member,
-                    ))
-                }));
+                    let imported = if star.conditional {
+                        Some(self.forwarded_file(file, work)?)
+                    } else {
+                        self.imported(file, star.module, work)
+                    };
+                    let imported = imported.filter(|imported| match name {
+                        ExportSlot::Named(name) => default || self.supplies(imported, name, work),
+                        ExportSlot::Default | ExportSlot::Unknown => true,
+                    });
+                    pending.extend(imported.map(|imported| (imported, name, member)));
+                }
                 continue;
             };
             let export = self.local_export(file, export, role, work)?;
@@ -168,13 +228,13 @@ impl<'source> Exports<'_, 'source> {
                     member,
                 }),
                 Export::Reexport { module, name } => {
-                    if let Some(imported) = self.imported_for_role(file, module, mode, role, work) {
+                    if let Some(imported) = self.imported(file, module, work) {
                         pending.push((imported, ExportSlot::Named(name), member));
                     }
                     None
                 }
                 Export::Module { module } => {
-                    let imported = self.imported_for_role(file, module, mode, role, work)?;
+                    let imported = self.imported(file, module, work)?;
                     if let Some(member) = member {
                         let (name, tail) = split_name(member);
                         pending.push((imported, ExportSlot::Named(name), tail));
@@ -219,6 +279,11 @@ impl<'source> Exports<'_, 'source> {
         };
         // `get: function () { return module.name }` exports a member of a required module.
         let (name, member) = split_name(name);
+        if member.is_none()
+            && let Some(signature) = file.declared_signature(name)
+        {
+            return Some(Export::Declaration(signature));
+        }
         let binding = js_binding(file, self.modes, name, position, role, work)?;
         if let Some(member) = member {
             return self.required_member(file, binding, member, work);
@@ -428,16 +493,19 @@ impl<'source> Exports<'_, 'source> {
             }
             if binding.kind == SyntaxExportKind::All {
                 let module = literal_contents(file.text(binding.source?)?)?;
-                let settled = match file.module_value.forwarded(binding.range) {
-                    ModuleValue::Forward(value) if value != module => continue,
+                let values = &file.module_value;
+                let value = values.forwarded(binding.range);
+                let settled = match value {
+                    ModuleValue::Forward if !values.modules.contains(&(module, None)) => continue,
                     ModuleValue::Replaced => continue,
                     ModuleValue::Unsettled => false,
-                    ModuleValue::Forward(_) | ModuleValue::Unwritten => true,
+                    ModuleValue::Forward | ModuleValue::Unwritten => true,
                 };
                 stars.push(ExportStar {
                     module,
                     replaces_module: written.starts_with("module.exports"),
                     settled,
+                    conditional: value == ModuleValue::Forward && values.modules.len() > 1,
                 });
                 continue;
             }
@@ -465,6 +533,19 @@ impl<'source> Exports<'_, 'source> {
                     || !file.javascript_alias_write_is_stable(binding, work)
                 {
                     return None;
+                }
+            }
+            // `module.exports = require(..).name` gives the value as a whole forward does.
+            if binding.kind == SyntaxExportKind::Default
+                && let Some(module) = file.required_module(binding)
+            {
+                match file.module_value.forwarded(binding.range) {
+                    ModuleValue::Forward if !file.module_value.modules.contains(&module) => {
+                        continue;
+                    }
+                    ModuleValue::Replaced => continue,
+                    ModuleValue::Unsettled => return None,
+                    ModuleValue::Forward | ModuleValue::Unwritten => {}
                 }
             }
             let target = file.javascript_export_candidate(binding, role, work)?;
@@ -507,20 +588,48 @@ impl<'source> Exports<'_, 'source> {
         Some(())
     }
 
+    /// The names a file exports, itself and through its stars. `None` when the work bound is
+    /// spent or a forward leaves open what the file exports.
     pub(super) fn names(
         &self,
         file: &File<'source>,
         work: &mut Work,
-    ) -> Option<std::collections::BTreeSet<&'source str>> {
+    ) -> Option<std::rc::Rc<Names<'source>>> {
+        let path = file.document.path.as_str();
+        let known = self
+            .names
+            .and_then(|index| index.borrow().get(path).cloned());
+        if let Some(names) = known {
+            return names;
+        }
+        let names = self.read_names(file, work).map(std::rc::Rc::new);
+        if let Some(index) = self.names.filter(|_| !work.exhausted) {
+            index.borrow_mut().insert(path, names.clone());
+        }
+        names
+    }
+
+    /// Whether the file can export `name`.
+    fn supplies(&self, file: &File<'source>, name: &str, work: &mut Work) -> bool {
+        self.names.is_none()
+            || self
+                .names(file, work)
+                .is_none_or(|names| names.contains(name))
+    }
+
+    fn read_names(&self, file: &File<'source>, work: &mut Work) -> Option<Names<'source>> {
         let mut pending = vec![file];
         let mut visited = std::collections::BTreeSet::new();
-        let mut names = std::collections::BTreeSet::new();
+        let mut names = Names::new();
         while let Some(file) = pending.pop() {
             if !work.charge() {
                 return None;
             }
             if !visited.insert(file.document.path.as_str()) {
                 continue;
+            }
+            if file.module_value.value == ModuleValue::Unsettled {
+                return None;
             }
             self.collect_names(file, &mut names, &mut pending, work)?;
         }
@@ -533,6 +642,73 @@ fn split_name(name: &str) -> (&str, Option<&str>) {
         .map_or((name.trim(), None), |(head, tail)| {
             (head.trim(), Some(tail.trim()))
         })
+}
+
+/// Whether a specifier is a relative path that can only name a JavaScript file.
+fn names_source(module: &str) -> bool {
+    (module.starts_with("./") || module.starts_with("../"))
+        && std::path::Path::new(module)
+            .extension()
+            .is_none_or(|extension| matches!(extension.to_str(), Some("js" | "cjs" | "mjs")))
+}
+
+/// Whether the file declares types alone.
+pub(crate) fn is_declaration_file(path: &str) -> bool {
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
+/// The file a specifier of a declaration file names: the TypeScript source in place of the
+/// written runtime file, else the declaration file. Two of one rank name none.
+fn declared_file<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    path: &str,
+) -> Option<&'index File<'source>> {
+    let typed = |path: &str| {
+        files
+            .get(path)
+            .filter(|file| file.document.facts.language().name == "typescript")
+    };
+    if let Some(file) = typed(path) {
+        return Some(file);
+    }
+    let written = |extension| path.strip_suffix(extension);
+    let (stems, extensions): (Vec<String>, [&[&str]; 2]) = if let Some(directory) = written("/") {
+        let index = if directory.is_empty() {
+            "index".to_owned()
+        } else {
+            format!("{directory}/index")
+        };
+        (vec![index], [&[".ts", ".tsx"], &[".d.ts"]])
+    } else if let Some(stem) = written(".js").or_else(|| written(".jsx")) {
+        (vec![stem.to_owned()], [&[".ts", ".tsx"], &[".d.ts"]])
+    } else if let Some(stem) = written(".mjs") {
+        (vec![stem.to_owned()], [&[".mts"], &[".d.mts"]])
+    } else if let Some(stem) = written(".cjs") {
+        (vec![stem.to_owned()], [&[".cts"], &[".d.cts"]])
+    } else {
+        (
+            vec![path.to_owned(), format!("{path}/index")],
+            [&[".ts", ".tsx"], &[".d.ts"]],
+        )
+    };
+    for extensions in extensions {
+        let mut found = None;
+        for stem in &stems {
+            for extension in extensions {
+                if let Some(file) = typed(&format!("{stem}{extension}"))
+                    && found.replace(file).is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 pub(super) fn module_file<'index, 'source>(
@@ -681,34 +857,41 @@ struct ExportStar<'source> {
     replaces_module: bool,
     /// Whether no other write of the file can give the module another value.
     settled: bool,
+    /// Whether a condition selects between this module and another.
+    conditional: bool,
 }
 
 /// What the writes of `module.exports` leave the module with.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum ModuleValue<'source> {
+pub(super) enum ModuleValue {
     /// The value the module starts with.
     #[default]
     Unwritten,
-    /// The module a forward requires, by the contents of its specifier.
-    Forward(&'source str),
+    /// What a forward requires.
+    Forward,
     /// A value the file writes itself, after every forward.
     Replaced,
     /// The value depends on a condition, a call or a computed key.
     Unsettled,
 }
 
+/// A required module by the contents of its specifier, and the one export taken from it.
+type Required<'source> = (&'source str, Option<&'source str>);
+
 /// The writes of `module.exports` in one file and what they leave the module with.
 #[derive(Default)]
 pub(super) struct ModuleValues<'source> {
     /// Start offsets of the written targets, in source order.
     writes: Vec<u64>,
-    value: ModuleValue<'source>,
+    value: ModuleValue,
+    /// What the deciding forward selects between.
+    modules: Vec<Required<'source>>,
 }
 
-impl<'source> ModuleValues<'source> {
+impl ModuleValues<'_> {
     /// The value of the module for an export binding that writes it, and the value before
     /// every write for any other binding.
-    fn forwarded(&self, binding: rift_syntax::ByteRange) -> ModuleValue<'source> {
+    fn forwarded(&self, binding: rift_syntax::ByteRange) -> ModuleValue {
         let first = self.writes.partition_point(|start| *start < binding.start);
         if self
             .writes
@@ -838,39 +1021,64 @@ impl<'source> File<'source> {
             }
         }
         self.module_value.writes.sort_unstable();
-        self.module_value.value = self.module_value(work)?;
+        let (value, modules) = self.module_value(work)?;
+        self.module_value.value = value;
+        self.module_value.modules = modules;
         Some(())
+    }
+
+    /// The name of a module-scope function a declaration file writes by signatures alone.
+    fn declared_signature(&self, name: &str) -> Option<rift_syntax::ByteRange> {
+        let declarations = self.by_qualified_name.get(name)?;
+        (is_declaration_file(self.document.path.as_str())
+            && declarations
+                .iter()
+                .all(|symbol| symbol.syntax_element_kind == Some("function_signature")))
+        .then(|| declarations.first()?.name_range)?
+    }
+
+    /// The module a binding of the module value requires.
+    fn required_module(
+        &self,
+        binding: &rift_syntax::SyntaxExportBinding,
+    ) -> Option<Required<'source>> {
+        let module = literal_contents(self.text(binding.source?)?)?;
+        match binding.kind {
+            SyntaxExportKind::All => Some((module, None)),
+            SyntaxExportKind::Default => Some((module, Some(self.text(binding.local?)?))),
+            SyntaxExportKind::Named | SyntaxExportKind::Namespace => None,
+        }
     }
 
     /// What the writes of `module.exports` leave the module with, or `None` once the work
     /// bound is spent. The last write that always runs decides, unless a later one that can run
     /// or not gives another value. A forward of the same module gives the same value.
-    fn module_value(&self, work: &mut Work) -> Option<ModuleValue<'source>> {
+    fn module_value(&self, work: &mut Work) -> Option<(ModuleValue, Vec<Required<'source>>)> {
         let writes = &self.module_value.writes;
         if writes.is_empty() {
-            return Some(ModuleValue::Unwritten);
+            return Some((ModuleValue::Unwritten, Vec::new()));
         }
-        let mut forwards = Vec::<(rift_syntax::ByteRange, &str)>::new();
+        let mut forwards = BTreeMap::<rift_syntax::ByteRange, Vec<Required<'source>>>::new();
         for binding in self.document.facts.export_bindings().unwrap_or_default() {
             if !work.charge() {
                 return None;
             }
-            if binding.kind == SyntaxExportKind::All
-                && binding.container.is_none()
-                && let Some(module) = binding
-                    .source
-                    .and_then(|source| literal_contents(self.text(source)?))
+            if binding.container.is_none()
+                && let Some(module) = self.required_module(binding)
             {
-                forwards.push((binding.range, module));
+                forwards.entry(binding.range).or_default().push(module);
             }
         }
-        forwards.sort_unstable();
         let forward = |start: u64| {
-            let after = forwards.partition_point(|(range, _)| range.start <= start);
-            forwards[..after]
-                .last()
+            let after = rift_syntax::ByteRange {
+                start: start.saturating_add(1),
+                end: 0,
+            };
+            forwards
+                .range(..after)
+                .next_back()
                 .filter(|(range, _)| range.contains(start))
-                .map(|(_, module)| *module)
+                .map(|(_, modules)| modules)
         };
         // The end of the source a `return` can skip, for each place where more of it starts.
         let mut skipped = self.facts.skippable().to_vec();
@@ -901,7 +1109,7 @@ impl<'source> File<'source> {
             })
             .max();
         let Some((last_end, last)) = last else {
-            return Some(ModuleValue::Unsettled);
+            return Some((ModuleValue::Unsettled, Vec::new()));
         };
         let last = forward(last);
         // A write in a function called later, or under a condition after the last one.
@@ -911,9 +1119,9 @@ impl<'source> File<'source> {
             .map(|start| forward(*start))
             .any(|value| value.is_none() || value != last);
         Some(match last {
-            _ if replaced => ModuleValue::Unsettled,
-            Some(module) => ModuleValue::Forward(module),
-            None => ModuleValue::Replaced,
+            _ if replaced => (ModuleValue::Unsettled, Vec::new()),
+            Some(modules) => (ModuleValue::Forward, modules.clone()),
+            None => (ModuleValue::Replaced, Vec::new()),
         })
     }
 

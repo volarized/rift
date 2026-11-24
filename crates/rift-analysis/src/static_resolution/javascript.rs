@@ -588,6 +588,7 @@ impl<'source> Index<'source> {
         let value = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         }
         .resolve_module_value(file, file.text(module)?, role, work)?;
         self.javascript_export_value(value, role, work)
@@ -742,6 +743,7 @@ impl<'source> Index<'source> {
         let exports = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         };
         if let Some(value) = exports.resolve_module_value(file, module, role, work) {
             let owner = self.javascript_export_value(value, role, work)?;
@@ -813,6 +815,7 @@ impl<'source> Index<'source> {
         let exports = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         };
         let mut receiver_names = BTreeSet::new();
         let mut receiver_ranges = BTreeSet::new();
@@ -880,6 +883,7 @@ impl<'source> Index<'source> {
         let resolver = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         };
         match resolver.resolve(file, file.text(module)?, name, ModuleMode::Esm, role, work)? {
             super::javascript_exports::ResolvedExport::Module(imported) => {
@@ -936,6 +940,7 @@ impl<'source> Index<'source> {
         let export = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         }
         .resolve_file(file, name, ModuleMode::CommonJs, role, work)?;
         self.javascript_export_value(export, role, work)
@@ -957,6 +962,7 @@ impl<'source> Index<'source> {
         let resolved = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         }
         .resolve(from, module, name, mode, role, work)?;
         self.javascript_export_value(resolved, role, work)

@@ -7,13 +7,15 @@ use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_syntax::{DocumentPlacement, StaticBindingKind, SyntaxExportBinding, SyntaxExportKind};
 
 use super::javascript::{ModuleMode, PackageModes, builtin_commonjs_name, js_binding};
-use super::javascript_exports::{Exports, ResolvedExport, literal_contents};
+use super::javascript_exports::{Exports, NameIndex, ResolvedExport, literal_contents};
 use super::{File, StaticSource, Target, Work, admitted_facts};
 use crate::NamespaceInput;
 use crate::analyzer::namespace::typescript::commonjs;
 use crate::analyzer::namespace::{ExportBinding, PreparedNamespace, SelectedFile};
 
 const WORK_PER_DECLARATION: usize = 16;
+/// The name an ECMAScript module gives its default export and a `CommonJS` module value.
+const DEFAULT_NAME: &str = "default";
 
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
@@ -55,9 +57,11 @@ pub(super) fn prepare(
         prepared.unresolved_exports = true;
         return;
     };
+    let names = NameIndex::default();
     let resolver = Exports {
         files: &files,
         modes: &modes,
+        names: Some(&names),
     };
     let mut additions = Vec::new();
     for file in files.values() {
@@ -73,6 +77,15 @@ pub(super) fn prepare(
             &mut work,
         );
     }
+    // A declaration of any file, as in an ambient module, keeps its identity.
+    let held = prepared
+        .anchors
+        .values()
+        .flat_map(BTreeMap::values)
+        .collect::<BTreeSet<_>>();
+    let placed = additions.len();
+    additions.retain(|alias: &ExportBinding| !held.contains(&alias.identity));
+    prepared.unresolved_exports |= additions.len() < placed;
     prepared.exports.extend(additions);
     collect_commonjs_modules(input, &resolver, prepared, aliases_max, &mut work);
     prepared.unresolved_exports |= work.exhausted;
@@ -405,97 +418,169 @@ fn collect<'source>(
     aliases_max: usize,
     work: &mut Work,
 ) {
+    let forwarding = Forwarding {
+        resolver,
+        file,
+        commonjs: commonjs_file(resolver, file, work),
+    };
+    let mut previous = None;
     for binding in file.document.facts.export_bindings().unwrap_or_default() {
-        if !work.charge() || additions.len().saturating_add(prepared.exports.len()) >= aliases_max {
-            prepared.unresolved_exports = true;
-            return;
+        let next = additions.len();
+        // Two modules of one condition can be the same file.
+        let first = match previous {
+            Some((range, first)) if forwarding.commonjs && range == binding.range => first,
+            _ => next,
+        };
+        previous = Some((binding.range, first));
+        for name in forwarding.names(binding, work).unwrap_or_default() {
+            if !work.charge()
+                || additions.len().saturating_add(prepared.exports.len()) >= aliases_max
+            {
+                prepared.unresolved_exports = true;
+                return;
+            }
+            let Some(target) = forwarding
+                .target(binding, name, work)
+                .and_then(|target| placed(file, binding, name, target, prepared))
+            else {
+                continue;
+            };
+            if additions[first..next]
+                .iter()
+                .all(|alias| alias.identity != target.identity)
+            {
+                additions.push(target);
+            }
         }
-        collect_binding(
+    }
+}
+
+/// What the export bindings of one file give to names of other files.
+struct Forwarding<'resolver, 'index, 'source> {
+    resolver: &'resolver Exports<'index, 'source>,
+    file: &'resolver File<'source>,
+    commonjs: bool,
+}
+
+impl<'source> Forwarding<'_, '_, 'source> {
+    /// The module a binding writes, by the contents of its specifier.
+    fn module(&self, binding: &SyntaxExportBinding) -> Option<&'source str> {
+        literal_contents(self.file.text(binding.source?)?)
+    }
+
+    /// The names a binding can give to declarations of other files.
+    fn names(&self, binding: &SyntaxExportBinding, work: &mut Work) -> Option<Vec<&'source str>> {
+        if !work.charge() {
+            return None;
+        }
+        let Self {
             resolver,
             file,
-            binding,
-            prepared,
-            additions,
-            aliases_max,
-            work,
-        );
-    }
-}
-
-fn collect_binding<'source>(
-    resolver: &Exports<'_, 'source>,
-    file: &File<'source>,
-    binding: &SyntaxExportBinding,
-    prepared: &mut PreparedNamespace,
-    additions: &mut Vec<ExportBinding>,
-    aliases_max: usize,
-    work: &mut Work,
-) {
-    let Some(module) = binding
-        .source
-        .and_then(|range| file.text(range))
-        .and_then(literal_contents)
-    else {
-        return;
-    };
-    let Some(imported) = resolver.imported(file, module, work) else {
-        return;
-    };
-    let names = match binding.kind {
-        SyntaxExportKind::All => resolver
-            .names(imported, work)
-            .map(|names| names.into_iter().collect::<Vec<_>>()),
-        _ => binding
-            .exported
-            .and_then(|range| file.text(range))
-            .map(|name| vec![name]),
-    };
-    for name in names.unwrap_or_default() {
-        if !work.charge() || additions.len().saturating_add(prepared.exports.len()) >= aliases_max {
-            prepared.unresolved_exports = true;
-            return;
-        }
-        let target = target(resolver, file, imported, binding, name, work);
-        if let Some(target) =
-            target.and_then(|target| placed(file, binding, name, target, prepared))
+            commonjs,
+        } = *self;
+        if let Some(module) = self.module(binding) {
+            let imported = resolver.imported(file, module, work)?;
+            if binding.kind == SyntaxExportKind::All {
+                let names = resolver.names(imported, work)?;
+                let default = commonjs.then_some(DEFAULT_NAME);
+                return Some(names.iter().copied().chain(default).collect());
+            }
+        } else if binding.source.is_some()
+            || binding.container.is_some()
+            || commonjs
+            || binding
+                .local
+                .is_none_or(|local| file.target_at(local).is_some())
         {
-            additions.push(target);
+            return None;
         }
+        let name = match binding.kind {
+            SyntaxExportKind::Default => DEFAULT_NAME,
+            _ => file.text(binding.exported?)?,
+        };
+        Some(vec![name])
+    }
+
+    /// What one of those names reaches.
+    fn target(
+        &self,
+        binding: &SyntaxExportBinding,
+        name: &'source str,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        let Self {
+            resolver,
+            file,
+            commonjs,
+        } = *self;
+        if commonjs {
+            return self
+                .required(binding, name, work)
+                .filter(|target| target.key().0 != file.document.path);
+        }
+        let Some(module) = self.module(binding) else {
+            // `import { name } from` with `export { name }` gives what `export { name } from`
+            // gives.
+            return own_export(resolver, file, name, work)
+                .filter(|target| target.key().0 != file.document.path);
+        };
+        let imported = resolver.imported(file, module, work)?;
+        if binding.kind == SyntaxExportKind::Namespace {
+            return Some(ResolvedExport::Module(imported.document));
+        }
+        let local = if binding.kind == SyntaxExportKind::All {
+            name
+        } else {
+            file.text(binding.local?)?
+        };
+        let value = own_export(resolver, imported, local, work)?;
+        if binding.kind == SyntaxExportKind::All
+            && own_export(resolver, file, name, work)?.key() != value.key()
+        {
+            return None;
+        }
+        Some(value)
+    }
+
+    /// What a `CommonJS` file gives a name through a module it requires.
+    fn required(
+        &self,
+        binding: &SyntaxExportBinding,
+        name: &'source str,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        let Self { resolver, file, .. } = *self;
+        let target = if name == DEFAULT_NAME {
+            resolver.resolve_value(file, ReferenceRole::Call, work)
+        } else {
+            resolver.resolve_file(file, name, ModuleMode::CommonJs, ReferenceRole::Call, work)
+        };
+        let member = || {
+            // A member of an object literal is no export of its own.
+            resolver
+                .literal_member(file, (name != DEFAULT_NAME).then_some(name), work)
+                .map(|target| ResolvedExport::Declaration {
+                    target,
+                    member: None,
+                })
+        };
+        target
+            .or_else(member)
+            .filter(|target| matches!(target, ResolvedExport::Declaration { .. }))
+            .filter(|_| binding.kind != SyntaxExportKind::Named)
     }
 }
 
-fn target<'source>(
+/// What the file gives a name, as a type before a value.
+fn own_export<'source>(
     resolver: &Exports<'_, 'source>,
     file: &File<'source>,
-    imported: &File<'source>,
-    binding: &SyntaxExportBinding,
     name: &'source str,
     work: &mut Work,
 ) -> Option<ResolvedExport<'source>> {
-    if binding.kind == SyntaxExportKind::Namespace {
-        return Some(ResolvedExport::Module(imported.document));
-    }
-    let local = if binding.kind == SyntaxExportKind::All {
-        name
-    } else {
-        file.text(binding.local?)?
-    };
-    let value = resolver
-        .resolve_file(imported, local, ModuleMode::Esm, ReferenceRole::Type, work)
-        .or_else(|| {
-            resolver.resolve_file(imported, local, ModuleMode::Esm, ReferenceRole::Read, work)
-        })?;
-    if binding.kind == SyntaxExportKind::All {
-        let winner = resolver
-            .resolve_file(file, name, ModuleMode::Esm, ReferenceRole::Type, work)
-            .or_else(|| {
-                resolver.resolve_file(file, name, ModuleMode::Esm, ReferenceRole::Read, work)
-            })?;
-        if winner.key() != value.key() {
-            return None;
-        }
-    }
-    Some(value)
+    resolver
+        .resolve_file(file, name, ModuleMode::Esm, ReferenceRole::Type, work)
+        .or_else(|| resolver.resolve_file(file, name, ModuleMode::Esm, ReferenceRole::Read, work))
 }
 
 fn module_id(file: &StaticSource<'_>, prepared: &PreparedNamespace) -> Option<SymbolId> {

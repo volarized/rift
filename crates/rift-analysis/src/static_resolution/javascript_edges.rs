@@ -412,6 +412,7 @@ impl<'source> Index<'source> {
         let resolver = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         };
         let value = match binding.kind {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => resolver.resolve(
