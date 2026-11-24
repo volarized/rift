@@ -14,6 +14,7 @@ use crate::NamespaceInput;
 
 pub(crate) mod commonjs;
 mod entry;
+mod internal_modules;
 mod observations;
 
 pub(super) use entry::build_paths;
@@ -30,6 +31,8 @@ pub(super) fn prepare(
     // Every entry of the package is decided over the files captured once here.
     let files = PackageFiles::captured(input);
     let mut imported = BTreeSet::new();
+    // Each file an entry names, with a module or without one the entries settle.
+    let mut entry_files = BTreeSet::new();
     if let Some(metadata) = &metadata {
         let entries = ["typescript", "javascript"].map(|language| {
             let has_files = selected
@@ -57,6 +60,9 @@ pub(super) fn prepare(
                 .collect::<BTreeMap<_, _>>();
             (language, kept)
         });
+        for (language, modules) in &entries {
+            entry_files.extend(modules.keys().map(|path| (*language, path.clone())));
+        }
         let inventory = selected
             .iter()
             .map(|file| (file.path, file.syntax.language().name.as_str()))
@@ -85,22 +91,7 @@ pub(super) fn prepare(
             }
             prepare_file(input, file, module, &mut prepared);
         }
-        if matches!(input.owner(), SymbolOwner::Package { .. }) {
-            for file in selected {
-                if file.syntax.language().name == "typescript"
-                    && selected_source_is_valid(input, file)
-                {
-                    let ambient = declaration_anchors(input, file, None);
-                    if !ambient.is_empty() {
-                        prepared
-                            .anchors
-                            .entry(file.path.as_str().to_owned())
-                            .or_default()
-                            .extend(ambient);
-                    }
-                }
-            }
-        }
+        prepare_ambient_modules(input, selected, &mut prepared);
         map_declared_types(input, &files, metadata, selected, &mut prepared);
     }
     observations::prepare(
@@ -111,6 +102,9 @@ pub(super) fn prepare(
         &imported,
         &mut prepared,
     );
+    if let Some(metadata) = &metadata {
+        internal_modules::prepare(input, metadata, &entry_files, selected, &mut prepared);
+    }
     if input.owner().is_local() {
         for file in selected {
             let language = file.syntax.language();
@@ -130,6 +124,29 @@ pub(super) fn prepare(
     prepared
 }
 
+/// Names what the files of a package declare in ambient modules.
+fn prepare_ambient_modules(
+    input: &NamespaceInput<'_>,
+    selected: &[SelectedFile<'_>],
+    prepared: &mut PreparedNamespace,
+) {
+    if !matches!(input.owner(), SymbolOwner::Package { .. }) {
+        return;
+    }
+    for file in selected {
+        if file.syntax.language().name == "typescript" && selected_source_is_valid(input, file) {
+            let ambient = declaration_anchors(input, file, None);
+            if !ambient.is_empty() {
+                prepared
+                    .anchors
+                    .entry(file.path.as_str().to_owned())
+                    .or_default()
+                    .extend(ambient);
+            }
+        }
+    }
+}
+
 fn prepare_file(
     input: &NamespaceInput<'_>,
     file: &SelectedFile<'_>,
@@ -137,6 +154,16 @@ fn prepare_file(
     prepared: &mut PreparedNamespace,
 ) -> bool {
     let anchors = declaration_anchors(input, file, Some(module));
+    prepare_anchors(input, file, module, anchors, prepared)
+}
+
+fn prepare_anchors(
+    input: &NamespaceInput<'_>,
+    file: &SelectedFile<'_>,
+    module: &str,
+    anchors: BTreeMap<String, SymbolId>,
+    prepared: &mut PreparedNamespace,
+) -> bool {
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;
@@ -203,6 +230,10 @@ fn export_bindings(
             continue;
         };
         let mut path = target_identity.qualified_path().to_vec();
+        if binding.container.is_some() && path.last() == Some(&name) {
+            // A declaration of an ambient module exports its own name.
+            continue;
+        }
         if path.first().map(String::as_str) != Some(module) || path.pop().is_none() {
             unresolved = true;
             continue;
@@ -715,6 +746,31 @@ impl From<CapturedExports> for Exports {
 }
 
 impl Exports {
+    /// Whether the subpath `./path` names anything but the file at `path` to a consumer of
+    /// `language`. The exact key decides, else the pattern with the longest prefix, as Node
+    /// matches them.
+    fn spells_other_file(&self, path: &str, language: &str) -> bool {
+        let Self::Subpaths(paths) = self else {
+            return false;
+        };
+        let spelled = format!("./{path}");
+        if let Some((_, target)) = paths.0.iter().find(|(key, _)| *key == spelled) {
+            return target.names_other(&spelled, None, language);
+        }
+        paths
+            .0
+            .iter()
+            .filter_map(|(key, target)| {
+                let (prefix, suffix) = key.split_once('*')?;
+                let matched = spelled.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                (!matched.is_empty()).then_some((prefix.len(), key.len(), matched, target))
+            })
+            .max_by_key(|(prefix, key, ..)| (*prefix, *key))
+            .is_some_and(|(.., matched, target)| {
+                target.names_other(&spelled, Some(matched), language)
+            })
+    }
+
     fn target(&self, language: &str) -> Option<&str> {
         match self {
             Self::Direct(path) => Some(path),
@@ -795,22 +851,30 @@ enum ExportTarget {
     Unresolved(UnresolvedTarget),
 }
 
-/// `null`, which excludes the subpath for the conditions it is written under, or a target
-/// list, which names no single file without reading the file system.
 #[derive(Deserialize)]
 #[serde(from = "Option<Vec<de::IgnoredAny>>")]
-struct UnresolvedTarget;
+enum UnresolvedTarget {
+    /// `null`, which excludes the subpath for the conditions it is written under.
+    Excluded,
+    /// A target list, which names no single file without reading the file system.
+    List,
+}
 
 impl From<Option<Vec<de::IgnoredAny>>> for UnresolvedTarget {
-    fn from(_: Option<Vec<de::IgnoredAny>>) -> Self {
-        Self
+    fn from(captured: Option<Vec<de::IgnoredAny>>) -> Self {
+        match captured {
+            None => Self::Excluded,
+            Some(_) => Self::List,
+        }
     }
 }
 
 /// What one export target gives a consumer.
 enum SelectedTarget<'metadata> {
     Path(&'metadata str),
-    /// The written target names no file this consumer resolves.
+    /// The written target gives this consumer no file.
+    Excluded,
+    /// Which file the written target gives this consumer is not established.
     Refused,
     /// No condition of the consumer is written: a later condition can still match.
     Unmatched,
@@ -836,7 +900,7 @@ impl ExportTarget {
     fn is_unconditional(&self, language: &str) -> bool {
         match self {
             Self::Direct(_) => true,
-            Self::Unresolved(UnresolvedTarget) => false,
+            Self::Unresolved(_) => false,
             Self::Conditions(conditions) => {
                 conditions.0.first().is_some_and(|(condition, target)| {
                     (condition == DEFAULT_CONDITION
@@ -847,10 +911,42 @@ impl ExportTarget {
         }
     }
 
+    /// Whether the target gives a consumer of `language` anything but `file`, with `matched`
+    /// in place of `*`. Conditions no static consumer enables count when it enables none.
+    fn names_other(&self, file: &str, matched: Option<&str>, language: &str) -> bool {
+        let is_file = |path: &str| match matched {
+            Some(matched) => path.replace('*', matched) == file,
+            None => path == file,
+        };
+        let mut unmatched = true;
+        for loader in [Loader::Module, Loader::CommonJs] {
+            let conditions = consumer_conditions(language, loader);
+            match self.select(language == "typescript", conditions) {
+                SelectedTarget::Unmatched => continue,
+                SelectedTarget::Excluded => {}
+                SelectedTarget::Path(path) if is_file(path) => {}
+                SelectedTarget::Path(_) | SelectedTarget::Refused => return true,
+            }
+            unmatched = false;
+        }
+        let mut pending = vec![self];
+        while let Some(target) = pending.pop().filter(|_| unmatched) {
+            match target {
+                Self::Direct(path) if is_file(path) => {}
+                Self::Unresolved(UnresolvedTarget::Excluded) => {}
+                Self::Direct(_) | Self::Unresolved(UnresolvedTarget::List) => return true,
+                Self::Conditions(conditions) => {
+                    pending.extend(conditions.0.iter().map(|(_, target)| target));
+                }
+            }
+        }
+        false
+    }
+
     fn selected_target(&self, types: bool, selected: &[&str]) -> Option<&str> {
         match self.select(types, selected) {
             SelectedTarget::Path(path) => Some(path),
-            SelectedTarget::Refused | SelectedTarget::Unmatched => None,
+            SelectedTarget::Excluded | SelectedTarget::Refused | SelectedTarget::Unmatched => None,
         }
     }
 
@@ -858,7 +954,8 @@ impl ExportTarget {
     fn select(&self, types: bool, selected: &[&str]) -> SelectedTarget<'_> {
         let conditions = match self {
             Self::Direct(path) => return SelectedTarget::Path(path),
-            Self::Unresolved(UnresolvedTarget) => return SelectedTarget::Refused,
+            Self::Unresolved(UnresolvedTarget::Excluded) => return SelectedTarget::Excluded,
+            Self::Unresolved(UnresolvedTarget::List) => return SelectedTarget::Refused,
             Self::Conditions(conditions) => conditions,
         };
         for (name, target) in &conditions.0 {
@@ -899,7 +996,7 @@ impl ExportTarget {
                         .filter(|(name, _)| name != TYPES_CONDITION)
                         .map(|(_, target)| target),
                 ),
-                Self::Unresolved(UnresolvedTarget) => {}
+                Self::Unresolved(_) => {}
             }
         }
         paths

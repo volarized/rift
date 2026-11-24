@@ -43,15 +43,25 @@ fn analyze_with_manifest(user: &str, owner: &str, manifest: &str) -> PackageAnal
 }
 
 #[test]
-fn direct_literal_without_a_published_module_identity_keeps_its_edges_unresolved() {
+fn direct_literal_of_a_file_no_entry_names_keeps_its_path_module() {
     let analyzed = analyze_with_manifest(USER, OWNER, ROOT_ONLY_MANIFEST);
-    assert!(!analyzed.publication().edges.iter().any(|edge| {
-        (edge.kinds == [EdgeKind::Calls]
-            && (occurrence(edge, USER, "library.exist()") || occurrence(edge, USER, "exist()")))
-            || (edge.kinds == [EdgeKind::Reads]
-                && occurrence(edge, USER, "library.exist")
-                && edge.to.as_str().ends_with("/default/exist"))
-    }));
+    for (kind, written, target) in [
+        (EdgeKind::Calls, "library.exist()", "/checkExistence"),
+        (EdgeKind::Calls, "exist()", "/checkExistence"),
+        (EdgeKind::Reads, "library.exist", "/default/exist"),
+    ] {
+        assert!(
+            analyzed.publication().edges.iter().any(|edge| {
+                edge.kinds == [kind]
+                    && occurrence(edge, USER, written)
+                    && edge
+                        .to
+                        .as_str()
+                        .ends_with(&format!("/beacon%2Fliteral.js{target}"))
+            }),
+            "{kind:?} {written}"
+        );
+    }
 }
 
 fn occurrence(edge: &StoredEdge, source: &str, written: &str) -> bool {

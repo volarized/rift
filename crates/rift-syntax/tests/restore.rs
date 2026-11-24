@@ -3,9 +3,9 @@
 use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_syntax::{
-    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind, StaticFacts,
-    StaticFactsParts, StaticMemberAlias, StaticMemberCopy, SyntaxDocument, SyntaxFacts,
-    SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
+    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind,
+    StaticBodyMember, StaticFacts, StaticFactsParts, StaticMemberAlias, StaticMemberCopy,
+    SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
 };
 
 fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
@@ -229,6 +229,175 @@ fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes()
         r"var root = {}; module.exports = root; \u006dodule.exports = other;",
     ] {
         assert_eq!(checked(source), None, "{source}");
+    }
+}
+
+#[test]
+fn test_body_members_name_their_body_and_its_holder() {
+    let source = "const own = ({ key: 1 } as const);
+run({ short, go() {} });
+type One = { a: 1 };
+type Two = { b: 1 } | { b: 2 };
+interface Body { c: 1; typed: { d: 1 } }
+class Named { e = 1; constructor(readonly f: 1, g: 2) {} }
+const held = class { h(): void {} };
+run(class { i = 1 });
+";
+    let document = parsed(ShippedLanguage::TypeScript, source);
+    let facts = document.facts().static_facts().expect("static facts");
+    let text = |range: ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    let named = "class Named { e = 1; constructor(readonly f: 1, g: 2) {} }";
+    let rows = facts
+        .body_members()
+        .iter()
+        .map(|row| (text(row.member), text(row.body), text(row.holder)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [
+            ("key: 1", "{ key: 1 }", "own = ({ key: 1 } as const)"),
+            ("short", "{ short, go() {} }", "({ short, go() {} })"),
+            ("go() {}", "{ short, go() {} }", "({ short, go() {} })"),
+            ("a: 1", "{ a: 1 }", "type One = { a: 1 };"),
+            ("b: 1", "{ b: 1 }", "{ b: 1 } | { b: 2 }"),
+            ("b: 2", "{ b: 2 }", "{ b: 1 } | { b: 2 }"),
+            ("d: 1", "{ d: 1 }", "typed: { d: 1 }"),
+            ("e = 1", named, source),
+            ("constructor(readonly f: 1, g: 2) {}", named, source),
+            ("readonly f: 1", named, source),
+            (
+                "h(): void {}",
+                "class { h(): void {} }",
+                "held = class { h(): void {} }"
+            ),
+            ("i = 1", "class { i = 1 }", "(class { i = 1 })"),
+        ]
+    );
+    let row = facts.body_members()[0];
+    let outside = StaticFactsParts {
+        body_members: vec![StaticBodyMember {
+            holder: row.member,
+            ..row
+        }],
+        ..StaticFactsParts::default()
+    };
+    assert_eq!(
+        StaticFacts::from_parts(source, SyntaxLimits::default(), outside)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_range_invalid::SLUG),
+    );
+}
+
+#[test]
+fn test_module_statements_stand_directly_in_the_source_file() {
+    let checked = |source| {
+        parsed(ShippedLanguage::TypeScript, source)
+            .facts()
+            .static_facts()
+            .expect("static facts")
+            .has_javascript_module_statement()
+    };
+    for source in [
+        "import './s';",
+        "export {};",
+        "export declare const a: 1;",
+        "import a = require('a');",
+    ] {
+        assert!(checked(source), "{source}");
+    }
+    for source in [
+        "declare module 'm' { import { A } from 'a'; export function g(a: A): void }",
+        "declare namespace N { export interface I {} }",
+        "declare function beside(): void;",
+        "const loaded = import('a');",
+    ] {
+        assert!(!checked(source), "{source}");
+    }
+}
+
+#[test]
+fn test_commonjs_writes_run_with_their_file() {
+    let checked = |source| {
+        parsed(ShippedLanguage::JavaScript, source)
+            .facts()
+            .static_facts()
+            .expect("static facts")
+            .commonjs_writes()
+            .iter()
+            .map(|(_, always)| *always)
+            .collect::<Vec<_>>()
+    };
+    for (source, always) in [
+        ("module.exports = a;", &[true][..]),
+        ("var b = module.exports = a;", &[true][..]),
+        ("exports = module.exports = a;", &[true][..]),
+        ("module.exports = a; module.exports = b;", &[true, true][..]),
+        ("if (c) module.exports = a;", &[false][..]),
+        ("c && (module.exports = a);", &[false][..]),
+        ("function swap() { module.exports = a }", &[][..]),
+        ("{ module.exports = a }", &[true][..]),
+        ("(module.exports = a);", &[true][..]),
+        ("(function () { module.exports = a })();", &[true][..]),
+        ("((function () { { module.exports = a } }))();", &[true][..]),
+        (
+            "(async function () { await b; module.exports = a })();",
+            &[][..],
+        ),
+        (
+            "(function () { if (c) { module.exports = a } })();",
+            &[false][..],
+        ),
+        ("run(function () { module.exports = a });", &[][..]),
+        ("run(module.exports = a);", &[false][..]),
+        (
+            "if (c) { module.exports = a } else { module.exports = a }",
+            &[true, true][..],
+        ),
+        (
+            "if (c) module.exports = a; else module.exports = a",
+            &[true, true][..],
+        ),
+        (
+            "if (c) module.exports = a; else module.exports = b",
+            &[false, false][..],
+        ),
+        ("if (c) { if (d) module.exports = a } else {}", &[false][..]),
+        ("try { module.exports = a } catch (e) {}", &[false][..]),
+        ("module['exports'] = a;", &[true][..]),
+        ("module[key] = a;", &[true][..]),
+        ("module.exports[key] = a;", &[][..]),
+        ("exports.a = a;", &[][..]),
+    ] {
+        assert_eq!(checked(source), always, "{source}");
+    }
+}
+
+#[test]
+fn test_a_return_can_skip_the_rest_of_its_function() {
+    let checked = |source: &str| {
+        parsed(ShippedLanguage::JavaScript, source)
+            .facts()
+            .static_facts()
+            .expect("static facts")
+            .skippable()
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(checked("if (a) return; b();"), [(7, 19)]);
+    assert_eq!(
+        checked("(function () { if (a) return; return })(); b()"),
+        [(22, 38)]
+    );
+    for source in [
+        "function f() { return }",
+        "run(function () { return })",
+        "(async function () { return })()",
+    ] {
+        assert!(checked(source).is_empty(), "{source}");
     }
 }
 

@@ -1,0 +1,151 @@
+//! Modules of npm package files that no entry names.
+
+use super::{
+    BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
+    SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_anchors,
+    selected_source_is_valid,
+};
+use serde::Deserialize;
+
+mod scopes;
+
+/// Names every remaining selected source by its package-relative path.
+///
+/// An entry or observed file keeps its module. A source of a nested package takes none, and
+/// a path that another file's module or an `exports` subpath spells stays with that one.
+/// With an `exports` map no consumer reaches these files by path, so their declarations are
+/// public only through an alias of a file that a consumer reaches. A name the file declares
+/// in more than one scope takes no identity, since one path would name distinct declarations.
+pub(super) fn prepare(
+    input: &NamespaceInput<'_>,
+    metadata: &PackageMetadata,
+    entries: &BTreeSet<(&str, ProjectPath)>,
+    selected: &[SelectedFile<'_>],
+    prepared: &mut PreparedNamespace,
+) {
+    if !matches!(input.owner(), SymbolOwner::Package { manager, .. } if manager == "npm") {
+        return;
+    }
+    let foreign = foreign_directories(input, &metadata.name);
+    let mut modules = held_modules(prepared);
+    for file in selected {
+        let language = file.syntax.language();
+        let supported = matches!(language.name.as_str(), "javascript" | "typescript")
+            && matches!(language.dialect.as_deref(), None | Some("tsx"));
+        if !supported
+            || entries.contains(&(language.name.as_str(), file.path.clone()))
+            || !selected_source_is_valid(input, file)
+            || is_foreign(file.path.as_str(), &foreign)
+        {
+            continue;
+        }
+        let path = file.path.as_str();
+        // A declaration file's ambient modules name no module for the file itself.
+        let ambient = declaration_anchors(input, file, None);
+        if prepared
+            .anchors
+            .get(path)
+            .is_some_and(|anchors| *anchors != ambient)
+        {
+            continue;
+        }
+        if is_script(file) {
+            continue;
+        }
+        let module = format!("{}/{path}", metadata.name);
+        let exported = metadata
+            .exports
+            .as_ref()
+            .is_some_and(|exports| exports.spells_other_file(path, &language.name));
+        if exported
+            || modules
+                .get(&(language.name.clone(), module.clone()))
+                .is_some_and(|holder| holder.as_deref() != Some(path))
+        {
+            prepared.unresolved_exports = true;
+            continue;
+        }
+        prepared.anchors.remove(path);
+        let mut anchors = declaration_anchors(input, file, Some(&module));
+        let withheld = scopes::repeated_names(file);
+        anchors.retain(|name, _| {
+            ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
+        });
+        if prepare_anchors(input, file, &module, anchors, prepared) {
+            modules.insert((language.name.clone(), module), Some(path.to_owned()));
+            if metadata.exports.is_some() {
+                prepared
+                    .unreached_modules
+                    .insert(path.to_owned(), ambient.into_keys().collect());
+            }
+        }
+    }
+}
+
+/// Whether a TypeScript file is no module: what it declares belongs to the global scope and
+/// to the ambient modules it names. A `.mts` or `.cts` source is always a module.
+fn is_script(file: &SelectedFile<'_>) -> bool {
+    file.syntax.language().name == "typescript"
+        && ![".mts", ".cts"]
+            .iter()
+            .any(|extension| file.path.as_str().ends_with(extension))
+        && !file
+            .syntax
+            .static_facts()
+            .is_some_and(rift_syntax::StaticFacts::has_javascript_module_statement)
+}
+
+/// The file that holds each module an established anchor names, or `None` for a module
+/// several files spell.
+fn held_modules(prepared: &PreparedNamespace) -> BTreeMap<(String, String), Option<String>> {
+    let mut modules = BTreeMap::new();
+    for (path, anchors) in &prepared.anchors {
+        for anchor in anchors.values() {
+            let Ok(identity) = SymbolIdentity::parse(anchor.as_str()) else {
+                continue;
+            };
+            let Some(module) = identity.qualified_path().first() else {
+                continue;
+            };
+            modules
+                .entry((identity.language().name.clone(), module.clone()))
+                .and_modify(|holder: &mut Option<String>| {
+                    if holder.as_deref() != Some(path) {
+                        *holder = None;
+                    }
+                })
+                .or_insert_with(|| Some(path.clone()));
+        }
+    }
+    modules
+}
+
+#[derive(Deserialize)]
+struct NestedManifest {
+    name: Option<String>,
+}
+
+/// Directories below the package root whose own manifest names another package, or cannot
+/// be read.
+fn foreign_directories(input: &NamespaceInput<'_>, package: &str) -> BTreeSet<String> {
+    input
+        .files()
+        .iter()
+        .chain(input.context_sources())
+        .filter_map(|source| {
+            let directory = source.path().as_str().strip_suffix("/package.json")?;
+            let named = (source.text().len() <= input.syntax().source_bytes_max())
+                .then(|| serde_json::from_str::<NestedManifest>(source.text()).ok())
+                .flatten()
+                .map(|manifest| manifest.name.is_none_or(|name| name == package));
+            (named != Some(true)).then(|| directory.to_owned())
+        })
+        .collect()
+}
+
+fn is_foreign(path: &str, foreign: &BTreeSet<String>) -> bool {
+    path.split('/').any(|segment| segment == "node_modules")
+        || path
+            .match_indices('/')
+            .any(|(end, _)| foreign.contains(&path[..end]))
+}

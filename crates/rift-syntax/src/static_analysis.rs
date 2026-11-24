@@ -96,6 +96,18 @@ pub struct StaticBinding {
     pub kind: StaticBindingKind,
 }
 
+/// One member of an ECMAScript object literal, type literal or class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticBodyMember {
+    /// Complete member.
+    pub member: ByteRange,
+    /// Literal or class holding the member.
+    pub body: ByteRange,
+    /// Syntax element the literal or class is the whole value or the whole written type of,
+    /// once parentheses, assertions and the annotation are read through.
+    pub holder: ByteRange,
+}
+
 /// Syntactic evidence held by one name binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticBindingKind {
@@ -362,6 +374,14 @@ pub struct StaticCommonJsExport {
 pub struct StaticFactsParts {
     /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
     pub javascript_module_syntax: bool,
+    /// Assignments to `module.exports` or a computed key of `module` that run while the file
+    /// does, in no function called later, and whether no condition encloses them.
+    pub commonjs_writes: Vec<(ByteRange, bool)>,
+    /// Source a `return` can skip: from the first one of the file, or of an immediately
+    /// called function, to that function's end.
+    pub skippable: Vec<ByteRange>,
+    /// Whether an ECMAScript import or export statement stands directly in the source file.
+    pub javascript_module_statement: bool,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
@@ -420,6 +440,8 @@ pub struct StaticFactsParts {
     /// Functions written as members of an object literal, with that literal: `this` inside
     /// them is the literal.
     pub object_members: Vec<(ByteRange, ByteRange)>,
+    /// Members written in an ECMAScript object literal, type literal or class.
+    pub body_members: Vec<StaticBodyMember>,
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
@@ -461,6 +483,26 @@ impl StaticFacts {
     #[must_use]
     pub fn has_javascript_module_syntax(&self) -> bool {
         self.0.javascript_module_syntax
+    }
+
+    /// Whether an import or export statement stands directly in the ECMAScript source file,
+    /// outside every ambient module and namespace.
+    #[must_use]
+    pub fn has_javascript_module_statement(&self) -> bool {
+        self.0.javascript_module_statement
+    }
+
+    /// Assignments to `module.exports` or a computed key of `module` that run while the file
+    /// does, in no function called later, and whether no condition encloses them.
+    #[must_use]
+    pub fn commonjs_writes(&self) -> &[(ByteRange, bool)] {
+        &self.0.commonjs_writes
+    }
+
+    /// Source a `return` of the file or of an immediately called function can skip.
+    #[must_use]
+    pub fn skippable(&self) -> &[ByteRange] {
+        &self.0.skippable
     }
 
     /// The direct default write, if the `CommonJS` wrapper remains closed.
@@ -644,6 +686,12 @@ impl StaticFacts {
         &self.0.object_members
     }
 
+    /// Members written in an ECMAScript object literal, type literal or class.
+    #[must_use]
+    pub fn body_members(&self) -> &[StaticBodyMember] {
+        &self.0.body_members
+    }
+
     /// What each `return` of a function returns: the object literal, or none.
     #[must_use]
     pub fn returned_objects(&self) -> &[(ByteRange, Option<ByteRange>)] {
@@ -746,6 +794,7 @@ impl StaticFacts {
             vector_capacity(&self.0.element_types),
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
+            vector_capacity(&self.0.body_members),
             vector_capacity(&self.0.returned_objects),
             vector_capacity(&self.0.spread_values),
             vector_capacity(&self.0.unsupported_bindings),
@@ -757,6 +806,8 @@ impl StaticFacts {
             vector_capacity(&self.0.expression_scopes),
             vector_capacity(&self.0.first_iterables),
             vector_capacity(&self.0.non_none_guards),
+            vector_capacity(&self.0.commonjs_writes),
+            vector_capacity(&self.0.skippable),
             vector_capacity(&self.0.closure_calls),
         ]
         .into_iter()
@@ -807,6 +858,7 @@ impl StaticFacts {
             self.element_types().len(),
             self.element_returns().len(),
             self.object_members().len(),
+            self.body_members().len(),
             self.returned_objects().len(),
             self.spread_values().len(),
             self.unsupported_bindings().len(),
@@ -818,6 +870,8 @@ impl StaticFacts {
             self.expression_scopes().len(),
             self.first_iterables().len(),
             self.non_none_guards().len(),
+            self.commonjs_writes().len(),
+            self.skippable().len(),
             self.closure_calls().len(),
         ];
         if lengths
@@ -912,6 +966,8 @@ impl StaticFacts {
         self.assignments()
             .iter()
             .chain(self.function_writes())
+            .chain(self.commonjs_writes().iter().map(|(write, _)| write))
+            .chain(self.skippable())
             .copied()
             .all(valid)
             && self.member_copies().iter().all(|copy| {
@@ -935,6 +991,11 @@ impl StaticFacts {
                 .object_members()
                 .iter()
                 .all(|(function, object)| valid(*function) && contains(*object, *function))
+            && self.body_members().iter().all(|row| {
+                valid(row.member)
+                    && contains(row.body, row.member)
+                    && contains(row.holder, row.body)
+            })
             && self
                 .returned_objects()
                 .iter()
