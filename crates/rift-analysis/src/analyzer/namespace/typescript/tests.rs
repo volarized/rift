@@ -371,7 +371,6 @@ fn unresolved_owner_metadata_conditions_and_paths_do_not_guess_module() {
     for metadata in [
         r#"{"name":"other","version":"3.8.5","types":"./index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.6","types":"./index.d.ts"}"#,
-        r#"{"name":"prettier","version":"3.8.5"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"../index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"/index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","typesVersions":{">=5":{"*": ["new/*"]}}}"#,
@@ -874,7 +873,7 @@ fn package_ambient_original_buffer_keeps_owner_ranges_and_unknown_entry() {
     let metadata: super::PackageMetadata =
         serde_json::from_str(metadata).expect("original metadata");
     assert!(
-        super::entry_path(&metadata, "typescript").is_none(),
+        metadata.types_versions.is_some(),
         "compiler applicability remains unknown"
     );
 }
@@ -1237,8 +1236,12 @@ fn commonjs_public_exports_require_entry_conditions_owner_and_mode() {
             true,
         ),
     ] {
-        let (prepared, _) =
-            commonjs_prepared(metadata, &[("index.js", source)], "index.js", conditions);
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[("index.js", source), ("other.js", "")],
+            "index.js",
+            conditions,
+        );
         assert_eq!(
             prepared
                 .anchors
@@ -1308,6 +1311,7 @@ fn commonjs_package_default_entry_and_extensionless_forwarder_are_checked_indepe
             &[
                 ("index.js", &forward),
                 ("lib/child.js", "exports.open = function open() {};"),
+                ("other.js", ""),
             ],
             "index.js",
             &["node", "require"],
@@ -1337,4 +1341,124 @@ fn commonjs_forwarding_checks_the_exact_file_before_adding_a_javascript_extensio
     );
     assert!(prepared.anchors["lib/child"].contains_key("exact"));
     assert!(!prepared.anchors.contains_key("lib/child.js"));
+}
+
+/// Node and TypeScript entry resolution over the captured files of a package without
+/// `exports`: exact names first, then extensions, then a folder's index.
+#[test]
+fn entry_paths_follow_extensions_folders_and_index_files() {
+    let load = "exports.load = function () {};";
+    let types = "export declare function load(): void;";
+    let placed = |language, metadata: &str, files: &[(&str, &str)]| {
+        let metadata = format!(r#"{{"name":"prettier","version":"3.8.5"{metadata}}}"#);
+        let found = prepared(language, &[("package.json", metadata.as_str())], files);
+        files
+            .iter()
+            .filter(|(path, _)| {
+                found
+                    .anchors
+                    .get(*path)
+                    .and_then(|anchors| anchors.get("load"))
+                    .is_some_and(|identity| {
+                        SymbolIdentity::parse(identity.as_str())
+                            .is_ok_and(|identity| identity.qualified_path() == ["prettier", "load"])
+                    })
+            })
+            .map(|(path, _)| (*path).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let javascript = ShippedLanguage::JavaScript;
+    let typescript = ShippedLanguage::TypeScript;
+    for (metadata, entry) in [
+        (r#","main":"index.js""#, "index.js"),
+        (r#","type":"commonjs","main":"index.js""#, "index.js"),
+        (r#","main":"./index.cjs""#, "index.cjs"),
+        (r#","main":"./index""#, "index.js"),
+        (r#","main":"index""#, "index.js"),
+        (r#","main":".""#, "index.js"),
+        (r#","main":"./""#, "index.js"),
+        ("", "index.js"),
+        (r#","main":"""#, "index.js"),
+        (r#","main":"lib""#, "lib/index.js"),
+        (r#","main":"./lib/""#, "lib/index.js"),
+        (r#","main":"./gone""#, "index.js"),
+        (r#","main":"./exact""#, "exact.js"),
+    ] {
+        let mut files = vec![
+            ("index.js", load),
+            ("lib/index.js", load),
+            ("exact.js", load),
+        ];
+        if entry == "index.cjs" {
+            files = vec![("index.cjs", load)];
+        }
+        assert_eq!(placed(javascript, metadata, &files), [entry], "{metadata}");
+    }
+    for (metadata, files) in [
+        (
+            r#","main":"./data.json""#,
+            vec![("index.js", load), ("data.json", "{}")],
+        ),
+        (r#","main":"./gone""#, vec![("other.js", load)]),
+        (r#","main":"../index""#, vec![("index.js", load)]),
+        (r#","main":"lib""#, vec![("lib/other.js", load)]),
+        ("", vec![("other.js", load)]),
+        (
+            r#","main":"./index","exports":{"./sub":"./sub.js"}"#,
+            vec![("index.js", load)],
+        ),
+    ] {
+        let files = files
+            .into_iter()
+            .filter(|(path, _)| *path != "data.json")
+            .collect::<Vec<_>>();
+        let found = if metadata.contains("data.json") {
+            prepared_with_members(metadata, &files, &[("data.json", "{}")])
+        } else {
+            placed(javascript, metadata, &files)
+        };
+        assert!(found.is_empty(), "{metadata} {found:?}");
+    }
+    for (metadata, files, entry) in [
+        (
+            r#","types":"./index""#,
+            vec![("index.d.ts", types)],
+            "index.d.ts",
+        ),
+        ("", vec![("index.d.ts", types)], "index.d.ts"),
+        (
+            r#","types":"lib""#,
+            vec![("lib/index.d.ts", types)],
+            "lib/index.d.ts",
+        ),
+        (
+            r#","main":"./lib/a.js""#,
+            vec![("lib/a.d.ts", types)],
+            "lib/a.d.ts",
+        ),
+    ] {
+        assert_eq!(placed(typescript, metadata, &files), [entry], "{metadata}");
+    }
+    assert!(
+        placed(
+            typescript,
+            r#","main":"./gone.js""#,
+            &[("index.d.ts", types)]
+        )
+        .is_empty()
+    );
+}
+
+fn prepared_with_members(
+    metadata: &str,
+    files: &[(&str, &str)],
+    members: &[(&str, &str)],
+) -> Vec<String> {
+    let metadata = format!(r#"{{"name":"prettier","version":"3.8.5"{metadata}}}"#);
+    let mut context = vec![("package.json", metadata.as_str())];
+    context.extend(members);
+    prepared(ShippedLanguage::JavaScript, &context, files)
+        .anchors
+        .into_keys()
+        .collect()
 }

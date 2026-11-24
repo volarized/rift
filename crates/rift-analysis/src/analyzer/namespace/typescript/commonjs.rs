@@ -1,7 +1,7 @@
 use super::{
-    BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SyntaxExportKind, declaration_anchors_with_public, export_subpath_is_valid,
-    observations, selected_source_is_valid,
+    BTreeMap, BTreeSet, NamespaceInput, PackageMembers, PackageMetadata, PreparedNamespace,
+    ProjectPath, SelectedFile, SyntaxExportKind, declaration_anchors_with_public,
+    export_subpath_is_valid, observations, selected_source_is_valid,
 };
 use crate::NamespaceModule;
 use std::collections::VecDeque;
@@ -23,7 +23,7 @@ pub(super) fn prepare(
     };
     if observation.export_conditions() != ["node", "require"]
         || is_mjs(implementation.path)
-        || !entry_matches(metadata, observation)
+        || !entry_matches(input, metadata, observation)
     {
         prepared.unresolved_exports = true;
         return;
@@ -115,7 +115,11 @@ pub(crate) fn admit_file(
     true
 }
 
-fn entry_matches(metadata: &PackageMetadata, observation: &NamespaceModule<'_>) -> bool {
+fn entry_matches(
+    input: &NamespaceInput<'_>,
+    metadata: &PackageMetadata,
+    observation: &NamespaceModule<'_>,
+) -> bool {
     let target = if let Some(exports) = &metadata.exports {
         exports
             .observed_targets(
@@ -123,13 +127,13 @@ fn entry_matches(metadata: &PackageMetadata, observation: &NamespaceModule<'_>) 
                 observation.module(),
                 observation.export_conditions(),
             )
-            .map(|(_, implementation)| implementation)
+            .and_then(|(_, implementation)| observations::target_path(implementation))
     } else if observation.module() == metadata.name {
-        Some(metadata.main.as_deref().unwrap_or("index.js"))
+        PackageMembers::captured(input).main(metadata.main.as_deref())
     } else {
         None
     };
-    target.and_then(observations::target_path).as_ref() == Some(observation.implementation().path())
+    target.as_ref() == Some(observation.implementation().path())
 }
 
 fn checked_names(file: &SelectedFile<'_>) -> BTreeSet<String> {
