@@ -43,9 +43,12 @@ patch: a type definition request on `JsonValue`, or on a value of that type, ans
 When the type of a function that returns the alias is asked first, the cycle is cut, and the same
 request answers `str`, `dict`, and `tuple`; a value indexed out of the dictionary is the
 `Divergent` marker, which the engine adapter in `rift-server` leaves out of a type answer.
-Definitions, references, and hierarchies are the same in both orders; of 87 answers over a
-two-file tree, 16 type definition answers differ (volarized/rift#1111). Aliases that converge
-without the patch answer the same in both orders.
+Over a two-file tree of 87 answers, 16 type definition answers differ (volarized/rift#1111), and
+definitions, references, and hierarchies are the same in both orders. That does not hold for every
+tree: over the tree of volarized/rift#1108, where members are read from such an alias, 53 of 782
+answers differ, among them 3 definitions, 3 references, 7 call hierarchy and 18 type hierarchy
+answers, and `value.upper` and `value.get` have no definition and no references in the order that
+cuts the cycle. Aliases that converge without the patch answer the same in both orders.
 
 The patch ends this family only. An alias that reaches itself through `Type[...]`, such as
 `A = List[Type["A"]]`, grows in a definition query the patch does not reach, and still does not
