@@ -332,6 +332,7 @@ fn commonjs_forward<'source>(
     if export.kind != SyntaxExportKind::Named
         || export.source.is_some()
         || export.container.is_some()
+        || file.declares_its_export(export)
         || !file.javascript_export_is_stable(export)
     {
         return None;

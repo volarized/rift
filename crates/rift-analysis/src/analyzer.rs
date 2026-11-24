@@ -2632,7 +2632,8 @@ enum ExportRule {
     Language(PackageLanguage),
     /// A JavaScript module exports a declaration the provider marks `Public`, one an
     /// `export` wraps or an export names (`export { a }`, `module.exports = { a }`), and a
-    /// member of a class so marked other than an ES private element.
+    /// member of a class so marked, or one assigned to a declaration so marked, other than
+    /// an ES private element.
     JavaScriptModule,
 }
 
@@ -2748,18 +2749,23 @@ impl<'facts> PythonExports<'facts> {
 }
 
 /// Whether a JavaScript module exports `symbol`: the provider marks it `Public`, or it is a
-/// member of a class so marked and no ES private element.
+/// member of a declaration so marked and no ES private element. A class declares members in
+/// its body. An assignment declares a member of any declaration it writes to, as
+/// `app.init = function () {}` and `Router.prototype.handle = function () {}` do.
 fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
     let exported = is_exported(symbol);
     let private_element = symbol.name.starts_with(PRIVATE_ELEMENT_PREFIX);
-    let member_of_exported_class = symbol
+    let assigned_member = symbol.syntax_element_kind == Some("assignment_expression")
+        && matches!(symbol.kind, "method" | "property");
+    let member_of_exported_declaration = symbol
         .container
         .as_deref()
         .and_then(|container| by_name.get(container))
         .is_some_and(|container| {
-            JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind) && is_exported(container)
+            (assigned_member || JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind))
+                && is_exported(container)
         });
-    exported || (member_of_exported_class && !private_element)
+    exported || (member_of_exported_declaration && !private_element)
 }
 
 /// Whether the provider marks `symbol` public, as an export of it does.
@@ -3441,6 +3447,69 @@ class _Private:
                 ("load", true),
             ]
         );
+    }
+
+    /// The public set of express's three files: a synchronized function export, a module
+    /// value named by an alias, a constructor with prototype methods, and named exports of
+    /// values. A helper and a function's local stay private.
+    #[test]
+    fn test_commonjs_modules_export_module_values_members_and_assigned_values() {
+        for (path, source, expected) in [
+            (
+                "lib/express.js",
+                "var proto = require('./application');\n\
+                 var Router = require('./router');\n\
+                 var unused = require('./unused');\n\
+                 exports = module.exports = createApplication;\n\
+                 function createApplication() { var app = {}; return app; }\n\
+                 exports.application = proto;\n\
+                 exports.Route = Router.Route;\n\
+                 exports.Router = Router;\n\
+                 exports.json = function json() {};\n\
+                 exports.static = require('serve-static');\n",
+                vec![
+                    "Route",
+                    "Router",
+                    "createApplication",
+                    "json",
+                    "proto",
+                    "static",
+                ],
+            ),
+            (
+                "lib/application.js",
+                "var app = exports = module.exports = {};\n\
+                 var trust = '@@trust';\n\
+                 app.init = function init() { this.cache = {}; };\n\
+                 app.set = function set(value) { var local = value; return helper(local); };\n\
+                 function helper(value) { return value }\n",
+                vec!["app", "app.init", "app.set"],
+            ),
+            (
+                "lib/view.js",
+                "module.exports = View;\n\
+                 function View(name) { var local = 1; this.name = name; this.size = local; }\n\
+                 View.prototype.lookup = function lookup() { var found = 1; return found; };\n\
+                 View.make = function make() {};\n\
+                 function Other() {}\n\
+                 Other.prototype.run = function run() {};\n",
+                vec!["View", "View.lookup", "View.make", "View.name", "View.size"],
+            ),
+        ] {
+            let analysis = package_analysis(ShippedLanguage::JavaScript, vec![(path, source)]);
+            let held = &analysis.files()[0];
+            let mut public = held
+                .file()
+                .syntax()
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .filter(|name| held.is_public(name))
+                .collect::<Vec<_>>();
+            public.sort_unstable();
+            public.dedup();
+            assert_eq!(public, expected, "{path}");
+        }
     }
 
     /// A paired JavaScript module keeps the public set its declaration file defines: an

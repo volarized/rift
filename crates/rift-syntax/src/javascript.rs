@@ -362,7 +362,7 @@ mod tests {
         );
     }
 
-    /// Captured property functions stay non-public without checked export context.
+    /// A rebound `exports` leaves every property assignment without export context.
     #[test]
     fn test_an_export_assignment_marks_nothing_it_does_not_name() {
         let document = analyze(
@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(symbol.kind, "function");
         assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
         assert!(symbol.kinds.contains(&SymbolKind::Callable));
-        assert!(!symbol.kinds.contains(&SymbolKind::Public));
+        assert!(symbol.kinds.contains(&SymbolKind::Public));
         assert_eq!(
             &source[usize::try_from(symbol.item_range.start).expect("item start")
                 ..usize::try_from(symbol.item_range.end).expect("item end")],
@@ -757,7 +757,7 @@ mod tests {
         assert!(symbols[0].range.end < symbols[1].range.start);
         for symbol in symbols {
             assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
-            assert!(!symbol.kinds.contains(&SymbolKind::Public));
+            assert!(symbol.kinds.contains(&SymbolKind::Public));
         }
         let changed = analyze(&source.replace("return 2", "return 3"));
         assert_eq!(changed.symbols().len(), document.symbols().len());
@@ -800,7 +800,8 @@ mod tests {
         for source in [
             "exports[key] = function () {};",
             "other.open = function () {};",
-            "exports.open = factory();",
+            "exports.open = void 0;",
+            "run(function () { exports.open = factory(); });",
         ] {
             let document = analyze(source);
             assert!(
@@ -815,14 +816,16 @@ mod tests {
 
     #[test]
     fn original_react_anonymous_property_assignments_keep_full_source_ranges() {
-        for (original, original_start) in [
+        for (original, original_start, module_statement) in [
             (
                 include_str!("../tests/fixtures/react/react.development.js"),
                 48_434_u64,
+                false,
             ),
             (
                 include_str!("../tests/fixtures/react/react.production.js"),
                 17_608_u64,
+                true,
             ),
         ] {
             let lf = original.replace("\r\n", "\n");
@@ -848,7 +851,7 @@ mod tests {
                     u64::try_from(expected_start).expect("supplied source offset")
                 );
                 assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
-                assert!(!symbol.kinds.contains(&SymbolKind::Public));
+                assert_eq!(symbol.kinds.contains(&SymbolKind::Public), module_statement);
                 let start = usize::try_from(symbol.item_range.start).expect("item start");
                 let end = usize::try_from(symbol.item_range.end).expect("item end");
                 assert!(source[start..end].starts_with(prefix));

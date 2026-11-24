@@ -23,11 +23,16 @@
 //!   (`export { x } from './y'`, `export * from './y'`) names another
 //!   module's declarations, so it marks none here. A function in a
 //!   literal property assignment (`exports.run = function () {}`) retains the
-//!   property binding and the original function source. The binding carries no
-//!   `Public` kind without supported module export context. A named function
-//!   expression keeps its local name inside its own body. An anonymous
-//!   `module.exports` function has the export name `default`. Class expressions
-//!   assigned to an export add no declaration.
+//!   property binding and the original function source. A class or any other
+//!   value but `void 0` declares the property it is assigned to
+//!   (`exports.limit = 10`), under `exports` when a declaration at module scope
+//!   has that name (`exports.limit`). A recorded top-level binding carries `Public` in a file without
+//!   ECMAScript module syntax. A named function expression keeps its local name
+//!   inside its own body. An anonymous `module.exports` function or class has
+//!   the export name `default`.
+//! - A module-scope name bound to the exported object
+//!   (`var app = exports = module.exports = {}`) is the module's default
+//!   export, and a function assigned to its member is exported with it.
 //! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
 //!   `protected`), and stays `None` everywhere else.
@@ -842,9 +847,9 @@ impl EcmaScriptKinds {
         }
     }
 
-    /// The original property token and function assigned to one literal export.
-    /// This records the physical binding; module and build evidence decide public export.
-    fn export_function<'tree>(
+    /// The original property token and the function or class assigned to one literal
+    /// export.
+    fn export_definition<'tree>(
         &self,
         syntax_element: Node<'tree>,
         text: &str,
@@ -854,13 +859,36 @@ impl EcmaScriptKinds {
         }
         let left = self.child(syntax_element, EcmaScriptGrammarField::Left)?;
         self.export_target(left, text)?;
-        let function =
+        let value =
             self.expression_value(self.child(syntax_element, EcmaScriptGrammarField::Right)?);
-        if !self.function_values.contains(&function.kind_id()) {
+        if !self.function_values.contains(&value.kind_id())
+            && value.kind_id() != self.class_expression
+        {
             return None;
         }
         let property = self.child(left, EcmaScriptGrammarField::Property)?;
-        Some((property, function))
+        Some((property, value))
+    }
+
+    /// The innermost assignment of a chain and the value it assigns: `b = value` and
+    /// `value` in `a = b = value`. Each step descends one admitted syntax element.
+    fn assignment_chain<'tree>(
+        &self,
+        assignment: Node<'tree>,
+    ) -> Option<(Node<'tree>, Node<'tree>)> {
+        let mut inner = assignment;
+        loop {
+            let value = self.expression_value(self.child(inner, EcmaScriptGrammarField::Right)?);
+            if value.kind_id() != self.assignment_expression {
+                return Some((inner, value));
+            }
+            inner = value;
+        }
+    }
+
+    /// The value an assignment or a chain of assignments ends in.
+    fn assigned_value<'tree>(&self, assignment: Node<'tree>) -> Option<Node<'tree>> {
+        self.assignment_chain(assignment).map(|(_, value)| value)
     }
 
     fn export_function_name<'text>(
@@ -868,7 +896,7 @@ impl EcmaScriptKinds {
         assignment: Node<'_>,
         text: &'text str,
     ) -> Option<&'text str> {
-        let (property, _) = self.export_function(assignment, text)?;
+        let (property, _) = self.export_definition(assignment, text)?;
         let left = self.child(assignment, EcmaScriptGrammarField::Left)?;
         if self.export_target(left, text) == Some(ExportTarget::Module) {
             Some(DEFAULT_EXPORT_NAME)
@@ -1066,6 +1094,14 @@ struct ModuleExports<'text> {
     default_values: BTreeSet<usize>,
     /// Exact named bindings from top-level `CommonJS` object exports.
     bindings: BTreeMap<usize, SyntaxExportBinding>,
+    /// Ids of the `CommonJS` assignments whose own declaration the module exports.
+    declared: BTreeSet<usize>,
+    /// Ids of the `CommonJS` assignments whose declaration qualifies under `exports`, since
+    /// a declaration at module scope takes its name.
+    shadowing: BTreeSet<usize>,
+    /// Ids of the object literals a `CommonJS` export holds under a declaration of its
+    /// own: their members are exported.
+    members: BTreeSet<usize>,
 }
 
 impl<'text> ModuleExports<'text> {
@@ -1086,7 +1122,7 @@ impl<'text> ModuleExports<'text> {
                 .assignment_export(statement, text)
                 .filter(|syntax_element| syntax_element.kind_id() == kinds.object_literal)
             {
-                exports.record_bindings(statement, object, kinds)?;
+                exports.record_bindings(statement, object, text, kinds)?;
             }
         }
         Ok(exports)
@@ -1118,25 +1154,72 @@ impl<'text> ModuleExports<'text> {
         }
     }
 
+    /// Records the settled properties of an exported object literal: a shorthand name, and
+    /// a `name: value` pair no later property of the literal can replace.
     fn record_bindings(
         &mut self,
         statement: Node<'_>,
         object: Node<'_>,
+        text: &str,
         kinds: &EcmaScriptKinds,
     ) -> Result<(), RiftError> {
         let range = extract::byte_range(statement)?;
-        for property in named_children(object) {
-            if property.kind_id() != kinds.shorthand_property_identifier {
+        let properties = named_children(object).collect::<Vec<_>>();
+        let mut later = BTreeSet::new();
+        let mut settled = true;
+        for property in properties.into_iter().rev() {
+            if property.kind_id() == kinds.shorthand_property_identifier {
+                later.extend(text.get(property.byte_range()));
+                let name = extract::byte_range(property)?;
+                self.bindings.insert(
+                    property.id(),
+                    SyntaxExportBinding {
+                        kind: SyntaxExportKind::Named,
+                        range,
+                        local: Some(name),
+                        exported: Some(name),
+                        source: None,
+                        container: None,
+                        type_only: false,
+                    },
+                );
                 continue;
             }
-            let name = extract::byte_range(property)?;
+            let key = match property.kind() {
+                "comment" => continue,
+                "method_definition" => kinds.child(property, EcmaScriptGrammarField::Name),
+                _ if property.kind_id() == kinds.pair => {
+                    property.child_by_field_id(kinds.key.get())
+                }
+                _ => None,
+            };
+            // A spread or a computed key can replace every property written before it.
+            let Some(key) = key.filter(|key| key.kind() != "computed_property_name") else {
+                settled = false;
+                continue;
+            };
+            let name = text.get(key.byte_range()).unwrap_or_default();
+            let unquoted = name.trim_matches(['"', '\'']);
+            settled &= !name.contains('\\');
+            let last = later.insert(unquoted) && settled;
+            if property.kind_id() != kinds.pair
+                || key.kind_id() != kinds.property_identifier
+                || name == "__proto__"
+                || !last
+            {
+                continue;
+            }
+            let exported = extract::byte_range(key)?;
+            let local = kinds
+                .property_export(property)
+                .map_or(Ok(exported), extract::byte_range)?;
             self.bindings.insert(
                 property.id(),
                 SyntaxExportBinding {
                     kind: SyntaxExportKind::Named,
                     range,
-                    local: Some(name),
-                    exported: Some(name),
+                    local: Some(local),
+                    exported: Some(exported),
                     source: None,
                     container: None,
                     type_only: false,
@@ -1144,6 +1227,19 @@ impl<'text> ModuleExports<'text> {
             );
         }
         Ok(())
+    }
+
+    /// Adds what the `CommonJS` assignments of the module body export.
+    fn add_commonjs(&mut self, exports: &commonjs::CommonJsExports<'_>, text: &'text str) {
+        self.names.extend(
+            exports
+                .named
+                .iter()
+                .filter_map(|name| text.get(name.byte_range())),
+        );
+        self.declared.extend(&exports.declared);
+        self.members.extend(&exports.objects);
+        self.shadowing.extend(&exports.shadowing);
     }
 
     /// Records one exported syntax element: an identifier's name, or an object literal
@@ -1231,6 +1327,74 @@ impl EcmaScriptRules<'_> {
             text.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
         });
         Some(written.unwrap_or(name))
+    }
+
+    /// The declaration an export assignment renders, exported when its assignment is.
+    fn assigned_declaration(
+        &self,
+        assignment: Node<'_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, RiftError> {
+        let Some((name, kind, value)) = self.assigned_export(assignment, text) else {
+            return Ok(None);
+        };
+        let body = if kind == EcmaScriptSymbolKind::Variable {
+            Some(value)
+        } else {
+            self.kinds.child(value, EcmaScriptGrammarField::Body)
+        };
+        let mut kinds = kind.kinds();
+        if self.exports.declared.contains(&assignment.id()) {
+            kinds.push(SymbolKind::Public);
+        }
+        Ok(Some(Declaration {
+            name: name.to_owned(),
+            kind: kind.word(),
+            kinds,
+            visibility: None,
+            body_range: body.map(extract::byte_range).transpose()?,
+            documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
+        }))
+    }
+
+    /// The declaration an export assignment makes: its name, its kind and the value that
+    /// declares it. A function is declared wherever it is written. A class or any other
+    /// value is declared by a recorded export of the module alone.
+    fn assigned_export<'tree, 'source>(
+        &self,
+        assignment: Node<'tree>,
+        text: &'source str,
+    ) -> Option<(&'source str, EcmaScriptSymbolKind, Node<'tree>)> {
+        if assignment.kind_id() != self.kinds.assignment_expression {
+            return None;
+        }
+        let binding = self.exports.bindings.get(&assignment.id());
+        if let Some((_, value)) = self.kinds.export_definition(assignment, text) {
+            let class = value.kind_id() == self.kinds.class_expression;
+            if class && binding.is_none() {
+                return None;
+            }
+            let kind = if class {
+                EcmaScriptSymbolKind::Class
+            } else {
+                EcmaScriptSymbolKind::Function
+            };
+            return Some((self.export_function_name(assignment, text)?, kind, value));
+        }
+        let binding = binding.filter(|binding| {
+            binding.kind == SyntaxExportKind::Named && binding.local == binding.exported
+        })?;
+        let left = self.kinds.child(assignment, EcmaScriptGrammarField::Left)?;
+        // A write through an alias declares the member it writes, never a module name.
+        self.kinds.export_target(left, text)?;
+        let property = self.kinds.child(left, EcmaScriptGrammarField::Property)?;
+        (binding.exported == extract::byte_range(property).ok()).then_some(())?;
+        Some((
+            text.get(property.byte_range())?,
+            EcmaScriptSymbolKind::Variable,
+            self.kinds.assigned_value(assignment)?,
+        ))
     }
 
     /// The export statement directly carrying this declaration.
@@ -1484,9 +1648,10 @@ impl EcmaScriptRules<'_> {
     fn exported(&self, visited: Visited<'_, '_>, name: &str) -> bool {
         let wrapped = self.wrapped_by_export(visited);
         let named = self.exports.names.contains(name) && self.at_module_scope(visited);
-        let in_exported_object = visited
-            .parent()
-            .is_some_and(|parent| self.exports.objects.contains(&parent.syntax_element().id()));
+        let in_exported_object = visited.parent().is_some_and(|parent| {
+            let object = parent.syntax_element().id();
+            self.exports.objects.contains(&object) || self.exports.members.contains(&object)
+        });
         wrapped || named || in_exported_object
     }
 
@@ -1719,20 +1884,8 @@ impl GrammarRules for EcmaScriptRules<'_> {
                 documentation_ranges: Vec::new(),
             }));
         }
-        if let Some((_, function)) = self.kinds.export_function(syntax_element, text) {
-            let Some(name) = self.export_function_name(syntax_element, text) else {
-                return Ok(None);
-            };
-            let body = self.kinds.child(function, EcmaScriptGrammarField::Body);
-            return Ok(Some(Declaration {
-                name: name.to_owned(),
-                kind: EcmaScriptSymbolKind::Function.word(),
-                kinds: EcmaScriptSymbolKind::Function.kinds(),
-                visibility: None,
-                body_range: body.map(extract::byte_range).transpose()?,
-                documentation: Vec::new(),
-                documentation_ranges: Vec::new(),
-            }));
+        if let Some(declaration) = self.assigned_declaration(syntax_element, text)? {
+            return Ok(Some(declaration));
         }
         let Some(kind) = self.kinds.symbol_kind(syntax_element) else {
             return self.bound_declaration(visited, text);
@@ -1815,8 +1968,12 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
-        if let Some(name) = self.export_function_name(syntax_element, text) {
-            return Some(name.to_owned());
+        if let Some((name, _, _)) = self.assigned_export(syntax_element, text) {
+            return Some(if self.exports.shadowing.contains(&syntax_element.id()) {
+                extract::qualify(self.qualification_separator(), EXPORTS_NAME, name)
+            } else {
+                name.to_owned()
+            });
         }
         if self.exports.objects.contains(&syntax_element.id()) {
             return Some(DEFAULT_EXPORT_NAME.to_owned());
@@ -1836,13 +1993,25 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     /// A constructor parameter property belongs to the class: it drops the
-    /// `constructor` scope its parameter list sits in.
+    /// `constructor` scope its parameter list sits in. An export assignment whose name a
+    /// declaration at module scope takes belongs to `exports`.
     fn declaration_qualification(
         &self,
         visited: Visited<'_, '_>,
         text: &str,
         qualification: &str,
     ) -> Option<String> {
+        if self
+            .exports
+            .shadowing
+            .contains(&visited.syntax_element().id())
+        {
+            return Some(extract::qualify(
+                self.qualification_separator(),
+                qualification,
+                EXPORTS_NAME,
+            ));
+        }
         self.kinds.parameter_property(visited, text)?;
         let class = qualification
             .strip_suffix(CONSTRUCTOR_NAME)?
@@ -1989,7 +2158,7 @@ pub(crate) fn analyze_included(
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
     };
-    let (assignments, commonjs_export) = commonjs::record(
+    let commonjs = commonjs::record(
         tree.root_node(),
         source,
         limits,
@@ -2000,6 +2169,7 @@ pub(crate) fn analyze_included(
             && !tree.root_node().has_error(),
         &mut rules.exports.bindings,
     )?;
+    rules.exports.add_commonjs(&commonjs, source.text);
     let mut capture = ranges.is_empty().then(|| {
         if language.name == "typescript" {
             crate::static_analysis::Capture::for_edge_typescript(
@@ -2017,7 +2187,7 @@ pub(crate) fn analyze_included(
         && !recovered
         && !tree.root_node().has_error()
     {
-        capture.record_commonjs_export(commonjs_export);
+        capture.record_commonjs_export(commonjs.closed_export);
     }
     let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),
@@ -2035,7 +2205,7 @@ pub(crate) fn analyze_included(
             language,
             facts,
             &visits,
-            &assignments,
+            &commonjs.assignments,
             &mut symbols,
         )?;
         facts.set_member_aliases(aliases);

@@ -20,7 +20,7 @@ pub(super) use entry::build_paths;
 use entry::{Entry, PackageFiles};
 
 /// Establishes declarations in an entry module from captured owner and metadata.
-/// Conditional targets without selected conditions and uncaptured module roots remain unresolved.
+/// Conditional targets no static consumer selects and uncaptured module roots remain unresolved.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
     selected: &[SelectedFile<'_>],
@@ -29,6 +29,7 @@ pub(super) fn prepare(
     let mut prepared = PreparedNamespace::default();
     // Every entry of the package is decided over the files captured once here.
     let files = PackageFiles::captured(input);
+    let mut imported = BTreeSet::new();
     if let Some(metadata) = &metadata {
         let entries = ["typescript", "javascript"].map(|language| {
             let has_files = selected
@@ -41,7 +42,8 @@ pub(super) fn prepare(
         // The file an admitted observation names holds its module before any file the
         // manifest alone names. Two admitted observations of one module still share its
         // identity (#995).
-        let observed = observations::observed_files(input, &files, metadata, selected);
+        imported = observations::import_builds(input, &files, metadata, selected, &entries[1].1);
+        let observed = observations::observed_files(input, &files, metadata, selected, &imported);
         let entries = entries.map(|(language, modules)| {
             let kept = modules
                 .into_iter()
@@ -101,7 +103,14 @@ pub(super) fn prepare(
         }
         map_declared_types(input, &files, metadata, selected, &mut prepared);
     }
-    observations::prepare(input, &files, metadata.as_ref(), selected, &mut prepared);
+    observations::prepare(
+        input,
+        &files,
+        metadata.as_ref(),
+        selected,
+        &imported,
+        &mut prepared,
+    );
     if input.owner().is_local() {
         for file in selected {
             let language = file.syntax.language();
@@ -154,6 +163,7 @@ fn export_bindings(
     let mut exports = Vec::new();
     let mut unresolved = false;
     let targets = declaration_targets(file.syntax, anchors);
+    let owned = owned_exports(file, anchors);
     let anchor_identities = anchors
         .values()
         .map(SymbolId::as_str)
@@ -177,6 +187,9 @@ fn export_bindings(
             unresolved = true;
             continue;
         };
+        if binding.local == binding.exported && owned.contains(&binding.local) {
+            continue;
+        }
         let Some(target) = targets
             .get(&(binding.container.clone(), local))
             .copied()
@@ -229,6 +242,25 @@ fn export_bindings(
     unresolved |= !refused.is_empty();
     exports.retain(|export| !refused.contains(export.identity.as_str()));
     (exports, unresolved)
+}
+
+/// The names an export gives to a declaration published under another owner: a property of
+/// an exported object literal under that object, and an assignment that shares its name
+/// with a declaration under `exports`.
+fn owned_exports(
+    file: &SelectedFile<'_>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeSet<Option<ByteRange>> {
+    file.syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            (symbol.syntax_element_kind == Some("pair")
+                || symbol.container.as_deref() == Some(EXPORTS_NAME))
+                && anchors.contains_key(&symbol.qualified_name)
+        })
+        .map(|symbol| symbol.name_range)
+        .collect()
 }
 
 pub(crate) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
@@ -346,7 +378,7 @@ fn entry_modules(
             Entry::Absent => (BTreeMap::new(), false),
         };
     };
-    let mut modules = BTreeMap::new();
+    let mut candidates = BTreeMap::<ProjectPath, Vec<EntryCandidate<'_>>>::new();
     let mut unresolved = false;
     for (key, target) in &exports.0 {
         let suffix = if key == "." {
@@ -361,36 +393,61 @@ fn entry_modules(
             unresolved = true;
             continue;
         };
-        let Some(target) = target.target(language) else {
+        let path = target
+            .target(language)
+            .and_then(|path| path.strip_prefix("./"))
+            .filter(|relative| export_subpath_is_valid(relative))
+            .and_then(|relative| ProjectPath::new(relative).ok());
+        let Some(path) = path else {
             unresolved = true;
             continue;
         };
-        let Some(relative) = target.strip_prefix("./") else {
-            unresolved = true;
-            continue;
-        };
-        if !export_subpath_is_valid(relative) {
-            unresolved = true;
-            continue;
-        }
-        let Ok(path) = ProjectPath::new(relative) else {
-            unresolved = true;
-            continue;
-        };
-        let module = format!("{}{suffix}", metadata.name);
-        match modules.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(Some(module));
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().as_ref() != Some(&module) {
-                    entry.insert(None);
-                    unresolved = true;
-                }
-            }
-        }
+        candidates.entry(path).or_default().push(EntryCandidate {
+            key,
+            module: format!("{}{suffix}", metadata.name),
+            unconditional: target.is_unconditional(language),
+        });
     }
+    let modules = candidates
+        .into_iter()
+        .map(|(path, candidates)| {
+            let module = file_module(candidates);
+            unresolved |= module.is_none();
+            (path, module)
+        })
+        .collect();
     (modules, unresolved)
+}
+
+/// One subpath whose target is a file.
+struct EntryCandidate<'metadata> {
+    key: &'metadata str,
+    module: String,
+    unconditional: bool,
+}
+
+/// The one module a file is published under. An unconditional subpath keeps the file before
+/// a conditional one, and two of them leave it unresolved. Among conditional subpaths the
+/// package entry holds it, else the first key in order; the others are aliases.
+fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> Option<String> {
+    let unconditional = candidates
+        .iter()
+        .filter(|candidate| candidate.unconditional)
+        .count();
+    if unconditional > 1 {
+        return None;
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            !candidate.unconditional,
+            candidate.key != ".",
+            candidate.key,
+        )
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.module)
 }
 
 fn export_subpath_is_valid(path: &str) -> bool {
@@ -411,6 +468,7 @@ fn entry_path(metadata: &PackageMetadata, language: &str) -> Option<ProjectPath>
 
 /// Associates explicit declared types with one captured defining export.
 /// Callable facts establish category, not parameter or return equivalence.
+/// Export conditions that name several implementation files associate none of them.
 fn map_declared_types(
     input: &NamespaceInput<'_>,
     files: &PackageFiles<'_>,
@@ -418,6 +476,13 @@ fn map_declared_types(
     selected: &[SelectedFile<'_>],
     prepared: &mut PreparedNamespace,
 ) {
+    if metadata
+        .exports
+        .as_ref()
+        .is_some_and(Exports::has_several_implementations)
+    {
+        return;
+    }
     // Two written implementations leave open which one the types describe.
     if matches!((&metadata.main, &metadata.module), (Some(main), Some(module)) if main != module) {
         return;
@@ -619,22 +684,57 @@ struct PackageMetadata {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+enum CapturedExports {
+    Direct(String),
+    Entries(OrderedConditions),
+}
+
+#[derive(Deserialize)]
+#[serde(from = "CapturedExports")]
 enum Exports {
     Direct(String),
     Subpaths(OrderedConditions),
+}
+
+impl From<CapturedExports> for Exports {
+    /// A map whose keys name no subpath holds the conditions of the package entry itself.
+    fn from(captured: CapturedExports) -> Self {
+        match captured {
+            CapturedExports::Direct(path) => Self::Direct(path),
+            CapturedExports::Entries(entries)
+                if entries.0.iter().any(|(key, _)| key.starts_with('.')) =>
+            {
+                Self::Subpaths(entries)
+            }
+            CapturedExports::Entries(conditions) => Self::Subpaths(OrderedConditions(vec![(
+                ".".to_owned(),
+                ExportTarget::Conditions(conditions),
+            )])),
+        }
+    }
 }
 
 impl Exports {
     fn target(&self, language: &str) -> Option<&str> {
         match self {
             Self::Direct(path) => Some(path),
-            Self::Subpaths(paths) => paths
-                .0
-                .iter()
-                .find(|(key, _)| key == ".")?
-                .1
-                .target(language),
+            Self::Subpaths(_) => self.entry()?.target(language),
         }
+    }
+
+    fn entry(&self) -> Option<&ExportTarget> {
+        let Self::Subpaths(paths) = self else {
+            return None;
+        };
+        let (_, target) = paths.0.iter().find(|(key, _)| key == ".")?;
+        Some(target)
+    }
+
+    /// Whether the conditions of the package entry name more than one file that is no
+    /// declared type: which of them a declared type describes depends on the consumer.
+    fn has_several_implementations(&self) -> bool {
+        self.entry()
+            .is_some_and(|target| target.implementations().len() > 1)
     }
 
     fn observed_targets(
@@ -665,49 +765,144 @@ impl Exports {
     }
 }
 
+/// The condition naming declared types, which a TypeScript consumer alone selects.
+const TYPES_CONDITION: &str = "types";
+/// The condition every consumer selects.
+const DEFAULT_CONDITION: &str = "default";
+/// How a static consumer loads a module. Node matches exactly one of `import` and `require`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loader {
+    Module,
+    CommonJs,
+}
+
+/// The conditions a consumer of `language` matches beside `types` and `default`. Custom,
+/// community and bundler conditions match none: no static consumer enables them.
+fn consumer_conditions(language: &str, loader: Loader) -> &'static [&'static str] {
+    match (language, loader) {
+        ("typescript", Loader::Module) => &["node", "import"],
+        ("typescript", Loader::CommonJs) => &["node", "require"],
+        (_, Loader::Module) => &["node", "import", "module-sync"],
+        (_, Loader::CommonJs) => &["node", "require", "module-sync"],
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ExportTarget {
     Direct(String),
     Conditions(OrderedConditions),
+    Unresolved(UnresolvedTarget),
+}
+
+/// `null`, which excludes the subpath for the conditions it is written under, or a target
+/// list, which names no single file without reading the file system.
+#[derive(Deserialize)]
+#[serde(from = "Option<Vec<de::IgnoredAny>>")]
+struct UnresolvedTarget;
+
+impl From<Option<Vec<de::IgnoredAny>>> for UnresolvedTarget {
+    fn from(_: Option<Vec<de::IgnoredAny>>) -> Self {
+        Self
+    }
+}
+
+/// What one export target gives a consumer.
+enum SelectedTarget<'metadata> {
+    Path(&'metadata str),
+    /// The written target names no file this consumer resolves.
+    Refused,
+    /// No condition of the consumer is written: a later condition can still match.
+    Unmatched,
 }
 
 impl ExportTarget {
+    /// The target that holds the module identity for `language`: the one an ECMAScript
+    /// module consumer selects in the declared order, else the one a `require` selects.
     fn target(&self, language: &str) -> Option<&str> {
+        [Loader::Module, Loader::CommonJs]
+            .into_iter()
+            .find_map(|loader| {
+                self.selected_target(
+                    language == "typescript",
+                    consumer_conditions(language, loader),
+                )
+            })
+    }
+
+    /// Whether the target was resolved by its first condition alone: a direct file, a first
+    /// `default`, or a first `types` for TypeScript. A subpath that first resolves through
+    /// the condition walk never takes a file from such a subpath.
+    fn is_unconditional(&self, language: &str) -> bool {
         match self {
-            Self::Direct(path) => Some(path),
+            Self::Direct(_) => true,
+            Self::Unresolved(UnresolvedTarget) => false,
             Self::Conditions(conditions) => {
-                let (condition, value) = conditions.0.first()?;
-                let matched =
-                    condition == "default" || (condition == "types" && language == "typescript");
-                if matched {
-                    value.target(language)
-                } else {
-                    None
-                }
+                conditions.0.first().is_some_and(|(condition, target)| {
+                    (condition == DEFAULT_CONDITION
+                        || (condition == TYPES_CONDITION && language == "typescript"))
+                        && target.is_unconditional(language)
+                })
             }
         }
     }
 
     fn selected_target(&self, types: bool, selected: &[&str]) -> Option<&str> {
-        match self {
-            Self::Direct(path) => Some(path),
-            Self::Conditions(conditions) => {
-                for (name, target) in &conditions.0 {
-                    if name.starts_with("types@") {
-                        return None;
-                    }
-                    if (name == "default"
-                        || (types && name == "types")
-                        || selected.contains(&name.as_str()))
-                        && let Some(path) = target.selected_target(types, selected)
-                    {
-                        return Some(path);
-                    }
+        match self.select(types, selected) {
+            SelectedTarget::Path(path) => Some(path),
+            SelectedTarget::Refused | SelectedTarget::Unmatched => None,
+        }
+    }
+
+    /// The JSON reader that captured the metadata refuses nesting past its recursion limit.
+    fn select(&self, types: bool, selected: &[&str]) -> SelectedTarget<'_> {
+        let conditions = match self {
+            Self::Direct(path) => return SelectedTarget::Path(path),
+            Self::Unresolved(UnresolvedTarget) => return SelectedTarget::Refused,
+            Self::Conditions(conditions) => conditions,
+        };
+        for (name, target) in &conditions.0 {
+            // A compiler version decides this selector, and no version is captured.
+            if name.starts_with("types@") {
+                if types {
+                    return SelectedTarget::Refused;
                 }
-                None
+                continue;
+            }
+            if name != DEFAULT_CONDITION
+                && !(types && name == TYPES_CONDITION)
+                && !selected.contains(&name.as_str())
+            {
+                continue;
+            }
+            match target.select(types, selected) {
+                SelectedTarget::Unmatched => {}
+                found => return found,
             }
         }
+        SelectedTarget::Unmatched
+    }
+
+    /// Every file written outside a declared types condition.
+    fn implementations(&self) -> BTreeSet<&str> {
+        let mut paths = BTreeSet::new();
+        let mut pending = vec![self];
+        while let Some(target) = pending.pop() {
+            match target {
+                Self::Direct(path) => {
+                    paths.insert(path.as_str());
+                }
+                Self::Conditions(conditions) => pending.extend(
+                    conditions
+                        .0
+                        .iter()
+                        .filter(|(name, _)| name != TYPES_CONDITION)
+                        .map(|(_, target)| target),
+                ),
+                Self::Unresolved(UnresolvedTarget) => {}
+            }
+        }
+        paths
     }
 }
 
@@ -755,6 +950,14 @@ fn declaration_anchors_with_public(
     let syntax = file.syntax;
     let source = file.source;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(module) = module {
+        // An export assignment whose name a module-scope declaration takes is declared
+        // under `exports`, the module's own object.
+        paths.insert(
+            EXPORTS_NAME.to_owned(),
+            vec![module.to_owned(), EXPORTS_NAME.to_owned()],
+        );
+    }
     let mut anchors = BTreeMap::new();
     let conflicts = assignment_name_conflicts(syntax, source);
     let assignments = syntax
@@ -773,7 +976,7 @@ fn declaration_anchors_with_public(
                 || symbol.kinds.contains(&SymbolKind::Public)
                 || public.contains(&symbol.qualified_name)
                 || symbol.name_range.is_some_and(|name| {
-                    assignments.contains(&(symbol.item_range, name, symbol.container.as_deref()))
+                    assignments.contains(&(symbol.item_range, name, export_container(symbol)))
                 })
         })
         .collect::<Vec<_>>();
@@ -913,6 +1116,18 @@ fn declared_module_name(symbol: &SyntaxSymbol, source: &str) -> Option<String> {
         return None;
     }
     observations::literal_module_name(source, range)
+}
+
+/// The container the syntax provider gives an export assignment that shares its name with
+/// a declaration of the module.
+const EXPORTS_NAME: &str = "exports";
+
+/// The container of an export the symbol declares: `exports` is the module itself.
+fn export_container(symbol: &SyntaxSymbol) -> Option<&str> {
+    symbol
+        .container
+        .as_deref()
+        .filter(|container| *container != EXPORTS_NAME)
 }
 
 fn container_path(
