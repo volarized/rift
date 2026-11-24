@@ -146,7 +146,9 @@ fn final_commonjs_literal_pair_refuses_uncertain_or_mutated_values() {
 function use() { return library.exist() }
 module.exports = use";
     let literal_negatives = [
-        "function local() { return 1 }\nmodule.exports = { exist: local, other: 1 }".to_owned(),
+        "function local() { return 1 }\nmodule.exports = { exist: local, [key]: 1 }".to_owned(),
+        "function local() { return 1 }\nmodule.exports = { exist: local, 'exist': 1 }".to_owned(),
+        "function local() { return 1 }\nmodule.exports = { exist: local, exist() {} }".to_owned(),
         "function local() { return 1 }\nmodule.exports = { exist: local, ...unknown }".to_owned(),
         format!("const module = {{ exports: {{}} }}\n{OWNER}"),
     ];
@@ -228,4 +230,30 @@ module.exports = use";
                 && occurrence(edge, user, "library.exist")
                 && edge.to.as_str().ends_with("/default/exist"))
     }));
+}
+
+#[test]
+fn literal_pair_before_other_written_properties_keeps_its_call_and_read() {
+    let user = "const library = require('./literal')
+function use() { return library.exist() }
+module.exports = use";
+    for owner in [
+        "function local() { return 1 }\nmodule.exports = { exist: local, other: 1 }",
+        "function local() { return 1 }\nmodule.exports = { ...base, exist: local, 'other': 1, last() {} }",
+    ] {
+        let analyzed = analyze(user, owner);
+        for (kind, text, target) in [
+            (EdgeKind::Calls, "library.exist()", "/local"),
+            (EdgeKind::Reads, "library.exist", "/default/exist"),
+        ] {
+            assert!(
+                analyzed.publication().edges.iter().any(|edge| {
+                    edge.kinds == [kind]
+                        && occurrence(edge, user, text)
+                        && edge.to.as_str().ends_with(target)
+                }),
+                "{kind:?} {owner}"
+            );
+        }
+    }
 }

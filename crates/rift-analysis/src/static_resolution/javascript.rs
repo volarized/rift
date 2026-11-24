@@ -357,7 +357,8 @@ impl<'source> Index<'source> {
         .is_some()
     }
 
-    /// The immutable local function named by a final, direct property of an object literal.
+    /// The immutable local function named by a direct property of an object literal that no
+    /// later property can replace.
     pub(super) fn javascript_final_pair_callable(
         &self,
         file: &File<'source>,
@@ -367,7 +368,8 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         if member.symbol.syntax_element_kind != Some("pair")
             || member.callable().is_some()
-            || !javascript_final_pair(file, member, object, work)
+            || !(javascript_final_pair(file, member, object, work)
+                || file.exported_pair_is_settled(member, work))
         {
             return None;
         }
@@ -752,7 +754,8 @@ impl<'source> Index<'source> {
         self.javascript_commonjs_literal_member(file, binding, supplied, member, role, work)
     }
 
-    /// Reads a checked direct export's property or calls the local function its final pair names.
+    /// Reads a checked direct export's property or calls the local function its settled pair
+    /// names.
     fn javascript_commonjs_literal_member(
         &self,
         file: &File<'source>,
@@ -786,7 +789,9 @@ impl<'source> Index<'source> {
             return None;
         }
         let selected = if role == rift_core::ReferenceRole::Read {
-            javascript_final_pair(supplied, target, literal, work).then_some(target)
+            (javascript_final_pair(supplied, target, literal, work)
+                || supplied.exported_pair_is_settled(target, work))
+            .then_some(target)
         } else if file.javascript_binding_reassigned(binding) {
             None
         } else {

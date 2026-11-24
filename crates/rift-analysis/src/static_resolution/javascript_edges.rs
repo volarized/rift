@@ -273,6 +273,16 @@ impl<'source> Index<'source> {
                 .javascript_call_from(file, outside, work)
                 .or_else(|| self.javascript_module_from(file, outside, work));
         }
+        // So does the write of `exports.name = value`, when the assignment declares the name.
+        if assignment && written && matches!(symbol.kind, "variable" | "class") {
+            let outside = ByteRange {
+                start: symbol.range.start,
+                end: symbol.range.end.checked_add(1)?,
+            };
+            return self
+                .javascript_call_from(file, outside, work)
+                .or_else(|| self.javascript_module_from(file, outside, work));
+        }
         let callable = matches!(symbol.kind, "function" | "method");
         if assignment && callable {
             self.javascript_call_from(file, range, work)

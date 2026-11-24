@@ -3692,3 +3692,530 @@ fn test_npm_entries_outside_the_index_leave_the_package_index_its_own_path() {
         assert_eq!(identities, expected, "{main}");
     }
 }
+
+#[test]
+fn test_commonjs_members_of_exported_literals_and_assigned_objects() {
+    // A `name: value` pair of an exported literal that no later property replaces names its
+    // value wherever it is written; an object assigned to a member after the export holds
+    // its own members.
+    let literal = "module.exports = { kDirect: Symbol('direct'), exist: checkExistence, last: 1 }
+function checkExistence () {}
+";
+    let parser = "function Parser () {}
+module.exports = Parser
+module.exports.helpers = { add: function add () {}, size: 1 }
+";
+    let replaced = "function Replaced () {}
+function other () {}
+module.exports = Replaced
+module.exports.helpers = { add: function add () {} }
+module.exports.helpers.add = other
+module.exports.tools = { run: function run () {} }
+module.exports.tools = other
+module.exports.computed = { run: function run () {} }
+module.exports.computed[other] = other
+";
+    let twice = "module.exports = { kTwice: Symbol('twice'), exist: checkTwice }
+function checkTwice () {}
+module.exports = { kTwice: 1 }
+";
+    let written = "module.exports = { kWritten: Symbol('written'), exist: checkWritten }
+function checkWritten () {}
+module.exports.kWritten = 1
+module.exports.exist = 1
+";
+    let main = "const { kDirect, exist } = require('./literal')
+const Parser = require('./parser')
+const Replaced = require('./replaced')
+const { kTwice, exist: existTwice } = require('./twice')
+const { kWritten, exist: existWritten } = require('./written')
+function use (server) { return [server[kDirect], exist(), Parser.helpers.add()] }
+function refuse (server) {
+  return [Replaced.helpers.add(), Replaced.tools.run(), Replaced.computed.run(), server[kTwice], existTwice(), server[kWritten], existWritten()]
+}
+module.exports = { use, refuse }
+";
+    let (_directory, index) = workspace(&[
+        ("literal.js", literal),
+        ("parser.js", parser),
+        ("replaced.js", replaced),
+        ("twice.js", twice),
+        ("written.js", written),
+        ("main.js", main),
+    ]);
+    for (kind, from, to) in [
+        (
+            EdgeKind::Imports,
+            "main.js/kDirect",
+            "literal.js/default/kDirect",
+        ),
+        (
+            EdgeKind::Imports,
+            "main.js/exist",
+            "literal.js/default/exist",
+        ),
+        (EdgeKind::Calls, "main.js/use", "literal.js/checkExistence"),
+        (EdgeKind::Calls, "main.js/use", "parser.js/helpers/add"),
+        (EdgeKind::Reads, "main.js/use", "parser.js/helpers"),
+        (EdgeKind::Reads, "main.js/use", "parser.js/helpers/add"),
+        (
+            EdgeKind::Contains,
+            "parser.js/helpers",
+            "parser.js/helpers/add",
+        ),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{kind:?} {from} {to}");
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.js/refuse")
+    }));
+    // A literal replaced later supplies nothing. A property written again is no longer the
+    // literal's: the import names the assignment that declares the export's value.
+    for name in ["kTwice", "existTwice", "kWritten", "existWritten"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Imports
+                    && edge.from().as_str().ends_with(&format!("main.js/{name}"))
+                    && edge.to().as_str().contains("/default/")
+            }),
+            "{name}"
+        );
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Imports,
+        "main.js/kWritten",
+        "written.js/kWritten"
+    ));
+    let javascript =
+        rift_protocol::read::Language::from_identity_segment("javascript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&javascript)
+            .expect("identity coverage")
+    );
+}
+
+/// The three files of express beside TypeScript's `CommonJS` output: a synchronized function
+/// export, named exports of values and required names, and a module value the file names by
+/// an alias.
+const COMMONJS_MODULES: &[(&str, &str)] = &[
+    (
+        "application.js",
+        "var app = exports = module.exports = {};
+app.init = function init() { return helper() };
+app.handle = handleRequest;
+function handleRequest() {}
+function helper() {}
+",
+    ),
+    (
+        "dynamic.js",
+        "var app = exports = module.exports = {};
+app.init = function init() {};
+app.handle = handleRequest;
+app[name] = function () {};
+function handleRequest() {}
+",
+    ),
+    (
+        "utils.js",
+        "exports.methods = ['get'];
+exports.etag = createETag({ weak: false });
+exports.normalize = function normalize() {};
+exports.Client = class Client { connect() {} static make() {} };
+var taken = createETag;
+exports.taken = createETag({ weak: true });
+function createETag() {}
+",
+    ),
+    (
+        "express.js",
+        "var proto = require('./application');
+var dynamic = require('./dynamic');
+var utils = require('./utils');
+exports = module.exports = createApplication;
+function createApplication() {
+  proto.init();
+  proto.handle();
+  dynamic.init();
+  dynamic.handle();
+  utils.normalize();
+  return [utils.methods, utils.etag, utils.taken, new utils.Client(), utils.Client.make()];
+}
+exports.application = proto;
+",
+    ),
+    (
+        "output.js",
+        "Object.defineProperty(exports, '__esModule', { value: true });
+const util_1 = require('./utils');
+Object.defineProperty(exports, 'normalize', { enumerable: true, get: function () { return util_1.normalize; } });
+__exportStar(require('./application2'), exports);
+",
+    ),
+    (
+        "application2.js",
+        "function run() {}
+exports.run = run;
+exports.default = run;
+",
+    ),
+    (
+        "main.js",
+        "const { normalize, run } = require('./output');
+const output = require('./output');
+function use() { return [normalize(), run(), output.run(), output.normalize()] }
+function refuse() { return [output.default(), output()] }
+module.exports = { use, refuse };
+",
+    ),
+];
+
+#[test]
+fn test_commonjs_module_value_aliases_and_assigned_values_resolve() {
+    let (_directory, index) = workspace(COMMONJS_MODULES);
+    for (kind, from, to) in [
+        (
+            EdgeKind::Calls,
+            "express.js/createApplication",
+            "application.js/app/init",
+        ),
+        (
+            EdgeKind::Calls,
+            "express.js/createApplication",
+            "application.js/handleRequest",
+        ),
+        (
+            EdgeKind::Calls,
+            "express.js/createApplication",
+            "utils.js/normalize",
+        ),
+        (
+            EdgeKind::Calls,
+            "express.js/createApplication",
+            "utils.js/Client",
+        ),
+        (
+            EdgeKind::Calls,
+            "express.js/createApplication",
+            "utils.js/Client/make",
+        ),
+        (
+            EdgeKind::Reads,
+            "express.js/createApplication",
+            "utils.js/methods",
+        ),
+        (
+            EdgeKind::Reads,
+            "express.js/createApplication",
+            "utils.js/etag",
+        ),
+        (
+            EdgeKind::Reads,
+            "express.js/createApplication",
+            "utils.js/exports/taken",
+        ),
+        (EdgeKind::Writes, "%2Futils.js", "utils.js/methods"),
+        (EdgeKind::Calls, "main.js/use", "utils.js/normalize"),
+        (EdgeKind::Calls, "main.js/use", "application2.js/run"),
+        (EdgeKind::Imports, "main.js/normalize", "utils.js/normalize"),
+        (
+            EdgeKind::Contains,
+            "utils.js/Client",
+            "utils.js/Client/connect",
+        ),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{kind:?} {from} {to}");
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && (edge.to().as_str().contains("dynamic.js")
+                || edge.from().as_str().ends_with("main.js/refuse"))
+    }));
+    // No write is owned by the declaration it writes.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Writes
+            && edge.from() == edge.to()
+            && edge.to().as_str().contains("utils.js")
+    }));
+    let javascript =
+        rift_protocol::read::Language::from_identity_segment("javascript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&javascript)
+            .expect("identity coverage")
+    );
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
+fn test_commonjs_module_value_alias_written_twice_calls_neither_value() {
+    for alias in ["app", "exportsApi", "Object", "Objects", "module_exports"] {
+        let library = format!(
+            "var {alias} = module.exports = {{}};
+{alias}.run = first;
+{alias}.once = first;
+function first() {{}}
+function second() {{}}
+function swap() {{ {alias}.run = second }}
+"
+        );
+        let main = "var library = require('./library');
+function twice() { library.run() }
+function once() { library.once() }
+";
+        let (_directory, index) = workspace(&[("library.js", &library), ("main.js", main)]);
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "main.js/once", "library.js/first"),
+            "{alias}"
+        );
+        for target in ["library.js/first", "library.js/second"] {
+            assert!(
+                !has_edge(&index, EdgeKind::Calls, "main.js/twice", target),
+                "{alias} {target}"
+            );
+        }
+    }
+}
+
+/// Imports that bind a key to a symbol value, and the key.
+const SYMBOL_KEYS: &[(&str, &str)] = &[
+    ("const { kInternals } = require('./keys.js')", "kInternals"),
+    ("const { kShared } = require('./keys.js')", "kShared"),
+    ("const { kState } = require('./bag.js')", "kState"),
+    ("const { kPair } = require('./literal.js')", "kPair"),
+    (
+        "const { kInternals: kKey } = require('./reexport.js')",
+        "kKey",
+    ),
+    ("const kOwn = Symbol.for('own')", "kOwn"),
+];
+
+/// Imports that bind a key to another or an unknown value, and the key.
+const OTHER_KEYS: &[(&str, &str)] = &[
+    ("const { kName } = require('./keys.js')", "kName"),
+    ("const { kLoose } = require('./keys.js')", "kLoose"),
+    ("const { kText } = require('./bag.js')", "kText"),
+    ("const { kSpread } = require('./spread.js')", "kSpread"),
+    ("const { kKeyed } = require('./spread.js')", "kKeyed"),
+    ("const kPart = Symbol('run').description", "kPart"),
+    ("const { kOther } = require('./literal.js')", "kOther"),
+    ("const { kChanged } = require('./changed.js')", "kChanged"),
+    ("const { kMissing } = require('./missing.js')", "kMissing"),
+    ("const { kExternal } = require('external')", "kExternal"),
+    (
+        "let { kInternals } = require('./keys.js'); kInternals = 'run'",
+        "kInternals",
+    ),
+    ("const Symbol = String; const kOwn = Symbol('run')", "kOwn"),
+];
+
+#[test]
+fn test_commonjs_export_keys_imported_as_symbols_name_no_export() {
+    // A computed key on `module.exports` whose value is a symbol declared in another module
+    // names no export. A string, a rebound name, an unresolved import and a name a later
+    // write changes leave every export unresolved for calls.
+    let keys = "const kInternals = Symbol('internals')
+const kShared = Symbol.for('shared')
+const kName = 'run'
+let kLoose = Symbol('loose')
+module.exports = { kInternals, kShared, kName, kLoose }
+";
+    let bag = "const keys = { kState: Symbol('state'), kText: 'run' }
+module.exports = keys
+";
+    let literal = "module.exports = { kPair: Symbol('pair'), kOther: 'run' }
+";
+    let spread =
+        "const keys = { kSpread: Symbol('spread'), kKeyed: Symbol('keyed'), ...other, [name]: 1 }
+module.exports = keys
+";
+    let changed = "const kChanged = Symbol('changed')
+exports.kChanged = kChanged
+exports.kChanged = 'run'
+";
+    let reexport = "const { kInternals } = require('./keys.js')
+module.exports.kInternals = kInternals
+";
+    let owner = |import: &str, key: &str| {
+        format!(
+            "{import}
+function run() {{ return 1 }}
+function Owner() {{}}
+module.exports = Owner
+module.exports.run = run
+module.exports[{key}] = {{ run }}
+"
+        )
+    };
+    let mut files = vec![
+        ("keys.js".to_owned(), keys.to_owned()),
+        ("bag.js".to_owned(), bag.to_owned()),
+        ("literal.js".to_owned(), literal.to_owned()),
+        ("changed.js".to_owned(), changed.to_owned()),
+        ("spread.js".to_owned(), spread.to_owned()),
+        ("reexport.js".to_owned(), reexport.to_owned()),
+    ];
+    let owners = SYMBOL_KEYS.iter().chain(OTHER_KEYS).enumerate();
+    let mut requires = Vec::new();
+    let mut calls = Vec::new();
+    for (index, (import, key)) in owners {
+        files.push((format!("owner{index}.js"), owner(import, key)));
+        requires.push(format!("const Owner{index} = require('./owner{index}.js')"));
+        calls.push(format!("new Owner{index}(), Owner{index}.run()"));
+    }
+    let main = format!(
+        "{}\nfunction build() {{ return [{}] }}\nmodule.exports = build\n",
+        requires.join("\n"),
+        calls.join(", ")
+    );
+    files.push(("main.js".to_owned(), main));
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let (_directory, index) = workspace(&files);
+    for (position, (import, _)) in SYMBOL_KEYS.iter().chain(OTHER_KEYS).enumerate() {
+        for member in ["Owner", "run"] {
+            assert_eq!(
+                has_edge(
+                    &index,
+                    EdgeKind::Calls,
+                    "main.js/build",
+                    &format!("owner{position}.js/{member}")
+                ),
+                position < SYMBOL_KEYS.len(),
+                "{import} {member}"
+            );
+        }
+    }
+}
+
+/// Every way a module assigns one function or class as its value, with the declaration the
+/// package exports and the member assigned after it.
+const MODULE_VALUES: &[(&str, &str, &str)] = &[
+    (
+        "anonymous.js",
+        "module.exports = function (val, options) { return val }\n",
+        "default",
+    ),
+    (
+        "named.js",
+        "module.exports = function named (val) { return val }\n",
+        "named",
+    ),
+    ("arrow.js", "module.exports = (a) => a\n", "default"),
+    (
+        "chain.js",
+        "exports = module.exports = function (val) { return val }\n",
+        "default",
+    ),
+    (
+        "synced.js",
+        "exports = module.exports = function synced (val) { return val }\n",
+        "synced",
+    ),
+    (
+        "kit.js",
+        "module.exports = class { run () { return 1 } static make () {} }\n",
+        "default",
+    ),
+    (
+        "tool.js",
+        "module.exports = class Tool { run () { return 1 } static make () {} }\n",
+        "Tool",
+    ),
+];
+
+#[test]
+fn test_commonjs_module_values_declare_their_function_or_class() {
+    let mut files = Vec::new();
+    for (path, source, _) in MODULE_VALUES {
+        files.push((
+            (*path).to_owned(),
+            format!("{source}module.exports.x = function x () {{ return 1 }}\nmodule.exports.limit = 10\n"),
+        ));
+        let class = source.contains("class");
+        let value = if class {
+            "lib.make(), new lib()"
+        } else {
+            "lib(1)"
+        };
+        files.push((
+            format!("use-{path}"),
+            format!("const lib = require('./{path}')\nfunction use () {{ return [{value}, lib.x(), lib.limit] }}\nmodule.exports = use\n"),
+        ));
+    }
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let (_directory, index) = workspace(&files);
+    for (path, source, name) in MODULE_VALUES {
+        let class = source.contains("class");
+        let file = index
+            .files()
+            .find(|file| file.path().as_str() == *path)
+            .expect("module file");
+        let symbol = file
+            .syntax()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.qualified_name == *name)
+            .expect("declared module value");
+        assert_eq!(
+            symbol.kind,
+            if class { "class" } else { "function" },
+            "{path}"
+        );
+        assert!(
+            symbol
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Public),
+            "{path}"
+        );
+        assert!(
+            file.syntax()
+                .export_bindings()
+                .expect("bindings")
+                .iter()
+                .any(|binding| binding.exported.is_none() && binding.local == symbol.name_range),
+            "{path} binds its module value"
+        );
+        let from = format!("use-{path}/use");
+        let mut expected = vec![
+            (EdgeKind::Calls, (*name).to_owned()),
+            (EdgeKind::Calls, "x".to_owned()),
+            (EdgeKind::Reads, "x".to_owned()),
+            (EdgeKind::Reads, "limit".to_owned()),
+        ];
+        if class {
+            expected.push((EdgeKind::Calls, format!("{name}/make")));
+            for member in ["run", "make"] {
+                assert!(
+                    has_edge(
+                        &index,
+                        EdgeKind::Contains,
+                        &format!("{path}/{name}"),
+                        &format!("{path}/{name}/{member}")
+                    ),
+                    "{path} {member}"
+                );
+            }
+        }
+        for (kind, to) in expected {
+            let to = format!("%2F{path}/{to}");
+            assert!(has_edge(&index, kind, &from, &to), "{kind:?} {from} {to}");
+        }
+    }
+    let javascript =
+        rift_protocol::read::Language::from_identity_segment("javascript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&javascript)
+            .expect("identity coverage")
+    );
+    assert_eq!(index.edges().dropped_edges(), 0);
+}

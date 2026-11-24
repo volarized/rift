@@ -3421,3 +3421,55 @@ fn test_rust_field_and_method_names_keep_exact_access_targets() {
 }
 
 mod external;
+
+/// Reading the writes of one file's exported members costs in proportion to the file, and a
+/// generated file leaves the budget of the others.
+#[test]
+fn export_member_writes_charge_the_budget_in_proportion_to_their_file() {
+    use std::fmt::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let generated = |exports: usize| {
+        let mut source = String::new();
+        for index in 0..exports {
+            write!(
+                source,
+                "exports.n{index} = {{ a: 1 }};\nexports.n{index}.a = 2;\n"
+            )
+            .expect("generated source");
+        }
+        source
+    };
+    let main = "function leaf() {} function root() { leaf(); } module.exports = root;";
+    let pass = |exports: usize, work_max: usize| {
+        let generated = generated(exports);
+        let used = AtomicUsize::new(0);
+        let result = resolution_by(
+            "javascript",
+            &[("generated.cjs", generated.as_str()), ("main.cjs", main)],
+            &[],
+            work_max,
+            &|graph, documents, input, work_max| {
+                super::resolve_by(
+                    graph,
+                    documents,
+                    input,
+                    work_max,
+                    |index, work, resolution| {
+                        used.store(work_max - work.budget.remaining(), Ordering::Relaxed);
+                        index.resolve_files(super::FileWork::CAPTURED, work, resolution);
+                    },
+                )
+            },
+        );
+        (used.load(Ordering::Relaxed), result)
+    };
+    let (small, _) = pass(100, 10_000_000);
+    let (large, result) = pass(400, 10_000_000);
+    assert!(small > 400, "each member and binding is charged: {small}");
+    assert!(large < small * 6, "{large} is not in proportion to {small}");
+    assert_eq!(calls(&result, "main.cjs").count(), 1);
+    let (_, tight) = pass(400, large * 8);
+    assert_eq!(calls(&tight, "main.cjs").count(), 1);
+    assert!(!tight.edge_calls.is_empty());
+}
