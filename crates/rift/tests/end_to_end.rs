@@ -264,6 +264,31 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     within("workspace preparation", await_workspace_ready(&client)).await??;
+    let map = within(
+        "the served map",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    )
+    .await??;
+    let map = harness::resource_json(&map, "rift://map")?;
+    let probed = std::process::Command::new("rustc")
+        .arg("--version")
+        .current_dir(root)
+        .output()?;
+    let probed = String::from_utf8(probed.stdout)?;
+    let version = probed
+        .split_whitespace()
+        .nth(1)
+        .ok_or("`rustc --version` prints a version")?;
+    let rust = map["packages"]
+        .as_array()
+        .ok_or("the map lists packages")?
+        .iter()
+        .find(|entry| entry["manager"] == "stdlib" && entry["name"] == "rust")
+        .ok_or_else(|| format!("the map names the Rust standard library: {map:#}"))?;
+    assert_eq!(
+        rust["version"], version,
+        "the server probed this machine's own toolchain: {map:#}"
+    );
     for &(path, kind, container) in DECLARATION_READS {
         let id = format!("rift://symbol/local/{path}");
         let answer = proxied_call(

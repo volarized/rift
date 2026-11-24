@@ -8047,8 +8047,8 @@ done
         Ok(())
     }
 
-    /// Gives the first capture its normal answer and makes a second capture outlast what is
-    /// left of the request's budget of at most 2 s.
+    /// Gives the first capture its normal answer and makes a second capture outlast any
+    /// budget these cases set.
     #[cfg(unix)]
     fn delay_inventory_revalidation(server: &RiftMcp, root: std::path::PathBuf) {
         let hook = Arc::downgrade(&server.forced_capture.0);
@@ -8061,7 +8061,7 @@ done
                 .expect("the server still holds its capture")
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((Arc::new(deferred), Duration::from_secs(2)));
+                Some((Arc::new(deferred), Duration::from_secs(60)));
             captured_tree(&root, current)
         });
     }
@@ -8201,7 +8201,7 @@ done
             directory.path(),
             &format!(
                 concat!(
-                    "[server]\nreadiness_timeout = '2s'\n",
+                    "[server]\nreadiness_timeout = '3s'\n",
                     "[languages.rust.lsp]\nsettle_delay = '10ms'\ncommand = ['sh', {}]\n",
                 ),
                 serde_json::to_string(&script)?,
@@ -8212,12 +8212,33 @@ done
         let published = Arc::clone(&server.published.read().await.current);
         let from = captured_traversal_seed(&published.reads, "caller")?;
         let to = captured_traversal_seed(&published.reads, "beacon")?;
+        let calls = || QueryParams {
+            query: "SELECT ?s ?t { ?s :calls ?t }".to_owned(),
+            ..Default::default()
+        };
+        // The engine starts and settles outside the timed request, whose budget then holds
+        // the warm engine's few exchanges and the check that never ends.
+        let QueryReadResult::Results(warm) = server
+            .graph_query(calls())
+            .await
+            .map_err(|failure| format!("the warming query must answer: {failure:?}"))?
+            .0
+            .result
+        else {
+            return Err("the warming query must answer rows".into());
+        };
+        assert!(
+            !warm
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::EngineAnalysisUnavailable { .. })),
+            "the engine answers the warming query: {:?}",
+            warm.warnings
+        );
+        published.engine_inventory.clear().await;
         delay_inventory_revalidation(server, directory.path().canonicalize()?);
         let result = server
-            .graph_query(QueryParams {
-                query: "SELECT ?s ?t { ?s :calls ?t }".to_owned(),
-                ..Default::default()
-            })
+            .graph_query(calls())
             .await
             .map_err(|failure| format!("the query must answer inside its budget: {failure:?}"))?
             .0
@@ -8237,7 +8258,7 @@ done
             result.warnings.iter().any(|warning| matches!(
                 warning,
                 ReadWarning::EngineAnalysisUnavailable { language: Some(_), detail }
-                    if detail.contains("readiness_timeout")
+                    if detail.contains("checked against the captured tree")
             )),
             "{:?}",
             result.warnings

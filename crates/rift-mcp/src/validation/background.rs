@@ -462,6 +462,7 @@ fn listed_in_directory(path: &Path) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::tests::pinned_workspace;
 
     fn denied(_: &Path) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
@@ -781,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_that_met_the_git_index_lock_records_its_end()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn old() {}\n")?;
         let (context, _invalidations) = stable_context(directory.path())?;
         let lock = directory.path().join("index.lock");
@@ -872,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn background_capture_recovers_missing_events_and_leaves_unchanged_publication_alone()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn old() {}\n")?;
         let limits = rift_index::WorkspaceIndexLimits::default();
         let super::super::WorkspaceCandidate::Stable {
@@ -938,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn partial_publication_discovers_a_file_created_without_an_event()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn old() {}\n")?;
         let limits = rift_index::WorkspaceIndexLimits::default();
         let (mut current, _preparation) = super::super::empty_workspace_preparation(
@@ -1068,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_input_does_not_schedule_itself_again_and_restore_recovers()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let original = "pub fn old() {}\n";
         std::fs::write(directory.path().join("lib.rs"), original)?;
         let (context, _invalidations) = stable_context(directory.path())?;
@@ -1121,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn failed_rebuild_recovers_after_byte_identical_restore_without_a_watcher_event()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let original = "pub fn old() {}\n";
         std::fs::write(directory.path().join("lib.rs"), original)?;
         let (context, _invalidations) = stable_context(directory.path())?;

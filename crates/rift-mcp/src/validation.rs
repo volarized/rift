@@ -822,11 +822,8 @@ impl ConfigurationState {
     /// Accepts the workspace's current `rift.toml`.
     pub(crate) fn accept(root: &Path) -> Self {
         let fingerprint = configuration_fingerprint(root);
-        let accepted = load_configuration(root);
-        #[cfg(test)]
-        let accepted = accepted.map(without_version_probes);
         Self {
-            accepted: accepted.map_err(Arc::new),
+            accepted: load_configuration(root).map_err(Arc::new),
             fingerprint,
         }
     }
@@ -1040,20 +1037,6 @@ impl ConfigurationState {
             .map(|configuration| configuration.logs.clone())
             .unwrap_or_default()
     }
-}
-
-/// Keeps a unit test's workspace on its package pins, whether or not it writes a
-/// `rift.toml`.
-///
-/// Every publication a test builds reads the standard library versions first, and the
-/// default probes answer from the machine's own `rustup` and `rustc`: on a Windows runner
-/// 101 tests of this module spent 47 of their 92 s in them and read none of their answers.
-/// `rift-server`'s own tests and `rift`'s end-to-end suite run the probes.
-#[cfg(test)]
-fn without_version_probes(mut configuration: WorkspaceConfiguration) -> WorkspaceConfiguration {
-    configuration.dependencies.resolution =
-        rift_protocol::dependencies::DependencyResolution::Static;
-    configuration
 }
 
 /// Exact bounded identity of the configuration policy source.
@@ -6070,6 +6053,20 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A workspace fixture whose package context reads its pins alone.
+    ///
+    /// Every publication a case builds reads the standard library versions first, and the
+    /// default probes answer from the machine's own `rustup` and `rustc`, which no case here
+    /// reads. The file that declares it is left out of the fixture's sources.
+    pub(crate) fn pinned_workspace() -> TestResult<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[dependencies]\nresolution = \"static\"\n[source]\nexclude = [\"rift.toml\"]\n",
+        )?;
+        Ok(directory)
+    }
+
     fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
         candidate_with_limits(root, epoch, WorkspaceIndexLimits::default())
     }
@@ -6657,7 +6654,7 @@ pub(crate) mod tests {
 
     #[test]
     fn superseded_state_updates_are_rejected_and_success_clears_failure() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let before = stable_candidate(directory.path(), 0)?;
         fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
@@ -6832,7 +6829,7 @@ pub(crate) mod tests {
             Some(b"source\0bytes".as_slice()),
             Some(b"pub fn beacon() {}\n".as_slice()),
         ] {
-            let directory = tempfile::tempdir()?;
+            let directory = pinned_workspace()?;
             let path = rift_core::ProjectPath::new("lib.rs")?;
             let absolute = directory.path().join(path.as_str());
             if let Some(bytes) = original {
@@ -7388,7 +7385,7 @@ pub(crate) mod tests {
     /// as long as SQLite runs.
     #[test]
     fn the_index_holds_no_path_under_the_state_directory() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let state = directory
             .path()
@@ -7538,7 +7535,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_name_event_on_an_absent_extensionless_path_names_that_path() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         let event_root = directory.path().canonicalize()?;
@@ -7561,7 +7558,7 @@ pub(crate) mod tests {
     #[test]
     fn a_name_event_on_a_directory_the_publication_holds_files_below_asks_for_the_workspace()
     -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         let event_root = directory.path().canonicalize()?;
@@ -7584,7 +7581,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_name_event_on_a_directory_on_disk_asks_for_the_workspace() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let event_root = directory.path().canonicalize()?;
         let (validation, _current) = installed_publication(directory.path())?;
@@ -7714,7 +7711,7 @@ pub(crate) mod tests {
     /// Removes `folder` from the workspace, reports it as `Remove(Any)`, and proves its
     /// files leave the index.
     async fn removed_as_remove_any(folder: &str) -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let removed_folder = directory.path().join("src").join(folder);
         fs::create_dir_all(&removed_folder)?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
@@ -7746,7 +7743,7 @@ pub(crate) mod tests {
     /// the event names that path alone, extensionless or not.
     #[test]
     fn a_file_created_or_removed_as_any_names_that_path() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("src/gone.rs"), "pub fn gone() {}\n")?;
@@ -7804,7 +7801,7 @@ pub(crate) mod tests {
     /// no impact, and the file created in it is the rebuild's one change.
     #[test]
     fn a_directory_modified_beside_a_file_created_in_it_rebuilds_that_file_alone() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _invalidations) =
@@ -7846,7 +7843,7 @@ pub(crate) mod tests {
     #[test]
     fn a_directory_modified_with_nothing_indexed_below_adds_nothing_to_the_change_set() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         fs::create_dir_all(directory.path().join("docs"))?;
@@ -8092,7 +8089,7 @@ pub(crate) mod tests {
     #[test]
     fn a_deleted_left_out_file_leaves_no_warning_behind() -> TestResult {
         for (name, bytes) in LEFT_OUT_FILES {
-            let directory = tempfile::tempdir()?;
+            let directory = pinned_workspace()?;
             let previous = left_out_publication(directory.path(), name, bytes)?;
             let path = rift_core::ProjectPath::new(name)?;
             fs::remove_file(directory.path().join(name))?;
@@ -8118,7 +8115,7 @@ pub(crate) mod tests {
     #[test]
     fn a_left_out_file_written_with_the_same_bytes_keeps_its_warning() -> TestResult {
         for (name, bytes) in LEFT_OUT_FILES {
-            let directory = tempfile::tempdir()?;
+            let directory = pinned_workspace()?;
             let previous = left_out_publication(directory.path(), name, bytes)?;
             let path = rift_core::ProjectPath::new(name)?;
             fs::write(directory.path().join(name), bytes)?;
@@ -8145,7 +8142,7 @@ pub(crate) mod tests {
     /// whole workspace instead of keeping the files the publication holds below it.
     #[test]
     fn a_change_set_naming_a_directory_gone_from_the_disk_reads_whole() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::create_dir_all(directory.path().join("pkg"))?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(
@@ -8196,7 +8193,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_superseded_attempt_returns_its_paths_to_the_next_rebuild() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -8239,7 +8236,7 @@ pub(crate) mod tests {
     /// so the record of a rebuild says where its time went.
     #[test]
     fn a_one_path_rebuild_closes_one_span_for_each_stage() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -8283,7 +8280,7 @@ pub(crate) mod tests {
     /// Issue #623: an unchanged full observation validates bytes without rebuilding facts.
     #[test]
     fn an_unchanged_whole_observation_shares_complete_published_facts() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(
             directory.path().join("opaque.unknown"),
@@ -8459,7 +8456,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_change_set_naming_unchanged_bytes_shares_the_previous_read_service() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let previous = stable_candidate(directory.path(), 0)?;
         let request = super::RebuildRequest {
@@ -8491,7 +8488,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_change_set_naming_edited_bytes_replaces_only_that_file() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("other.rs"), "pub fn other() {}\n")?;
         let previous = stable_candidate(directory.path(), 0)?;
@@ -8898,7 +8895,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rebuild_is_superseded_when_epoch_already_moved() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -8925,7 +8922,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rebuild_is_superseded_when_configuration_moves_during_capture() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -8966,7 +8963,7 @@ pub(crate) mod tests {
     );
 
     fn running_capture_fixture() -> TestResult<RunningCaptureFixture> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -9098,7 +9095,7 @@ pub(crate) mod tests {
     );
 
     fn observed_rewrite() -> TestResult<ObservedRewrite> {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -9273,7 +9270,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn supervisor_records_a_superseded_rebuild_with_both_epochs() -> TestResult {
         let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -9348,7 +9345,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn supervisor_marks_the_watch_unhealthy_when_blocking_work_is_gone() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -9462,7 +9459,7 @@ pub(crate) mod tests {
     /// A supervisor records its end before the watcher finishes releasing.
     #[tokio::test(start_paused = true)]
     async fn a_supervisor_that_ends_records_that_its_watch_stopped() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -9527,7 +9524,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn supervisor_records_rebuild_failure_and_notifies_waiters() -> TestResult {
         let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -9583,7 +9580,7 @@ pub(crate) mod tests {
     /// The startup record names the installed epoch after every selected file is prepared.
     #[test]
     fn startup_publication_is_recorded_once_after_complete_preparation() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         let (context, _invalidations) = initial_preparation_context(root)?;
@@ -9631,7 +9628,7 @@ pub(crate) mod tests {
     /// trigger the supervisor's next rebuild runs under.
     #[test]
     fn superseded_preparation_emits_no_startup_publication() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         let (context, _invalidations) = initial_preparation_context(root)?;
@@ -9679,7 +9676,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn preparation_worker_records_only_successful_startup_publication() -> TestResult {
         for (missing, cancelled) in [(false, false), (true, false), (false, true)] {
-            let directory = tempfile::tempdir()?;
+            let directory = pinned_workspace()?;
             let root = directory.path();
             fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
             let (context, _invalidations) = initial_preparation_context(root)?;
@@ -9732,7 +9729,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn directory_events_during_preparation_publish_only_the_captured_tree() -> TestResult {
         for directory_event in [false, true] {
-            let directory = tempfile::tempdir()?;
+            let directory = pinned_workspace()?;
             let root = directory.path();
             fs::create_dir(root.join("src"))?;
             fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
@@ -9810,7 +9807,7 @@ pub(crate) mod tests {
     /// A directory event must not publish newly discovered bytes without their declarations.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_source_added_after_discovery_cannot_publish_an_incomplete_tree() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::create_dir(root.join("src"))?;
         fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
@@ -9856,7 +9853,7 @@ pub(crate) mod tests {
     /// Changed rules must replace the retained policy even when selected paths stay equal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn startup_preparation_rejects_changed_inclusion_rules() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "pub struct Beacon;\n")?;
         fs::write(root.join(".gitignore"), "old.tmp\n")?;
@@ -10016,7 +10013,7 @@ pub(crate) mod tests {
     /// preparation, before the publication.
     #[tokio::test]
     async fn the_complete_publication_holds_what_its_first_read_builds() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "/// Beacon.\npub fn beacon() {}\n")?;
         fs::write(root.join("other.rs"), "pub fn lantern() {}\n")?;
@@ -10040,7 +10037,7 @@ pub(crate) mod tests {
     /// A file edited after discovery is captured before its first prepared publication.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_file_edited_after_discovery_is_in_the_first_prepared_publication() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         let lib = rift_core::ProjectPath::new("lib.rs")?;
@@ -10117,8 +10114,8 @@ pub(crate) mod tests {
 
     /// Renames `folder` out after discovery, then proves the full rebuild drops its files.
     async fn renamed_away_after_discovery(folder: &str) -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let elsewhere = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
+        let elsewhere = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         fs::create_dir_all(root.join(folder))?;
@@ -10241,7 +10238,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_whole_commit_stamps_the_published_revision_and_leaves_units_searchable() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -10275,7 +10272,7 @@ pub(crate) mod tests {
     /// naming the tree revision it answers for.
     #[tokio::test]
     async fn a_handed_write_is_recorded_handed_committing_and_settled() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let revision = published.reads.tree_revision().to_owned();
         let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
@@ -10327,7 +10324,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_commit_releases_its_publication_while_the_store_holds_the_write() -> TestResult {
         for (whole_owed, change) in [(false, false), (false, true), (true, true)] {
-            let directory = tempfile::tempdir()?;
+            let directory = pinned_workspace()?;
             let published = candidate_declaring(directory.path(), 0, "beacon")?;
             let revision = published.reads.tree_revision().to_owned();
             let retired = Arc::downgrade(&published);
@@ -10377,7 +10374,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_prepared_change_owes_a_commit_when_worker_admission_is_closed() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let revision = published.reads.tree_revision().to_owned();
         let double = StoreDouble::new();
@@ -10443,7 +10440,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_write_lands_while_its_trigram_batch_is_held_and_a_new_lane_resumes_it() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let revision = published.reads.tree_revision().to_owned();
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -10498,7 +10495,7 @@ pub(crate) mod tests {
     /// stored wait for the next batch.
     #[tokio::test]
     async fn a_held_write_runs_before_the_next_trigram_batch() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
         let first_revision = first.reads.tree_revision().to_owned();
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -10556,7 +10553,7 @@ pub(crate) mod tests {
     /// the lane waits for the next write, which owes a batch again.
     #[tokio::test]
     async fn a_refused_trigram_batch_is_recorded_and_the_next_write_owes_another() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let double = StoreDouble::new();
@@ -10601,13 +10598,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_whole_write_compares_the_recorded_digests_and_writes_only_what_moved() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
         // The store lives outside the captured tree, as `.rift/index` does: the second capture
         // runs after the open, and a file the open writes beside the database would join
         // the tree as a moved file.
-        let state = tempfile::tempdir()?;
+        let state = pinned_workspace()?;
         let index = Arc::new(search_index(&state.path().join("search.db")).await?);
         let double = StoreDouble::new();
         double.attach(Arc::clone(&index));
@@ -10791,7 +10788,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_commit_leaves_out_an_oversized_unit_records_it_and_publishes_the_rest() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let blob = format!("pub const BLOB: &str = \"{}\";\n", "b".repeat(96));
         fs::write(directory.path().join("blob.rs"), blob)?;
@@ -10851,7 +10848,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_change_commit_replaces_one_path_and_keeps_every_other_unit() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         fs::write(directory.path().join("moved.rs"), "pub fn firstbeta() {}\n")?;
         let first = stable_candidate(directory.path(), 0)?;
@@ -11041,7 +11038,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_backlog_merges_every_write_handed_while_one_waits_and_answers_for_each() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let publications = declaring_publications(directory.path(), 4)?;
         let revision = |epoch: usize| publications[epoch].reads.tree_revision().to_owned();
         let commit = |epoch: usize| -> TestResult<super::LexicalCommit> {
@@ -11148,7 +11145,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_merged_write_answers_for_the_newest_revisions_within_the_bound() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let publications = declaring_publications(directory.path(), 2)?;
         let mut held =
             super::LexicalCommit::new(change_naming_lib()?, Arc::clone(&publications[0]));
@@ -11168,7 +11165,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rebuild_publishes_while_the_lane_still_holds_its_transaction() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
@@ -11242,7 +11239,7 @@ pub(crate) mod tests {
     /// and the next publication compares again once the store answers.
     #[tokio::test]
     async fn a_refused_recorded_digest_read_leaves_the_whole_comparison_owed() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
         let second = candidate_declaring(directory.path(), 1, "secondgamma")?;
         let double = StoreDouble::new();
@@ -11298,7 +11295,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_failing_commit_leads_to_a_whole_comparison_on_the_next_publication() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
         let second = candidate_declaring(directory.path(), 1, "secondgamma")?;
         let third = candidate_declaring(directory.path(), 2, "thirddelta")?;
@@ -11382,7 +11379,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_transaction_past_its_deadline_is_recorded_and_the_lane_keeps_waiting() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
@@ -11441,7 +11438,7 @@ pub(crate) mod tests {
     /// bound far under `LEXICAL_COMMIT_TIMEOUT` instead of after the transaction.
     #[tokio::test]
     async fn a_cancelled_lane_aborts_the_transaction_it_was_running() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
@@ -11493,7 +11490,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_lane_aborts_a_transaction_past_its_deadline() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
@@ -11566,7 +11563,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_write_past_the_transaction_bound_commits_in_parts_and_stamps_the_last() -> TestResult
     {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = three_file_publication(directory.path())?;
         let revision = published.reads.tree_revision().to_owned();
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -11627,7 +11624,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_stop_between_parts_keeps_whole_files_and_the_next_start_writes_the_rest()
     -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = three_file_publication(directory.path())?;
         let revision = published.reads.tree_revision().to_owned();
         let derivation = super::derivation_revision(
@@ -11745,7 +11742,7 @@ pub(crate) mod tests {
     /// A restart preserves stored rows while their analyzer and configuration agree.
     #[tokio::test]
     async fn a_restart_keeps_rows_under_one_analyzer_and_rederives_under_another() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = three_file_publication(directory.path())?;
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
 
@@ -11887,7 +11884,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn writes_handed_while_one_runs_merge_into_one_write_answering_for_each() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let publications = declaring_publications(directory.path(), 4)?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
@@ -11949,7 +11946,7 @@ pub(crate) mod tests {
     /// revision as owed.
     #[tokio::test]
     async fn a_failed_transaction_wakes_the_waiters_on_the_landing() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
         let double = StoreDouble::new();
         double.refuse_changes();
@@ -11989,7 +11986,7 @@ pub(crate) mod tests {
     /// as still committing rather than settled.
     #[tokio::test]
     async fn a_merging_write_wakes_the_waiters_on_the_landing() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let publications = declaring_publications(directory.path(), 3)?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
@@ -12021,7 +12018,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_published_rebuild_hands_its_write_to_the_lane() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn firstbeta() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12066,7 +12063,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rebuild_publishes_when_the_lexical_lane_has_ended() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn firstbeta() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12117,7 +12114,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_empty_change_write_is_not_held() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -12152,7 +12149,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_write_handed_after_the_lane_ended_is_dropped() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -12285,7 +12282,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_lane_runs_the_pass_one_request_asks_for() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
         let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
@@ -12308,7 +12305,7 @@ pub(crate) mod tests {
     /// from queueing one whole pass each.
     #[tokio::test(flavor = "current_thread")]
     async fn the_lane_runs_the_newest_publication_when_two_requests_coalesce() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let earlier = stable_candidate(directory.path(), 0)?;
         fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
@@ -12364,7 +12361,7 @@ pub(crate) mod tests {
     /// has already been sent, so nothing else will ask for it.
     #[tokio::test(flavor = "current_thread")]
     async fn an_older_publication_does_not_displace_the_newest_one() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(
             directory.path().join("lib.rs"),
             "pub fn beacon() {}\npub fn lantern() {}\n",
@@ -12392,7 +12389,7 @@ pub(crate) mod tests {
     /// sequence mints: it is how a test tells which of two asks at one epoch the lane ran.
     #[tokio::test(flavor = "current_thread")]
     async fn a_publication_asked_for_again_at_one_epoch_runs_again() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(
             directory.path().join("lib.rs"),
             "pub fn beacon() {}\npub fn lantern() {}\n",
@@ -12419,7 +12416,7 @@ pub(crate) mod tests {
     /// is gone.
     #[tokio::test]
     async fn a_request_after_the_lane_ended_leaves_the_store_as_it_was() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let earlier = stable_candidate(directory.path(), 0)?;
         let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
@@ -12519,7 +12516,7 @@ pub(crate) mod tests {
     /// tree revision it embeds.
     #[tokio::test]
     async fn a_population_pass_records_its_start_and_its_end() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let published = stable_candidate(directory.path(), 0)?;
         let index = counting_index(&directory.path().join("search.db")).await?;
@@ -12563,7 +12560,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn supervisor_dispatches_superseded_when_epoch_moves_before_acceptance() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12698,7 +12695,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn rebuild_answers_cancelled_while_its_capture_still_blocks() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12751,7 +12748,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn supervisor_ends_when_cancelled_while_its_capture_still_blocks() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12796,7 +12793,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shutdown_cancels_the_running_capture() -> TestResult {
         const WAIT_MAX: Duration = Duration::from_secs(3);
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12848,7 +12845,7 @@ pub(crate) mod tests {
 
     #[test]
     fn capture_is_cancelled_before_it_runs_once_the_token_is_cancelled() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -12882,7 +12879,7 @@ pub(crate) mod tests {
 
     #[test]
     fn capture_is_cancelled_before_its_candidate_is_handed_on() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -13096,7 +13093,7 @@ pub(crate) mod tests {
     /// A failed observation reports the publication, pending work, and recorded failure.
     #[tokio::test(start_paused = true)]
     async fn native_publication_timeout_reports_observed_state() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::write(root.join("lib.rs"), "pub fn old() {}\n")?;
         let before = stable_candidate(root, 0)?;
@@ -13180,7 +13177,7 @@ pub(crate) mod tests {
     /// rescan publishes the tree.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn native_watcher_publication_matches_cold_indexed_facts() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let root = directory.path();
         fs::create_dir(root.join("src"))?;
         fs::write(
@@ -13288,7 +13285,7 @@ pub(crate) mod tests {
     /// A settled revision logs nothing.
     #[test]
     fn an_unranked_search_records_the_commit_it_waits_on() -> TestResult {
-        let directory = tempfile::tempdir()?;
+        let directory = pinned_workspace()?;
         let publications = declaring_publications(directory.path(), 2)?;
         let first = publications[0].reads.tree_revision().to_owned();
         let commit = |epoch: usize| -> TestResult<super::LexicalCommit> {
