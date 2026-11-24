@@ -759,9 +759,7 @@ pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
             format!("{parent}/{}", relative.as_str())
         };
         let root = ProjectPath::new(root).ok()?;
-        let name = explicit
-            .name
-            .unwrap_or_else(|| package.name.replace('-', "_"));
+        let name = crate_name(package.name, explicit.name);
         if !crate_name_is_valid(&name)
             || library.replace((root.as_str().to_owned(), name)).is_some()
         {
@@ -804,9 +802,7 @@ fn library_roots(
         };
         let enabled = package.autolib != Some(false) || metadata.lib.is_some();
         let library = metadata.lib.unwrap_or_default();
-        let name = library
-            .name
-            .unwrap_or_else(|| package.name.replace('-', "_"));
+        let name = crate_name(package.name, library.name);
         if !crate_name_is_valid(&name) {
             continue;
         }
@@ -863,6 +859,14 @@ fn source_identifier(name: &str) -> Option<String> {
     }
     let name = name.nfc().collect::<String>();
     python_identifier_is_valid(&name).then_some(name)
+}
+
+/// The crate name Cargo derives from a library target, which is named after its package when
+/// the manifest names none.
+///
+/// Manifests published before RFC 940 spell a library name with hyphens.
+fn crate_name(package: String, library: Option<String>) -> String {
+    library.unwrap_or(package).replace('-', "_")
 }
 
 fn crate_name_is_valid(name: &str) -> bool {
