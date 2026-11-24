@@ -152,8 +152,16 @@ fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// Measures a bounded batch and returns its last document and average analysis CPU time.
-fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument, Duration) {
+/// Measures a bounded batch and returns its last document and average analysis CPU time, or
+/// no time when [`ANALYSES_PER_SAMPLE_MAX`] analyses did not move the process CPU clock by
+/// [`CPU_SAMPLE_MIN`].
+///
+/// A clock that counts whole ticks can charge less than a batch spent: Windows adds one tick
+/// of 15.6 ms to the thread that runs when the tick ends.
+fn sampled_analysis(
+    provider: &dyn SyntaxProvider,
+    text: &str,
+) -> (SyntaxDocument, Option<Duration>) {
     let path = ProjectPath::new("wide").expect("valid fixture path");
     let mut documents = Vec::with_capacity(ANALYSES_PER_SAMPLE_MAX);
     let start = ProcessTime::try_now().expect("the process CPU clock must be available");
@@ -173,20 +181,28 @@ fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument,
             .try_elapsed()
             .expect("the process CPU clock must be readable");
         if elapsed >= CPU_SAMPLE_MIN {
-            break elapsed;
+            break Some(elapsed);
         }
-        assert!(
-            documents.len() < ANALYSES_PER_SAMPLE_MAX,
-            "the CPU sample must reach its accounting interval within the document bound"
-        );
+        if documents.len() == ANALYSES_PER_SAMPLE_MAX {
+            break None;
+        }
     };
     let analyses = u32::try_from(documents.len()).expect("the sample count is bounded");
     let document = documents.pop().expect("at least one measured analysis");
-    (document, elapsed / analyses)
+    (document, elapsed.map(|elapsed| elapsed / analyses))
+}
+
+/// The sample of a calibrated file, which the clock must measure.
+fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument, Duration) {
+    let (document, elapsed) = sampled_analysis(provider, text);
+    let elapsed = elapsed
+        .expect("the CPU sample must reach its accounting interval within the document bound");
+    (document, elapsed)
 }
 
 /// The smaller file's line count: `lines_min`, doubled until one analysis of the smaller file
-/// takes [`SMALL_RUN_MIN`], at most [`CALIBRATION_DOUBLINGS_MAX`] times.
+/// takes [`SMALL_RUN_MIN`], at most [`CALIBRATION_DOUBLINGS_MAX`] times. A file the clock
+/// does not measure takes less.
 ///
 /// A doubling that would carry the larger file past the default limits' source bytes or
 /// syntax elements is not taken. One run at `lines_min` goes first and counts for nothing, so
@@ -198,15 +214,16 @@ fn calibrated_lines(
 ) -> usize {
     let limits = SyntaxLimits::default();
     let next_large = 2 * usize::from(GROWTH_FACTOR);
-    timed_analysis(provider, &build(lines_min));
+    sampled_analysis(provider, &build(lines_min));
     let mut lines = lines_min;
     for _ in 0..CALIBRATION_DOUBLINGS_MAX {
         let text = build(lines);
-        let (document, elapsed) = timed_analysis(provider, &text);
+        let (document, elapsed) = sampled_analysis(provider, &text);
+        let measured = elapsed.is_some_and(|elapsed| elapsed >= SMALL_RUN_MIN);
         let bytes_fit = text.len() * next_large <= limits.source_bytes_max();
         let syntax_elements_fit =
             document.syntax_elements().len() * next_large <= limits.syntax_elements_max();
-        if elapsed >= SMALL_RUN_MIN || !(bytes_fit && syntax_elements_fit) {
+        if measured || !(bytes_fit && syntax_elements_fit) {
             return lines;
         }
         lines *= 2;
