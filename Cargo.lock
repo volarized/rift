@@ -4902,7 +4902,7 @@ version = "0.0.100"
 dependencies = [
  "rift-error",
  "serde",
- "syn 2.0.119",
+ "syn 3.0.3",
  "thiserror 2.0.21",
  "toml",
 ]
@@ -5265,7 +5265,7 @@ dependencies = [
  "quote",
  "rift-tracing",
  "rift-tracing-consumer-fixture",
- "syn 2.0.119",
+ "syn 3.0.3",
  "tokio",
 ]
 
