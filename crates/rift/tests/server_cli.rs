@@ -130,11 +130,25 @@ fn stale_identity() -> ProductIdentity {
 /// `live_vector_search` suite is the one place the shipped default is exercised.
 const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
+/// The `[dependencies]` table of every fixture but [`probing_workspace`].
+///
+/// Rift runs the standard library version probes by default, and a server start spawns
+/// `rustup` and `rustc` for them. They answer from the machine's own toolchain, so a
+/// fixture that reads none of their answers pins its package context.
+const PROBES_DISABLED: &str = "[dependencies]\nresolution = \"static\"\n";
+
 /// A workspace fixture: one Rust source and a `rift.toml` that turns the vector
-/// ranking off, whose `[server]` idle timeout reaps any orphaned server within a
-/// minute, and whose server binds an [`assigned_port`].
+/// ranking and the version probes off, whose `[server]` idle timeout reaps any orphaned
+/// server within a minute, and whose server binds an [`assigned_port`].
 fn workspace() -> TestResult<tempfile::TempDir> {
     workspace_with_server_keys(&format!("port = {}\n", assigned_port()?))
+}
+
+/// The same fixture under the shipped `[dependencies]` table, whose version probes a
+/// case gives its own programs to run.
+#[cfg(unix)]
+fn probing_workspace() -> TestResult<tempfile::TempDir> {
+    workspace_with_tables("", &format!("port = {}\n", assigned_port()?))
 }
 
 /// The same fixture on the default serving range: a second server elected in the
@@ -145,11 +159,16 @@ fn workspace_on_the_default_range() -> TestResult<tempfile::TempDir> {
 
 /// The fixture with `keys` added to its `[server]` table.
 fn workspace_with_server_keys(keys: &str) -> TestResult<tempfile::TempDir> {
+    workspace_with_tables(PROBES_DISABLED, keys)
+}
+
+/// The fixture with `tables` ahead of its `[server]` table and `keys` in that table.
+fn workspace_with_tables(tables: &str, keys: &str) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{keys}"),
+        format!("{VECTOR_DISABLED}{tables}[server]\nidle_timeout = \"60s\"\n{keys}"),
     )?;
     Ok(directory)
 }
@@ -1424,7 +1443,7 @@ fn stage_ended_line<'a>(records: &'a str, stage: &str) -> TestResult<&'a str> {
 #[cfg(unix)]
 #[test]
 fn a_stop_during_a_dependency_probe_kills_the_probe_and_ends_cleanly() -> TestResult {
-    let directory = workspace()?;
+    let directory = probing_workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let tools = tempfile::tempdir()?;
@@ -1477,7 +1496,7 @@ fn a_stop_during_a_dependency_probe_kills_the_probe_and_ends_cleanly() -> TestRe
 #[cfg(unix)]
 #[test]
 fn a_stop_during_a_probe_whose_child_holds_the_pipes_ends_cleanly() -> TestResult {
-    let directory = workspace()?;
+    let directory = probing_workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let tools = tempfile::tempdir()?;

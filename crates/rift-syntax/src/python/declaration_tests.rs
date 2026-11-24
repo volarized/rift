@@ -157,6 +157,27 @@ fn test_empty_python_module_keeps_a_source_facet() {
     assert!(module.name_range.is_none());
 }
 
+#[test]
+fn test_python_modules_without_tokens_keep_a_source_facet() {
+    for text in ["\n", "   \n\n", "\r\n", " ", "\t\n", "# c\n"] {
+        let document = analyze(text);
+        let [module] = document.symbols() else {
+            panic!("{text:?} declares its module alone");
+        };
+        assert_eq!(module.qualified_name, ".", "{text:?}");
+        assert_eq!(module.kind, "module", "{text:?}");
+        assert!(module.item_range.start < module.item_range.end, "{text:?}");
+        assert!(
+            module.range.end <= u64::try_from(text.len()).expect("text length"),
+            "{text:?}"
+        );
+        assert_eq!(module.range, module.item_range, "{text:?}");
+        if text.trim().is_empty() {
+            assert_eq!(spelled(text, module.range), text);
+        }
+    }
+}
+
 /// A `def` directly in a class body declares a `method` member of the
 /// class; `__init__` constructs it, `staticmethod` and `classmethod` belong
 /// to the class, and `property` reads like a field. A class owns members,

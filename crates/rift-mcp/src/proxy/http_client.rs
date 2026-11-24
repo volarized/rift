@@ -9,6 +9,7 @@ use futures_util::{StreamExt as _, stream};
 use sse_stream::SseStream;
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue, WWW_AUTHENTICATE};
+use rift_protocol::message::MessageBuffer;
 use rmcp::model::{ClientJsonRpcMessage, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::common::client_side_sse::BoxedSseResponse;
 use rmcp::transport::common::http_header::{
@@ -308,12 +309,11 @@ async fn read_response(
             .write_all(&chunk)
             .map_err(|_| refused("JSON-RPC response exceeds byte limit"))?;
     }
-    if declared
-        .is_some_and(|length| length != u64::try_from(buffer.bytes.len()).unwrap_or(u64::MAX))
-    {
+    let bytes = buffer.into_bytes();
+    if declared.is_some_and(|length| length != u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
         return Err(refused("JSON-RPC response content length differs"));
     }
-    Ok(buffer.bytes)
+    Ok(bytes)
 }
 
 fn encode_message(
@@ -323,47 +323,15 @@ fn encode_message(
     encode_bounded(message, limit).map_err(StreamableHttpError::Deserialize)
 }
 
+/// Encodes a message into an allocation of its own length: retained encodings are charged
+/// by their allocation, which the shared buffer grows past the bytes it holds.
 pub(crate) fn encode_bounded(
     message: &impl Serialize,
     limit: usize,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let mut buffer = MessageBuffer::new(limit);
-    serde_json::to_writer(&mut buffer, message)?;
-    Ok(buffer.bytes)
-}
-
-struct MessageBuffer {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-
-impl MessageBuffer {
-    const fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            limit,
-        }
-    }
-}
-
-impl Write for MessageBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let next = next_length(self.bytes.len(), bytes.len(), self.limit)
-            .ok_or_else(|| io::Error::other("JSON-RPC message exceeds byte limit"))?;
-        self.bytes
-            .try_reserve_exact(next - self.bytes.len())
-            .map_err(io::Error::other)?;
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn next_length(current: usize, incoming: usize, limit: usize) -> Option<usize> {
-    current.checked_add(incoming).filter(|next| *next <= limit)
+    let mut bytes = rift_protocol::message::encode_bounded(message, limit)?;
+    bytes.shrink_to_fit();
+    Ok(bytes)
 }
 
 fn refused(message: &'static str) -> StreamableHttpError<reqwest::Error> {

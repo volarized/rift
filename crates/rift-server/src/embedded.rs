@@ -25,10 +25,11 @@
 mod edges;
 mod hermetic;
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use rift_dependency::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages};
@@ -175,6 +176,10 @@ enum AnswerRefusal {
     /// The document moved between the peer's view and this engine's: the
     /// same request is worth sending again once the views converge.
     Moved(String),
+    /// The answer panicked and its tree's database is gone. The slot's retry schedule
+    /// sends the request again, against the database that request builds; an answer that
+    /// panics every time ends as this refusal, with the panic's text.
+    Lost(String),
 }
 
 impl From<String> for AnswerRefusal {
@@ -218,16 +223,14 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
                 if let (Some(uri), Some(sent)) = (
                     params.pointer("/textDocument/uri").and_then(Value::as_str),
                     params.pointer("/textDocument/text").and_then(Value::as_str),
-                ) && let Ok(mut documents) = documents.lock()
-                {
-                    documents.insert(uri.to_owned(), sent.to_owned());
+                ) {
+                    lock_recovered(documents).insert(uri.to_owned(), sent.to_owned());
                 }
             }
             if method == "textDocument/didClose"
                 && let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str)
-                && let Ok(mut documents) = documents.lock()
             {
-                documents.remove(uri);
+                lock_recovered(documents).remove(uri);
             }
             Handled::Silent
         }
@@ -325,7 +328,7 @@ fn answered(
     let sent = params
         .pointer(uri_pointer)
         .and_then(Value::as_str)
-        .and_then(|uri| documents.lock().ok()?.get(uri).cloned());
+        .and_then(|uri| lock_recovered(documents).get(uri).cloned());
     let outcome = with_database(root, |db, canonical| {
         let exchange = Exchange {
             spelled_root: root,
@@ -340,6 +343,10 @@ fn answered(
             let (code, detail) = match refusal {
                 AnswerRefusal::Invalid(detail) => (INTERNAL_ERROR, detail),
                 AnswerRefusal::Moved(detail) => (CONTENT_MODIFIED, detail),
+                AnswerRefusal::Lost(panic) => (
+                    INTERNAL_ERROR,
+                    format!("the embedded ty engine panicked while it answered: {panic}"),
+                ),
             };
             error_reply(id, code, &detail)
         }
@@ -383,9 +390,6 @@ struct TreeDatabase {
     runtime: Option<(rift_protocol::read::RuntimeIdentity, SystemPathBuf)>,
 }
 
-/// The process-wide database cache, keyed by canonical tree root: one
-/// workspace server serves one tree, and a replaced session reuses the
-/// database its predecessor built.
 fn captured_python_runtime(
     metadata: &ProjectMetadata,
     root: &SystemPath,
@@ -455,14 +459,77 @@ pub(crate) fn python_standard_library(
     .flatten()
 }
 
-fn databases() -> &'static Mutex<HashMap<PathBuf, TreeDatabase>> {
-    static DATABASES: OnceLock<Mutex<HashMap<PathBuf, TreeDatabase>>> = OnceLock::new();
+/// One tree's database, absent until a request builds it and after a panic dropped it.
+type TreeSlot = Arc<Mutex<Option<TreeDatabase>>>;
+
+/// The process-wide database cache, keyed by canonical tree root: one
+/// workspace server serves one tree, and a replaced session reuses the
+/// database its predecessor built.
+///
+/// The map's lock covers the lookup alone. Each tree's answers hold that tree's
+/// own lock, so one tree's answer neither delays another's nor takes it down.
+fn databases() -> &'static Mutex<HashMap<PathBuf, TreeSlot>> {
+    static DATABASES: OnceLock<Mutex<HashMap<PathBuf, TreeSlot>>> = OnceLock::new();
     DATABASES.get_or_init(Mutex::default)
 }
 
+/// The slot of the tree at `canonical_root`, empty on first use.
+fn tree_slot(canonical_root: &Path) -> TreeSlot {
+    let mut databases = lock_recovered(databases());
+    Arc::clone(databases.entry(canonical_root.to_path_buf()).or_default())
+}
+
+/// Locks a mutex whose every critical section leaves a complete value, so a holder's panic
+/// says nothing about the value: the poison is cleared and the value stands.
+fn lock_recovered<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        mutex.clear_poison();
+        PoisonError::into_inner(poisoned)
+    })
+}
+
+/// Runs `work` on the tree in `slot`, holding its lock.
+///
+/// A panic inside `work` drops the tree's database, whose half-written state no later
+/// answer may read, and is answered as [`AnswerRefusal::Lost`]. The next request builds
+/// the database from the files on disk. A lock an earlier panic left poisoned drops the
+/// database the same way.
+fn with_slot<T>(
+    slot: &Mutex<Option<TreeDatabase>>,
+    work: impl FnOnce(&mut Option<TreeDatabase>) -> Result<T, AnswerRefusal>,
+) -> Result<T, AnswerRefusal> {
+    let mut tree = slot.lock().unwrap_or_else(|poisoned| {
+        slot.clear_poison();
+        let mut tree = PoisonError::into_inner(poisoned);
+        tree.take();
+        tree
+    });
+    // The database is the only state the closure can leave half-written, and a panic
+    // discards it before anything reads it again.
+    catch_unwind(AssertUnwindSafe(|| work(&mut tree))).unwrap_or_else(|panic| {
+        tree.take();
+        let text = panic_text(panic.as_ref());
+        rift_tracing::warn!(
+            component = "engine",
+            panic = text,
+            "the embedded ty engine panicked while it answered; its database is dropped"
+        );
+        Err(AnswerRefusal::Lost(text.to_owned()))
+    })
+}
+
+/// The message a panic carries, when it carries one.
+fn panic_text(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic without a message")
+}
+
 /// Runs `answer` against the tree's database, building it on first use.
-/// The lock is held for the whole call, which serializes semantic work per
-/// process; every answer extracts owned data before returning.
+/// The tree's lock is held for the whole call, which serializes semantic work per
+/// tree; every answer extracts owned data before returning.
 ///
 /// Each call observes the tree's project environment once and rebuilds the
 /// database when the observation differs from the one it was built under, so
@@ -484,19 +551,16 @@ fn with_tree<T>(
     let root = tree_root.canonicalize().map_err(|error| {
         AnswerRefusal::Invalid(format!("tree root {}: {error}", tree_root.display()))
     })?;
-    let mut databases = databases().lock().map_err(|_| {
-        AnswerRefusal::Invalid("the embedded ty database cache is poisoned".to_owned())
-    })?;
-    let environment = TreeEnvironment::observe(&root);
-    let tree = match databases.entry(root.clone()) {
-        Entry::Occupied(entry) if entry.get().environment == environment => entry.into_mut(),
-        Entry::Occupied(mut entry) => {
-            entry.insert(TreeDatabase::built(&root, environment)?);
-            entry.into_mut()
-        }
-        Entry::Vacant(entry) => entry.insert(TreeDatabase::built(&root, environment)?),
-    };
-    answer(tree, &root)
+    with_slot(&tree_slot(&root), |slot| {
+        #[cfg(test)]
+        tests::panic_as_planned(&root);
+        let environment = TreeEnvironment::observe(&root);
+        let tree = match slot.take_if(|tree| tree.environment == environment) {
+            Some(tree) => slot.insert(tree),
+            None => slot.insert(TreeDatabase::built(&root, environment)?),
+        };
+        answer(tree, &root)
+    })
 }
 
 impl TreeDatabase {
@@ -610,29 +674,34 @@ fn opened_document(root: &Path, params: &Value) {
     let Ok(system_path) = SystemPathBuf::from_path_buf(path.clone()) else {
         return;
     };
-    let Ok(mut databases) = databases().lock() else {
+    let slot = lock_recovered(databases()).get(&root).map(Arc::clone);
+    let Some(slot) = slot else {
         return;
     };
-    let Some(TreeDatabase { database, .. }) = databases.get_mut(&root) else {
-        return;
-    };
-    let event = if !path.exists() {
+    // A panic here drops the tree's database, and the next request reads the disk anew.
+    let _fed = with_slot(&slot, |slot| {
+        if let Some(TreeDatabase { database, .. }) = slot {
+            feed_document(database, system_path, path.exists());
+        }
+        Ok(())
+    });
+}
+
+/// Applies one document's on-disk state to the database.
+fn feed_document(database: &mut ProjectDatabase, path: SystemPathBuf, exists: bool) {
+    let event = if !exists {
         ChangeEvent::Deleted {
-            path: system_path,
+            path,
             kind: DeletedKind::Any,
         }
-    } else if database
-        .files()
-        .try_system(database, &system_path)
-        .is_some()
-    {
+    } else if database.files().try_system(database, &path).is_some() {
         ChangeEvent::Changed {
-            path: system_path,
+            path,
             kind: ChangedKind::FileContent,
         }
     } else {
         ChangeEvent::Created {
-            path: system_path,
+            path,
             kind: CreatedKind::File,
         }
     };
@@ -982,6 +1051,8 @@ fn pulled_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use ruff_db::system::System as _;
 
     use super::*;
@@ -1711,6 +1782,271 @@ mod tests {
         });
         let got = handle_message(&past_the_file, directory.path(), &empty_documents());
         assert!(matches!(&got, Handled::Reply(r) if r["error"]["code"] == CONTENT_MODIFIED));
+    }
+
+    /// An answer that panics, as one does when a dependency it calls panics.
+    fn panicking_answer(
+        _database: &mut ProjectDatabase,
+        _exchange: &Exchange<'_>,
+        _params: &Value,
+    ) -> Result<Value, AnswerRefusal> {
+        panic!("a dependency of the answer panicked");
+    }
+
+    /// One answer for the tree's `app.py`, as the session's request receives it.
+    fn answer_for(
+        root: &Path,
+        answer: fn(&mut ProjectDatabase, &Exchange<'_>, &Value) -> Result<Value, AnswerRefusal>,
+    ) -> Value {
+        let Handled::Reply(reply) = answered(
+            &json!(1),
+            root,
+            &empty_documents(),
+            &json!({ "textDocument": { "uri": uri_of(&root.join("app.py")) } }),
+            DOCUMENT_URI,
+            answer,
+        ) else {
+            panic!("a request replies");
+        };
+        reply
+    }
+
+    /// #563: a panic inside one tree's answer costs that answer, with a refusal naming the
+    /// panic, and that tree's database, which the next request builds again. Another tree
+    /// answers as before.
+    #[test]
+    fn test_a_panicking_answer_costs_that_answer_and_no_later_one() {
+        let (_panicked, root) = importing_tree();
+        let (_other, other_root) = importing_tree();
+        let before = answer_for(&root, pulled_diagnostics);
+        let other_before = answer_for(&other_root, pulled_diagnostics);
+
+        let lost = answer_for(&root, panicking_answer);
+        assert_eq!(lost["error"]["code"], INTERNAL_ERROR, "{lost}");
+
+        assert_eq!(answer_for(&root, pulled_diagnostics), before);
+        assert_eq!(answer_for(&other_root, pulled_diagnostics), other_before);
+        let lost_again = answer_for(&root, panicking_answer);
+        assert_eq!(lost_again["error"]["code"], INTERNAL_ERROR, "{lost_again}");
+        assert_eq!(answer_for(&root, pulled_diagnostics), before);
+    }
+
+    /// A panic drops the database the panicking answer may have left half-written: the next
+    /// request builds another one from the files on disk.
+    #[test]
+    fn test_a_panicking_answer_drops_the_tree_database() {
+        let (_directory, root) = importing_tree();
+        let open = |root: &Path| {
+            with_tree(root, |tree, _| {
+                let app = SystemPathBuf::from_path_buf(root.join("app.py")).expect("UTF-8 path");
+                Ok(tree
+                    .database
+                    .files()
+                    .try_system(&tree.database, &app)
+                    .is_some())
+            })
+            .expect("the tree answers")
+        };
+        answer_for(&root, pulled_diagnostics);
+        assert!(open(&root), "the answered request interned `app.py`");
+        answer_for(&root, panicking_answer);
+        assert!(!open(&root), "the rebuilt database interned no file");
+    }
+
+    /// A lock a panic left poisoned recovers: the tree's database is dropped, the poison is
+    /// cleared, and the next request, notification and captured source answer.
+    #[test]
+    fn test_a_poisoned_tree_recovers_on_the_next_request() {
+        let (_directory, root) = importing_tree();
+        let before = answer_for(&root, pulled_diagnostics);
+        let slot = tree_slot(&root);
+        let poison = || {
+            let held = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                let _held = held.lock().expect("an unpoisoned slot");
+                panic!("poison the tree slot");
+            })
+            .join()
+            .expect_err("the holder panicked");
+            assert!(slot.is_poisoned());
+        };
+        poison();
+        assert_eq!(answer_for(&root, pulled_diagnostics), before);
+        assert!(!slot.is_poisoned(), "the next request clears the poison");
+
+        poison();
+        opened_document(
+            &root,
+            &json!({ "textDocument": { "uri": uri_of(&root.join("app.py")) } }),
+        );
+        assert!(!slot.is_poisoned(), "a document open clears the poison");
+        assert_eq!(answer_for(&root, pulled_diagnostics), before);
+    }
+
+    /// The document store recovers the same way and keeps the text it holds.
+    #[test]
+    fn test_a_poisoned_document_store_keeps_its_open_documents() {
+        let (_directory, root) = importing_tree();
+        let uri = uri_of(&root.join("app.py"));
+        let documents = empty_documents();
+        let open = json!({
+            "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "text": "import inside\n" } },
+        });
+        assert!(matches!(
+            handle_message(&open, &root, &documents),
+            Handled::Silent
+        ));
+        let held = Arc::clone(&documents);
+        std::thread::spawn(move || {
+            let _held = held.lock().expect("an unpoisoned store");
+            panic!("poison the document store");
+        })
+        .join()
+        .expect_err("the holder panicked");
+        assert_eq!(
+            lock_recovered(&documents).get(&uri).map(String::as_str),
+            Some("import inside\n")
+        );
+        assert!(!documents.is_poisoned());
+        let close = json!({
+            "method": "textDocument/didClose",
+            "params": { "textDocument": { "uri": uri } },
+        });
+        assert!(matches!(
+            handle_message(&close, &root, &documents),
+            Handled::Silent
+        ));
+        assert!(lock_recovered(&documents).is_empty());
+    }
+
+    /// The answers still planned to panic, per canonical tree root.
+    static PLANNED_PANICS: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+    /// Panics while the tree at `root` has a planned panic left.
+    pub(super) fn panic_as_planned(root: &Path) {
+        let planned = {
+            let mut panics = lock_recovered(&PLANNED_PANICS);
+            let left = panics.entry(root.to_path_buf()).or_default();
+            let planned = *left > 0;
+            *left = left.saturating_sub(1);
+            planned
+        };
+        assert!(!planned, "a planned panic in {}", root.display());
+    }
+
+    fn plan_panics(root: &Path, count: u64) {
+        lock_recovered(&PLANNED_PANICS).insert(root.to_path_buf(), count);
+    }
+
+    /// One walk's prepare at `helper` in the tree's `app.py` through `slot`, and the
+    /// attempts it took.
+    async fn prepared(
+        slot: &crate::engine::EngineSlot,
+        root: &Path,
+    ) -> (Result<crate::engine::OutgoingAnswer<usize>, RiftError>, u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let source = std::fs::read_to_string(root.join("app.py")).expect("fixture module");
+        let path = rift_core::ProjectPath::new("app.py").expect("a project path");
+        let attempts = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&attempts);
+        let opened = path.clone();
+        let answer = slot
+            .request_outgoing(
+                move |session: &mut EngineSession| {
+                    let (path, source) = (opened.clone(), source.clone());
+                    Box::pin(async move { session.open(&path, "python", source).await })
+                },
+                move |session: &mut EngineSession| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let path = path.clone();
+                    Box::pin(async move {
+                        let position = lsp_types::Position {
+                            line: 0,
+                            character: 4,
+                        };
+                        let items = session.prepare_call_hierarchy(&path, position).await?;
+                        Ok(Some(items.len()))
+                    })
+                },
+                |session: &mut EngineSession| {
+                    Box::pin(async move {
+                        let path = rift_core::ProjectPath::new("app.py").expect("a project path");
+                        session.close(&path).await.expect("the document closes");
+                    })
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .await;
+        (answer, attempts.load(Ordering::SeqCst))
+    }
+
+    /// #563: through one session, a panic that does not repeat is answered by the next
+    /// attempt, and one that repeats ends at the retry table's bound as a refusal naming
+    /// the panic, never as an engine still analyzing. The request after it answers.
+    #[tokio::test]
+    async fn test_a_panicking_answer_ends_inside_the_retry_table() {
+        const ATTEMPTS: u64 = 4;
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(
+            directory.path().join("app.py"),
+            "def helper():\n    return 1\n",
+        )
+        .expect("fixture module");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let configuration = serde_json::from_value(json!({
+            "embedded": "ty",
+            "retry": { "attempts": ATTEMPTS, "delay": "1ms", "delay_limit": "1ms" },
+        }))
+        .expect("configuration");
+        let key = crate::engine::LspProcessKey::named("python");
+        let pool = crate::engine::EnginePool::new(
+            &root,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        let slot = pool.engine_by_key(&key).expect("the embedded slot");
+        let ready = |answer: &Result<crate::engine::OutgoingAnswer<usize>, RiftError>| {
+            matches!(answer, Ok(crate::engine::OutgoingAnswer::Ready(1)))
+        };
+
+        let (answer, attempts) = prepared(slot, &root).await;
+        assert!(ready(&answer) && attempts == 1, "{attempts}: {answer:?}");
+
+        plan_panics(&root, 1);
+        let (answer, attempts) = prepared(slot, &root).await;
+        assert!(ready(&answer) && attempts == 2, "{attempts}: {answer:?}");
+
+        plan_panics(&root, u64::MAX);
+        let (answer, attempts) = prepared(slot, &root).await;
+        let refused = answer.expect_err("every attempt panicked");
+        assert_eq!(attempts, ATTEMPTS, "{refused:?}");
+        assert_eq!(
+            refused.slug(),
+            rift_error::errors::lsp::engine_refused_terminal::SLUG
+        );
+        assert!(
+            refused.detail().contains("a planned panic"),
+            "{}",
+            refused.detail()
+        );
+
+        plan_panics(&root, 0);
+        let (answer, attempts) = prepared(slot, &root).await;
+        assert!(ready(&answer) && attempts == 1, "{attempts}: {answer:?}");
+        pool.shutdown().await;
+    }
+
+    /// A document open feeds a tree that has a database and creates no entry for another.
+    #[test]
+    fn test_a_document_open_creates_no_tree_entry() {
+        let (_directory, root) = importing_tree();
+        opened_document(
+            &root,
+            &json!({ "textDocument": { "uri": uri_of(&root.join("app.py")) } }),
+        );
+        assert!(!lock_recovered(databases()).contains_key(&root));
     }
 
     /// A tree whose root is not UTF-8 builds no ty database: every answer refuses as an

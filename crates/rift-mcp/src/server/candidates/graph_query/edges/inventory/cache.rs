@@ -15,6 +15,14 @@ pub(crate) struct EngineInventoryCache {
     pub(super) entries: tokio::sync::Mutex<InventoryEntries>,
 }
 
+#[cfg(test)]
+impl EngineInventoryCache {
+    /// Forgets every answer, so the next read asks the engine again.
+    pub(crate) async fn clear(&self) {
+        self.entries.lock().await.reads.clear();
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct InventoryEntries {
     reads: Vec<SavedInventory>,

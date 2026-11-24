@@ -49,6 +49,9 @@ RUN_LOG_BYTES_MAX = 16 * 1024 * 1024
 # Original records for a full workspace run require more than 16 MiB.
 # This bounds disk retention independently of the diagnostic caches.
 RUN_TELEMETRY_BYTES_MAX = 256 * 1024 * 1024
+# Decoded record bytes written as one gzip member. The collector shares the test
+# runner's processors, and a member per record spent a third of its time on setup.
+TELEMETRY_MEMBER_BYTES_MAX = 256 * 1024
 EVENT_BYTES_MAX = 16 * 1024 * 1024
 CASES_MAX = 32_768
 RUN_SECONDS_MAX = 3_600.0
@@ -293,7 +296,30 @@ def retained_collector(directory: Path) -> Iterator[Collector]:
 
 
 class ArtifactStore:
-    """Spool original records while bounded stores serve live test snapshots."""
+    """Spool original records while bounded stores serve live test snapshots.
+
+    Records wait in memory until they fill one gzip member, at most
+    `TELEMETRY_MEMBER_BYTES_MAX` bytes and the record that crosses it. `retained` and
+    `omitted` count a record once its member is written or refused, so a reader of
+    either count flushes first:
+
+    >>> import tempfile
+    >>> entry = LogEntry(1, "INFO", "started", (), (), "", "")
+    >>> with tempfile.TemporaryDirectory() as directory:
+    ...     artifact = ArtifactStore(Path(directory) / "telemetry.jsonl.gz", {})
+    ...     for _ in range(3):
+    ...         artifact.record(entry)
+    ...     held = (artifact.received, artifact.retained)
+    ...     artifact.flush()
+    ...     flushed = artifact.retained
+    ...     artifact.record(entry)
+    ...     artifact.close()
+    ...     rows = [EVIDENCE.validate_json(line) for line in artifact.read(artifact.path)]
+    >>> (held, flushed, artifact.retained, artifact.omitted)
+    ((3, 0), 3, 4, 0)
+    >>> [row.record.body for row in rows]
+    ['started', 'started', 'started', 'started']
+    """
 
     def __init__(self, path: Path, outcomes: dict[str, Outcome]) -> None:
         self.path = path
@@ -309,11 +335,19 @@ class ArtifactStore:
         self.write_error: str | None = None
         self.written = 0
         self.received_bytes = 0
+        self.member: list[bytes] = []
+        self.member_bytes = 0
         self.lock = threading.Lock()
         self.output = self.path.open("ab")
 
+    def flush(self) -> None:
+        """Write the records still waiting for their member to fill."""
+        with self.lock:
+            self.write_member()
+
     def close(self) -> None:
         """Close the retained file after the collector finishes its bounded shutdown."""
+        self.flush()
         try:
             self.output.close()
         except OSError as error:
@@ -354,26 +388,38 @@ class ArtifactStore:
                 }
             }
         data = EVIDENCE.dump_json(evidence, exclude=excluded) + b"\n"
-        decoded_bytes = len(data)
-        if self.path.suffix == ".gz":
-            data = zlib.compress(data, level=zlib.Z_BEST_SPEED, wbits=GZIP_WINDOW)
         with self.lock:
             self.received += 1
-            self.received_bytes += len(data)
-            if (
-                decoded_bytes > RUN_TELEMETRY_BYTES_MAX
-                or self.written + len(data) > RUN_TELEMETRY_BYTES_MAX
-            ):
+            if len(data) > RUN_TELEMETRY_BYTES_MAX:
                 self.omitted += 1
                 return
-            try:
-                self.output.write(data)
-            except OSError as error:
-                self.write_error = str(error)[:LINE_CHARS_MAX]
-                self.omitted += 1
-                return
-            self.written += len(data)
-            self.retained += 1
+            self.member.append(data)
+            self.member_bytes += len(data)
+            if self.member_bytes >= TELEMETRY_MEMBER_BYTES_MAX:
+                self.write_member()
+
+    def write_member(self) -> None:
+        """Write the waiting records as one gzip member. The caller holds the lock."""
+        records = len(self.member)
+        if not records:
+            return
+        data = b"".join(self.member)
+        self.member.clear()
+        self.member_bytes = 0
+        if self.path.suffix == ".gz":
+            data = zlib.compress(data, level=zlib.Z_BEST_SPEED, wbits=GZIP_WINDOW)
+        self.received_bytes += len(data)
+        if self.written + len(data) > RUN_TELEMETRY_BYTES_MAX:
+            self.omitted += records
+            return
+        try:
+            self.output.write(data)
+        except OSError as error:
+            self.write_error = str(error)[:LINE_CHARS_MAX]
+            self.omitted += records
+            return
+        self.written += len(data)
+        self.retained += records
 
     def observe(self, record: LogEntry | SpanRecord | MetricPoint) -> bool:
         self.record(record)
@@ -1331,6 +1377,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                     else:
                         errors.append(f"incomplete execution: {error}")
             # Collector has completed its bounded shutdown before the final snapshot.
+            artifact.flush()
             if reader.pending:
                 reader.line(bytes(reader.pending))
             errors.extend(reader.errors)

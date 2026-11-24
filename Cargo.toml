@@ -10,7 +10,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.96"
+version = "0.0.97"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -245,6 +245,20 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.tree-sitter]
+opt-level = 3
+
+# Every server start and request capture compiles glob matchers, and the pattern suites
+# compile and match thousands of patterns, through `regex`'s engines.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.aho-corasick]
+opt-level = 3
+
+[profile.dev.package.globset]
 opt-level = 3
 
 # gemm-common's `vmulq_f16` is an `#[inline]` fp16 `asm!` without a `target_feature`

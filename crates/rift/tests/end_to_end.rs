@@ -227,9 +227,12 @@ const DECLARATION_READS: &[(&str, &str, Option<&str>)] = &[
 ];
 
 /// Declaration facts retain their containers and public import paths through the CLI.
+///
+/// The one served fixture here that keeps the shipped `[dependencies]` table, so each
+/// native runner starts a server over its own `rustc`, Node.js, and Python.
 #[tokio::test]
 async fn declaration_members_bound_names_and_module_exports_are_addressable() -> TestResult {
-    let directory = laid_out_workspace(
+    let directory = harness::bounded_workspace(
         &[
             ("Cargo.toml", harness::RUST_PROJECT_MANIFEST),
             (
@@ -253,6 +256,7 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
                 "A, B = 1, 2\ntype Pair = tuple[int, int]\nif True:\n    FLAG = 1\nclass Model:\n    def __init__(self):\n        self.name = 'x'\n    def save(self):\n        pass\n",
             ),
         ],
+        "",
         &assigned_port_key()?,
     )?;
     let root = directory.path();
@@ -260,6 +264,33 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     within("workspace preparation", await_workspace_ready(&client)).await??;
+    let map = within(
+        "the served map",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    )
+    .await??;
+    let map = harness::resource_json(&map, "rift://map")?;
+    // The server's probe ignores the toolchain cargo selected for this test run.
+    let probed = std::process::Command::new("rustc")
+        .arg("--version")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .current_dir(root)
+        .output()?;
+    let probed = String::from_utf8(probed.stdout)?;
+    let version = probed
+        .split_whitespace()
+        .nth(1)
+        .ok_or("`rustc --version` prints a version")?;
+    let rust = map["packages"]
+        .as_array()
+        .ok_or("the map lists packages")?
+        .iter()
+        .find(|entry| entry["manager"] == "stdlib" && entry["name"] == "rust")
+        .ok_or_else(|| format!("the map names the Rust standard library: {map:#}"))?;
+    assert_eq!(
+        rust["version"], version,
+        "the server probed this machine's own toolchain: {map:#}"
+    );
     for &(path, kind, container) in DECLARATION_READS {
         let id = format!("rift://symbol/local/{path}");
         let answer = proxied_call(

@@ -108,9 +108,17 @@ fn full_json_rpc_envelope_counts_escaping_before_allocation() {
     let mut buffer = MessageBuffer::new(4);
     buffer.write_all(b"abc").expect("within limit");
     assert!(buffer.write_all(b"de").is_err());
-    assert_eq!(buffer.bytes, b"abc", "crossing chunk never appended");
-    assert_eq!(next_length(usize::MAX, 1, usize::MAX), None);
-    assert_eq!(next_length(3, 1, 4), Some(4));
+    assert_eq!(buffer.as_bytes(), b"abc", "crossing chunk never appended");
+}
+
+/// A retained encoding is charged by its allocation, so the encoder keeps none of the room
+/// its buffer grew by.
+#[test]
+fn an_encoding_is_held_in_an_allocation_of_its_own_length() {
+    let message = json!({"name": "\u{1}".repeat(1000)});
+    let encoded = encode_bounded(&message, 8192).expect("within limit");
+    assert!(encoded.len() > 6000, "every character is escaped");
+    assert_eq!(encoded.capacity(), encoded.len());
 }
 
 #[tokio::test]

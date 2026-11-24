@@ -1392,13 +1392,26 @@ impl IndexContents {
             count_workspace_bytes(&mut bytes, file.content().len(), root, limits)?;
         }
         let mut paths = BTreeSet::new();
-        for file in files.iter().copied().chain(
+        let manifests = files.iter().copied().chain(
             metadata
                 .values()
                 .map(|file| rift_analysis::PackageSource::new(file.path(), file.content())),
-        ) {
+        );
+        // The entry paths of a package manifest come last: they fit the remaining bounds or
+        // stay unobserved, which leaves the entry unresolved and never refuses the build.
+        let (entries, builds): (Vec<_>, Vec<_>) =
+            manifests.partition(|file| file.path().as_str() == PACKAGE_MANIFEST);
+        for file in builds.into_iter().chain(entries) {
             check_cancelled(cancelled)?;
             if let Some(requested) = rift_analysis::build_paths(file, &files, limits.syntax()) {
+                let count = files.len() + metadata.len() + paths.len() + requested.len();
+                let length = requested.iter().map(|path| path.0.len()).sum::<usize>();
+                if file.path().as_str() == PACKAGE_MANIFEST
+                    && (count > limits.files_max()
+                        || bytes.saturating_add(length) > limits.workspace_bytes_max())
+                {
+                    continue;
+                }
                 for path in requested {
                     if !paths.insert(path.clone()) {
                         continue;
@@ -7059,6 +7072,9 @@ fn checkpoint_after(prepared: usize, total: usize) -> Option<usize> {
         Some(total)
     }
 }
+
+/// The manifest whose entry paths a workspace observes.
+const PACKAGE_MANIFEST: &str = "package.json";
 
 /// Counts one kept file's bytes against `workspace_bytes_max`.
 fn count_workspace_bytes(

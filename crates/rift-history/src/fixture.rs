@@ -190,6 +190,10 @@ pub fn commit_duplicate_path(root: &Path, path: &str, branch: &str) {
 /// Panics when git cannot run or exits nonzero.
 pub fn commit_wide_folder(root: &Path, count: usize, branch: &str) {
     let blob = plumb(root, &["hash-object", "-w", "--stdin"], b"wide\n");
+    // `mktree` looks up the object of every entry: a packed blob is found in memory, a
+    // loose one opens its file again for each path.
+    let pack = plumb(root, &["rev-parse", "--git-path", "objects/pack/pack"], b"");
+    plumb(root, &["pack-objects", "-q", &pack], blob.as_bytes());
     let mut entries = String::new();
     for index in 0..count {
         writeln!(entries, "100644 blob {blob}\t{index:06}.txt")
