@@ -2234,3 +2234,81 @@ fn test_rust_imports_of_a_reexporting_module_start_at_the_module() {
         }
     }
 }
+
+#[test]
+fn test_rust_target_conditions_on_modules_keep_every_row_of_the_active_target() {
+    // #859: each place a condition can stand, for the host target and for the other one.
+    const ITEMS: [&str; 4] = [
+        "pub trait Shape { fn area(&self) -> u32; }",
+        "pub struct Square { side: u32 }",
+        "impl Shape for Square { fn area(&self) -> u32 { helper(self.side) } }",
+        "fn helper(v: u32) -> u32 { v }",
+    ];
+    let manifest =
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\n";
+    let rows = |library: &str, module: &str| {
+        let (_directory, index) =
+            fixture_index(manifest, &[("src/lib.rs", library), ("src/m.rs", module)]);
+        index
+            .edges()
+            .edges()
+            .map(|edge| {
+                (
+                    edge.kind(),
+                    edge.from().as_str().to_owned(),
+                    edge.to().as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let module = ITEMS.join("\n");
+    let (host, other) = if cfg!(windows) {
+        ("windows", "unix")
+    } else {
+        ("unix", "windows")
+    };
+    let file = rows("pub mod m;", &module);
+    let inline = rows(&format!("pub mod m {{ {module} }}"), "");
+    let root = rows(&module, "");
+    assert!(!file.is_empty() && !inline.is_empty() && !root.is_empty());
+    for condition in [
+        host.to_owned(),
+        format!("any({host}, custom)"),
+        "not(target_arch = \"wasm32\")".to_owned(),
+        format!("all(feature = \"std\", {host})"),
+    ] {
+        let each = ITEMS
+            .map(|item| format!("#[cfg({condition})] {item}"))
+            .join("\n");
+        for (found, expected) in [
+            (
+                rows(&format!("#[cfg({condition})] pub mod m;"), &module),
+                &file,
+            ),
+            (
+                rows("pub mod m;", &format!("#![cfg({condition})]\n{module}")),
+                &file,
+            ),
+            (
+                rows(&format!("#[cfg({condition})] pub mod m {{ {module} }}"), ""),
+                &inline,
+            ),
+            (rows(&format!("#![cfg({condition})]\n{module}"), ""), &root),
+            (rows(&each, ""), &root),
+        ] {
+            assert_eq!(&found, expected, "{condition}");
+        }
+    }
+    for condition in [other.to_owned(), format!("all(feature = \"std\", {other})")] {
+        for found in [
+            rows(&format!("#[cfg({condition})] pub mod m;"), &module),
+            rows(&format!("#[cfg({condition})] pub mod m {{ {module} }}"), ""),
+            rows(&format!("#![cfg({condition})]\n{module}"), ""),
+        ] {
+            assert!(
+                found.iter().all(|(kind, _, _)| *kind != EdgeKind::Calls),
+                "{condition}: {found:?}"
+            );
+        }
+    }
+}

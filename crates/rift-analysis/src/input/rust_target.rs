@@ -116,8 +116,10 @@ impl RustTarget {
         TARGETS.into_iter().find(|target| target.triple == triple)
     }
 
-    /// The target this process was built for, which a local workspace uses; `None` on a
-    /// host outside the supported targets.
+    /// The target this process was built for, which a local workspace and its installed
+    /// sources use; `None` on a host outside the supported targets.
+    ///
+    /// A `build.target` of a Cargo configuration file is not read.
     #[must_use]
     pub fn host() -> Option<Self> {
         let env = if cfg!(target_env = "gnu") {
@@ -137,9 +139,19 @@ impl RustTarget {
         } else {
             return None;
         };
+        let vendor = if cfg!(target_vendor = "apple") {
+            "apple"
+        } else if cfg!(target_vendor = "pc") {
+            "pc"
+        } else if cfg!(target_vendor = "unknown") {
+            "unknown"
+        } else {
+            return None;
+        };
         TARGETS.into_iter().find(|target| {
             cfg!(target_endian = "little")
                 && target.pointer_width == pointer_width
+                && target.vendor == vendor
                 && target.arch == std::env::consts::ARCH
                 && target.os == std::env::consts::OS
                 && target.env == env

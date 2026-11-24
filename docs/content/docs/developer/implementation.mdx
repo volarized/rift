@@ -1527,7 +1527,8 @@ produce the same contextual publication; files with framework context parse curr
 Package analysis decides the target conditions of Rust items (`unix`, `windows`, `target_os`, and
 the other target predicates) for `x86_64-unknown-linux-gnu` on every host, so one release gives the
 same facts wherever it is analyzed. `ExactPackageInput::with_rust_target` selects another target.
-A workspace index decides them for its host target. A condition on a custom flag stays unknown, and
+A workspace index and the installed sources it reads decide them for the host target; a
+`build.target` of a Cargo configuration file is not read. A condition on a custom flag stays unknown, and
 the items it holds keep their declarations without edges.
 
 The stub and module join pairs a stub with the module it declares: `mod.pyi` with `mod.py`,
