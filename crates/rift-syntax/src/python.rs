@@ -1246,7 +1246,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
             source.text,
         )?);
         export_bindings.sort_by_key(|binding| binding.range.start);
-        let static_facts = capture.finish();
+        let static_facts = capture.finish_python(tree.root_node())?;
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),

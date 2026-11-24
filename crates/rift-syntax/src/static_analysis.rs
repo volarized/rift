@@ -442,6 +442,9 @@ pub struct StaticFactsParts {
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
     /// after later statements of the enclosing scope.
     pub expression_scopes: Vec<ByteRange>,
+    /// Python comprehensions and the iterable of their first clause, which the enclosing scope
+    /// evaluates.
+    pub first_iterables: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -701,6 +704,12 @@ impl StaticFacts {
         &self.0.expression_scopes
     }
 
+    /// Python comprehensions and the iterable of their first clause.
+    #[must_use]
+    pub fn first_iterables(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.first_iterables
+    }
+
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     #[must_use]
     pub fn non_none_guards(&self) -> &[(ByteRange, ByteRange)] {
@@ -746,6 +755,7 @@ impl StaticFacts {
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
+            vector_capacity(&self.0.first_iterables),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.closure_calls),
         ]
@@ -806,6 +816,7 @@ impl StaticFacts {
             self.receiver_arguments().len(),
             self.loops().len(),
             self.expression_scopes().len(),
+            self.first_iterables().len(),
             self.non_none_guards().len(),
             self.closure_calls().len(),
         ];
@@ -1000,12 +1011,7 @@ impl StaticFacts {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
         let rust = self.rust_rows_valid(&valid, limits);
-        let flow = self
-            .loops()
-            .iter()
-            .chain(self.expression_scopes())
-            .copied()
-            .all(valid);
+        let flow = self.python_flow_valid(valid);
         if !(edges
             && references
             && declared_types
@@ -1025,15 +1031,27 @@ impl StaticFacts {
             && unsupported
             && implementations
             && rust
-            && flow
-            && self
-                .non_none_guards()
-                .iter()
-                .all(|(name, body)| valid(*name) && valid(*body) && name.end <= body.start))
+            && flow)
         {
             return errors::syntax::facts_range_invalid().fail();
         }
         Ok(())
+    }
+
+    fn python_flow_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
+        self.loops()
+            .iter()
+            .chain(self.expression_scopes())
+            .copied()
+            .all(&valid)
+            && self
+                .first_iterables()
+                .iter()
+                .all(|(scope, iterable)| valid(*iterable) && contains(*scope, *iterable))
+            && self
+                .non_none_guards()
+                .iter()
+                .all(|(name, body)| valid(*name) && valid(*body) && name.end <= body.start)
     }
 }
 
@@ -1118,10 +1136,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar {
-    Python(
-        &'static python_edges::EdgePythonKinds,
-        python_edges::EmptyLists,
-    ),
+    Python(&'static python_edges::EdgePythonKinds),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
@@ -1160,10 +1175,7 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn for_edge_python(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::Python(
-                python_edges::edge_python_kinds(),
-                python_edges::EmptyLists::default(),
-            ),
+            grammar: Grammar::Python(python_edges::edge_python_kinds()),
             source,
             facts: StaticFacts::default(),
             edge_heritage: heritage_edges::edge_python_kinds(),
@@ -1203,12 +1215,7 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
-            Grammar::Python(kinds, lists) => {
-                let first = self.facts.0.bindings.len();
-                kinds.record_edge(visited, self.source, &mut self.facts.0)?;
-                lists.note(&mut self.facts.0, first, self.source);
-                lists.record_use(kinds, visited, self.source, &mut self.facts.0)
-            }
+            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }
@@ -1220,6 +1227,17 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn finish(self) -> StaticFacts {
         self.facts
+    }
+
+    /// Finishes a Python capture with the facts that need the whole tree.
+    pub(crate) fn finish_python(
+        mut self,
+        root: tree_sitter::Node<'_>,
+    ) -> Result<StaticFacts, RiftError> {
+        if let Grammar::Python(kinds) = self.grammar {
+            kinds.close_lists(root, self.source, &mut self.facts.0)?;
+        }
+        Ok(self.facts)
     }
 
     pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {

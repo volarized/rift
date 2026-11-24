@@ -3,8 +3,6 @@
 mod guards;
 mod lists;
 
-pub(super) use lists::EmptyLists;
-
 use std::sync::OnceLock;
 
 use rift_error::RiftError;
@@ -164,6 +162,7 @@ impl EdgePythonKinds {
             facts.loops.push(byte_range(syntax_element)?);
         } else if self.scopes[3..].contains(&id) {
             facts.expression_scopes.push(byte_range(syntax_element)?);
+            self.edge_first_iterable(syntax_element, facts)?;
         }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
@@ -239,6 +238,24 @@ impl EdgePythonKinds {
         }
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts)?;
+        Ok(())
+    }
+
+    /// The iterable of a comprehension's first clause, which the enclosing scope evaluates.
+    fn edge_first_iterable(
+        &self,
+        comprehension: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let mut cursor = comprehension.walk();
+        let clause = comprehension
+            .named_children(&mut cursor)
+            .find(|child| child.kind_id() == self.assignment[3]);
+        if let Some(iterable) = clause.and_then(|clause| clause.child_by_field_id(self.right)) {
+            facts
+                .first_iterables
+                .push((byte_range(comprehension)?, byte_range(iterable)?));
+        }
         Ok(())
     }
 
@@ -724,7 +741,11 @@ impl EdgePythonKinds {
         if assigned.is_some_and(|value| value.kind_id() == self.none && !value.is_missing()) {
             return Ok(StaticBindingKind::PythonNone);
         }
+        let chained = visited
+            .parent()
+            .is_some_and(|parent| parent.syntax_element().kind_id() == self.assignment[0]);
         if target.kind_id() == self.identifier
+            && !chained
             && assignment
                 .child_by_field_id(self.right)
                 .is_some_and(|value| {

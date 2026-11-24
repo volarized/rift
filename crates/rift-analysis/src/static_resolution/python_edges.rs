@@ -604,7 +604,7 @@ fn edge_python_binding<'source>(
                 || (global && scope != module)
                 || (nonlocal && scope == module)
                 || (in_body && file.class_scopes.contains(&scope))
-                || produces(binding, position)
+                || file.python_evaluated_outside(scope, position)
             {
                 continue;
             }
@@ -661,16 +661,6 @@ fn edge_python_binding<'source>(
     }
 }
 
-/// Whether `position` is in the iterable that produces a comprehension's own target. The first
-/// iterable is read outside the comprehension, and no later one reads the target it binds.
-fn produces(binding: &StaticBinding, position: u64) -> bool {
-    matches!(
-        binding.kind,
-        StaticBindingKind::PythonElement { iterable, .. }
-            if binding.available_from == binding.scope.start && iterable.contains(position)
-    )
-}
-
 /// Bindings of one name that cannot have run before a read at `position`.
 ///
 /// In the body of the callable whose scope holds the name, and in module code outside callable
@@ -715,6 +705,14 @@ fn later_bindings(
 }
 
 impl File<'_> {
+    /// Whether `position` is in the first iterable of the comprehension at `scope`, which the
+    /// enclosing scope evaluates.
+    fn python_evaluated_outside(&self, scope: ByteRange, position: u64) -> bool {
+        self.python_first_iterables
+            .get(&scope)
+            .is_some_and(|iterable| iterable.contains(position))
+    }
+
     fn python_guard_available(
         &self,
         selected: &StaticBinding,

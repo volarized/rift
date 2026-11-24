@@ -440,6 +440,8 @@ struct File<'source> {
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
+    /// The iterable of each comprehension's first clause, by the comprehension's range.
+    python_first_iterables: BTreeMap<ByteRange, ByteRange>,
     /// Python annotation ranges by start, which can be evaluated after later statements.
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
@@ -576,6 +578,7 @@ impl<'source> File<'source> {
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
+            python_first_iterables: BTreeMap::new(),
             python_annotations: BTreeMap::new(),
             python_non_none: BTreeMap::new(),
             python_calls: BTreeMap::new(),
@@ -628,6 +631,12 @@ impl<'source> File<'source> {
                 .entry(written)
                 .or_default()
                 .push((name, body));
+        }
+        for &(comprehension, iterable) in self.facts.first_iterables() {
+            if !work.charge() {
+                return None;
+            }
+            self.python_first_iterables.insert(comprehension, iterable);
         }
         for binding in self.facts.bindings() {
             if !work.charge() {

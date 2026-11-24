@@ -244,12 +244,33 @@ fn test_python_appended_lists_refuse_uses_that_may_change_their_elements() {
         "    held = [values]\n",
         "    yield values\n",
         "    values = []\n",
+        "    other = values = []\n",
     ] {
         let body = format!(
             "def use(item: Item, more):\n    values = []\n    values.append(item)\n{uses}    for value in values:\n        value.read()\n"
         );
         assert_eq!(readers(&body), Vec::<String>::new(), "{body}");
     }
+}
+
+#[test]
+fn test_python_appended_lists_refuse_uses_written_before_the_list() {
+    for body in [
+        "def use(item: Item, more):\n    def add(): values.extend(more)\n    values = []\n    values.append(item)\n    add()\n    for value in values:\n        value.read()\n",
+        "def use(item: Item, more):\n    add = lambda: values.extend(more)\n    values = []\n    values.append(item)\n    add()\n    for value in values:\n        value.read()\n",
+        "def use(item: Item, flags):\n    for flag in flags:\n        if flag:\n            fill(values)\n        else:\n            values = []\n            values.append(item)\n        for value in values:\n            value.read()\n",
+        "def use(item: Item):\n    other = values = []\n    other.append(Other())\n    values.append(item)\n    for value in values:\n        value.read()\n",
+        "def use(item: Item):\n    values = other = []\n    other.append(Other())\n    values.append(item)\n    for value in values:\n        value.read()\n",
+    ] {
+        assert_eq!(readers(body), Vec::<String>::new(), "{body}");
+    }
+    // A list of another scope is judged by its own uses alone.
+    assert_eq!(
+        readers(
+            "def first(more):\n    values = []\n    fill(values)\ndef use(item: Item):\n    values = []\n    values.append(item)\n    for value in values:\n        value.read()\ndef last():\n    values = []\n    return values\n"
+        ),
+        ["use"]
+    );
 }
 
 #[test]
@@ -302,8 +323,16 @@ fn test_python_comprehension_iterables_read_the_enclosing_name() {
     );
     assert_eq!(
         readers(
-            "def use(groups: list[list[Item]]):\n    return [group.read() for group in groups for group in group]\n"
+            "def use(pairs: list[Item], groups: list[list[Other]]):\n    return [value.read() for value in pairs for pairs in groups]\n"
         ),
-        Vec::<String>::new()
+        ["use"]
     );
+    for body in [
+        "def use(pairs: list[Other], groups: list[list[Item]]):\n    return [value.read() for value in pairs for pairs in groups]\n",
+        "def use(pairs: list[Other], groups: list[tuple[Item, Item]]):\n    return [value.read() for value in pairs for pairs, *rest in groups]\n",
+        "def use(groups: list[list[Item]]):\n    return [group.read() for group in groups for group in group]\n",
+        "def use(groups: list[Other], value: list[Item]):\n    return [value.read() for group in groups for value in value]\n",
+    ] {
+        assert_eq!(readers(body), Vec::<String>::new(), "{body}");
+    }
 }
