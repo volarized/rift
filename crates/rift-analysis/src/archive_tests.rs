@@ -705,13 +705,7 @@ fn fixture_path(path: &str) -> ProjectPath {
 }
 
 fn read(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveError> {
-    read_archive(
-        bytes,
-        ArchiveFormat::TarGzip,
-        &ArchiveDigest::Sha256(Sha256::digest(bytes).into()),
-        Some("release"),
-        limits,
-    )
+    read_format(bytes, ArchiveFormat::TarGzip, limits)
 }
 
 #[test]
@@ -1267,13 +1261,7 @@ fn zip_bytes(path: &str, content: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::
 }
 
 fn read_zip_fixture(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveError> {
-    read_archive(
-        bytes,
-        ArchiveFormat::Zip,
-        &ArchiveDigest::Sha256(Sha256::digest(bytes).into()),
-        Some("release"),
-        limits,
-    )
+    read_format(bytes, ArchiveFormat::Zip, limits)
 }
 
 #[test]
@@ -1917,13 +1905,70 @@ fn oversized_archives() -> Result<Vec<NamedArchive>, Box<dyn std::error::Error>>
     Ok(archives)
 }
 
+/// Reads one archive as a slice, and checks that a reader of short reads answers the same.
 fn read_format(
     bytes: &[u8],
     format: ArchiveFormat,
     limits: ArchiveLimits,
 ) -> Result<ArchiveFiles, ArchiveError> {
     let digest = ArchiveDigest::Sha256(Sha256::digest(bytes).into());
-    read_archive(bytes, format, &digest, Some("release"), limits)
+    let root = Some("release");
+    let slice = read_archive(bytes, format, &digest, root, limits);
+    let reader = ShortReads::new(bytes);
+    let read = read_archive_from(reader, format, &digest, root, limits, &|_, _| true);
+    match (&slice, &read) {
+        (Ok(slice), Ok(read)) => {
+            assert_eq!(slice.digest(), read.digest());
+            assert_eq!(slice.files(), read.files());
+            assert_eq!(slice.members(), read.members());
+            assert_eq!(slice.skipped_links(), read.skipped_links());
+            assert_eq!(slice.omissions(), read.omissions());
+            assert_eq!(slice.replaced(), read.replaced());
+        }
+        (Err(slice), Err(read)) => assert_eq!(slice, read),
+        _ => panic!("slice {:?}, reader {:?}", slice.is_ok(), read.is_ok()),
+    }
+    slice
+}
+
+/// Archive bytes returned 1, 2, up to 7 bytes at a time, interrupted between them, that start
+/// at their end and fail the read at `fails_at`.
+struct ShortReads<'a> {
+    cursor: Cursor<&'a [u8]>,
+    reads: usize,
+    fails_at: Option<usize>,
+}
+
+impl<'a> ShortReads<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        let mut cursor = Cursor::new(bytes);
+        cursor.set_position(bytes.len() as u64);
+        Self {
+            cursor,
+            reads: 0,
+            fails_at: None,
+        }
+    }
+}
+
+impl Read for ShortReads<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        if self.fails_at == Some(self.reads) {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        if self.reads.is_multiple_of(5) {
+            return Err(ErrorKind::Interrupted.into());
+        }
+        let length = buffer.len().min(1 + self.reads % 7);
+        self.cursor.read(&mut buffer[..length])
+    }
+}
+
+impl Seek for ShortReads<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.cursor.seek(position)
+    }
 }
 
 #[test]
@@ -3157,6 +3202,214 @@ fn repeated_pax_size_records_agree_with_their_header() -> TestResult {
         for limits in both_modes(ArchiveLimits::default()) {
             assert_eq!(read(&gzip(&tar)?, limits).is_ok(), accepted);
         }
+    }
+    Ok(())
+}
+
+// Issue #1077.
+#[test]
+fn a_selection_retains_its_files_and_lists_the_others() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let name = format!("release/{DECOMPOSED}.py");
+    let binary = oversized();
+    let entries = [
+        ("release/", b"".as_slice(), tar::EntryType::Directory),
+        ("release/a.py", SOURCE, regular),
+        ("release/b.bin", b"binary", regular),
+        ("release/link", b"", tar::EntryType::Symlink),
+        (&name, SOURCE, regular),
+        ("release/native.so", &binary, regular),
+    ];
+    for (archive, format, bytes) in member_archives(&entries)? {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let keep = |path: &ProjectPath, size: u64| {
+            asked.borrow_mut().push((path.as_str().to_owned(), size));
+            path.as_str() == "a.py" && size < 1024
+        };
+        let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+        let files = read_archive_from(
+            Cursor::new(&bytes),
+            format,
+            &digest,
+            Some("release"),
+            skipping(&bytes)?,
+            &keep,
+        )?;
+        assert_eq!(retained(&files), [("a.py", SOURCE)], "{archive}");
+        let file = ArchiveMemberKind::File;
+        let mut expected = vec![
+            ("b.bin", file, ArchiveOmissionReason::Unselected, 6),
+            (
+                name.strip_prefix("release/").ok_or("fixture root")?,
+                file,
+                ArchiveOmissionReason::NonCanonicalUnicode,
+                SOURCE.len() as u64,
+            ),
+            ("native.so", file, ArchiveOmissionReason::Oversized, 5000),
+            ("r", file, ArchiveOmissionReason::Unselected, 0),
+        ];
+        expected.sort_by_key(|omission| omission.0);
+        assert_eq!(omitted(&files), expected, "{archive}");
+        assert_eq!(files.skipped_links().len(), 1, "{archive}");
+        assert_eq!(
+            files.members().get("release/b.bin"),
+            Some(&ArchiveMemberKind::File),
+            "{archive}"
+        );
+        let mut asked = asked.into_inner();
+        asked.dedup();
+        assert_eq!(
+            asked,
+            [
+                ("a.py".to_owned(), SOURCE.len() as u64),
+                ("b.bin".to_owned(), 6),
+                ("r".to_owned(), 0)
+            ],
+            "{archive}: directories, links, and other omissions are not asked"
+        );
+    }
+    Ok(())
+}
+
+fn read_none(
+    bytes: &[u8],
+    format: ArchiveFormat,
+    limits: ArchiveLimits,
+) -> Result<ArchiveFiles, ArchiveError> {
+    let digest = ArchiveDigest::Sha256(Sha256::digest(bytes).into());
+    let reader = Cursor::new(bytes);
+    read_archive_from(reader, format, &digest, Some("release"), limits, &|_, _| {
+        false
+    })
+}
+
+#[test]
+fn unselected_files_keep_every_refusal_and_bound() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let binary = oversized();
+    for (archive, format, bytes) in member_archives(&[("release/a", &binary, regular)])? {
+        let refuse = skipping(&bytes)?.with_oversized_members(OversizedMembers::Refuse);
+        assert_eq!(
+            read_none(&bytes, format, refuse).expect_err("member bytes"),
+            ArchiveBound::MemberBytes.exceeded(5000, 1024, Some(fixture_path("release/a"))),
+            "{archive}"
+        );
+        let files = read_none(&bytes, format, ArchiveLimits::default())?;
+        assert!(files.files().is_empty(), "{archive}");
+        assert_eq!(files.omissions().len(), 2, "{archive}");
+        if format == ArchiveFormat::Zip {
+            let expanded = ArchiveLimits::new(bytes.len(), 4999, 4999, 4, 200)?;
+            assert!(read_none(&bytes, format, expanded).is_err(), "{archive}");
+        }
+        let mut corrupt = bytes.clone();
+        let middle = corrupt.len() / 3;
+        corrupt[middle] ^= 0xff;
+        assert!(
+            read_none(&corrupt, format, ArchiveLimits::default()).is_err(),
+            "{archive}: a damaged member"
+        );
+    }
+    for path in ["release/../a", "other/a", "/release/a"] {
+        let bytes = tar_bytes(&[(path, b"text", regular)])?;
+        let selected = read(&bytes, ArchiveLimits::default()).expect_err("unsafe path");
+        let unselected = read_none(&bytes, ArchiveFormat::TarGzip, ArchiveLimits::default());
+        assert_eq!(unselected.expect_err("unsafe path"), selected);
+    }
+    let repeated = [
+        ("release/a", b"one".as_slice(), regular),
+        ("release/./a", b"two", regular),
+    ];
+    let bytes = tar_bytes(&repeated)?;
+    let files = read_none(&bytes, ArchiveFormat::TarGzip, ArchiveLimits::default())?;
+    assert_eq!(replaced(&files), ["a"]);
+    let only_large = |_: &ProjectPath, size: u64| size > 3;
+    let grown = tar_bytes(&[repeated[0], ("release/a", b"three", regular)])?;
+    let digest = ArchiveDigest::Sha256(Sha256::digest(&grown).into());
+    let files = read_archive_from(
+        Cursor::new(&grown),
+        ArchiveFormat::TarGzip,
+        &digest,
+        Some("release"),
+        ArchiveLimits::default(),
+        &only_large,
+    )?;
+    assert_eq!(retained(&files), [("a", b"three".as_slice())]);
+    assert!(files.omissions().is_empty());
+    assert_eq!(replaced(&files), ["a"]);
+    Ok(())
+}
+
+#[test]
+fn a_failed_read_is_no_invalid_archive() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let mut binary = oversized();
+    binary.truncate(400);
+    for (archive, format, bytes) in member_archives(&[("release/a", &binary, regular)])? {
+        let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+        let mut failed = 0;
+        for fails_at in (1..).step_by(17) {
+            let mut reader = ShortReads::new(&bytes);
+            reader.fails_at = Some(fails_at);
+            let result = read_archive_from(
+                &mut reader,
+                format,
+                &digest,
+                Some("release"),
+                ArchiveLimits::default(),
+                &|_, _| true,
+            );
+            if reader.reads < fails_at {
+                assert!(result.is_ok(), "{archive}");
+                break;
+            }
+            let error = result.expect_err("a failed read");
+            assert_eq!(error, ArchiveError::Read(ErrorKind::TimedOut), "{archive}");
+            assert!(error.to_string().contains("reader failed"), "{error}");
+            failed += 1;
+        }
+        assert!(failed > 10, "{archive}: {failed} failures");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reader_is_bounded_before_it_is_decoded() -> TestResult {
+    let bytes = tar_bytes(&[("release/a", b"text", tar::EntryType::Regular)])?;
+    let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+    let read = |bytes: &[u8], digest: &ArchiveDigest, compressed: usize| {
+        let limits = ArchiveLimits::new(compressed, 8192, 1024, 2, 200)?;
+        let reader = ShortReads::new(bytes);
+        read_archive_from(
+            reader,
+            ArchiveFormat::TarGzip,
+            digest,
+            Some("release"),
+            limits,
+            &|_, _| true,
+        )
+    };
+    assert_eq!(read(&bytes, &digest, bytes.len())?.files().len(), 1);
+    assert_eq!(
+        read(&bytes, &digest, bytes.len() - 1).expect_err("compressed byte bound"),
+        ArchiveError::CompressedLimit
+    );
+    assert_eq!(
+        read(&[], &digest, 1).expect_err("an empty reader"),
+        ArchiveError::CompressedLimit
+    );
+    let sha512 = ArchiveDigest::Sha512(Sha512::digest(&bytes).into());
+    assert_eq!(
+        read(&bytes, &sha512, bytes.len())?.digest(),
+        FileDigest::of(&bytes)
+    );
+    for wrong in [
+        ArchiveDigest::Sha256([0; 32]),
+        ArchiveDigest::Sha512([0; 64]),
+    ] {
+        assert_eq!(
+            read(b"not an archive", &wrong, 64).expect_err("digest before container"),
+            ArchiveError::DigestMismatch
+        );
     }
     Ok(())
 }

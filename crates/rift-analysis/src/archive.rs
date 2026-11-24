@@ -6,7 +6,7 @@ use std::{
     borrow::Borrow,
     cell::{Cell, OnceCell},
     collections::{BTreeMap, BTreeSet},
-    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom},
 };
 
 use crate::input::ArchiveMemberKind;
@@ -219,6 +219,8 @@ pub enum ArchiveOmissionReason {
     Oversized,
     /// The name does not use Unicode NFC, so no [`ProjectPath`] names the member.
     NonCanonicalUnicode,
+    /// The caller of [`read_archive_from`] did not select the file.
+    Unselected,
 }
 
 /// A member the reader validated and left out.
@@ -306,9 +308,10 @@ impl ArchiveFiles {
     }
 
     /// Members left out, in path order: files over the member byte bound under
-    /// [`OversizedMembers::Skip`], and members whose name does not use Unicode NFC.
+    /// [`OversizedMembers::Skip`], files the caller did not select, and members whose name does
+    /// not use Unicode NFC.
     ///
-    /// Each path is absent from [`Self::files`]. An oversized path remains in
+    /// Each path is absent from [`Self::files`]. An oversized or unselected path remains in
     /// [`Self::members`] as a file.
     /// The caller decides whether an omitted path leaves its source selection incomplete.
     #[must_use]
@@ -494,6 +497,8 @@ pub enum ArchiveError {
     UnsupportedEntry,
     /// Archive member lies outside the caller's exact release root.
     RootMismatch,
+    /// The caller's reader failed.
+    Read(ErrorKind),
 }
 
 impl ArchiveError {
@@ -507,6 +512,7 @@ impl std::fmt::Display for ArchiveError {
         let message = match self {
             Self::BoundExceeded(exceeded) => return std::fmt::Display::fmt(exceeded, f),
             Self::UnsafePath(path) => return std::fmt::Display::fmt(path, f),
+            Self::Read(kind) => return write!(f, "archive reader failed: {kind}"),
             Self::InvalidLimits => "archive limits are invalid",
             Self::CompressedLimit => "archive exceeds its compressed byte bound",
             Self::DigestMismatch => "archive digest differs from exact release metadata",
@@ -552,118 +558,276 @@ pub fn read_archive(
     root: Option<&str>,
     limits: ArchiveLimits,
 ) -> Result<ArchiveFiles, ArchiveError> {
-    if bytes.is_empty() || bytes.len() > limits.compressed_bytes {
-        return Err(ArchiveError::CompressedLimit);
-    }
-    let digest = match expected {
-        ArchiveDigest::Sha256(expected) => {
-            let actual = <[u8; 32]>::from(Sha256::digest(bytes));
-            if actual != *expected {
-                return Err(ArchiveError::DigestMismatch);
-            }
-            FileDigest::from_bytes(actual)
-        }
-        ArchiveDigest::Sha512(expected) => {
-            if <[u8; 64]>::from(Sha512::digest(bytes)) != *expected {
-                return Err(ArchiveError::DigestMismatch);
-            }
-            FileDigest::of(bytes)
-        }
+    read_archive_from(
+        Cursor::new(bytes),
+        format,
+        expected,
+        root,
+        limits,
+        &|_, _| true,
+    )
+}
+
+/// Reads an archive as [`read_archive`] does, from a seekable reader, and retains the bytes of
+/// the regular files `keep` selects.
+///
+/// `keep` answers for the path of a file, after the archive root is removed, and its declared
+/// size. Every other file is checked, decoded, and counted as a kept one, its bytes are
+/// dropped as they are decoded, and [`ArchiveFiles::omissions`] lists it as
+/// [`ArchiveOmissionReason::Unselected`].
+///
+/// The reader is read from its start: once for the digest, and then in two passes for tar and
+/// by member for ZIP. Its bytes must not change meanwhile. The reader keeps buffers, the member
+/// inventory, and the selected files; the container is never held whole.
+///
+/// # Errors
+/// Returns [`ArchiveError`] as [`read_archive`] does, and [`ArchiveError::Read`] when the reader
+/// fails.
+pub fn read_archive_from(
+    mut reader: impl Read + Seek,
+    format: ArchiveFormat,
+    expected: &ArchiveDigest,
+    root: Option<&str>,
+    limits: ArchiveLimits,
+    keep: &dyn Fn(&ProjectPath, u64) -> bool,
+) -> Result<ArchiveFiles, ArchiveError> {
+    let mut source = Source {
+        reader: &mut reader,
+        failed: None,
     };
+    let result = read_source(&mut source, format, expected, root, limits, keep);
+    match source.failed {
+        Some(kind) => Err(ArchiveError::Read(kind)),
+        None => result,
+    }
+}
+
+fn read_source<R: Read + Seek>(
+    source: &mut Source<'_, R>,
+    format: ArchiveFormat,
+    expected: &ArchiveDigest,
+    root: Option<&str>,
+    limits: ArchiveLimits,
+    keep: &dyn Fn(&ProjectPath, u64) -> bool,
+) -> Result<ArchiveFiles, ArchiveError> {
+    let compressed = source
+        .seek(SeekFrom::End(0))
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    let compressed = usize::try_from(compressed)
+        .ok()
+        .filter(|compressed| (1..=limits.compressed_bytes).contains(compressed))
+        .ok_or(ArchiveError::CompressedLimit)?;
+    let digest = verified_digest(source, compressed, expected)?;
     if let Some(root) = root {
         let path = ProjectPath::new(root).map_err(|_| ArchiveError::unsafe_path(root))?;
         if path.as_str().is_empty() || root.contains('/') {
             return Err(ArchiveError::unsafe_path(root));
         }
     }
-    let mut output = ArchiveOutput::new(root, limits, limits.expanded(bytes.len()));
+    let mut output = ArchiveOutput::new(root, limits, limits.expanded(compressed));
+    output.keep = keep;
     match format {
-        ArchiveFormat::TarGzip => read_tar(bytes, &mut output)?,
-        ArchiveFormat::Zip => read_zip(bytes, &mut output)?,
+        ArchiveFormat::TarGzip => read_tar(source, compressed, &mut output)?,
+        ArchiveFormat::Zip => read_zip(source, compressed, &mut output)?,
     }
     Ok(output.into_files(digest))
 }
 
-const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_DEFAULT;
-
-/// Decodes the gzip stream once into memory, or twice without retaining it.
-///
-/// Retaining oversized file bytes is what [`OversizedMembers::Skip`] avoids, so that mode
-/// decodes one stream for header validation and another for the members.
-fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
-    let expanded = output.expanded;
-    let read_max = expanded.maximum as u64 + 1;
-    let gzip = || GzipMembers::new(bytes).take(read_max);
-    // The gzip stream ends where its padding starts, so padding earns no expansion.
-    let check = |stream: &std::io::Take<GzipMembers<'_>>| {
-        let decoded = read_max - stream.limit();
-        if stream.limit() == 0 {
-            return Err(expanded.exceeded(decoded, None));
+/// Digests the whole reader through a fixed buffer and compares it with the expected digest.
+fn verified_digest<R: Read + Seek>(
+    source: &mut Source<'_, R>,
+    compressed: usize,
+    expected: &ArchiveDigest,
+) -> Result<FileDigest, ArchiveError> {
+    source.restart()?;
+    let mut sha256 = Sha256::new();
+    let mut sha512 = matches!(expected, ArchiveDigest::Sha512(_)).then(Sha512::new);
+    let mut buffer = vec![0; SOURCE_BUFFER_BYTES];
+    let mut read = 0;
+    loop {
+        let length = source
+            .read(&mut buffer)
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        let Some(bytes) = buffer.get(..length).filter(|bytes| !bytes.is_empty()) else {
+            break;
+        };
+        read += length;
+        if read > compressed {
+            return Err(ArchiveError::CompressedLimit);
         }
-        let bound = output
-            .limits
-            .expanded(bytes.len() - stream.get_ref().rest().len());
-        if decoded > bound.maximum as u64 {
-            return Err(bound.exceeded(bound.maximum as u64 + 1, None));
-        }
-        Ok(())
-    };
-    match output.limits.oversized_members {
-        OversizedMembers::Refuse => {
-            let mut decoded = Vec::new();
-            let mut stream = gzip();
-            stream
-                .read_to_end(&mut decoded)
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            check(&stream)?;
-            check_tar_headers(decoded.as_slice(), output.limits)?;
-            read_tar_members(decoded.as_slice(), output)
-        }
-        OversizedMembers::Skip => {
-            let mut stream = gzip();
-            let checked = check_tar_headers(&mut stream, output.limits);
-            // The rest of the stream decides the byte bound and gzip's own checks before a
-            // header refusal, as decoding into memory first does.
-            std::io::copy(&mut stream, &mut std::io::sink())
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            check(&stream)?;
-            checked?;
-            read_tar_members(gzip(), output)
+        sha256.update(bytes);
+        if let Some(sha512) = &mut sha512 {
+            sha512.update(bytes);
         }
     }
+    let actual = <[u8; 32]>::from(sha256.finalize());
+    let verified = match expected {
+        ArchiveDigest::Sha256(expected) => actual == *expected,
+        ArchiveDigest::Sha512(expected) => {
+            sha512.is_some_and(|sha512| <[u8; 64]>::from(sha512.finalize()) == *expected)
+        }
+    };
+    if !verified {
+        return Err(ArchiveError::DigestMismatch);
+    }
+    Ok(FileDigest::from_bytes(actual))
+}
+
+/// Bytes read from the caller's reader at once.
+const SOURCE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The caller's reader, with the first failure it reported.
+///
+/// The container libraries report a failed read as a malformed container.
+struct Source<'a, R> {
+    reader: &'a mut R,
+    failed: Option<ErrorKind>,
+}
+
+impl<R: Read + Seek> Source<'_, R> {
+    fn restart(&mut self) -> Result<(), ArchiveError> {
+        self.seek(SeekFrom::Start(0))
+            .map(|_| ())
+            .map_err(|_| ArchiveError::InvalidArchive)
+    }
+
+    fn record<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(error) = &result {
+            self.failed.get_or_insert(error.kind());
+        }
+        result
+    }
+}
+
+impl<R: Read + Seek> Read for Source<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let result = self.reader.read(buffer);
+            match &result {
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Ok(_) | Err(_) => return self.record(result),
+            }
+        }
+    }
+}
+
+impl<R: Read + Seek> Seek for Source<'_, R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let result = self.reader.seek(position);
+        self.record(result)
+    }
+}
+
+const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_DEFAULT;
+
+/// Decodes the gzip stream once for header validation and once for the members.
+fn read_tar<R: Read + Seek>(
+    source: &mut Source<'_, R>,
+    compressed: usize,
+    output: &mut ArchiveOutput<'_>,
+) -> Result<(), ArchiveError> {
+    source.restart()?;
+    let mut stream = gzip_stream(&mut *source, output.expanded);
+    let checked = check_tar_headers(&mut stream, output.limits);
+    // The rest of the stream decides the byte bound and gzip's own checks before a header
+    // refusal.
+    std::io::copy(&mut stream, &mut std::io::sink()).map_err(|_| ArchiveError::InvalidArchive)?;
+    check_expansion(&stream, compressed, output)?;
+    checked?;
+    source.restart()?;
+    let stream = gzip_stream(source, output.expanded);
+    read_tar_members(stream, output)
+}
+
+/// The gzip stream of `source`, up to one byte past the decompressed byte bound.
+fn gzip_stream<R: Read>(
+    source: R,
+    expanded: ExpandedBound,
+) -> std::io::Take<GzipMembers<BufReader<R>>> {
+    let source = BufReader::with_capacity(SOURCE_BUFFER_BYTES, source);
+    GzipMembers::new(source).take(expanded.maximum as u64 + 1)
+}
+
+/// Refuses a stream read to its end that decoded more than its bound. The gzip stream ends
+/// where its padding starts, so padding earns no expansion.
+fn check_expansion<B>(
+    stream: &std::io::Take<GzipMembers<B>>,
+    compressed: usize,
+    output: &ArchiveOutput<'_>,
+) -> Result<(), ArchiveError> {
+    let decoded = output.expanded.maximum as u64 + 1 - stream.limit();
+    if stream.limit() == 0 {
+        return Err(output.expanded.exceeded(decoded, None));
+    }
+    let padding = usize::try_from(stream.get_ref().padding).unwrap_or(compressed);
+    let bound = output.limits.expanded(compressed.saturating_sub(padding));
+    if decoded > bound.maximum as u64 {
+        return Err(bound.exceeded(bound.maximum as u64 + 1, None));
+    }
+    Ok(())
 }
 
 /// Decodes every gzip member and ends at the NUL bytes that pad the last one.
 ///
 /// Other bytes after a member start another member, so anything else that trails the stream
 /// is refused as an invalid member header.
-struct GzipMembers<'a>(flate2::bufread::GzDecoder<&'a [u8]>);
+struct GzipMembers<B> {
+    /// The member being decoded; absent once the stream ended.
+    member: Option<flate2::bufread::GzDecoder<B>>,
+    /// NUL bytes after the last member.
+    padding: u64,
+}
 
-impl<'a> GzipMembers<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self(flate2::bufread::GzDecoder::new(bytes))
+impl<B: BufRead> GzipMembers<B> {
+    fn new(source: B) -> Self {
+        Self {
+            member: Some(flate2::bufread::GzDecoder::new(source)),
+            padding: 0,
+        }
     }
 
-    /// Bytes no member has consumed; the padding, once the stream was read to its end.
-    fn rest(&self) -> &'a [u8] {
-        self.0.get_ref()
+    /// Reads past NUL padding to the end of `source`; whether another member starts instead.
+    fn another_member(&mut self, source: &mut B) -> std::io::Result<bool> {
+        loop {
+            let bytes = source.fill_buf()?;
+            let length = bytes.len();
+            let padding = bytes.iter().take_while(|byte| **byte == 0).count();
+            self.padding += padding as u64;
+            if padding < length {
+                return if self.padding == 0 {
+                    Ok(true)
+                } else {
+                    Err(ErrorKind::InvalidData.into())
+                };
+            }
+            if length == 0 {
+                return Ok(false);
+            }
+            source.consume(length);
+        }
     }
 }
 
-impl Read for GzipMembers<'_> {
+impl<B: BufRead> Read for GzipMembers<B> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
         // Each pass consumes one member header, so the compressed bytes bound the loop.
-        loop {
-            let read = self.0.read(buffer)?;
-            let rest = self.rest();
-            if read != 0 || rest.iter().all(|byte| *byte == 0) {
+        while let Some(member) = &mut self.member {
+            let read = member.read(buffer)?;
+            if read != 0 {
                 return Ok(read);
             }
-            self.0.reset(rest);
+            let Some(member) = self.member.take() else {
+                break;
+            };
+            let mut source = member.into_inner();
+            if self.another_member(&mut source)? {
+                self.member = Some(flate2::bufread::GzDecoder::new(source));
+            }
         }
+        Ok(0)
     }
 }
 
@@ -850,18 +1014,23 @@ fn read_tar_members(reader: impl Read, output: &mut ArchiveOutput<'_>) -> Result
     Ok(())
 }
 
-fn read_zip(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
+fn read_zip<R: Read + Seek>(
+    source: &mut Source<'_, R>,
+    compressed: usize,
+    output: &mut ArchiveOutput<'_>,
+) -> Result<(), ArchiveError> {
+    source.restart()?;
     let limits = output.limits;
     let refused = OnceCell::new();
     let metadata = Cell::new(true);
     let declared_members = Cell::new(None);
     let reader = ZipReadGuard {
-        cursor: Cursor::new(bytes),
+        source,
         limits,
         refused: &refused,
         metadata: &metadata,
         declared_members: &declared_members,
-        remaining_bytes: bytes.len().saturating_mul(4),
+        remaining_bytes: compressed.saturating_mul(4),
         remaining_operations: limits.members.saturating_mul(16).saturating_add(4096),
     };
     let opened = zip::ZipArchive::new(reader);
@@ -872,9 +1041,11 @@ fn read_zip(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveE
     metadata.set(false);
     if declared_members.get() != Some(archive.len() as u64) {
         // zip has already located any prepended bytes, including ZIP64 archives.
-        let offset = usize::try_from(archive.offset()).map_err(|_| ArchiveError::InvalidArchive)?;
-        let bytes = bytes.get(offset..).ok_or(ArchiveError::InvalidArchive)?;
-        return read_repeated_zip(bytes, output, archive.into_inner());
+        let start = archive.offset();
+        let length = (compressed as u64)
+            .checked_sub(start)
+            .ok_or(ArchiveError::InvalidArchive)?;
+        return read_repeated_zip((start, length), output, archive.into_inner());
     }
     if archive.len() > limits.members {
         return Err(limits.members_exceeded(archive.len() as u64, None));
@@ -939,14 +1110,16 @@ fn read_zip(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveE
 /// The existing metadata guard has already bounded the archive. Each original record and
 /// compressed payload also consumes its remaining work budget; retained files share tar's
 /// path, member-type, byte-comparison, and decompressed-byte acceptance.
-fn read_repeated_zip(
-    bytes: &[u8],
+fn read_repeated_zip<R: Read + Seek>(
+    (start, length): (u64, u64),
     output: &mut ArchiveOutput<'_>,
-    mut work: ZipReadGuard<'_>,
+    work: ZipReadGuard<'_, '_, R>,
 ) -> Result<(), ArchiveError> {
     let limits = output.limits;
-    let archive =
-        rawzip::ZipArchive::from_slice(bytes).map_err(|_| ArchiveError::InvalidArchive)?;
+    let (mut work, source) = work.into_work();
+    let mut buffer = vec![0; ZIP_CENTRAL_RECORD_BYTES_MAX];
+    let archive = rawzip::ZipArchive::from_seekable(Suffix { source, start }, &mut buffer)
+        .map_err(|_| ArchiveError::InvalidArchive)?;
     let expected = work
         .declared_members
         .get()
@@ -954,7 +1127,7 @@ fn read_repeated_zip(
     if archive.entries_hint() != expected {
         return Err(ArchiveError::InvalidArchive);
     }
-    let mut entries = archive.entries();
+    let mut entries = archive.entries(&mut buffer);
     let mut count = 0_u64;
     while let Some(entry) = entries
         .next_entry()
@@ -964,14 +1137,18 @@ fn read_repeated_zip(
             return Err(limits.members_exceeded(count + 1, None));
         }
         count += 1;
-        let (path, kind) = repeated_zip_member_metadata(bytes, &entry, &mut work)?;
+        let (path, kind) = repeated_zip_member_metadata(archive.get_ref(), &entry, &mut work)?;
         if entry.flags().is_encrypted() {
             return Err(ArchiveError::UnsupportedEntry);
         }
         let local = archive
             .get_entry(entry.wayfinder())
             .map_err(|_| ArchiveError::InvalidArchive)?;
-        work.charge(local.data().len())?;
+        let (data_start, data_end) = local.compressed_data_range();
+        if data_end > length {
+            return Err(ArchiveError::InvalidArchive);
+        }
+        work.charge(data_end.saturating_sub(data_start))?;
         push_repeated_zip_member(output, &entry, &local, &path, kind)?;
     }
     if count != expected {
@@ -980,8 +1157,39 @@ fn read_repeated_zip(
     Ok(())
 }
 
+/// The bytes of a reader from `start` on, as a reader of their own.
+struct Suffix<S> {
+    source: S,
+    start: u64,
+}
+
+impl<S: Read> Read for Suffix<S> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.source.read(buffer)
+    }
+}
+
+impl<S: Seek> Seek for Suffix<S> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let position = match position {
+            SeekFrom::Start(offset) => SeekFrom::Start(
+                offset
+                    .checked_add(self.start)
+                    .ok_or(ErrorKind::InvalidInput)?,
+            ),
+            relative => relative,
+        };
+        self.source
+            .seek(position)?
+            .checked_sub(self.start)
+            .ok_or_else(|| ErrorKind::InvalidInput.into())
+    }
+}
+
 /// Fixed central-directory header bytes before its bounded name, extras, and comment.
 const ZIP_CENTRAL_HEADER_BYTES: usize = 46;
+/// The longest central-directory record: its header, and three fields of u16 length.
+const ZIP_CENTRAL_RECORD_BYTES_MAX: usize = ZIP_CENTRAL_HEADER_BYTES + 3 * 0xffff;
 /// Byte length of a ZIP32 end-of-central-directory record without a comment.
 const ZIP_FOOTER_BYTES: usize = 22;
 /// Central-directory byte-size field in a ZIP32 end-of-central-directory record.
@@ -996,21 +1204,19 @@ const ZIP_CENTRAL_LOCAL_OFFSET: std::ops::Range<usize> = 42..46;
 /// modes without decoding payloads. Its fixed header and three u16-length fields bound the
 /// record to 196,651 bytes; generated local header and footer add 57 bytes.
 fn repeated_zip_member_metadata(
-    bytes: &[u8],
+    source: &impl rawzip::ReaderAt,
     entry: &rawzip::ZipFileHeaderRecord<'_>,
-    work: &mut ZipReadGuard<'_>,
+    work: &mut ZipWork<'_>,
 ) -> Result<(String, ArchiveMemberKind), ArchiveError> {
     let length = ZIP_CENTRAL_HEADER_BYTES
         + entry.file_path().as_ref().len()
         + entry.extra_fields().remaining_bytes().len()
         + entry.comment().as_bytes().len();
-    work.charge(length)?;
-    let start = usize::try_from(entry.central_directory_offset())
+    work.charge(length as u64)?;
+    let mut record = vec![0; length];
+    source
+        .read_exact_at(&mut record, entry.central_directory_offset())
         .map_err(|_| ArchiveError::InvalidArchive)?;
-    let end = start
-        .checked_add(length)
-        .ok_or(ArchiveError::InvalidArchive)?;
-    let record = bytes.get(start..end).ok_or(ArchiveError::InvalidArchive)?;
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -1033,7 +1239,7 @@ fn repeated_zip_member_metadata(
     );
     let mut metadata = Vec::with_capacity(local_bytes + length + footer.len());
     metadata.extend_from_slice(&generated[..local_bytes]);
-    metadata.extend_from_slice(record);
+    metadata.extend_from_slice(&record);
     metadata
         [local_bytes + ZIP_CENTRAL_LOCAL_OFFSET.start..local_bytes + ZIP_CENTRAL_LOCAL_OFFSET.end]
         .fill(0);
@@ -1078,7 +1284,7 @@ impl ZipCompression {
 fn push_repeated_zip_member(
     output: &mut ArchiveOutput<'_>,
     entry: &rawzip::ZipFileHeaderRecord<'_>,
-    local: &rawzip::ZipSliceEntry<'_>,
+    local: &rawzip::ZipEntry<'_, impl rawzip::ReaderAt>,
     path: &str,
     kind: ArchiveMemberKind,
 ) -> Result<(), ArchiveError> {
@@ -1090,16 +1296,17 @@ fn push_repeated_zip_member(
     let size = entry.uncompressed_size_hint();
     match compression {
         ZipCompression::Stored => {
-            let mut reader = local.verifying_reader(local.data());
+            let mut reader = local.verifying_reader(local.reader());
             output.push(path, directory, size, &mut reader)
         }
         ZipCompression::Deflate => {
-            let decoder = flate2::bufread::DeflateDecoder::new(local.data());
+            let decoder = flate2::bufread::DeflateDecoder::new(BufReader::new(local.reader()));
             let mut reader = local.verifying_reader(decoder);
             output.push(path, directory, size, &mut reader)
         }
         ZipCompression::Zstd => {
-            let mut member = ZstdMember::new(local.data(), output.limits, size)?;
+            let source = BufReader::new(local.reader());
+            let mut member = ZstdMember::new(source, output.limits, size)?;
             let mut reader = local.verifying_reader(&mut member);
             output
                 .push(path, directory, size, &mut reader)
@@ -1342,11 +1549,12 @@ fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
 // EOCD reads are 22 bytes (ZIP32) and 56 bytes (ZIP64), including the signature. Refuse
 // declared counts at that read boundary, before the library can reserve member storage.
 // Container interpretation and all field decoding remain in zip; this guard only bounds
-// the count that controls its allocation. Cursor returns each fixed-size read in one call.
+// the count that controls its allocation. The guard fills each buffer, so a fixed-size read
+// takes one call whatever the caller's reader returns.
 // Keep that count to find duplicate raw names, which zip otherwise collapses in its index.
 // Once metadata is decoded, file contents cannot be mistaken for a footer.
-struct ZipReadGuard<'a> {
-    cursor: Cursor<&'a [u8]>,
+struct ZipReadGuard<'a, 'source, R> {
+    source: &'a mut Source<'source, R>,
     limits: ArchiveLimits,
     refused: &'a OnceCell<ArchiveError>,
     metadata: &'a Cell<bool>,
@@ -1355,32 +1563,69 @@ struct ZipReadGuard<'a> {
     remaining_operations: usize,
 }
 
-impl ZipReadGuard<'_> {
-    fn charge(&mut self, bytes: usize) -> Result<(), ArchiveError> {
-        self.operation().map_err(|_| ArchiveError::WorkLimit)?;
-        self.remaining_bytes = self
-            .remaining_bytes
-            .checked_sub(bytes)
-            .ok_or(ArchiveError::WorkLimit)?;
-        Ok(())
-    }
+/// The work a ZIP archive may still cost, without the reader it was charged to.
+struct ZipWork<'a> {
+    refused: &'a OnceCell<ArchiveError>,
+    declared_members: &'a Cell<Option<u64>>,
+    remaining_bytes: usize,
+    remaining_operations: usize,
+}
 
-    fn operation(&mut self) -> std::io::Result<()> {
-        if self.remaining_operations == 0 || self.refused.get().is_some() {
-            self.refused.get_or_init(|| ArchiveError::WorkLimit);
-            return Err(std::io::Error::other(
-                "archive metadata exceeds its work bound",
-            ));
-        }
-        self.remaining_operations -= 1;
+impl ZipWork<'_> {
+    fn charge(&mut self, bytes: u64) -> Result<(), ArchiveError> {
+        zip_operation(self.refused, &mut self.remaining_operations)
+            .map_err(|_| ArchiveError::WorkLimit)?;
+        self.remaining_bytes = usize::try_from(bytes)
+            .ok()
+            .and_then(|bytes| self.remaining_bytes.checked_sub(bytes))
+            .ok_or(ArchiveError::WorkLimit)?;
         Ok(())
     }
 }
 
-impl Read for ZipReadGuard<'_> {
+/// Consumes one operation of the ZIP work bound.
+fn zip_operation(
+    refused: &OnceCell<ArchiveError>,
+    remaining_operations: &mut usize,
+) -> std::io::Result<()> {
+    if *remaining_operations == 0 || refused.get().is_some() {
+        refused.get_or_init(|| ArchiveError::WorkLimit);
+        return Err(std::io::Error::other(
+            "archive metadata exceeds its work bound",
+        ));
+    }
+    *remaining_operations -= 1;
+    Ok(())
+}
+
+impl<'a, 'source, R: Read + Seek> ZipReadGuard<'a, 'source, R> {
+    fn into_work(self) -> (ZipWork<'a>, &'a mut Source<'source, R>) {
+        let work = ZipWork {
+            refused: self.refused,
+            declared_members: self.declared_members,
+            remaining_bytes: self.remaining_bytes,
+            remaining_operations: self.remaining_operations,
+        };
+        (work, self.source)
+    }
+
+    /// Reads until `buffer` is full or the reader ends.
+    fn fill(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while let Some(rest) = buffer.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+            match self.source.read(rest)? {
+                0 => break,
+                read => filled += read,
+            }
+        }
+        Ok(filled)
+    }
+}
+
+impl<R: Read + Seek> Read for ZipReadGuard<'_, '_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.operation()?;
-        let length = self.cursor.read(buffer)?;
+        zip_operation(self.refused, &mut self.remaining_operations)?;
+        let length = self.fill(buffer)?;
         if length > self.remaining_bytes {
             self.refused.get_or_init(|| ArchiveError::WorkLimit);
             return Err(std::io::Error::other(
@@ -1417,10 +1662,10 @@ impl Read for ZipReadGuard<'_> {
     }
 }
 
-impl Seek for ZipReadGuard<'_> {
+impl<R: Read + Seek> Seek for ZipReadGuard<'_, '_, R> {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        self.operation()?;
-        self.cursor.seek(position)
+        zip_operation(self.refused, &mut self.remaining_operations)?;
+        self.source.seek(position)
     }
 }
 
@@ -1505,6 +1750,8 @@ impl RelativePath {
 
 struct ArchiveOutput<'a> {
     root: Option<&'a str>,
+    /// Whether the bytes of a file are retained, by its path below the root and its size.
+    keep: &'a dyn Fn(&ProjectPath, u64) -> bool,
     limits: ArchiveLimits,
     expanded: ExpandedBound,
     remaining: usize,
@@ -1543,6 +1790,7 @@ impl<'a> ArchiveOutput<'a> {
     fn new(root: Option<&'a str>, limits: ArchiveLimits, expanded: ExpandedBound) -> Self {
         Self {
             root,
+            keep: &|_, _| true,
             limits,
             expanded,
             remaining: expanded.maximum,
@@ -1656,11 +1904,17 @@ impl<'a> ArchiveOutput<'a> {
             RelativePath::Canonical(relative) => {
                 let path = RelativePath::project_path(relative)
                     .ok_or_else(|| ArchiveError::unsafe_path(path))?;
-                if oversized {
-                    let path = ArchivePath(path.as_str().to_owned());
-                    self.omit(path, ArchiveOmissionReason::Oversized, size, reader)?;
+                let omission = if oversized {
+                    Some(ArchiveOmissionReason::Oversized)
                 } else {
-                    self.retain(path, size, length, reader)?;
+                    (!(self.keep)(&path, size)).then_some(ArchiveOmissionReason::Unselected)
+                };
+                match omission {
+                    Some(reason) => {
+                        let path = ArchivePath(path.as_str().to_owned());
+                        self.omit(path, reason, size, reader)?;
+                    }
+                    None => self.retain(path, size, length, reader)?,
                 }
             }
         }

@@ -1513,6 +1513,12 @@ for ZIP. `ArchiveFiles::replaced` lists the path when an earlier file of it had 
 Every repeated member counts toward the archive bounds. A repeated directory or link, and a path
 that changes its member type, refuse the archive.
 
+`read_archive_from` reads the same archive from a seekable reader and takes a selection by the path
+and size of each file. The reader is read for its digest and then in two passes for tar, or member by
+member for ZIP, so neither the compressed archive nor its container is held whole. A file outside the
+selection is checked, decoded, and counted as a selected one and is an entry of `omissions`. A failure
+of the reader is `ArchiveError::Read`. `read_archive` reads a slice through the same implementation.
+
 NUL bytes that pad the end of a gzip stream count toward `compressed_size` and not toward
 `expansion_ratio`; any other data after the stream refuses the archive.
 
