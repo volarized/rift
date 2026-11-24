@@ -8,7 +8,7 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBindingKind, StaticCallee, StaticFactsParts, StaticReference, binding, call, field,
+    StaticBinding, StaticBindingKind, StaticCallee, StaticFactsParts, StaticReference, call, field,
     identifier, kind,
 };
 use crate::ByteRange;
@@ -193,23 +193,26 @@ impl EdgePythonKinds {
                     .named_children(&mut cursor)
                     .filter(|name| name.kind_id() == self.identifier)
                 {
-                    facts
-                        .bindings
-                        .push(binding(name, scope, byte_range(scope)?.start, kind)?);
+                    facts.bindings.push(self.scoped_binding(
+                        name,
+                        scope,
+                        self.scope_range(scope)?.start,
+                        kind,
+                    )?);
                 }
             }
         } else if id == self.unsupported
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
-            facts.unsupported_bindings.push(byte_range(scope)?);
+            facts.unsupported_bindings.push(self.scope_range(scope)?);
             if let Some(module) = visited
                 .parent()
                 .and_then(|parent| parent.syntax_element().child_by_field_id(self.module))
             {
-                facts.bindings.push(binding(
+                facts.bindings.push(self.scoped_binding(
                     syntax_element,
                     scope,
-                    byte_range(scope)?.start,
+                    self.scope_range(scope)?.start,
                     StaticBindingKind::PythonImport {
                         module: byte_range(module)?,
                         export: None,
@@ -220,6 +223,32 @@ impl EdgePythonKinds {
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts)?;
         Ok(())
+    }
+
+    /// The range a scope covers. A module covers its file from the first byte: the syntax root
+    /// leaves out the spaces, line ends and byte order mark before the first token.
+    fn scope_range(&self, scope: Node<'_>) -> Result<ByteRange, RiftError> {
+        let range = byte_range(scope)?;
+        Ok(if scope.kind_id() == self.scopes[0] {
+            ByteRange { start: 0, ..range }
+        } else {
+            range
+        })
+    }
+
+    fn scoped_binding(
+        &self,
+        name: Node<'_>,
+        scope: Node<'_>,
+        available_from: u64,
+        kind: StaticBindingKind,
+    ) -> Result<StaticBinding, RiftError> {
+        Ok(StaticBinding {
+            name: byte_range(name)?,
+            scope: self.scope_range(scope)?,
+            available_from,
+            kind,
+        })
     }
 
     fn edge_type_parameters(
@@ -246,7 +275,7 @@ impl EdgePythonKinds {
                 candidate = element.named_child(0);
             }
             if let Some(name) = name {
-                facts.bindings.push(binding(
+                facts.bindings.push(self.scoped_binding(
                     name,
                     definition,
                     byte_range(definition)?.start,
@@ -302,9 +331,12 @@ impl EdgePythonKinds {
                 }
                 _ => StaticBindingKind::Local,
             };
-            facts
-                .bindings
-                .push(binding(name, scope, byte_range(scope)?.start, kind)?);
+            facts.bindings.push(self.scoped_binding(
+                name,
+                scope,
+                self.scope_range(scope)?.start,
+                kind,
+            )?);
         }
         Ok(())
     }
@@ -361,9 +393,12 @@ impl EdgePythonKinds {
                     export,
                 }
             };
-            facts
-                .bindings
-                .push(binding(local, scope, byte_range(scope)?.start, kind)?);
+            facts.bindings.push(self.scoped_binding(
+                local,
+                scope,
+                self.scope_range(scope)?.start,
+                kind,
+            )?);
         }
         Ok(())
     }
@@ -397,21 +432,23 @@ impl EdgePythonKinds {
                     .child_by_field_id(self.type_field)
                     .map(byte_range)
                     .transpose()?;
-                facts.bindings.push(binding(
-                    name,
-                    scope,
-                    byte_range(scope)?.start,
-                    match class_name
-                        .filter(|_| first && !self.patterns.contains(&parameter.kind_id()))
-                    {
-                        Some(class_name) => StaticBindingKind::PythonReceiver {
-                            class_name: byte_range(class_name)?,
+                facts.bindings.push(
+                    self.scoped_binding(
+                        name,
+                        scope,
+                        self.scope_range(scope)?.start,
+                        match class_name
+                            .filter(|_| first && !self.patterns.contains(&parameter.kind_id()))
+                        {
+                            Some(class_name) => StaticBindingKind::PythonReceiver {
+                                class_name: byte_range(class_name)?,
+                            },
+                            None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
+                                StaticBindingKind::PythonAnnotation { annotation }
+                            }),
                         },
-                        None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
-                            StaticBindingKind::PythonAnnotation { annotation }
-                        }),
-                    },
-                )?);
+                    )?,
+                );
             }
             first = false;
         }
@@ -586,18 +623,18 @@ impl EdgePythonKinds {
                     | StaticBindingKind::PythonNone => byte_range(visited.syntax_element())?.end,
                     // The loop body reads each element after the iterated value.
                     StaticBindingKind::PythonElement { iterable } => iterable.end,
-                    _ => byte_range(scope)?.start,
+                    _ => self.scope_range(scope)?.start,
                 };
                 facts
                     .bindings
-                    .push(binding(target, scope, available, kind)?);
+                    .push(self.scoped_binding(target, scope, available, kind)?);
             } else if target.kind_id() == self.attribute {
                 facts.assignments.push(byte_range(target)?);
                 if let Some((receiver, member)) = target
                     .child_by_field_id(self.object)
                     .zip(target.child_by_field_id(self.member))
                 {
-                    facts.bindings.push(binding(
+                    facts.bindings.push(self.scoped_binding(
                         member,
                         scope,
                         byte_range(visited.syntax_element())?.end,
@@ -608,9 +645,12 @@ impl EdgePythonKinds {
                 }
                 let kind = self.edge_assignment_kind(visited, target)?;
                 if kind != StaticBindingKind::Shadow {
-                    facts
-                        .bindings
-                        .push(binding(target, scope, byte_range(scope)?.start, kind)?);
+                    facts.bindings.push(self.scoped_binding(
+                        target,
+                        scope,
+                        self.scope_range(scope)?.start,
+                        kind,
+                    )?);
                 }
             } else if self.patterns.contains(&target.kind_id()) {
                 let mut cursor = target.walk();
@@ -670,27 +710,6 @@ impl EdgePythonKinds {
                 }
                 _ => Ok(StaticBindingKind::Shadow),
             },
-        }
-    }
-}
-
-/// Gives the bindings of a module the whole file as their scope. The syntax root, `root`, leaves
-/// out the spaces, line ends and byte order mark the file starts with.
-pub(super) fn widen_module_scope(facts: &mut StaticFactsParts, root: ByteRange, file: ByteRange) {
-    if root == file {
-        return;
-    }
-    for binding in &mut facts.bindings {
-        if binding.scope == root {
-            binding.scope = file;
-            if binding.available_from == root.start {
-                binding.available_from = file.start;
-            }
-        }
-    }
-    for scope in &mut facts.unsupported_bindings {
-        if *scope == root {
-            *scope = file;
         }
     }
 }

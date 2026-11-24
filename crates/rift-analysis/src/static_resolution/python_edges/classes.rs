@@ -681,7 +681,9 @@ impl<'source> Index<'source> {
             .into_iter()
             .flatten()
             .copied()
-            .filter(|binding| binding.scope == class.symbol.item_range);
+            .filter(|binding| {
+                binding.scope == class.symbol.item_range && !file.python_module_binding(binding)
+            });
         if !target.symbol.kinds.contains(&SymbolKind::Callable) {
             // An instance write through `self` before the property goes through its setter;
             // the class body declares only the property, so the slot is the property.

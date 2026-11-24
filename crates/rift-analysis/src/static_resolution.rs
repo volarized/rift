@@ -398,6 +398,7 @@ struct File<'source> {
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
+    python_whole: python_edges::WholeFile,
     /// Python annotation ranges by start, which can be evaluated after later statements.
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
@@ -534,6 +535,7 @@ impl<'source> File<'source> {
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
+            python_whole: python_edges::WholeFile::Module,
             python_annotations: BTreeMap::new(),
             python_non_none: BTreeMap::new(),
             python_calls: BTreeMap::new(),
@@ -706,6 +708,15 @@ impl<'source> File<'source> {
         let mut callables = Vec::new();
         let mut classes = Vec::new();
         let python = self.document.facts.language().name == "python";
+        if python
+            && self
+                .facts
+                .expression_scopes()
+                .iter()
+                .any(|scope| self.python_whole_range() == Some(*scope))
+        {
+            self.python_whole = python_edges::WholeFile::Expression;
+        }
         for symbol in self.document.facts.symbols() {
             if self.inactive(symbol.item_range, work) {
                 continue;
@@ -734,6 +745,15 @@ impl<'source> File<'source> {
                     .entry(symbol.item_range)
                     .and_modify(|entry| *entry = None)
                     .or_insert(Some(symbol));
+            }
+            if python
+                && symbol.container.is_none()
+                && self.python_whole_range() == Some(symbol.item_range)
+                && let Some(name) = symbol.name_range
+                && (symbol.kinds.contains(&SymbolKind::Constructible)
+                    || symbol.kinds.contains(&SymbolKind::Callable))
+            {
+                self.python_whole = python_edges::WholeFile::Definition(name);
             }
             if python && symbol.kinds.contains(&SymbolKind::Constructible) {
                 self.class_scopes.insert(symbol.item_range);
@@ -772,6 +792,25 @@ impl<'source> File<'source> {
             file: self.document,
             symbol: *self.callables.resolve(range.start, range.end)?,
         })
+    }
+
+    /// The range a Python module's bindings have as their scope.
+    fn python_whole_range(&self) -> Option<ByteRange> {
+        Some(ByteRange {
+            start: 0,
+            end: u64::try_from(self.document.source.len()).ok()?,
+        })
+    }
+
+    /// Whether a Python binding belongs to the module. One definition or expression may cover
+    /// the whole file too, and then the range alone does not tell.
+    fn python_module_binding(&self, binding: &StaticBinding) -> bool {
+        self.python_whole_range() == Some(binding.scope)
+            && match self.python_whole {
+                python_edges::WholeFile::Module => true,
+                python_edges::WholeFile::Definition(name) => binding.name == name,
+                python_edges::WholeFile::Expression => false,
+            }
     }
 
     fn parent_callable(&self, symbol: &SyntaxSymbol) -> Option<Target<'source>> {
