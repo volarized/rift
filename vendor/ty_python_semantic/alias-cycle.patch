@@ -9,7 +9,7 @@
 +        // provisional values carry `Divergent` markers. An alias that has not converged within
 +        // the tainted iterations is wrapping its previous value in one more layer each time:
 +        // from then on reduce the nesting as the other cycle functions do. Earlier iterations
-+        // stay as inferred, so cycles that converge on their own are unchanged. A value with an
++        // stay as inferred, so a cycle that converges within them is unchanged. A value with an
 +        // unguarded cycle stays as inferred too: the reduction drops a bare marker from a union,
 +        // and `RecursiveType::recover` needs it to report the invalid alias.
 +        let env = ProgramEnvironment::from_definition(definition);

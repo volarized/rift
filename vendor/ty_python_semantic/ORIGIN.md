@@ -28,9 +28,18 @@ hierarchy, or diagnostic request on such a function does not end. The patch redu
 with the crate's own `Type::recursive_type_normalized` once the alias has not converged within
 `TAINTED_CYCLES` iterations, and leaves a value with an unguarded cycle as inferred so that an
 invalid alias is still reported. The alias then converges with its recursive positions replaced
-by the `Divergent` marker: `JsonDict` is `dict[str, Divergent]`. Aliases that converge on their
-own and invalid aliases answer as upstream does; the crate's own `mdtest` suite passes with the
-change (506 files).
+by the `Divergent` marker: `JsonDict` is `dict[str, Divergent]`.
+
+An alias cycle that converges within `TAINTED_CYCLES` iterations answers as upstream does, and so
+does an invalid alias; the crate's own `mdtest` suite passes with the change (506 files). The
+iteration count belongs to the whole cycle, not to one alias: a valid alias that shares a cycle
+with another one running longer is reduced too, and loses structure it had upstream. In
+`A0: TypeAlias = Union["A0", "A2"]`, `A1 = Tuple["A2", Optional[A0]]`, `A2 = Dict[str, "A1"]`,
+upstream answers `A2 = dict[str, tuple[A2, Divergent | None]]` and this crate `dict[str, Divergent]`.
+
+The patch ends this family only. An alias that reaches itself through `Type[...]`, such as
+`A = List[Type["A"]]`, grows in a definition query the patch does not reach, and still does not
+converge (volarized/rift#1079).
 
 ## What is left out
 
@@ -39,7 +48,7 @@ and `README.md`: the library target reads none of them. `resources/lint_docs` st
 lint declarations include those files as documentation.
 
 The manifest is the upstream one with every `workspace = true` replaced by the value the ruff
-workspace gives it at this revision, lints included. Dependencies on other ruff and ty crates
+workspace gives it at this revision, lints included, and with `publish = false` added. Dependencies on other ruff and ty crates
 name the same git revision, and `ty_python_semantic` is a path. The development dependencies and
 the `mdtest` test target are left out. An empty workspace table keeps the crate outside the Rift
 workspace.
@@ -56,8 +65,11 @@ dependency graph holds one `ty_python_semantic`, and theirs has to be this one.
 3. Run the regression test `recursive_aliases_end_a_definition` of `rift-server` without the
    patch. If it passes, upstream ends the request: drop the three directories and return to the
    git dependency.
-4. Otherwise apply `alias-cycle.patch` from this directory (`git apply --directory
-   vendor/ty_python_semantic`), adapt it where the cycle function changed, and write the adapted
-   patch back.
+4. Otherwise apply the patch from the repository root with
+   `git apply --directory=vendor/ty_python_semantic vendor/ty_python_semantic/alias-cycle.patch`,
+   adapt it where the cycle function changed, and write the adapted patch back. Run upstream's
+   `cargo test -p ty_python_semantic --test mdtest` on a ruff checkout with the patch applied:
+   that suite, not this repository's, covers converging and invalid alias cycles.
 5. Move the revision in the workspace manifest, in the three vendored manifests, and in the three
-   origin notes together, and raise the `+rift.N` suffix when the patch changes, and confirm `cargo tree -d` names no ruff or ty crate.
+   origin notes together. Raise the `+rift.N` suffix when the patch changes.
+6. Confirm `cargo tree -d` names no ruff or ty crate.
