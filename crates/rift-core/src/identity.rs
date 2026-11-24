@@ -81,8 +81,9 @@ const DECLARATION_ORDINAL_MARKER: char = '#';
 ///
 /// Several declarations of one qualified name are one logical symbol; the ordinal - the
 /// declaration's position among them, counted from 0 in source order - keeps their
-/// provider keys apart. The address is a provider key, never a public identity, and
-/// nothing reads the ordinal back out of it.
+/// provider keys apart. An export alias that spells the name takes an ordinal after them.
+/// The address is a provider key, never a public identity, and nothing reads the ordinal
+/// back out of it.
 #[must_use]
 pub fn declaration_address(
     language_segment: &str,

@@ -45,7 +45,7 @@ pub use input::{
     PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot, PackageImportRootOrigin, PackageSource,
 };
 #[cfg(feature = "collector")]
-pub use input::{NamespaceInput, NamespaceModule, PackageDependency};
+pub use input::{NamespaceInput, NamespaceModule, PackageDependency, RustTarget};
 pub use revision::{
     ManifestError, analyzer_digest, analyzer_manifest_path, analyzer_revision,
     render_analyzer_manifest,

@@ -1531,6 +1531,13 @@ analysis without becoming a published source unit. `PackageAnalysis::warnings` r
 framework context and dynamic expressions. Fresh, supplied, and checked restored raw syntax
 produce the same contextual publication; files with framework context parse current source before applying framework facts.
 
+Package analysis decides the target conditions of Rust items (`unix`, `windows`, `target_os`, and
+the other target predicates) for `x86_64-unknown-linux-gnu` on every host, so one release gives the
+same facts wherever it is analyzed. `ExactPackageInput::with_rust_target` selects another target.
+A workspace index and the installed sources it reads decide them for the host target; a
+`build.target` of a Cargo configuration file is not read. A condition on a custom flag stays unknown, and
+the items it holds keep their declarations without edges.
+
 The stub and module join pairs a stub with the module it declares: `mod.pyi` with `mod.py`,
 `index.d.ts` with `index.js`, `.d.mts` with `.mjs`, and `.d.cts` with `.cjs`. A `.d.ts` beside no
 `.js` pairs with its `.mjs`, then its `.cjs`, so an ESM build claims a stub before a bundled one.

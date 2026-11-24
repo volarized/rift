@@ -3586,3 +3586,396 @@ fn export_paths_answer_and_charge_what_a_scan_in_order_does() {
     }
     assert_eq!(indexed.first(&exports, &paths[2]), (None, 5));
 }
+
+/// Anchors of one library, as the path after `crate_root/` by file and declared name.
+fn placed(files: &[(&str, &str)]) -> BTreeMap<(String, String), String> {
+    selected_anchors(&[("Cargo.toml", MANIFEST)], files, None, false)
+        .into_iter()
+        .flat_map(|(path, anchors)| {
+            anchors.into_iter().map(move |(name, identity)| {
+                let identity = SymbolIdentity::parse(identity.as_str()).expect("identity");
+                (
+                    (path.clone(), name),
+                    identity.qualified_path()[1..].join("/"),
+                )
+            })
+        })
+        .collect()
+}
+
+const OWNERS: &str = "pub struct Task; pub struct Holder<T>(T); pub enum Mode { On } pub union Bits { pub value: u8 } pub type Alias = Task; pub trait Run { fn go(&self) {} } pub mod prelude; pub mod types; mod user;";
+
+#[test]
+fn implementations_outside_the_type_module_take_the_type_identity() {
+    // #775: the written type of an implementation names its owner through the module's
+    // imports; the file's own declarations keep the file's module path.
+    let prelude = "pub use crate::types::Inner as Outer; pub use crate::types as renamed;";
+    let types = "pub struct Inner; pub mod nested { pub struct Deep; impl super::Inner { pub fn up(&self) {} } }";
+    for (user, expected) in [
+        (
+            "use crate::Task; impl Task { pub fn run(&self) { fn helper() {} } } fn local() {}",
+            &[
+                ("Task", "Task"),
+                ("Task::run", "Task/run"),
+                ("Task::run::helper", "Task/run/helper"),
+                ("local", "user/local"),
+            ][..],
+        ),
+        (
+            "use crate::Task as Job; impl Job { pub fn run(&self) {} }",
+            &[("Job", "Task"), ("Job::run", "Task/run")],
+        ),
+        (
+            "use crate::{types::{Inner, nested::Deep as Low}, Mode, Bits}; impl Inner { fn a(&self) {} } impl Low { fn b(&self) {} } impl Mode { fn c(&self) {} } impl Bits { fn d(&self) {} }",
+            &[
+                ("Inner::a", "types/Inner/a"),
+                ("Low::b", "types/nested/Deep/b"),
+                ("Mode::c", "Mode/c"),
+                ("Bits::d", "Bits/d"),
+            ],
+        ),
+        (
+            "use super::Holder; impl<T> Holder<T> { fn a(&self) {} } impl<T: Clone> Clone for Holder<T> { fn clone(&self) -> Self { loop {} } }",
+            &[
+                ("Holder", "Holder"),
+                ("Holder::a", "Holder/a"),
+                ("Holder::clone", "Holder/clone"),
+            ],
+        ),
+        (
+            "impl crate::Task { fn a(&self) {} } impl super::types::Inner { fn b(&self) {} }",
+            &[
+                ("crate::Task::a", "Task/a"),
+                ("super::types::Inner::b", "types/Inner/b"),
+            ],
+        ),
+        (
+            "use crate::types; impl types::Inner { fn a(&self) {} } impl self::types::nested::Deep { fn b(&self) {} }",
+            &[
+                ("types::Inner::a", "types/Inner/a"),
+                ("self::types::nested::Deep::b", "types/nested/Deep/b"),
+            ],
+        ),
+        (
+            "use crate::prelude::{Outer, renamed::nested::Deep}; impl Outer { fn a(&self) {} } impl Deep { fn b(&self) {} }",
+            &[
+                ("Outer::a", "types/Inner/a"),
+                ("Deep::b", "types/nested/Deep/b"),
+            ],
+        ),
+        (
+            "mod inner { use super::super::Task; impl Task { fn a(&self) {} } }",
+            &[("inner", "user/inner"), ("inner::Task::a", "Task/a")],
+        ),
+        (
+            "use derive::Error; pub struct Error; use crate::Task; impl Task { fn a(&self) {} } impl Error { fn b(&self) {} }",
+            &[("Task::a", "Task/a"), ("Error::b", "user/Error/b")],
+        ),
+        (
+            "#[cfg(unix)] use crate::Task; #[cfg(windows)] use crate::Mode as Task; impl Task { fn a(&self) {} }",
+            &[("Task::a", "Task/a")],
+        ),
+    ] {
+        let found = placed(&[
+            ("src/lib.rs", OWNERS),
+            ("src/prelude.rs", prelude),
+            ("src/types.rs", types),
+            ("src/user.rs", user),
+        ]);
+        for (name, path) in expected {
+            assert_eq!(
+                found
+                    .get(&("src/user.rs".to_owned(), (*name).to_owned()))
+                    .map(String::as_str),
+                Some(*path),
+                "{user}: {found:?}"
+            );
+        }
+        assert_eq!(
+            found[&(
+                "src/types.rs".to_owned(),
+                "nested::super::Inner::up".to_owned()
+            )],
+            "types/Inner/up"
+        );
+    }
+}
+
+#[test]
+fn implementations_without_one_established_owner_keep_their_module() {
+    for (user, name, path) in [
+        (
+            "use crate::*; impl Task { fn a(&self) {} }",
+            "Task::a",
+            "user/Task/a",
+        ),
+        (
+            "use crate::Alias; impl Alias { fn a(&self) {} }",
+            "Alias::a",
+            "user/Alias/a",
+        ),
+        (
+            "use std::vec::Vec; use crate::Run; impl Run for Vec<u8> { fn go(&self) {} }",
+            "Vec::go",
+            "user/Vec/go",
+        ),
+        (
+            "use crate::{Run, Task}; impl<Task> Run for Task { fn go(&self) {} }",
+            "Task::go",
+            "user/Task/go",
+        ),
+        (
+            "use crate::{Run, Task}; impl Run for &Task { fn go(&self) {} }",
+            "&Task::go",
+            "user/&Task/go",
+        ),
+        (
+            "#[cfg(custom)] use crate::Task; impl Task { fn a(&self) {} }",
+            "Task::a",
+            "user/Task/a",
+        ),
+        (
+            "use crate::Task; use crate::Mode as Task; impl Task { fn a(&self) {} }",
+            "Task::a",
+            "user/Task/a",
+        ),
+        (
+            "fn body() { use crate::Task; impl Task { fn a(&self) {} } }",
+            "body::Task::a",
+            "user/body/Task/a",
+        ),
+        (
+            "use crate::Missing; impl Missing { fn a(&self) {} }",
+            "Missing::a",
+            "user/Missing/a",
+        ),
+        (
+            "use self::loops as loops; impl loops::Task { fn a(&self) {} }",
+            "loops::Task::a",
+            "user/loops/Task/a",
+        ),
+    ] {
+        let found = placed(&[
+            ("src/lib.rs", OWNERS),
+            ("src/prelude.rs", ""),
+            ("src/types.rs", ""),
+            ("src/user.rs", user),
+        ]);
+        assert_eq!(
+            found
+                .get(&("src/user.rs".to_owned(), name.to_owned()))
+                .map(String::as_str),
+            Some(path),
+            "{user}: {found:?}"
+        );
+    }
+}
+
+const TWO_TASKS: &str = "pub struct Task; pub mod other { pub struct Task; } pub mod user;";
+
+#[test]
+fn implementations_follow_imports_past_values_modules_and_leading_lines() {
+    let cases = [
+        // A value import shares the name of the module that holds the implementation.
+        (
+            vec![
+                ("src/lib.rs", "pub struct Task; pub mod format;"),
+                ("src/format.rs", "mod parse; pub use parse::{parse, Wide};"),
+                (
+                    "src/format/parse.rs",
+                    "use crate::Task; pub struct Wide; pub fn parse() {} impl Task { fn a(&self) {} } impl super::Wide { fn b(&self) {} }",
+                ),
+            ],
+            "src/format/parse.rs",
+        ),
+        (
+            vec![
+                ("src/lib.rs", TWO_TASKS),
+                (
+                    "src/user.rs",
+                    "\n\n  use crate::Task;\nimpl Task { fn a(&self) {} }\n",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        (
+            vec![
+                ("src/lib.rs", TWO_TASKS),
+                (
+                    "src/user.rs",
+                    "// Comment first.\nuse crate::Task;\nimpl Task { fn a(&self) {} }\n",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        // A block's imports apply to the block alone.
+        (
+            vec![
+                ("src/lib.rs", TWO_TASKS),
+                (
+                    "src/user.rs",
+                    "const _: () = { use crate::other::Task; }; use crate::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+    ];
+    assert_task_owner(&cases);
+}
+
+#[test]
+fn implementations_follow_the_active_condition() {
+    let cases = [
+        // An inactive module leaves its name to the import of the active condition.
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "#[cfg(windows)] pub mod imp { pub struct Task; } #[cfg(unix)] use crate as imp; pub struct Task; pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::imp::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "pub mod imp { #![cfg(windows)] pub struct Task; } use crate as imp; pub struct Task; pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::imp::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        // An inactive glob competes with nothing.
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "#[cfg(custom)] pub struct Task; #[cfg(windows)] use other::*; pub mod other { pub struct Task; } pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        // An unknown condition without a competing import names one type.
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "#[cfg(custom)] pub struct Task; pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+    ];
+    assert_task_owner(&cases);
+}
+
+/// Each case's implementation of `Task` in the named file belongs to the library's `Task`.
+fn assert_task_owner(cases: &[(Vec<(&str, &str)>, &str)]) {
+    for (files, path) in cases {
+        let found = placed(files);
+        assert_eq!(
+            found
+                .get(&((*path).to_owned(), "Task::a".to_owned()))
+                .map(String::as_str),
+            Some("Task/a"),
+            "{files:?}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn implementations_refuse_competing_names_and_blocks() {
+    for (library, user) in [
+        // Beside a declaration with an unknown condition the import can be the type.
+        (
+            "#[cfg(custom)] pub struct Task; #[cfg(not(custom))] use other::Task; pub mod other { pub struct Task; } pub mod user;",
+            "use crate::Task; impl Task { fn a(&self) {} }",
+        ),
+        // A module of unknown condition competes with an import of its name.
+        (
+            "#[cfg(custom)] pub mod imp { pub struct Task; } #[cfg(not(custom))] use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        (
+            "#[cfg(custom)] pub mod imp { pub struct Task; } use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        (
+            "pub mod imp { #![cfg(custom)] pub struct Task; } #[cfg(not(custom))] use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        (
+            "pub mod imp { #![cfg(custom)] pub struct Task; } use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        // A glob can supply a name whose declaration has an unknown condition.
+        (
+            "#[cfg(custom)] pub struct Task; #[cfg(not(custom))] use other::*; pub mod other { pub struct Task; } pub mod user;",
+            "use crate::Task; impl Task { fn a(&self) {} }",
+        ),
+        (
+            "#[cfg(custom)] pub mod imp { pub struct Task; } use other::*; pub mod other { pub mod imp { pub struct Task; } } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        // Two imports of one name refuse it, whatever a shorter path names.
+        (
+            "pub mod first { pub struct Task; } pub mod second { pub struct Task; } pub mod facade { pub use crate::first::Task; pub use crate::second::Task; } pub mod user;",
+            "use crate::facade::Task; impl Task { fn a(&self) {} }",
+        ),
+        // A block reads its own names, whatever the file imports.
+        (
+            TWO_TASKS,
+            "use crate::Task; const _: () = { use crate::other::Task; impl Task { fn a(&self) {} } };",
+        ),
+        (
+            TWO_TASKS,
+            "use crate::Task; const _: () = { use crate::other::*; impl Task { fn a(&self) {} } };",
+        ),
+        (
+            TWO_TASKS,
+            "use crate::Task; static VALUE: u8 = { use crate::other::Task; impl Task { fn a(&self) {} } 1 };",
+        ),
+        (
+            TWO_TASKS,
+            "use crate::Task; enum Kind { One = { use crate::other::Task; impl Task { fn a(&self) {} } 1 } }",
+        ),
+        (
+            TWO_TASKS,
+            "use crate::Task; fn body() { use crate::other::Task; impl Task { fn a(&self) {} } }",
+        ),
+        // A type declared in a block is no item of its module.
+        (
+            "pub fn body() { pub struct Task; } pub mod user;",
+            "use crate::body::Task; impl Task { fn a(&self) {} }",
+        ),
+        (
+            "const _: () = { pub struct Task; }; pub mod user;",
+            "use crate::Task; impl Task { fn a(&self) {} }",
+        ),
+    ] {
+        let found = placed(&[("src/lib.rs", library), ("src/user.rs", user)]);
+        assert!(
+            found
+                .iter()
+                .filter(|((path, _), _)| path == "src/user.rs")
+                .all(|(_, path)| path.starts_with("user/")),
+            "{user}: {found:?}"
+        );
+    }
+}

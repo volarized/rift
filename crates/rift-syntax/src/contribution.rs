@@ -8,6 +8,7 @@ use rift_core::{
     SymbolId, TreeRevision, declaration_address, encode_path,
 };
 use rift_error::RiftError;
+use rift_protocol::identity::SymbolIdentity;
 use rift_provider::{ProviderPublication, PublicationLimits};
 
 use crate::{SyntaxDocument, SyntaxFacts};
@@ -55,6 +56,8 @@ pub struct DocumentPlacement {
     unit: SourceUnitId,
     identity_path: String,
     identity_anchors: BTreeMap<String, SymbolId>,
+    module: Option<SymbolId>,
+    module_path: Vec<String>,
     aliases: Vec<PlacedAlias>,
     logical_declarations: BTreeMap<String, LogicalDeclaration>,
 }
@@ -72,6 +75,8 @@ impl DocumentPlacement {
             unit,
             identity_path: identity_path.into(),
             identity_anchors: BTreeMap::new(),
+            module: None,
+            module_path: Vec::new(),
             aliases: Vec::new(),
             logical_declarations: BTreeMap::new(),
         }
@@ -109,6 +114,7 @@ impl DocumentPlacement {
         use get_size2::GetSize;
         let (origin, tracker) = self.origin.get_heap_size_with_tracker(tracker);
         let (unit, tracker) = self.unit.get_heap_size_with_tracker(tracker);
+        let (module, tracker) = self.module.get_heap_size_with_tracker(tracker);
         let (anchors, tracker) = rift_protocol::retained_map_material(
             &self.identity_anchors,
             tracker,
@@ -127,6 +133,11 @@ impl DocumentPlacement {
             origin,
             unit,
             self.identity_path.capacity(),
+            module,
+            self.module_path
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+            self.module_path.iter().map(String::capacity).sum(),
             anchors,
             mappings,
             self.aliases
@@ -177,6 +188,30 @@ impl DocumentPlacement {
     pub fn with_identity_anchors(mut self, anchors: BTreeMap<String, SymbolId>) -> Self {
         self.identity_anchors = anchors;
         self
+    }
+
+    /// Supplies the established module of the document; an identity that is not
+    /// canonical establishes none.
+    #[must_use]
+    pub fn with_module(mut self, module: Option<SymbolId>) -> Self {
+        let parsed = module
+            .as_ref()
+            .and_then(|module| SymbolIdentity::parse(module.as_str()).ok());
+        self.module_path = parsed.map_or_else(Vec::new, |module| module.qualified_path().to_vec());
+        self.module = module.filter(|_| !self.module_path.is_empty());
+        self
+    }
+
+    /// The established module of the document.
+    #[must_use]
+    pub const fn module(&self) -> Option<&SymbolId> {
+        self.module.as_ref()
+    }
+
+    /// The path of the established module, from its crate name on; empty without one.
+    #[must_use]
+    pub fn module_path(&self) -> &[String] {
+        &self.module_path
     }
 
     /// Returns the current established identity for one qualified name, which every
@@ -415,7 +450,18 @@ impl SyntaxPublicationBuilder {
         additions: &mut Vec<Contribution>,
     ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
-        let mut ordinals = BTreeMap::<&str, usize>::new();
+        let mut ordinals = placement
+            .aliases
+            .iter()
+            .map(|alias| (alias.qualified_name.as_str(), 0))
+            .collect::<BTreeMap<_, usize>>();
+        // A declaration of the name can be another symbol, so each alias takes the next
+        // ordinal after the file's declarations of it.
+        for symbol in syntax.symbols() {
+            if let Some(ordinal) = ordinals.get_mut(symbol.qualified_name.as_str()) {
+                *ordinal = symbol.declaration_ordinal.saturating_add(1).max(*ordinal);
+            }
+        }
         for alias in &placement.aliases {
             let ordinal = ordinals.entry(&alias.qualified_name).or_default();
             let identity = declaration_address(
@@ -588,9 +634,9 @@ impl crate::SyntaxSymbol {
 #[cfg(test)]
 mod tests {
     use crate::provider::SyntaxLimits;
-    use rift_core::{ProjectPath, ProviderRevision, SourceRevision, TreeRevision};
+    use rift_core::{ProjectPath, ProviderRevision, SourceRevision, SymbolId, TreeRevision};
 
-    use super::SyntaxPublicationBuilder;
+    use super::{DocumentPlacement, PlacedAlias, SyntaxPublicationBuilder};
     use crate::{RustSyntaxProvider, SyntaxProvider, SyntaxSource};
 
     fn publication(value: u64) -> ProviderRevision {
@@ -708,6 +754,73 @@ mod tests {
                 (address("sys::open"), Some(address("sys"))),
                 (address("sys#1"), None),
                 (address("sys::open#1"), Some(address("sys#1"))),
+            ]
+        );
+    }
+
+    /// An export alias that spells the name of a declaration keeps a key of its own, after
+    /// every declaration of that name, whichever of the two the source writes first.
+    #[test]
+    fn export_aliases_publish_keys_after_the_declarations_they_share_a_name_with() {
+        let provider = RustSyntaxProvider::default();
+        let path = ProjectPath::new("src/facade.rs").expect("path");
+        let text = "impl Task { pub fn start() {} }\npub use crate::task::{Job, Task};\nimpl Clone for Task { fn clone(&self) -> Self { Task } }\n";
+        let document = provider
+            .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
+            .expect("syntax document");
+        let alias = |name: &str, module: &str| PlacedAlias {
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            identity: SymbolId::new(format!("rift://symbol/local/rust/fixture/{module}/{name}"))
+                .expect("alias identity"),
+            target_identity: format!("rift://symbol/rust/src/task.rs/{name}"),
+            range: crate::ByteRange { start: 32, end: 65 },
+            visibility: None,
+        };
+        let placement = DocumentPlacement::project(&document)
+            .expect("placement")
+            .with_aliases(vec![
+                alias("Job", "facade"),
+                alias("Task", "facade"),
+                alias("Task", "again"),
+            ]);
+        let mut builder = SyntaxPublicationBuilder::new(
+            publication(1),
+            source_revision(1),
+            tree_revision(1),
+            rift_provider::PublicationLimits::default(),
+        )
+        .expect("builder");
+        builder
+            .add_document_placed(&document, &placement)
+            .expect("document");
+        let publication = builder.build().expect("distinct keys publish");
+        let keys = publication
+            .contributions()
+            .iter()
+            .map(|contribution| {
+                (
+                    contribution.key().reference().symbol().as_str().to_owned(),
+                    contribution
+                        .edges()
+                        .iter()
+                        .map(|edge| edge.target().symbol().as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let address = |name: &str| format!("rift://symbol/rust/src/facade.rs/{name}");
+        let target = |name: &str| vec![format!("rift://symbol/rust/src/task.rs/{name}")];
+        assert_eq!(
+            keys,
+            [
+                (address("Task"), vec![]),
+                (address("Task::start"), vec![]),
+                (address("Task#1"), vec![]),
+                (address("Task::clone"), vec![]),
+                (address("Job"), target("Job")),
+                (address("Task#2"), target("Task")),
+                (address("Task#3"), target("Task")),
             ]
         );
     }

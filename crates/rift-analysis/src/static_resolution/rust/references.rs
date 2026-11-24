@@ -145,13 +145,33 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Import, target)?;
-        if let Some(source) = self.rust.import_source(file, range, work) {
-            let source = self.occurrence(file, range, range, ReferenceRole::Import, source)?;
-            if let rift_provider::NormalizedTarget::Symbol(from) = source.target {
-                occurrence.edge_from = Some(from);
-            }
-        }
+        occurrence.edge_from = self.rust_module_from(file, range, work);
         Some(occurrence)
+    }
+
+    /// The module whose `use` declaration stands at `range`. A reexport declares its name
+    /// there as well, and that name imports nothing.
+    pub(in crate::static_resolution) fn rust_module_from(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<rift_core::SymbolId> {
+        let imported = file
+            .facts
+            .rust_uses()
+            .iter()
+            .find(|imported| work.charge() && imported.range == range)?;
+        let scope = crate::analyzer::namespace::rust_file_scope(file.document.source)?;
+        if imported.scope == scope {
+            return file.document.placement.module().cloned();
+        }
+        let source = self.rust.import_source(file, range, work)?;
+        let source = self.occurrence(file, range, range, ReferenceRole::Import, source)?;
+        match source.target {
+            rift_provider::NormalizedTarget::Symbol(from) => Some(from),
+            rift_provider::NormalizedTarget::Contribution(_) => None,
+        }
     }
 
     fn rust_edge(
@@ -558,7 +578,35 @@ impl<'source> Namespaces<'source> {
         })
     }
 
+    /// The declaration that contains `symbol`. The header of an implementation is a facet of
+    /// the type it names, so a module holding it contains it only when it declares the type.
     fn container(
+        &self,
+        file: &File<'source>,
+        symbol: &'source SyntaxSymbol,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let parent = self.parent(file, symbol, work)?;
+        if symbol.kind != "impl_item" {
+            return Some(parent);
+        }
+        let path = Target {
+            file: file.document,
+            symbol,
+        }
+        .admitted_path()?;
+        let holder = parent.admitted_path()?;
+        let declares = path
+            .split_last()
+            .is_some_and(|(_, owner)| owner == holder.as_slice());
+        // The written path of a foreign type keeps its header below the module of the block.
+        let foreign = path.len() > holder.len()
+            && path.starts_with(&holder)
+            && !self.types.contains_key(&path);
+        (declares || foreign).then_some(parent)
+    }
+
+    fn parent(
         &self,
         file: &File<'source>,
         symbol: &SyntaxSymbol,

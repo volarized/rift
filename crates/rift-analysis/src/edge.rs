@@ -503,16 +503,27 @@ impl EdgeStore {
     /// A zero cap publishes no edges.
     #[must_use]
     pub fn build_capped(graph: &NormalizedGraph, edges_max: usize) -> Self {
-        Self::build_with_spans(graph, edges_max).0
+        Self::build_placed(graph, BTreeMap::new(), edges_max)
+    }
+
+    /// Builds graph adjacency whose units' modules are `modules` where placement
+    /// established one, else the common parent of the unit's declarations.
+    pub(crate) fn build_placed(
+        graph: &NormalizedGraph,
+        modules: BTreeMap<SourceUnitId, SymbolId>,
+        edges_max: usize,
+    ) -> Self {
+        Self::build_with_spans(graph, modules, edges_max).0
     }
 
     /// Builds graph adjacency and adds static edges with the same definition spans.
     pub(crate) fn build_resolving(
         graph: &NormalizedGraph,
+        modules: BTreeMap<SourceUnitId, SymbolId>,
         edges_max: usize,
         resolve: impl FnOnce() -> StaticResolution,
     ) -> (Self, StaticResolution) {
-        let (mut store, spans) = Self::build_with_spans(graph, edges_max);
+        let (mut store, spans) = Self::build_with_spans(graph, modules, edges_max);
         let resolution = resolve();
         store.add_static(
             &spans,
@@ -523,11 +534,18 @@ impl EdgeStore {
         (store, resolution)
     }
 
-    fn build_with_spans(graph: &NormalizedGraph, edges_max: usize) -> (Self, DefinitionSpans) {
+    fn build_with_spans(
+        graph: &NormalizedGraph,
+        modules: BTreeMap<SourceUnitId, SymbolId>,
+        edges_max: usize,
+    ) -> (Self, DefinitionSpans) {
         let UnitDefinitions {
             spans,
-            edge_modules,
+            mut edge_modules,
         } = UnitDefinitions::build(graph);
+        // A declaration can belong to a type of another module, so the module placement
+        // established decides before the common parent of the declarations.
+        edge_modules.extend(modules);
         let mut outgoing: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut incoming: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut budget = LoopBudget::new(edges_max);
@@ -1105,7 +1123,8 @@ mod tests {
         let module = symbol("rift://symbol/local/rust/fixture");
         for cap in 0..=6 {
             let before = DEFINITION_BUILDS.get();
-            let (shared, _) = EdgeStore::build_resolving(&graph, cap, resolution);
+            let (shared, _) =
+                EdgeStore::build_resolving(&graph, super::BTreeMap::new(), cap, resolution);
             assert_eq!(DEFINITION_BUILDS.get() - before, 1, "cap {cap}");
 
             let mut separate = EdgeStore::build_capped(&graph, cap);

@@ -256,30 +256,7 @@ impl WorkspaceSemantics {
         if !input.owner().is_local() {
             return errors::analysis::package_input_identity_invalid().fail();
         }
-        let captured = input
-            .files()
-            .iter()
-            .map(|source| (source.path(), source.text()))
-            .collect::<BTreeMap<_, _>>();
-        if documents.len() > captured.len() {
-            return errors::analysis::package_input_identity_invalid().fail();
-        }
-        let mut selected = Vec::with_capacity(documents.len());
-        let mut paths = BTreeSet::new();
-        for document in documents {
-            if !paths.insert(document.path())
-                || captured
-                    .get(document.path())
-                    .is_none_or(|source| source.len() != document.source().len())
-            {
-                return errors::analysis::package_input_identity_invalid().fail();
-            }
-            selected.push(SelectedFile {
-                path: document.path(),
-                source: document.source(),
-                syntax: document.syntax(),
-            });
-        }
+        let selected = selected_sources(&input, documents)?;
         let mut namespace = prepare_context(&input, &selected);
         let mut placed = documents
             .iter()
@@ -313,6 +290,7 @@ impl WorkspaceSemantics {
                 .placement
                 .clone()
                 .with_identity_anchors(namespace.anchors.remove(path).unwrap_or_default())
+                .with_module(namespace.rust_modules.remove(path))
                 .with_logical_declarations(namespace.mappings.remove(path).unwrap_or_default())
                 .with_aliases(aliases.remove(path).unwrap_or_default());
         }
@@ -354,6 +332,38 @@ impl WorkspaceSemantics {
             outside_namespaces,
         })
     }
+}
+
+/// The selected documents, each one an admitted source of the input named once.
+fn selected_sources<'source>(
+    input: &NamespaceInput<'source>,
+    documents: &[&'source IndexedFile],
+) -> Result<Vec<SelectedFile<'source>>, RiftError> {
+    let captured = input
+        .files()
+        .iter()
+        .map(|source| (source.path(), source.text()))
+        .collect::<BTreeMap<_, _>>();
+    if documents.len() > captured.len() {
+        return errors::analysis::package_input_identity_invalid().fail();
+    }
+    let mut selected = Vec::with_capacity(documents.len());
+    let mut paths = BTreeSet::new();
+    for document in documents {
+        if !paths.insert(document.path())
+            || captured
+                .get(document.path())
+                .is_none_or(|source| source.len() != document.source().len())
+        {
+            return errors::analysis::package_input_identity_invalid().fail();
+        }
+        selected.push(SelectedFile {
+            path: document.path(),
+            source: document.source(),
+            syntax: document.syntax(),
+        });
+    }
+    Ok(selected)
 }
 
 #[cfg(test)]
