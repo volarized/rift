@@ -29,6 +29,7 @@ pub(super) fn prepare(
     let mut prepared = PreparedNamespace::default();
     // Every entry of the package is decided over the files captured once here.
     let files = PackageFiles::captured(input);
+    let mut imported = BTreeSet::new();
     if let Some(metadata) = &metadata {
         let entries = ["typescript", "javascript"].map(|language| {
             let has_files = selected
@@ -41,7 +42,8 @@ pub(super) fn prepare(
         // The file an admitted observation names holds its module before any file the
         // manifest alone names. Two admitted observations of one module still share its
         // identity (#995).
-        let observed = observations::observed_files(input, &files, metadata, selected);
+        imported = observations::import_builds(input, &files, metadata, selected, &entries[1].1);
+        let observed = observations::observed_files(input, &files, metadata, selected, &imported);
         let entries = entries.map(|(language, modules)| {
             let kept = modules
                 .into_iter()
@@ -101,7 +103,14 @@ pub(super) fn prepare(
         }
         map_declared_types(input, &files, metadata, selected, &mut prepared);
     }
-    observations::prepare(input, &files, metadata.as_ref(), selected, &mut prepared);
+    observations::prepare(
+        input,
+        &files,
+        metadata.as_ref(),
+        selected,
+        &imported,
+        &mut prepared,
+    );
     if input.owner().is_local() {
         for file in selected {
             let language = file.syntax.language();

@@ -3950,6 +3950,36 @@ fn test_commonjs_module_value_aliases_and_assigned_values_resolve() {
     assert_eq!(index.edges().dropped_edges(), 0);
 }
 
+#[test]
+fn test_commonjs_module_value_alias_written_twice_calls_neither_value() {
+    for alias in ["app", "exportsApi", "Objects", "module_exports"] {
+        let library = format!(
+            "var {alias} = module.exports = {{}};
+{alias}.run = first;
+{alias}.once = first;
+function first() {{}}
+function second() {{}}
+function swap() {{ {alias}.run = second }}
+"
+        );
+        let main = "var library = require('./library');
+function twice() { library.run() }
+function once() { library.once() }
+";
+        let (_directory, index) = workspace(&[("library.js", &library), ("main.js", main)]);
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "main.js/once", "library.js/first"),
+            "{alias}"
+        );
+        for target in ["library.js/first", "library.js/second"] {
+            assert!(
+                !has_edge(&index, EdgeKind::Calls, "main.js/twice", target),
+                "{alias} {target}"
+            );
+        }
+    }
+}
+
 /// Imports that bind a key to a symbol value, and the key.
 const SYMBOL_KEYS: &[(&str, &str)] = &[
     ("const { kInternals } = require('./keys.js')", "kInternals"),

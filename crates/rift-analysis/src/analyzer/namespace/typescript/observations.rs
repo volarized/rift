@@ -10,10 +10,10 @@ pub(super) fn prepare(
     files: &PackageFiles<'_>,
     metadata: Option<&PackageMetadata>,
     selected: &[SelectedFile<'_>],
+    imported: &BTreeSet<&str>,
     prepared: &mut PreparedNamespace,
 ) {
     let mut conflicts = BTreeSet::new();
-    let imported = import_builds(input, metadata);
     for observation in input.modules() {
         // A build observed under `import` holds the module; the decision is made, not unknown.
         if observation.declarations().is_empty()
@@ -102,27 +102,15 @@ pub(super) fn observed_files<'input>(
     files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     selected: &[SelectedFile<'_>],
+    imported: &BTreeSet<&str>,
 ) -> BTreeMap<(&'static str, &'input str), BTreeSet<&'input ProjectPath>> {
     let mut observed = BTreeMap::<_, BTreeSet<_>>::new();
-    let imported = import_builds(input, Some(metadata));
     for observation in input.modules() {
-        let Some(implementation) = selected_file(input, selected, observation.implementation())
-            .filter(|file| file.syntax.language().name == "javascript")
-        else {
+        let Some(implementation) = javascript_file(input, selected, observation) else {
             continue;
         };
         let module = observation.module();
-        let joined = observation
-            .declarations()
-            .iter()
-            .filter(|source| {
-                selected_file(input, selected, **source).is_some_and(|file| {
-                    file.syntax.language().name == "typescript"
-                        && package_observation(files, metadata, observation, file)
-                })
-            })
-            .map(|source| source.path())
-            .collect::<BTreeSet<_>>();
+        let joined = joined_files(input, files, metadata, selected, observation);
         let admitted = if observation.declarations().is_empty() {
             let import = observation.export_conditions().contains(&"import");
             if imported.contains(module) {
@@ -148,21 +136,71 @@ pub(super) fn observed_files<'input>(
     observed
 }
 
-/// Modules a build observed under `import` holds, as the manifest's conditions describe it.
-/// Observations that join declarations are judged with them.
-fn import_builds<'input>(
+/// Modules a build observed under `import` holds: the manifest's conditions describe that
+/// build, its file is selected and is the one the static entries give the module, and no
+/// admitted observation joins declarations to the module.
+pub(super) fn import_builds<'input>(
     input: &NamespaceInput<'input>,
-    metadata: Option<&PackageMetadata>,
+    files: &PackageFiles<'_>,
+    metadata: &PackageMetadata,
+    selected: &[SelectedFile<'_>],
+    entries: &BTreeMap<ProjectPath, Option<String>>,
 ) -> BTreeSet<&'input str> {
+    let joined = input
+        .modules()
+        .iter()
+        .filter(|observation| {
+            javascript_file(input, selected, observation).is_some()
+                && !joined_files(input, files, metadata, selected, observation).is_empty()
+        })
+        .map(|observation| observation.module())
+        .collect::<BTreeSet<_>>();
     input
         .modules()
         .iter()
         .filter(|observation| {
+            let module = observation.module();
             observation.declarations().is_empty()
                 && observation.export_conditions().contains(&"import")
-                && metadata.is_some_and(|metadata| describes_build(metadata, observation))
+                && !joined.contains(module)
+                && javascript_file(input, selected, observation).is_some()
+                && entries
+                    .get(observation.implementation().path())
+                    .map(Option::as_deref)
+                    == Some(Some(module))
+                && describes_build(metadata, observation)
         })
         .map(|observation| observation.module())
+        .collect()
+}
+
+fn javascript_file<'selected, 'source>(
+    input: &NamespaceInput<'_>,
+    selected: &'selected [SelectedFile<'source>],
+    observation: &NamespaceModule<'_>,
+) -> Option<&'selected SelectedFile<'source>> {
+    selected_file(input, selected, observation.implementation())
+        .filter(|file| file.syntax.language().name == "javascript")
+}
+
+/// The selected declaration files the observation joins to its module.
+fn joined_files<'input>(
+    input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
+    metadata: &PackageMetadata,
+    selected: &[SelectedFile<'_>],
+    observation: &NamespaceModule<'input>,
+) -> BTreeSet<&'input ProjectPath> {
+    observation
+        .declarations()
+        .iter()
+        .filter(|source| {
+            selected_file(input, selected, **source).is_some_and(|file| {
+                file.syntax.language().name == "typescript"
+                    && package_observation(files, metadata, observation, file)
+            })
+        })
+        .map(|source| source.path())
         .collect()
 }
 

@@ -1809,7 +1809,11 @@ fn observed_module_builds_hold_their_module_before_main() {
         ("index.d.ts", "export declare function load(): void;"),
     ];
     let holders = |observed: Option<(&str, &[&str])>| {
-        let prepared = observed_declarations(metadata, &files, observed);
+        let observed = observed
+            .map(|(entry, conditions)| (entry, conditions, true))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let prepared = observed_declarations(metadata, &files, &observed);
         prepared
             .anchors
             .iter()
@@ -1832,7 +1836,7 @@ fn observed_module_builds_hold_their_module_before_main() {
 fn observed_declarations(
     metadata: &str,
     files: &[(&str, &str)],
-    observed: Option<(&str, &[&str])>,
+    observed: &[(&str, &[&str], bool)],
 ) -> super::PreparedNamespace {
     let owner = SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react/javascript/react/load")
         .expect("package owner")
@@ -1868,9 +1872,10 @@ fn observed_declarations(
     };
     let declarations = [source("index.d.ts")];
     let observations = observed
-        .into_iter()
-        .map(|(entry, conditions)| {
-            crate::NamespaceModule::new("react", source(entry), &declarations, conditions)
+        .iter()
+        .map(|(entry, conditions, joined)| {
+            let declarations = if *joined { &declarations[..] } else { &[] };
+            crate::NamespaceModule::new("react", source(entry), declarations, conditions)
         })
         .collect::<Vec<_>>();
     let manifest = ProjectPath::new("package.json").expect("manifest path");
@@ -2152,21 +2157,77 @@ fn observed_entries_hold_their_module_before_static_conditions() {
             .iter()
             .map(|(path, conditions)| (*path, conditions.as_slice()))
             .collect::<Vec<_>>();
-        let held = observed_module_files(dual, &files, &observations);
-        // A refused observation leaves the module to the static conditions of main.
-        assert!(held.len() <= 1, "{observed:?} {held:?}");
-        assert!(held.is_empty() || held == expected, "{observed:?} {held:?}");
+        assert_eq!(
+            observed_module_files(dual, &files, &observations),
+            expected,
+            "{observed:?}"
+        );
     }
-    assert_eq!(
-        observed_module_files(dual, &files, &[("a.cjs", &["node", "require"])]),
-        ["a.cjs"],
-        "the required file keeps its identity and its forwards"
-    );
     let window = [("w.js", "exports.open = function () {};")];
     assert!(
-        observed_module_files(browser, &window, &[("w.js", &["browser"])]).len() <= 1,
-        "one file holds the observed module"
+        observed_module_files(browser, &window, &[("w.js", &["browser"])]).is_empty(),
+        "only a [node, require] observation holds a module without declarations"
     );
+}
+
+#[test]
+fn a_required_build_holds_the_module_no_import_build_takes() {
+    let synchronous = r#"{"name":"react","version":"19.3.0","exports":{".":{"module-sync":"./m.js","import":"./i.mjs","require":"./c.cjs"}}}"#;
+    let bundled = r#"{"name":"react","version":"19.3.0","exports":{".":{"browser":{"import":"./i.mjs"},"require":"./c.cjs"}}}"#;
+    let build = "exports.open = function () {};";
+    let module = "export function open() {}";
+    for (metadata, files, import) in [
+        (
+            synchronous,
+            vec![("m.js", module), ("i.mjs", module), ("c.cjs", build)],
+            &["node", "import"][..],
+        ),
+        (
+            bundled,
+            vec![("i.mjs", module), ("c.cjs", build)],
+            &["browser", "import"][..],
+        ),
+        (
+            synchronous,
+            vec![("i.mjs", "export function open("), ("c.cjs", build)],
+            &["node", "import"][..],
+        ),
+    ] {
+        let required: (&str, &[&str]) = ("c.cjs", &["node", "require"]);
+        for observations in [
+            vec![required],
+            vec![required, ("i.mjs", import)],
+            vec![("i.mjs", import), required],
+        ] {
+            assert_eq!(
+                observed_module_files(metadata, &files, &observations),
+                ["c.cjs"],
+                "{metadata} {observations:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_observation_with_declarations_holds_its_module_before_an_import_build() {
+    let metadata = r#"{"name":"react","version":"19.3.0","exports":{".":{"require":{"types":"./index.d.ts","default":"./a.cjs"},"import":"./b.mjs"}}}"#;
+    let files = [
+        ("a.cjs", "exports.load = function () {};"),
+        ("b.mjs", "export function load() {}"),
+        ("index.d.ts", "export declare function load(): void;"),
+    ];
+    let joined: (&str, &[&str], bool) = ("a.cjs", &["node", "require"], true);
+    let import: (&str, &[&str], bool) = ("b.mjs", &["node", "import"], false);
+    let bare: (&str, &[&str], bool) = ("a.cjs", &["node", "require"], false);
+    for observed in [
+        vec![joined],
+        vec![joined, import],
+        vec![import, joined],
+        vec![import, joined, bare],
+    ] {
+        let prepared = observed_declarations(metadata, &files, &observed);
+        assert_eq!(module_holders(&prepared), ["a.cjs"], "{observed:?}");
+    }
 }
 
 fn observed_module_files(
@@ -2175,6 +2236,11 @@ fn observed_module_files(
     observations: &[(&str, &[&str])],
 ) -> Vec<String> {
     let (prepared, _) = commonjs_observed(metadata, files, observations);
+    module_holders(&prepared)
+}
+
+/// The JavaScript files that hold the package's own module.
+fn module_holders(prepared: &super::PreparedNamespace) -> Vec<String> {
     prepared
         .anchors
         .iter()

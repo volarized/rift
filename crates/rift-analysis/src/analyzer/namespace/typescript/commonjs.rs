@@ -147,20 +147,28 @@ fn entry_matches(
 }
 
 fn checked_names(file: &SelectedFile<'_>) -> BTreeSet<String> {
-    let bindings = file.syntax.export_bindings().unwrap_or_default();
+    let bindings = file
+        .syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter(|binding| {
+            binding.kind == SyntaxExportKind::Named
+                && binding.source.is_none()
+                && binding.local == binding.exported
+        })
+        .map(|binding| (binding.range, binding.local, binding.container.as_deref()))
+        .collect::<BTreeSet<_>>();
     file.syntax
         .symbols()
         .iter()
         .filter(|symbol| {
             symbol.syntax_element_kind == Some("assignment_expression")
-                && bindings.iter().any(|binding| {
-                    binding.kind == SyntaxExportKind::Named
-                        && binding.source.is_none()
-                        && binding.range == symbol.item_range
-                        && binding.local == symbol.name_range
-                        && binding.exported == symbol.name_range
-                        && binding.container.as_deref() == export_container(symbol)
-                })
+                && bindings.contains(&(
+                    symbol.item_range,
+                    symbol.name_range,
+                    export_container(symbol),
+                ))
         })
         .map(|symbol| symbol.qualified_name.clone())
         .collect()

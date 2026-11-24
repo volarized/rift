@@ -972,11 +972,13 @@ impl<'source> File<'source> {
 
     /// Whether no later property of the exported literal can replace `pair`.
     pub(super) fn exported_pair_is_settled(&self, pair: Target<'source>, work: &mut Work) -> bool {
-        self.document
-            .facts
-            .export_bindings()
-            .unwrap_or_default()
-            .iter()
+        pair.symbol
+            .name_range
+            .and_then(|range| self.text(range))
+            .zip(self.exports.as_ref())
+            .and_then(|(name, exports)| exports.named.get(name))
+            .into_iter()
+            .flatten()
             .any(|binding| {
                 work.charge()
                     && binding.exported == pair.symbol.name_range
@@ -1079,10 +1081,12 @@ impl<'source> File<'source> {
         else {
             return true;
         };
-        if ["exports", "module.exports", "Object."]
-            .iter()
-            .any(|prefix| written.starts_with(prefix))
-        {
+        // Only a whole leading name is the module's own object, not `exportsApi`.
+        if ["exports", "module.exports", "Object"].iter().any(|name| {
+            written.strip_prefix(name).is_some_and(|rest| {
+                !rest.starts_with(|next: char| next.is_alphanumeric() || matches!(next, '_' | '$'))
+            })
+        }) {
             return true;
         }
         let Some((alias, _)) = written.split_once('.') else {
