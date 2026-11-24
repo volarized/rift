@@ -1564,6 +1564,44 @@ mod tests {
         );
     }
 
+    /// Two aliases that name each other through no container are invalid, and each is
+    /// reported. The vendored `ty_python_semantic` reduces the nesting of an alias cycle
+    /// that has not converged (`vendor/ty_python_semantic/ORIGIN.md`); that reduction
+    /// drops a bare cycle marker from a union, so it must leave these values alone.
+    #[test]
+    fn test_the_diagnostic_pull_reports_both_aliases_of_an_unguarded_cycle() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("aliases.py");
+        std::fs::write(
+            &path,
+            "from typing import TypeAlias, Union\n\nFirst: TypeAlias = Union[int, \"Second\"]\nSecond: TypeAlias = Union[str, \"First\"]\n",
+        )
+        .expect("fixture file");
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": uri_of(&path) } },
+        });
+        let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
+        else {
+            panic!("the pull must reply");
+        };
+        let items = reply["result"]["items"]
+            .as_array()
+            .expect("a full report carries items");
+        let cyclic: Vec<_> = items
+            .iter()
+            .filter(|item| item["code"] == serde_json::json!("cyclic-type-alias-definition"))
+            .map(|item| item["range"]["start"]["line"].clone())
+            .collect();
+        assert_eq!(
+            cyclic,
+            [serde_json::json!(2), serde_json::json!(3)],
+            "ty reports each alias of the cycle: {reply:#}"
+        );
+    }
+
     /// References answer across files with the caller's own spellings, and
     /// a position resolving no symbol answers the empty list.
     #[test]
