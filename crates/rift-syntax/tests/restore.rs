@@ -4,8 +4,8 @@ use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_syntax::{
     ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind, StaticFacts,
-    StaticFactsParts, StaticMemberAlias, StaticMemberCopy, SyntaxDocument, SyntaxFacts,
-    SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
+    StaticFactsParts, StaticLiteralMember, StaticMemberAlias, StaticMemberCopy, SyntaxDocument,
+    SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
 };
 
 fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
@@ -230,6 +230,52 @@ fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes()
     ] {
         assert_eq!(checked(source), None, "{source}");
     }
+}
+
+#[test]
+fn test_literal_members_name_their_literal_and_its_holder() {
+    let source = "const own = ({ key: 1 } as const);
+run({ short, go() {} });
+type One = { a: 1 };
+type Two = { b: 1 } | { b: 2 };
+interface Body { c: 1; typed: { d: 1 } }
+";
+    let document = parsed(ShippedLanguage::TypeScript, source);
+    let facts = document.facts().static_facts().expect("static facts");
+    let text = |range: ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    let rows = facts
+        .literal_members()
+        .iter()
+        .map(|row| (text(row.member), text(row.literal), text(row.holder)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [
+            ("key: 1", "{ key: 1 }", "own = ({ key: 1 } as const)"),
+            ("short", "{ short, go() {} }", "({ short, go() {} })"),
+            ("go() {}", "{ short, go() {} }", "({ short, go() {} })"),
+            ("a: 1", "{ a: 1 }", "type One = { a: 1 };"),
+            ("b: 1", "{ b: 1 }", "{ b: 1 } | { b: 2 }"),
+            ("b: 2", "{ b: 2 }", "{ b: 1 } | { b: 2 }"),
+            ("d: 1", "{ d: 1 }", "typed: { d: 1 }"),
+        ]
+    );
+    let row = facts.literal_members()[0];
+    let outside = StaticFactsParts {
+        literal_members: vec![StaticLiteralMember {
+            holder: row.member,
+            ..row
+        }],
+        ..StaticFactsParts::default()
+    };
+    assert_eq!(
+        StaticFacts::from_parts(source, SyntaxLimits::default(), outside)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_range_invalid::SLUG),
+    );
 }
 
 #[test]

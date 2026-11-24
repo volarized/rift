@@ -96,6 +96,18 @@ pub struct StaticBinding {
     pub kind: StaticBindingKind,
 }
 
+/// One member of an ECMAScript object or type literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticLiteralMember {
+    /// Complete member.
+    pub member: ByteRange,
+    /// Literal holding the member.
+    pub literal: ByteRange,
+    /// Syntax element the literal is the whole value or the whole written type of, once
+    /// parentheses, assertions and the annotation are read through.
+    pub holder: ByteRange,
+}
+
 /// Syntactic evidence held by one name binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticBindingKind {
@@ -403,6 +415,8 @@ pub struct StaticFactsParts {
     /// Functions written as members of an object literal, with that literal: `this` inside
     /// them is the literal.
     pub object_members: Vec<(ByteRange, ByteRange)>,
+    /// Members written in an ECMAScript object or type literal.
+    pub literal_members: Vec<StaticLiteralMember>,
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
@@ -637,6 +651,12 @@ impl StaticFacts {
         &self.0.object_members
     }
 
+    /// Members written in an ECMAScript object or type literal.
+    #[must_use]
+    pub fn literal_members(&self) -> &[StaticLiteralMember] {
+        &self.0.literal_members
+    }
+
     /// What each `return` of a function returns: the object literal, or none.
     #[must_use]
     pub fn returned_objects(&self) -> &[(ByteRange, Option<ByteRange>)] {
@@ -733,6 +753,7 @@ impl StaticFacts {
             vector_capacity(&self.0.element_types),
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
+            vector_capacity(&self.0.literal_members),
             vector_capacity(&self.0.returned_objects),
             vector_capacity(&self.0.spread_values),
             vector_capacity(&self.0.unsupported_bindings),
@@ -794,6 +815,7 @@ impl StaticFacts {
             self.element_types().len(),
             self.element_returns().len(),
             self.object_members().len(),
+            self.literal_members().len(),
             self.returned_objects().len(),
             self.spread_values().len(),
             self.unsupported_bindings().len(),
@@ -922,6 +944,11 @@ impl StaticFacts {
                 .object_members()
                 .iter()
                 .all(|(function, object)| valid(*function) && contains(*object, *function))
+            && self.literal_members().iter().all(|row| {
+                valid(row.member)
+                    && contains(row.literal, row.member)
+                    && contains(row.holder, row.literal)
+            })
             && self
                 .returned_objects()
                 .iter()

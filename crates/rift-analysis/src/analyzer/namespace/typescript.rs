@@ -154,6 +154,16 @@ fn prepare_file(
     prepared: &mut PreparedNamespace,
 ) -> bool {
     let anchors = declaration_anchors(input, file, Some(module));
+    prepare_anchors(input, file, module, anchors, prepared)
+}
+
+fn prepare_anchors(
+    input: &NamespaceInput<'_>,
+    file: &SelectedFile<'_>,
+    module: &str,
+    anchors: BTreeMap<String, SymbolId>,
+    prepared: &mut PreparedNamespace,
+) -> bool {
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;

@@ -31,6 +31,18 @@ fn spelled(identity: &str) -> Vec<String> {
 
 /// Every published declaration by its module, name path, and file, with its public flag.
 pub(super) fn declared(analysis: &PackageAnalysis) -> BTreeMap<(Vec<String>, String), bool> {
+    let rows = rows(analysis);
+    let declared = rows.iter().cloned().collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        declared.len(),
+        rows.len(),
+        "each declaration has its own identity: {rows:?}"
+    );
+    declared
+}
+
+/// Every published declaration row, one for each declaration of an identity.
+fn rows(analysis: &PackageAnalysis) -> Vec<((Vec<String>, String), bool)> {
     let publication = analysis.publication();
     publication
         .declarations
@@ -383,6 +395,138 @@ fn an_exports_subpath_keeps_the_name_of_another_file() {
         if !identified {
             assert!(!analysis.publication().coverage[0].identity_complete);
         }
+    }
+}
+
+/// How often each name of `module` is declared under an identity.
+fn counted(analysis: &PackageAnalysis, module: &str) -> BTreeMap<String, usize> {
+    let mut counted = BTreeMap::new();
+    for ((path, _), _) in rows(analysis) {
+        if path[0] == module && path.len() > 1 {
+            *counted.entry(path[1..].join("/")).or_default() += 1;
+        }
+    }
+    counted
+}
+
+const REPEATED: &str = "it(function () { function helper() {} });
+it(function () { var helper = 1; });
+it(function () { class dup { secret() {} } });
+function dup() { { let block = 1; } { let block = 2; } var twice = 1; var twice = 2; }
+exports.dup = dup;
+class A { static x() {} x() {} y() {} }
+const E = class { static s() {} s() {} };
+class B { get v() { return 1 } set v(value) {} constructor() { this.w = 1 } w() {} }
+function F() { this.z = 1; }
+F.z = 2;
+F.prototype.p = function () {};
+var again = 1;
+var again = 2;
+var own = { key: 1, nested: { deep: 1 } };
+own.key = 2;
+run({ option: 1 });
+run({ option: 2 });
+run({ get pair() { return 1 }, set pair(value) {} });
+function build() { if (cond) return { part: 1 }; return { part: 2 } }
+module.exports = { A, B, F };
+";
+
+#[test]
+fn a_name_declared_in_several_scopes_takes_no_identity() {
+    let analysis = analyze(MAIN, &[("index.js", ""), ("lib/k.js", REPEATED)]);
+    let counted = counted(&analysis, "beacon/lib/k.js");
+    for name in [
+        "helper",
+        "dup",
+        "dup/secret",
+        "dup/block",
+        "dup/twice",
+        "A/x",
+        "E/s",
+        "option",
+        "build/part",
+    ] {
+        assert!(!counted.contains_key(name), "{name} {counted:?}");
+    }
+    for (name, count) in [
+        ("A", 1),
+        ("A/y", 1),
+        ("B/v", 2),
+        ("pair", 2),
+        ("B/w", 2),
+        ("F/p", 1),
+        ("F/z", 1),
+        ("again", 2),
+        ("own/key", 1),
+        ("own/nested/deep", 1),
+    ] {
+        assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
+    }
+    for name in ["helper", "dup", "secret", "block", "x"] {
+        assert!(
+            analysis
+                .publication()
+                .objects
+                .iter()
+                .any(|object| object.name == name && object.id.is_none()),
+            "{name} keeps its object"
+        );
+    }
+    let merged = "export function over(a: string): void;
+export function over(a: number): void;
+export function over(a: unknown): void {}
+export interface Shape { a: 1 }
+export interface Shape { b: 1 }
+export interface Value { a: 1 }
+export const Value = 1;
+export function Merged(): void {}
+export namespace Merged { export const inner = 1; const hidden = 1; }
+export namespace Merged { const hidden = 2; export function other(): void {} }
+export type Union = { kind: 1; only: 1 } | { kind: 2 };
+export type Whole = { whole: 1; nested: { deep: 1 } };
+export interface Calls { (options: { limit: 1 }): void; (options: { limit: 2 }): void; own: 1 }
+export interface Made { go(): void }
+export const Made = make(() => ({ go() {} }));
+run(() => { interface Local { a: 1 } const scoped = 1; return scoped });
+run(() => { const scoped = 2; return scoped });
+";
+    let analysis = analyze(MAIN, &[("index.js", ""), ("lib/m.ts", merged)]);
+    let counted = self::counted(&analysis, "beacon/lib/m.ts");
+    for (name, count) in [
+        ("over", 3),
+        ("Shape", 2),
+        ("Shape/a", 1),
+        ("Shape/b", 1),
+        ("Value", 2),
+        ("Merged", 3),
+        ("Merged/inner", 1),
+        ("Merged/other", 1),
+        ("Made", 2),
+        ("Union", 1),
+        ("Union/only", 1),
+        ("Whole/whole", 1),
+        ("Whole/nested/deep", 1),
+        ("Calls/own", 1),
+    ] {
+        assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
+    }
+    for name in [
+        "Merged/hidden",
+        "scoped",
+        "Made/go",
+        "Union/kind",
+        "Calls/limit",
+    ] {
+        assert!(!counted.contains_key(name), "{name} {counted:?}");
+    }
+}
+
+#[test]
+fn an_entry_keeps_the_identities_of_names_in_several_scopes() {
+    let analysis = analyze(MAIN, &[("index.js", REPEATED)]);
+    let counted = counted(&analysis, "beacon");
+    for (name, count) in [("helper", 2), ("dup", 2), ("A/x", 2)] {
+        assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
     }
 }
 

@@ -2,17 +2,20 @@
 
 use super::{
     BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_file,
+    SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_anchors,
     selected_source_is_valid,
 };
 use serde::Deserialize;
+
+mod scopes;
 
 /// Names every remaining selected source by its package-relative path.
 ///
 /// An entry or observed file keeps its module. A source of a nested package takes none, and
 /// a path that another file's module or an `exports` subpath spells stays with that one.
 /// With an `exports` map no consumer reaches these files by path, so their declarations are
-/// public only through an alias of a file that a consumer reaches.
+/// public only through an alias of a file that a consumer reaches. A name the file declares
+/// in more than one scope takes no identity, since one path would name distinct declarations.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
     metadata: &PackageMetadata,
@@ -63,7 +66,12 @@ pub(super) fn prepare(
             continue;
         }
         prepared.anchors.remove(path);
-        if prepare_file(input, file, &module, prepared) {
+        let mut anchors = declaration_anchors(input, file, Some(&module));
+        let withheld = scopes::repeated_names(file);
+        anchors.retain(|name, _| {
+            ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
+        });
+        if prepare_anchors(input, file, &module, anchors, prepared) {
             modules.insert((language.name.clone(), module), Some(path.to_owned()));
             if metadata.exports.is_some() {
                 prepared

@@ -53,9 +53,9 @@ pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use static_analysis::{
     HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticCommonJsExport,
     StaticConditionalItem, StaticDeclaredReturn, StaticFacts, StaticFactsParts,
-    StaticFunctionContext, StaticInherentImpl, StaticMember, StaticMemberAlias,
-    StaticMemberCallback, StaticMemberCopy, StaticParameter, StaticReexport, StaticReference,
-    StaticRustUse,
+    StaticFunctionContext, StaticInherentImpl, StaticLiteralMember, StaticMember,
+    StaticMemberAlias, StaticMemberCallback, StaticMemberCopy, StaticParameter, StaticReexport,
+    StaticReference, StaticRustUse,
 };
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};

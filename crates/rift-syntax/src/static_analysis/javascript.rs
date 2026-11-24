@@ -5,8 +5,8 @@ use tree_sitter::Node;
 
 use super::{
     StaticBinding, StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts,
-    StaticFunctionContext, StaticMember, StaticMemberCopy, StaticParameter, StaticReexport,
-    StaticReference, binding, call, enclosing, field, identifier, kind,
+    StaticFunctionContext, StaticLiteralMember, StaticMember, StaticMemberCopy, StaticParameter,
+    StaticReexport, StaticReference, binding, call, enclosing, field, identifier, kind,
 };
 use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
@@ -363,6 +363,7 @@ impl Kinds {
         let id = syntax_element.kind_id();
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
+        self.record_literal_member(visited, facts)?;
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
         self.record_module_statement(visited, facts);
@@ -543,6 +544,58 @@ impl Kinds {
             facts
                 .object_members
                 .push((byte_range(element)?, byte_range(object)?));
+        }
+        Ok(())
+    }
+
+    /// Records a member of an object or type literal with the syntax element that holds the
+    /// literal.
+    fn record_literal_member(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let type_literal = self
+            .type_shapes
+            .as_ref()
+            .map(|shapes| shapes.signature_holders[1]);
+        let member = visited.syntax_element();
+        let Some(literal) = visited.parent().filter(|parent| {
+            let id = parent.syntax_element().kind_id();
+            (id == self.object_literal[0] || Some(id) == type_literal)
+                && matches!(
+                    member.kind(),
+                    "pair"
+                        | "shorthand_property_identifier"
+                        | "method_definition"
+                        | "property_signature"
+                        | "method_signature"
+                )
+        }) else {
+            return Ok(());
+        };
+        // The syntax walk has admitted every enclosing element's depth.
+        let mut holder = literal.parent();
+        while let Some(outer) = holder.filter(|outer| {
+            matches!(
+                outer.syntax_element().kind(),
+                "parenthesized_expression"
+                    | "parenthesized_type"
+                    | "as_expression"
+                    | "satisfies_expression"
+                    | "type_assertion"
+                    | "non_null_expression"
+                    | "type_annotation"
+            )
+        }) {
+            holder = outer.parent();
+        }
+        if let Some(holder) = holder {
+            facts.literal_members.push(StaticLiteralMember {
+                member: byte_range(member)?,
+                literal: byte_range(literal.syntax_element())?,
+                holder: byte_range(holder.syntax_element())?,
+            });
         }
         Ok(())
     }
