@@ -10,9 +10,9 @@ use serde::Deserialize;
 /// Names every remaining selected source by its package-relative path.
 ///
 /// An entry or observed file keeps its module. A source of a nested package takes none, and
-/// a path another file's module already spells stays with that file. With an `exports` map
-/// no consumer reaches these files by path, so their declarations are public only through an
-/// alias of a file that a consumer reaches.
+/// a path that another file's module or an `exports` subpath spells stays with that one.
+/// With an `exports` map no consumer reaches these files by path, so their declarations are
+/// public only through an alias of a file that a consumer reaches.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
     metadata: &PackageMetadata,
@@ -50,9 +50,14 @@ pub(super) fn prepare(
             continue;
         }
         let module = format!("{}/{path}", metadata.name);
-        if modules
-            .get(&(language.name.clone(), module.clone()))
-            .is_some_and(|holder| holder.as_deref() != Some(path))
+        let exported = metadata
+            .exports
+            .as_ref()
+            .is_some_and(|exports| exports.spells_other_file(path, &language.name));
+        if exported
+            || modules
+                .get(&(language.name.clone(), module.clone()))
+                .is_some_and(|holder| holder.as_deref() != Some(path))
         {
             prepared.unresolved_exports = true;
             continue;

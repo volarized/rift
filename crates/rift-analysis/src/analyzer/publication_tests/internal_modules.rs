@@ -349,6 +349,44 @@ fn a_typescript_script_names_no_module_by_its_path() {
 }
 
 #[test]
+fn an_exports_subpath_keeps_the_name_of_another_file() {
+    let source = "export function run() {}\n";
+    for (exports, identified) in [
+        (r#"{".":"./a.js","./lib/a.js":"./a.js"}"#, false),
+        (r#"{".":"./a.js","./lib/a.js":"./dist/a.wasm"}"#, false),
+        (r#"{".":"./a.js","./lib/*":"./dist/*"}"#, false),
+        (r#"{".":"./a.js","./lib/a.js":["./a.js"]}"#, false),
+        (
+            r#"{".":"./a.js","./lib/*":{"import":"./lib/*","require":"./dist/*"}}"#,
+            false,
+        ),
+        (r#"{".":"./a.js","./lib/a.js":{"browser":"./a.js"}}"#, false),
+        (r#"{".":"./a.js","./*":"./*","./lib/*":null}"#, true),
+        (
+            r#"{".":"./a.js","./lib/*":{"custom":"./src/*","types":"./dist/*","import":"./lib/*"}}"#,
+            true,
+        ),
+        (
+            r#"{".":"./a.js","./*":"./dist/*","./lib/*":"./lib/*"}"#,
+            true,
+        ),
+        (r#"{".":"./a.js","./lib/*":{"browser":"./lib/*"}}"#, true),
+        (r#"{".":"./a.js","./other/*":"./dist/*"}"#, true),
+    ] {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","exports":{exports}}}"#);
+        let analysis = analyze(&manifest, &[("a.js", source), ("lib/a.js", source)]);
+        assert_eq!(
+            public(&analysis, &["beacon/lib/a.js", "run"], "lib/a.js").is_some(),
+            identified,
+            "{exports}"
+        );
+        if !identified {
+            assert!(!analysis.publication().coverage[0].identity_complete);
+        }
+    }
+}
+
+#[test]
 fn a_forward_another_value_can_replace_reaches_no_target() {
     let user = "var i = require('./index');
 var { open } = require('./index');

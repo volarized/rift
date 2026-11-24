@@ -736,6 +736,31 @@ impl From<CapturedExports> for Exports {
 }
 
 impl Exports {
+    /// Whether the subpath `./path` names anything but the file at `path` to a consumer of
+    /// `language`. The exact key decides, else the pattern with the longest prefix, as Node
+    /// matches them.
+    fn spells_other_file(&self, path: &str, language: &str) -> bool {
+        let Self::Subpaths(paths) = self else {
+            return false;
+        };
+        let spelled = format!("./{path}");
+        if let Some((_, target)) = paths.0.iter().find(|(key, _)| *key == spelled) {
+            return target.names_other(&spelled, None, language);
+        }
+        paths
+            .0
+            .iter()
+            .filter_map(|(key, target)| {
+                let (prefix, suffix) = key.split_once('*')?;
+                let matched = spelled.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                (!matched.is_empty()).then_some((prefix.len(), key.len(), matched, target))
+            })
+            .max_by_key(|(prefix, key, ..)| (*prefix, *key))
+            .is_some_and(|(.., matched, target)| {
+                target.names_other(&spelled, Some(matched), language)
+            })
+    }
+
     fn target(&self, language: &str) -> Option<&str> {
         match self {
             Self::Direct(path) => Some(path),
@@ -816,22 +841,30 @@ enum ExportTarget {
     Unresolved(UnresolvedTarget),
 }
 
-/// `null`, which excludes the subpath for the conditions it is written under, or a target
-/// list, which names no single file without reading the file system.
 #[derive(Deserialize)]
 #[serde(from = "Option<Vec<de::IgnoredAny>>")]
-struct UnresolvedTarget;
+enum UnresolvedTarget {
+    /// `null`, which excludes the subpath for the conditions it is written under.
+    Excluded,
+    /// A target list, which names no single file without reading the file system.
+    List,
+}
 
 impl From<Option<Vec<de::IgnoredAny>>> for UnresolvedTarget {
-    fn from(_: Option<Vec<de::IgnoredAny>>) -> Self {
-        Self
+    fn from(captured: Option<Vec<de::IgnoredAny>>) -> Self {
+        match captured {
+            None => Self::Excluded,
+            Some(_) => Self::List,
+        }
     }
 }
 
 /// What one export target gives a consumer.
 enum SelectedTarget<'metadata> {
     Path(&'metadata str),
-    /// The written target names no file this consumer resolves.
+    /// The written target gives this consumer no file.
+    Excluded,
+    /// Which file the written target gives this consumer is not established.
     Refused,
     /// No condition of the consumer is written: a later condition can still match.
     Unmatched,
@@ -857,7 +890,7 @@ impl ExportTarget {
     fn is_unconditional(&self, language: &str) -> bool {
         match self {
             Self::Direct(_) => true,
-            Self::Unresolved(UnresolvedTarget) => false,
+            Self::Unresolved(_) => false,
             Self::Conditions(conditions) => {
                 conditions.0.first().is_some_and(|(condition, target)| {
                     (condition == DEFAULT_CONDITION
@@ -868,10 +901,42 @@ impl ExportTarget {
         }
     }
 
+    /// Whether the target gives a consumer of `language` anything but `file`, with `matched`
+    /// in place of `*`. Conditions no static consumer enables count when it enables none.
+    fn names_other(&self, file: &str, matched: Option<&str>, language: &str) -> bool {
+        let is_file = |path: &str| match matched {
+            Some(matched) => path.replace('*', matched) == file,
+            None => path == file,
+        };
+        let mut unmatched = true;
+        for loader in [Loader::Module, Loader::CommonJs] {
+            let conditions = consumer_conditions(language, loader);
+            match self.select(language == "typescript", conditions) {
+                SelectedTarget::Unmatched => continue,
+                SelectedTarget::Excluded => {}
+                SelectedTarget::Path(path) if is_file(path) => {}
+                SelectedTarget::Path(_) | SelectedTarget::Refused => return true,
+            }
+            unmatched = false;
+        }
+        let mut pending = vec![self];
+        while let Some(target) = pending.pop().filter(|_| unmatched) {
+            match target {
+                Self::Direct(path) if is_file(path) => {}
+                Self::Unresolved(UnresolvedTarget::Excluded) => {}
+                Self::Direct(_) | Self::Unresolved(UnresolvedTarget::List) => return true,
+                Self::Conditions(conditions) => {
+                    pending.extend(conditions.0.iter().map(|(_, target)| target));
+                }
+            }
+        }
+        false
+    }
+
     fn selected_target(&self, types: bool, selected: &[&str]) -> Option<&str> {
         match self.select(types, selected) {
             SelectedTarget::Path(path) => Some(path),
-            SelectedTarget::Refused | SelectedTarget::Unmatched => None,
+            SelectedTarget::Excluded | SelectedTarget::Refused | SelectedTarget::Unmatched => None,
         }
     }
 
@@ -879,7 +944,8 @@ impl ExportTarget {
     fn select(&self, types: bool, selected: &[&str]) -> SelectedTarget<'_> {
         let conditions = match self {
             Self::Direct(path) => return SelectedTarget::Path(path),
-            Self::Unresolved(UnresolvedTarget) => return SelectedTarget::Refused,
+            Self::Unresolved(UnresolvedTarget::Excluded) => return SelectedTarget::Excluded,
+            Self::Unresolved(UnresolvedTarget::List) => return SelectedTarget::Refused,
             Self::Conditions(conditions) => conditions,
         };
         for (name, target) in &conditions.0 {
@@ -920,7 +986,7 @@ impl ExportTarget {
                         .filter(|(name, _)| name != TYPES_CONDITION)
                         .map(|(_, target)| target),
                 ),
-                Self::Unresolved(UnresolvedTarget) => {}
+                Self::Unresolved(_) => {}
             }
         }
         paths
