@@ -249,11 +249,20 @@ const FILE_WORK_FLOOR: usize = 262_144;
 /// the heaviest: it ends a pass whose lookups run away, not one that is merely large.
 const FILE_WORK_PER_ELEMENT: usize = 1_024;
 
+/// The `append` calls on one Python list, each with its appended expression.
+type PythonAppends = Vec<(ByteRange, ByteRange)>;
+
 #[derive(Debug)]
 struct Work {
     budget: LoopBudget,
     exhausted: bool,
     python_depth: u8,
+    /// Python expressions whose stated type is being read, by file and range.
+    python_expressions: Vec<(usize, ByteRange)>,
+    /// The `append` calls read for each Python list, by file and name.
+    python_appends: BTreeMap<(usize, ByteRange), Option<PythonAppends>>,
+    /// Whether the assignments of one Python attribute are being compared.
+    python_comparing: bool,
     javascript_depth: u8,
 }
 
@@ -263,6 +272,9 @@ impl Work {
             budget: LoopBudget::new(maximum),
             exhausted: false,
             python_depth: 0,
+            python_expressions: Vec::new(),
+            python_appends: BTreeMap::new(),
+            python_comparing: false,
             javascript_depth: 0,
         }
     }
@@ -287,6 +299,36 @@ impl Work {
         self.python_depth += 1;
         let result = lookup(self);
         self.python_depth -= 1;
+        result
+    }
+
+    /// Reads the type an expression of one file states. An expression whose own type depends
+    /// on it states none.
+    fn python_expression<T>(
+        &mut self,
+        file: &str,
+        range: ByteRange,
+        lookup: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        let expression = (file.as_ptr() as usize, range);
+        if self.python_expressions.contains(&expression) {
+            return None;
+        }
+        self.python_expressions.push(expression);
+        let result = self.python_lookup(lookup);
+        self.python_expressions.pop();
+        result
+    }
+
+    /// Compares the assignments of one Python attribute. The attributes their values read are
+    /// not compared in turn.
+    fn python_comparison(&mut self, compare: impl FnOnce(&mut Self) -> bool) -> bool {
+        if self.python_comparing {
+            return false;
+        }
+        self.python_comparing = true;
+        let result = compare(self);
+        self.python_comparing = false;
         result
     }
 
@@ -604,6 +646,7 @@ impl<'source> File<'source> {
                 | StaticBindingKind::PythonFunction { .. }
                 | StaticBindingKind::PythonAlias { .. }
                 | StaticBindingKind::PythonElement { .. }
+                | StaticBindingKind::PythonUnpacked { .. }
                 | StaticBindingKind::PythonInstance { .. } => {
                     self.python_values.insert(binding.name.end, binding.kind);
                 }

@@ -1,6 +1,9 @@
 //! Captured Python call sites and lexical import bindings.
 
 mod guards;
+mod lists;
+
+pub(super) use lists::EmptyLists;
 
 use std::sync::OnceLock;
 
@@ -8,14 +11,28 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBindingKind, StaticCallee, StaticFactsParts, StaticReference, binding, call, field,
-    identifier, kind,
+    PythonPosition, StaticBindingKind, StaticCallee, StaticFactsParts, StaticReference, binding,
+    call, field, identifier, kind,
 };
 use crate::extract::{Visited, byte_range};
+
+/// Where a target stands in the target of its statement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetPlace {
+    /// The statement binds this target alone.
+    Whole,
+    /// The statement unpacks its value into this target and others.
+    Part(PythonPosition),
+    /// The target is inside another pattern or beside a starred target.
+    Other,
+}
 
 pub(super) struct EdgePythonKinds {
     identifier: u16,
     none: u16,
+    list: u16,
+    argument_list: u16,
+    keyword_argument: u16,
     call: u16,
     attribute: u16,
     definitions: [u16; 2],
@@ -63,6 +80,9 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
         EdgePythonKinds {
             identifier: id("identifier"),
             none: id("none"),
+            list: id("list"),
+            argument_list: id("argument_list"),
+            keyword_argument: id("keyword_argument"),
             call: id("call"),
             attribute: id("attribute"),
             definitions,
@@ -76,6 +96,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
                 id("set_comprehension"),
                 id("generator_expression"),
             ],
+            // The first three unpack a value into every target they hold.
             patterns: [
                 id("pattern_list"),
                 id("tuple_pattern"),
@@ -575,16 +596,23 @@ impl EdgePythonKinds {
         let Some(scope) = edge_enclosing(visited, scopes) else {
             return Ok(());
         };
-        let mut pending = vec![target];
-        while let Some(target) = pending.pop() {
+        let mut pending = vec![(target, TargetPlace::Whole)];
+        while let Some((target, place)) = pending.pop() {
             if target.kind_id() == self.identifier {
-                let kind = self.edge_assignment_kind(visited, target)?;
+                let kind = self.edge_assignment_kind(visited, target, place)?;
                 let available = match kind {
                     StaticBindingKind::PythonInstance { .. }
                     | StaticBindingKind::PythonAlias { .. }
+                    | StaticBindingKind::PythonUnpacked { .. }
+                    | StaticBindingKind::PythonEmptyList
                     | StaticBindingKind::PythonNone => byte_range(visited.syntax_element())?.end,
-                    // The loop body reads each element after the iterated value.
-                    StaticBindingKind::PythonElement { iterable } => iterable.end,
+                    // The loop body reads each element after the iterated value. A
+                    // comprehension writes its result before the value.
+                    StaticBindingKind::PythonElement { iterable, .. }
+                        if visited.syntax_element().kind_id() == self.assignment[2] =>
+                    {
+                        iterable.end
+                    }
                     _ => byte_range(scope)?.start,
                 };
                 facts
@@ -605,39 +633,83 @@ impl EdgePythonKinds {
                         },
                     )?);
                 }
-                let kind = self.edge_assignment_kind(visited, target)?;
+                let kind = self.edge_assignment_kind(visited, target, place)?;
                 if kind != StaticBindingKind::Shadow {
                     facts
                         .bindings
                         .push(binding(target, scope, byte_range(scope)?.start, kind)?);
                 }
             } else if self.patterns.contains(&target.kind_id()) {
-                let mut cursor = target.walk();
-                pending.extend(target.named_children(&mut cursor));
+                self.edge_pattern_targets(target, place, &mut pending);
             }
         }
         Ok(())
+    }
+
+    /// Queues the targets one pattern holds, with the part of the value each takes.
+    fn edge_pattern_targets<'tree>(
+        &self,
+        pattern: Node<'tree>,
+        place: TargetPlace,
+        pending: &mut Vec<(Node<'tree>, TargetPlace)>,
+    ) {
+        let mut cursor = pattern.walk();
+        let targets = pattern
+            .named_children(&mut cursor)
+            .filter(|target| !target.is_extra())
+            .collect::<Vec<_>>();
+        let unpacks = place == TargetPlace::Whole
+            && self.patterns[..3].contains(&pattern.kind_id())
+            && !targets
+                .iter()
+                .any(|target| self.patterns[3..].contains(&target.kind_id()));
+        let count = u32::try_from(targets.len()).ok().filter(|_| unpacks);
+        for (index, target) in (0_u32..).zip(targets) {
+            let place = count.map_or(TargetPlace::Other, |count| {
+                TargetPlace::Part(PythonPosition { index, count })
+            });
+            pending.push((target, place));
+        }
     }
 
     fn edge_assignment_kind(
         &self,
         visited: Visited<'_, '_>,
         target: Node<'_>,
+        place: TargetPlace,
     ) -> Result<StaticBindingKind, RiftError> {
         let assignment = visited.syntax_element();
-        if assignment.kind_id() == self.assignment[2]
-            && target.kind_id() == self.identifier
-            && assignment.child_by_field_id(self.left) == Some(target)
-            && let Some(iterable) = assignment.child_by_field_id(self.right)
-        {
-            return Ok(StaticBindingKind::PythonElement {
-                iterable: byte_range(iterable)?,
-            });
+        let position = match place {
+            TargetPlace::Whole => None,
+            TargetPlace::Part(position) => Some(position),
+            TargetPlace::Other => return Ok(StaticBindingKind::Shadow),
+        };
+        if self.assignment[2..].contains(&assignment.kind_id()) {
+            return match assignment.child_by_field_id(self.right) {
+                Some(iterable) if target.kind_id() == self.identifier => {
+                    Ok(StaticBindingKind::PythonElement {
+                        iterable: byte_range(iterable)?,
+                        position,
+                    })
+                }
+                _ => Ok(StaticBindingKind::Shadow),
+            };
         }
-        if assignment.kind_id() != self.assignment[0]
-            || assignment.child_by_field_id(self.left) != Some(target)
-        {
+        if assignment.kind_id() != self.assignment[0] {
             return Ok(StaticBindingKind::Shadow);
+        }
+        if let Some(position) = position {
+            return match assignment.child_by_field_id(self.right) {
+                Some(value)
+                    if [self.identifier, self.attribute, self.call].contains(&value.kind_id()) =>
+                {
+                    Ok(StaticBindingKind::PythonUnpacked {
+                        value: byte_range(value)?,
+                        position,
+                    })
+                }
+                _ => Ok(StaticBindingKind::Shadow),
+            };
         }
         if let Some(annotation) = assignment.child_by_field_id(self.type_field) {
             return Ok(StaticBindingKind::PythonAnnotation {
@@ -651,6 +723,17 @@ impl EdgePythonKinds {
         }
         if assigned.is_some_and(|value| value.kind_id() == self.none && !value.is_missing()) {
             return Ok(StaticBindingKind::PythonNone);
+        }
+        if target.kind_id() == self.identifier
+            && assignment
+                .child_by_field_id(self.right)
+                .is_some_and(|value| {
+                    value.kind_id() == self.list
+                        && value.named_child_count() == 0
+                        && !value.has_error()
+                })
+        {
+            return Ok(StaticBindingKind::PythonEmptyList);
         }
         let constructor = assignment
             .child_by_field_id(self.right)

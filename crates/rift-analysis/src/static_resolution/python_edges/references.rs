@@ -66,7 +66,7 @@ impl<'source> Index<'source> {
                 result.record(self.python_edge(file, range, EdgeKind::Contains, parent, target));
                 if symbol.kinds.contains(&SymbolKind::Callable)
                     && parent.symbol.kinds.contains(&SymbolKind::Constructible)
-                    && let Some(base) = self.python_base_member(parent, &symbol.name, work)
+                    && let Some(base) = self.python_declared_base_member(parent, &symbol.name, work)
                     && base.symbol.kinds.contains(&SymbolKind::Callable)
                 {
                     result.record(self.python_edge(file, range, EdgeKind::Overrides, target, base));

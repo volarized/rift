@@ -171,11 +171,23 @@ pub enum StaticBindingKind {
     },
     /// A Python name assigned the `None` literal.
     PythonNone,
-    /// A Python `for` loop target bound to each element of the iterated value.
+    /// A Python `for` target, in a loop or a comprehension, bound to each element of the
+    /// iterated value or to one part of it.
     PythonElement {
         /// Authored iterated expression.
         iterable: ByteRange,
+        /// Place of the name in the target, absent for a target of one name.
+        position: Option<PythonPosition>,
     },
+    /// A Python assignment target bound to one part of the assigned value.
+    PythonUnpacked {
+        /// Authored value: a name, a member or a call.
+        value: ByteRange,
+        /// Place of the target among the targets.
+        position: PythonPosition,
+    },
+    /// A Python name assigned an empty list literal.
+    PythonEmptyList,
     /// A write to a Python member slot, separate from lexical bindings.
     PythonMemberWrite {
         /// Authored receiver of the assignment target.
@@ -219,6 +231,15 @@ pub enum StaticBindingKind {
         /// Authored initializer expression.
         initializer: ByteRange,
     },
+}
+
+/// Place of one name in a Python target that unpacks a value without a starred name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonPosition {
+    /// Zero-based place of the name.
+    pub index: u32,
+    /// Number of parts the target unpacks.
+    pub count: u32,
 }
 
 /// One named export forwarded directly from another module.
@@ -1061,7 +1082,12 @@ impl StaticBinding {
                 decorator,
             } => valid(annotation) && decorator.is_none_or(&valid),
             StaticBindingKind::PythonAlias { value } => valid(value),
-            StaticBindingKind::PythonElement { iterable } => valid(iterable),
+            StaticBindingKind::PythonElement { iterable, position } => {
+                valid(iterable) && position.is_none_or(|position| position.index < position.count)
+            }
+            StaticBindingKind::PythonUnpacked { value, position } => {
+                valid(value) && position.index < position.count
+            }
             StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
@@ -1069,6 +1095,7 @@ impl StaticBinding {
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
             | StaticBindingKind::PythonNone
+            | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonGlobal
             | StaticBindingKind::PythonNonlocal
             | StaticBindingKind::RustTypeParameter => true,
@@ -1091,7 +1118,10 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar {
-    Python(&'static python_edges::EdgePythonKinds),
+    Python(
+        &'static python_edges::EdgePythonKinds,
+        python_edges::EmptyLists,
+    ),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
@@ -1130,7 +1160,10 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn for_edge_python(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::Python(python_edges::edge_python_kinds()),
+            grammar: Grammar::Python(
+                python_edges::edge_python_kinds(),
+                python_edges::EmptyLists::default(),
+            ),
             source,
             facts: StaticFacts::default(),
             edge_heritage: heritage_edges::edge_python_kinds(),
@@ -1170,7 +1203,12 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
-            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
+            Grammar::Python(kinds, lists) => {
+                let first = self.facts.0.bindings.len();
+                kinds.record_edge(visited, self.source, &mut self.facts.0)?;
+                lists.note(&mut self.facts.0, first, self.source);
+                lists.record_use(kinds, visited, self.source, &mut self.facts.0)
+            }
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }

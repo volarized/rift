@@ -95,13 +95,13 @@ fn test_httpx_static_collection_floors() -> Result<(), Box<dyn std::error::Error
             ("variable", 942),
         ],
         edges: &[
-            (EdgeKind::Calls, 430),
+            (EdgeKind::Calls, 842),
             (EdgeKind::Contains, 1284),
             (EdgeKind::Extends, 56),
             (EdgeKind::HasType, 620),
             (EdgeKind::Imports, 204),
             (EdgeKind::Overrides, 55),
-            (EdgeKind::Reads, 682),
+            (EdgeKind::Reads, 688),
             (EdgeKind::Writes, 192),
         ],
     })
@@ -155,16 +155,64 @@ fn test_click_static_collection_floors() -> Result<(), Box<dyn std::error::Error
         ],
         edges: &[
             (EdgeKind::Aliases, 64),
-            (EdgeKind::Calls, 525),
+            (EdgeKind::Calls, 1245),
             (EdgeKind::Contains, 1649),
             (EdgeKind::Extends, 47),
             (EdgeKind::HasType, 473),
             (EdgeKind::Imports, 195),
             (EdgeKind::Overrides, 84),
-            (EdgeKind::Reads, 884),
-            (EdgeKind::Writes, 283),
+            (EdgeKind::Reads, 913),
+            (EdgeKind::Writes, 285),
         ],
     })
+}
+
+#[test]
+#[ignore = "requires click 8.5.0 in RIFT_CORPUS_CLICK"]
+fn test_click_calls_on_container_elements_are_stored() -> Result<(), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(std::env::var_os("RIFT_CORPUS_CLICK").ok_or("missing corpus")?);
+    let index = WorkspaceIndex::build(
+        &root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::new(
+            vec!["src/click/**/*.py".into(), "pyproject.toml".into()],
+            vec![],
+            true,
+        ),
+        &TextFileInclusion::default(),
+    )?;
+    for (from, to) in [
+        (
+            "core/Command/parse_args",
+            "core/Parameter/handle_parse_result",
+        ),
+        (
+            "core/Command/shell_complete",
+            "core/Command/get_short_help_str",
+        ),
+        ("core/Command/to_info_dict", "core/Parameter/to_info_dict"),
+        (
+            "core/Group/format_commands",
+            "core/Command/get_short_help_str",
+        ),
+        (
+            "core/Group/shell_complete",
+            "core/Command/get_short_help_str",
+        ),
+        ("core/Group/invoke", "core/Command/invoke"),
+        ("core/Group/invoke", "core/Command/make_context"),
+        ("types/Tuple/to_info_dict", "types/ParamType/to_info_dict"),
+    ] {
+        assert!(
+            index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls
+                    && edge.from().as_str() == format!("rift://symbol/local/python/click/{from}")
+                    && edge.to().as_str() == format!("rift://symbol/local/python/click/{to}")
+            }),
+            "{from} -> {to}"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -214,13 +262,13 @@ fn test_requests_static_collection_floors() -> Result<(), Box<dyn std::error::Er
             ("variable", 807),
         ],
         edges: &[
-            (EdgeKind::Calls, 248),
+            (EdgeKind::Calls, 530),
             (EdgeKind::Contains, 872),
             (EdgeKind::Extends, 37),
             (EdgeKind::HasType, 353),
             (EdgeKind::Imports, 185),
             (EdgeKind::Overrides, 8),
-            (EdgeKind::Reads, 297),
+            (EdgeKind::Reads, 299),
             (EdgeKind::Writes, 96),
         ],
     })

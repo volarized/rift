@@ -561,3 +561,40 @@ fn test_python_rebound_classes_optional_receivers_and_conditional_methods_store_
     }
     assert!(index.edges().is_complete());
 }
+
+#[test]
+fn test_python_declared_container_elements_store_calls_and_reads() {
+    let probe = "class Item:\n    def leaf(self): return 1\ndef values() -> list[Item]: return []\ndef use():\n    for value in values():\n        value.leaf()\n";
+    let unpacked = "class Item:\n    def leaf(self): return 1\nclass Other:\n    def leaf(self): return 2\ndef use(pairs: list[tuple[str, Item]]):\n    for name, item in pairs:\n        item.leaf()\ndef refused(pairs: list[tuple[str, int, Item]]):\n    for name, item in pairs:\n        item.leaf()\n";
+    let (_directory, index) = build(&[("probe.py", probe), ("unpacked.py", unpacked)]);
+    for (source, module, spelling) in [
+        (probe, "probe", "value.leaf"),
+        (unpacked, "unpacked", "item.leaf"),
+    ] {
+        let use_ = format!("{module}/use");
+        let leaf = format!("{module}/Item/leaf");
+        assert_eq!(
+            stored(&index, source, "calls", &use_, &leaf),
+            Some(format!("{spelling}()")),
+            "{:?}",
+            index.edges()
+        );
+        assert_eq!(
+            stored(&index, source, "reads", &use_, &leaf).as_deref(),
+            Some(spelling)
+        );
+    }
+    assert!(index.edges().edges().all(|edge| {
+        !edge.from().as_str().ends_with("/refused")
+            || !["calls", "reads"].contains(&edge.kind().as_ref())
+    }));
+    assert!(
+        index
+            .edges()
+            .edges()
+            .all(|edge| !edge.to().as_str().ends_with("Other/leaf")
+                || edge.kind().as_ref() == "contains")
+    );
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}

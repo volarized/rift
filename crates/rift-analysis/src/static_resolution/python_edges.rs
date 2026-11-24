@@ -140,6 +140,7 @@ impl<'source> Index<'source> {
                     | StaticBindingKind::PythonInstance { .. }
                     | StaticBindingKind::PythonAlias { .. }
                     | StaticBindingKind::PythonElement { .. }
+                    | StaticBindingKind::PythonUnpacked { .. }
             ) {
                 return None;
             }
@@ -242,7 +243,8 @@ impl<'source> Index<'source> {
                     return None;
                 }
                 let class = file.target_at(class_name)?;
-                return self.python_base_member(class, file.text(member)?, work);
+                // `super()` reads class slots; an attribute of the instance is none of them.
+                return self.python_declared_base_member(class, file.text(member)?, work);
             }
         }
         None
@@ -425,14 +427,21 @@ impl<'source> Index<'source> {
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
             | StaticBindingKind::PythonNone
+            | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonInstance { .. }
             | StaticBindingKind::PythonAlias { .. }
             | StaticBindingKind::PythonFunction { .. } => {
                 file.target_at(binding.name).map(Value::Symbol)
             }
-            StaticBindingKind::PythonElement { iterable } => {
+            StaticBindingKind::PythonElement { iterable, position } => {
                 file.target_at(binding.name).map(Value::Symbol).or_else(|| {
-                    self.python_element(file, iterable, work)
+                    self.python_element(file, iterable, position, work)
+                        .map(Value::Instance)
+                })
+            }
+            StaticBindingKind::PythonUnpacked { value, position } => {
+                file.target_at(binding.name).map(Value::Symbol).or_else(|| {
+                    self.python_unpacked(file, value, position, work)
                         .map(Value::Instance)
                 })
             }
@@ -518,6 +527,8 @@ impl<'source> Index<'source> {
                 | StaticBindingKind::PythonInstance { .. }
                 | StaticBindingKind::PythonAlias { .. }
                 | StaticBindingKind::PythonElement { .. }
+                | StaticBindingKind::PythonUnpacked { .. }
+                | StaticBindingKind::PythonEmptyList
                 | StaticBindingKind::PythonFunction { .. } => {
                     return file.target_at(binding.name).map(Value::Symbol);
                 }
@@ -593,6 +604,7 @@ fn edge_python_binding<'source>(
                 || (global && scope != module)
                 || (nonlocal && scope == module)
                 || (in_body && file.class_scopes.contains(&scope))
+                || produces(binding, position)
             {
                 continue;
             }
@@ -647,6 +659,16 @@ fn edge_python_binding<'source>(
                 .then_some(selected);
         }
     }
+}
+
+/// Whether `position` is in the iterable that produces a comprehension's own target. The first
+/// iterable is read outside the comprehension, and no later one reads the target it binds.
+fn produces(binding: &StaticBinding, position: u64) -> bool {
+    matches!(
+        binding.kind,
+        StaticBindingKind::PythonElement { iterable, .. }
+            if binding.available_from == binding.scope.start && iterable.contains(position)
+    )
 }
 
 /// Bindings of one name that cannot have run before a read at `position`.
