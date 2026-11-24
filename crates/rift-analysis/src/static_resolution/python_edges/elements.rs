@@ -6,7 +6,7 @@ use rift_syntax::{
 };
 
 use super::super::{File, Index, PythonAppends, Target, Work};
-use super::annotations::{slice_range, top_level_parts};
+use super::annotations::{annotation_text, slice_range, top_level_parts};
 use super::classes::TYPING_MODULES;
 use super::{Value, edge_python_binding};
 
@@ -495,15 +495,9 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Arguments> {
         work.python_lookup(|work| {
-            if !work.charge() {
-                return None;
-            }
+            let annotation = self.python_stated_annotation(file, annotation, work)?;
             let written = file.text(annotation)?;
-            let text = written.trim().trim_matches(['\'', '"']);
-            if let Some(inner) = self.python_optional_member(file, annotation, written, text, work)
-            {
-                return self.python_arguments(file, inner, work);
-            }
+            let text = annotation_text(written);
             let mut alternatives = top_level_parts(text, '|', work)?
                 .into_iter()
                 .filter(|part| *part != "None");

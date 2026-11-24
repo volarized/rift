@@ -458,6 +458,30 @@ impl<'source> Index<'source> {
         binding: &StaticBinding,
         work: &mut Work,
     ) -> Option<Value<'source>> {
+        let declared = self.declared_value(file, binding, work);
+        if declared.is_some() {
+            return declared;
+        }
+        let element = match binding.kind {
+            StaticBindingKind::PythonElement { iterable, position } => {
+                self.python_element(file, iterable, position, work)?
+            }
+            StaticBindingKind::PythonUnpacked { value, position } => {
+                self.python_unpacked(file, value, position, work)?
+            }
+            _ => return None,
+        };
+        Some(Value::Instance(element))
+    }
+
+    /// The value a binding declares or imports, without the container a name iterates or
+    /// unpacks.
+    fn declared_value(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        work: &mut Work,
+    ) -> Option<Value<'source>> {
         match binding.kind {
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
@@ -465,20 +489,10 @@ impl<'source> Index<'source> {
             | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonInstance { .. }
             | StaticBindingKind::PythonAlias { .. }
+            | StaticBindingKind::PythonElement { .. }
+            | StaticBindingKind::PythonUnpacked { .. }
             | StaticBindingKind::PythonFunction { .. } => {
                 file.target_at(binding.name).map(Value::Symbol)
-            }
-            StaticBindingKind::PythonElement { iterable, position } => {
-                file.target_at(binding.name).map(Value::Symbol).or_else(|| {
-                    self.python_element(file, iterable, position, work)
-                        .map(Value::Instance)
-                })
-            }
-            StaticBindingKind::PythonUnpacked { value, position } => {
-                file.target_at(binding.name).map(Value::Symbol).or_else(|| {
-                    self.python_unpacked(file, value, position, work)
-                        .map(Value::Instance)
-                })
             }
             StaticBindingKind::PythonReceiver { class_name } => {
                 let class = file.target_at(class_name)?;
