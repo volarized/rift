@@ -183,7 +183,7 @@ fn repeated_zip_unicode_extra_names_share_path_validation() -> TestResult {
         let bytes = unicode_name_zip(name)?;
         assert_eq!(
             read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("unsafe Unicode name"),
-            ArchiveError::UnsafePath
+            ArchiveError::unsafe_path(name)
         );
     }
     let bytes = unicode_name_zip("other/a")?;
@@ -631,7 +631,7 @@ fn read(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveErro
 }
 
 #[test]
-fn archive_error_messages_name_no_path_but_a_bounded_member() {
+fn archive_error_messages_name_no_path_but_a_bounded_or_unsafe_member() {
     let errors = [
         ArchiveError::InvalidLimits,
         ArchiveError::CompressedLimit,
@@ -640,7 +640,6 @@ fn archive_error_messages_name_no_path_but_a_bounded_member() {
         ArchiveBound::ExpandedBytes.exceeded(2, 1, None),
         ArchiveBound::Members.exceeded(2, 1, None),
         ArchiveError::WorkLimit,
-        ArchiveError::UnsafePath,
         ArchiveError::DuplicatePath,
         ArchiveError::UnsupportedEntry,
         ArchiveError::RootMismatch,
@@ -655,6 +654,11 @@ fn archive_error_messages_name_no_path_but_a_bounded_member() {
         .exceeded(2, 1, Some(fixture_path("release/a")))
         .to_string();
     assert_eq!(bounded.matches("release/a").count(), 1, "{bounded}");
+    let named = ArchiveError::unsafe_path("release/../a\n").to_string();
+    assert_eq!(
+        named, "archive path is invalid: \"release/../a\\n\"",
+        "control characters are escaped"
+    );
 }
 
 #[test]
@@ -725,7 +729,7 @@ fn unsafe_and_cross_root_paths_are_refused() -> TestResult {
         let bytes = tar_bytes(&[(path, b"text", tar::EntryType::Regular)])?;
         assert_eq!(
             read(&bytes, ArchiveLimits::default()).expect_err("archive must be refused"),
-            ArchiveError::UnsafePath,
+            ArchiveError::unsafe_path(path),
             "path={path:?}"
         );
     }
@@ -809,7 +813,7 @@ fn link_naming_the_archive_root_is_refused() -> TestResult {
             ArchiveLimits::default(),
         )
         .expect_err("a link cannot name the archive root"),
-        ArchiveError::UnsafePath
+        ArchiveError::unsafe_path("./")
     );
     Ok(())
 }
@@ -891,7 +895,7 @@ fn sparse_pax_metadata_and_invalid_release_roots_are_refused() -> TestResult {
             ArchiveLimits::default(),
         )
         .expect_err("release root must be one safe path component"),
-        ArchiveError::UnsafePath
+        ArchiveError::unsafe_path("../release")
     );
     Ok(())
 }
@@ -926,7 +930,7 @@ fn schily_sparse_metadata_and_nested_root_are_refused() -> TestResult {
             ArchiveLimits::default(),
         )
         .expect_err("nested root is refused"),
-        ArchiveError::UnsafePath
+        ArchiveError::unsafe_path("release/docs")
     );
     Ok(())
 }
@@ -1190,7 +1194,7 @@ fn zip_paths_modes_crc_and_declared_member_count_are_checked() -> TestResult {
         let bytes = zip_bytes(path, b"text")?;
         assert_eq!(
             read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("unsafe ZIP path"),
-            ArchiveError::UnsafePath
+            ArchiveError::unsafe_path(path)
         );
     }
     let mut bytes = zip_bytes("release/a", b"text")?;
@@ -2111,7 +2115,7 @@ fn oversized_links_directories_and_extended_headers_are_refused_in_both_modes() 
     let bytes = tar_bytes(&[("release/../a", content.as_slice(), tar::EntryType::Regular)])?;
     assert_eq!(
         read(&bytes, skipping(&bytes)?).expect_err("an omitted path is still checked"),
-        ArchiveError::UnsafePath
+        ArchiveError::unsafe_path("release/../a")
     );
     Ok(())
 }
@@ -2393,7 +2397,7 @@ fn pax_global_headers_that_change_members_are_refused() -> TestResult {
     let bytes = gzip(&[comment.as_slice(), &outside].concat())?;
     assert_eq!(
         read(&bytes, ArchiveLimits::default()).expect_err("traversal after a global header"),
-        ArchiveError::UnsafePath
+        ArchiveError::unsafe_path("release/../a.py")
     );
     let outside = raw_member("other/a.py", b'0', SOURCE)?;
     let bytes = gzip(&[comment.as_slice(), &outside].concat())?;
@@ -2514,5 +2518,338 @@ fn nul_padding_does_not_raise_the_expansion_ratio_bound() -> TestResult {
             );
         }
     }
+    Ok(())
+}
+
+/// `é` as `e` and a combining acute accent, the Unicode NFD form.
+const DECOMPOSED: &str = "e\u{301}";
+/// The Unicode NFC form of [`DECOMPOSED`].
+const COMPOSED: &str = "\u{e9}";
+
+/// One archive of the same members in every container and ZIP reader.
+///
+/// The repeated ZIP reader runs when a raw name repeats, so its archive holds `release/r` twice.
+fn member_archives(
+    entries: &[(&str, &[u8], tar::EntryType)],
+) -> Result<Vec<NamedArchive>, Box<dyn std::error::Error>> {
+    let regular = tar::EntryType::Regular;
+    let mut repeated = entries.to_vec();
+    repeated.push(("release/r", b"", regular));
+    let mut raw_entries = repeated.clone();
+    raw_entries.push(("release/s", b"", regular));
+    let mut raw = zip_members_bytes(&raw_entries)?;
+    replace_zip_name(&mut raw, b"release/s", b"release/r");
+    Ok(vec![
+        (
+            "tar".to_owned(),
+            ArchiveFormat::TarGzip,
+            tar_bytes(&repeated)?,
+        ),
+        (
+            "zip".to_owned(),
+            ArchiveFormat::Zip,
+            zip_members_bytes(&repeated)?,
+        ),
+        ("repeated zip".to_owned(), ArchiveFormat::Zip, raw),
+    ])
+}
+
+fn retained(files: &ArchiveFiles) -> Vec<(&str, &[u8])> {
+    files
+        .files()
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect()
+}
+
+fn omitted(files: &ArchiveFiles) -> Vec<(&str, ArchiveMemberKind, ArchiveOmissionReason, u64)> {
+    files
+        .omissions()
+        .iter()
+        .map(|omission| {
+            (
+                omission.path().as_str(),
+                omission.kind(),
+                omission.reason(),
+                omission.size(),
+            )
+        })
+        .collect()
+}
+
+// Issue #1035.
+#[test]
+fn members_outside_unicode_nfc_are_omitted_by_path() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let directory = format!("release/{DECOMPOSED}/");
+    let nested = format!("release/{DECOMPOSED}/b.py");
+    let link = format!("release/{DECOMPOSED}.lnk");
+    let file = format!("release/{DECOMPOSED}.txt");
+    let entries = [
+        ("release/a.py", SOURCE, regular),
+        (file.as_str(), b"text".as_slice(), regular),
+        (&directory, b"", tar::EntryType::Directory),
+        (&nested, SOURCE, regular),
+        (&link, b"", tar::EntryType::Symlink),
+        ("release/z.py", SOURCE, regular),
+    ];
+    for (name, format, bytes) in member_archives(&entries)? {
+        for limits in both_modes(ArchiveLimits::default()) {
+            let files = read_format(&bytes, format, limits)?;
+            assert_eq!(
+                retained(&files),
+                [("a.py", SOURCE), ("r", b"".as_slice()), ("z.py", SOURCE)],
+                "{name}"
+            );
+            let reason = ArchiveOmissionReason::NonCanonicalUnicode;
+            assert_eq!(
+                omitted(&files),
+                [
+                    (DECOMPOSED, ArchiveMemberKind::Directory, reason, 0),
+                    (
+                        link.strip_prefix("release/").ok_or("fixture root")?,
+                        ArchiveMemberKind::Link,
+                        reason,
+                        0
+                    ),
+                    (
+                        file.strip_prefix("release/").ok_or("fixture root")?,
+                        ArchiveMemberKind::File,
+                        reason,
+                        4
+                    ),
+                    (
+                        nested.strip_prefix("release/").ok_or("fixture root")?,
+                        ArchiveMemberKind::File,
+                        reason,
+                        SOURCE.len() as u64
+                    ),
+                ],
+                "{name}"
+            );
+            assert_eq!(
+                files.members().keys().collect::<Vec<_>>(),
+                ["release/a.py", "release/r", "release/z.py"],
+                "{name}"
+            );
+            assert!(files.skipped_links().is_empty(), "{name}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn names_outside_unicode_nfc_keep_every_path_refusal() -> TestResult {
+    let long = format!("release/{}", DECOMPOSED.repeat(PROJECT_PATH_BYTES_MAX / 3));
+    assert!(long.len() > PROJECT_PATH_BYTES_MAX);
+    assert!(ProjectPath::new(long.nfc().collect::<String>()).is_ok());
+    for (root, name) in [
+        (Some("release"), format!("release/../{DECOMPOSED}")),
+        (Some("release"), format!("release/{DECOMPOSED}/../../a")),
+        (Some("release"), format!("/release/{DECOMPOSED}")),
+        (Some("release"), format!("release\\{DECOMPOSED}")),
+        (Some("release"), format!("release/{DECOMPOSED}\n")),
+        (Some("release"), format!("C:/release/{DECOMPOSED}")),
+        (Some("release"), format!("release/.rift/{DECOMPOSED}")),
+        (None, format!(".rift/{DECOMPOSED}")),
+        // The NFC form of U+212A is `K`, a drive letter.
+        (None, "\u{212a}:/a".to_owned()),
+    ] {
+        for kind in [
+            tar::EntryType::Regular,
+            tar::EntryType::Symlink,
+            tar::EntryType::Directory,
+        ] {
+            let entries = [
+                ("release/a.py", SOURCE, tar::EntryType::Regular),
+                (name.as_str(), b"".as_slice(), kind),
+            ];
+            let mut archives = vec![(ArchiveFormat::TarGzip, tar_bytes(&entries)?, name.clone())];
+            if kind == tar::EntryType::Regular {
+                archives.push((
+                    ArchiveFormat::Zip,
+                    zip_members_bytes(&entries)?,
+                    name.clone(),
+                ));
+            }
+            for (format, bytes, member) in archives {
+                let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+                assert_eq!(
+                    read_archive(&bytes, format, &digest, root, ArchiveLimits::default())
+                        .expect_err("unsafe name outside NFC"),
+                    ArchiveError::unsafe_path(&member),
+                    "{format:?} {kind:?}"
+                );
+            }
+        }
+    }
+    let bytes = zip_members_bytes(&[(&long, b"", tar::EntryType::Regular)])?;
+    let error = read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("long name");
+    let ArchiveError::UnsafePath(path) = &error else {
+        panic!("unsafe path, got {error:?}");
+    };
+    assert_eq!(
+        path.name(),
+        &long[..long.floor_char_boundary(PROJECT_PATH_BYTES_MAX)]
+    );
+    assert_eq!(path.name().len() + path.bytes_dropped(), long.len());
+    assert!(path.bytes_dropped() > 0);
+    assert!(
+        error
+            .to_string()
+            .ends_with(&format!(" and {} more bytes", path.bytes_dropped())),
+        "{error}"
+    );
+    let other = format!("other/{DECOMPOSED}");
+    let bytes = tar_bytes(&[(&other, b"", tar::EntryType::Regular)])?;
+    assert_eq!(
+        read(&bytes, ArchiveLimits::default()).expect_err("another root"),
+        ArchiveError::RootMismatch
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unsafe_tar_name_that_is_not_utf8_is_named() -> TestResult {
+    let mut tar = raw_member("release/a.py", b'0', SOURCE)?;
+    let mut header = tar::Header::new_ustar();
+    header.as_mut_bytes()[..10].copy_from_slice(b"release/\xffb");
+    header.set_size(0);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    tar.extend_from_slice(header.as_bytes());
+    let bytes = gzip(&tar)?;
+    for limits in both_modes(ArchiveLimits::default()) {
+        assert_eq!(
+            read(&bytes, limits).expect_err("name is not UTF-8"),
+            ArchiveError::unsafe_path("release/\u{fffd}b")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn names_equal_in_unicode_nfc_stay_separate_members() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let composed = format!("release/{COMPOSED}");
+    let decomposed = format!("release/{DECOMPOSED}");
+    for (first, second) in [(&composed, &decomposed), (&decomposed, &composed)] {
+        let entries = [
+            (first.as_str(), first.as_bytes(), regular),
+            (second.as_str(), second.as_bytes(), regular),
+        ];
+        for (name, format, bytes) in member_archives(&entries)? {
+            let files = read_format(&bytes, format, ArchiveLimits::default())?;
+            assert_eq!(
+                retained(&files),
+                [("r", b"".as_slice()), (COMPOSED, composed.as_bytes())],
+                "{name}"
+            );
+            assert_eq!(files.omissions().len(), 1, "{name}");
+            assert_eq!(files.omissions()[0].path().as_str(), DECOMPOSED, "{name}");
+        }
+    }
+    let entries = [
+        ("release/e\u{302}\u{323}", b"one".as_slice(), regular),
+        ("release/e\u{323}\u{302}", b"two", regular),
+    ];
+    for (name, format, bytes) in member_archives(&entries)? {
+        let files = read_format(&bytes, format, ArchiveLimits::default())?;
+        assert_eq!(files.omissions().len(), 2, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn members_outside_unicode_nfc_keep_collision_refusals() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let file = format!("release/{DECOMPOSED}");
+    let directory = format!("release/{DECOMPOSED}/");
+    let child = format!("release/{DECOMPOSED}/a");
+    let directory_kind = tar::EntryType::Directory;
+    for entries in [
+        [(&file, regular), (&child, regular)],
+        [(&child, regular), (&file, regular)],
+        [(&directory, directory_kind), (&file, regular)],
+        [(&file, tar::EntryType::Symlink), (&file, regular)],
+        [(&directory, directory_kind), (&directory, directory_kind)],
+    ] {
+        let bytes = tar_bytes(&entries.map(|(path, kind)| (path.as_str(), b"".as_slice(), kind)))?;
+        assert_eq!(
+            read(&bytes, ArchiveLimits::default()).expect_err("collision outside NFC"),
+            ArchiveError::DuplicatePath,
+            "{entries:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn members_outside_unicode_nfc_consume_every_bound() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let name = format!("release/{DECOMPOSED}.so");
+    let binary = oversized();
+    for (archive, format, bytes) in member_archives(&[(&name, &binary, regular)])? {
+        let skip = skipping(&bytes)?;
+        assert_eq!(
+            read_format(
+                &bytes,
+                format,
+                skip.with_oversized_members(OversizedMembers::Refuse)
+            )
+            .expect_err("member bytes"),
+            ArchiveBound::MemberBytes.exceeded(5000, 1024, None),
+            "{archive}"
+        );
+        let files = read_format(&bytes, format, skip)?;
+        assert_eq!(
+            omitted(&files),
+            [(
+                name.strip_prefix("release/").ok_or("fixture root")?,
+                ArchiveMemberKind::File,
+                ArchiveOmissionReason::NonCanonicalUnicode,
+                5000
+            )],
+            "{archive}"
+        );
+        let members = ArchiveLimits::new(bytes.len(), 65_536, 8192, 1, 200)?;
+        assert!(
+            matches!(
+                read_format(&bytes, format, members),
+                Err(ArchiveError::BoundExceeded(exceeded))
+                    if exceeded.bound() == ArchiveBound::Members
+            ),
+            "{archive}"
+        );
+        if format == ArchiveFormat::Zip {
+            let expanded = ArchiveLimits::new(bytes.len(), 4999, 4999, 4, 200)?
+                .with_oversized_members(OversizedMembers::Skip);
+            assert_eq!(
+                read_format(&bytes, format, expanded).expect_err("decompressed bytes"),
+                ArchiveBound::ExpandedBytes.exceeded(5000, 4999, None),
+                "{archive}"
+            );
+        }
+    }
+    let bytes = tar_bytes(&[(&name, &binary, regular)])?;
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(bytes.as_slice()).read_to_end(&mut tar)?;
+    let short = gzip(&tar[..512 + 4999])?;
+    for limits in both_modes(ArchiveLimits::default()) {
+        assert_eq!(
+            read(&short, limits).expect_err("file shorter than its header"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    let mut bytes = zip_bytes(&name, b"text")?;
+    let start = zip::ZipArchive::new(Cursor::new(bytes.as_slice()))?
+        .by_index(0)?
+        .data_start()
+        .ok_or("ZIP data offset unavailable")?;
+    bytes[usize::try_from(start)?] ^= 1;
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("CRC-32"),
+        ArchiveError::InvalidArchive
+    );
     Ok(())
 }
