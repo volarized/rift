@@ -3633,9 +3633,21 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.31.3"
+version = "0.31.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
@@ -4354,7 +4366,7 @@ checksum = "0e3f4237d0e4741eb50bc5584db701f1299c85fa31ff0274dd6445e79dc42d12"
 dependencies = [
  "futures",
  "indexmap 2.14.0",
- "nix",
+ "nix 0.31.4",
  "tokio",
  "tracing",
  "windows",
@@ -4739,7 +4751,7 @@ dependencies = [
  "jiff",
  "jsonschema",
  "mimalloc",
- "nix",
+ "nix 0.32.0",
  "oxrdf",
  "regex-syntax",
  "reqwest",
@@ -4949,7 +4961,7 @@ dependencies = [
  "data-encoding",
  "get-size2",
  "ignore",
- "nix",
+ "nix 0.32.0",
  "rayon",
  "regex-syntax",
  "rift-analysis",
@@ -8135,7 +8147,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libc",
  "memchr",
- "nix",
+ "nix 0.31.4",
  "typed-path",
  "windows-sys 0.61.2",
  "zeroize",

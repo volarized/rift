@@ -67,7 +67,7 @@ indicatif = { version = "0.18.6", default-features = false, features = ["unicode
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 lsp-types = "0.97.0"
 mimalloc = { version = "=0.1.52", features = ["v2", "override"] }
-nix = { version = "0.31.3", features = ["signal"] }
+nix = { version = "0.32.0", features = ["signal"] }
 notify = "=8.2.2"
 oas3-gen-support = "=0.28.0"
 oas3 = "=0.22.0"
