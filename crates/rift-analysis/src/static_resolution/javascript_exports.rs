@@ -1082,11 +1082,15 @@ impl<'source> File<'source> {
             return true;
         };
         // Only a whole leading name is the module's own object, not `exportsApi`.
-        if ["exports", "module.exports", "Object"].iter().any(|name| {
-            written.strip_prefix(name).is_some_and(|rest| {
-                !rest.starts_with(|next: char| next.is_alphanumeric() || matches!(next, '_' | '$'))
+        if written.starts_with("Object.defineProperty(")
+            || ["exports", "module.exports"].iter().any(|name| {
+                written.strip_prefix(name).is_some_and(|rest| {
+                    !rest.starts_with(|next: char| {
+                        next.is_alphanumeric() || matches!(next, '_' | '$')
+                    })
+                })
             })
-        }) {
+        {
             return true;
         }
         let Some((alias, _)) = written.split_once('.') else {

@@ -3952,7 +3952,7 @@ fn test_commonjs_module_value_aliases_and_assigned_values_resolve() {
 
 #[test]
 fn test_commonjs_module_value_alias_written_twice_calls_neither_value() {
-    for alias in ["app", "exportsApi", "Objects", "module_exports"] {
+    for alias in ["app", "exportsApi", "Object", "Objects", "module_exports"] {
         let library = format!(
             "var {alias} = module.exports = {{}};
 {alias}.run = first;
