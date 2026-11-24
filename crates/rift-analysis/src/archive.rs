@@ -474,16 +474,30 @@ const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTEN
 /// decodes one stream for header validation and another for the members.
 fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
     let expanded = output.expanded;
-    let gzip = || flate2::read::MultiGzDecoder::new(bytes).take(expanded.maximum as u64 + 1);
+    let read_max = expanded.maximum as u64 + 1;
+    let gzip = || GzipMembers::new(bytes).take(read_max);
+    // The gzip stream ends where its padding starts, so padding earns no expansion.
+    let check = |stream: &std::io::Take<GzipMembers<'_>>| {
+        let decoded = read_max - stream.limit();
+        if stream.limit() == 0 {
+            return Err(expanded.exceeded(decoded, None));
+        }
+        let bound = output
+            .limits
+            .expanded(bytes.len() - stream.get_ref().rest().len());
+        if decoded > bound.maximum as u64 {
+            return Err(bound.exceeded(bound.maximum as u64 + 1, None));
+        }
+        Ok(())
+    };
     match output.limits.oversized_members {
         OversizedMembers::Refuse => {
             let mut decoded = Vec::new();
-            gzip()
+            let mut stream = gzip();
+            stream
                 .read_to_end(&mut decoded)
                 .map_err(|_| ArchiveError::InvalidArchive)?;
-            if decoded.len() > expanded.maximum {
-                return Err(expanded.exceeded(decoded.len() as u64, None));
-            }
+            check(&stream)?;
             check_tar_headers(decoded.as_slice(), output.limits)?;
             read_tar_members(decoded.as_slice(), output)
         }
@@ -494,11 +508,43 @@ fn read_tar(bytes: &[u8], output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveE
             // header refusal, as decoding into memory first does.
             std::io::copy(&mut stream, &mut std::io::sink())
                 .map_err(|_| ArchiveError::InvalidArchive)?;
-            if stream.limit() == 0 {
-                return Err(expanded.exceeded(expanded.maximum as u64 + 1, None));
-            }
+            check(&stream)?;
             checked?;
             read_tar_members(gzip(), output)
+        }
+    }
+}
+
+/// Decodes every gzip member and ends at the NUL bytes that pad the last one.
+///
+/// Other bytes after a member start another member, so anything else that trails the stream
+/// is refused as an invalid member header.
+struct GzipMembers<'a>(flate2::bufread::GzDecoder<&'a [u8]>);
+
+impl<'a> GzipMembers<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self(flate2::bufread::GzDecoder::new(bytes))
+    }
+
+    /// Bytes no member has consumed; the padding, once the stream was read to its end.
+    fn rest(&self) -> &'a [u8] {
+        self.0.get_ref()
+    }
+}
+
+impl Read for GzipMembers<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        // Each pass consumes one member header, so the compressed bytes bound the loop.
+        loop {
+            let read = self.0.read(buffer)?;
+            let rest = self.rest();
+            if read != 0 || rest.iter().all(|byte| *byte == 0) {
+                return Ok(read);
+            }
+            self.0.reset(rest);
         }
     }
 }

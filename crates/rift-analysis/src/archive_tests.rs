@@ -2403,3 +2403,116 @@ fn pax_global_headers_that_change_members_are_refused() -> TestResult {
     );
     Ok(())
 }
+
+// Issue #1034.
+#[test]
+fn nul_padding_after_the_gzip_stream_is_accepted_within_the_compressed_bound() -> TestResult {
+    let plain = tar_bytes(&[("release/a.py", SOURCE, tar::EntryType::Regular)])?;
+    let empty = gzip(b"")?;
+    for stream in [
+        plain.clone(),
+        [plain.as_slice(), &empty].concat(),
+        [empty.as_slice(), &plain, &empty, &empty].concat(),
+    ] {
+        for padding in [0, 1, 512, 10_240] {
+            let bytes = [stream.as_slice(), &vec![0; padding]].concat();
+            let exact = ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?;
+            for limits in both_modes(exact) {
+                let files = read(&bytes, limits)?;
+                assert_eq!(files.files()[&fixture_path("a.py")], SOURCE);
+                assert_eq!(files.digest(), FileDigest::of(&bytes));
+            }
+            for limits in both_modes(ArchiveLimits::new(bytes.len() - 1, 8192, 1024, 2, 200)?) {
+                assert_eq!(
+                    read(&bytes, limits).expect_err("compressed byte bound"),
+                    ArchiveError::CompressedLimit
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn trailing_gzip_data_other_than_nul_padding_is_refused() -> TestResult {
+    let plain = tar_bytes(&[("release/a.py", SOURCE, tar::EntryType::Regular)])?;
+    let other = tar_bytes(&[("release/b.py", SOURCE, tar::EntryType::Regular)])?;
+    let cut = |bytes: usize| plain[..plain.len() - bytes].to_vec();
+    let mut wrong_length = plain.clone();
+    let length = wrong_length.len() - 4;
+    wrong_length[length] ^= 1;
+    for (name, bytes) in [
+        ("text", [plain.as_slice(), b"x"].concat()),
+        (
+            "text after padding",
+            [plain.as_slice(), &[0; 512], b"x"].concat(),
+        ),
+        (
+            "text in padding",
+            [plain.as_slice(), &[0; 8], b"x", &[0; 8]].concat(),
+        ),
+        (
+            "member after padding",
+            [plain.as_slice(), &[0; 512], &other].concat(),
+        ),
+        (
+            "part of a member header",
+            [plain.as_slice(), &other[..4]].concat(),
+        ),
+        (
+            "part of a member header, padded",
+            [plain.as_slice(), &other[..2], &[0; 8]].concat(),
+        ),
+        ("padding alone", vec![0; 512]),
+        ("cut length", cut(1)),
+        (
+            "cut checksum, padded",
+            [cut(5).as_slice(), &[0; 512]].concat(),
+        ),
+        (
+            "wrong length, padded",
+            [wrong_length.as_slice(), &[0; 512]].concat(),
+        ),
+    ] {
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                read(&bytes, limits).expect_err(name),
+                ArchiveError::InvalidArchive,
+                "{name}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nul_padding_does_not_raise_the_expansion_ratio_bound() -> TestResult {
+    let plain = tar_bytes(&[("release/a.py", SOURCE, tar::EntryType::Regular)])?;
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(plain.as_slice()).read_to_end(&mut decoded)?;
+    let accepted = decoded.len().div_ceil(plain.len());
+    let refused = accepted - 1;
+    let maximum = plain.len() * refused;
+    for padding in [0, 512, 10_240] {
+        let bytes = [plain.as_slice(), &vec![0; padding]].concat();
+        for limits in both_modes(ArchiveLimits::new(bytes.len(), 65_536, 1024, 2, refused)?) {
+            assert_eq!(
+                read(&bytes, limits).expect_err("expansion ratio of the gzip stream"),
+                ArchiveBound::ExpansionRatio.exceeded(maximum as u64 + 1, maximum as u64, None),
+                "padding={padding}"
+            );
+        }
+        for limits in both_modes(ArchiveLimits::new(bytes.len(), 65_536, 1024, 2, accepted)?) {
+            assert_eq!(read(&bytes, limits)?.files().len(), 1);
+        }
+        // The byte bound decides where it is the narrower one.
+        let narrow = decoded.len() - 1;
+        for limits in both_modes(ArchiveLimits::new(bytes.len(), narrow, 1024, 2, 200)?) {
+            assert_eq!(
+                read(&bytes, limits).expect_err("decompressed bytes"),
+                ArchiveBound::ExpandedBytes.exceeded(narrow as u64 + 1, narrow as u64, None)
+            );
+        }
+    }
+    Ok(())
+}
