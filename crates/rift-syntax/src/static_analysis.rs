@@ -374,8 +374,12 @@ pub struct StaticCommonJsExport {
 pub struct StaticFactsParts {
     /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
     pub javascript_module_syntax: bool,
-    /// Assignments to `module.exports` or `exports` that stand directly in the source file.
-    pub commonjs_direct_writes: Vec<ByteRange>,
+    /// Assignments to `module.exports` or a computed key of `module` that run while the file
+    /// does, in no function called later, and whether no condition encloses them.
+    pub commonjs_writes: Vec<(ByteRange, bool)>,
+    /// Source a `return` can skip: from the first one of the file, or of an immediately
+    /// called function, to that function's end.
+    pub skippable: Vec<ByteRange>,
     /// Whether an ECMAScript import or export statement stands directly in the source file.
     pub javascript_module_statement: bool,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
@@ -488,10 +492,17 @@ impl StaticFacts {
         self.0.javascript_module_statement
     }
 
-    /// Assignments to `module.exports` or `exports` in a statement of the source file itself.
+    /// Assignments to `module.exports` or a computed key of `module` that run while the file
+    /// does, in no function called later, and whether no condition encloses them.
     #[must_use]
-    pub fn commonjs_direct_writes(&self) -> &[ByteRange] {
-        &self.0.commonjs_direct_writes
+    pub fn commonjs_writes(&self) -> &[(ByteRange, bool)] {
+        &self.0.commonjs_writes
+    }
+
+    /// Source a `return` of the file or of an immediately called function can skip.
+    #[must_use]
+    pub fn skippable(&self) -> &[ByteRange] {
+        &self.0.skippable
     }
 
     /// The direct default write, if the `CommonJS` wrapper remains closed.
@@ -795,7 +806,8 @@ impl StaticFacts {
             vector_capacity(&self.0.expression_scopes),
             vector_capacity(&self.0.first_iterables),
             vector_capacity(&self.0.non_none_guards),
-            vector_capacity(&self.0.commonjs_direct_writes),
+            vector_capacity(&self.0.commonjs_writes),
+            vector_capacity(&self.0.skippable),
             vector_capacity(&self.0.closure_calls),
         ]
         .into_iter()
@@ -858,7 +870,8 @@ impl StaticFacts {
             self.expression_scopes().len(),
             self.first_iterables().len(),
             self.non_none_guards().len(),
-            self.commonjs_direct_writes().len(),
+            self.commonjs_writes().len(),
+            self.skippable().len(),
             self.closure_calls().len(),
         ];
         if lengths
@@ -953,7 +966,8 @@ impl StaticFacts {
         self.assignments()
             .iter()
             .chain(self.function_writes())
-            .chain(self.commonjs_direct_writes())
+            .chain(self.commonjs_writes().iter().map(|(write, _)| write))
+            .chain(self.skippable())
             .copied()
             .all(valid)
             && self.member_copies().iter().all(|copy| {

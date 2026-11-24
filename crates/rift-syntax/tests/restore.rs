@@ -319,27 +319,85 @@ fn test_module_statements_stand_directly_in_the_source_file() {
 }
 
 #[test]
-fn test_direct_commonjs_writes_run_without_a_condition() {
+fn test_commonjs_writes_run_with_their_file() {
     let checked = |source| {
         parsed(ShippedLanguage::JavaScript, source)
             .facts()
             .static_facts()
             .expect("static facts")
-            .commonjs_direct_writes()
-            .len()
+            .commonjs_writes()
+            .iter()
+            .map(|(_, always)| *always)
+            .collect::<Vec<_>>()
     };
-    for (source, count) in [
-        ("module.exports = a;", 1),
-        ("var b = module.exports = a;", 1),
-        ("exports = module.exports = a;", 2),
-        ("module.exports = a; module.exports = b;", 2),
-        ("if (c) module.exports = a;", 0),
-        ("c && (module.exports = a);", 0),
-        ("function swap() { module.exports = a }", 0),
-        ("{ module.exports = a }", 0),
-        ("exports.a = a;", 0),
+    for (source, always) in [
+        ("module.exports = a;", &[true][..]),
+        ("var b = module.exports = a;", &[true][..]),
+        ("exports = module.exports = a;", &[true][..]),
+        ("module.exports = a; module.exports = b;", &[true, true][..]),
+        ("if (c) module.exports = a;", &[false][..]),
+        ("c && (module.exports = a);", &[false][..]),
+        ("function swap() { module.exports = a }", &[][..]),
+        ("{ module.exports = a }", &[true][..]),
+        ("(module.exports = a);", &[true][..]),
+        ("(function () { module.exports = a })();", &[true][..]),
+        ("((function () { { module.exports = a } }))();", &[true][..]),
+        (
+            "(async function () { await b; module.exports = a })();",
+            &[][..],
+        ),
+        (
+            "(function () { if (c) { module.exports = a } })();",
+            &[false][..],
+        ),
+        ("run(function () { module.exports = a });", &[][..]),
+        ("run(module.exports = a);", &[false][..]),
+        (
+            "if (c) { module.exports = a } else { module.exports = a }",
+            &[true, true][..],
+        ),
+        (
+            "if (c) module.exports = a; else module.exports = a",
+            &[true, true][..],
+        ),
+        (
+            "if (c) module.exports = a; else module.exports = b",
+            &[false, false][..],
+        ),
+        ("if (c) { if (d) module.exports = a } else {}", &[false][..]),
+        ("try { module.exports = a } catch (e) {}", &[false][..]),
+        ("module['exports'] = a;", &[true][..]),
+        ("module[key] = a;", &[true][..]),
+        ("module.exports[key] = a;", &[][..]),
+        ("exports.a = a;", &[][..]),
     ] {
-        assert_eq!(checked(source), count, "{source}");
+        assert_eq!(checked(source), always, "{source}");
+    }
+}
+
+#[test]
+fn test_a_return_can_skip_the_rest_of_its_function() {
+    let checked = |source: &str| {
+        parsed(ShippedLanguage::JavaScript, source)
+            .facts()
+            .static_facts()
+            .expect("static facts")
+            .skippable()
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(checked("if (a) return; b();"), [(7, 19)]);
+    assert_eq!(
+        checked("(function () { if (a) return; return })(); b()"),
+        [(22, 38)]
+    );
+    for source in [
+        "function f() { return }",
+        "run(function () { return })",
+        "(async function () { return })()",
+    ] {
+        assert!(checked(source).is_empty(), "{source}");
     }
 }
 

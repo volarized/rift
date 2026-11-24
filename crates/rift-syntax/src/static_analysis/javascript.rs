@@ -368,7 +368,8 @@ impl Kinds {
         self.record_spread_value(syntax_element, facts)?;
         self.record_module_statement(visited, facts);
         self.record_module_syntax(visited, source, facts);
-        self.record_direct_write(visited, source, facts)?;
+        self.record_commonjs_write(visited, source, facts)?;
+        self.record_skippable(visited, facts)?;
         self.record_reference(visited, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
@@ -632,9 +633,9 @@ impl Kinds {
         .then_some(parent)
     }
 
-    /// Records a write of the `CommonJS` module value in a statement of the source file itself,
-    /// with no condition and no function around it.
-    fn record_direct_write(
+    /// Records a write of `module.exports` or of a computed key of `module` that runs while
+    /// its file does, and whether no condition encloses it.
+    fn record_commonjs_write(
         &self,
         visited: Visited<'_, '_>,
         source: &str,
@@ -642,34 +643,111 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let element = visited.syntax_element();
         if element.kind_id() != self.assignment[0]
-            || !element
-                .child_by_field_id(self.left)
-                .and_then(|left| text(left, source))
-                .is_some_and(|left| matches!(left, "module.exports" | "exports"))
+            || !element.child_by_field_id(self.left).is_some_and(|left| {
+                text(left, source) == Some("module.exports")
+                    || (left.kind_id() == self.subscript
+                        && left
+                            .child_by_field_id(self.object)
+                            .and_then(|object| text(object, source))
+                            == Some("module"))
+            })
         {
+            return Ok(());
+        }
+        let mut always = true;
+        // The syntax walk has admitted every enclosing element's depth.
+        let mut parent = visited.parent();
+        while let Some(candidate) = parent {
+            let id = candidate.syntax_element().kind_id();
+            if id == self.scopes[0] {
+                facts.commonjs_writes.push((byte_range(element)?, always));
+                break;
+            }
+            let called = self.immediately_called(candidate);
+            if !called && (id == self.scopes[7] || self.function_scopes.contains(&id)) {
+                break;
+            }
+            always &= called
+                || same_branches(candidate.syntax_element(), source)
+                || matches!(
+                    candidate.syntax_element().kind(),
+                    "assignment_expression"
+                        | "call_expression"
+                        | "else_clause"
+                        | "expression_statement"
+                        | "lexical_declaration"
+                        | "parenthesized_expression"
+                        | "statement_block"
+                        | "variable_declaration"
+                        | "variable_declarator"
+                );
+            parent = candidate.parent();
+        }
+        Ok(())
+    }
+
+    /// Records the source that the first `return` of the file or of an immediately called
+    /// function can skip.
+    fn record_skippable(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
+        if element.kind_id() != self.return_statement {
             return Ok(());
         }
         // The syntax walk has admitted every enclosing element's depth.
         let mut parent = visited.parent();
         while let Some(candidate) = parent {
-            let kind = candidate.syntax_element().kind();
-            if kind == "program" {
-                facts.commonjs_direct_writes.push(byte_range(element)?);
-                break;
-            }
-            if !matches!(
-                kind,
-                "assignment_expression"
-                    | "expression_statement"
-                    | "variable_declarator"
-                    | "variable_declaration"
-                    | "lexical_declaration"
-            ) {
+            if self
+                .function_scopes
+                .contains(&candidate.syntax_element().kind_id())
+            {
                 break;
             }
             parent = candidate.parent();
         }
+        let Some(function) = parent.filter(|function| {
+            function.syntax_element().kind_id() == self.scopes[0]
+                || self.immediately_called(*function)
+        }) else {
+            return Ok(());
+        };
+        let skipped = crate::ByteRange {
+            start: byte_range(element)?.start,
+            end: byte_range(function.syntax_element())?.end,
+        };
+        if facts
+            .skippable
+            .last()
+            .is_none_or(|last| !last.encloses(skipped))
+        {
+            facts.skippable.push(skipped);
+        }
         Ok(())
+    }
+
+    /// Whether a function expression is called where it is written: `(function () { .. })()`.
+    fn immediately_called(&self, function: Visited<'_, '_>) -> bool {
+        let element = function.syntax_element();
+        if element.kind_id() != self.named_expression[0]
+            || element.child(0).map(|first| first.kind()) == Some("async")
+        {
+            return false;
+        }
+        let mut callee = function;
+        while let Some(outer) = callee
+            .parent()
+            .filter(|outer| outer.syntax_element().kind_id() == self.parenthesized)
+        {
+            callee = outer;
+        }
+        callee.parent().is_some_and(|call| {
+            call.syntax_element().kind_id() == self.call
+                && call.syntax_element().child_by_field_id(self.callee)
+                    == Some(callee.syntax_element())
+        })
     }
 
     fn record_module_statement(&self, visited: Visited<'_, '_>, facts: &mut StaticFactsParts) {
@@ -2336,6 +2414,29 @@ impl Kinds {
         }
         Ok(())
     }
+}
+
+/// Whether an `if` statement runs the same source whether its condition holds or not.
+fn same_branches(statement: Node<'_>, source: &str) -> bool {
+    if statement.kind() != "if_statement" {
+        return false;
+    }
+    let branch = |element: Node<'_>| {
+        let written = text(element, source)?.trim();
+        let written = written
+            .strip_prefix('{')
+            .and_then(|inner| inner.strip_suffix('}'))
+            .unwrap_or(written);
+        Some(written.trim().trim_end_matches(';'))
+    };
+    let consequence = statement
+        .child_by_field_name("consequence")
+        .and_then(branch);
+    let alternative = statement
+        .child_by_field_name("alternative")
+        .and_then(|clause| clause.named_child(0))
+        .and_then(branch);
+    consequence.is_some() && consequence == alternative
 }
 
 fn text<'a>(syntax_element: Node<'_>, source: &'a str) -> Option<&'a str> {

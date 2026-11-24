@@ -608,6 +608,120 @@ fn an_entry_keeps_the_identities_of_names_in_several_scopes() {
     }
 }
 
+/// Forwards of `child.js`, and whether one gives the module its value.
+const FORWARDS: &[(&str, bool)] = &[
+    ("module.exports = require('./child');", true),
+    ("exports = module.exports = require('./child');", true),
+    ("var child = module.exports = require('./child');", true),
+    (
+        "module.exports = require('./child'); exports.other = 1;",
+        true,
+    ),
+    ("{ module.exports = require('./child') }", true),
+    ("(module.exports = require('./child'));", true),
+    (
+        "(function () { module.exports = require('./child') })();",
+        true,
+    ),
+    (
+        "module.exports = require('./child'); module.exports = require('./child');",
+        true,
+    ),
+    (
+        "module.exports = require('./child'); if (cond) module.exports = require('./child');",
+        true,
+    ),
+    (
+        "module.exports = other; module.exports = require('./child');",
+        true,
+    ),
+    (
+        "module.exports = require('./other'); module.exports = require('./child');",
+        true,
+    ),
+    (
+        "module.exports = require('./child'); module.exports = require('./other');",
+        false,
+    ),
+    (
+        "module.exports = (function () { module.exports = require('./child'); return other })();",
+        false,
+    ),
+    (
+        "(function () { if (cond) return; module.exports = require('./child') })();",
+        false,
+    ),
+    (
+        "if (cond) return; module.exports = require('./child');",
+        false,
+    ),
+    (
+        "if (cond) module.exports = other; module.exports = require('./child');",
+        true,
+    ),
+    (
+        "if (cond) { module.exports = other; return } module.exports = require('./child');",
+        false,
+    ),
+    (
+        "class A { static { module.exports = other } } module.exports = require('./child');",
+        false,
+    ),
+    (
+        "module.exports = require('./child'); (() => { module.exports = other })();",
+        false,
+    ),
+    (
+        "module.exports = require('./child'); module['exports'] = other;",
+        false,
+    ),
+    (
+        "module['exports'] = other; module.exports = require('./child');",
+        true,
+    ),
+    (
+        "module[key] = other; module.exports = require('./child');",
+        true,
+    ),
+    (
+        "module.exports = require('./child'); module[key] = other;",
+        false,
+    ),
+    (
+        "module.exports = require('./child'); module['id'] = other;",
+        true,
+    ),
+    (
+        "if (cond) { module.exports = require('./child') } else { module.exports = require('./child') }",
+        true,
+    ),
+    (
+        "if (cond) { module.exports = require('./child') } else { module.exports = require('./other') }",
+        false,
+    ),
+    ("if (cond) module.exports = require('./child');", false),
+    ("cond && (module.exports = require('./child'));", false),
+    (
+        "module.exports = require('./child'); module.exports = other;",
+        false,
+    ),
+    (
+        "module.exports = require('./child'); if (cond) module.exports = other;",
+        false,
+    ),
+    (
+        "module.exports = require('./child'); function swap() { module.exports = other }",
+        false,
+    ),
+    ("module.exports = require(target);", false),
+    (
+        "const require = other; module.exports = require('./child');",
+        false,
+    ),
+    ("module.exports = require('../child');", false),
+    ("module.exports = require('./missing');", false),
+];
+
 #[test]
 fn a_forward_another_value_can_replace_reaches_no_target() {
     let user = "var i = require('./index');
@@ -615,45 +729,13 @@ var { open } = require('./index');
 function use() { i.open(); open() }
 exports.use = use;
 ";
-    for (forward, settled) in [
-        ("module.exports = require('./child');", true),
-        ("exports = module.exports = require('./child');", true),
-        ("var child = module.exports = require('./child');", true),
-        (
-            "module.exports = require('./child'); exports.other = 1;",
-            true,
-        ),
-        ("if (cond) module.exports = require('./child');", false),
-        ("cond && (module.exports = require('./child'));", false),
-        (
-            "module.exports = require('./child'); module.exports = other;",
-            false,
-        ),
-        (
-            "module.exports = other; module.exports = require('./child');",
-            false,
-        ),
-        (
-            "module.exports = require('./child'); if (cond) module.exports = other;",
-            false,
-        ),
-        (
-            "module.exports = require('./child'); function swap() { module.exports = other }",
-            false,
-        ),
-        ("module.exports = require(target);", false),
-        (
-            "const require = other; module.exports = require('./child');",
-            false,
-        ),
-        ("module.exports = require('../child');", false),
-        ("module.exports = require('./missing');", false),
-    ] {
+    for &(forward, settled) in FORWARDS {
         let analysis = analyze(
             MAIN,
             &[
                 ("index.js", forward),
                 ("child.js", "exports.open = function open() {};\n"),
+                ("other.js", "exports.open = function open() {};\n"),
                 ("user.js", user),
             ],
         );
