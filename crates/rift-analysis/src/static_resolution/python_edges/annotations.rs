@@ -66,9 +66,9 @@ impl<'source> Index<'source> {
         let member = if self.python_typing_name(file, head, "Optional", work) {
             inner
         } else if self.python_typing_name(file, head, "Union", work) {
-            let mut members = top_level_members(inner)
+            let mut members = top_level_parts(inner, ',', work)?
                 .into_iter()
-                .filter(|member| member.trim().trim_matches(['\'', '"']) != "None");
+                .filter(|member| member.trim_matches(['\'', '"']) != "None");
             let member = members.next()?;
             if members.next().is_some() {
                 return None;
@@ -94,22 +94,45 @@ pub(super) fn slice_range(range: ByteRange, written: &str, slice: &str) -> Optio
     })
 }
 
-/// Comma separated members of a subscript, outside nested brackets and parentheses.
-pub(super) fn top_level_members(text: &str) -> Vec<&str> {
-    let mut members = Vec::new();
-    let mut depth = 0_usize;
-    let mut start = 0;
-    for (index, character) in text.char_indices() {
-        match character {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                members.push(&text[start..index]);
-                start = index + 1;
-            }
-            _ => {}
+/// Text one charge of the work budget covers.
+const CHARGED_BYTES: usize = 64;
+
+/// The parts of `text` between `separator`s outside brackets, parentheses and quotes, without
+/// the spaces around each. A trailing separator adds no part.
+pub(super) fn top_level_parts<'text>(
+    text: &'text str,
+    separator: char,
+    work: &mut Work,
+) -> Option<Vec<&'text str>> {
+    for _ in 0..=text.len() / CHARGED_BYTES {
+        if !work.charge() {
+            return None;
         }
     }
-    members.push(&text[start..]);
-    members
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        match (quote, character) {
+            (Some(open), _) => {
+                if character == open {
+                    quote = None;
+                }
+            }
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '[' | '(') => depth += 1,
+            (None, ']' | ')') => depth = depth.saturating_sub(1),
+            (None, _) if depth == 0 && character == separator => {
+                parts.push(text[start..index].trim());
+                start = index + separator.len_utf8();
+            }
+            (None, _) => {}
+        }
+    }
+    let last = text[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    Some(parts)
 }

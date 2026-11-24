@@ -689,6 +689,134 @@ def Mixed():
     assert!(!held.is_public("Mixed.__enter__"));
 }
 
+#[test]
+fn python_package_visibility_hides_definitions_inside_private_functions() {
+    let source = r"def _helper():
+    def inner(): pass
+
+class Session:
+    def _prepare(self):
+        self.url = 1
+        def step(): pass
+
+    def open(self):
+        self._handle = 1
+        def step(): pass
+";
+    let analysis = analyzed(ShippedLanguage::Python, vec![("mod.py", source)]);
+    let held = &analysis.files()[0];
+    for (name, public) in [
+        ("_helper", false),
+        ("_helper.inner", false),
+        ("Session.url", true),
+        ("Session._prepare", false),
+        ("Session._prepare.step", false),
+        ("Session._handle", false),
+        ("Session.open.step", true),
+    ] {
+        assert!(
+            held.file()
+                .syntax()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.qualified_name == name),
+            "{name}"
+        );
+        assert_eq!(held.is_public(name), public, "{name}");
+    }
+}
+
+#[test]
+fn python_package_visibility_follows_the_names_a_module_lists() {
+    let source = r#"from .other import imported as imported
+
+__all__ = ["Session", "_listed", "imported"]
+
+class Session:
+    def __init__(self): pass
+    def _hidden(self): pass
+
+class Unlisted:
+    def open(self): pass
+
+class _Private:
+    def open(self): pass
+
+def _listed(): pass
+def unlisted(): pass
+
+__all__ += ("_Private", "LIMIT")
+LIMIT = 1
+OTHER = 2
+"#;
+    let analysis = analyzed(
+        ShippedLanguage::Python,
+        vec![
+            ("pkg/mod.py", source),
+            (
+                "pkg/other.py",
+                "def imported(): pass
+",
+            ),
+            (
+                "pkg/empty.py",
+                "__all__ = []
+def run(): pass
+",
+            ),
+            (
+                "pkg/computed.py",
+                "__all__ = ['run'] + names()
+def run(): pass
+def open(): pass
+def _hidden(): pass
+",
+            ),
+        ],
+    );
+    for (path, name, public) in [
+        ("pkg/mod.py", "Session", true),
+        ("pkg/mod.py", "Session.__init__", true),
+        ("pkg/mod.py", "Session._hidden", false),
+        ("pkg/mod.py", "Unlisted", false),
+        ("pkg/mod.py", "Unlisted.open", false),
+        ("pkg/mod.py", "_Private", true),
+        ("pkg/mod.py", "_Private.open", true),
+        ("pkg/mod.py", "_listed", true),
+        ("pkg/mod.py", "unlisted", false),
+        ("pkg/mod.py", "LIMIT", true),
+        ("pkg/mod.py", "OTHER", false),
+        ("pkg/mod.py", "__all__", false),
+        ("pkg/other.py", "imported", true),
+        ("pkg/empty.py", "run", false),
+        ("pkg/empty.py", "__all__", false),
+        ("pkg/computed.py", "run", true),
+        ("pkg/computed.py", "open", true),
+        ("pkg/computed.py", "_hidden", false),
+    ] {
+        let held = analysis
+            .files()
+            .iter()
+            .find(|file| file.file().path().as_str() == path)
+            .expect(path);
+        assert!(
+            held.file()
+                .syntax()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.qualified_name == name),
+            "{path} {name}"
+        );
+        assert_eq!(held.is_public(name), public, "{path} {name}");
+        let declaration = symbol_at(&analysis, path, name).expect(name);
+        assert_eq!(declaration.public, public, "{path} {name}");
+    }
+    assert!(
+        analysis.files().iter().all(|file| file.is_public(".")),
+        "a module stays public whatever it lists"
+    );
+}
+
 /// A stub member whose class joined the module names the class the module declares as its
 /// container.
 #[test]

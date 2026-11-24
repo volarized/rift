@@ -24,6 +24,8 @@
 //! - A module-level `from module import name as name`, the typing
 //!   convention's explicit re-export, records an export binding; the
 //!   namespace places it as an alias in the importing module.
+//! - A module-level `__all__` written as string literals records an export
+//!   binding for the assigned name, then one for each listed name.
 //! - Python states no authored visibility, so `visibility` stays `None`;
 //!   the leading-underscore convention is a reading habit, not syntax.
 
@@ -40,6 +42,7 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+mod declared_exports;
 mod overload;
 mod variable_scopes;
 
@@ -107,6 +110,29 @@ const ALIASED_IMPORT_KIND: &str = "aliased_import";
 const MODULE_NAME_FIELD: &str = "module_name";
 /// Grammar field holding the name an aliased import binds.
 const ALIAS_FIELD: &str = "alias";
+/// Grammar spelling of an augmented assignment, `names += more`.
+const AUGMENTED_ASSIGNMENT_KIND: &str = "augmented_assignment";
+/// Grammar field holding an augmented assignment's operator.
+const OPERATOR_FIELD: &str = "operator";
+/// Grammar field holding a call's arguments.
+const ARGUMENTS_FIELD: &str = "arguments";
+/// Sequence expressions an `__all__` list may be written as.
+const SEQUENCE_KINDS: [&str; 3] = ["list", "tuple", "expression_list"];
+/// Loops whose `right` field is the iterated value.
+const LOOP_KINDS: [&str; 2] = ["for_statement", "for_in_clause"];
+/// Syntax elements that read a name they hold and cannot write it.
+const READING_KINDS: [&str; 6] = [
+    "binary_operator",
+    "comparison_operator",
+    "if_statement",
+    "list_splat",
+    "not_operator",
+    "return_statement",
+];
+/// Grammar spelling of a call's arguments.
+const ARGUMENT_LIST_KIND: &str = "argument_list";
+/// Grammar field holding a call's callee.
+const FUNCTION_FIELD: &str = "function";
 /// Targets that bind every name they hold: `a, b`, `(a, b)`, `[a, *b]`.
 const TARGET_PATTERN_KINDS: [&str; 4] = [
     "pattern_list",
@@ -132,7 +158,14 @@ const DOC_ATTRIBUTE: &str = "__doc__";
 /// Decorators that bind a method to its class rather than an instance.
 const STATIC_DECORATORS: [&str; 2] = ["staticmethod", "classmethod"];
 /// Decorators that make a method read like a field.
-const PROPERTY_DECORATORS: [&str; 4] = ["property", "cached_property", "setter", "deleter"];
+const PROPERTY_DECORATORS: [&str; 6] = [
+    "property",
+    "cached_property",
+    "abstractproperty",
+    "getter",
+    "setter",
+    "deleter",
+];
 /// String prefix letter that makes a literal a formatted string.
 const FORMATTED_PREFIXES: [char; 2] = ['f', 'F'];
 
@@ -177,6 +210,14 @@ struct PythonKinds {
     target_patterns: Vec<u16>,
     declaring_statements: Vec<u16>,
     declaring_clauses: Vec<u16>,
+    augmented_assignment: u16,
+    sequence_kinds: Vec<u16>,
+    loop_kinds: Vec<u16>,
+    reading_kinds: Vec<u16>,
+    argument_list: u16,
+    function_field: NonZeroU16,
+    operator: NonZeroU16,
+    arguments: NonZeroU16,
     name: NonZeroU16,
     body: NonZeroU16,
     left: NonZeroU16,
@@ -227,6 +268,14 @@ impl PythonKinds {
             declaring_clauses: DECLARING_CLAUSE_KINDS
                 .map(|kind| kind_id(language, kind))
                 .to_vec(),
+            augmented_assignment: kind_id(language, AUGMENTED_ASSIGNMENT_KIND),
+            sequence_kinds: SEQUENCE_KINDS.map(|kind| kind_id(language, kind)).to_vec(),
+            loop_kinds: LOOP_KINDS.map(|kind| kind_id(language, kind)).to_vec(),
+            reading_kinds: READING_KINDS.map(|kind| kind_id(language, kind)).to_vec(),
+            argument_list: kind_id(language, ARGUMENT_LIST_KIND),
+            function_field: field_id(language, FUNCTION_FIELD),
+            operator: field_id(language, OPERATOR_FIELD),
+            arguments: field_id(language, ARGUMENTS_FIELD),
             name: field_id(language, NAME_FIELD),
             body: field_id(language, BODY_FIELD),
             left: field_id(language, LEFT_FIELD),
@@ -1175,7 +1224,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         };
         rules.assigned_docs = assigned_docs(&rules, tree.root_node(), source.text)?;
         let mut capture = crate::static_analysis::Capture::for_edge_python(source.text);
-        let (syntax_elements, mut symbols, export_bindings) = extract::extract_with_capture(
+        let (syntax_elements, mut symbols, mut export_bindings) = extract::extract_with_capture(
             tree.root_node(),
             source,
             limits,
@@ -1202,7 +1251,13 @@ impl SyntaxProvider for PythonSyntaxProvider {
         }
         rules.attach_assigned_docs(&mut symbols);
         attach_attribute_docs(&rules, tree.root_node(), source.text, &mut symbols)?;
-        let static_facts = capture.finish();
+        export_bindings.extend(declared_exports::declared_exports(
+            python_kinds(),
+            tree.root_node(),
+            source.text,
+        )?);
+        export_bindings.sort_by_key(|binding| binding.range.start);
+        let static_facts = capture.finish_python(tree.root_node())?;
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
