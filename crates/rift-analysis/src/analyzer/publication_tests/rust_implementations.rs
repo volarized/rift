@@ -72,6 +72,14 @@ fn implementations_are_facets_of_the_imported_type() {
         })
     };
     assert!(
+        publication.edges.iter().all(|edge| {
+            !edge.kinds.contains(&EdgeKind::Contains)
+                || edge.to.as_str() != version
+                || edge.from.as_str() == ROOT
+        }),
+        "a module that holds an implementation does not contain its type"
+    );
+    assert!(
         publication.edges.iter().any(|edge| {
             edge.kinds.contains(&EdgeKind::Imports)
                 && edge.from.as_str() == format!("{ROOT}/display")

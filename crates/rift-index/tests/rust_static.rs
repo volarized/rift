@@ -2314,3 +2314,32 @@ fn test_rust_target_conditions_on_modules_keep_every_row_of_the_active_target() 
         }
     }
 }
+
+#[test]
+fn test_rust_associated_types_come_from_their_own_implementation() {
+    // Several implementations of one type declare an associated type of one name, in one file
+    // and in others; `Self::Error` names the one of the enclosing implementation.
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            (
+                "src/lib.rs",
+                "pub mod parse; pub struct Fault; pub struct Id; pub trait From<T> { type Error; fn from(value: T) -> Result<Id, Self::Error>; }\nimpl From<u8> for Id { type Error = Fault; fn from(_value: u8) -> Result<Id, Self::Error> { Ok(Id) } }\n",
+            ),
+            (
+                "src/parse.rs",
+                "use crate::{Fault, From, Id};\nimpl From<u16> for Id { type Error = Fault; fn from(_value: u16) -> Result<Id, Self::Error> { Ok(Id) } }\nimpl From<u32> for Id { type Error = Fault; fn from(_value: u32) -> Result<Id, Self::Error> { Ok(Id) } }\n",
+            ),
+        ],
+    );
+    let used = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind() == EdgeKind::HasType && edge.to().as_str().ends_with("/fixture/Id/Error")
+        })
+        .map(|edge| edge.from().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(used.len(), 3, "{used:?}");
+    assert!(used.iter().all(|from| from.ends_with("/fixture/Id/from")));
+}

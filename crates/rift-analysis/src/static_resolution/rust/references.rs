@@ -578,7 +578,28 @@ impl<'source> Namespaces<'source> {
         })
     }
 
+    /// The declaration that contains `symbol`. The header of an implementation is a facet of
+    /// the type it names, so a module holding it contains it only when it declares the type.
     fn container(
+        &self,
+        file: &File<'source>,
+        symbol: &'source SyntaxSymbol,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let parent = self.parent(file, symbol, work)?;
+        if symbol.kind != "impl_item" {
+            return Some(parent);
+        }
+        let path = Target {
+            file: file.document,
+            symbol,
+        }
+        .admitted_path()?;
+        let (_, owner) = path.split_last()?;
+        (parent.admitted_path()? == owner).then_some(parent)
+    }
+
+    fn parent(
         &self,
         file: &File<'source>,
         symbol: &SyntaxSymbol,

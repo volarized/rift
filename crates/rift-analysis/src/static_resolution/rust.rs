@@ -110,6 +110,11 @@ impl<'source> Namespaces<'source> {
                 .filter(|target| self.available(*target));
         }
         let parts = path_segments(file.text(range)?, work)?;
+        if let ["Self", name] = parts.as_slice()
+            && let Some(target) = Self::associated_type(file, range.start, name, work)
+        {
+            return self.available(target).then_some(target);
+        }
         if let [name] = parts.as_slice()
             && let Some(target) = Self::local_type(file, range.start, name, work)
         {
@@ -123,6 +128,35 @@ impl<'source> Namespaces<'source> {
                         && target.symbol.kinds.contains(&SymbolKind::Type)
                         && self.available(*target)
                 })
+            })
+    }
+
+    /// The associated type `Self::name` of the implementation around `position`, whatever
+    /// other implementations of the type declare.
+    fn associated_type(
+        file: &File<'source>,
+        position: u64,
+        name: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let implementation = file
+            .facts
+            .inherent_impls()
+            .iter()
+            .filter(|implementation| work.charge() && implementation.range.contains(position))
+            .min_by_key(|implementation| implementation.range.end - implementation.range.start)?;
+        let header = file.target_at(implementation.type_path)?;
+        let qualified = format!("{}::{name}", header.symbol.qualified_name);
+        file.by_qualified_name
+            .get(qualified.as_str())?
+            .iter()
+            .find(|symbol| {
+                symbol.kinds.contains(&SymbolKind::Type)
+                    && implementation.range.encloses(symbol.item_range)
+            })
+            .map(|symbol| Target {
+                file: file.document,
+                symbol,
             })
     }
 
