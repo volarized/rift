@@ -98,7 +98,15 @@ fn test_rust_impl_only_module_keeps_imported_calls_and_type_members() {
             .edges()
             .any(|edge| edge.kind() == EdgeKind::Contains
                 && edge.from().as_str().ends_with("/fixture/Task")
-                && edge.to().as_str().ends_with("/Task/run"))
+                && edge.to().as_str().ends_with("/fixture/Task/run"))
+    );
+    assert!(
+        index
+            .edges()
+            .edges()
+            .all(|edge| !edge.from().as_str().contains("/jobs/Task")
+                && !edge.to().as_str().contains("/jobs/Task")),
+        "the implementation belongs to the imported type"
     );
 }
 
@@ -2068,4 +2076,300 @@ fn test_rust_reexports_of_dependency_items_keep_the_written_module() {
         "/fixture/local",
         "/alloc/inner/local/Thing"
     ));
+}
+
+#[test]
+fn test_rust_target_conditions_store_facts_of_the_host_target() {
+    // #859: a local workspace decides target predicates with the host target.
+    let (_directory, index) = fixture_index(
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\n",
+        &[(
+            "src/lib.rs",
+            "pub struct Item { pub value: usize }\npub fn leaf() -> usize { 1 }\nimpl Item {\n    #[cfg(feature = \"std\")]\n    pub fn by_feature(&self) -> usize { leaf() + self.value }\n    #[cfg(unix)]\n    pub fn by_unix(&self) -> usize { leaf() + self.value }\n    #[cfg(any(unix, windows, target_os = \"wasi\"))]\n    pub fn by_any_target(&self) -> usize { leaf() + self.value }\n    #[cfg(all(feature = \"std\", any(unix, windows)))]\n    pub fn by_feature_and_target(&self) -> usize { leaf() + self.value }\n    #[cfg(not(target_os = \"emscripten\"))]\n    pub fn by_not_target(&self) -> usize { leaf() + self.value }\n    #[cfg(windows)]\n    pub fn by_windows(&self) -> usize { leaf() + self.value }\n    #[cfg(all(unix, custom))]\n    pub fn by_unknown(&self) -> usize { leaf() + self.value }\n    pub fn plain(&self) -> usize { leaf() + self.value }\n}\n#[cfg(unix)]\npub fn native() -> usize { 1 }\n#[cfg(windows)]\npub fn native() -> usize { 2 }\npub fn caller() -> usize { native() }\n",
+        )],
+    );
+    for (method, active) in [
+        ("by_feature", true),
+        ("by_unix", cfg!(unix)),
+        ("by_any_target", true),
+        ("by_feature_and_target", true),
+        ("by_not_target", true),
+        ("by_windows", cfg!(windows)),
+        ("by_unknown", false),
+        ("plain", true),
+    ] {
+        let from = format!("/Item/{method}");
+        for (kind, from, to) in [
+            (EdgeKind::Contains, "/fixture/Item", from.as_str()),
+            (EdgeKind::Calls, from.as_str(), "/fixture/leaf"),
+            (EdgeKind::Reads, from.as_str(), "/Item/value"),
+        ] {
+            assert_eq!(
+                has_edge(&index, kind, from, to),
+                active,
+                "{kind:?} {from} -> {to}"
+            );
+        }
+    }
+    assert!(
+        has_edge(
+            &index,
+            EdgeKind::Calls,
+            "/fixture/caller",
+            "/fixture/native"
+        ),
+        "the inactive alternative leaves the active declaration as the one target"
+    );
+    let view = index.symbol_view().expect("symbols");
+    assert!(
+        view.normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some()),
+        "every declaration keeps its identity"
+    );
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+/// Every stored edge of one fixture without its occurrence.
+fn edge_rows(files: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String, String)> {
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, files);
+    assert!(index.edges().is_complete());
+    index
+        .edges()
+        .edges()
+        .map(|edge| {
+            (
+                format!("{:?}", edge.kind()),
+                edge.from().as_str().to_owned(),
+                edge.to().as_str().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_rust_leading_whitespace_keeps_every_row_of_a_reexporting_file() {
+    // #982: the parsed file starts at its first token and its `use` items apply to the file.
+    const OTHER: &str = "pub struct Item; impl Item { pub fn read(&self) -> u8 { 1 } } pub fn leaf() {} pub trait Tr { fn t(&self); }";
+    const FACADE: &str = "pub use crate::other::{leaf, Item, Tr};\npub use crate::other as renamed;\nuse crate::other::leaf as private;\nmod child;\n";
+    const USER: &str = "use crate::facade::{leaf, Item, Tr};\npub fn run(x: &Item) -> u8 { leaf(); x.read() }\npub fn path() { crate::facade::leaf(); crate::facade::renamed::leaf(); }\npub struct H;\nimpl Tr for H { fn t(&self) {} }\npub fn ty(x: crate::facade::Item) -> u8 { x.read() }\n";
+    const CHILD: &str = "pub fn inherited() { super::private() }\n";
+    let heads = ["", "\n", "   ", "\r\n", "\n// c\n", "// c\n"];
+    let module = heads.map(|head| {
+        let facade = format!("{head}{FACADE}");
+        edge_rows(&[
+            ("src/lib.rs", "pub mod other; pub mod facade; pub mod user;"),
+            ("src/other.rs", OTHER),
+            ("src/facade.rs", facade.as_str()),
+            ("src/facade/child.rs", CHILD),
+            ("src/user.rs", USER),
+        ])
+    });
+    let root = heads.map(|head| {
+        let library =
+            format!("{head}mod other; pub use other::{{leaf, Item, Tr}}; pub mod user;\n");
+        edge_rows(&[
+            ("src/lib.rs", library.as_str()),
+            ("src/other.rs", OTHER),
+            (
+                "src/user.rs",
+                "pub fn run(x: &crate::Item) -> u8 { crate::leaf(); x.read() }\n",
+            ),
+        ])
+    });
+    for rows in [module, root] {
+        assert!(
+            rows[0]
+                .iter()
+                .any(|(kind, _, to)| kind == "Calls" && to.ends_with("/other/leaf"))
+        );
+        for (head, found) in heads.iter().zip(&rows) {
+            assert_eq!(found, &rows[0], "{head:?}");
+        }
+    }
+}
+
+#[test]
+fn test_rust_imports_of_a_reexporting_module_start_at_the_module() {
+    // #983: the module of a file is the one its placement states, not the common parent of
+    // the names it declares.
+    for (library, module) in [
+        ("mod other; use other::leaf;", "/fixture"),
+        ("mod other; pub use other::leaf;", "/fixture"),
+        ("mod other; pub use other::{leaf, Item};", "/fixture"),
+        (
+            "mod other; pub use other::leaf; pub fn own() {}",
+            "/fixture",
+        ),
+        (
+            "mod other; pub use std::fmt::Debug; pub use other::leaf;",
+            "/fixture",
+        ),
+        (
+            "pub mod inner { pub fn leaf() {} pub mod deep { pub use super::leaf; } }",
+            "/inner/deep",
+        ),
+        ("pub mod other; pub mod user;", "/fixture/user"),
+        ("pub mod other; pub mod implement;", "/fixture/implement"),
+    ] {
+        let rows = edge_rows(&[
+            ("src/lib.rs", library),
+            ("src/other.rs", "pub struct Item; pub fn leaf() {}"),
+            ("src/user.rs", "pub use crate::other::leaf;"),
+            (
+                "src/implement.rs",
+                "use crate::other::Item; impl Item { pub fn read(&self) {} }",
+            ),
+        ]);
+        let importers = rows
+            .iter()
+            .filter(|(kind, _, _)| kind == "Imports")
+            .map(|(_, from, _)| from.as_str())
+            .collect::<Vec<_>>();
+        assert!(!importers.is_empty(), "{library}");
+        for importer in importers {
+            assert!(importer.ends_with(module), "{library}: {importer}");
+        }
+    }
+}
+
+#[test]
+fn test_rust_target_conditions_on_modules_keep_every_row_of_the_active_target() {
+    // #859: each place a condition can stand, for the host target and for the other one.
+    const ITEMS: [&str; 4] = [
+        "pub trait Shape { fn area(&self) -> u32; }",
+        "pub struct Square { side: u32 }",
+        "impl Shape for Square { fn area(&self) -> u32 { helper(self.side) } }",
+        "fn helper(v: u32) -> u32 { v }",
+    ];
+    let manifest =
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\n";
+    let rows = |library: &str, module: &str| {
+        let (_directory, index) =
+            fixture_index(manifest, &[("src/lib.rs", library), ("src/m.rs", module)]);
+        index
+            .edges()
+            .edges()
+            .map(|edge| {
+                (
+                    edge.kind(),
+                    edge.from().as_str().to_owned(),
+                    edge.to().as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let module = ITEMS.join("\n");
+    let (host, other) = if cfg!(windows) {
+        ("windows", "unix")
+    } else {
+        ("unix", "windows")
+    };
+    let file = rows("pub mod m;", &module);
+    let inline = rows(&format!("pub mod m {{ {module} }}"), "");
+    let root = rows(&module, "");
+    assert!(!file.is_empty() && !inline.is_empty() && !root.is_empty());
+    for condition in [
+        host.to_owned(),
+        format!("any({host}, custom)"),
+        "not(target_arch = \"wasm32\")".to_owned(),
+        format!("all(feature = \"std\", {host})"),
+    ] {
+        let each = ITEMS
+            .map(|item| format!("#[cfg({condition})] {item}"))
+            .join("\n");
+        for (found, expected) in [
+            (
+                rows(&format!("#[cfg({condition})] pub mod m;"), &module),
+                &file,
+            ),
+            (
+                rows("pub mod m;", &format!("#![cfg({condition})]\n{module}")),
+                &file,
+            ),
+            (
+                rows(&format!("#[cfg({condition})] pub mod m {{ {module} }}"), ""),
+                &inline,
+            ),
+            (rows(&format!("#![cfg({condition})]\n{module}"), ""), &root),
+            (rows(&each, ""), &root),
+        ] {
+            assert_eq!(&found, expected, "{condition}");
+        }
+    }
+    for condition in [other.to_owned(), format!("all(feature = \"std\", {other})")] {
+        let each = ITEMS
+            .map(|item| format!("#[cfg({condition})] {item}"))
+            .join("\n");
+        for found in [
+            rows(&format!("#[cfg({condition})] pub mod m;"), &module),
+            rows("pub mod m;", &format!("#![cfg({condition})]\n{module}")),
+            rows(&format!("#[cfg({condition})] pub mod m {{ {module} }}"), ""),
+            rows(&format!("#![cfg({condition})]\n{module}"), ""),
+            rows(&each, ""),
+        ] {
+            assert_eq!(found, Vec::new(), "{condition}");
+        }
+    }
+}
+
+#[test]
+fn test_rust_associated_types_come_from_their_own_implementation() {
+    // Several implementations of one type declare an associated type of one name, in one file
+    // and in others; `Self::Error` names the one of the enclosing implementation.
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            (
+                "src/lib.rs",
+                "pub mod parse; pub struct Fault; pub struct Id; pub trait From<T> { type Error; fn from(value: T) -> Result<Id, Self::Error>; }\nimpl From<u8> for Id { type Error = Fault; fn from(_value: u8) -> Result<Id, Self::Error> { Ok(Id) } }\n",
+            ),
+            (
+                "src/parse.rs",
+                "use crate::{Fault, From, Id};\nimpl From<u16> for Id { type Error = Fault; fn from(_value: u16) -> Result<Id, Self::Error> { Ok(Id) } }\nimpl From<u32> for Id { type Error = Fault; fn from(_value: u32) -> Result<Id, Self::Error> { Ok(Id) } }\n",
+            ),
+        ],
+    );
+    let used = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind() == EdgeKind::HasType && edge.to().as_str().ends_with("/fixture/Id/Error")
+        })
+        .map(|edge| edge.from().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(used.len(), 3, "{used:?}");
+    assert!(used.iter().all(|from| from.ends_with("/fixture/Id/from")));
+}
+
+#[test]
+fn test_rust_implementation_headers_are_contained_where_their_owner_is() {
+    // A header of a foreign type is a symbol of its own module; one of a package type is a
+    // facet of that type, wherever the block stands.
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            (
+                "src/lib.rs",
+                "pub mod user; pub trait Say { fn say(&self); } pub struct Own;",
+            ),
+            (
+                "src/user.rs",
+                "pub mod deep { pub struct Inner; }\nimpl crate::Say for std::io::Empty { fn say(&self) {} }\nimpl crate::Say for crate::Own { fn say(&self) {} }\nimpl deep::Inner { pub fn read(&self) {} }\npub fn body() { impl crate::Say for &bool { fn say(&self) {} } }\n",
+            ),
+        ],
+    );
+    let contains = |from: &str, to: &str| has_edge(&index, EdgeKind::Contains, from, to);
+    assert!(contains("/fixture/user", "/user/std/io/Empty"));
+    assert!(contains("/user/deep", "/user/deep/Inner"));
+    assert!(!contains("/fixture/user", "/user/deep/Inner"));
+    assert!(!contains("/fixture/user", "/fixture/Own"));
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| { edge.kind() == EdgeKind::Contains && edge.from() == edge.to() })
+    );
 }

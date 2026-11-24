@@ -14,6 +14,7 @@ mod graph;
 mod module_imports;
 mod returned_callables;
 mod rust_guard;
+mod rust_implementations;
 mod rust_root_imports;
 
 fn publication(

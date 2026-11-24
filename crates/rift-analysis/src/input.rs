@@ -38,6 +38,10 @@ mod namespace;
 #[cfg(feature = "collector")]
 pub use namespace::{NamespaceInput, NamespaceModule};
 #[cfg(feature = "collector")]
+mod rust_target;
+#[cfg(feature = "collector")]
+pub use rust_target::RustTarget;
+#[cfg(feature = "collector")]
 mod dependency;
 #[cfg(feature = "collector")]
 pub use dependency::PackageDependency;
@@ -405,6 +409,8 @@ pub struct ExactPackageInput<'input> {
     release_version: &'input str,
     #[cfg(feature = "collector")]
     rust_configuration: Option<(&'input ProjectPath, &'input [&'input str])>,
+    #[cfg(feature = "collector")]
+    rust_target: Option<RustTarget>,
     language: &'input Language,
     origin: &'input ContributionOrigin,
     files: &'input [PackageSource<'input>],
@@ -453,6 +459,8 @@ impl<'input> ExactPackageInput<'input> {
             release_version,
             #[cfg(feature = "collector")]
             rust_configuration: None,
+            #[cfg(feature = "collector")]
+            rust_target: Some(RustTarget::PACKAGE),
             language,
             origin,
             files,
@@ -515,6 +523,17 @@ impl<'input> ExactPackageInput<'input> {
             .with_rust_configuration(manifest, flags)?;
         self.rust_configuration = input.rust_configuration();
         Ok(self)
+    }
+
+    /// Selects the target whose predicates decide this package's conditional Rust items.
+    ///
+    /// The default is [`RustTarget::PACKAGE`] on every host. `None` keeps every target
+    /// predicate unknown.
+    #[cfg(feature = "collector")]
+    #[must_use]
+    pub const fn with_rust_target(mut self, target: Option<RustTarget>) -> Self {
+        self.rust_target = target;
+        self
     }
 
     /// Adds admitted dependency publications and their original selected sources.

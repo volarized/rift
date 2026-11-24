@@ -1,11 +1,11 @@
-//! Evaluates captured Cargo default features without assuming a target platform.
+//! Evaluates Cargo default features and target predicates for conditional Rust items.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
 use super::macros::{Condition, configured_with_flags, tokens};
-use crate::NamespaceInput;
+use crate::{NamespaceInput, RustTarget};
 
 pub(crate) fn valid_flags(flags: &[&str]) -> bool {
     flags.iter().all(|flag| {
@@ -31,12 +31,14 @@ pub(crate) fn valid_flags(flags: &[&str]) -> bool {
 pub(crate) struct Configurations<'input> {
     manifests: BTreeMap<&'input str, Option<Features>>,
     captured: Option<(&'input str, BTreeSet<&'input str>)>,
+    target: Option<RustTarget>,
     depth: usize,
 }
 
 pub(crate) struct Configuration<'input> {
     features: Option<&'input Features>,
     flags: Option<&'input BTreeSet<&'input str>>,
+    target: Option<RustTarget>,
     depth: usize,
 }
 
@@ -152,6 +154,7 @@ impl<'input> Configurations<'input> {
         Self {
             manifests,
             captured,
+            target: input.rust_target(),
             depth: input.syntax().syntax_depth_max(),
         }
     }
@@ -168,6 +171,7 @@ impl<'input> Configurations<'input> {
                         .as_ref()
                         .filter(|(parent, _)| *parent == directory)
                         .map(|(_, flags)| flags),
+                    target: self.target,
                     depth: self.depth,
                 };
             }
@@ -175,6 +179,7 @@ impl<'input> Configurations<'input> {
                 return Configuration {
                     features: None,
                     flags: None,
+                    target: self.target,
                     depth: self.depth,
                 };
             }
@@ -226,7 +231,8 @@ impl Configuration<'_> {
     fn predicate(&self, input: &[&str], depth: usize) -> Option<bool> {
         // Static collection uses the normal Cargo build, with test code disabled.
         // Complete captured flags decide only the build they were supplied for.
-        // Otherwise platform and custom flags remain unknown.
+        // Otherwise the selected target decides its own predicates and custom flags
+        // remain unknown.
         match configured_with_flags(
             input,
             true,
@@ -236,8 +242,10 @@ impl Configuration<'_> {
                 if atom.iter().any(|token| token.contains('\\')) {
                     return None;
                 }
-                self.flags
-                    .map(|flags| flags.contains(atom.concat().as_str()))
+                match self.flags {
+                    Some(flags) => Some(flags.contains(atom.concat().as_str())),
+                    None => self.target?.predicate(atom),
+                }
             },
         )? {
             Condition::Known(value) => Some(value),
@@ -371,6 +379,7 @@ mod tests {
         let configuration = Configuration {
             features: Some(&features),
             flags: None,
+            target: Some(crate::RustTarget::PACKAGE),
             depth: 32,
         };
         for (attribute, expected) in [
@@ -384,6 +393,18 @@ mod tests {
             ("#[cfg_attr(docsrs, doc(cfg(feature=\"std\")))]", Some(true)),
             ("#[cfg(any())]", Some(false)),
             ("#[cfg(all())]", Some(true)),
+            ("#[cfg(unix)]", Some(true)),
+            ("#[cfg(windows)]", Some(false)),
+            ("#[cfg(any(windows, target_os = \"redox\"))]", Some(false)),
+            (
+                "#[cfg(all(feature=\"std\", target_family=\"unix\"))]",
+                Some(true),
+            ),
+            ("#[cfg(not(target_os = \"emscripten\"))]", Some(true)),
+            ("#[cfg(all(unix, unknown))]", None),
+            ("#[cfg(any(unix, unknown))]", Some(true)),
+            ("#[cfg(target_feature=\"sse2\")]", None),
+            ("#[cfg(target_os = \"a\\nb\")]", None),
         ] {
             assert_eq!(configuration.attribute(attribute), expected, "{attribute}");
         }

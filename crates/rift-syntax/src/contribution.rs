@@ -8,6 +8,7 @@ use rift_core::{
     SymbolId, TreeRevision, declaration_address, encode_path,
 };
 use rift_error::RiftError;
+use rift_protocol::identity::SymbolIdentity;
 use rift_provider::{ProviderPublication, PublicationLimits};
 
 use crate::{SyntaxDocument, SyntaxFacts};
@@ -55,6 +56,8 @@ pub struct DocumentPlacement {
     unit: SourceUnitId,
     identity_path: String,
     identity_anchors: BTreeMap<String, SymbolId>,
+    module: Option<SymbolId>,
+    module_path: Vec<String>,
     aliases: Vec<PlacedAlias>,
     logical_declarations: BTreeMap<String, LogicalDeclaration>,
 }
@@ -72,6 +75,8 @@ impl DocumentPlacement {
             unit,
             identity_path: identity_path.into(),
             identity_anchors: BTreeMap::new(),
+            module: None,
+            module_path: Vec::new(),
             aliases: Vec::new(),
             logical_declarations: BTreeMap::new(),
         }
@@ -109,6 +114,7 @@ impl DocumentPlacement {
         use get_size2::GetSize;
         let (origin, tracker) = self.origin.get_heap_size_with_tracker(tracker);
         let (unit, tracker) = self.unit.get_heap_size_with_tracker(tracker);
+        let (module, tracker) = self.module.get_heap_size_with_tracker(tracker);
         let (anchors, tracker) = rift_protocol::retained_map_material(
             &self.identity_anchors,
             tracker,
@@ -127,6 +133,11 @@ impl DocumentPlacement {
             origin,
             unit,
             self.identity_path.capacity(),
+            module,
+            self.module_path
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+            self.module_path.iter().map(String::capacity).sum(),
             anchors,
             mappings,
             self.aliases
@@ -177,6 +188,30 @@ impl DocumentPlacement {
     pub fn with_identity_anchors(mut self, anchors: BTreeMap<String, SymbolId>) -> Self {
         self.identity_anchors = anchors;
         self
+    }
+
+    /// Supplies the established module of the document; an identity that is not
+    /// canonical establishes none.
+    #[must_use]
+    pub fn with_module(mut self, module: Option<SymbolId>) -> Self {
+        let parsed = module
+            .as_ref()
+            .and_then(|module| SymbolIdentity::parse(module.as_str()).ok());
+        self.module_path = parsed.map_or_else(Vec::new, |module| module.qualified_path().to_vec());
+        self.module = module.filter(|_| !self.module_path.is_empty());
+        self
+    }
+
+    /// The established module of the document.
+    #[must_use]
+    pub const fn module(&self) -> Option<&SymbolId> {
+        self.module.as_ref()
+    }
+
+    /// The path of the established module, from its crate name on; empty without one.
+    #[must_use]
+    pub fn module_path(&self) -> &[String] {
+        &self.module_path
     }
 
     /// Returns the current established identity for one qualified name, which every

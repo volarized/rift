@@ -1519,6 +1519,7 @@ fn resolution_by(
                         .remove(source.path.as_str())
                         .unwrap_or_default(),
                 )
+                .with_module(namespaces.rust_modules.remove(source.path.as_str()))
                 .with_logical_declarations(
                     namespaces
                         .mappings

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rift_analysis::{
     ExactPackageInput, ExactPackageLimits, IndexedFile, PackageAnalysis, PackageAnalyzer,
-    PackageImportRoot, PackageSource, PackageSyntax, PackageSyntaxIdentity,
+    PackageImportRoot, PackageSource, PackageSyntax, PackageSyntaxIdentity, RustTarget,
 };
 use rift_core::{ContributionOrigin, ProjectPath, SourceLocation};
 use rift_error::RiftError;
@@ -27,6 +27,8 @@ pub(super) struct Sources {
     import_roots: Vec<PackageImportRoot>,
     root: Option<PathBuf>,
     limits: ExactPackageLimits,
+    /// The target the installed sources are built for, which is the host's.
+    target: Option<RustTarget>,
 }
 
 impl Sources {
@@ -78,6 +80,7 @@ impl Sources {
             import_roots,
             root,
             limits,
+            target: RustTarget::host(),
         };
         if let Some(metadata) = metadata {
             captured
@@ -117,6 +120,7 @@ impl Sources {
         )?
         .with_import_roots(&self.import_roots)?
         .with_framework_context(context, &[])
+        .map(|input| input.with_rust_target(self.target))
     }
 
     pub(super) fn analyze(
@@ -350,5 +354,101 @@ fn target_language(owner: &SymbolOwner, extension: &str) -> Result<&'static str,
             Ok("javascript")
         }
         _ => Err(coverage_failure()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = "pub mod sys { #[cfg(unix)] pub fn native() {} #[cfg(windows)] pub fn other() {} }\n#[cfg(unix)] pub fn run() { sys::native() }\n#[cfg(windows)] pub fn call() { sys::other() }\n";
+
+    /// Whether installed sources of a package or runtime store each of the two calls.
+    fn calls(
+        owner: SymbolOwner,
+        location: SourceLocation,
+        target: Option<RustTarget>,
+    ) -> [bool; 2] {
+        let manifest = if matches!(owner, SymbolOwner::Runtime { .. }) {
+            "core/Cargo.toml"
+        } else {
+            "Cargo.toml"
+        };
+        let path = manifest.replace("Cargo.toml", "src/lib.rs");
+        let sources = Sources {
+            files: BTreeMap::from([(
+                ProjectPath::new(path).expect("source path"),
+                Arc::new(SOURCE.to_owned()),
+            )]),
+            context: BTreeMap::from([(
+                ProjectPath::new(manifest).expect("manifest path"),
+                "[package]\nname='core'\nversion='1.0.0'\n".to_owned(),
+            )]),
+            owner,
+            origin: ContributionOrigin::new(Some(location), SourceKind::Authored).expect("origin"),
+            language: Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            import_roots: Vec::new(),
+            root: None,
+            limits: ExactPackageLimits::new(16, 65_536),
+            target,
+        };
+        let files = super::sources(&sources.files);
+        let context = context_sources(&sources.context);
+        let input = sources.input(&files, &context).expect("installed input");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("installed analysis");
+        ["/native", "/other"].map(|callee| {
+            analysis.publication().edges.iter().any(|edge| {
+                edge.kinds.contains(&rift_protocol::read::EdgeKind::Calls)
+                    && edge.to.as_str().ends_with(callee)
+            })
+        })
+    }
+
+    #[test]
+    fn installed_sources_follow_the_target_of_their_host() {
+        let package = rift_protocol::read::PackageIdentity {
+            manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
+            name: "core".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let runtime = rift_protocol::read::RuntimeIdentity {
+            runtime: "rust".to_owned(),
+            version: "1.98.1".to_owned(),
+        };
+        let owners = [
+            (
+                package.owner().expect("package owner"),
+                SourceLocation::Dependency { package },
+            ),
+            (
+                runtime.owner().expect("runtime owner"),
+                SourceLocation::Stdlib {
+                    runtime: Some(runtime),
+                },
+            ),
+        ];
+        for (owner, location) in owners {
+            for (triple, expected) in [
+                ("aarch64-apple-darwin", [true, false]),
+                ("x86_64-unknown-linux-gnu", [true, false]),
+                ("x86_64-pc-windows-msvc", [false, true]),
+            ] {
+                let target = RustTarget::from_triple(triple);
+                assert!(target.is_some(), "{triple}");
+                assert_eq!(
+                    calls(owner.clone(), location.clone(), target),
+                    expected,
+                    "{triple}"
+                );
+            }
+            assert_eq!(
+                calls(owner, location, RustTarget::host()),
+                [cfg!(unix), cfg!(windows)]
+            );
+        }
     }
 }

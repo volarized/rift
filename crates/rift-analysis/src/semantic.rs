@@ -80,6 +80,7 @@ pub struct BuiltSemantics {
 #[must_use]
 pub struct PreparedSemantics {
     publications: Arc<PublicationSet>,
+    modules: std::collections::BTreeMap<rift_core::SourceUnitId, rift_core::SymbolId>,
     revision: u64,
     /// Documents outside the publication's declaration capacity.
     pub beyond_declaration_bound: Vec<ProjectPath>,
@@ -132,7 +133,7 @@ impl PreparedSemantics {
                 if self.beyond_declaration_bound.is_empty()
                     && self.refused_contributions.is_empty() =>
             {
-                EdgeStore::build_resolving(&graph, edges_max, || {
+                EdgeStore::build_resolving(&graph, self.modules, edges_max, || {
                     crate::static_resolution::resolve(
                         &graph,
                         sources,
@@ -142,7 +143,7 @@ impl PreparedSemantics {
                 })
             }
             _ => (
-                EdgeStore::build_capped(&graph, edges_max),
+                EdgeStore::build_placed(&graph, self.modules, edges_max),
                 StaticResolution::default(),
             ),
         };
@@ -508,8 +509,16 @@ impl WorkspaceSemantics {
         }
         let publication = builder.build()?;
         let publications = Arc::new(PublicationSet::empty(limits).replaced(publication)?);
+        let modules = documents
+            .iter()
+            .filter_map(|document| {
+                let placement = &document.placement;
+                Some((placement.unit().clone(), placement.module()?.clone()))
+            })
+            .collect();
         Ok(PreparedSemantics {
             publications,
+            modules,
             revision,
             beyond_declaration_bound,
             refused_contributions,

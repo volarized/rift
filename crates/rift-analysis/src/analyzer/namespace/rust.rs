@@ -13,7 +13,10 @@ use unicode_normalization::UnicodeNormalization;
 use crate::NamespaceInput;
 
 pub(super) mod configuration;
+mod implementations;
 mod macros;
+
+pub(crate) use implementations::file_scope;
 
 /// The modules the conditional item chains of one file declare, each with whether the
 /// configuration admits its branch: admitted when one declaring branch is, inactive when
@@ -128,12 +131,23 @@ pub(super) fn prepare(
             return super::PreparedNamespace::default();
         }
     }
+    let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
+    let modules = Modules {
+        configurations: &configurations,
+        admitted: &admitted,
+    };
+    implementations::place(input, selected, &assigned, &modules, &mut anchors);
+    let rust_modules = assigned
+        .iter()
+        .filter(|(path, _)| anchors.contains_key(*path))
+        .filter_map(|(path, module)| Some((path.clone(), module_identity(input, module)?)))
+        .collect();
     let mut prepared = super::PreparedNamespace {
         anchors,
+        rust_modules,
         outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
-    let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
     local_exports(input, selected, &requested, &admitted, &mut prepared);
     retain_root_anchor(input, root, &inventory, &assigned, &mut prepared);
     prepared
@@ -176,6 +190,16 @@ fn queue_module_children(
         ));
     }
     true
+}
+
+fn module_identity(input: &NamespaceInput<'_>, module: &[String]) -> Option<SymbolId> {
+    let identity = SymbolIdentity::new(
+        input.owner().clone(),
+        ShippedLanguage::Rust.language(),
+        module.to_vec(),
+    )
+    .ok()?;
+    SymbolId::new(identity.wire_identity()).ok()
 }
 
 /// Retains the accepted Cargo root namespace for package imports.
@@ -995,7 +1019,56 @@ struct Modules<'configuration, 'input> {
     admitted: &'configuration BTreeMap<String, Option<bool>>,
 }
 
+/// The first byte of `range`, which no item inside it starts before.
+const fn first(range: rift_syntax::ByteRange) -> rift_syntax::ByteRange {
+    rift_syntax::ByteRange {
+        start: range.start,
+        end: range.start + 1,
+    }
+}
+
 impl Modules<'_, '_> {
+    /// The admission of a module file itself; a file no ordinary item declares is admitted.
+    fn file(&self, file: &super::SelectedFile<'_>) -> Option<bool> {
+        let module = self
+            .admitted
+            .get(file.path.as_str())
+            .copied()
+            .unwrap_or(Some(true));
+        let scope = file_scope(file.source)?;
+        and(
+            module,
+            self.configurations.file(file.path.as_str()).admitted(
+                file.syntax,
+                file.source,
+                first(scope),
+            ),
+        )
+    }
+
+    /// The admission of a module item: its own attributes and, for an inline module, the
+    /// inner attributes of its body.
+    fn module(
+        &self,
+        file: &super::SelectedFile<'_>,
+        symbol: &rift_syntax::SyntaxSymbol,
+    ) -> Option<bool> {
+        let item = self.declared(file, symbol.item_range);
+        match symbol.body_range {
+            Some(body) => and(item, self.declared(file, body)),
+            None => item,
+        }
+    }
+
+    /// The admission of a declaration itself, whatever the conditions of its contents.
+    fn declared(
+        &self,
+        file: &super::SelectedFile<'_>,
+        range: rift_syntax::ByteRange,
+    ) -> Option<bool> {
+        self.admitted(file, first(range))
+    }
+
     fn admitted(
         &self,
         file: &super::SelectedFile<'_>,
