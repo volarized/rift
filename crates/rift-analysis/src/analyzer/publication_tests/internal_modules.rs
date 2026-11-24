@@ -485,6 +485,8 @@ export namespace Merged { const hidden = 2; export function other(): void {} }
 export type Union = { kind: 1; only: 1 } | { kind: 2 };
 export type Whole = { whole: 1; nested: { deep: 1 } };
 export interface Calls { (options: { limit: 1 }): void; (options: { limit: 2 }): void; own: 1 }
+export type Both = { shared: 1 };
+export const Both = { shared: 1 };
 export interface Made { go(): void }
 export const Made = make(() => ({ go() {} }));
 run(() => { interface Local { a: 1 } const scoped = 1; return scoped });
@@ -507,6 +509,7 @@ run(() => { const scoped = 2; return scoped });
         ("Whole/whole", 1),
         ("Whole/nested/deep", 1),
         ("Calls/own", 1),
+        ("Both/shared", 2),
     ] {
         assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
     }
@@ -518,6 +521,81 @@ run(() => { const scoped = 2; return scoped });
         "Calls/limit",
     ] {
         assert!(!counted.contains_key(name), "{name} {counted:?}");
+    }
+}
+
+/// Members of classes, object literals and functions that no declaration holds alone.
+const BODIES: &str = "run(class { hook() {} constructor() { this.made = 1 } });
+run(class { hook() {} constructor() { this.made = 2 } });
+new (class { own1 = 1; static own2 = 1; static both() {} both() {} })();
+new (class { own1 = 2; static own2 = 2 })();
+var list = [class { item() {} }, class { item() {} }];
+var fns = [function () { this.slot = 1 }, function () { this.slot = 2 }];
+let Late;
+Late = class { late() {} };
+Late = class { late() {} };
+run(class { single() {} get access() { return 1 } set access(value) {} });
+const Held = class { kept() {} };
+var double = { part1: 1 };
+var double = { part1: 2 };
+";
+
+#[test]
+fn members_of_several_bodies_without_a_name_take_no_identity() {
+    let classes = "export declare function make(value: unknown): void;
+make(class { constructor(readonly param: 1) {} several(a: 1): void; several(a: 2): void; several() {} });
+make(class { constructor(readonly param: 2) {} field = 1 });
+export const classes = [class { constructor(readonly inner: 1) {} }, class { inner = 1 }];
+export class Overloads { go(a: 1): void; go(a: 2): void; go() {} constructor(readonly value: 1) {} }
+";
+    let analysis = analyze(
+        MAIN,
+        &[
+            ("index.js", ""),
+            ("lib/b.js", BODIES),
+            ("lib/c.ts", classes),
+        ],
+    );
+    let javascript = counted(&analysis, "beacon/lib/b.js");
+    let typescript = counted(&analysis, "beacon/lib/c.ts");
+    for name in [
+        "hook",
+        "constructor",
+        "made",
+        "own1",
+        "own2",
+        "both",
+        "list/item",
+        "slot",
+        "fns/slot",
+        "late",
+        "double/part1",
+        "param",
+        "classes/inner",
+    ] {
+        assert!(
+            !javascript.contains_key(name) && !typescript.contains_key(name),
+            "{name} {javascript:?} {typescript:?}"
+        );
+    }
+    for (name, count) in [
+        ("single", 1),
+        ("access", 2),
+        ("Held", 1),
+        ("Held/kept", 1),
+        ("double", 2),
+    ] {
+        assert_eq!(javascript.get(name), Some(&count), "{name} {javascript:?}");
+    }
+    for (name, count) in [
+        ("several", 3),
+        ("field", 1),
+        ("classes", 1),
+        ("classes/constructor", 1),
+        ("Overloads/go", 3),
+        ("Overloads/value", 1),
+    ] {
+        assert_eq!(typescript.get(name), Some(&count), "{name} {typescript:?}");
     }
 }
 

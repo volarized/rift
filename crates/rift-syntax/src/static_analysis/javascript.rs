@@ -4,8 +4,8 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBinding, StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts,
-    StaticFunctionContext, StaticLiteralMember, StaticMember, StaticMemberCopy, StaticParameter,
+    StaticBinding, StaticBindingKind, StaticBodyMember, StaticCallee, StaticDeclaredReturn,
+    StaticFactsParts, StaticFunctionContext, StaticMember, StaticMemberCopy, StaticParameter,
     StaticReexport, StaticReference, binding, call, enclosing, field, identifier, kind,
 };
 use crate::ByteRange;
@@ -363,7 +363,7 @@ impl Kinds {
         let id = syntax_element.kind_id();
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
-        self.record_literal_member(visited, facts)?;
+        self.record_body_member(visited, facts)?;
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
         self.record_module_statement(visited, facts);
@@ -548,34 +548,24 @@ impl Kinds {
         Ok(())
     }
 
-    /// Records a member of an object or type literal with the syntax element that holds the
-    /// literal.
-    fn record_literal_member(
+    /// Records a member of an object literal, a type literal or a class with the syntax
+    /// element that holds the literal or class.
+    fn record_body_member(
         &self,
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let type_literal = self
-            .type_shapes
-            .as_ref()
-            .map(|shapes| shapes.signature_holders[1]);
         let member = visited.syntax_element();
-        let Some(literal) = visited.parent().filter(|parent| {
-            let id = parent.syntax_element().kind_id();
-            (id == self.object_literal[0] || Some(id) == type_literal)
-                && matches!(
-                    member.kind(),
-                    "pair"
-                        | "shorthand_property_identifier"
-                        | "method_definition"
-                        | "property_signature"
-                        | "method_signature"
-                )
-        }) else {
+        let Some(body) = self.member_body(visited) else {
             return Ok(());
         };
+        // A class expression is one value, whose holder stands around the class itself.
+        let body = match body.parent() {
+            Some(class) if body.syntax_element().kind_id() == self.scopes[7] => class,
+            _ => body,
+        };
         // The syntax walk has admitted every enclosing element's depth.
-        let mut holder = literal.parent();
+        let mut holder = body.parent();
         while let Some(outer) = holder.filter(|outer| {
             matches!(
                 outer.syntax_element().kind(),
@@ -591,13 +581,55 @@ impl Kinds {
             holder = outer.parent();
         }
         if let Some(holder) = holder {
-            facts.literal_members.push(StaticLiteralMember {
+            facts.body_members.push(StaticBodyMember {
                 member: byte_range(member)?,
-                literal: byte_range(literal.syntax_element())?,
+                body: byte_range(body.syntax_element())?,
                 holder: byte_range(holder.syntax_element())?,
             });
         }
         Ok(())
+    }
+
+    /// The object literal, type literal or class body a member is written in. A parameter of
+    /// a class method that declares a property is a member of the class.
+    fn member_body<'walk, 'tree>(
+        &self,
+        visited: Visited<'walk, 'tree>,
+    ) -> Option<Visited<'walk, 'tree>> {
+        let member = visited.syntax_element();
+        let parent = visited.parent()?;
+        let id = parent.syntax_element().kind_id();
+        if id == self.parameters && self.parameter_wrappers.contains(&member.kind_id()) {
+            let mut cursor = member.walk();
+            let property = member.children(&mut cursor).any(|child| {
+                matches!(
+                    child.kind(),
+                    "accessibility_modifier" | "override_modifier" | "readonly"
+                )
+            });
+            return parent
+                .parent()
+                .filter(|_| property)
+                .and_then(Visited::parent)
+                .filter(|body| body.syntax_element().kind_id() == self.scopes[7]);
+        }
+        let type_literal = self
+            .type_shapes
+            .as_ref()
+            .is_some_and(|shapes| shapes.signature_holders[1] == id);
+        ((id == self.object_literal[0] || id == self.scopes[7] || type_literal)
+            && matches!(
+                member.kind(),
+                "pair"
+                    | "shorthand_property_identifier"
+                    | "method_definition"
+                    | "property_signature"
+                    | "method_signature"
+                    | "abstract_method_signature"
+                    | "field_definition"
+                    | "public_field_definition"
+            ))
+        .then_some(parent)
     }
 
     /// Records a write of the `CommonJS` module value in a statement of the source file itself,

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::read::SymbolKind;
-use rift_syntax::{ByteRange, StaticFacts, StaticLiteralMember, SyntaxFacts, SyntaxSymbol};
+use rift_syntax::{ByteRange, StaticBodyMember, StaticFacts, SyntaxFacts, SyntaxSymbol};
 
 use super::SelectedFile;
 use crate::EnclosingDefinitions;
@@ -17,10 +17,10 @@ enum Scope {
     Lexical(ByteRange),
     /// The instances of the containing declaration.
     Member,
-    /// One object literal or type literal that no declaration holds.
-    Literal(ByteRange),
     /// The containing declaration itself: a static member, or an export of a namespace.
     Static,
+    /// One literal or class that no declaration holds alone, and whether the member is static.
+    Body(ByteRange, bool),
 }
 
 /// The qualified names of `file` that declarations of different scopes share.
@@ -51,10 +51,11 @@ struct FileScopes<'source> {
     enclosing: EnclosingDefinitions<ByteRange>,
     /// Functions and classes, whose own members differ from those of their instances.
     constructors: BTreeSet<&'source str>,
-    /// Members of object and type literals, by their own range.
-    literal_members: BTreeMap<ByteRange, &'source StaticLiteralMember>,
-    /// Every declaration by its name and range.
-    declared: BTreeSet<(&'source str, ByteRange)>,
+    /// Members of literals and classes, by their own range.
+    body_members: BTreeMap<ByteRange, &'source StaticBodyMember>,
+    /// The literal or class each declaration holds, for its values and for its types, or
+    /// `None` for a name declared with several.
+    held: BTreeMap<(&'source str, bool), Option<ByteRange>>,
     /// Each namespace by its name and the end of its block.
     namespaces: BTreeSet<(&'source str, u64)>,
 }
@@ -75,6 +76,33 @@ impl<'source> FileScopes<'source> {
                 .or_insert(binding.scope);
         }
         let symbols = syntax.symbols();
+        let body_members = facts
+            .map_or(&[][..], StaticFacts::body_members)
+            .iter()
+            .map(|row| (row.member, row))
+            .collect::<BTreeMap<_, _>>();
+        let declared = symbols
+            .iter()
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.item_range))
+            .collect::<BTreeSet<_>>();
+        let mut held = BTreeMap::<(&str, bool), Option<ByteRange>>::new();
+        for symbol in symbols {
+            let (Some(container), Some(row)) = (
+                symbol.container.as_deref(),
+                body_members.get(&symbol.item_range),
+            ) else {
+                continue;
+            };
+            // `name = { .. }`, `name: { .. }` and `class name { .. }` declare members of `name`.
+            if [row.holder, row.body]
+                .iter()
+                .any(|range| declared.contains(&(container, *range)))
+            {
+                held.entry((container, is_type_member(symbol)))
+                    .and_modify(|body| *body = body.filter(|body| *body == row.body))
+                    .or_insert(Some(row.body));
+            }
+        }
         Self {
             source: ByteRange {
                 start: 0,
@@ -95,15 +123,8 @@ impl<'source> FileScopes<'source> {
                 })
                 .map(|symbol| symbol.qualified_name.as_str())
                 .collect(),
-            literal_members: facts
-                .map_or(&[][..], StaticFacts::literal_members)
-                .iter()
-                .map(|row| (row.member, row))
-                .collect(),
-            declared: symbols
-                .iter()
-                .map(|symbol| (symbol.qualified_name.as_str(), symbol.item_range))
-                .collect(),
+            body_members,
+            held,
             namespaces: symbols
                 .iter()
                 .filter(|symbol| symbol.kind == "namespace")
@@ -114,17 +135,15 @@ impl<'source> FileScopes<'source> {
 
     fn of(&self, symbol: &SyntaxSymbol, file: &SelectedFile<'_>) -> Scope {
         let container = symbol.container.as_deref();
-        if let Some(row) = self.literal_members.get(&symbol.item_range) {
-            // `name = { .. }` and `name: { .. }` declare members of `name`.
+        if let Some(row) = self.body_members.get(&symbol.item_range) {
+            let fixed = symbol.kinds.contains(&SymbolKind::Static);
             let held = container.is_some_and(|container| {
-                [row.holder, row.literal]
-                    .iter()
-                    .any(|range| self.declared.contains(&(container, *range)))
+                self.held.get(&(container, is_type_member(symbol))) == Some(&Some(row.body))
             });
-            return if held {
-                Scope::Member
-            } else {
-                Scope::Literal(row.literal)
+            return match (held, fixed) {
+                (false, fixed) => Scope::Body(row.body, fixed),
+                (true, false) => Scope::Member,
+                (true, true) => Scope::Static,
             };
         }
         let assigned = symbol.syntax_element_kind == Some("assignment_expression");
@@ -185,6 +204,14 @@ impl<'source> FileScopes<'source> {
         }
         *scope
     }
+}
+
+/// Whether a type literal or an interface declares the member.
+fn is_type_member(symbol: &SyntaxSymbol) -> bool {
+    matches!(
+        symbol.syntax_element_kind,
+        Some("property_signature" | "method_signature")
+    )
 }
 
 /// Whether an assignment writes `this.name` or `Owner.prototype.name`, rather than the

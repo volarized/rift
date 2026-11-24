@@ -3,9 +3,9 @@
 use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_syntax::{
-    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind, StaticFacts,
-    StaticFactsParts, StaticLiteralMember, StaticMemberAlias, StaticMemberCopy, SyntaxDocument,
-    SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
+    ByteRange, MarkdownFacts, MarkdownFactsParts, ShippedLanguage, StaticBindingKind,
+    StaticBodyMember, StaticFacts, StaticFactsParts, StaticMemberAlias, StaticMemberCopy,
+    SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames, SyntaxSource,
 };
 
 fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
@@ -233,12 +233,15 @@ fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes()
 }
 
 #[test]
-fn test_literal_members_name_their_literal_and_its_holder() {
+fn test_body_members_name_their_body_and_its_holder() {
     let source = "const own = ({ key: 1 } as const);
 run({ short, go() {} });
 type One = { a: 1 };
 type Two = { b: 1 } | { b: 2 };
 interface Body { c: 1; typed: { d: 1 } }
+class Named { e = 1; constructor(readonly f: 1, g: 2) {} }
+const held = class { h(): void {} };
+run(class { i = 1 });
 ";
     let document = parsed(ShippedLanguage::TypeScript, source);
     let facts = document.facts().static_facts().expect("static facts");
@@ -246,10 +249,11 @@ interface Body { c: 1; typed: { d: 1 } }
         &source
             [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
     };
+    let named = "class Named { e = 1; constructor(readonly f: 1, g: 2) {} }";
     let rows = facts
-        .literal_members()
+        .body_members()
         .iter()
-        .map(|row| (text(row.member), text(row.literal), text(row.holder)))
+        .map(|row| (text(row.member), text(row.body), text(row.holder)))
         .collect::<Vec<_>>();
     assert_eq!(
         rows,
@@ -261,11 +265,20 @@ interface Body { c: 1; typed: { d: 1 } }
             ("b: 1", "{ b: 1 }", "{ b: 1 } | { b: 2 }"),
             ("b: 2", "{ b: 2 }", "{ b: 1 } | { b: 2 }"),
             ("d: 1", "{ d: 1 }", "typed: { d: 1 }"),
+            ("e = 1", named, source),
+            ("constructor(readonly f: 1, g: 2) {}", named, source),
+            ("readonly f: 1", named, source),
+            (
+                "h(): void {}",
+                "class { h(): void {} }",
+                "held = class { h(): void {} }"
+            ),
+            ("i = 1", "class { i = 1 }", "(class { i = 1 })"),
         ]
     );
-    let row = facts.literal_members()[0];
+    let row = facts.body_members()[0];
     let outside = StaticFactsParts {
-        literal_members: vec![StaticLiteralMember {
+        body_members: vec![StaticBodyMember {
             holder: row.member,
             ..row
         }],
