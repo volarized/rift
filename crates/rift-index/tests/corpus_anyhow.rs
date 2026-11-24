@@ -66,7 +66,7 @@ fn test_anyhow_static_collection_floors() -> Result<(), Box<dyn std::error::Erro
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 123),
-        (EdgeKind::Contains, 187),
+        (EdgeKind::Contains, 183),
         (EdgeKind::Implements, 5),
         (EdgeKind::Imports, 40),
         (EdgeKind::HasType, 167),

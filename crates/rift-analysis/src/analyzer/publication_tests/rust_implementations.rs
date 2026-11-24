@@ -165,3 +165,192 @@ fn a_reexporting_module_that_implements_the_type_publishes_both_symbols() {
         }
     }
 }
+
+/// Where a symbol's definition is read from: its published object and its document.
+struct Defined<'case> {
+    symbol: &'case str,
+    kind: &'case str,
+    name: &'case str,
+    visibility: &'case str,
+    document: &'case str,
+}
+
+/// The fields of a symbol come from the declaration that defines it, whichever file the
+/// provider reads first (#1025).
+#[test]
+fn a_symbol_reads_as_its_definition_in_every_file_order() {
+    let task = |source, kind| (source, kind, "pub", "task.rs");
+    for ((definition, kind, visibility, document), implementation) in [
+        (
+            task("/// The type.\npub struct Task;\n", "struct"),
+            "pub use crate::task::Task;\n/// The block.\nimpl Task { pub fn start() {} }\n",
+        ),
+        (
+            task("/// The type.\npub enum Task { One }\n", "enum"),
+            "use crate::task::Task;\n/// The block.\nimpl Clone for Task { fn clone(&self) -> Self { Task::One } }\n",
+        ),
+        (
+            task("/// The type.\npub struct Task<T>(pub T);\n", "struct"),
+            "use crate::task::Task;\n/// The block.\nimpl<T: Copy> Task<T> { pub fn start(&self) -> T { self.0 } }\n",
+        ),
+        (
+            task(
+                "/// The type.\npub union Task { pub one: u8 }\n",
+                "union_item",
+            ),
+            "/// The block.\nimpl crate::task::Task { pub fn start() {} }\n",
+        ),
+        (
+            task("/// The type.\npub struct Task;\n", "struct"),
+            "pub mod inner { use crate::task::Task; /// The block.\nimpl Task { pub fn start() {} } }\n",
+        ),
+        (
+            task(
+                "/// The type.\n#[cfg(unix)]\npub struct Task;\n/// The type.\n#[cfg(not(unix))]\npub struct Task;\n",
+                "struct",
+            ),
+            "use crate::task::Task;\n/// The block.\nimpl Task { pub fn start() {} }\n",
+        ),
+        (
+            task(
+                "impl Task { pub fn stop() {} }\n/// The type.\npub struct Task;\n",
+                "struct",
+            ),
+            "use crate::task::Task;\nimpl Task { pub fn start() {} }\nimpl Drop for Task { fn drop(&mut self) {} }\n",
+        ),
+        (
+            (
+                "/// The type.\npub(crate) struct Task;\n",
+                "struct",
+                "pub(crate)",
+                "",
+            ),
+            "use crate::task::Task;\n/// The block.\nimpl Task { pub fn start() {} }\n",
+        ),
+    ] {
+        for module in ["facade", "zfacade"] {
+            let defined = Defined {
+                symbol: "/task/Task",
+                kind,
+                name: "Task",
+                visibility,
+                document,
+            };
+            assert_defined(&[("task", definition), (module, implementation)], &defined);
+        }
+    }
+}
+
+/// A field and a method of one path share a symbol, and the field reads as it does when the
+/// method is written in the type's own file (#1006).
+#[test]
+fn a_field_and_a_method_of_one_path_read_as_the_field_in_every_file_order() {
+    for module in ["facade", "zfacade"] {
+        assert_defined(
+            &[
+                ("task", "pub struct Task { pub size: u8 }\n"),
+                (
+                    module,
+                    "use crate::task::Task;\nimpl Task { pub(crate) fn size(&self) -> u8 { 1 } }\n",
+                ),
+            ],
+            &Defined {
+                symbol: "/task/Task/size",
+                kind: "field_declaration",
+                name: "size",
+                visibility: "pub",
+                document: "task.rs",
+            },
+        );
+    }
+}
+
+/// A member several implementations declare reads from the file that defines the type.
+#[test]
+fn a_member_of_several_implementations_reads_from_the_file_of_its_type() {
+    for module in ["facade", "zfacade"] {
+        assert_defined(
+            &[
+                (
+                    "task",
+                    "pub struct Task;\nimpl Task { /// The type.\npub(crate) fn size(&self) -> u8 { 1 } }\n",
+                ),
+                (
+                    module,
+                    "use crate::task::Task;\nimpl Task { /// The block.\npub fn size(&self) -> u16 { 1 } }\n",
+                ),
+            ],
+            &Defined {
+                symbol: "/task/Task/size",
+                kind: "function",
+                name: "size",
+                visibility: "pub(crate)",
+                document: &format!("{module}.rs"),
+            },
+        );
+    }
+}
+
+fn assert_defined(modules: &[(&str, &str)], defined: &Defined<'_>) {
+    let root = modules
+        .iter()
+        .flat_map(|(module, _)| ["pub mod ", module, ";\n"])
+        .collect::<String>();
+    let paths = modules
+        .iter()
+        .map(|(module, _)| format!("src/{module}.rs"))
+        .collect::<Vec<_>>();
+    let files = std::iter::once(("src/lib.rs", root.as_str()))
+        .chain(
+            paths
+                .iter()
+                .zip(modules)
+                .map(|(path, (_, text))| (path.as_str(), *text)),
+        )
+        .collect::<Vec<_>>();
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::Rust,
+        files,
+        None,
+        Some(("Cargo.toml", "[package]\nname='beacon'\nversion='1.0.0'\n")),
+    )
+    .unwrap_or_else(|error| panic!("{modules:?}: {error:?}"));
+    let publication = analysis.publication();
+    let id = format!("{ROOT}{}", defined.symbol);
+    let container = defined
+        .symbol
+        .rsplit_once('/')
+        .filter(|(container, _)| container.ends_with("/Task"))
+        .map(|(container, _)| format!("{ROOT}{container}"));
+    let object = publication
+        .objects
+        .iter()
+        .find(|object| object.id.as_ref().is_some_and(|held| held.as_str() == id))
+        .unwrap_or_else(|| panic!("{modules:?}: {id}"));
+    assert_eq!(
+        (
+            object.kind.0.as_str(),
+            object.name.as_str(),
+            object.visibility.as_deref(),
+            object.container.as_ref().map(SymbolId::as_str),
+        ),
+        (
+            defined.kind,
+            defined.name,
+            Some(defined.visibility),
+            container.as_deref(),
+        ),
+        "{modules:?}"
+    );
+    if let Some(documentation) = object.documentation.first() {
+        assert_eq!(documentation.text, "The type.", "{modules:?}");
+    }
+    let document = publication
+        .documents
+        .iter()
+        .find(|document| document.identity == id)
+        .map_or("", |document| {
+            document.unit.0.rsplit('/').next().expect("file")
+        });
+    assert_eq!(document, defined.document, "{modules:?}");
+}

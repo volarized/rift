@@ -284,9 +284,10 @@ impl SymbolAssembler {
     /// Assembles one normalized record.
     ///
     /// Providers named earlier in `precedence` select scalar presentation
-    /// fields. Unnamed providers follow in provider identity order. Lists
-    /// combine in same order without duplicates. Missing captured
-    /// Contributions return `None`.
+    /// fields. Unnamed providers follow in provider identity order, and within one
+    /// provider [`NormalizedGraph::definition_ranks`]: no declaration fills a scalar
+    /// field one of a lower rank leaves out. Lists combine in same order without
+    /// duplicates. Missing captured Contributions return `None`.
     #[must_use]
     pub fn assemble(
         graph: &NormalizedGraph,
@@ -320,26 +321,36 @@ impl SymbolAssembler {
         if record.index_revision() != graph.index_revision() {
             return None;
         }
-        let mut contributions = record
+        let captured = record
             .contributions()
             .iter()
-            .map(|key| graph.contribution(key).map(|value| (key.clone(), value)))
+            .map(|key| graph.contribution(key))
             .collect::<Option<Vec<_>>>()?;
-        contributions.sort_by(|(left_key, _), (right_key, _)| {
-            provider_rank(left_key, precedence)
-                .cmp(&provider_rank(right_key, precedence))
-                .then_with(|| left_key.cmp(right_key))
+        let mut ranked = match captured.as_slice() {
+            [only] => vec![(0, *only)],
+            several => graph
+                .definition_ranks(several)
+                .into_iter()
+                .zip(several.iter().copied())
+                .collect(),
+        };
+        ranked.sort_by_cached_key(|(rank, contribution)| {
+            let key = contribution.key();
+            (provider_rank(key, precedence), *rank, key.clone())
         });
+        let contributions = ranked
+            .iter()
+            .map(|(_, contribution)| (contribution.key().clone(), *contribution))
+            .collect::<Vec<_>>();
         let primary = contributions.first()?.1;
-        let primary_facts = contributions
+        let selecting = selecting_facts(&ranked);
+        let primary_facts = selecting.first().copied();
+        let selected_visibility = selecting
             .iter()
-            .find_map(|(_, contribution)| contribution.facts());
-        let selected_visibility = contributions
+            .find_map(|facts| facts.visibility_spelling());
+        let selected_container = selecting
             .iter()
-            .find_map(|(_, contribution)| contribution.facts()?.visibility_spelling());
-        let selected_container = contributions
-            .iter()
-            .find_map(|(_, contribution)| contribution.facts()?.container_reference());
+            .find_map(|facts| facts.container_reference());
         let facts = primary_facts.map(|facts| {
             combined_facts(
                 &contributions,
@@ -449,6 +460,24 @@ fn relationships(
                 .collect(),
         ),
     }
+}
+
+/// The facts scalar fields are selected from, in presentation order: none of a higher rank
+/// than the first, so an implementation fills no field a definition leaves out.
+fn selecting_facts<'graph>(
+    ranked: &[(u8, &'graph Contribution)],
+) -> Vec<&'graph PortableSymbolFacts> {
+    let mut supplied = ranked
+        .iter()
+        .filter_map(|(rank, contribution)| Some((*rank, contribution.facts()?)))
+        .peekable();
+    let Some((first, _)) = supplied.peek().copied() else {
+        return Vec::new();
+    };
+    supplied
+        .filter(|(rank, _)| *rank <= first)
+        .map(|(_, facts)| facts)
+        .collect()
 }
 
 fn provider_rank(key: &ContributionKey, precedence: &[ProviderId]) -> (usize, ProviderId) {
@@ -1071,6 +1100,160 @@ mod tests {
             let differences =
                 super::presentation_disagreements(&contributions, &primary, selected, None, None);
             assert_eq!(differences.is_empty(), separate, "{differences:?}");
+        }
+    }
+
+    fn facet(
+        symbol: &str,
+        (kind, file): (&str, &str),
+        identity: &str,
+        container: Option<&str>,
+        visibility: Option<&str>,
+    ) -> Contribution {
+        let mut facts = PortableSymbolFacts::new(
+            Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            symbol,
+            symbol,
+            ExactKind(kind.to_owned()),
+        );
+        if kind == "struct" {
+            facts = facts.kinds(vec![SymbolKind::Type]);
+        }
+        if let Some(container) = container {
+            facts = facts.container(reference("syntax", container));
+        }
+        if let Some(visibility) = visibility {
+            facts = facts.visibility(visibility);
+        }
+        let start = symbol.bytes().map(u64::from).sum();
+        Contribution::builder(
+            ContributionKey::new(
+                provider("syntax"),
+                ProviderRevision::new(1).expect("revision"),
+                ProviderSymbolId::new(symbol).expect("provider symbol"),
+            ),
+            SourceApplicability::Exact {
+                source_revision: SourceRevision::new(1).expect("source"),
+                tree_revision: TreeRevision::new(1).expect("tree"),
+            },
+            facts,
+            ContributionOrigin::new(
+                Some(SourceLocation::Project { package: None }),
+                SourceKind::Authored,
+            )
+            .expect("origin"),
+        )
+        .source(DeclarationBinding::new(
+            SourceUnitId::parse(&format!("rift://source/rift.sources.project/src/{file}.rs"))
+                .expect("unit"),
+            SourceRange::new(start, start + 1).expect("range"),
+        ))
+        .identity_anchor(SymbolId::new(identity).expect("identity"))
+        .build()
+        .expect("contribution")
+    }
+
+    /// Within one provider a definition precedes the implementations in its file, and those
+    /// precede the ones in another file, whatever their keys; none fills a field a lower rank
+    /// leaves out. A type without a definition keeps the order of the keys.
+    #[test]
+    fn a_definition_gives_the_fields_whatever_its_key_sorts_after() {
+        let task = "rift://symbol/local/rust/app/Task";
+        let size = "rift://symbol/local/rust/app/Task/size";
+        let go = "rift://symbol/local/rust/app/Task/go";
+        let module = "rift://symbol/local/rust/app/inner";
+        let other = "rift://symbol/local/rust/app/Other";
+        let publication = ProviderPublication::new(
+            provider("syntax"),
+            ProviderRevision::new(1).expect("revision"),
+            vec![
+                facet("module", ("module", "facade"), module, None, None),
+                facet(
+                    "a-block",
+                    ("impl_item", "facade"),
+                    task,
+                    Some("module"),
+                    Some("private"),
+                ),
+                facet(
+                    "b-block",
+                    ("impl_item", "task"),
+                    task,
+                    None,
+                    Some("private"),
+                ),
+                facet("task", ("struct", "task"), task, None, None),
+                facet(
+                    "a-size",
+                    ("function", "facade"),
+                    size,
+                    Some("a-block"),
+                    Some("private"),
+                ),
+                facet(
+                    "size",
+                    ("field_declaration", "task"),
+                    size,
+                    Some("task"),
+                    None,
+                ),
+                facet(
+                    "a-go",
+                    ("function", "facade"),
+                    go,
+                    Some("a-block"),
+                    Some("pub"),
+                ),
+                facet("b-go", ("function", "task"), go, Some("b-block"), None),
+                facet(
+                    "a-other",
+                    ("impl_item", "facade"),
+                    other,
+                    Some("module"),
+                    Some("private"),
+                ),
+                facet("other", ("function", "task"), other, None, Some("pub")),
+            ],
+            PublicationLimits::default(),
+        )
+        .expect("publication");
+        let set = PublicationSet::empty(PublicationLimits::default())
+            .replaced(publication)
+            .expect("set");
+        let graph = Normalizer::normalize(
+            IndexRevision::new(1).expect("index"),
+            SourceRevision::new(1).expect("source"),
+            TreeRevision::new(1).expect("tree"),
+            &Arc::new(set),
+            None,
+        )
+        .expect("graph");
+        for (order, container, visibility) in [
+            (&["task", "b-block", "a-block"][..], None, None),
+            (&["size", "a-size"][..], Some(task), None),
+            (&["b-go", "a-go"][..], Some(task), None),
+            (&["a-other", "other"][..], Some(module), Some("private")),
+        ] {
+            let record = graph
+                .record_for(&reference("syntax", order[0]))
+                .expect("record");
+            let assembled =
+                SymbolAssembler::assemble(&graph, record, &[provider("syntax")]).expect("symbol");
+            let facts = assembled.facts().expect("facts");
+            assert_eq!(facts.name(), order[0]);
+            assert_eq!(
+                assembled
+                    .contributions()
+                    .iter()
+                    .map(|key| key.reference().symbol().as_str())
+                    .collect::<Vec<_>>(),
+                order
+            );
+            assert_eq!(assembled.container().map(SymbolId::as_str), container);
+            assert_eq!(facts.visibility_spelling(), visibility);
         }
     }
 

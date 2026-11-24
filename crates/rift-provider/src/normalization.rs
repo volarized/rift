@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rift_core::{
     Contribution, ContributionKey, ContributionReference, DeclarationBinding, EdgeKind,
     EquivalenceEvidence, IndexRevision, ReferenceRole, SourceApplicability, SourceRevision,
-    SourceUnitId, SymbolId, SymbolRecord, SymbolResolution, TreeRevision,
+    SourceUnitId, SymbolId, SymbolKind, SymbolRecord, SymbolResolution, TreeRevision,
 };
 
 use rift_error::RiftError;
@@ -289,6 +289,69 @@ impl NormalizedGraph {
         self.publications.contribution(key)
     }
 
+    /// Ranks the declarations of one symbol, lowest first, by how they define it.
+    ///
+    /// A symbol can have several declarations in several files. Wherever one declaration
+    /// stands for the symbol - in its presentation fields, in the order of its declarations,
+    /// in the file it is counted in - the lowest rank does, and a provider's key decides
+    /// between equal ranks only:
+    ///
+    /// - 0: a declaration that is no part of an implementation;
+    /// - 1: an implementation, or a member declared in one, in a file that defines the type;
+    /// - 2: an implementation, or a member declared in one, in another file.
+    ///
+    /// Implementations of a type no declaration defines rank with the other declarations.
+    #[must_use]
+    pub fn definition_ranks(&self, contributions: &[&Contribution]) -> Vec<u8> {
+        let blocks = contributions
+            .iter()
+            .map(|contribution| self.implementation(contribution))
+            .collect::<Vec<_>>();
+        let defining = blocks
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|block| self.record_for(block.key().reference()))
+            .into_iter()
+            .flat_map(SymbolRecord::contributions)
+            .filter_map(|key| self.contribution(key))
+            .filter(|contribution| {
+                !is_implementation(contribution)
+                    && contribution
+                        .facts()
+                        .is_some_and(|facts| facts.symbol_kinds().contains(&SymbolKind::Type))
+            })
+            .filter_map(|contribution| contribution.source().map(DeclarationBinding::unit))
+            .collect::<BTreeSet<_>>();
+        blocks
+            .into_iter()
+            .map(|block| match block {
+                Some(block) if !defining.is_empty() => {
+                    let unit = block.source().map(DeclarationBinding::unit);
+                    1 + u8::from(!unit.is_some_and(|unit| defining.contains(unit)))
+                }
+                _ => 0,
+            })
+            .collect()
+    }
+
+    /// The `impl` block a Contribution is, or is declared in.
+    fn implementation<'graph>(
+        &'graph self,
+        contribution: &'graph Contribution,
+    ) -> Option<&'graph Contribution> {
+        if is_implementation(contribution) {
+            return Some(contribution);
+        }
+        let container = contribution.facts()?.container_reference()?;
+        self.contribution(&ContributionKey::new(
+            container.provider().clone(),
+            contribution.key().publication(),
+            container.symbol().clone(),
+        ))
+        .filter(|container| is_implementation(container))
+    }
+
     /// Returns normalized References.
     #[must_use]
     pub fn references(&self) -> &[NormalizedReference] {
@@ -452,6 +515,12 @@ fn initial_anchors(
             anchors
         })
         .collect()
+}
+
+fn is_implementation(contribution: &Contribution) -> bool {
+    contribution
+        .facts()
+        .is_some_and(|facts| facts.kind().0 == "impl_item")
 }
 
 fn applicable_contributions(

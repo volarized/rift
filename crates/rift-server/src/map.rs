@@ -176,7 +176,8 @@ fn source_unit_paths(index: &WorkspaceIndex) -> BTreeMap<CoreSourceUnitId, CoreP
 }
 
 /// The project path a normalized record's declaration belongs to, resolved through its first
-/// contribution that carries a source binding. `None` for a record with no project-located
+/// contribution of the lowest [`NormalizedGraph::definition_ranks`] that carries a source
+/// binding. `None` for a record with no project-located
 /// contribution: a dependency or standard-library declaration, or one this revision's syntax
 /// pass never bound to a unit this workspace indexed.
 fn record_home_path<'a>(
@@ -184,11 +185,18 @@ fn record_home_path<'a>(
     record: &SymbolRecord,
     unit_paths: &'a BTreeMap<CoreSourceUnitId, CoreProjectPath>,
 ) -> Option<&'a CoreProjectPath> {
-    record
+    let declared = record
         .contributions()
         .iter()
         .filter_map(|key| graph.contribution(key))
-        .find_map(Contribution::source)
+        .filter(|contribution| contribution.source().is_some())
+        .collect::<Vec<_>>();
+    graph
+        .definition_ranks(&declared)
+        .into_iter()
+        .zip(declared)
+        .min_by_key(|(rank, _)| *rank)
+        .and_then(|(_, contribution)| contribution.source())
         .and_then(|binding| unit_paths.get(binding.unit()))
 }
 
@@ -1272,6 +1280,32 @@ mod tests {
             super::module_edges(&graph, &unit_paths, &records).is_empty(),
             "a reference whose source unit maps to no project path contributes nothing"
         );
+        Ok(())
+    }
+
+    /// A module counts the types it defines, not the ones it implements, whichever path
+    /// sorts first (#1025).
+    #[test]
+    fn a_type_counts_in_the_module_that_defines_it() -> TestResult {
+        for implementing in ["first", "second"] {
+            let root = format!("pub mod holder;\npub mod {implementing};\n");
+            let path = format!("src/{implementing}/mod.rs");
+            let (_directory, map) = served_map(&[
+                ("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n"),
+                ("src/lib.rs", &root),
+                ("src/holder/mod.rs", "pub struct Task;\n"),
+                (&path, "use crate::holder::Task;\nimpl Task {}\n"),
+            ])?;
+            let symbols = |module: &str| {
+                map.modules
+                    .iter()
+                    .flat_map(|listed| &listed.children)
+                    .find(|listed| listed.path.0 == module)
+                    .map_or(0, |listed| listed.symbols)
+            };
+            assert_eq!(symbols("src/holder"), 1, "{implementing}");
+            assert_eq!(symbols(&format!("src/{implementing}")), 0, "{implementing}");
+        }
         Ok(())
     }
 
