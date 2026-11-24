@@ -301,7 +301,7 @@
       "description": "License metadata supplied by the source adapter.",
       "properties": {
         "expression": {
-          "description": "Declared expression; collection does not infer a license from source text.",
+          "description": "Declared expression, absent when the source declares none; a blank one is refused.\nCollection does not infer a license from source text.",
           "type": "string"
         },
         "files": {
