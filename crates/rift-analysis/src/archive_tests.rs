@@ -2414,16 +2414,19 @@ fn pax_global_headers_consume_member_and_extension_byte_bounds() -> TestResult {
             ArchiveBound::ExtensionBytes.exceeded(size as u64, size as u64 - 1, named())
         );
     }
-    for limits in both_modes(ArchiveLimits::new(
-        bytes.len(),
-        8192,
-        size,
-        1,
-        u32::MAX as usize,
-    )?) {
+    for limits in both_modes(ArchiveLimits::new(4096, 8192, size, 1, u32::MAX as usize)?) {
+        assert_eq!(read(&bytes, limits)?.files().len(), 1);
+        let twice = gzip(
+            &[
+                global_header(&comment)?,
+                global_header(&comment)?,
+                raw_member("release/a.py", b'0', SOURCE)?,
+            ]
+            .concat(),
+        )?;
         assert_eq!(
-            read(&bytes, limits).expect_err("member count"),
-            ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/a.py")))
+            read(&twice, limits).expect_err("extended header count"),
+            ArchiveBound::ExtendedHeaders.exceeded(2, 1, named())
         );
     }
     for limits in both_modes(ArchiveLimits::new(
@@ -3001,6 +3004,60 @@ fn the_folder_that_holds_the_archive_root_is_accepted() -> TestResult {
             ArchiveError::RootMismatch,
             "{kind:?}"
         );
+    }
+    Ok(())
+}
+
+// Issue #1051.
+#[test]
+fn extended_headers_have_their_own_count() -> TestResult {
+    let mut tar = raw_member("release/", b'5', b"")?;
+    for file in ["b", "c"] {
+        let path = pax_record("path", &format!("release/{file}"));
+        tar.extend(raw_member("PaxHeaders/x", b'x', path.as_bytes())?);
+        tar.extend(raw_member("release/x", b'0', SOURCE)?);
+    }
+    let bytes = gzip(&tar)?;
+    for limits in both_modes(ArchiveLimits::new(bytes.len(), 8192, 1024, 3, 200)?) {
+        assert_eq!(
+            retained(&read(&bytes, limits)?),
+            [("b", SOURCE), ("c", SOURCE)]
+        );
+    }
+    for limits in both_modes(ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?) {
+        assert_eq!(
+            read(&bytes, limits).expect_err("a folder and two files"),
+            ArchiveBound::Members.exceeded(3, 2, Some(fixture_path("release/c")))
+        );
+    }
+    for (first, second) in [(b'x', b'L'), (b'L', b'x')] {
+        let record = pax_record("comment", "x");
+        let content = |flag| match flag {
+            b'x' => record.as_bytes(),
+            _ => b"release/a\0".as_slice(),
+        };
+        let tar = [
+            raw_member("first", first, content(first))?,
+            raw_member("second", second, content(second))?,
+            raw_member("release/a", b'0', SOURCE)?,
+        ]
+        .concat();
+        let bytes = gzip(&tar)?;
+        for limits in both_modes(ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?) {
+            assert_eq!(read(&bytes, limits)?.files().len(), 1);
+        }
+        for limits in both_modes(ArchiveLimits::new(bytes.len(), 8192, 1024, 1, 200)?) {
+            assert!(
+                matches!(
+                    read(&bytes, limits),
+                    Err(ArchiveError::BoundExceeded(exceeded))
+                        if exceeded.bound() == ArchiveBound::ExtendedHeaders
+                            && exceeded.observed() == 2
+                            && exceeded.maximum() == 1
+                ),
+                "{first} {second}"
+            );
+        }
     }
     Ok(())
 }

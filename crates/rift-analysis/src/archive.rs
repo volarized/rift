@@ -327,8 +327,11 @@ impl ArchiveFiles {
 /// One quantity [`ArchiveLimits`] bounds while the reader decodes an archive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveBound {
-    /// Members in the archive, including directories, links, and extended headers.
+    /// Members in the archive, including directories and links.
     Members,
+    /// GNU and PAX extended headers in the archive, which are no members and share the member
+    /// count's maximum.
+    ExtendedHeaders,
     /// Bytes of one member.
     MemberBytes,
     /// Bytes of one GNU or PAX extended header.
@@ -346,6 +349,7 @@ impl ArchiveBound {
     const fn label(self) -> &'static str {
         match self {
             Self::Members => "member count",
+            Self::ExtendedHeaders => "extended header count",
             Self::MemberBytes => "member byte",
             Self::ExtensionBytes => "extended header byte",
             Self::WindowBytes => "Zstandard window byte",
@@ -521,8 +525,9 @@ impl std::error::Error for ArchiveError {}
 ///
 /// `root` names an exact top-level directory from release metadata. `None` preserves paths. The
 /// directory that holds the root, `./`, lies outside no root.
-/// Directories count toward the member bound but never become files. Extended tar headers count
-/// toward both byte and member bounds before the tar library interprets them. A PAX global
+/// Directories count toward the member bound but never become files. Extended tar headers are no
+/// members: their own count has the member bound's maximum, and they count toward the byte bounds
+/// before the tar library interprets them. A PAX global
 /// header is metadata under no root: it is refused only with a record that changes a member's
 /// path, link target, or size, or between another extended header and its member. A symbolic or
 /// hard link entry is skipped rather than refused: it never becomes a file, its target is
@@ -708,22 +713,27 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
     raw.set_ignore_zeros(true);
     let mut extended = TarExtension::default();
     // Raw iteration exposes GNU and PAX headers before the library allocates their contents.
-    for (index, entry) in raw
+    let mut members = 0_u64;
+    let mut extended_headers = 0_u64;
+    for entry in raw
         .entries()
         .map_err(|_| ArchiveError::InvalidArchive)?
         .raw(true)
-        .enumerate()
     {
-        if index >= limits.members {
-            let member = entry
-                .ok()
-                .and_then(|entry| extended.member_path(&entry.path_bytes()));
-            return Err(limits.members_exceeded(index as u64 + 1, member));
-        }
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
         let global = kind.is_pax_global_extensions();
         let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions() || global;
+        let (bound, count) = if extension {
+            (ArchiveBound::ExtendedHeaders, &mut extended_headers)
+        } else {
+            (ArchiveBound::Members, &mut members)
+        };
+        *count += 1;
+        if *count > limits.members as u64 {
+            let member = extended.member_path(&entry.path_bytes());
+            return Err(bound.exceeded(*count, limits.members as u64, member));
+        }
         let link = kind.is_symlink() || kind.is_hard_link();
         if !kind.is_file() && !kind.is_dir() && !extension && !link {
             return Err(ArchiveError::UnsupportedEntry);
@@ -789,18 +799,20 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
 fn read_tar_members(reader: impl Read, output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
     let mut archive = tar::Archive::new(reader);
     archive.set_ignore_zeros(true);
-    for (index, entry) in archive
+    let mut members = 0_u64;
+    for entry in archive
         .entries()
         .map_err(|_| ArchiveError::InvalidArchive)?
-        .enumerate()
     {
-        if index >= output.limits.members {
-            return Err(output.limits.members_exceeded(index as u64 + 1, None));
-        }
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
+        // The header pass counted every global header.
         if kind.is_pax_global_extensions() {
             continue;
+        }
+        members += 1;
+        if members > output.limits.members as u64 {
+            return Err(output.limits.members_exceeded(members, None));
         }
         let path = String::from_utf8(entry.path_bytes().into_owned()).map_err(|error| {
             ArchiveError::unsafe_path(&String::from_utf8_lossy(error.as_bytes()))
