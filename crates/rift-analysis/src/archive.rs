@@ -5,7 +5,7 @@
 use std::{
     borrow::Borrow,
     cell::{Cell, OnceCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
 };
 
@@ -265,6 +265,7 @@ pub struct ArchiveFiles {
     members: BTreeMap<String, ArchiveMemberKind>,
     skipped_links: Vec<ProjectPath>,
     omissions: Vec<ArchiveOmission>,
+    replaced: BTreeSet<ArchivePath>,
 }
 
 impl ArchiveFiles {
@@ -312,6 +313,14 @@ impl ArchiveFiles {
     #[must_use]
     pub fn omissions(&self) -> &[ArchiveOmission] {
         &self.omissions
+    }
+
+    /// Paths of regular files that an earlier member named with different bytes.
+    ///
+    /// The last member of a path is the one kept, or the one omitted.
+    #[must_use]
+    pub const fn replaced(&self) -> &BTreeSet<ArchivePath> {
+        &self.replaced
     }
 }
 
@@ -472,7 +481,8 @@ pub enum ArchiveError {
     /// A member name or the caller's archive root is absolute, traverses parents, or is
     /// otherwise no [`ArchivePath`].
     UnsafePath(UnsafeArchivePath),
-    /// Multiple members name the same normalized path.
+    /// Members of one normalized path are not all regular files, or a file or link is the parent
+    /// of another member.
     DuplicatePath,
     /// Archive contains a device, FIFO, encrypted, or sparse entry, or a PAX global header that
     /// changes how later members are read.
@@ -516,8 +526,10 @@ impl std::error::Error for ArchiveError {}
 /// path, link target, or size, or between another extended header and its member. A symbolic or
 /// hard link entry is skipped rather than refused: it never becomes a file, its target is
 /// never opened, and its path is carried in [`ArchiveFiles::skipped_links`].
-/// Repeated regular files retain one file when their normalized paths and bytes match.
-/// Repeated directories and links, conflicting bytes, and file-parent collisions are refused.
+/// The last regular file of one normalized path is kept, in archive order for tar and in central
+/// directory order for ZIP, as tar extraction keeps it. [`ArchiveFiles::replaced`] lists the path
+/// when an earlier file of it had different bytes. Repeated directories and links, a path that
+/// changes its member type, and file-parent collisions are refused.
 /// Every repeated member consumes the same member, decompressed-byte, and work bounds.
 /// A regular file over the member byte bound refuses the archive unless the limits select
 /// [`OversizedMembers::Skip`]. A member whose name does not use Unicode NFC is checked and
@@ -1296,7 +1308,7 @@ fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
 // declared counts at that read boundary, before the library can reserve member storage.
 // Container interpretation and all field decoding remain in zip; this guard only bounds
 // the count that controls its allocation. Cursor returns each fixed-size read in one call.
-// Keep that count to reject duplicate raw names, which zip otherwise collapses in its index.
+// Keep that count to find duplicate raw names, which zip otherwise collapses in its index.
 // Once metadata is decoded, file contents cannot be mistaken for a footer.
 struct ZipReadGuard<'a> {
     cursor: Cursor<&'a [u8]>,
@@ -1465,6 +1477,7 @@ struct ArchiveOutput<'a> {
     files: BTreeMap<ProjectPath, Vec<u8>>,
     skipped_links: Vec<ProjectPath>,
     omitted: BTreeMap<ArchivePath, OmittedContent>,
+    replaced: BTreeSet<ArchivePath>,
 }
 
 /// One omitted member; the length and digest of a file are compared when its path repeats.
@@ -1502,6 +1515,7 @@ impl<'a> ArchiveOutput<'a> {
             files: BTreeMap::new(),
             skipped_links: Vec::new(),
             omitted: BTreeMap::new(),
+            replaced: BTreeSet::new(),
         }
     }
 
@@ -1618,7 +1632,7 @@ impl<'a> ArchiveOutput<'a> {
         Ok(())
     }
 
-    /// Retains one regular file's bytes, accepting a repeated path only with equal bytes.
+    /// Retains one regular file's bytes in place of an earlier file of its path.
     fn retain(
         &mut self,
         path: ProjectPath,
@@ -1634,23 +1648,20 @@ impl<'a> ArchiveOutput<'a> {
         if content.len() != length {
             return Err(ArchiveError::InvalidArchive);
         }
-        if self.omitted.contains_key(path.as_str()) {
-            return Err(ArchiveError::DuplicatePath);
+        let replaced = self.omitted.remove(path.as_str()).is_some()
+            || self
+                .files
+                .get(&path)
+                .is_some_and(|earlier| *earlier != content);
+        if replaced {
+            self.replaced.insert(ArchivePath(path.as_str().to_owned()));
         }
-        match self.files.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(content);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &content => {}
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(ArchiveError::DuplicatePath);
-            }
-        }
+        self.files.insert(path, content);
         Ok(())
     }
 
     /// Decodes one regular file through a fixed buffer, checking its declared size, and
-    /// records the omission. A repeated path is accepted only with equal bytes.
+    /// records the omission in place of an earlier file of its path.
     fn omit(
         &mut self,
         path: ArchivePath,
@@ -1670,18 +1681,15 @@ impl<'a> ArchiveOutput<'a> {
             size,
             digest: writer.0.finalize().into(),
         };
-        if self.files.contains_key(path.as_str()) {
-            return Err(ArchiveError::DuplicatePath);
+        let replaced = self.files.remove(path.as_str()).is_some()
+            || self
+                .omitted
+                .get(&path)
+                .is_some_and(|earlier| *earlier != content);
+        if replaced {
+            self.replaced.insert(path.clone());
         }
-        match self.omitted.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(content);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &content => {}
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(ArchiveError::DuplicatePath);
-            }
-        }
+        self.omitted.insert(path, content);
         Ok(())
     }
 
@@ -1719,6 +1727,7 @@ impl<'a> ArchiveOutput<'a> {
             files: self.files,
             members: self.seen,
             skipped_links: self.skipped_links,
+            replaced: self.replaced,
             omissions: self
                 .omitted
                 .into_iter()

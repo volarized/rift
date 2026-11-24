@@ -450,34 +450,118 @@ fn raw_zip_duplicates_compare_every_member_and_keep_exact_bytes() -> TestResult 
     Ok(())
 }
 
+// Issue #1036: the last member is kept, as tar extraction keeps it.
 #[test]
-fn repeated_files_with_conflicting_bytes_or_lengths_are_refused() -> TestResult {
+fn repeated_files_with_conflicting_bytes_or_lengths_keep_the_last() -> TestResult {
+    let regular = tar::EntryType::Regular;
     for second in [b"tesT".as_slice(), b"texts", b""] {
         let entries = [
-            ("release/a", b"text".as_slice(), tar::EntryType::Regular),
-            ("release/./a", second, tar::EntryType::Regular),
+            ("release/a", b"text".as_slice(), regular),
+            ("release/./a", second, regular),
         ];
-        let tar = tar_bytes(&entries)?;
-        let zip = zip_members_bytes(&entries)?;
-        assert_eq!(
-            read(&tar, ArchiveLimits::default()).expect_err("conflicting tar bytes"),
-            ArchiveError::DuplicatePath
-        );
-        assert_eq!(
-            read_zip_fixture(&zip, ArchiveLimits::default()).expect_err("conflicting ZIP bytes"),
-            ArchiveError::DuplicatePath
-        );
         let mut raw = zip_members_bytes(&[
-            ("release/a", b"text".as_slice(), tar::EntryType::Regular),
-            ("release/b", second, tar::EntryType::Regular),
+            ("release/a", b"text".as_slice(), regular),
+            ("release/b", second, regular),
         ])?;
         replace_zip_name(&mut raw, b"release/b", b"release/a");
-        assert_eq!(
-            read_zip_fixture(&raw, ArchiveLimits::default())
-                .expect_err("conflicting raw ZIP bytes"),
-            ArchiveError::DuplicatePath
-        );
+        for (bytes, format) in [
+            (tar_bytes(&entries)?, ArchiveFormat::TarGzip),
+            (zip_members_bytes(&entries)?, ArchiveFormat::Zip),
+            (raw, ArchiveFormat::Zip),
+        ] {
+            for limits in both_modes(ArchiveLimits::default()) {
+                let files = read_format(&bytes, format, limits)?;
+                assert_eq!(retained(&files), [("a", second)], "{format:?}");
+                assert_eq!(replaced(&files), ["a"], "{format:?}");
+                assert_eq!(files.members().len(), 1);
+                assert!(files.omissions().is_empty());
+                assert_eq!(files.digest(), FileDigest::of(&bytes));
+            }
+        }
     }
+    let entries = [
+        ("release/a", b"one".as_slice(), regular),
+        ("release/b", b"same", regular),
+        ("release/a", b"two", regular),
+        ("release/b", b"same", regular),
+        ("release/a", b"one", regular),
+    ];
+    let files = read(&tar_bytes(&entries)?, ArchiveLimits::default())?;
+    assert_eq!(retained(&files), [("a", b"one".as_slice()), ("b", b"same")]);
+    assert_eq!(replaced(&files), ["a"], "equal bytes replace nothing");
+    Ok(())
+}
+
+#[test]
+fn repeated_files_with_different_bytes_keep_every_refusal() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let file = ("release/a", b"one".as_slice(), regular);
+    let other = ("release/a", b"two".as_slice(), regular);
+    for third in [
+        ("release/a", b"".as_slice(), tar::EntryType::Symlink),
+        ("release/a", b"", tar::EntryType::Link),
+        ("release/a/", b"", tar::EntryType::Directory),
+        ("release/a/b", b"", regular),
+    ] {
+        for entries in [
+            [file, other, third],
+            [file, third, other],
+            [third, file, other],
+        ] {
+            let bytes = tar_bytes(&entries)?;
+            for limits in both_modes(ArchiveLimits::default()) {
+                assert_eq!(
+                    read(&bytes, limits).expect_err("member type or parent collision"),
+                    ArchiveError::DuplicatePath,
+                    "{entries:?}"
+                );
+            }
+        }
+    }
+    let name = format!("release/{DECOMPOSED}");
+    let repeated = format!("release/./{DECOMPOSED}");
+    let entries = [
+        (name.as_str(), b"one".as_slice(), regular),
+        (&repeated, b"three", regular),
+    ];
+    for (archive, format, bytes) in member_archives(&entries)? {
+        let files = read_format(&bytes, format, ArchiveLimits::default())?;
+        assert_eq!(replaced(&files), [DECOMPOSED], "{archive}");
+        assert_eq!(files.omissions().len(), 1, "{archive}");
+        assert_eq!(files.omissions()[0].size(), 5, "{archive}");
+    }
+    Ok(())
+}
+
+#[test]
+fn replaced_files_consume_member_and_expanded_byte_bounds() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let entries = [
+        ("release/a", b"one".as_slice(), regular),
+        ("release/./a", b"three", regular),
+    ];
+    let bytes = zip_members_bytes(&entries)?;
+    let limits =
+        |expanded, member, members| ArchiveLimits::new(bytes.len(), expanded, member, members, 200);
+    assert_eq!(read_zip_fixture(&bytes, limits(8, 5, 2)?)?.files().len(), 1);
+    assert_eq!(
+        read_zip_fixture(&bytes, limits(7, 5, 2)?).expect_err("decompressed bytes"),
+        ArchiveBound::ExpandedBytes.exceeded(8, 7, Some(fixture_path("release/a")))
+    );
+    assert_eq!(
+        read_zip_fixture(&bytes, limits(8, 4, 2)?).expect_err("member bytes"),
+        ArchiveBound::MemberBytes.exceeded(5, 4, Some(fixture_path("release/a")))
+    );
+    assert_eq!(
+        read_zip_fixture(&bytes, limits(8, 5, 1)?).expect_err("member count"),
+        ArchiveBound::Members.exceeded(2, 1, None)
+    );
+    let tar = tar_bytes(&entries)?;
+    let limits = ArchiveLimits::new(tar.len(), 8192, 1024, 1, 200)?;
+    assert_eq!(
+        read(&tar, limits).expect_err("tar member count"),
+        ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/a")))
+    );
     Ok(())
 }
 
@@ -742,13 +826,17 @@ fn unsafe_and_cross_root_paths_are_refused() -> TestResult {
 }
 
 #[test]
-fn normalized_duplicates_and_file_parent_collisions_are_refused() -> TestResult {
-    for (first, second) in [
-        ("release/a", "./release/a"),
-        ("release/a", "release//a"),
-        ("release/a", "release/a/b"),
-        ("release/a/b", "release/a"),
-    ] {
+fn normalized_duplicates_keep_the_last_and_file_parent_collisions_are_refused() -> TestResult {
+    for (first, second) in [("release/a", "./release/a"), ("release/a", "release//a")] {
+        let bytes = tar_bytes(&[
+            (first, b"one", tar::EntryType::Regular),
+            (second, b"two", tar::EntryType::Regular),
+        ])?;
+        let files = read(&bytes, ArchiveLimits::default())?;
+        assert_eq!(retained(&files), [("a", b"two".as_slice())]);
+        assert_eq!(replaced(&files), ["a"]);
+    }
+    for (first, second) in [("release/a", "release/a/b"), ("release/a/b", "release/a")] {
         let bytes = tar_bytes(&[
             (first, b"one", tar::EntryType::Regular),
             (second, b"two", tar::EntryType::Regular),
@@ -1397,7 +1485,7 @@ fn configured_tar_extension_bytes_accept_exact_and_refuse_one_over_before_alloca
 }
 
 #[test]
-fn zip_conflicting_raw_names_are_refused_before_index_collapse() -> TestResult {
+fn zip_conflicting_raw_names_keep_the_last_before_index_collapse() -> TestResult {
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for path in ["release/a", "release/b"] {
         archive.start_file(path, zip::write::SimpleFileOptions::default())?;
@@ -1410,10 +1498,9 @@ fn zip_conflicting_raw_names_are_refused_before_index_collapse() -> TestResult {
             bytes[offset + 8] = b'a';
         }
     }
-    assert_eq!(
-        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("duplicate raw name"),
-        ArchiveError::DuplicatePath
-    );
+    let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+    assert_eq!(retained(&files), [("a", b"release/b".as_slice())]);
+    assert_eq!(replaced(&files), ["a"]);
     Ok(())
 }
 
@@ -2158,12 +2245,12 @@ fn bound_refusals_resolve_extended_member_paths() -> TestResult {
 }
 
 #[test]
-fn repeated_omitted_files_compare_bytes_and_never_replace_retained_files() -> TestResult {
+fn repeated_omitted_files_compare_bytes_and_keep_the_last() -> TestResult {
     let binary = oversized();
     let mut changed = binary.clone();
     changed[2500] ^= 1;
     let longer = [binary.as_slice(), b"x"].concat();
-    for (first, second, accepted) in [
+    for (first, second, equal) in [
         (binary.as_slice(), binary.as_slice(), true),
         (&binary, &changed, false),
         (&binary, &longer, false),
@@ -2184,17 +2271,18 @@ fn repeated_omitted_files_compare_bytes_and_never_replace_retained_files() -> Te
             (zip_members_bytes(&entries)?, ArchiveFormat::Zip),
             (raw, ArchiveFormat::Zip),
         ] {
-            let result = read_format(&bytes, format, skipping(&bytes)?);
-            if accepted {
-                let files = result?;
-                assert_eq!(files.omissions().len(), 1);
-                assert!(files.files().is_empty());
+            let files = read_format(&bytes, format, skipping(&bytes)?)?;
+            if second == SOURCE {
+                assert_eq!(retained(&files), [("a", SOURCE)]);
+                assert!(files.omissions().is_empty());
             } else {
-                assert_eq!(
-                    result.expect_err("conflicting repeated file"),
-                    ArchiveError::DuplicatePath
-                );
+                assert!(files.files().is_empty());
+                assert_eq!(files.omissions().len(), 1);
+                assert_eq!(files.omissions()[0].path().as_str(), "a");
+                assert_eq!(files.omissions()[0].size(), second.len() as u64);
             }
+            let expected: &[&str] = if equal { &[] } else { &["a"] };
+            assert_eq!(replaced(&files), expected);
         }
     }
     Ok(())
@@ -2560,6 +2648,10 @@ fn retained(files: &ArchiveFiles) -> Vec<(&str, &[u8])> {
         .iter()
         .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
         .collect()
+}
+
+fn replaced(files: &ArchiveFiles) -> Vec<&str> {
+    files.replaced().iter().map(ArchivePath::as_str).collect()
 }
 
 fn omitted(files: &ArchiveFiles) -> Vec<(&str, ArchiveMemberKind, ArchiveOmissionReason, u64)> {

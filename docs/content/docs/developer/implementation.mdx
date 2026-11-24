@@ -1506,6 +1506,12 @@ member or the archive root it refuses.
 A PAX global header, such as the one `git archive` writes, names no member and lies under no root.
 It counts toward `members`, `member_size`, and `extension_size`. A global record that changes the
 path, link target, or size of later members refuses the archive.
+
+The last regular file of one path is kept, in archive order for tar and in central directory order
+for ZIP. `ArchiveFiles::replaced` lists the path when an earlier file of it had different bytes.
+Every repeated member counts toward the archive bounds. A repeated directory or link, and a path
+that changes its member type, refuse the archive.
+
 NUL bytes that pad the end of a gzip stream count toward `compressed_size` and not toward
 `expansion_ratio`; any other data after the stream refuses the archive.
 
