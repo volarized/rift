@@ -9,7 +9,7 @@ mod receiver_guards;
 mod references;
 mod slots;
 
-pub(super) use classes::ClassOrders;
+pub(super) use classes::{ClassOrders, MemberOwners};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,6 +59,19 @@ impl EdgePythonModules {
         Some(python_import_target(&anchor, package, module)?.join("."))
     }
 }
+
+/// A name a module binds, by the module's path.
+type ModuleName<'source> = (&'source str, &'source str);
+
+/// Where the imports of each name lead: the last name a chain of imports reaches, or `None`
+/// where the chain is a cycle.
+///
+/// A name another file writes to is no link: whether its slot is available depends on the
+/// writer.
+#[derive(Default)]
+pub(super) struct ImportTargets<'source>(
+    BTreeMap<ModuleName<'source>, Option<ModuleName<'source>>>,
+);
 
 /// What covers a Python file beside its module.
 #[derive(Clone, Copy)]
@@ -259,12 +272,10 @@ impl<'source> Index<'source> {
             }
         }
         let caller = file.enclosing_callable(call.range)?;
-        for binding in file.facts.bindings() {
+        let receivers = file.python_receivers.get(&caller.symbol.item_range)?;
+        for &binding in receivers {
             if !work.charge() {
                 return None;
-            }
-            if binding.scope != caller.symbol.item_range {
-                continue;
             }
             if let StaticBindingKind::PythonReceiver { class_name } = binding.kind {
                 let selected = edge_python_binding(
@@ -517,6 +528,92 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Follows every import of every Python module once.
+    pub(super) fn python_import_targets(&self, work: &mut Work) -> Option<ImportTargets<'source>> {
+        let mut targets = ImportTargets::default();
+        for file in self.python_files() {
+            for binding in file.facts.bindings() {
+                if !work.charge() {
+                    return None;
+                }
+                if matches!(
+                    binding.kind,
+                    StaticBindingKind::PythonImport {
+                        export: Some(_),
+                        ..
+                    }
+                ) {
+                    let name = (file.document.path.as_str(), file.text(binding.name)?);
+                    self.follow_imports(name, &mut targets, work)?;
+                }
+            }
+        }
+        Some(targets)
+    }
+
+    /// Follows the imports of `name` up to a name already followed, the end of the chain, or
+    /// a name of the chain itself.
+    fn follow_imports(
+        &self,
+        mut name: ModuleName<'source>,
+        targets: &mut ImportTargets<'source>,
+        work: &mut Work,
+    ) -> Option<()> {
+        let mut chain = BTreeSet::new();
+        let target = loop {
+            if !work.charge() {
+                return None;
+            }
+            if let Some(known) = targets.0.get(&name) {
+                break *known;
+            }
+            if !chain.insert(name) {
+                break None;
+            }
+            match self.imported_name(name, work) {
+                Some(next) => name = next,
+                None if work.exhausted => return None,
+                None => break Some(name),
+            }
+        };
+        targets
+            .0
+            .extend(chain.into_iter().map(|name| (name, target)));
+        Some(())
+    }
+
+    /// The name of a selected module that the one binding of `name` imports.
+    fn imported_name(
+        &self,
+        (path, name): ModuleName<'source>,
+        work: &mut Work,
+    ) -> Option<ModuleName<'source>> {
+        if self.python_writes.contains_key(name) {
+            return None;
+        }
+        let file = self.files.get(path)?;
+        let bindings = file.by_name.get(name)?.iter().copied();
+        let root = bindings.filter(|binding| file.python_module_binding(binding));
+        let binding = self.python_binding_group(file, root, work)?;
+        let StaticBindingKind::PythonImport {
+            module,
+            export: Some(export),
+        } = binding.kind
+        else {
+            return None;
+        };
+        file.qualified_target(".")?.admitted_path()?;
+        let module = EdgePythonModules::name(file, file.text(module)?)?;
+        let target = self.edge_python.path(&module)?;
+        let exported = file.text(export)?;
+        // A package importing a name from itself binds its submodule.
+        if target == path && exported == name {
+            return None;
+        }
+        let target = self.files.get(target)?;
+        Some((target.document.path.as_str(), exported))
+    }
+
     fn module_value(&self, name: &str) -> Option<Value<'source>> {
         let prefix = format!("{name}.");
         (self.edge_python.path(name).is_some()
@@ -535,6 +632,15 @@ impl<'source> Index<'source> {
         mut name: &'index str,
         work: &mut Work,
     ) -> Option<Value<'source>> {
+        if let Some(target) = self
+            .python_imports
+            .0
+            .get(&(file.document.path.as_str(), name))
+        {
+            let (path, imported) = (*target)?;
+            file = self.files.get(path)?;
+            name = imported;
+        }
         let mut visited = BTreeSet::new();
         loop {
             if !work.charge() || !visited.insert((file.document.path.as_str(), name)) {
@@ -635,7 +741,11 @@ fn edge_python_binding<'source>(
             .body_range
             .is_some_and(|body| body.contains(position))
     });
-    let bindings = file.by_name.get(name)?;
+    let around = ByteRange {
+        start: position,
+        end: position.checked_add(1)?,
+    };
+    let bindings = &file.bindings_around(name, around).collect::<Vec<_>>();
     let mut excluded = BTreeSet::new();
     let mut global = false;
     let mut nonlocal = false;

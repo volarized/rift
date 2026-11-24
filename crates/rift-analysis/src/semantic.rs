@@ -243,7 +243,7 @@ impl WorkspaceSemantics {
         unit: &rift_core::SourceUnitId,
         range: Option<rift_syntax::ByteRange>,
     ) -> bool {
-        if self.static_resolution.exhausted || !self.edges.is_complete() {
+        if self.static_resolution.exhausted || self.edges.dropped_edges() > 0 {
             return false;
         }
         let coverage = &self.static_resolution.edge_calls;

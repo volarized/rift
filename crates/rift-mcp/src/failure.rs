@@ -451,6 +451,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.analysis.context7_too_many_entries",
                 "rift.analysis.documentation_limit_exceeded",
                 "rift.analysis.package_declarations_exceeded",
+                "rift.analysis.package_input_import_limit_exceeded",
                 "rift.analysis.package_input_too_many_bytes",
                 "rift.analysis.package_input_too_many_files",
                 "rift.analysis.package_retained_source_bytes_exceeded",

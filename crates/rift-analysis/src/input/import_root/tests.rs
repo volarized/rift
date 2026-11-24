@@ -107,7 +107,7 @@ fn module_and_root_counts_stop_at_the_aggregate_bound() {
         .map(|index| format!("m{index}"))
         .collect::<Vec<_>>();
     let exact = PackageImportRoot::new(None, modules.clone(), PackageImportRootOrigin::Wheel)
-        .expect("64 module entries");
+        .expect("module entries at the bound");
     assert!(validate_roots(std::slice::from_ref(&exact)).is_ok());
     let mut overflow = modules;
     overflow.push("extra".to_owned());
@@ -119,6 +119,50 @@ fn module_and_root_counts_stop_at_the_aggregate_bound() {
     assert!(validate_roots(&roots).is_ok());
     roots.push(root(Some("overflow"), &["module"]));
     assert!(validate_roots(&roots).is_err());
+}
+
+#[test]
+fn import_limits_name_the_observed_quantity_and_its_bound() {
+    let modules = (0..1_000)
+        .map(|index| format!("module_{index}"))
+        .collect::<Vec<_>>();
+    let wheel = PackageImportRoot::new(None, modules, PackageImportRootOrigin::Wheel)
+        .expect("a wheel with 1,000 top-level modules");
+    assert!(validate_roots(std::slice::from_ref(&wheel)).is_ok());
+
+    let refused = |error: &rift_error::RiftError, field: &str, bound: usize| {
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.package_input_import_limit_exceeded"
+        );
+        let message = error.to_string();
+        for part in [field.to_owned(), bound.to_string(), (bound + 1).to_string()] {
+            assert!(message.contains(&part), "{message}");
+        }
+    };
+    let field = "package_import_entries_max";
+    let entries = (0..=PACKAGE_IMPORT_ENTRIES_MAX)
+        .map(|index| format!("m{index}"))
+        .collect::<Vec<_>>();
+    let error = PackageImportRoot::new(None, entries.clone(), PackageImportRootOrigin::Wheel)
+        .expect_err("one module over the bound");
+    refused(&error, field, PACKAGE_IMPORT_ENTRIES_MAX);
+    let exact = PackageImportRoot::new(
+        None,
+        entries[..PACKAGE_IMPORT_ENTRIES_MAX].to_vec(),
+        PackageImportRootOrigin::Wheel,
+    )
+    .expect("modules at the bound");
+    let error = validate_roots(&[exact, root(Some("src"), &["extra"])])
+        .expect_err("one aggregate module over the bound");
+    refused(&error, field, PACKAGE_IMPORT_ENTRIES_MAX);
+    let error = PackageImportRoot::new(
+        None,
+        vec!["x".repeat(PACKAGE_IMPORT_BYTES_MAX + 1)],
+        PackageImportRootOrigin::Wheel,
+    )
+    .expect_err("one byte over the bound");
+    refused(&error, "package_import_bytes_max", PACKAGE_IMPORT_BYTES_MAX);
 }
 
 #[test]

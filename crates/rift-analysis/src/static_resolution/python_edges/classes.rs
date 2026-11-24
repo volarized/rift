@@ -1,10 +1,11 @@
 //! Captured Python class order and member lookup.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use rift_core::LoopBudget;
 use rift_protocol::read::SymbolKind;
 
-use super::super::{File, Index, Target, Work};
+use super::super::{File, FileWork, Index, Target, Work};
 use super::{Value, edge_python_binding};
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
 
@@ -132,22 +133,80 @@ impl ClassKey<'_> {
     }
 }
 
+/// The order of every class of the selected sources, and whether the bound on reading them
+/// ended before the last one.
 #[derive(Default)]
-pub(in crate::static_resolution) struct ClassOrders<'source>(
-    BTreeMap<ClassKey<'source>, ClassOrder<'source>>,
-);
+pub(in crate::static_resolution) struct ClassOrders<'source> {
+    orders: Orders<'source>,
+    pub(in crate::static_resolution) ended: bool,
+}
+
+type Orders<'source> = BTreeMap<ClassKey<'source>, ClassOrder<'source>>;
 
 struct ClassOrder<'source> {
-    classes: Vec<ClassKey<'source>>,
+    classes: OrderedClasses<'source>,
     complete: bool,
 }
 
+/// The classes of one order, the class itself first.
+enum OrderedClasses<'source> {
+    /// The class, then the order of its only base.
+    Inherited(ClassKey<'source>),
+    Merged(Vec<ClassKey<'source>>),
+}
+
 impl<'source> ClassOrder<'source> {
-    fn partial(class: ClassKey<'source>) -> Self {
+    fn merged(classes: Vec<ClassKey<'source>>, complete: bool) -> Self {
         Self {
-            classes: vec![class],
-            complete: false,
+            classes: OrderedClasses::Merged(classes),
+            complete,
         }
+    }
+
+    fn partial(class: ClassKey<'source>) -> Self {
+        Self::merged(vec![class], false)
+    }
+}
+
+/// The classes of the order of `class`. An order inherits only orders established before it,
+/// so the walk ends.
+fn ordered<'orders, 'source>(
+    orders: &'orders Orders<'source>,
+    class: ClassKey<'source>,
+) -> impl Iterator<Item = ClassKey<'source>> + 'orders {
+    let mut inherited = Some(class);
+    let mut merged: &[ClassKey<'source>] = &[];
+    std::iter::from_fn(move || {
+        if let Some((class, rest)) = merged.split_first() {
+            merged = rest;
+            return Some(*class);
+        }
+        let class = inherited.take()?;
+        match &orders.get(&class)?.classes {
+            OrderedClasses::Inherited(base) => {
+                inherited = Some(*base);
+                Some(class)
+            }
+            OrderedClasses::Merged(classes) => {
+                let (class, rest) = classes.split_first()?;
+                merged = rest;
+                Some(*class)
+            }
+        }
+    })
+}
+
+/// The classes that declare a member, by the member's name.
+#[derive(Default)]
+pub(in crate::static_resolution) struct MemberOwners<'source>(
+    BTreeMap<&'source str, BTreeSet<ClassKey<'source>>>,
+);
+
+impl<'source> MemberOwners<'source> {
+    /// The classes other than `class` that declare `name`.
+    fn others(&self, class: ClassKey<'source>, name: &str) -> Option<&BTreeSet<ClassKey<'source>>> {
+        let owners = self.0.get(name)?;
+        owners.iter().any(|owner| *owner != class).then_some(owners)
     }
 }
 
@@ -167,19 +226,73 @@ enum ExternalBinding<'index, 'source> {
 }
 
 impl<'source> Index<'source> {
-    pub(in crate::static_resolution) fn python_class_orders(
+    /// Reads which classes of the Python files declare each member name.
+    pub(in crate::static_resolution) fn python_member_owners(
         &self,
         work: &mut Work,
-    ) -> Option<ClassOrders<'source>> {
-        let mut pending = BTreeMap::new();
-        for file in self
-            .files
-            .values()
-            .filter(|file| file.document.facts.language().name == "python")
-        {
+    ) -> Option<MemberOwners<'source>> {
+        let mut owners = MemberOwners::default();
+        for file in self.python_files() {
             for symbol in file.document.facts.symbols() {
                 if !work.charge() {
                     return None;
+                }
+                if let Some(container) = symbol.container.as_deref() {
+                    let class = ClassKey::Declaration(file.document.path.as_str(), container);
+                    owners.0.entry(&symbol.name).or_default().insert(class);
+                }
+            }
+        }
+        Some(owners)
+    }
+
+    /// Reads the order of every Python class, under the shares of the files that declare
+    /// them. A class past that bound has no order, and the others keep theirs.
+    pub(in crate::static_resolution) fn python_class_orders(
+        &self,
+        shares: FileWork,
+        work: &mut Work,
+    ) -> ClassOrders<'source> {
+        let bound = self
+            .python_files()
+            .map(|file| shares.max(file))
+            .fold(0, usize::saturating_add)
+            .min(work.budget.remaining());
+        let mut apart = Work::new(bound);
+        let mut orders = BTreeMap::from([(
+            ClassKey::Generic,
+            ClassOrder::merged(vec![ClassKey::Generic], true),
+        )]);
+        let bases = self.python_bases(&mut apart);
+        order_classes(bases, &mut orders, &mut apart);
+        let used = bound.saturating_sub(apart.budget.remaining());
+        work.budget = LoopBudget::new(work.budget.remaining().saturating_sub(used));
+        ClassOrders {
+            orders,
+            ended: apart.exhausted,
+        }
+    }
+
+    pub(super) fn python_files(&self) -> impl Iterator<Item = &File<'source>> {
+        self.files
+            .values()
+            .filter(|file| file.document.facts.language().name == "python")
+    }
+
+    /// The bases each class of the selected sources names, up to the bound.
+    fn python_bases(&self, work: &mut Work) -> Bases<'source> {
+        let mut pending = BTreeMap::new();
+        for file in self.python_files() {
+            let mut heritage = BTreeMap::<ByteRange, Vec<ByteRange>>::new();
+            for edge in file.facts.heritage_edges() {
+                if !work.charge() {
+                    return pending;
+                }
+                heritage.entry(edge.from).or_default().push(edge.target);
+            }
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    return pending;
                 }
                 if !symbol.kinds.contains(&SymbolKind::Constructible) {
                     continue;
@@ -188,94 +301,38 @@ impl<'source> Index<'source> {
                     file: file.document,
                     symbol,
                 };
-                let bases = self.python_class_bases(file, target, work)?;
+                let written = symbol.name_range.and_then(|name| heritage.get(&name));
+                let Some(bases) = self.python_class_bases(file, written, work) else {
+                    return pending;
+                };
                 pending.insert(key(target), bases);
             }
         }
-        let mut orders = BTreeMap::from([(
-            ClassKey::Generic,
-            ClassOrder {
-                classes: vec![ClassKey::Generic],
-                complete: true,
-            },
-        )]);
-        for base in pending.values().flatten().flatten() {
-            if let ClassKey::External(..) = base {
-                orders.insert(
-                    *base,
-                    ClassOrder {
-                        classes: vec![*base],
-                        complete: true,
-                    },
-                );
-            }
-        }
-        while !pending.is_empty() {
-            let mut ready = Vec::new();
-            for (class, bases) in &pending {
-                if !work.charge() {
-                    return None;
-                }
-                let mut available = true;
-                for base in bases.iter().flatten() {
-                    if !work.charge() {
-                        return None;
-                    }
-                    available &= orders.contains_key(base);
-                }
-                if available {
-                    ready.push(*class);
-                }
-            }
-            if ready.is_empty() {
-                break;
-            }
-            for class in ready {
-                let bases = pending.remove(&class)?;
-                let order = merge_order(class, &bases, &orders, work);
-                if work.exhausted {
-                    return None;
-                }
-                orders.insert(class, order.unwrap_or_else(|| ClassOrder::partial(class)));
-            }
-        }
-        for class in pending.into_keys() {
-            if !work.charge() {
-                return None;
-            }
-            orders.insert(class, ClassOrder::partial(class));
-        }
-        Some(ClassOrders(orders))
+        pending
     }
 
     fn python_class_bases(
         &self,
         file: &File<'source>,
-        class: Target<'source>,
+        written: Option<&Vec<ByteRange>>,
         work: &mut Work,
     ) -> Option<Vec<Option<ClassKey<'source>>>> {
         let mut bases = Vec::new();
-        for edge in file.facts.heritage_edges() {
+        for &range in written.into_iter().flatten() {
             if !work.charge() {
                 return None;
             }
-            if Some(edge.from) != class.symbol.name_range {
-                continue;
-            }
-            let base = if self.python_generic_marker(file, edge.target, work) {
+            let base = if self.python_generic_marker(file, range, work) {
                 Some(ClassKey::Generic)
-            } else if let Some(base) = self.edge_python_base(file, edge.target, work) {
+            } else if let Some(base) = self.edge_python_base(file, range, work) {
                 Some(key(base))
             } else {
-                self.python_external_class(file, edge.target, work)
-                    .then_some(ClassKey::External(
-                        file.document.path.as_str(),
-                        edge.target.start,
-                    ))
+                self.python_external_class(file, range, work)
+                    .then_some(ClassKey::External(file.document.path.as_str(), range.start))
             };
             bases.push(base);
         }
-        Some(bases)
+        (!work.exhausted).then_some(bases)
     }
 
     /// A base expression names a class outside the selected sources: an unbound name (a
@@ -523,9 +580,9 @@ impl<'source> Index<'source> {
         instance: bool,
         work: &mut Work,
     ) -> Option<bool> {
-        let order = self.edge_python_classes.0.get(&key(class))?;
+        let complete = self.edge_python_classes.orders.get(&key(class))?.complete;
         let owner = declaration.symbol.container.as_deref()?;
-        for &ancestor in &order.classes {
+        for ancestor in ordered(&self.edge_python_classes.orders, key(class)) {
             if !work.charge() {
                 return None;
             }
@@ -537,7 +594,7 @@ impl<'source> Index<'source> {
                 return Some(false);
             }
         }
-        order.complete.then_some(false)
+        complete.then_some(false)
     }
 
     /// The member the class body of the nearest ancestor declares. An attribute a method
@@ -548,13 +605,16 @@ impl<'source> Index<'source> {
         name: &str,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let order = self.edge_python_classes.0.get(&key(class))?;
-        for &ancestor in order.classes.iter().skip(1) {
+        let owners = self.python_members.others(key(class), name)?;
+        for ancestor in ordered(&self.edge_python_classes.orders, key(class)).skip(1) {
             if !work.charge() {
                 return None;
             }
             if ancestor.blocks_member(name) {
                 return None;
+            }
+            if !owners.contains(&ancestor) {
+                continue;
             }
             let ClassKey::Declaration(path, qualified) = ancestor else {
                 continue;
@@ -884,13 +944,16 @@ impl<'source> Index<'source> {
         name: &str,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let order = self.edge_python_classes.0.get(&key(class))?;
-        for &ancestor in order.classes.iter().skip(1) {
+        let owners = self.python_members.others(key(class), name)?;
+        for ancestor in ordered(&self.edge_python_classes.orders, key(class)).skip(1) {
             if !work.charge() {
                 return None;
             }
             if ancestor.blocks_member(name) {
                 return None;
+            }
+            if !owners.contains(&ancestor) {
+                continue;
             }
             let ClassKey::Declaration(path, qualified) = ancestor else {
                 continue;
@@ -911,11 +974,7 @@ fn python_slot_bindings<'index, 'source>(
     class: Target<'source>,
     name: &str,
 ) -> impl Iterator<Item = &'source StaticBinding> + Clone + use<'index, 'source> {
-    file.by_name
-        .get(name)
-        .into_iter()
-        .flatten()
-        .copied()
+    file.bindings_around(name, class.symbol.item_range)
         .filter(move |binding| {
             binding.scope == class.symbol.item_range
                 && !file.python_module_binding(binding)
@@ -982,26 +1041,84 @@ fn python_property_slot<'source>(
     first
 }
 
+type Bases<'source> = BTreeMap<ClassKey<'source>, Vec<Option<ClassKey<'source>>>>;
+
+/// Orders every class after its bases, each class and base read once. A class whose bases
+/// never get an order has a partial one.
+fn order_classes<'source>(
+    mut pending: Bases<'source>,
+    orders: &mut Orders<'source>,
+    work: &mut Work,
+) {
+    let mut waiting = BTreeMap::<ClassKey<'source>, usize>::new();
+    let mut derived = BTreeMap::<ClassKey<'source>, Vec<ClassKey<'source>>>::new();
+    let mut ready = VecDeque::new();
+    for (class, bases) in &pending {
+        let known = bases.iter().flatten().collect::<BTreeSet<_>>();
+        let mut missing = 0;
+        for base in known {
+            if !work.charge() {
+                return;
+            }
+            if let ClassKey::External(..) = base {
+                orders.insert(*base, ClassOrder::merged(vec![*base], true));
+            } else if !orders.contains_key(base) {
+                missing += 1;
+                derived.entry(*base).or_default().push(*class);
+            }
+        }
+        if missing == 0 {
+            ready.push_back(*class);
+        } else {
+            waiting.insert(*class, missing);
+        }
+    }
+    while let Some(class) = ready.pop_front() {
+        let Some(bases) = pending.remove(&class) else {
+            continue;
+        };
+        let order = merge_order(class, &bases, orders, work);
+        if work.exhausted {
+            return;
+        }
+        orders.insert(class, order.unwrap_or_else(|| ClassOrder::partial(class)));
+        for derived in derived.remove(&class).into_iter().flatten() {
+            if !work.charge() {
+                return;
+            }
+            if let Some(missing) = waiting.get_mut(&derived) {
+                *missing -= 1;
+                if *missing == 0 {
+                    ready.push_back(derived);
+                }
+            }
+        }
+    }
+    for class in pending.into_keys() {
+        if !work.charge() {
+            return;
+        }
+        orders.insert(class, ClassOrder::partial(class));
+    }
+}
+
 fn merge_order<'source>(
     class: ClassKey<'source>,
     bases: &[Option<ClassKey<'source>>],
-    orders: &BTreeMap<ClassKey<'source>, ClassOrder<'source>>,
+    orders: &Orders<'source>,
     work: &mut Work,
 ) -> Option<ClassOrder<'source>> {
-    let mut partial = ClassOrder::partial(class);
+    if !work.charge() {
+        return None;
+    }
     if let [base] = bases {
         let Some(base) = base else {
-            return Some(partial);
+            return Some(ClassOrder::partial(class));
         };
-        let parent = orders.get(base)?;
-        for &class in &parent.classes {
-            if !work.charge() {
-                return None;
-            }
-            partial.classes.push(class);
-        }
-        partial.complete = parent.complete;
-        return Some(partial);
+        return Some(ClassOrder {
+            classes: OrderedClasses::Inherited(*base),
+            complete: orders.get(base)?.complete,
+        });
     }
     let mut known = BTreeSet::new();
     let mut complete = true;
@@ -1022,59 +1139,194 @@ fn merge_order<'source>(
     if !complete {
         // The first direct base precedes its own bases in every valid class order.
         // Unknown ancestors of another base can change the order after that point.
-        if let Some(Some(base)) = bases.first() {
-            partial.classes.push(*base);
-        }
-        return Some(partial);
+        let first = bases.first().copied().flatten();
+        let classes = std::iter::once(class).chain(first).collect();
+        return Some(ClassOrder::merged(classes, false));
     }
-    let mut sequences = Vec::new();
-    let mut direct = Vec::new();
-    for base in bases {
-        if !work.charge() {
-            return None;
-        }
-        let base = (*base)?;
-        direct.push(base);
-        sequences.push(orders.get(&base)?.classes.as_slice());
-    }
-    sequences.push(direct.as_slice());
-    let mut order = vec![class];
-    while sequences.iter().any(|sequence| !sequence.is_empty()) {
-        let mut selected = None;
-        for sequence in &sequences {
+    let direct = bases.iter().copied().collect::<Option<Vec<_>>>()?;
+    let mut sequences = Vec::with_capacity(direct.len() + 1);
+    for base in &direct {
+        let mut sequence = VecDeque::new();
+        for class in ordered(orders, *base) {
             if !work.charge() {
                 return None;
             }
-            let Some(candidate) = sequence.first() else {
+            sequence.push_back(class);
+        }
+        sequences.push(sequence);
+    }
+    sequences.push(direct.into());
+    merge_sequences(class, sequences, work)
+}
+
+/// Merges the orders of the bases of `class`, with its bases as the last sequence, by the C3
+/// rule: the next class is the first head that no sequence holds behind its own head.
+///
+/// Each class leaves each sequence once, and the next head is read from an index, so the work
+/// is the length of the sequences and does not grow with their number.
+fn merge_sequences<'source>(
+    class: ClassKey<'source>,
+    sequences: Vec<VecDeque<ClassKey<'source>>>,
+    work: &mut Work,
+) -> Option<ClassOrder<'source>> {
+    let mut merge = Merge::new(sequences);
+    let mut order = vec![class];
+    while !merge.heads.is_empty() {
+        order.push(merge.take_next(work)?);
+    }
+    Some(ClassOrder::merged(order, true))
+}
+
+/// Sequences under a C3 merge, with their heads indexed.
+struct Merge<'source> {
+    sequences: Vec<VecDeque<ClassKey<'source>>>,
+    /// How many sequences hold a class behind their head, for the classes one holds.
+    behind: BTreeMap<ClassKey<'source>, usize>,
+    /// The sequences each class heads.
+    heads: BTreeMap<ClassKey<'source>, Vec<usize>>,
+    /// The sequences whose head no sequence holds behind its own.
+    ready: BTreeSet<usize>,
+}
+
+impl<'source> Merge<'source> {
+    fn new(sequences: Vec<VecDeque<ClassKey<'source>>>) -> Self {
+        let mut behind = BTreeMap::<_, usize>::new();
+        let mut heads = BTreeMap::<_, Vec<_>>::new();
+        for (index, sequence) in sequences.iter().enumerate() {
+            for class in sequence.iter().skip(1) {
+                *behind.entry(*class).or_default() += 1;
+            }
+            if let Some(head) = sequence.front() {
+                heads.entry(*head).or_default().push(index);
+            }
+        }
+        let ready = heads
+            .iter()
+            .filter(|(head, _)| !behind.contains_key(*head))
+            .flat_map(|(_, sequences)| sequences.iter().copied())
+            .collect();
+        Self {
+            sequences,
+            behind,
+            heads,
+            ready,
+        }
+    }
+
+    /// The next class of the merged order, removed from every sequence it heads. `None` where
+    /// no order satisfies every sequence.
+    fn take_next(&mut self, work: &mut Work) -> Option<ClassKey<'source>> {
+        let first = *self.ready.first()?;
+        let selected = *self.sequences.get(first)?.front()?;
+        for index in self.heads.remove(&selected)? {
+            if !work.charge() {
+                return None;
+            }
+            self.ready.remove(&index);
+            let sequence = self.sequences.get_mut(index)?;
+            sequence.pop_front();
+            let Some(&head) = sequence.front() else {
                 continue;
             };
-            let mut in_tail = false;
-            for other in &sequences {
-                for item in other.iter().skip(1) {
-                    if !work.charge() {
-                        return None;
-                    }
-                    in_tail |= item == candidate;
+            let sequences = self.heads.entry(head).or_default();
+            sequences.push(index);
+            // The sequences a class already heads become ready when the last one behind ends.
+            match self.behind.get_mut(&head) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.behind.remove(&head);
+                    self.ready.extend(sequences.iter().copied());
+                }
+                None => {
+                    self.ready.insert(index);
                 }
             }
-            if !in_tail {
-                selected = Some(*candidate);
-                break;
-            }
         }
-        let selected = selected?;
-        order.push(selected);
-        for sequence in &mut sequences {
-            if !work.charge() {
-                return None;
+        Some(selected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+
+    fn class(index: usize) -> ClassKey<'static> {
+        ClassKey::Declaration(NAMES[index], "C")
+    }
+
+    /// The C3 rule as Python states it: scan every sequence for a head in no tail.
+    fn scanned(
+        class: ClassKey<'static>,
+        mut sequences: Vec<VecDeque<ClassKey<'static>>>,
+    ) -> Option<Vec<ClassKey<'static>>> {
+        let mut order = vec![class];
+        loop {
+            sequences.retain(|sequence| !sequence.is_empty());
+            if sequences.is_empty() {
+                return Some(order);
             }
-            if sequence.first() == Some(&selected) {
-                *sequence = &sequence[1..];
+            let head = sequences.iter().map(|sequence| sequence[0]).find(|head| {
+                !sequences
+                    .iter()
+                    .any(|sequence| sequence.iter().skip(1).any(|class| class == head))
+            })?;
+            order.push(head);
+            for sequence in &mut sequences {
+                if sequence[0] == head {
+                    sequence.pop_front();
+                }
             }
         }
     }
-    Some(ClassOrder {
-        classes: order,
-        complete: true,
-    })
+
+    #[test]
+    fn merged_orders_equal_a_scan_over_generated_hierarchies() {
+        let mut state = 1_u64;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            usize::try_from(state >> 33).expect("31 bits") % bound
+        };
+        let (mut merged, mut refused) = (0, 0);
+        for _ in 0..2_000 {
+            let mut orders: Vec<Option<Vec<ClassKey<'static>>>> = Vec::new();
+            for index in 0..NAMES.len() {
+                let mut bases = Vec::new();
+                for _ in 0..next(4) {
+                    let base = next(index.max(1));
+                    if base < index && !bases.contains(&base) {
+                        bases.push(base);
+                    }
+                }
+                let sequences = bases
+                    .iter()
+                    .map(|base| orders[*base].clone().map(VecDeque::from))
+                    .chain([Some(bases.iter().map(|base| class(*base)).collect())])
+                    .collect::<Option<Vec<_>>>();
+                let Some(sequences) = sequences else {
+                    orders.push(None);
+                    continue;
+                };
+                let expected = scanned(class(index), sequences.clone());
+                let mut work = Work::new(10_000);
+                let found = merge_sequences(class(index), sequences, &mut work).map(|order| {
+                    let OrderedClasses::Merged(classes) = order.classes else {
+                        panic!("a merged order");
+                    };
+                    classes
+                });
+                assert_eq!(found.is_some(), expected.is_some());
+                assert!(found == expected, "class {index}");
+                match expected {
+                    Some(_) => merged += 1,
+                    None => refused += 1,
+                }
+                orders.push(expected);
+            }
+        }
+        assert!(merged > 1_000 && refused > 100, "{merged} {refused}");
+    }
 }

@@ -15,14 +15,14 @@ flag_management:
 # they had almost none of to give: measured on one tree they reached three lines
 # the unit report did not, out of 78,757.
 #
-# The corpus job runs in `ci` as five matrix legs, and each leg uploads its own
-# `corpus` report beside the CLI job's `cli` report, so one run sends six builds.
+# The corpus job runs in `ci` as six matrix legs, and each leg uploads its own
+# `corpus` report beside the CLI job's `cli` report, so one run sends seven builds.
 # Waiting for two let Codecov compute a pull request's patch from two corpus legs
-# before the CLI report landed. Keep six uploads per run in step with the CLI and
+# before the CLI report landed. Keep seven uploads per run in step with the CLI and
 # corpus jobs.
 codecov:
   notify:
-    after_n_builds: 6
+    after_n_builds: 7
 
 coverage:
   precision: 2
@@ -43,7 +43,7 @@ coverage:
 comment:
   layout: "reach, diff, flags, files"
   require_changes: false
-  after_n_builds: 6
+  after_n_builds: 7
 
 github_checks:
   annotations: true

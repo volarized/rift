@@ -165,10 +165,11 @@ fn test_edge_configuration_preserves_declaration_only_package_analysis() {
             .expect("package input");
         PackageAnalyzer::analyze(input, 1).expect("package analysis")
     };
+    // Static resolution ends on the work budget these edge bounds leave it.
     let exact = analyze_bound(2);
-    assert!(exact.semantics.edges().is_complete());
+    assert!(!exact.semantics.edges().is_complete());
     let one_over = analyze_bound(1);
-    assert!(one_over.semantics.edges().is_complete());
+    assert!(!one_over.semantics.edges().is_complete());
     assert_eq!(one_over.semantics.edges().dropped_edges(), 0);
     assert_eq!(
         exact.publication().declarations,
@@ -439,4 +440,33 @@ fn test_notebook_document_bound_keeps_cells_and_counts_only_published_source() {
             .as_str(),
         "rift.analysis.package_retained_source_bytes_exceeded"
     );
+}
+
+// Issue #1065: a merged order holds every ancestor, so the orders of a chain end on their share.
+#[test]
+fn class_orders_past_their_share_keep_the_other_edges_and_report_it() {
+    let classes = (1..2_000).fold(String::new(), |mut text, link| {
+        use std::fmt::Write as _;
+        writeln!(text, "class C{link}(C{}, M): pass", link - 1).expect("text line");
+        text
+    });
+    let source = format!(
+        "class Zed:\n    def m(self): pass\ndef sentinel(z: Zed):\n    z.m()\nclass M: pass\n\
+         class C0: pass\n{classes}"
+    );
+    let sentinel = |source: &str| {
+        let analysis =
+            super::fixture::package_analysis(ShippedLanguage::Python, vec![("mod.py", source)]);
+        let edges = analysis.semantics.edges();
+        let called = edges.edges().any(|edge| {
+            edge.from().as_str().ends_with("/sentinel") && edge.to().as_str().ends_with("/Zed/m")
+        });
+        (called, edges.is_complete(), edges.dropped_edges())
+    };
+    assert_eq!(sentinel(&source), (true, false, 0));
+    let short = source
+        .lines()
+        .take(40)
+        .fold(String::new(), |text, line| text + line + "\n");
+    assert_eq!(sentinel(&short), (true, true, 0));
 }

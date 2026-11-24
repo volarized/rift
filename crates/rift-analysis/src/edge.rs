@@ -18,8 +18,8 @@
 //!
 //! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit and byte range.
 //!
-//! Building stops at [`EDGES_MAX`] edges; [`EdgeStore::is_complete`] and
-//! [`EdgeStore::dropped_edges`] report the truncation.
+//! Building stops at [`EDGES_MAX`] edges and [`EdgeStore::dropped_edges`] counts the rest. Static
+//! resolution ends on its work budgets. [`EdgeStore::is_complete`] reports both.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -308,6 +308,8 @@ pub struct EdgeStore {
     outgoing: BTreeMap<SymbolId, Vec<Edge>>,
     incoming: BTreeMap<SymbolId, Vec<Edge>>,
     dropped_edges: u64,
+    /// Whether static resolution ended on a work budget before it read every site.
+    resolution_ended: bool,
     edge_modules: BTreeMap<SourceUnitId, SymbolId>,
 }
 
@@ -525,6 +527,7 @@ impl EdgeStore {
     ) -> (Self, StaticResolution) {
         let (mut store, spans) = Self::build_with_spans(graph, modules, edges_max);
         let resolution = resolve();
+        store.resolution_ended = resolution.ended;
         store.add_static(
             &spans,
             &resolution.occurrences,
@@ -612,6 +615,7 @@ impl EdgeStore {
                 outgoing,
                 incoming,
                 dropped_edges,
+                resolution_ended: false,
                 edge_modules,
             },
             spans,
@@ -642,10 +646,10 @@ impl EdgeStore {
     }
 
     /// Whether every eligible reference became an edge. `false` once building stopped at
-    /// the configured edge cap.
+    /// the configured edge cap, or static resolution ended on a work budget.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
-        self.dropped_edges == 0
+        self.dropped_edges == 0 && !self.resolution_ended
     }
 
     /// Whether this store holds no edges at all. `outgoing` and `incoming` always gain an

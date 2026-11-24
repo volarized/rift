@@ -187,8 +187,10 @@ __rift_error_definition!(
     message = "selected artifact field {field} is invalid: {violation}",
     action = "replace or rebuild the invalid publication, then retry",
     fields = {
+        bound: optional(unsigned),
         cause: optional(cause),
         field: required(string),
+        observed: optional(unsigned),
         violation: required(string),
     },
 );
@@ -234,6 +236,18 @@ __rift_error_definition!(
     fields = {
         cause: optional(cause),
         path: optional(path),
+    },
+);
+
+__rift_error_definition!(
+    package_input_import_limit_exceeded,
+    slug = "rift.analysis.package_input_import_limit_exceeded",
+    message = "package import roots exceed their accepted limit",
+    action = "reduce package import roots below their accepted limit and retry",
+    fields = {
+        bound: required(unsigned),
+        field: required(string),
+        observed: required(unsigned),
     },
 );
 

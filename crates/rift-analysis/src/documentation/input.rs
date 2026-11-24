@@ -627,11 +627,15 @@ fn validate_license(source: &DocumentationSource) -> Result<(), RiftError> {
     let Some(license) = &source.license else {
         return Ok(());
     };
-    let valid_expression = license
-        .expression
-        .as_ref()
-        .is_none_or(|text| !text.is_empty() && text.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize);
-    if !valid_expression || license.files.len() > DOCUMENTATION_LICENSE_FILES_MAX as usize {
+    let expression = license.expression.as_deref();
+    if expression.is_some_and(|text| text.trim().is_empty()) {
+        return errors::analysis::documentation_format_invalid()
+            .field("license.expression")
+            .fail();
+    }
+    let within_bytes =
+        expression.is_none_or(|text| text.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize);
+    if !within_bytes || license.files.len() > DOCUMENTATION_LICENSE_FILES_MAX as usize {
         return errors::analysis::documentation_limit_exceeded()
             .field("license")
             .fail();
@@ -1023,6 +1027,35 @@ mod tests {
         assert!(DocumentationInput::new(record.clone(), "a").is_ok());
         record.license.as_mut().expect("license").files.push(file);
         assert_eq!(violation(record, "a"), DocumentationViolation::Identity);
+    }
+
+    #[test]
+    fn test_a_blank_license_expression_has_an_invalid_format() {
+        for expression in ["", " ", "\n"] {
+            let mut record = source("README.md", "a");
+            record.license = Some(DocumentationLicense {
+                expression: Some(expression.to_owned()),
+                files: Vec::new(),
+            });
+            let error = DocumentationInput::new(record.clone(), "a").expect_err("blank expression");
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "license.expression"),
+                "{error}"
+            );
+            assert_eq!(
+                violation(record, "a"),
+                DocumentationViolation::Format,
+                "{expression:?}"
+            );
+        }
+        let mut record = source("README.md", "a");
+        record.license = Some(DocumentationLicense {
+            expression: None,
+            files: Vec::new(),
+        });
+        assert!(DocumentationInput::new(record, "a").is_ok());
     }
 
     #[test]

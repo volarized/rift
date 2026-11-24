@@ -6,7 +6,10 @@ use crate::identity::SourceDigest;
 use crate::read::ProjectPath;
 
 /// Expanded compatibility tags retained for one selected artifact.
-pub const PACKAGE_ARTIFACT_TAGS_MAX: usize = 64;
+///
+/// A published wheel name compresses each interpreter, ABI, and platform it supports, and the
+/// tags are their product. [`PACKAGE_ARTIFACT_BYTES_MAX`] leaves 64 bytes for each tag.
+pub const PACKAGE_ARTIFACT_TAGS_MAX: usize = 1_024;
 /// Aggregate UTF-8 bytes retained for one selected artifact.
 pub const PACKAGE_ARTIFACT_BYTES_MAX: usize = 65_536;
 
@@ -14,7 +17,7 @@ pub const PACKAGE_ARTIFACT_BYTES_MAX: usize = 65_536;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackageArtifactViolation {
     /// An input or expanded tag set exceeds its bound.
-    Length,
+    Length { observed: usize, bound: usize },
     /// A compatibility tag has invalid components.
     Tag,
     /// The artifact filename is not one root-relative basename.
@@ -24,15 +27,27 @@ pub(crate) enum PackageArtifactViolation {
 impl From<PackageArtifactViolation> for RiftError {
     fn from(violation: PackageArtifactViolation) -> Self {
         let detail = match violation {
-            PackageArtifactViolation::Length => "Length",
+            PackageArtifactViolation::Length { .. } => "Length",
             PackageArtifactViolation::Tag => "Tag",
             PackageArtifactViolation::Path => "Path",
         };
-        errors::analysis::package_artifact_invalid()
+        let error = errors::analysis::package_artifact_invalid()
             .field("artifact")
-            .violation(detail)
-            .error()
+            .violation(detail);
+        match violation {
+            PackageArtifactViolation::Length { observed, bound } => {
+                error.observed(observed as u64).bound(bound as u64).error()
+            }
+            PackageArtifactViolation::Tag | PackageArtifactViolation::Path => error.error(),
+        }
     }
+}
+
+fn within(observed: usize, bound: usize) -> Result<(), PackageArtifactViolation> {
+    if observed <= bound {
+        return Ok(());
+    }
+    Err(PackageArtifactViolation::Length { observed, bound })
 }
 
 /// One expanded Python, ABI and platform compatibility tag.
@@ -70,17 +85,12 @@ impl WheelTag {
     /// # Errors
     /// Returns a violation for invalid components or an excessive byte count.
     pub fn new(python: &str, abi: &str, platform: &str) -> Result<Self, RiftError> {
-        if [python, abi, platform]
-            .iter()
-            .any(|value| value.len() > PACKAGE_ARTIFACT_BYTES_MAX)
-            || [python, abi, platform]
-                .iter()
-                .map(|value| lowercase_bytes(value))
-                .sum::<usize>()
-                > PACKAGE_ARTIFACT_BYTES_MAX
-        {
-            return Err(PackageArtifactViolation::Length.into());
+        let fields = [python, abi, platform];
+        for value in fields {
+            within(value.len(), PACKAGE_ARTIFACT_BYTES_MAX)?;
         }
+        let bytes = fields.iter().map(|value| lowercase_bytes(value)).sum();
+        within(bytes, PACKAGE_ARTIFACT_BYTES_MAX)?;
         if !python_identifier_is_valid(python)
             || !tag_component_is_valid(abi)
             || !tag_component_is_valid(platform)
@@ -96,48 +106,57 @@ impl WheelTag {
 
     /// Expands a compressed compatibility tag under count and byte bounds.
     ///
+    /// A Python part that names no interpreter, such as `7` in `py2.7`, adds no tag. At least
+    /// one part names one.
+    ///
     /// # Errors
     /// Returns a violation before expansion for malformed or excessive input.
     pub fn parse(value: &str) -> Result<Vec<Self>, RiftError> {
-        if value.len() > PACKAGE_ARTIFACT_BYTES_MAX {
-            return Err(PackageArtifactViolation::Length.into());
-        }
+        within(value.len(), PACKAGE_ARTIFACT_BYTES_MAX)?;
         let mut fields = value.split('-');
         let python = fields.next().ok_or(PackageArtifactViolation::Tag)?;
         let abi = fields.next().ok_or(PackageArtifactViolation::Tag)?;
         let platform = fields.next().ok_or(PackageArtifactViolation::Tag)?;
         if fields.next().is_some()
-            || !python.split('.').all(python_identifier_is_valid)
+            || !python.split('.').all(tag_component_is_valid)
+            || !python.split('.').any(python_identifier_is_valid)
             || !abi.split('.').all(tag_component_is_valid)
             || !platform.split('.').all(tag_component_is_valid)
         {
             return Err(PackageArtifactViolation::Tag.into());
         }
+        let interpreters = || {
+            python
+                .split('.')
+                .filter(|part| python_identifier_is_valid(part))
+        };
         let counts = [
-            python.split('.').count(),
+            interpreters().count(),
             abi.split('.').count(),
             platform.split('.').count(),
         ];
         let count = counts.iter().try_fold(1_usize, |count, next| {
             count
                 .checked_mul(*next)
-                .ok_or(PackageArtifactViolation::Length)
+                .ok_or(PackageArtifactViolation::Length {
+                    observed: usize::MAX,
+                    bound: PACKAGE_ARTIFACT_TAGS_MAX,
+                })
         })?;
-        if count > PACKAGE_ARTIFACT_TAGS_MAX {
-            return Err(PackageArtifactViolation::Length.into());
-        }
-        let bytes = [python, abi, platform]
+        within(count, PACKAGE_ARTIFACT_TAGS_MAX)?;
+        let field_bytes = [
+            interpreters().map(lowercase_bytes).sum::<usize>(),
+            abi.split('.').map(lowercase_bytes).sum(),
+            platform.split('.').map(lowercase_bytes).sum(),
+        ];
+        let bytes = field_bytes
             .iter()
             .zip(counts)
-            .map(|(field, field_count)| {
-                field.split('.').map(lowercase_bytes).sum::<usize>() * (count / field_count)
-            })
-            .sum::<usize>();
-        if bytes > PACKAGE_ARTIFACT_BYTES_MAX {
-            return Err(PackageArtifactViolation::Length.into());
-        }
+            .map(|(bytes, field_count)| bytes * (count / field_count))
+            .sum();
+        within(bytes, PACKAGE_ARTIFACT_BYTES_MAX)?;
         let mut tags = Vec::with_capacity(count);
-        for python in python.split('.') {
+        for python in interpreters() {
             for abi in abi.split('.') {
                 for platform in platform.split('.') {
                     tags.push(Self::new(python, abi, platform)?);
@@ -208,7 +227,7 @@ pub struct PackageArtifact {
     /// Complete digest of the selected archive bytes.
     content_digest: SourceDigest,
     /// Expanded tags accepted from the selected wheel's filename and metadata.
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = 1024))]
     tags: Vec<WheelTag>,
 }
 
@@ -238,15 +257,12 @@ impl PackageArtifact {
         content_digest: SourceDigest,
         tags: &[WheelTag],
     ) -> Result<Self, RiftError> {
-        if tags.len() > PACKAGE_ARTIFACT_TAGS_MAX
-            || filename
-                .len()
-                .saturating_add(content_digest.as_str().len())
-                .saturating_add(tags.iter().map(WheelTag::bytes).sum::<usize>())
-                > PACKAGE_ARTIFACT_BYTES_MAX
-        {
-            return Err(PackageArtifactViolation::Length.into());
-        }
+        within(tags.len(), PACKAGE_ARTIFACT_TAGS_MAX)?;
+        let bytes = filename
+            .len()
+            .saturating_add(content_digest.as_str().len())
+            .saturating_add(tags.iter().map(WheelTag::bytes).sum::<usize>());
+        within(bytes, PACKAGE_ARTIFACT_BYTES_MAX)?;
         if !crate::identity::source_unit_path_is_valid(filename) || filename.contains('/') {
             return Err(PackageArtifactViolation::Path.into());
         }
