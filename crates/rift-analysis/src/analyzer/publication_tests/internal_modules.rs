@@ -307,3 +307,64 @@ fn an_alias_of_an_entry_keeps_the_aliased_declaration_and_its_members_public() {
         );
     }
 }
+
+#[test]
+fn a_forward_another_value_can_replace_reaches_no_target() {
+    let user = "var i = require('./index');
+var { open } = require('./index');
+function use() { i.open(); open() }
+exports.use = use;
+";
+    for (forward, settled) in [
+        ("module.exports = require('./child');", true),
+        ("exports = module.exports = require('./child');", true),
+        ("var child = module.exports = require('./child');", true),
+        (
+            "module.exports = require('./child'); exports.other = 1;",
+            true,
+        ),
+        ("if (cond) module.exports = require('./child');", false),
+        ("cond && (module.exports = require('./child'));", false),
+        (
+            "module.exports = require('./child'); module.exports = other;",
+            false,
+        ),
+        (
+            "module.exports = other; module.exports = require('./child');",
+            false,
+        ),
+        (
+            "module.exports = require('./child'); if (cond) module.exports = other;",
+            false,
+        ),
+        (
+            "module.exports = require('./child'); function swap() { module.exports = other }",
+            false,
+        ),
+        ("module.exports = require(target);", false),
+        (
+            "const require = other; module.exports = require('./child');",
+            false,
+        ),
+        ("module.exports = require('../child');", false),
+        ("module.exports = require('./missing');", false),
+    ] {
+        let analysis = analyze(
+            MAIN,
+            &[
+                ("index.js", forward),
+                ("child.js", "exports.open = function open() {};\n"),
+                ("user.js", user),
+            ],
+        );
+        let reached = edges(&analysis)
+            .into_iter()
+            .filter(|(from, kind, to)| {
+                from[0] == "beacon/user.js"
+                    && to[0] == "beacon/child.js"
+                    && [EdgeKind::Calls, EdgeKind::Reads].contains(kind)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(!reached.is_empty(), settled, "{forward} {reached:?}");
+    }
+}

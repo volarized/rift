@@ -233,6 +233,31 @@ fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes()
 }
 
 #[test]
+fn test_direct_commonjs_writes_run_without_a_condition() {
+    let checked = |source| {
+        parsed(ShippedLanguage::JavaScript, source)
+            .facts()
+            .static_facts()
+            .expect("static facts")
+            .commonjs_direct_writes()
+            .len()
+    };
+    for (source, count) in [
+        ("module.exports = a;", 1),
+        ("var b = module.exports = a;", 1),
+        ("exports = module.exports = a;", 2),
+        ("module.exports = a; module.exports = b;", 2),
+        ("if (c) module.exports = a;", 0),
+        ("c && (module.exports = a);", 0),
+        ("function swap() { module.exports = a }", 0),
+        ("{ module.exports = a }", 0),
+        ("exports.a = a;", 0),
+    ] {
+        assert_eq!(checked(source), count, "{source}");
+    }
+}
+
+#[test]
 fn test_member_copy_checks_original_ranges_and_keeps_older_facts_unknown() {
     let source = "class Owner {
         handle = () => '';

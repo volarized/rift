@@ -341,6 +341,8 @@ pub struct StaticCommonJsExport {
 pub struct StaticFactsParts {
     /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
     pub javascript_module_syntax: bool,
+    /// Assignments to `module.exports` or `exports` that stand directly in the source file.
+    pub commonjs_direct_writes: Vec<ByteRange>,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
@@ -437,6 +439,12 @@ impl StaticFacts {
     #[must_use]
     pub fn has_javascript_module_syntax(&self) -> bool {
         self.0.javascript_module_syntax
+    }
+
+    /// Assignments to `module.exports` or `exports` in a statement of the source file itself.
+    #[must_use]
+    pub fn commonjs_direct_writes(&self) -> &[ByteRange] {
+        &self.0.commonjs_direct_writes
     }
 
     /// The direct default write, if the `CommonJS` wrapper remains closed.
@@ -726,6 +734,7 @@ impl StaticFacts {
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
             vector_capacity(&self.0.non_none_guards),
+            vector_capacity(&self.0.commonjs_direct_writes),
             vector_capacity(&self.0.closure_calls),
         ]
         .into_iter()
@@ -786,6 +795,7 @@ impl StaticFacts {
             self.loops().len(),
             self.expression_scopes().len(),
             self.non_none_guards().len(),
+            self.commonjs_direct_writes().len(),
             self.closure_calls().len(),
         ];
         if lengths
@@ -1005,6 +1015,7 @@ impl StaticFacts {
             && implementations
             && rust
             && flow
+            && self.0.commonjs_direct_writes.iter().all(|row| valid(*row))
             && self
                 .non_none_guards()
                 .iter()

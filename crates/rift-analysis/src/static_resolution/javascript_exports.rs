@@ -144,6 +144,10 @@ impl<'source> Exports<'_, 'source> {
             let (direct, stars) = self.export_candidates(file, name, mode, role, work)?;
             let Some(export) = direct else {
                 let default = matches!(name, ExportSlot::Default | ExportSlot::Named("default"));
+                // A forward another value can replace establishes no target.
+                if stars.iter().any(|star| !star.settled) {
+                    return None;
+                }
                 pending.extend(stars.into_iter().filter_map(|star| {
                     // Only `module.exports = require(..)` passes the module value on.
                     if default && !star.replaces_module {
@@ -426,6 +430,7 @@ impl<'source> Exports<'_, 'source> {
                 stars.push(ExportStar {
                     module: literal_contents(file.text(binding.source?)?)?,
                     replaces_module: written.starts_with("module.exports"),
+                    settled: file.forward_is_settled(binding, written),
                 });
                 continue;
             }
@@ -667,6 +672,8 @@ impl<'source> ExportBindings<'source> {
 struct ExportStar<'source> {
     module: &'source str,
     replaces_module: bool,
+    /// Whether no other write of the file can give the module another value.
+    settled: bool,
 }
 
 type ExportCandidates<'source> = (Option<Export<'source>>, Vec<ExportStar<'source>>);
@@ -1052,6 +1059,26 @@ impl<'source> File<'source> {
                             start < binding.range.start && self.top_level_default_export(start)
                         })
                     }))
+    }
+
+    /// Whether `module.exports = require(..)` always runs and is the only write of the
+    /// module value. An `export *` and a copy onto `exports` replace no value.
+    fn forward_is_settled(
+        &self,
+        binding: &rift_syntax::SyntaxExportBinding,
+        written: &str,
+    ) -> bool {
+        if !["module.exports", "exports"]
+            .iter()
+            .any(|left| written.starts_with(left))
+        {
+            return true;
+        }
+        self.facts.commonjs_direct_writes().contains(&binding.range)
+            && self
+                .export_writes
+                .get(&ExportSlot::Default)
+                .is_none_or(Option::is_some)
     }
 
     /// Whether a default export binding outside every declaration starts at `start`.

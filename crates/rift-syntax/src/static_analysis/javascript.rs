@@ -366,6 +366,7 @@ impl Kinds {
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
         self.record_module_syntax(visited, source, facts);
+        self.record_direct_write(visited, source, facts)?;
         self.record_reference(visited, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
@@ -541,6 +542,46 @@ impl Kinds {
             facts
                 .object_members
                 .push((byte_range(element)?, byte_range(object)?));
+        }
+        Ok(())
+    }
+
+    /// Records a write of the `CommonJS` module value in a statement of the source file itself,
+    /// with no condition and no function around it.
+    fn record_direct_write(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
+        if element.kind_id() != self.assignment[0]
+            || !element
+                .child_by_field_id(self.left)
+                .and_then(|left| text(left, source))
+                .is_some_and(|left| matches!(left, "module.exports" | "exports"))
+        {
+            return Ok(());
+        }
+        // The syntax walk has admitted every enclosing element's depth.
+        let mut parent = visited.parent();
+        while let Some(candidate) = parent {
+            let kind = candidate.syntax_element().kind();
+            if kind == "program" {
+                facts.commonjs_direct_writes.push(byte_range(element)?);
+                break;
+            }
+            if !matches!(
+                kind,
+                "assignment_expression"
+                    | "expression_statement"
+                    | "variable_declarator"
+                    | "variable_declaration"
+                    | "lexical_declaration"
+            ) {
+                break;
+            }
+            parent = candidate.parent();
         }
         Ok(())
     }
