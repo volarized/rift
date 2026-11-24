@@ -110,6 +110,140 @@ fn test_rust_impl_only_module_keeps_imported_calls_and_type_members() {
     );
 }
 
+/// The stored index of a crate whose `facade` module reexports a type and implements it.
+fn reexporting_module(facade: &str) -> Result<WorkspaceIndex, rift_error::RiftError> {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    for (path, text) in [
+        (
+            "Cargo.toml",
+            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n",
+        ),
+        ("src/lib.rs", "pub mod task; pub mod facade; pub mod outer;"),
+        ("src/task.rs", "pub struct Task { pub id: u8 }"),
+        (
+            "src/outer.rs",
+            "pub use crate::facade::Task; pub fn take(task: crate::facade::Task) -> u8 { task.start() }",
+        ),
+        ("src/facade.rs", facade),
+    ] {
+        std::fs::write(root.join(path), text).expect("source");
+    }
+    WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+}
+
+const REEXPORTING_MODULES: [&str; 6] = [
+    "pub use crate::task::Task;\nimpl Task { pub fn start(&self) -> u8 { self.id } }\n",
+    "impl Task { pub fn start(&self) -> u8 { self.id } }\npub use crate::task::Task;\n",
+    "pub use crate::task::{Task};\nimpl Task { pub fn start(&self) -> u8 { self.id } }\nimpl Clone for Task { fn clone(&self) -> Self { Task { id: 0 } } }\n",
+    "pub(crate) use crate::task::Task;\nimpl Task { pub fn start(&self) -> u8 { self.id } }\n",
+    "pub mod inner { pub struct Task; }\npub use crate::task::Task;\nimpl Task { pub fn start(&self) -> u8 { self.id } }\n",
+    "pub use crate::task::Task;\npub trait Run<T> { fn start(&self) -> u8; }\nimpl<T> Run<T> for Task { fn start(&self) -> u8 { self.id } }\n",
+];
+
+#[test]
+fn test_rust_reexporting_module_that_implements_the_type_is_indexed() {
+    for facade in REEXPORTING_MODULES {
+        let index = reexporting_module(facade).unwrap_or_else(|error| {
+            panic!("{facade}: {error:?}");
+        });
+        assert!(index.edges().is_complete(), "{facade}");
+        assert_eq!(index.edges().dropped_edges(), 0, "{facade}");
+        let view = index.symbol_view().expect("symbols");
+        let mut keys = std::collections::BTreeSet::new();
+        for record in view.normalized_graph().records() {
+            for key in record.contributions() {
+                assert!(
+                    keys.insert(key.reference().symbol().as_str().to_owned()),
+                    "{facade}: one provider symbol belongs to one record: {key:?}"
+                );
+            }
+        }
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::HasType
+                    && edge.from().as_str().ends_with("/fixture/outer/take")
+                    && edge.to().as_str().ends_with("/fixture/task/Task")),
+            "{facade}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_reexport_and_implementation_of_one_type_are_two_symbols() {
+    for facade in REEXPORTING_MODULES {
+        let index = reexporting_module(facade).unwrap_or_else(|error| {
+            panic!("{facade}: {error:?}");
+        });
+        let view = index.symbol_view().expect("symbols");
+        let sources = |identity: &str| {
+            view.normalized_graph()
+                .records()
+                .iter()
+                .filter(|record| {
+                    record
+                        .identity()
+                        .is_some_and(|id| id.as_str().ends_with(identity))
+                })
+                .flat_map(rift_core::SymbolRecord::contributions)
+                .map(|key| {
+                    let symbol = key.reference().symbol().as_str();
+                    symbol
+                        .strip_prefix("rift://symbol/rust/src/")
+                        .unwrap_or(symbol)
+                        .to_owned()
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let implementations = facade.matches("impl").count();
+        let ordinal = |position: usize| match position {
+            0 => "facade.rs/Task".to_owned(),
+            later => format!("facade.rs/Task#{later}"),
+        };
+        assert_eq!(
+            sources("/fixture/task/Task"),
+            (0..implementations)
+                .map(ordinal)
+                .chain(["task.rs/Task".to_owned()])
+                .collect(),
+            "{facade}: every implementation is a facet of the type"
+        );
+        assert_eq!(
+            sources("/fixture/facade/Task"),
+            [ordinal(implementations)].into(),
+            "{facade}: the reexport is a symbol of its own"
+        );
+        let edge = |kind: EdgeKind, from: &str, to: &str| {
+            index.edges().edges().any(|edge| {
+                edge.kind() == kind
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with(to)
+            })
+        };
+        for (kind, from, to) in [
+            (EdgeKind::Aliases, "/facade/Task", "/task/Task"),
+            (EdgeKind::Contains, "/task/Task", "/task/Task/start"),
+            (EdgeKind::Reads, "/task/Task/start", "/task/Task/id"),
+            (EdgeKind::Calls, "/outer/take", "/task/Task/start"),
+        ] {
+            assert!(edge(kind, from, to), "{facade}: {kind:?} {from} -> {to}");
+        }
+        assert!(
+            !edge(EdgeKind::HasType, "/facade/Task", "/task/Task")
+                && !edge(EdgeKind::Contains, "/fixture/facade", "/facade/Task"),
+            "{facade}: the reexport declares nothing"
+        );
+    }
+}
+
 #[test]
 fn test_rust_binding_does_not_shadow_its_own_initializer() {
     let directory = tempfile::tempdir().expect("workspace");

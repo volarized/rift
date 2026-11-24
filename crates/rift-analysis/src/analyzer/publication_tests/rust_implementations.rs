@@ -101,3 +101,67 @@ fn implementations_are_facets_of_the_imported_type() {
         assert!(edge(kind, from, to), "{kind:?} {from} -> {to}");
     }
 }
+
+/// A module that reexports a type and implements it publishes the alias beside the type's
+/// facets, and every declaration once.
+#[test]
+fn a_reexporting_module_that_implements_the_type_publishes_both_symbols() {
+    for facade in [
+        "pub use crate::task::Task;\nimpl Task { pub fn start(&self) -> u64 { self.major } }\n",
+        "impl Task { pub fn start(&self) -> u64 { self.major } }\npub use crate::task::Task;\n",
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::Rust,
+            vec![
+                ("src/lib.rs", "pub mod facade;\npub mod task;\n"),
+                ("src/task.rs", "pub struct Task { pub major: u64 }\n"),
+                ("src/facade.rs", facade),
+            ],
+            None,
+            Some(("Cargo.toml", "[package]\nname='beacon'\nversion='1.0.0'\n")),
+        )
+        .unwrap_or_else(|error| panic!("{facade}: {error:?}"));
+        let publication = analysis.publication();
+        let declared = publication
+            .declarations
+            .iter()
+            .map(|declaration| {
+                let unit = declaration.unit.0.rsplit('/').next().expect("file");
+                let symbol = declaration.symbol.as_str();
+                (
+                    symbol.strip_prefix(ROOT).unwrap_or(symbol).to_owned(),
+                    unit.to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (symbol, unit) in [
+            ("/task/Task", "task.rs"),
+            ("/task/Task", "facade.rs"),
+            ("/task/Task/start", "facade.rs"),
+            ("/facade/Task", "facade.rs"),
+        ] {
+            assert_eq!(
+                declared
+                    .iter()
+                    .filter(|(found, file)| found == symbol && file == unit)
+                    .count(),
+                1,
+                "{facade}: {symbol} in {unit}: {declared:?}"
+            );
+        }
+        for (kind, from, to) in [
+            (EdgeKind::Aliases, "facade/Task", "task/Task"),
+            (EdgeKind::Contains, "task/Task", "task/Task/start"),
+            (EdgeKind::Reads, "task/Task/start", "task/Task/major"),
+        ] {
+            assert!(
+                publication.edges.iter().any(|edge| {
+                    edge.kinds.contains(&kind)
+                        && edge.from.as_str() == format!("{ROOT}/{from}")
+                        && edge.to.as_str() == format!("{ROOT}/{to}")
+                }),
+                "{facade}: {kind:?} {from} -> {to}"
+            );
+        }
+    }
+}
