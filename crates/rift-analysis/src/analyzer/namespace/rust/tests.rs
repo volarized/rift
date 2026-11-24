@@ -452,11 +452,51 @@ fn competing_library_roots_stay_unresolved() {
     );
 }
 
+// Issue #1049: `.` names the folder it stands in, as Cargo reads a target path.
+#[test]
+fn current_folder_segments_keep_the_target_path() {
+    for path in ["./src/lib.rs", "src/./lib.rs", "././src/lib.rs"] {
+        let manifest = format!("{MANIFEST}[lib]\npath='{path}'\n");
+        let found = anchors(
+            &[("Cargo.toml", &manifest)],
+            "src/lib.rs",
+            "pub struct Runner;",
+        );
+        assert_eq!(
+            found["Runner"].as_str(),
+            "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Runner",
+            "{path}"
+        );
+        let found = anchors(
+            &[("nested/Cargo.toml", &manifest)],
+            "nested/src/lib.rs",
+            "pub struct Runner;",
+        );
+        assert!(found.contains_key("Runner"), "{path}");
+        let found = project_anchors(
+            &rift_protocol::identity::SymbolOwner::Local,
+            &[("Cargo.toml", &manifest)],
+            &[("src/lib.rs", "pub struct Root;")],
+        );
+        assert_eq!(
+            found["src/lib.rs"]["Root"].as_str(),
+            "rift://symbol/local/rust/crate_root/Root",
+            "{path}"
+        );
+    }
+}
+
 #[test]
 fn unsafe_library_paths_and_unsupported_crate_names_stay_unresolved() {
     for field in [
         "path='../lib.rs'",
+        "path='./../lib.rs'",
+        "path='src/./../src/lib.rs'",
         "path='/lib.rs'",
+        "path='/./src/lib.rs'",
+        "path='.//src/lib.rs'",
+        "path='.'",
+        "path='./'",
         "path=''",
         "name='wrong.name'",
         "name='4-wrong'",
