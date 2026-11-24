@@ -476,8 +476,8 @@ expansion_ratio = 200
 - `member_size` caps one member's bytes, 1b to `expanded_size`, at most 64gb
 - `extension_size` caps one GNU or PAX extended header, 1b to 64mb, checked before allocating
   its contents; that header must also fit `member_size`
-- `members` caps all archive members, including directories, links, and extended headers,
-  1 to 5000000
+- `members` caps archive members, including directories and links, and separately the GNU and PAX
+  extended headers, which are no members, 1 to 5000000
 - `expansion_ratio` caps expanded bytes per compressed byte, 1 to 4294967295; `expanded_size`
   still bounds the result
 

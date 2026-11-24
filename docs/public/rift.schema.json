@@ -50,7 +50,7 @@
         },
         "members": {
           "default": 100000,
-          "description": "Most archive members accepted, including directories, links, and extended headers.",
+          "description": "Most archive members accepted, including directories and links, and separately most\nGNU and PAX extended headers, which are no members.",
           "format": "uint32",
           "maximum": 5000000,
           "minimum": 1,

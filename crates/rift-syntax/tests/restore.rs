@@ -2817,3 +2817,42 @@ fn checked_variance_state_restores_equal_to_a_fresh_parse() {
     assert!(!restored.declaration_syntax_complete());
     assert_eq!(&restored, fresh.facts());
 }
+
+// Issue #1052.
+#[test]
+fn names_no_record_retains_are_counted_and_left_out() {
+    for control in ['\0', '\u{1}', '\u{000b}', '\u{007f}', '\u{0085}'] {
+        for (shipped, members) in [
+            (ShippedLanguage::JavaScript, 1),
+            (ShippedLanguage::TypeScript, 1),
+        ] {
+            let text = format!("export const o = {{ '{control}a': 1, kept: 2 }};\n");
+            let document = parsed(shipped, &text);
+            let facts = document.facts();
+            assert_eq!(facts.left_out_declaration_count(), members, "{control:?}");
+            assert!(facts.left_out_symbols().is_empty(), "{control:?}");
+            let names = facts
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["o", "o.kept"], "{control:?}");
+            let restored = SyntaxFacts::from_parts(&text, SyntaxLimits::default(), parts(facts))
+                .expect("facts their own provider produced");
+            assert_eq!(&restored, facts);
+        }
+        let text = format!("export const o = {{ '{control}': {{ inner() {{}} }}, kept: 2 }};\n");
+        let document = parsed(ShippedLanguage::JavaScript, &text);
+        let facts = document.facts();
+        assert_eq!(facts.left_out_declaration_count(), 2, "{control:?}");
+        assert!(facts.left_out_symbols().is_empty(), "{control:?}");
+        assert!(
+            SyntaxFacts::from_parts(&text, SyntaxLimits::default(), parts(facts)).is_ok(),
+            "{control:?}"
+        );
+    }
+    let text = "export const o = { '\ta': 1, kept: 2 };\n";
+    let document = parsed(ShippedLanguage::JavaScript, text);
+    assert_eq!(document.facts().left_out_declaration_count(), 1);
+    assert_eq!(document.facts().left_out_symbols().len(), 1);
+}
