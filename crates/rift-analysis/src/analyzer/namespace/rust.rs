@@ -1046,6 +1046,20 @@ impl Modules<'_, '_> {
         )
     }
 
+    /// The admission of a module item: its own attributes and, for an inline module, the
+    /// inner attributes of its body.
+    fn module(
+        &self,
+        file: &super::SelectedFile<'_>,
+        symbol: &rift_syntax::SyntaxSymbol,
+    ) -> Option<bool> {
+        let item = self.declared(file, symbol.item_range);
+        match symbol.body_range {
+            Some(body) => and(item, self.declared(file, body)),
+            None => item,
+        }
+    }
+
     /// The admission of a declaration itself, whatever the conditions of its contents.
     fn declared(
         &self,

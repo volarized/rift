@@ -3823,12 +3823,32 @@ fn implementations_follow_imports_past_values_modules_and_leading_lines() {
             ],
             "src/user.rs",
         ),
+    ];
+    assert_task_owner(&cases);
+}
+
+#[test]
+fn implementations_follow_the_active_condition() {
+    let cases = [
         // An inactive module leaves its name to the import of the active condition.
         (
             vec![
                 (
                     "src/lib.rs",
                     "#[cfg(windows)] pub mod imp { pub struct Task; } #[cfg(unix)] use crate as imp; pub struct Task; pub mod user;",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::imp::Task; impl Task { fn a(&self) {} }",
+                ),
+            ],
+            "src/user.rs",
+        ),
+        (
+            vec![
+                (
+                    "src/lib.rs",
+                    "pub mod imp { #![cfg(windows)] pub struct Task; } use crate as imp; pub struct Task; pub mod user;",
                 ),
                 (
                     "src/user.rs",
@@ -3866,11 +3886,16 @@ fn implementations_follow_imports_past_values_modules_and_leading_lines() {
             "src/user.rs",
         ),
     ];
+    assert_task_owner(&cases);
+}
+
+/// Each case's implementation of `Task` in the named file belongs to the library's `Task`.
+fn assert_task_owner(cases: &[(Vec<(&str, &str)>, &str)]) {
     for (files, path) in cases {
-        let found = placed(&files);
+        let found = placed(files);
         assert_eq!(
             found
-                .get(&(path.to_owned(), "Task::a".to_owned()))
+                .get(&((*path).to_owned(), "Task::a".to_owned()))
                 .map(String::as_str),
             Some("Task/a"),
             "{files:?}: {found:?}"
@@ -3893,6 +3918,14 @@ fn implementations_refuse_competing_names_and_blocks() {
         ),
         (
             "#[cfg(custom)] pub mod imp { pub struct Task; } use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        (
+            "pub mod imp { #![cfg(custom)] pub struct Task; } #[cfg(not(custom))] use real as imp; pub mod real { pub struct Task; } pub mod user;",
+            "impl crate::imp::Task { fn a(&self) {} }",
+        ),
+        (
+            "pub mod imp { #![cfg(custom)] pub struct Task; } use real as imp; pub mod real { pub struct Task; } pub mod user;",
             "impl crate::imp::Task { fn a(&self) {} }",
         ),
         // A glob can supply a name whose declaration has an unknown condition.

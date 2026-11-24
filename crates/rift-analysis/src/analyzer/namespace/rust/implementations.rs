@@ -283,7 +283,7 @@ impl Types {
                 if let Some(body) = symbol.body_range {
                     scopes.insert(body, path.clone());
                 }
-                self.declare_module(path, modules.declared(file, symbol.item_range));
+                self.declare_module(path, modules.module(file, symbol));
                 continue;
             }
             if symbol.kind == "impl_item" || !symbol.kinds.contains(&SymbolKind::Type) {
