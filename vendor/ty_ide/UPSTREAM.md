@@ -1,6 +1,7 @@
 This directory contains the `ty_ide` crate of https://github.com/astral-sh/ruff at commit
 `fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1`. The git tree of `crates/ty_ide/src` at that commit is
-`ee28ef307e80dcc93595d9bc0fc9cd18eb42f90a`. The license comes from the same revision.
+`ee28ef307e80dcc93595d9bc0fc9cd18eb42f90a`, the `snapshots` folders included. The license comes from
+the same revision.
 
 Every file under `src` keeps its upstream bytes; the `snapshots` folders of the crate's own tests
 are left out. The crate is here only because it depends on `ty_python_semantic`, which carries one

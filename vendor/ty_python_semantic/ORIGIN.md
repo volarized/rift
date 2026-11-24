@@ -37,14 +37,22 @@ with another one running longer is reduced too, and loses structure it had upstr
 `A0: TypeAlias = Union["A0", "A2"]`, `A1 = Tuple["A2", Optional[A0]]`, `A2 = Dict[str, "A1"]`,
 upstream answers `A2 = dict[str, tuple[A2, Divergent | None]]` and this crate `dict[str, Divergent]`.
 
+The answer depends on which request reaches the aliases first. Asked through the alias module
+first, the aliases converge as upstream's recursive types: a type definition request on
+`JsonValue`, or on a value of that type, answers no target. Asked through a function that returns
+the alias first, the cycle is cut, and the same request answers `str`, `dict`, and `tuple`, and a
+value indexed out of the dictionary answers the `Divergent` marker. Definitions, references, and
+hierarchies are the same in both orders; of 87 answers over a two-file tree, 16 type definition
+answers differ. Aliases that converge without the patch answer the same in both orders.
+
 The patch ends this family only. An alias that reaches itself through `Type[...]`, such as
 `A = List[Type["A"]]`, grows in a definition query the patch does not reach, and still does not
 converge (volarized/rift#1079).
 
 ## What is left out
 
-`tests`, `resources/mdtest`, `resources/corpus`, `resources/primer`, `mdtest.py`, `mdtest.py.lock`,
-and `README.md`: the library target reads none of them. `resources/lint_docs` stays, since the
+`tests`, `resources/mdtest`, `resources/corpus`, `resources/primer`, `resources/README.md`,
+`mdtest.py`, `mdtest.py.lock`, and `README.md`: the library target reads none of them. `resources/lint_docs` stays, since the
 lint declarations include those files as documentation.
 
 The manifest is the upstream one with every `workspace = true` replaced by the value the ruff
