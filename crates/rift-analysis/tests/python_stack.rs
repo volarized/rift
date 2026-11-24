@@ -222,6 +222,62 @@ fn a_chain_of_reexports_ends() {
     );
 }
 
+// Issue #1066.
+#[test]
+fn a_chain_of_module_imports_names_its_first_module() {
+    const MODULES: usize = 2_000;
+    let names = (0..MODULES)
+        .map(|link| format!("chain/m{link}"))
+        .collect::<Vec<_>>();
+    let mut modules = names
+        .iter()
+        .enumerate()
+        .map(|(link, name)| match link {
+            0 => (name.as_str(), format!("{CLASS}a = C\n")),
+            link => (
+                name.as_str(),
+                format!("from chain.m{} import a\n", link - 1),
+            ),
+        })
+        .collect::<Vec<_>>();
+    modules.push(("chain/__init__", String::new()));
+    let last = MODULES - 1;
+    modules.push((
+        "chain/use",
+        format!("from chain.m{last} import a\na().m()\n"),
+    ));
+    let found = edges(&modules, 512);
+    let called = "chain/use -> chain/m0/C/m".to_owned();
+    assert!(found.contains(&called), "{} edges", found.len());
+    let imported = format!("chain/m{last} -> chain/m0/a");
+    assert!(found.contains(&imported), "{} edges", found.len());
+}
+
+#[test]
+fn module_imports_that_end_in_a_cycle_name_nothing() {
+    let found = edges(
+        &[
+            ("chain/__init__", String::new()),
+            ("chain/a", "from chain.b import x, y\nx.m()\n".to_owned()),
+            (
+                "chain/b",
+                "from chain.c import x\nfrom chain.c import z as y\n".to_owned(),
+            ),
+            ("chain/c", format!("from chain.b import x\n{CLASS}z = C\n")),
+            (
+                "chain/d",
+                "from chain.a import x, y\nx.m()\ny().m()\n".to_owned(),
+            ),
+        ],
+        512,
+    );
+    assert!(
+        found.contains(&"chain/d -> chain/c/C/m".to_owned()),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|edge| edge.ends_with("/x")), "{found:?}");
+}
+
 // Issue #1065.
 #[test]
 fn a_long_base_class_chain_keeps_the_edges_of_its_file() {

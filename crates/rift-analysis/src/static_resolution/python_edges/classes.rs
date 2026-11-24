@@ -273,7 +273,7 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn python_files(&self) -> impl Iterator<Item = &File<'source>> {
+    pub(super) fn python_files(&self) -> impl Iterator<Item = &File<'source>> {
         self.files
             .values()
             .filter(|file| file.document.facts.language().name == "python")
