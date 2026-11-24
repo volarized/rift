@@ -44,7 +44,52 @@ pub(super) fn type_definitions(
 ) -> Result<Value, AnswerRefusal> {
     let (file, offset) = document_position(database, exchange, params)?;
     let targets = ty_ide::goto_type_definition(database, database.program_file(file), offset);
-    navigation_locations(database, exchange, targets)
+    let Value::Array(mut locations) = navigation_locations(database, exchange, targets)? else {
+        return Ok(Value::Array(Vec::new()));
+    };
+    locations.retain(|location| !names_divergent_marker(database, location));
+    Ok(Value::Array(locations))
+}
+
+/// The stub ty declares its own dynamic markers in.
+const MARKER_STUB_URI: &str = "vendored://stdlib/ty_extensions/_internal.pyi";
+/// The name of the marker ty puts where type inference did not converge.
+const DIVERGENT_MARKER: &str = "Divergent";
+
+/// Whether `location` is the declaration of ty's `Divergent` marker.
+///
+/// The marker stands for a part of a type that inference gave up on, such as the recursive
+/// positions of an alias cycle the vendored `ty_python_semantic` cuts. It is no type of the
+/// program, so a type definition answer leaves it out instead of naming it.
+fn names_divergent_marker(database: &ProjectDatabase, location: &Value) -> bool {
+    if location["uri"] != MARKER_STUB_URI {
+        return false;
+    }
+    let Ok(file) =
+        ruff_db::files::vendored_path_to_file(database, "stdlib/ty_extensions/_internal.pyi")
+    else {
+        return false;
+    };
+    let text = source_text(database, file);
+    let start = &location["range"]["start"];
+    let (Some(line), Some(character)) = (
+        start["line"]
+            .as_u64()
+            .and_then(|line| usize::try_from(line).ok()),
+        start["character"]
+            .as_u64()
+            .and_then(|character| usize::try_from(character).ok()),
+    ) else {
+        return false;
+    };
+    text.as_str()
+        .lines()
+        .nth(line)
+        .and_then(|content| content.get(character..))
+        .is_some_and(|rest| {
+            rest.strip_prefix(DIVERGENT_MARKER)
+                .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        })
 }
 
 pub(super) fn implementations(
@@ -235,6 +280,60 @@ mod tests {
             json!({"line": 6, "character": 4}),
             "{answer}"
         );
+    }
+
+    /// The alias module of [`RECURSIVE_ALIASES`] with a function that returns the other alias.
+    const ORDERED_ALIASES: &str = "from typing import Dict, Tuple, Union\n\nJsonValue = Union[str, \"JsonDict\", Tuple[\"JsonValue\"]]\nJsonDict = Dict[str, JsonValue]\n\n\ndef as_json() -> JsonDict:\n    return {}\n\n\ndef element() -> JsonValue:\n    return \"\"\n";
+    const ORDERED_ALIASES_CALLER: &str = "from a import as_json, element\n\nvalue = as_json()\nitem = value[\"k\"]\nleaf = element()\n";
+
+    /// The type targets of one position of `b.py` in a tree of [`ORDERED_ALIASES`], asked after
+    /// the type of `first` on a new database.
+    fn type_targets_after(first: (&str, u64, u64), asked: (u64, u64)) -> Vec<String> {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        std::fs::write(root.join("a.py"), ORDERED_ALIASES).expect("aliases");
+        std::fs::write(root.join("b.py"), ORDERED_ALIASES_CALLER).expect("caller");
+        let at = |file: &str, line: u64, character: u64| {
+            json!({
+                "textDocument": {"uri": super::super::path_to_uri(&root.join(file)).expect("URI")},
+                "position": {"line": line, "character": character},
+            })
+        };
+        super::super::with_database(root, |database, canonical_root| {
+            let exchange = Exchange {
+                spelled_root: root,
+                canonical_root,
+                sent_text: None,
+            };
+            type_definitions(database, &exchange, &at(first.0, first.1, first.2))?;
+            type_definitions(database, &exchange, &at("b.py", asked.0, asked.1))
+        })
+        .expect("type definition")
+        .as_array()
+        .expect("locations")
+        .iter()
+        .map(|location| location["uri"].as_str().expect("a URI").to_owned())
+        .collect()
+    }
+
+    /// The vendored ty cuts the cycle of these aliases only when the type of a function that
+    /// returns one is asked before the type of an alias itself
+    /// (`vendor/ty_python_semantic/ORIGIN.md`), so a type definition depends on the first
+    /// type request. This states today's answers: after the alias's own type, a value of the
+    /// alias has no type target; after the function's, it has the three classes of the cut
+    /// union. A value the cut leaves as ty's `Divergent` marker names no type in either order.
+    #[test]
+    fn recursive_alias_types_depend_on_the_first_request_and_never_name_the_marker() {
+        const ALIAS_FIRST: (&str, u64, u64) = ("a.py", 2, 0);
+        const FUNCTION_FIRST: (&str, u64, u64) = ("b.py", 2, 8);
+        const LEAF: (u64, u64) = (4, 0);
+        const ITEM: (u64, u64) = (3, 0);
+        const BUILTINS: &str = "vendored://stdlib/builtins.pyi";
+
+        assert_eq!(type_targets_after(ALIAS_FIRST, LEAF), [""; 0]);
+        assert_eq!(type_targets_after(FUNCTION_FIRST, LEAF), [BUILTINS; 3]);
+        assert_eq!(type_targets_after(ALIAS_FIRST, ITEM), [""; 0]);
+        assert_eq!(type_targets_after(FUNCTION_FIRST, ITEM), [""; 0]);
     }
 
     /// A request ty does not end cannot be canceled from inside the process, so each
