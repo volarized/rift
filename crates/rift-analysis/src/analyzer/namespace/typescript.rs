@@ -38,6 +38,22 @@ pub(super) fn prepare(
             prepared.unresolved_exports |= unresolved;
             (language, modules)
         });
+        // The file an admitted observation names holds its module before any file the
+        // manifest alone names, so no two files take one identity.
+        let observed = observations::observed_files(input, &files, metadata, selected);
+        let entries = entries.map(|(language, modules)| {
+            let kept = modules
+                .into_iter()
+                .filter(|(path, module)| {
+                    module.as_deref().is_none_or(|module| {
+                        observed
+                            .get(&(language, module))
+                            .is_none_or(|files| files.contains(path))
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+            (language, kept)
+        });
         let inventory = selected
             .iter()
             .map(|file| (file.path, file.syntax.language().name.as_str()))

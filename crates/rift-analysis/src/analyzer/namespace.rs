@@ -141,7 +141,8 @@ pub fn build_paths(
     files: &[crate::PackageSource<'_>],
     syntax: rift_syntax::SyntaxLimits,
 ) -> Option<Vec<rift_protocol::read::ProjectPath>> {
-    typescript::build_paths(metadata).or_else(|| python::build_paths(metadata, files, syntax))
+    typescript::build_paths(metadata, syntax.source_bytes_max())
+        .or_else(|| python::build_paths(metadata, files, syntax))
 }
 
 pub(crate) fn rust_configuration_is_valid(flags: &[&str]) -> bool {

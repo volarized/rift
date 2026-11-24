@@ -3634,3 +3634,61 @@ fn test_npm_entries_follow_extensions_folders_and_index_files() {
         );
     }
 }
+
+/// A file the index leaves out is no missing file: the written entry stays the entry, and the
+/// package's own index takes no identity from it.
+#[test]
+fn test_npm_entries_outside_the_index_leave_the_package_index_its_own_path() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let write = |path: &str, text: &str| {
+        let path = directory.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("folder")).expect("folder");
+        std::fs::write(path, text).expect("file");
+    };
+    std::fs::create_dir(directory.path().join(".git")).expect("repository");
+    write(".gitignore", "dist/\n");
+    write("index.js", "exports.load = function () {};\n");
+    write("dist/a.js", "exports.load = function () {};\n");
+    let large = format!("exports.load = function () {{}};\n//{}\n", "x".repeat(4096));
+    write("big.js", &large);
+    for (main, limited) in [("dist/a.js", false), ("./dist/a", false), ("./big", true)] {
+        write(
+            "package.json",
+            &format!(r#"{{"name":"beacon","version":"1.0.0","main":"{main}"}}"#),
+        );
+        let mut limits = WorkspaceIndexLimits::default();
+        if limited {
+            let syntax = limits.syntax();
+            limits = limits.with_syntax(
+                rift_syntax::SyntaxLimits::new(
+                    2048,
+                    syntax.syntax_elements_max(),
+                    syntax.syntax_depth_max(),
+                )
+                .expect("syntax limits"),
+            );
+        }
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("index");
+        let view = index.symbol_view().expect("view");
+        let identities = view
+            .normalized_graph()
+            .records()
+            .iter()
+            .filter_map(|record| record.identity())
+            .map(|identity| identity.as_str().to_owned())
+            .filter(|identity| identity.ends_with("/load"))
+            .collect::<Vec<_>>();
+        let expected = ["big.js", "index.js"]
+            .into_iter()
+            .filter(|path| !limited || *path == "index.js")
+            .map(|path| format!("rift://symbol/local/javascript/.%2F{path}/load"))
+            .collect::<Vec<_>>();
+        assert_eq!(identities, expected, "{main}");
+    }
+}

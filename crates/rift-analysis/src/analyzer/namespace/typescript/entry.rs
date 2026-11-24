@@ -101,8 +101,9 @@ impl<'input> PackageFiles<'input> {
         Entry::Absent
     }
 
-    /// The entry `main` names for Node. `module` is no Node field: it names the entry only
-    /// where Node's resolution establishes none.
+    /// The entry `main` names for Node. `module` is no Node field: without a written `main` it
+    /// names the entry when Node's index is established missing, or when its state is not
+    /// captured. The captured `module` file is then the one entry the manifest spells.
     pub(super) fn runtime(&self, main: Option<&str>, module: Option<&str>) -> Entry {
         let entry = match runtime_candidates(main) {
             Some(candidates) => self.first(candidates),
@@ -219,8 +220,9 @@ fn normalized(target: &str) -> Option<String> {
 /// observe. `exports` names its files exactly and requests nothing.
 pub(in crate::analyzer) fn build_paths(
     manifest: PackageSource<'_>,
+    source_bytes_max: usize,
 ) -> Option<Vec<ObservationPath>> {
-    if manifest.path().as_str() != "package.json" {
+    if manifest.path().as_str() != "package.json" || manifest.text().len() > source_bytes_max {
         return None;
     }
     let metadata: PackageMetadata = serde_json::from_str(manifest.text()).ok()?;

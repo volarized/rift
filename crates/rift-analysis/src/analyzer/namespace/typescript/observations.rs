@@ -88,6 +88,52 @@ pub(super) fn prepare(
     }
 }
 
+/// The files admitted resolver observations give each module, by language.
+pub(super) fn observed_files<'input>(
+    input: &NamespaceInput<'input>,
+    files: &PackageFiles<'_>,
+    metadata: &PackageMetadata,
+    selected: &[SelectedFile<'_>],
+) -> BTreeMap<(&'static str, &'input str), BTreeSet<&'input ProjectPath>> {
+    let mut observed = BTreeMap::<_, BTreeSet<_>>::new();
+    for observation in input.modules() {
+        let Some(implementation) = selected_file(input, selected, observation.implementation())
+            .filter(|file| file.syntax.language().name == "javascript")
+        else {
+            continue;
+        };
+        let module = observation.module();
+        let joined = observation
+            .declarations()
+            .iter()
+            .filter(|source| {
+                selected_file(input, selected, **source).is_some_and(|file| {
+                    file.syntax.language().name == "typescript"
+                        && package_observation(files, metadata, observation, file)
+                })
+            })
+            .map(|source| source.path())
+            .collect::<BTreeSet<_>>();
+        let admitted = if observation.declarations().is_empty() {
+            commonjs::admits(files, metadata, observation, implementation)
+        } else {
+            !joined.is_empty()
+        };
+        if admitted {
+            observed
+                .entry(("javascript", module))
+                .or_default()
+                .insert(observation.implementation().path());
+            observed
+                .entry(("typescript", module))
+                .or_default()
+                .extend(joined);
+        }
+    }
+    observed.retain(|_, files| !files.is_empty());
+    observed
+}
+
 fn selected_file<'selected, 'source>(
     input: &NamespaceInput<'_>,
     selected: &'selected [SelectedFile<'source>],
