@@ -1066,7 +1066,7 @@ async fn both_proxies_write_the_same_text_and_continue_retained_pages() -> TestR
                 if request["query"]
                     .as_str()
                     .is_some_and(|query| query.contains(":calls") || query.contains(":references"))
-                    && message.contains("the embedded ty database cache is poisoned")
+                    && message.contains("the embedded ty engine panicked while it answered")
                     && message.contains("rift.lsp.engine_refused_terminal")
                 {
                     // The CLI reads persisted records directly; the drain may still hold
@@ -1091,7 +1091,7 @@ async fn both_proxies_write_the_same_text_and_continue_retained_pages() -> TestR
                     rift_tracing::warn!(
                         expected_failure = "https://github.com/volarized/rift/issues/583",
                         %error,
-                        "XFAIL: the upstream OpenTelemetry span panic poisoned the embedded ty database"
+                        "XFAIL: the upstream OpenTelemetry span panic repeated past the retry table"
                     );
                     eprintln!("XFAIL https://github.com/volarized/rift/issues/583: {error}");
                     continue 'cases;
