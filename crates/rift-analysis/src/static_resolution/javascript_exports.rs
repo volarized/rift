@@ -946,21 +946,22 @@ fn folder_file<'index, 'source>(
     let extension = std::path::Path::new(&path)
         .extension()
         .and_then(std::ffi::OsStr::to_str);
-    // A data or native file is no source of the analysis, and Node loads it when it exists.
-    if matches!(extension, Some("json" | "node" | "wasm")) {
-        return Candidate::Open;
+    match extension {
+        // A data or native file is no source of the analysis, and Node loads it when it exists.
+        Some("json" | "node" | "wasm") => return Candidate::Open,
+        // Node reads no TypeScript source for a file the package does not ship.
+        Some("js" | "cjs" | "mjs") => {}
+        _ => {
+            if let found @ Candidate::File(_) = one_file(files, &path, &[".js"]) {
+                return found;
+            }
+        }
     }
-    // Node adds `.js`; a written `.js` can be the output of a TypeScript source.
-    let candidate = match path.strip_suffix(".js") {
-        Some(stem) => one_file(files, stem, SOURCES),
-        None => one_file(files, &path, &[".js"]),
-    };
-    match candidate {
-        Candidate::Missing if manifest.data => Candidate::Open,
-        Candidate::Missing => match index(&path) {
-            Candidate::Missing => index(directory),
-            found => found,
-        },
+    match index(&path) {
+        // Node tries a data or native file of this name before the folder's index, and the
+        // selected files of a package name none.
+        Candidate::Missing if !matches!(extension, Some("js" | "cjs" | "mjs")) => Candidate::Open,
+        Candidate::Missing => index(directory),
         found => found,
     }
 }

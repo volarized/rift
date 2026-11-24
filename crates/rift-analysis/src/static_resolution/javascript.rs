@@ -32,8 +32,6 @@ pub(super) struct Folder {
     pub(super) known: bool,
     /// The file a runtime loads, as the manifest writes it.
     pub(super) main: Option<String>,
-    /// Whether the package has a data or native file Node tries for `main` after `.js`.
-    pub(super) data: bool,
     /// The declaration file, as the manifest writes it.
     pub(super) types: Option<String>,
 }
@@ -75,7 +73,6 @@ impl<'source> PackageModes<'source> {
                 .entry(directory.to_owned())
                 .or_insert_with(|| folder(manifest.as_ref()));
         }
-        note_data_files(namespace, &mut folders, work)?;
         let mut scopes = BTreeMap::new();
         let mut module_syntax = std::collections::BTreeSet::new();
         for file in files.values().filter(|file| {
@@ -169,41 +166,6 @@ fn javascript_constructor_function(target: Target<'_>) -> bool {
         )
 }
 
-/// Notes the folders whose `main` Node completes with a data or native file of the input.
-fn note_data_files(
-    namespace: &NamespaceInput<'_>,
-    folders: &mut BTreeMap<String, Folder>,
-    work: &mut Work,
-) -> Option<()> {
-    let mut wanted = BTreeMap::<String, Vec<String>>::new();
-    for (directory, folder) in folders.iter() {
-        let path = folder
-            .main
-            .as_ref()
-            .and_then(|main| super::javascript_exports::folder_path(directory, main));
-        for path in path
-            .into_iter()
-            .flat_map(|path| [".json", ".node"].map(|extension| format!("{path}{extension}")))
-        {
-            wanted.entry(path).or_default().push(directory.clone());
-        }
-    }
-    if wanted.is_empty() {
-        return Some(());
-    }
-    for source in namespace.files().iter().chain(namespace.context_sources()) {
-        if !work.charge() {
-            return None;
-        }
-        for directory in wanted.remove(source.path().as_str()).into_iter().flatten() {
-            if let Some(folder) = folders.get_mut(&directory) {
-                folder.data = true;
-            }
-        }
-    }
-    Some(())
-}
-
 type Manifest = serde_json::Map<String, serde_json::Value>;
 
 fn package_mode(manifest: Option<&Manifest>) -> ModuleMode {
@@ -229,7 +191,6 @@ fn folder(manifest: Option<&Manifest>) -> Folder {
     Folder {
         known: true,
         main: written("main"),
-        data: false,
         types: written("types").or_else(|| written("typings")),
     }
 }

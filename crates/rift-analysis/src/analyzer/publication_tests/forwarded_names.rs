@@ -415,7 +415,7 @@ const FOLDERS: &[FolderRow] = &[
     (
         r#"{"main":"main"}"#,
         &["sub/main.cjs", "sub/main.mjs", "sub/index.js"],
-        Some("sub/index.js"),
+        None,
     ),
     (
         r#"{"main":"main"}"#,
@@ -442,6 +442,15 @@ const FOLDERS: &[FolderRow] = &[
         &["sub/main.cjs", "sub/other.js"],
         None,
     ),
+    // Node can load a data or native file the selected files of a package do not name.
+    (r#"{"main":"main"}"#, &["sub/index.js"], None),
+    // Node reads no TypeScript source for a `main` the package does not ship.
+    (
+        r#"{"main":"main.js"}"#,
+        &["sub/main.ts", "sub/index.js"],
+        Some("sub/index.js"),
+    ),
+    (r#"{"main":"main"}"#, &["sub/main.ts", "sub/index.js"], None),
     (r#"{"main":""}"#, &["sub/index.js"], Some("sub/index.js")),
     (
         r#"{"type":"commonjs"}"#,
