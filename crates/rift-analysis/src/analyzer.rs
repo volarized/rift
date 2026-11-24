@@ -261,7 +261,8 @@ fn analyzed_file(
     );
     let placement =
         placement_of(input.owner(), input.origin(), file)?.with_identity_anchors(BTreeMap::new());
-    let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
+    let public_names =
+        public_qualified_names(parsed.syntax().language(), parsed.source(), parsed.syntax());
     let item_kinds = item_kinds(parsed.syntax().symbols());
     Ok(AnalyzedFile {
         file: parsed,
@@ -2599,7 +2600,7 @@ impl PackageLanguage {
         self,
         symbol: &SyntaxSymbol,
         by_name: &BTreeMap<&str, &SyntaxSymbol>,
-        python_scopes: Option<&crate::EnclosingDefinitions<&SyntaxSymbol>>,
+        python: Option<&PythonExports<'_>>,
     ) -> bool {
         match self {
             Self::Rust => match symbol.visibility.as_deref() {
@@ -2614,9 +2615,7 @@ impl PackageLanguage {
                     }),
                 _ => false,
             },
-            Self::Python | Self::Cython => {
-                python_scopes.is_some_and(|scopes| is_python_export(symbol, scopes))
-            }
+            Self::Python | Self::Cython => python.is_some_and(|exports| exports.is_public(symbol)),
             Self::TypeScript | Self::Vue | Self::Svelte => !symbol
                 .visibility
                 .as_deref()
@@ -2633,7 +2632,8 @@ enum ExportRule {
     Language(PackageLanguage),
     /// A JavaScript module exports a declaration the provider marks `Public`, one an
     /// `export` wraps or an export names (`export { a }`, `module.exports = { a }`), and a
-    /// member of a class so marked other than an ES private element.
+    /// member of a class so marked, or one assigned to a declaration so marked, other than
+    /// an ES private element.
     JavaScriptModule,
 }
 
@@ -2651,57 +2651,121 @@ impl ExportRule {
         self,
         symbol: &SyntaxSymbol,
         by_name: &BTreeMap<&str, &SyntaxSymbol>,
-        python_scopes: Option<&crate::EnclosingDefinitions<&SyntaxSymbol>>,
+        python: Option<&PythonExports<'_>>,
     ) -> bool {
         match self {
-            Self::Language(rules) => rules.is_public(symbol, by_name, python_scopes),
+            Self::Language(rules) => rules.is_public(symbol, by_name, python),
             Self::JavaScriptModule => is_javascript_export(symbol, by_name),
         }
     }
 }
 
-/// A private class hides its subtree. A special method of a visible class is public.
-fn is_python_export(
-    symbol: &SyntaxSymbol,
-    scopes: &crate::EnclosingDefinitions<&SyntaxSymbol>,
-) -> bool {
-    let private = symbol.name.starts_with('_');
-    let Some(containing) = scopes.containing(symbol.item_range.start, symbol.item_range.end) else {
-        return !private && symbol.container.is_none();
-    };
-    let mut ancestors = containing
-        .filter(|owner| owner.item_range != symbol.item_range)
-        .peekable();
-    if private {
-        let protocol = symbol
+/// What decides whether a Python declaration is public: its enclosing definitions and the
+/// names the module lists.
+struct PythonExports<'facts> {
+    scopes: crate::EnclosingDefinitions<&'facts SyntaxSymbol>,
+    /// The names `__all__` lists, when the module states them.
+    listed: Option<BTreeSet<&'facts str>>,
+}
+
+impl<'facts> PythonExports<'facts> {
+    fn new(source: &'facts str, facts: &'facts SyntaxFacts) -> Self {
+        Self {
+            scopes: crate::EnclosingDefinitions::new(
+                facts
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| matches!(symbol.kind, "class" | "function" | "method"))
+                    .map(|symbol| (symbol.item_range.start, symbol.item_range.end, symbol)),
+            ),
+            listed: Self::listed(source, facts),
+        }
+    }
+
+    /// A binding without a module source belongs to `__all__`: the first names the list, the
+    /// others its entries.
+    fn listed(source: &'facts str, facts: &'facts SyntaxFacts) -> Option<BTreeSet<&'facts str>> {
+        let mut bindings = facts
+            .export_bindings()?
+            .iter()
+            .filter(|binding| binding.source.is_none());
+        bindings.next()?;
+        bindings
+            .map(|binding| {
+                let name = binding.exported?;
+                source.get(usize::try_from(name.start).ok()?..usize::try_from(name.end).ok()?)
+            })
+            .collect()
+    }
+
+    /// A declaration is public when its own name and each container around it are public. A
+    /// method that assigns an attribute of its class holds the assignment without containing
+    /// the attribute.
+    fn is_public(&self, symbol: &SyntaxSymbol) -> bool {
+        let Some(containing) = self
+            .scopes
+            .containing(symbol.item_range.start, symbol.item_range.end)
+        else {
+            return symbol.container.is_none() && self.is_name_public(symbol, None);
+        };
+        let mut current = symbol;
+        for owner in containing.filter(|owner| owner.item_range != symbol.item_range) {
+            if !self.is_name_public(current, Some(owner)) {
+                return false;
+            }
+            if current.container.as_deref() == Some(owner.qualified_name.as_str()) {
+                current = owner;
+            }
+        }
+        self.is_name_public(current, None)
+    }
+
+    /// Whether `symbol`'s own name is public directly inside `owner`, or in the module.
+    ///
+    /// A leading underscore makes a name private, except a name the module lists and the
+    /// special method of a class. A name the module omits from its list stays public: another
+    /// module may re-export it or extend the class.
+    fn is_name_public(&self, symbol: &SyntaxSymbol, owner: Option<&SyntaxSymbol>) -> bool {
+        let listed = owner.is_none()
+            && self
+                .listed
+                .as_ref()
+                .is_some_and(|listed| listed.contains(symbol.name.as_str()));
+        if listed || !symbol.name.starts_with('_') {
+            return true;
+        }
+        let special = symbol
             .name
             .strip_prefix("__")
             .and_then(|name| name.strip_suffix("__"))
             .is_some_and(|name| !name.is_empty() && !name.starts_with('_') && !name.ends_with('_'));
-        let class_member = ancestors.peek().is_some_and(|owner| {
-            owner.kind == "class"
-                && Some(owner.qualified_name.as_str()) == symbol.container.as_deref()
-        });
-        if !protocol || !class_member || !matches!(symbol.kind, "method" | "function") {
-            return false;
-        }
+        special
+            && matches!(symbol.kind, "method" | "function")
+            && owner.is_some_and(|owner| {
+                owner.kind == "class"
+                    && Some(owner.qualified_name.as_str()) == symbol.container.as_deref()
+            })
     }
-    !ancestors.any(|owner| owner.kind == "class" && owner.name.starts_with('_'))
 }
 
 /// Whether a JavaScript module exports `symbol`: the provider marks it `Public`, or it is a
-/// member of a class so marked and no ES private element.
+/// member of a declaration so marked and no ES private element. A class declares members in
+/// its body. An assignment declares a member of any declaration it writes to, as
+/// `app.init = function () {}` and `Router.prototype.handle = function () {}` do.
 fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
     let exported = is_exported(symbol);
     let private_element = symbol.name.starts_with(PRIVATE_ELEMENT_PREFIX);
-    let member_of_exported_class = symbol
+    let assigned_member = symbol.syntax_element_kind == Some("assignment_expression")
+        && matches!(symbol.kind, "method" | "property");
+    let member_of_exported_declaration = symbol
         .container
         .as_deref()
         .and_then(|container| by_name.get(container))
         .is_some_and(|container| {
-            JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind) && is_exported(container)
+            (assigned_member || JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind))
+                && is_exported(container)
         });
-    exported || (member_of_exported_class && !private_element)
+    exported || (member_of_exported_declaration && !private_element)
 }
 
 /// Whether the provider marks `symbol` public, as an export of it does.
@@ -2710,12 +2774,16 @@ fn is_exported(symbol: &SyntaxSymbol) -> bool {
 }
 
 /// Qualified names of declarations a package file exposes under its language's export
-/// rule.
+/// rule, read from `source` and its syntax facts.
 ///
 /// A paired module's set is replaced afterwards by the one its stub defines, so this rule
 /// decides an unpaired file alone.
 #[must_use]
-pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTreeSet<String> {
+pub fn public_qualified_names(
+    language: &Language,
+    source: &str,
+    facts: &SyntaxFacts,
+) -> BTreeSet<String> {
     let symbols = facts.symbols();
     let Some(rule) = ExportRule::for_language(language) else {
         return symbols
@@ -2723,19 +2791,12 @@ pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTree
             .map(|symbol| symbol.qualified_name.clone())
             .collect();
     };
-    let python_scopes = matches!(
+    let python = matches!(
         rule,
         ExportRule::Language(PackageLanguage::Python | PackageLanguage::Cython)
     )
-    .then(|| {
-        crate::EnclosingDefinitions::new(
-            symbols
-                .iter()
-                .filter(|symbol| matches!(symbol.kind, "class" | "function" | "method"))
-                .map(|symbol| (symbol.item_range.start, symbol.item_range.end, symbol)),
-        )
-    });
-    let by_name = if python_scopes.is_some() {
+    .then(|| PythonExports::new(source, facts));
+    let by_name = if python.is_some() {
         BTreeMap::new()
     } else {
         symbols
@@ -2743,8 +2804,8 @@ pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTree
             .map(|symbol| (symbol.qualified_name.as_str(), symbol))
             .collect()
     };
-    let public = |symbol| rule.is_public(symbol, &by_name, python_scopes.as_ref());
-    if python_scopes.is_some() {
+    let public = |symbol| rule.is_public(symbol, &by_name, python.as_ref());
+    if python.is_some() {
         // Name-keyed visibility must hold for every physical declaration that shares it.
         let mut visibility = BTreeMap::new();
         for symbol in symbols {
@@ -3386,6 +3447,69 @@ class _Private:
                 ("load", true),
             ]
         );
+    }
+
+    /// The public set of express's three files: a synchronized function export, a module
+    /// value named by an alias, a constructor with prototype methods, and named exports of
+    /// values. A helper and a function's local stay private.
+    #[test]
+    fn test_commonjs_modules_export_module_values_members_and_assigned_values() {
+        for (path, source, expected) in [
+            (
+                "lib/express.js",
+                "var proto = require('./application');\n\
+                 var Router = require('./router');\n\
+                 var unused = require('./unused');\n\
+                 exports = module.exports = createApplication;\n\
+                 function createApplication() { var app = {}; return app; }\n\
+                 exports.application = proto;\n\
+                 exports.Route = Router.Route;\n\
+                 exports.Router = Router;\n\
+                 exports.json = function json() {};\n\
+                 exports.static = require('serve-static');\n",
+                vec![
+                    "Route",
+                    "Router",
+                    "createApplication",
+                    "json",
+                    "proto",
+                    "static",
+                ],
+            ),
+            (
+                "lib/application.js",
+                "var app = exports = module.exports = {};\n\
+                 var trust = '@@trust';\n\
+                 app.init = function init() { this.cache = {}; };\n\
+                 app.set = function set(value) { var local = value; return helper(local); };\n\
+                 function helper(value) { return value }\n",
+                vec!["app", "app.init", "app.set"],
+            ),
+            (
+                "lib/view.js",
+                "module.exports = View;\n\
+                 function View(name) { var local = 1; this.name = name; this.size = local; }\n\
+                 View.prototype.lookup = function lookup() { var found = 1; return found; };\n\
+                 View.make = function make() {};\n\
+                 function Other() {}\n\
+                 Other.prototype.run = function run() {};\n",
+                vec!["View", "View.lookup", "View.make", "View.name", "View.size"],
+            ),
+        ] {
+            let analysis = package_analysis(ShippedLanguage::JavaScript, vec![(path, source)]);
+            let held = &analysis.files()[0];
+            let mut public = held
+                .file()
+                .syntax()
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .filter(|name| held.is_public(name))
+                .collect::<Vec<_>>();
+            public.sort_unstable();
+            public.dedup();
+            assert_eq!(public, expected, "{path}");
+        }
     }
 
     /// A paired JavaScript module keeps the public set its declaration file defines: an

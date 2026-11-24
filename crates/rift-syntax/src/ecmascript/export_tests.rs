@@ -330,3 +330,305 @@ fn declared_function_types_keep_variable_kind_and_callable_fact() {
         );
     }
 }
+
+/// Every `CommonJS` form that names an export, beside the ones that name none.
+#[test]
+fn commonjs_assignments_bind_every_exported_name() {
+    let source = "var proto = require('./application');
+var taken = require('./taken');
+exports = module.exports = create;
+function create() {}
+exports.application = proto;
+exports.Route = taken.Route;
+exports.json = { parse: function parse() {} };
+exports.Client = class Client { connect() {} };
+exports.open = exports.load = function load() {};
+exports.placeholder = exports.later = void 0;
+exports.taken = taken.value;
+";
+    let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+    assert_eq!(
+        commonjs_bindings(source, &document),
+        [
+            (SyntaxExportKind::Default, None, Some("create"), None),
+            named("application", "proto"),
+            named("Route", "Route"),
+            named("json", "json"),
+            named("Client", "Client"),
+            named("open", "load"),
+            named("load", "load"),
+            named("taken", "taken"),
+        ]
+    );
+    let declared = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.kinds.contains(&SymbolKind::Public))
+        .map(|symbol| (symbol.qualified_name.as_str(), symbol.kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declared,
+        [
+            ("proto", "variable"),
+            ("create", "function"),
+            ("Route", "variable"),
+            ("json", "variable"),
+            ("json.parse", "property"),
+            ("Client", "class"),
+            ("load", "function"),
+            ("exports.taken", "variable"),
+        ]
+    );
+    assert!(
+        document
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.qualified_name == "Client.connect" && symbol.kind == "method")
+    );
+}
+
+#[test]
+fn commonjs_assignments_without_a_written_name_bind_nothing() {
+    let source = "exports['quoted'] = 1;\nexports[computed] = 2;\nexports.plain = 3;\n";
+    let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+    assert_eq!(
+        commonjs_bindings(source, &document),
+        [named("plain", "plain")]
+    );
+}
+
+type Bound<'source> = (
+    SyntaxExportKind,
+    Option<&'source str>,
+    Option<&'source str>,
+    Option<&'source str>,
+);
+
+fn named<'source>(exported: &'source str, local: &'source str) -> Bound<'source> {
+    (SyntaxExportKind::Named, Some(exported), Some(local), None)
+}
+
+fn commonjs_bindings<'source>(
+    source: &'source str,
+    document: &SyntaxDocument,
+) -> Vec<Bound<'source>> {
+    document
+        .facts()
+        .export_bindings()
+        .expect("recorded exports")
+        .iter()
+        .map(|binding| {
+            (
+                binding.kind,
+                token(source, binding.exported),
+                token(source, binding.local),
+                token(source, binding.source),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn commonjs_aliases_of_the_module_value_export_their_members() {
+    for declarator in [
+        "var app = exports = module.exports = {};",
+        "var app = module.exports = exports = {};",
+        "const app = module.exports = Object.create(null);",
+        "const app = module.exports = { ready: true };",
+    ] {
+        let source = format!(
+            "{declarator}\napp.init = function init() {{}};\napp.use = helper;\napp.size = 1;\nfunction helper() {{}}\nfunction hidden() {{ app.late = helper; }}\n"
+        );
+        let document = analyze(&JavaScriptSyntaxProvider::default(), &source);
+        let bindings = commonjs_bindings(&source, &document);
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.0 == SyntaxExportKind::Named && binding.1 != Some("ready"))
+                .collect::<Vec<_>>(),
+            [&named("init", "init"), &named("use", "helper")],
+            "{declarator}"
+        );
+        assert!(
+            bindings.contains(&(SyntaxExportKind::Default, None, Some("app"), None)),
+            "{declarator}"
+        );
+        for (name, public) in [
+            ("app", true),
+            ("app.init", true),
+            ("helper", true),
+            ("hidden", false),
+        ] {
+            let symbol = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.qualified_name == name)
+                .expect("declared name");
+            assert_eq!(
+                symbol.kinds.contains(&SymbolKind::Public),
+                public,
+                "{declarator} {name}"
+            );
+        }
+        if declarator.contains("ready") {
+            assert!(document.symbols().iter().any(|symbol| {
+                symbol.qualified_name == "app.ready" && symbol.kinds.contains(&SymbolKind::Public)
+            }));
+        }
+    }
+    for source in [
+        "const out = exports; out.open = function open() {};",
+        "const out = module.exports; out.open = function open() {};",
+        "module.exports = Base; const out = module.exports; out.open = function open() {};",
+    ] {
+        let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+        assert!(
+            commonjs_bindings(source, &document).contains(&named("open", "open")),
+            "{source}"
+        );
+    }
+    for source in [
+        "let app = module.exports = {}; app = other; app.init = function init() {};",
+        "let app = module.exports = {}; app ||= other; app.init = function init() {};",
+        "let app = module.exports = {}; app++; app.init = function init() {};",
+        "let app = module.exports = {}; [app] = other; app.init = function init() {};",
+        "let app = module.exports = {}; for (app of other) {} app.init = function init() {};",
+        "var app = module.exports = {}; var app = other; app.init = function init() {};",
+        "var app = module.exports = {}; function app() {} app.init = function init() {};",
+        "var app = module.exports = {}; module.exports ||= other; app.init = function init() {};",
+        "var app = module.exports = {}; module['exports'] = other; app.init = function init() {};",
+        "var app = module.exports = {}; module.exports = other; app.init = function init() {};",
+        "var app = exports = {}; app.init = function init() {};",
+        "const out = exports; module.exports = other; out.init = function init() {};",
+        "function wrap() { var app = exports = module.exports = {}; app.init = function init() {}; }",
+        "var app = exports = module.exports = {}; exports = other; app.init = function init() {};",
+        "var app = exports = module.exports = {}; if (ready) { app.init = function init() {}; }",
+        "import { other } from './other.js'; var app = local = {}; app.init = function init() {};",
+    ] {
+        let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+        assert!(
+            !commonjs_bindings(source, &document)
+                .iter()
+                .any(|binding| binding.1 == Some("init")),
+            "{source}"
+        );
+        assert!(
+            !document.symbols().iter().any(|symbol| {
+                symbol.name == "init" && symbol.kinds.contains(&SymbolKind::Public)
+            }),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn commonjs_typescript_output_binds_defined_properties_and_copied_modules() {
+    let source = "Object.defineProperty(exports, \"__esModule\", { value: true });
+exports.answer = exports.open = void 0;
+const util_1 = require('./util');
+Object.defineProperty(exports, 'helper', { enumerable: true, get: function () { return util_1.helper; } });
+Object.defineProperty(exports, 'plain', { value: open });
+Object.defineProperty(exports, 'getter', { get() { return open; } });
+Object.defineProperty(exports, 'arrow', { get: () => open });
+Object.defineProperty(exports, name, { value: open });
+Object.defineProperty(exports, 'spread', { ...other, value: open });
+Object.defineProperty(other, 'foreign', { value: open });
+__exportStar(require('./shapes'), exports);
+tslib_1.__exportStar(require('./types'), exports);
+__export(require('./older'));
+function open() {}
+exports.open = open;
+";
+    let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+    let all = |module| (SyntaxExportKind::All, None, None, Some(module));
+    assert_eq!(
+        commonjs_bindings(source, &document),
+        [
+            named("helper", "util_1.helper"),
+            named("plain", "open"),
+            named("getter", "open"),
+            named("arrow", "open"),
+            all("'./shapes'"),
+            all("'./types'"),
+            all("'./older'"),
+            named("open", "open"),
+        ]
+    );
+    let rebound = format!("{source}exports = other;\n");
+    let document = analyze(&JavaScriptSyntaxProvider::default(), &rebound);
+    assert!(commonjs_bindings(&rebound, &document).is_empty());
+}
+
+#[test]
+fn commonjs_literals_bind_pairs_no_later_property_replaces() {
+    let bound = |literal: &str| {
+        let source = format!("module.exports = {literal};\nfunction check() {{}}\n");
+        let document = analyze(&JavaScriptSyntaxProvider::default(), &source);
+        commonjs_bindings(&source, &document)
+            .into_iter()
+            .map(|binding| {
+                (
+                    binding.1.unwrap_or_default().to_owned(),
+                    binding.2.unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let pair = |exported: &str, local: &str| (exported.to_owned(), local.to_owned());
+    assert_eq!(
+        bound("{ kDirect: Symbol('direct'), exist: check, check }"),
+        [
+            pair("kDirect", "kDirect"),
+            pair("exist", "check"),
+            pair("check", "check"),
+        ]
+    );
+    assert_eq!(
+        bound("{ ...base, first: check, [key]: other, last: check }"),
+        [pair("last", "check")]
+    );
+    assert_eq!(
+        bound("{ twice: check, 'twice': other, once: check, get once() {} }"),
+        []
+    );
+}
+
+#[test]
+fn ecmascript_module_syntax_leaves_assignments_to_exports_unexported() {
+    let source =
+        "export function open() {}\nexports.run = function run() {};\nexports.limit = 1;\n";
+    let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+    for symbol in document.symbols() {
+        assert_eq!(
+            symbol.kinds.contains(&SymbolKind::Public),
+            symbol.name == "open",
+            "{}",
+            symbol.qualified_name
+        );
+    }
+}
+
+/// A generated module with many aliases and writes keeps one binding for each write.
+#[test]
+fn commonjs_generated_aliases_bind_each_write_once() {
+    use std::fmt::Write as _;
+
+    let mut source = String::new();
+    for index in 0..400 {
+        write!(
+            source,
+            "var app{index} = exports;\napp{index}.run{index} = function () {{}};\n"
+        )
+        .expect("generated source");
+    }
+    let document = analyze(&JavaScriptSyntaxProvider::default(), &source);
+    let bindings = commonjs_bindings(&source, &document);
+    assert_eq!(bindings.len(), 400);
+    for index in 0..400 {
+        let name = format!("run{index}");
+        assert!(
+            bindings.contains(&named(&name, &name)),
+            "write through alias {index}"
+        );
+    }
+}

@@ -392,7 +392,10 @@ fn unresolved_owner_metadata_conditions_and_paths_do_not_guess_module() {
         r#"{"name":"prettier","version":"3.8.5","types":"../index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"/index.d.ts"}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","typesVersions":{">=5":{"*": ["new/*"]}}}"#,
-        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"browser":"./browser.d.ts","types":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"browser":"./index.d.ts","@prettier/source":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":null,"default":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types@>=5.7":"./new.d.ts","types":"./index.d.ts"}}}"#,
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":"../index.d.ts"}}}"#,
         r#"{"name":"prettier","version":"3.8.5","exports":{".":["./index.d.ts"]}}"#,
         r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":"./index.d.ts","types":"./other.d.ts"}}}"#,
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","types":"./other.d.ts"}"#,
@@ -459,6 +462,140 @@ fn captured_types_and_main_map_one_explicit_export_to_its_defining_object() {
     assert_eq!(found.mappings["index.d.ts"].len(), 1);
     assert_eq!(found.exports.len(), 1);
     assert_eq!(found.exports[0].target, mapping.identity);
+}
+
+#[test]
+fn export_conditions_resolve_the_first_one_a_static_consumer_selects() {
+    for (exports, types, implementation) in [
+        // zod 4.6.7 lists a condition no published consumer resolves first.
+        (
+            r#"{".":{"@zod/source":"./src/index.ts","types":"./index.d.cts","import":"./index.js","require":"./index.cjs"}}"#,
+            "./index.d.cts",
+            "./index.js",
+        ),
+        (
+            r#"{".":{"browser":"./browser.js","types":"./index.d.ts","default":"./index.mjs"}}"#,
+            "./index.d.ts",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"import":{"types":"./index.d.mts","default":"./index.mjs"},"require":{"types":"./index.d.cts","default":"./index.cjs"}}}"#,
+            "./index.d.mts",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"require":"./index.cjs","import":"./index.mjs"}}"#,
+            "./index.mjs",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"node":{"import":"./node.mjs"},"import":{"development":"./dev.mjs"},"default":"./index.mjs"}}"#,
+            "./node.mjs",
+            "./node.mjs",
+        ),
+        (
+            r#"{".":{"default":"./index.mjs","types":"./index.d.ts"}}"#,
+            "./index.mjs",
+            "./index.mjs",
+        ),
+        (
+            r#"{"types":"./index.d.ts","import":"./index.mjs"}"#,
+            "./index.d.ts",
+            "./index.mjs",
+        ),
+        (
+            r#"{".":{"types":"./index.d.ts","default":"./index.mjs"},"./internal/*":null,"./list":["./list.mjs"]}"#,
+            "./index.d.ts",
+            "./index.mjs",
+        ),
+    ] {
+        let metadata: super::PackageMetadata = serde_json::from_str(&format!(
+            r#"{{"name":"prettier","version":"3.8.5","exports":{exports}}}"#
+        ))
+        .expect("captured metadata");
+        for (language, expected) in [("typescript", types), ("javascript", implementation)] {
+            assert_eq!(
+                super::entry_path(&metadata, language)
+                    .as_ref()
+                    .map(ProjectPath::as_str),
+                expected.strip_prefix("./"),
+                "{language} {exports}"
+            );
+        }
+    }
+    let metadata: super::PackageMetadata = serde_json::from_str(
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"types":"./index.d.ts"}}}"#,
+    )
+    .expect("captured metadata");
+    assert!(super::entry_path(&metadata, "javascript").is_none());
+}
+
+#[test]
+fn unknown_first_conditions_establish_every_published_entry_point() {
+    let files = [
+        ("src/index.ts", "export class Source {}"),
+        (
+            "index.d.cts",
+            "export declare class ZodType { parse(): void }",
+        ),
+        (
+            "core/index.d.ts",
+            "export declare function safeParse(): void;",
+        ),
+    ];
+    let found = prepared(
+        ShippedLanguage::TypeScript,
+        &[(
+            "package.json",
+            r#"{"name":"prettier","version":"3.8.5","exports":{".":{"@zod/source":"./src/index.ts","types":"./index.d.cts","import":"./index.js","require":"./index.cjs"},"./core":{"@zod/source":"./src/core.ts","import":{"types":"./core/index.d.ts","default":"./core/index.js"}}}}"#,
+        )],
+        &files,
+    );
+    for (path, name, qualified) in [
+        ("index.d.cts", "ZodType", vec!["prettier", "ZodType"]),
+        (
+            "index.d.cts",
+            "ZodType.parse",
+            vec!["prettier", "ZodType", "parse"],
+        ),
+        (
+            "core/index.d.ts",
+            "safeParse",
+            vec!["prettier/core", "safeParse"],
+        ),
+    ] {
+        let identity = SymbolIdentity::parse(found.anchors[path][name].as_str())
+            .expect("published entry identity");
+        assert_eq!(identity.qualified_path(), qualified);
+    }
+    assert!(
+        !found.anchors.contains_key("src/index.ts"),
+        "no published consumer resolves the source condition"
+    );
+}
+
+#[test]
+fn conditions_map_declared_types_only_to_one_implementation() {
+    let types = "export declare function format(source: string): string;";
+    let implementation = "export function format(source) { return source; }";
+    let found = mixed_entries(
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"@prettier/source":"./src/index.ts","types":"./index.d.ts","default":"./index.mjs"}}}"#,
+        types,
+        implementation,
+    );
+    assert!(
+        found.mappings.is_empty(),
+        "the source condition names a second implementation"
+    );
+    let found = mixed_entries(
+        r#"{"name":"prettier","version":"3.8.5","exports":{".":{"import":{"types":"./index.d.ts","default":"./index.mjs"},"default":"./index.mjs"}}}"#,
+        types,
+        implementation,
+    );
+    assert_eq!(
+        found.mappings["index.d.ts"]["format"].identity,
+        found.anchors["index.mjs"]["format"]
+    );
 }
 
 #[test]
@@ -695,7 +832,7 @@ fn explicit_export_subpaths_establish_independent_captured_modules() {
 #[test]
 fn missing_conditional_and_pattern_exports_leave_sources_unresolved() {
     for target in [
-        r#"{"./hub":{"import":"./hub.ts"}}"#,
+        r#"{"./hub":{"browser":"./hub.ts"}}"#,
         r#"{"./*":"./hub.ts"}"#,
         r#"{"./hub":"./missing.ts"}"#,
         r#"{"./hub":"../hub.ts"}"#,
@@ -1018,6 +1155,17 @@ fn commonjs_prepared(
     super::PreparedNamespace,
     Vec<std::sync::Arc<rift_syntax::SyntaxFacts>>,
 ) {
+    commonjs_observed(metadata, files, &[(entry, conditions)])
+}
+
+fn commonjs_observed(
+    metadata: &str,
+    files: &[(&str, &str)],
+    observed: &[(&str, &[&str])],
+) -> (
+    super::PreparedNamespace,
+    Vec<std::sync::Arc<rift_syntax::SyntaxFacts>>,
+) {
     let owner = SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react/javascript/react/open")
         .expect("captured package owner")
         .owner()
@@ -1045,17 +1193,17 @@ fn commonjs_prepared(
         .collect::<Vec<_>>();
     let metadata_path = ProjectPath::new("package.json").expect("metadata path");
     let context = [PackageSource::new(&metadata_path, metadata)];
-    let implementation = sources
+    let observations = observed
         .iter()
-        .find(|source| source.path().as_str() == entry)
-        .copied()
-        .expect("selected original entry");
-    let observations = [crate::NamespaceModule::new(
-        "react",
-        implementation,
-        &[],
-        conditions,
-    )];
+        .map(|(entry, conditions)| {
+            let implementation = sources
+                .iter()
+                .find(|source| source.path().as_str() == *entry)
+                .copied()
+                .expect("selected original entry");
+            crate::NamespaceModule::new("react", implementation, &[], conditions)
+        })
+        .collect::<Vec<_>>();
     let language = ShippedLanguage::JavaScript.language();
     let input = ExactPackageInput::new(
         &owner,
@@ -1132,10 +1280,14 @@ fn commonjs_original_react_builds_keep_distinct_modules_and_public_bindings() {
             .iter()
             .find(|symbol| symbol.name == "useState")
             .expect("original raw useState");
-        assert!(
-            !declaration
+        // The production build assigns in the module body; the development build assigns
+        // inside a conditional function expression.
+        assert_eq!(
+            declaration
                 .kinds
-                .contains(&rift_protocol::read::SymbolKind::Public)
+                .contains(&rift_protocol::read::SymbolKind::Public),
+            path.ends_with("production.js"),
+            "{path}"
         );
         let anchors = prepared
             .anchors
@@ -1657,7 +1809,11 @@ fn observed_module_builds_hold_their_module_before_main() {
         ("index.d.ts", "export declare function load(): void;"),
     ];
     let holders = |observed: Option<(&str, &[&str])>| {
-        let prepared = observed_declarations(metadata, &files, observed);
+        let observed = observed
+            .map(|(entry, conditions)| (entry, conditions, true))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let prepared = observed_declarations(metadata, &files, &observed);
         prepared
             .anchors
             .iter()
@@ -1680,7 +1836,7 @@ fn observed_module_builds_hold_their_module_before_main() {
 fn observed_declarations(
     metadata: &str,
     files: &[(&str, &str)],
-    observed: Option<(&str, &[&str])>,
+    observed: &[(&str, &[&str], bool)],
 ) -> super::PreparedNamespace {
     let owner = SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react/javascript/react/load")
         .expect("package owner")
@@ -1716,9 +1872,10 @@ fn observed_declarations(
     };
     let declarations = [source("index.d.ts")];
     let observations = observed
-        .into_iter()
-        .map(|(entry, conditions)| {
-            crate::NamespaceModule::new("react", source(entry), &declarations, conditions)
+        .iter()
+        .map(|(entry, conditions, joined)| {
+            let declarations = if *joined { &declarations[..] } else { &[] };
+            crate::NamespaceModule::new("react", source(entry), declarations, conditions)
         })
         .collect::<Vec<_>>();
     let manifest = ProjectPath::new("package.json").expect("manifest path");
@@ -1763,4 +1920,335 @@ fn observed_declarations(
         })
         .collect::<Vec<_>>();
     super::prepare(&input.namespace_input(), &selected)
+}
+
+/// The modules each file of a conditional package is published under, by language.
+fn published_modules(
+    exports: &str,
+    files: &[(&str, &str)],
+) -> (BTreeMap<String, Vec<String>>, bool) {
+    let metadata = format!(r#"{{"name":"prettier","version":"3.8.5","exports":{exports}}}"#);
+    let found = prepared_languages(
+        ShippedLanguage::TypeScript,
+        &[("package.json", metadata.as_str())],
+        files,
+        Some(
+            &files
+                .iter()
+                .map(|(path, _)| {
+                    if path.ends_with("ts") {
+                        ShippedLanguage::TypeScript
+                    } else {
+                        ShippedLanguage::JavaScript
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+    );
+    let mut modules = BTreeMap::<String, Vec<String>>::new();
+    for (path, anchors) in &found.anchors {
+        if let Some(module) = anchors.get(".") {
+            modules
+                .entry(module.as_str().to_owned())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    (modules, found.unresolved_exports)
+}
+
+/// The exports of one package entry, the files it ships, and the files that hold its
+/// JavaScript and TypeScript modules.
+type ConditionalEntry = (
+    &'static str,
+    &'static [&'static str],
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+const CONDITIONAL_ENTRIES: &[ConditionalEntry] = &[
+    (r#""./index.js""#, &["index.js"], Some("index.js"), None),
+    (
+        r#"{"require":"./a.cjs","import":"./b.mjs"}"#,
+        &["a.cjs", "b.mjs"],
+        Some("b.mjs"),
+        None,
+    ),
+    (
+        r#"{"import":"./b.mjs","require":"./a.cjs"}"#,
+        &["a.cjs", "b.mjs"],
+        Some("b.mjs"),
+        None,
+    ),
+    (
+        r#"{"node":"./n.js","default":"./browser.js"}"#,
+        &["n.js", "browser.js"],
+        Some("n.js"),
+        None,
+    ),
+    (
+        r#"{"browser":"./w.js","default":"./d.js"}"#,
+        &["w.js", "d.js"],
+        Some("d.js"),
+        None,
+    ),
+    (
+        r#"{"@zod/source":"./s.ts","types":"./i.d.cts","import":"./i.js","require":"./i.cjs"}"#,
+        &["s.ts", "i.d.cts", "i.js", "i.cjs"],
+        Some("i.js"),
+        Some("i.d.cts"),
+    ),
+    (
+        r#"{"custom":"./index.js","types":"./index.d.ts","import":"./index.js","require":"./index.cjs"}"#,
+        &["index.d.ts", "index.js", "index.cjs"],
+        Some("index.js"),
+        Some("index.d.ts"),
+    ),
+    (
+        r#"{"import":{"types":"./i.d.mts","default":"./i.mjs"},"require":{"types":"./i.d.cts","default":"./i.cjs"}}"#,
+        &["i.d.mts", "i.mjs", "i.d.cts", "i.cjs"],
+        Some("i.mjs"),
+        Some("i.d.mts"),
+    ),
+    (r#"{"require":"./a.cjs"}"#, &["a.cjs"], Some("a.cjs"), None),
+    (r#"{"import":"./b.mjs"}"#, &["b.mjs"], Some("b.mjs"), None),
+    (
+        r#"{"default":"./d.js","import":"./b.mjs"}"#,
+        &["d.js", "b.mjs"],
+        Some("d.js"),
+        None,
+    ),
+    (
+        r#"{"types@>=5":"./n.d.ts","types":"./o.d.ts","default":"./d.js"}"#,
+        &["n.d.ts", "o.d.ts", "d.js"],
+        Some("d.js"),
+        None,
+    ),
+    (
+        r#"{"import":null,"default":"./d.js"}"#,
+        &["d.js"],
+        Some("d.js"),
+        None,
+    ),
+    (r#"{"browser":"./w.js"}"#, &["w.js"], None, None),
+    (
+        r#"{"module-sync":"./m.js","require":"./a.cjs"}"#,
+        &["m.js", "a.cjs"],
+        Some("m.js"),
+        None,
+    ),
+    (
+        r#"{"node":{"import":"./n.mjs","require":"./n.cjs"},"default":"./d.js"}"#,
+        &["n.mjs", "n.cjs", "d.js"],
+        Some("n.mjs"),
+        None,
+    ),
+];
+
+/// One package entry names one file for each language, whatever order its conditions have.
+#[test]
+fn conditional_exports_hold_one_file_for_each_module() {
+    let javascript = "export function load() {}";
+    let types = "export declare function load(): void;";
+    let source = |path: &'static str| {
+        (
+            path,
+            if path.ends_with("ts") {
+                types
+            } else {
+                javascript
+            },
+        )
+    };
+    for &(exports, files, script, declared) in CONDITIONAL_ENTRIES {
+        let exports = if exports.starts_with('{') {
+            format!(r#"{{".":{exports}}}"#)
+        } else {
+            exports.to_owned()
+        };
+        let files = files.iter().copied().map(source).collect::<Vec<_>>();
+        let (modules, _) = published_modules(&exports, &files);
+        for (language, expected) in [("javascript", script), ("typescript", declared)] {
+            let held = modules
+                .iter()
+                .filter(|(module, _)| module.ends_with(&format!("/{language}/prettier")))
+                .flat_map(|(_, paths)| paths.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                held,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{language} {exports}"
+            );
+        }
+    }
+}
+
+/// A file reached by several subpaths is published under one module.
+#[test]
+fn export_subpaths_of_one_file_keep_one_module() {
+    let load = "export function load() {}";
+    for (exports, path, expected, unresolved) in [
+        (
+            r#"{".":"./index.js","./main":{"import":"./index.js"}}"#,
+            "index.js",
+            Some("prettier"),
+            false,
+        ),
+        (
+            r#"{".":{"import":"./a.js"},"./a":{"import":"./a.js"}}"#,
+            "a.js",
+            Some("prettier"),
+            false,
+        ),
+        (
+            r#"{"./b":{"import":"./a.js"},"./a":{"import":"./a.js"}}"#,
+            "a.js",
+            Some("prettier%2Fa"),
+            false,
+        ),
+        (r#"{".":"./a.js","./a":"./a.js"}"#, "a.js", None, true),
+        (
+            r#"{"./sub":{"require":"./s.cjs","import":"./s.mjs"}}"#,
+            "s.mjs",
+            Some("prettier%2Fsub"),
+            false,
+        ),
+    ] {
+        let mut files = vec![(path, load)];
+        if path == "s.mjs" {
+            files.push(("s.cjs", load));
+        }
+        let (modules, unresolved_exports) = published_modules(exports, &files);
+        let held = modules
+            .iter()
+            .map(|(module, paths)| (module.rsplit('/').next().expect("module"), paths.as_slice()))
+            .collect::<Vec<_>>();
+        match expected {
+            Some(module) => assert_eq!(held, [(module, [path.to_owned()].as_slice())], "{exports}"),
+            None => assert!(held.is_empty(), "{exports}"),
+        }
+        if unresolved {
+            assert!(unresolved_exports, "{exports}");
+        }
+    }
+}
+
+/// The resolver's file holds the module, and no second file shares it.
+#[test]
+fn observed_entries_hold_their_module_before_static_conditions() {
+    let dual = r#"{"name":"react","version":"19.3.0","exports":{".":{"require":"./a.cjs","import":"./b.mjs"}}}"#;
+    let browser = r#"{"name":"react","version":"19.3.0","exports":{".":{"browser":"./w.js"}}}"#;
+    let files = [
+        ("a.cjs", "exports.open = function () {};"),
+        ("b.mjs", "export function open() {}"),
+    ];
+    for (observed, expected) in [
+        (vec![("a.cjs", vec!["node", "require"])], vec!["a.cjs"]),
+        (vec![("b.mjs", vec!["node", "import"])], vec!["b.mjs"]),
+        (
+            vec![
+                ("a.cjs", vec!["node", "require"]),
+                ("b.mjs", vec!["node", "import"]),
+            ],
+            vec!["b.mjs"],
+        ),
+    ] {
+        let observations = observed
+            .iter()
+            .map(|(path, conditions)| (*path, conditions.as_slice()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed_module_files(dual, &files, &observations),
+            expected,
+            "{observed:?}"
+        );
+    }
+    let window = [("w.js", "exports.open = function () {};")];
+    assert!(
+        observed_module_files(browser, &window, &[("w.js", &["browser"])]).is_empty(),
+        "only a [node, require] observation holds a module without declarations"
+    );
+}
+
+#[test]
+fn a_required_build_holds_the_module_no_import_build_takes() {
+    let synchronous = r#"{"name":"react","version":"19.3.0","exports":{".":{"module-sync":"./m.js","import":"./i.mjs","require":"./c.cjs"}}}"#;
+    let bundled = r#"{"name":"react","version":"19.3.0","exports":{".":{"browser":{"import":"./i.mjs"},"require":"./c.cjs"}}}"#;
+    let build = "exports.open = function () {};";
+    let module = "export function open() {}";
+    for (metadata, files, import) in [
+        (
+            synchronous,
+            vec![("m.js", module), ("i.mjs", module), ("c.cjs", build)],
+            &["node", "import"][..],
+        ),
+        (
+            bundled,
+            vec![("i.mjs", module), ("c.cjs", build)],
+            &["browser", "import"][..],
+        ),
+        (
+            synchronous,
+            vec![("i.mjs", "export function open("), ("c.cjs", build)],
+            &["node", "import"][..],
+        ),
+    ] {
+        let required: (&str, &[&str]) = ("c.cjs", &["node", "require"]);
+        for observations in [
+            vec![required],
+            vec![required, ("i.mjs", import)],
+            vec![("i.mjs", import), required],
+        ] {
+            assert_eq!(
+                observed_module_files(metadata, &files, &observations),
+                ["c.cjs"],
+                "{metadata} {observations:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_observation_with_declarations_holds_its_module_before_an_import_build() {
+    let metadata = r#"{"name":"react","version":"19.3.0","exports":{".":{"require":{"types":"./index.d.ts","default":"./a.cjs"},"import":"./b.mjs"}}}"#;
+    let files = [
+        ("a.cjs", "exports.load = function () {};"),
+        ("b.mjs", "export function load() {}"),
+        ("index.d.ts", "export declare function load(): void;"),
+    ];
+    let joined: (&str, &[&str], bool) = ("a.cjs", &["node", "require"], true);
+    let import: (&str, &[&str], bool) = ("b.mjs", &["node", "import"], false);
+    let bare: (&str, &[&str], bool) = ("a.cjs", &["node", "require"], false);
+    for observed in [
+        vec![joined],
+        vec![joined, import],
+        vec![import, joined],
+        vec![import, joined, bare],
+    ] {
+        let prepared = observed_declarations(metadata, &files, &observed);
+        assert_eq!(module_holders(&prepared), ["a.cjs"], "{observed:?}");
+    }
+}
+
+fn observed_module_files(
+    metadata: &str,
+    files: &[(&str, &str)],
+    observations: &[(&str, &[&str])],
+) -> Vec<String> {
+    let (prepared, _) = commonjs_observed(metadata, files, observations);
+    module_holders(&prepared)
+}
+
+/// The JavaScript files that hold the package's own module.
+fn module_holders(prepared: &super::PreparedNamespace) -> Vec<String> {
+    prepared
+        .anchors
+        .iter()
+        .filter(|(_, anchors)| {
+            anchors
+                .get(".")
+                .is_some_and(|module| module.as_str().ends_with("/javascript/react"))
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
 }

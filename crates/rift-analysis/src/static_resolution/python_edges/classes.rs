@@ -6,7 +6,7 @@ use rift_protocol::read::SymbolKind;
 
 use super::super::{File, Index, Target, Work};
 use super::{Value, edge_python_binding};
-use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind};
+use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
 
 /// Classes the Python `builtins` module provides, which a module may name without binding.
 const BUILTIN_CLASSES: [&str; 96] = [
@@ -107,6 +107,9 @@ const BUILTIN_CLASSES: [&str; 96] = [
     "type",
     "zip",
 ];
+
+/// Modules that provide the typing names.
+pub(super) const TYPING_MODULES: [&str; 2] = ["typing", "typing_extensions"];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ClassKey<'source> {
@@ -369,34 +372,46 @@ impl<'source> Index<'source> {
         expected: &str,
         work: &mut Work,
     ) -> bool {
-        let Some(text) = file.text(range) else {
-            return false;
-        };
+        self.python_library_name(file, range, work)
+            .is_some_and(|qualified| {
+                qualified.rsplit_once('.').is_some_and(|(module, name)| {
+                    name == expected && TYPING_MODULES.contains(&module)
+                })
+            })
+    }
+
+    /// The module path and name the dotted expression at `range` reads from a module outside
+    /// the selected sources, imported by name or read through the module.
+    pub(super) fn python_library_name(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<String> {
+        let text = file.text(range)?;
         let mut names = text.split('.').map(str::trim);
-        let Some(name) = names.next() else {
-            return false;
-        };
-        let Some(binding) = edge_python_binding(self, file, name, range.start, work) else {
-            return false;
-        };
-        let (module, export) = match binding.kind {
-            StaticBindingKind::PythonImport { module, export } => (module, export),
-            StaticBindingKind::PythonModule { module } if file.text(module) == Some(name) => {
-                (module, None)
+        let name = names.next()?;
+        let binding = edge_python_binding(self, file, name, range.start, work)?;
+        let mut qualified = match binding.kind {
+            StaticBindingKind::PythonImport { module, export } => {
+                let mut path = vec![file.text(module)?];
+                if let Some(export) = export {
+                    path.push(file.text(export)?);
+                }
+                path
             }
-            _ => return false,
+            // Importing a dotted path binds its first component.
+            StaticBindingKind::PythonModule { .. } => vec![name],
+            _ => return None,
         };
-        let Some(module) = file.text(module) else {
-            return false;
-        };
-        let typing = ["typing", "typing_extensions"].contains(&module);
-        if !typing || self.edge_python.0.contains_key(module) {
-            return false;
-        }
-        match export {
-            Some(export) => file.text(export) == Some(expected) && names.next().is_none(),
-            None => names.next() == Some(expected) && names.next().is_none(),
-        }
+        qualified.extend(names);
+        let qualified = qualified.join(".");
+        let (module, _) = qualified.rsplit_once('.')?;
+        let local = std::iter::successors(Some(module), |module| {
+            module.rsplit_once('.').map(|(parent, _)| parent)
+        })
+        .any(|module| self.edge_python.0.contains_key(module));
+        (!local && !qualified.starts_with('.')).then_some(qualified)
     }
 
     pub(super) fn python_member_value(
@@ -496,7 +511,9 @@ impl<'source> Index<'source> {
         order.complete.then_some(false)
     }
 
-    fn python_declared_base_member(
+    /// The member the class body of the nearest ancestor declares. An attribute a method
+    /// assigns through its receiver belongs to the instance and declares none.
+    pub(super) fn python_declared_base_member(
         &self,
         class: Target<'source>,
         name: &str,
@@ -514,16 +531,104 @@ impl<'source> Index<'source> {
                 continue;
             };
             let base = self.files.get(path)?.qualified_target(qualified)?;
-            if let Some(target) = self.python_own_member(base, name, work)
-                && !self.python_assigned_member(target)
-            {
+            let Some(target) = self.python_own_member(base, name, work) else {
+                continue;
+            };
+            if !self.python_assigned_member(target) {
                 return Some(target);
+            }
+            if let Some(method) = self.python_method_slot(base, name, work) {
+                return Some(method);
             }
         }
         None
     }
 
+    /// The callable a class body declares under a name its methods assign too.
+    fn python_method_slot(
+        &self,
+        class: Target<'source>,
+        name: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let file = self.files.get(class.file.path.as_str())?;
+        let bindings = python_slot_bindings(file, class, name);
+        let binding = self.python_binding_group(file, bindings, work)?;
+        file.target_at(binding.name)?.callable()
+    }
+
+    /// The class or instance a value holds. An attribute that methods assign instances of
+    /// different classes holds neither.
     pub(super) fn python_receiver(
+        &self,
+        value: Value<'source>,
+        work: &mut Work,
+    ) -> Option<Value<'source>> {
+        let target = match value {
+            Value::Symbol(target)
+            | Value::Member {
+                assigned: target, ..
+            } => Some(target),
+            Value::Instance(_) | Value::Module(_) => None,
+        };
+        let held = self.python_held_value(value, work)?;
+        if let Value::Instance(class) = held
+            && let Some(target) = target
+            && self.python_assigned_member(target)
+            && work.python_comparison(|work| self.python_assigned_otherwise(target, class, work))
+        {
+            return None;
+        }
+        Some(held)
+    }
+
+    /// Whether another assignment of an attribute without a written type holds an instance of
+    /// a class other than `class`.
+    fn python_assigned_otherwise(
+        &self,
+        target: Target<'source>,
+        class: Target<'source>,
+        work: &mut Work,
+    ) -> bool {
+        let Some(file) = self.files.get(target.file.path.as_str()) else {
+            return false;
+        };
+        let facets = file
+            .by_qualified_name
+            .get(target.symbol.qualified_name.as_str())
+            .into_iter()
+            .flatten()
+            .copied();
+        let value_of = |symbol: &SyntaxSymbol| {
+            symbol
+                .name_range
+                .and_then(|name| file.python_values.get(&name.end))
+        };
+        if facets.clone().any(|symbol| {
+            matches!(
+                value_of(symbol),
+                Some(StaticBindingKind::PythonAnnotation { .. })
+            )
+        }) {
+            return false;
+        }
+        facets
+            .filter(|symbol| symbol.name_range != target.symbol.name_range)
+            .any(|symbol| {
+                if !work.charge() {
+                    return true;
+                }
+                let facet = Target {
+                    file: file.document,
+                    symbol,
+                };
+                let other =
+                    work.python_lookup(|work| self.python_held_value(Value::Symbol(facet), work));
+                matches!(other, Some(Value::Instance(other)) if key(other) != key(class))
+            })
+    }
+
+    fn python_held_value(
         &self,
         mut value: Value<'source>,
         work: &mut Work,
@@ -569,8 +674,11 @@ impl<'source> Index<'source> {
                 StaticBindingKind::PythonAlias { value } => {
                     work.python_lookup(|work| self.python_name(file, *value, work))?
                 }
-                StaticBindingKind::PythonElement { iterable } => {
-                    Value::Instance(self.python_element(file, *iterable, work)?)
+                StaticBindingKind::PythonElement { iterable, position } => {
+                    Value::Instance(self.python_element(file, *iterable, *position, work)?)
+                }
+                StaticBindingKind::PythonUnpacked { value, position } => {
+                    Value::Instance(self.python_unpacked(file, *value, *position, work)?)
                 }
                 _ => return None,
             };
@@ -607,16 +715,27 @@ impl<'source> Index<'source> {
         getter: Target<'source>,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        let (file, annotation) = self.python_property_annotation(getter, work)?;
+        self.python_annotation(file, annotation, work)
+    }
+
+    /// The return annotation of a property whose class body holds no other definition of the
+    /// name than its setter and deleter.
+    pub(super) fn python_property_annotation(
+        &self,
+        getter: Target<'source>,
+        work: &mut Work,
+    ) -> Option<(&File<'source>, ByteRange)> {
         let file = self.files.get(getter.file.path.as_str())?;
         let range = getter.symbol.name_range?;
         let StaticBindingKind::PythonFunction {
             annotation,
             decorator: Some(decorator),
-        } = file.python_values.get(&range.end)?
+        } = *file.python_values.get(&range.end)?
         else {
             return None;
         };
-        if file.text(*decorator)? != "property" || file.blocked(decorator.start, work) {
+        if file.text(decorator)? != "property" || file.blocked(decorator.start, work) {
             return None;
         }
         for binding in file.by_name.get("property").into_iter().flatten() {
@@ -625,20 +744,15 @@ impl<'source> Index<'source> {
             }
         }
         let class = file.qualified_target(getter.symbol.container.as_deref()?)?;
-        for binding in file
-            .by_name
-            .get(getter.symbol.name.as_str())
-            .into_iter()
-            .flatten()
-        {
+        for binding in python_slot_bindings(file, class, &getter.symbol.name) {
             if !work.charge() {
                 return None;
             }
-            if binding.scope == class.symbol.item_range && binding.name != range {
+            if binding.name != range && !python_property_accessor(file, getter, binding) {
                 return None;
             }
         }
-        self.python_annotation(file, *annotation, work)
+        Some((file, annotation))
     }
 
     pub(super) fn python_call_result(
@@ -675,15 +789,7 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         let file = self.files.get(class.file.path.as_str())?;
         let target = file.qualified_target(&format!("{}.{name}", class.symbol.qualified_name))?;
-        let bindings = file
-            .by_name
-            .get(name)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|binding| {
-                binding.scope == class.symbol.item_range && !file.python_module_binding(binding)
-            });
+        let bindings = python_slot_bindings(file, class, name);
         if !target.symbol.kinds.contains(&SymbolKind::Callable) {
             // An instance write through `self` before the property goes through its setter;
             // the class body declares only the property, so the slot is the property.
@@ -732,6 +838,60 @@ impl<'source> Index<'source> {
         }
         None
     }
+}
+
+/// The bindings of a class body that give `name` a value. An annotation without a value
+/// declares a type alone.
+fn python_slot_bindings<'index, 'source>(
+    file: &'index File<'source>,
+    class: Target<'source>,
+    name: &str,
+) -> impl Iterator<Item = &'source StaticBinding> + Clone + use<'index, 'source> {
+    file.by_name
+        .get(name)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(move |binding| {
+            binding.scope == class.symbol.item_range
+                && !file.python_module_binding(binding)
+                && match binding.kind {
+                    StaticBindingKind::PythonAnnotation { annotation } => {
+                        usize::try_from(annotation.end)
+                            .ok()
+                            .and_then(|end| file.document.source.get(end..))
+                            .is_some_and(|rest| {
+                                rest.trim_start_matches([' ', '\t', '\\', '\r', '\n'])
+                                    .starts_with('=')
+                            })
+                    }
+                    _ => true,
+                }
+        })
+}
+
+/// Whether `binding` is the setter or deleter that `getter` decorates.
+fn python_property_accessor(file: &File<'_>, getter: Target<'_>, binding: &StaticBinding) -> bool {
+    let Some(facet) = file.target_at(binding.name) else {
+        return false;
+    };
+    let Some(decorators) = file.text(ByteRange {
+        start: facet.symbol.range.start,
+        end: binding.name.start,
+    }) else {
+        return false;
+    };
+    let name = getter.symbol.name.as_str();
+    facet.symbol.kinds.contains(&SymbolKind::Property)
+        && facet.symbol.qualified_name == getter.symbol.qualified_name
+        && ["setter", "deleter"].iter().any(|accessor| {
+            decorators
+                .strip_prefix('@')
+                .and_then(|rest| rest.strip_prefix(name))
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.strip_prefix(accessor))
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        })
 }
 
 /// The first property facet of `target` when every binding the class body holds for the

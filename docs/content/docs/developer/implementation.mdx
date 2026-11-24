@@ -1551,8 +1551,8 @@ A declaration counts as public by its language's rule:
 - Python - names without a leading underscore
 - TypeScript - every member but `private` and `protected` ones
 - JavaScript - the declarations an `export` wraps or names, including `module.exports` and
-  `exports.name` assignments, and the members of an exported class other than a `#` private
-  element
+  `exports.name` assignments, `Object.defineProperty(exports, "name", ..)`, and the members of an
+  exported class or assigned to an exported declaration other than a `#` private element
 
 In a paired module the stub defines the public set, and a stub declaration with no implementation
 answers from the stub alone.

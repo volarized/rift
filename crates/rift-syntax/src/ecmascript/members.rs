@@ -697,6 +697,9 @@ fn method_declaration(
     if static_member {
         kinds.push(SymbolKind::Static);
     }
+    if rules.exports.declared.contains(&function.assignment.id()) {
+        kinds.push(SymbolKind::Public);
+    }
     let (documentation, documentation_ranges) =
         rules.attached_jsdoc(statement(function, rules), source)?;
     Ok(Declaration {
