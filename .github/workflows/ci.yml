@@ -676,7 +676,7 @@ jobs:
           path: target/integration.tar.zst
           key: >-
             integration-archive-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', '.config/nextest.toml', 'justfile') }}
+            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', 'vendor/**', '.config/nextest.toml', 'justfile') }}
       # The R2 secrets reach this step alone, and the sccache server it starts
       # holds them for every later compile. The Actions scope holds the write
       # pair and the Dependabot scope the read pair; a fork receives neither.
@@ -731,7 +731,7 @@ jobs:
           path: target/integration-cli.tar.zst
           key: >-
             integration-cli-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', 'justfile') }}
+            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', 'vendor/**', 'justfile') }}
       # The R2 secrets reach this step alone, and the sccache server it starts
       # holds them for every later compile. The Actions scope holds the write
       # pair and the Dependabot scope the read pair; a fork receives neither.

@@ -119,7 +119,7 @@ skip = [
   { name = "thiserror", version = "1.0.69" },
   { name = "thiserror-impl", version = "1.0.69" },
 
-  # The embedded ty stack (git-pinned ruff workspace crates) pins one older
+  # The embedded ty stack (ruff workspace crates at one pinned revision) pins one older
   # version beside the workspace's own of each entry below; none can be
   # aligned from this workspace, the ruff workspace pins them itself.
   { name = "compact_str", version = "0.9.1" },
