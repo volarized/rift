@@ -1492,6 +1492,13 @@ copy, and the analyzer checks the aggregate before allocation.
 `ArchiveLimits::from_configuration` applies `[package.archive]` when the caller decodes an archive
 before constructing package input. Archive admission and package input each enforce their selected
 bounds; increasing compressed bytes alone does not raise expanded bytes or declaration capacity.
+A refused bound returns `ArchiveError::BoundExceeded` with the bound, the observed quantity, the
+maximum, and the member path when the reader decoded one. A regular file over `member_size`
+refuses the archive unless the caller selects `OversizedMembers::Skip` through
+`ArchiveLimits::with_oversized_members`. That mode decodes the file without retaining it, so its
+size still counts toward `expanded_size` and a size that differs from its header still refuses the
+archive. `ArchiveFiles::omissions` lists each such path and size. An omitted file can be
+a source file, so the caller reads `omissions` before it treats its file selection as complete.
 
 <VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
 

@@ -1,6 +1,6 @@
 //! Reuses documentation resolution results when resolver facts stay unchanged.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use rift_protocol::documentation::{
     DOCUMENTATION_BLOCKS_CEILING, DOCUMENTATION_REFERENCES_CEILING, DOCUMENTATION_SOURCES_CEILING,
@@ -151,7 +151,7 @@ impl ResolutionCache {
         input: &ResolutionInput<'_>,
     ) -> Result<ResolutionOutput, RiftError> {
         validate_input(input)?;
-        let indexes = ResolverIndexes::new(input)?;
+        let indexes = ResolverIndexes::new(input, previous)?;
         let facts = collect_block_facts(input)?;
         let plan = ResolutionPlan::new(previous, &facts, &indexes)?;
         let affected = plan.affected_blocks(previous, &facts);
@@ -185,21 +185,78 @@ struct ResolverIndexes<'a> {
 }
 
 impl<'a> ResolverIndexes<'a> {
-    fn new(input: &ResolutionInput<'a>) -> Result<Self, RiftError> {
+    fn new(
+        input: &ResolutionInput<'a>,
+        previous: Option<&ResolutionCache>,
+    ) -> Result<Self, RiftError> {
+        let sources: BTreeMap<_, _> = input
+            .sources
+            .iter()
+            .map(|source| (&source.identity, source))
+            .collect();
+        let blocks: BTreeMap<_, _> = input
+            .blocks
+            .iter()
+            .map(|block| (&block.identity, block))
+            .collect();
+        let mut direct = HashSet::new();
+        let mut fragments = HashSet::new();
+        let mut references = input
+            .candidates
+            .iter()
+            .map(|candidate| candidate.authored.as_str())
+            .collect::<HashSet<_>>();
+        for link in input
+            .resolvable_links
+            .iter()
+            .chain(input.fixed_unresolved_links)
+        {
+            direct.insert(link.authored.as_str());
+            if let Some(source) = blocks
+                .get(&link.block)
+                .and_then(|block| sources.get(&block.source))
+                && let Ok(Destination::Local {
+                    fragment: Some(fragment),
+                    ..
+                }) = local_destination(source, &link.authored)
+                && let Ok(name) = percent_encoding::percent_decode_str(&fragment).decode_utf8()
+            {
+                fragments.insert(name.into_owned());
+            }
+        }
+        for key in previous.into_iter().flat_map(|cache| cache.states.keys()) {
+            match key {
+                DependencyKey::DirectSymbol(symbol) => {
+                    direct.insert(symbol.as_str());
+                }
+                DependencyKey::Qualified { name, .. } => {
+                    fragments.insert(name.clone());
+                }
+                DependencyKey::Reference { authored, .. } => {
+                    references.insert(authored.as_str());
+                }
+                DependencyKey::Target { .. } => {}
+            }
+        }
+        let reference_names = DeclarationNames::requested(input.declarations, &references);
+        let declaration_names =
+            DeclarationLinkNames::requested(input.declarations, &direct, &fragments);
+        rift_tracing::debug!(
+            component = "documentation",
+            operation = "documentation.requested_names",
+            declarations = input.declarations.len(),
+            direct_names = direct.len(),
+            qualified_names = fragments.len(),
+            reference_names = references.len(),
+            reference_buckets = reference_names.bucket_count(),
+            link_buckets = declaration_names.bucket_count(),
+        );
         Ok(Self {
-            sources: input
-                .sources
-                .iter()
-                .map(|source| (&source.identity, source))
-                .collect(),
-            blocks: input
-                .blocks
-                .iter()
-                .map(|block| (&block.identity, block))
-                .collect(),
+            sources,
+            blocks,
             fragments: super::links::fragment_index(input.fragments)?,
-            reference_names: DeclarationNames::new(input.declarations),
-            declaration_names: DeclarationLinkNames::new(input.declarations),
+            reference_names,
+            declaration_names,
         })
     }
 }
@@ -434,7 +491,7 @@ fn resolve_affected_blocks(
 ) -> Result<BTreeMap<DocumentationDigest, CachedBlock>, RiftError> {
     let mut results = copy_unaffected(facts, affected, previous);
     initialize_affected(&mut results, facts, affected, fingerprints)?;
-    let selected = resolve_selected(input, affected, &indexes.reference_names)?;
+    let selected = resolve_selected(input, affected, indexes)?;
     store_selected(&mut results, selected)?;
     Ok(results)
 }
@@ -452,7 +509,7 @@ struct SelectedResults {
 fn resolve_selected(
     input: &ResolutionInput<'_>,
     affected: &BTreeSet<DocumentationDigest>,
-    reference_names: &DeclarationNames<'_>,
+    indexes: &ResolverIndexes<'_>,
 ) -> Result<SelectedResults, RiftError> {
     let mut resolvable = select_links(input.resolvable_links, affected);
     let fixed = select_links(input.fixed_unresolved_links, affected);
@@ -465,10 +522,10 @@ fn resolve_selected(
     let resolved_count = resolvable.len();
     resolvable.extend(fixed);
     let mut references = super::links::resolve_declaration_links(
-        input.sources,
-        input.blocks,
+        &indexes.sources,
+        &indexes.blocks,
         &mut resolvable,
-        input.declarations,
+        &indexes.declaration_names,
     )?;
     let fixed_unresolved_links = resolvable.split_off(resolved_count);
     let candidates = input
@@ -478,16 +535,21 @@ fn resolve_selected(
         .cloned()
         .collect::<Vec<_>>();
     let (mut candidate_references, _) =
-        super::resolve_references(input.declarations, &candidates)?.into_parts();
+        super::references::resolve_indexed_references(&indexes.reference_names, &candidates)?
+            .into_parts();
     references.append(&mut candidate_references);
     let candidates = candidates
         .into_iter()
         .map(|candidate| {
-            let unresolved = reference_names.resolve(&candidate).err().map(|reason| {
-                let mut unresolved = candidate.clone();
-                unresolved.reason = reason;
-                unresolved
-            });
+            let unresolved = indexes
+                .reference_names
+                .resolve(&candidate)
+                .err()
+                .map(|reason| {
+                    let mut unresolved = candidate.clone();
+                    unresolved.reason = reason;
+                    unresolved
+                });
             (candidate, unresolved)
         })
         .collect();
@@ -1133,6 +1195,52 @@ mod tests {
     }
 
     #[test]
+    fn encoded_qualified_link_wakes_only_for_its_source_and_keeps_duplicate_claims() {
+        let sources = source_set(vec![
+            input("guide.md", "[go](lib.md#%43ompass) [bad](lib.md#%FF)\n"),
+            input("lib.md", "Compass\n"),
+            input("other.md", "Compass\n"),
+        ]);
+        let rust = Language::from_identity_segment("rust").expect("Rust");
+        let python = Language::from_identity_segment("python").expect("Python");
+        let owner = content_identity("lib.md");
+        let other = content_identity("other.md");
+        let first = super::super::collect_tests::canonical_symbol("rust", "lib.md", "Compass");
+        let second = super::super::collect_tests::canonical_symbol("python", "lib.md", "Compass");
+        let unrelated =
+            super::super::collect_tests::canonical_symbol("rust", "other.md", "Compass");
+        let mut claims = ambiguous_declarations(&owner, &first, &second, &rust, &python).to_vec();
+        let elsewhere = DocumentationDeclaration::new(
+            &unrelated,
+            &rust,
+            "Compass",
+            "Compass",
+            &other,
+            TextRange { start: 0, end: 7 },
+        )
+        .expect("other source");
+        let empty = super::super::collect_documentation(&sources, std::slice::from_ref(&elsewhere))
+            .expect("missing requested source");
+        assert!(empty.index().references.is_empty());
+        let duplicate = claims.pop().expect("second claim");
+        claims.push(elsewhere);
+        let one = super::super::collect_documentation_incremental(Some(&empty), &sources, &claims)
+            .expect("new qualified target");
+        assert_eq!(one.index().references.len(), 1);
+        assert_eq!(one.index().references[0].target, first);
+        claims.push(duplicate);
+        let ambiguous =
+            super::super::collect_documentation_incremental(Some(&one), &sources, &claims)
+                .expect("ambiguous target");
+        assert!(ambiguous.index().references.is_empty());
+        assert_parity(
+            &ambiguous,
+            &super::super::collect_documentation(&sources, &claims).expect("full comparison"),
+        );
+        assert_eq!(one.index().references[0].target, first);
+    }
+
+    #[test]
     fn ambiguous_same_source_declarations_invalidate_qualified_link() {
         let sources = source_set(vec![
             input("guide.md", "[target](lib.md#Compass)\n"),
@@ -1374,6 +1482,50 @@ mod tests {
                 .recomputed_blocks(),
             1
         );
+    }
+
+    #[test]
+    fn requested_names_include_previous_misses_and_restore_cross_language_ambiguity() {
+        let case = candidate_case();
+        let declarations = candidate_declarations(&case, true);
+        let old = resolve_candidates(None, &case, &[]);
+        let changed = resolve_candidates(old.next_cache.as_ref(), &case, &declarations);
+        let fresh = resolve_candidates(None, &case, &declarations);
+        assert_eq!(changed.references, fresh.references);
+        assert_eq!(changed.unresolved_references, fresh.unresolved_references);
+        assert!(!changed.references.is_empty());
+        assert!(
+            changed
+                .unresolved_references
+                .iter()
+                .any(|candidate| candidate.authored == "open"
+                    && candidate.reason == DocumentationUnresolvedReason::Ambiguous)
+        );
+        let previous_only = super::ResolutionInput {
+            sources: std::slice::from_ref(&case.source),
+            blocks: std::slice::from_ref(&case.block),
+            resolvable_links: &[],
+            fixed_unresolved_links: &[],
+            fragments: &[],
+            candidates: &[],
+            declarations: &declarations,
+        };
+        let fresh_index =
+            super::ResolverIndexes::new(&previous_only, None).expect("no current requests");
+        assert_eq!(fresh_index.reference_names.bucket_count(), 0);
+        let held = super::ResolverIndexes::new(&previous_only, old.next_cache.as_ref())
+            .expect("previous requests");
+        assert_eq!(
+            held.reference_names
+                .resolve_name("open", Some(&case.rust))
+                .expect("current claimant")
+                .0,
+            &case.rust_symbol
+        );
+        assert!(held.reference_names.resolve_name("open", None).is_err());
+        let restored = resolve_candidates(changed.next_cache.as_ref(), &case, &[]);
+        assert_eq!(restored.references, old.references);
+        assert_eq!(restored.unresolved_references, old.unresolved_references);
     }
 
     #[test]

@@ -232,6 +232,7 @@ impl CapturedFacts {
                     .collect(),
                 left_out_symbols: Vec::new(),
                 has_errors: self.has_errors,
+                variance_errors_only: false,
                 left_out_declarations: usize::try_from(self.left_out_declarations)
                     .expect("bounded omissions"),
                 markdown_facts: None,

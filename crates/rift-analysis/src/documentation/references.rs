@@ -1,6 +1,7 @@
 //! Exact declaration matching for authored inline code candidates.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 
 use rift_core::symbol_identity;
 use rift_protocol::documentation::{
@@ -15,6 +16,69 @@ use super::identity::canonical_digest;
 use super::input::{source_path, validate_identity};
 use rift_error::{RiftError, errors};
 
+/// One declaration spelling and the owner and language established by the canonical codec.
+#[derive(Debug)]
+pub struct DocumentationSymbol {
+    wire: SymbolId,
+    scope: Option<(rift_protocol::identity::SymbolOwner, Language)>,
+}
+
+impl DocumentationSymbol {
+    /// Reads the canonical scope once. Legacy spellings retain their original wire value.
+    #[must_use]
+    pub fn new(wire: SymbolId) -> Self {
+        let scope = rift_protocol::identity::SymbolIdentity::parse(&wire.0)
+            .ok()
+            .map(|id| (id.owner().clone(), id.language().clone()));
+        Self { wire, scope }
+    }
+
+    /// Returns the unmodified wire identity.
+    #[must_use]
+    pub const fn wire(&self) -> &SymbolId {
+        &self.wire
+    }
+
+    /// Returns the canonical owner and language when established.
+    #[must_use]
+    pub fn scope(&self) -> Option<(&rift_protocol::identity::SymbolOwner, &Language)> {
+        self.scope
+            .as_ref()
+            .map(|(owner, language)| (owner, language))
+    }
+
+    /// Validates declaration facts using this spelling's established canonical scope.
+    ///
+    /// # Errors
+    /// Returns the same source, name, identity or range refusal as raw declaration admission.
+    pub fn declaration<'a>(
+        &'a self,
+        language: &'a Language,
+        name: &'a str,
+        qualified_name: &'a str,
+        source: &'a DocumentationContentIdentity,
+        range: TextRange,
+    ) -> Result<DocumentationDeclaration<'a>, RiftError> {
+        validate_declaration(
+            &self.wire,
+            language,
+            name,
+            qualified_name,
+            source,
+            &range,
+            self.scope().map(|(_, language)| language),
+        )?;
+        Ok(DocumentationDeclaration {
+            symbol: &self.wire,
+            language,
+            name,
+            qualified_name,
+            source: Cow::Borrowed(source),
+            range,
+        })
+    }
+}
+
 /// A borrowed declaration's identity and name-resolution facts.
 #[derive(Clone, Debug)]
 pub struct DocumentationDeclaration<'declaration> {
@@ -22,7 +86,7 @@ pub struct DocumentationDeclaration<'declaration> {
     language: &'declaration Language,
     name: &'declaration str,
     qualified_name: &'declaration str,
-    source: DocumentationContentIdentity,
+    source: Cow<'declaration, DocumentationContentIdentity>,
     range: TextRange,
 }
 
@@ -40,40 +104,13 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
         source: &DocumentationContentIdentity,
         range: TextRange,
     ) -> Result<Self, RiftError> {
-        validate_identity(source)?;
-        let accepted_name = |text: &str| {
-            !text.is_empty()
-                && text.len() <= DOCUMENTATION_TEXT_BYTES_CEILING as usize
-                && !text.chars().any(char::is_control)
-        };
-        if !accepted_name(name) || !accepted_name(qualified_name) {
-            return errors::analysis::documentation_identity_invalid()
-                .field("declaration.name")
-                .fail();
-        }
-        let accepted_symbol =
-            if let Ok(identity) = rift_protocol::identity::SymbolIdentity::parse(&symbol.0) {
-                identity.language() == language
-            } else {
-                let path = declaration_path(source)?;
-                symbol.0 == symbol_identity(&language.identity_segment(), &path, qualified_name)
-            };
-        if !accepted_symbol {
-            return errors::analysis::documentation_identity_invalid()
-                .field("declaration.symbol")
-                .fail();
-        }
-        if range.end < range.start {
-            return errors::analysis::documentation_range_invalid()
-                .field("declaration.range")
-                .fail();
-        }
+        validate_declaration(symbol, language, name, qualified_name, source, &range, None)?;
         Ok(Self {
             symbol,
             language,
             name,
             qualified_name,
-            source: source.clone(),
+            source: Cow::Owned(source.clone()),
             range,
         })
     }
@@ -92,7 +129,10 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
     /// Returns the source containing the declaration.
     #[must_use]
     pub const fn source(&self) -> &DocumentationContentIdentity {
-        &self.source
+        match &self.source {
+            Cow::Borrowed(source) => source,
+            Cow::Owned(source) => source,
+        }
     }
 
     /// Returns the declaration range in its source.
@@ -100,6 +140,47 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
     pub const fn range(&self) -> &TextRange {
         &self.range
     }
+}
+
+fn validate_declaration(
+    symbol: &SymbolId,
+    language: &Language,
+    name: &str,
+    qualified_name: &str,
+    source: &DocumentationContentIdentity,
+    range: &TextRange,
+    canonical_language: Option<&Language>,
+) -> Result<(), RiftError> {
+    validate_identity(source)?;
+    let accepted_name = |text: &str| {
+        !text.is_empty()
+            && text.len() <= DOCUMENTATION_TEXT_BYTES_CEILING as usize
+            && !text.chars().any(char::is_control)
+    };
+    if !accepted_name(name) || !accepted_name(qualified_name) {
+        return errors::analysis::documentation_identity_invalid()
+            .field("declaration.name")
+            .fail();
+    }
+    let accepted_symbol = if let Some(known) = canonical_language {
+        known == language
+    } else if let Ok(identity) = rift_protocol::identity::SymbolIdentity::parse(&symbol.0) {
+        identity.language() == language
+    } else {
+        let path = declaration_path(source)?;
+        symbol.0 == symbol_identity(&language.identity_segment(), &path, qualified_name)
+    };
+    if !accepted_symbol {
+        return errors::analysis::documentation_identity_invalid()
+            .field("declaration.symbol")
+            .fail();
+    }
+    if range.end < range.start {
+        return errors::analysis::documentation_range_invalid()
+            .field("declaration.range")
+            .fail();
+    }
+    Ok(())
 }
 
 pub(super) fn declaration_path(source: &DocumentationContentIdentity) -> Result<String, RiftError> {
@@ -171,7 +252,19 @@ pub fn resolve_references(
     candidates: &[DocumentationReferenceCandidate],
 ) -> Result<ResolvedDocumentationReferences, RiftError> {
     validate_reference_counts(declarations.len(), candidates.len())?;
-    let index = DeclarationNames::new(declarations);
+    let names = candidates
+        .iter()
+        .filter(|candidate| candidate.authored.len() <= DOCUMENTATION_TEXT_BYTES_CEILING as usize)
+        .map(|candidate| candidate.authored.as_str())
+        .collect();
+    let index = DeclarationNames::requested(declarations, &names);
+    resolve_indexed_references(&index, candidates)
+}
+
+pub(super) fn resolve_indexed_references(
+    index: &DeclarationNames<'_>,
+    candidates: &[DocumentationReferenceCandidate],
+) -> Result<ResolvedDocumentationReferences, RiftError> {
     let mut references = Vec::new();
     let mut unresolved = Vec::new();
     let mut occurrences = BTreeMap::new();
@@ -262,35 +355,43 @@ pub(super) struct DeclarationNames<'declaration> {
 }
 
 impl<'declaration> DeclarationNames<'declaration> {
-    pub(super) fn new(declarations: &'declaration [DocumentationDeclaration<'_>]) -> Self {
+    pub(super) fn requested(
+        declarations: &'declaration [DocumentationDeclaration<'_>],
+        names: &HashSet<&str>,
+    ) -> Self {
         let mut index = Self {
             qualified: BTreeMap::new(),
             bare: BTreeMap::new(),
         };
         for declaration in declarations {
-            index.insert(declaration, None);
-            index.insert(declaration, Some(language_key(declaration.language)));
+            let bare = names.contains(declaration.name);
+            let qualified = declaration.qualified_name != declaration.name
+                && names.contains(declaration.qualified_name);
+            if bare || qualified {
+                for language in [None, Some(language_key(declaration.language))] {
+                    if bare {
+                        add_name(
+                            &mut index.bare,
+                            (declaration.name, language),
+                            declaration.symbol,
+                        );
+                    }
+                    if qualified {
+                        add_name(
+                            &mut index.qualified,
+                            (declaration.qualified_name, language),
+                            declaration.symbol,
+                        );
+                    }
+                }
+            }
         }
         index
     }
 
-    fn insert(
-        &mut self,
-        declaration: &'declaration DocumentationDeclaration<'_>,
-        language: Option<LanguageKey<'declaration>>,
-    ) {
-        add_name(
-            &mut self.bare,
-            (declaration.name, language),
-            declaration.symbol,
-        );
-        if declaration.qualified_name != declaration.name {
-            add_name(
-                &mut self.qualified,
-                (declaration.qualified_name, language),
-                declaration.symbol,
-            );
-        }
+    #[cfg(feature = "collector")]
+    pub(super) fn bucket_count(&self) -> usize {
+        self.bare.len() + self.qualified.len()
     }
 
     pub(super) fn resolve(
@@ -401,6 +502,50 @@ mod tests {
             authored: spelling.to_owned(),
             language: None,
             reason: DocumentationUnresolvedReason::Missing,
+        }
+    }
+
+    #[test]
+    fn canonical_documentation_symbol_matches_raw_identity_name_and_range_refusals() {
+        let rust = language();
+        let python = Language::from_identity_segment("python").expect("Python");
+        let unit = source("src/lib.rs");
+        let canonical = identity("rust", "app", "Café");
+        for (wire, language, name, start, end, accepted) in [
+            (canonical.clone(), &rust, "Café", 0, 5, true),
+            (canonical.clone(), &python, "Café", 0, 5, false),
+            (canonical.clone(), &rust, "", 0, 5, false),
+            (canonical, &rust, "Café", 7, 5, false),
+            (
+                SymbolId("rift://symbol/local/rust/app/%GG".into()),
+                &rust,
+                "Café",
+                0,
+                5,
+                false,
+            ),
+        ] {
+            let symbol = super::DocumentationSymbol::new(wire.clone());
+            let raw = DocumentationDeclaration::new(
+                &wire,
+                language,
+                name,
+                name,
+                &unit,
+                TextRange { start, end },
+            );
+            let typed = symbol.declaration(language, name, name, &unit, TextRange { start, end });
+            assert_eq!(raw.is_ok(), accepted);
+            match (raw, typed) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.symbol(), b.symbol());
+                    assert_eq!(a.source(), b.source());
+                    assert!(std::ptr::eq(b.source(), &raw const unit));
+                    assert_eq!(a.range(), b.range());
+                }
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                _ => panic!("raw and canonical admission differed"),
+            }
         }
     }
 
