@@ -69,6 +69,8 @@ pub(crate) struct StaticResolution {
     pub(crate) unavailable_sources: usize,
     pub(crate) unresolved_sites: usize,
     pub(crate) exhausted: bool,
+    /// Whether the pass, the class orders, or any file ended on its work budget.
+    pub(crate) ended: bool,
     pub(crate) edge_calls: BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
 }
 
@@ -172,6 +174,7 @@ fn resolve_by<'source>(
         }
         return StaticResolution {
             exhausted: work.exhausted,
+            ended: true,
             edge_calls,
             ..StaticResolution::default()
         };
@@ -183,7 +186,8 @@ fn resolve_by<'source>(
     };
     files(&index, &mut work, &mut resolution);
     external::admit_declared(namespace, &mut resolution.external, work_max);
-    resolution.exhausted = work.exhausted;
+    resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
+    resolution.ended |= resolution.exhausted;
     resolution
 }
 
@@ -219,6 +223,13 @@ impl FileWork {
         self.floor
             .saturating_add(file.elements().saturating_mul(self.per_element))
     }
+
+    /// The share of a captured source in the pass that orders every Python class: 128 for
+    /// each element leaves a class of three elements about 400 ancestors to merge.
+    const CLASS_ORDERS: Self = Self {
+        floor: FILE_WORK_FLOOR,
+        per_element: 128,
+    };
 
     /// How many of `files`, from the first, may run apart with `left` of the pass budget:
     /// the longest run whose shares, with the one charge each file costs the pass, fit.
@@ -447,6 +458,8 @@ struct File<'source> {
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
     python_non_none: BTreeMap<&'source str, Vec<(ByteRange, ByteRange)>>,
+    /// The receiver parameters of the methods of a Python file, by the method's range.
+    python_receivers: BTreeMap<ByteRange, Vec<&'source StaticBinding>>,
     /// The calls of a Python file by their first byte, the shortest first.
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
@@ -589,6 +602,7 @@ impl<'source> File<'source> {
             python_first_iterables: BTreeMap::new(),
             python_annotations: BTreeMap::new(),
             python_non_none: BTreeMap::new(),
+            python_receivers: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             element_types: BTreeMap::new(),
@@ -661,6 +675,12 @@ impl<'source> File<'source> {
             }
             self.by_name.entry(name).or_default().push(binding);
             match binding.kind {
+                StaticBindingKind::PythonReceiver { .. } => {
+                    self.python_receivers
+                        .entry(binding.scope)
+                        .or_default()
+                        .push(binding);
+                }
                 StaticBindingKind::PythonAnnotation { .. }
                 | StaticBindingKind::PythonFunction { .. }
                 | StaticBindingKind::PythonAlias { .. }
@@ -933,6 +953,24 @@ impl<'source> File<'source> {
             .any(|scope| !work.charge() || scope.contains(position))
     }
 
+    /// The bindings of `name` whose scope encloses `range`, each scope's in declaration
+    /// order, and with few bindings of the name every other one too.
+    fn bindings_around(
+        &self,
+        name: &str,
+        range: ByteRange,
+    ) -> impl Iterator<Item = &'source StaticBinding> + Clone + use<'source> {
+        let scopes = self
+            .by_scope
+            .get(name)
+            .and_then(|scopes| scopes.containing(range.start, range.end));
+        match scopes {
+            Some(scopes) => scopes.flatten().copied().collect::<Vec<_>>(),
+            None => self.by_name.get(name).cloned().unwrap_or_default(),
+        }
+        .into_iter()
+    }
+
     /// Reads the bindings of `name` in the smallest scope that holds `position` and a
     /// binding `admits`, in declaration order. `read` receives each with whether it is the
     /// first of its scope; a scope read before a smaller one is found starts over there.
@@ -1055,6 +1093,8 @@ struct Index<'source> {
     owners: external::Owners,
     edge_python: python_edges::EdgePythonModules,
     edge_python_classes: python_edges::ClassOrders<'source>,
+    /// The classes that declare a member, by the member's name.
+    python_members: python_edges::MemberOwners<'source>,
     python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
@@ -1133,13 +1173,15 @@ impl<'source> Index<'source> {
             owners,
             edge_python,
             edge_python_classes: python_edges::ClassOrders::default(),
+            python_members: python_edges::MemberOwners::default(),
             python_writes,
             syntax_publication,
             unavailable_sources,
             #[cfg(test)]
             performed: std::sync::atomic::AtomicUsize::new(0),
         };
-        index.edge_python_classes = index.python_class_orders(work)?;
+        index.python_members = index.python_member_owners(work)?;
+        index.edge_python_classes = index.python_class_orders(FileWork::CLASS_ORDERS, work);
         Some(index)
     }
 
@@ -1673,6 +1715,7 @@ impl StaticResolution {
         self.unresolved_sites += apart.unresolved_sites;
         if over_share {
             self.unavailable_sources += 1;
+            self.ended = true;
         }
         let unit = file.document.placement.unit();
         if let Some((coverage, apart)) = self

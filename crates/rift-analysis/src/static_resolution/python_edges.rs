@@ -9,7 +9,7 @@ mod receiver_guards;
 mod references;
 mod slots;
 
-pub(super) use classes::ClassOrders;
+pub(super) use classes::{ClassOrders, MemberOwners};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -259,12 +259,10 @@ impl<'source> Index<'source> {
             }
         }
         let caller = file.enclosing_callable(call.range)?;
-        for binding in file.facts.bindings() {
+        let receivers = file.python_receivers.get(&caller.symbol.item_range)?;
+        for &binding in receivers {
             if !work.charge() {
                 return None;
-            }
-            if binding.scope != caller.symbol.item_range {
-                continue;
             }
             if let StaticBindingKind::PythonReceiver { class_name } = binding.kind {
                 let selected = edge_python_binding(
@@ -635,7 +633,11 @@ fn edge_python_binding<'source>(
             .body_range
             .is_some_and(|body| body.contains(position))
     });
-    let bindings = file.by_name.get(name)?;
+    let around = ByteRange {
+        start: position,
+        end: position.checked_add(1)?,
+    };
+    let bindings = &file.bindings_around(name, around).collect::<Vec<_>>();
     let mut excluded = BTreeSet::new();
     let mut global = false;
     let mut nonlocal = false;

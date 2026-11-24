@@ -65,7 +65,7 @@ fn analyzed(modules: &[(String, String)], syntax_depth_max: usize) -> Vec<String
         PackageImportRoot::new(None, names, PackageImportRootOrigin::Wheel).expect("fixture root"),
     ];
     let syntax = SyntaxLimits::new(1 << 24, 1 << 22, syntax_depth_max).expect("syntax limits");
-    let limits = ExactPackageLimits::new(2_048, 1 << 26).with_syntax(syntax);
+    let limits = ExactPackageLimits::new(8_192, 1 << 26).with_syntax(syntax);
     let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
         .expect("fixture input")
         .with_import_roots(&roots)
@@ -128,45 +128,71 @@ fn values_that_construct_each_other_end() {
 /// The last link of a chain.
 const LAST: usize = LINKS - 1;
 
-/// Analyzes one module that holds `links`, and returns its edge count.
-fn chained(text: String) -> usize {
-    edges(&module(text), 65_536).len()
+/// The edges of one module at the deepest supported syntax.
+fn chained(text: String) -> Vec<String> {
+    edges(&module(text), 65_536)
+}
+
+/// Every edge of `expected` is in `found`, which holds `count` edges.
+fn assert_edges(found: &[String], count: usize, expected: &[&str]) {
+    for edge in expected {
+        assert!(
+            found.iter().any(|found| found == edge),
+            "{edge} of {}",
+            found.len()
+        );
+    }
+    assert_eq!(found.len(), count);
 }
 
 #[test]
 fn a_chain_of_constructed_values_ends() {
     let links = chain(|link, before| format!("a{link} = a{before}()"));
-    assert!(chained(format!("{CLASS}a0 = C\n{links}a{LAST}.m()\n")) > 0);
+    let found = chained(format!("{CLASS}a0 = C\n{links}a{LAST}.m()\n"));
+    assert_edges(
+        &found,
+        1003,
+        &["module/C -> module/C/m", "module -> module/C"],
+    );
 }
 
 #[test]
 fn a_chain_of_constructed_attributes_ends() {
     let links = chain(|link, before| format!("        self.a{link} = self.a{before}()"));
-    assert!(
-        chained(format!(
-            "{CLASS}class A:\n    def f(self):\n        self.a0 = C\n{links}        self.a{LAST}.m()\n"
-        )) > 0
+    let found = chained(format!(
+        "{CLASS}class A:\n    def f(self):\n        self.a0 = C\n{links}        self.a{LAST}.m()\n"
+    ));
+    assert_edges(
+        &found,
+        3005,
+        &["module/A -> module/A/f", "module/A/f -> module/A/a998"],
     );
 }
 
 #[test]
 fn a_chain_of_aliases_ends() {
     let links = chain(|link, before| format!("a{link} = a{before}"));
-    assert!(
-        chained(format!(
-            "{CLASS}a0 = C\n{links}a{LAST}().m()\nclass D(a{LAST}): pass\n"
-        )) > 0
+    let found = chained(format!(
+        "{CLASS}a0 = C\n{links}a{LAST}().m()\nclass D(a{LAST}): pass\n"
+    ));
+    assert_edges(
+        &found,
+        1008,
+        &[
+            "module -> module/C/m",
+            "module/D -> module/C",
+            "module/D -> module/a999",
+        ],
     );
 }
 
 #[test]
 fn a_chain_of_container_aliases_ends() {
     let links = chain(|link, before| format!("a{link} = a{before}"));
-    assert!(
-        chained(format!(
-            "{CLASS}from typing import List\na0: List[C] = []\n{links}for x in a{LAST}:\n    x.m()\n"
-        )) > 0
-    );
+    let found = chained(format!(
+        "{CLASS}from typing import List\na0: List[C] = []\n{links}for x in a{LAST}:\n    x.m()\n"
+    ));
+    assert_edges(&found, 1005, &["module -> module/a998"]);
 }
 
 #[test]
@@ -174,37 +200,74 @@ fn a_chain_of_container_elements_ends() {
     let links = chain(|link, before| {
         format!("    xs{link}: \"List[x{before}]\" = []\n    for x{link} in xs{link}: pass")
     });
-    assert!(
-        chained(format!(
-            "{CLASS}from typing import List\ndef f(xs0: List[C]):\n    for x0 in xs0: pass\n{links}    x{LAST}.m()\n"
-        )) > 0
-    );
+    let found = chained(format!(
+        "{CLASS}from typing import List\ndef f(xs0: List[C]):\n    for x0 in xs0: pass\n{links}    x{LAST}.m()\n"
+    ));
+    assert_edges(&found, 1005, &["module/C -> module/C/m"]);
 }
 
 #[test]
 fn a_chain_of_reexports_ends() {
-    // Every name of the chain is an import of its own, so the work is quadratic.
-    let links = LINKS / 4;
-    let last = links - 1;
-    let exports = chain_of(links, |link, before| {
-        format!("from module import a{before} as a{link}")
-    });
+    let exports = chain(|link, before| format!("from module import a{before} as a{link}"));
     let found = edges(
         &module(format!(
-            "from outside import a0\n{exports}class K(a{last}): pass\n"
+            "{CLASS}from module import C as a0\n{exports}class K(a{LAST}): pass\nK().m()\n"
         )),
         512,
     );
-    assert!(!found.is_empty());
+    assert_edges(
+        &found,
+        1008,
+        &["module/K -> module/C", "module -> module/C/m"],
+    );
+}
+
+// Issue #1065.
+#[test]
+fn a_long_base_class_chain_keeps_the_edges_of_its_file() {
+    const CLASSES: usize = 10_000;
+    let sentinel = "class Zed:\n    def m(self): pass\ndef sentinel(z: Zed):\n    z.m()\n";
+    let last = CLASSES - 1;
+    let links = chain_of(CLASSES, |link, before| {
+        format!("class C{link}(C{before}): pass")
+    });
+    let found = chained(format!(
+        "{sentinel}class C0:\n    def m(self): pass\n{links}C{last}().m()\n"
+    ));
+    assert_edges(
+        &found,
+        30_008,
+        &[
+            "module/sentinel -> module/Zed/m",
+            "module/C9999 -> module/C9998",
+            "module -> module/C0/m",
+        ],
+    );
+    let links =
+        chain(|link, before| format!("class C{link}(C{before}):\n    def m(self): super().m()"));
+    let found = chained(format!(
+        "{sentinel}class C0:\n    def m(self): pass\n{links}C{LAST}().m()\n"
+    ));
+    assert_edges(
+        &found,
+        7 * LINKS + 4,
+        &[
+            "module/sentinel -> module/Zed/m",
+            "module/C999/m -> module/C998/m",
+        ],
+    );
 }
 
 #[test]
 fn a_chain_of_bases_ends() {
     let links = chain(|link, before| format!("class C{link}(C{before}): pass"));
-    assert!(
-        chained(format!(
-            "class C0:\n    def m(self): pass\n{links}C{LAST}().m()\n"
-        )) > 0
+    let found = chained(format!(
+        "class C0:\n    def m(self): pass\n{links}C{LAST}().m()\n"
+    ));
+    assert_edges(
+        &found,
+        3002,
+        &["module -> module/C0/m", "module/C999 -> module/C998"],
     );
 }
 
@@ -214,11 +277,13 @@ fn a_chain_of_returns_ends() {
         format!("class C{link}:\n    def n(self) -> \"C{before}\": return C{before}()")
     });
     let calls = ".n()".repeat(LAST);
-    assert!(
-        chained(format!(
-            "{CLASS}class C0(C): pass\n{links}def f(x: C{LAST}):\n    x{calls}.m()\n"
-        )) > 0
-    );
+    let found = chained(format!(
+        "{CLASS}class C0(C): pass\n{links}def f(x: C{LAST}):\n    x{calls}.m()\n"
+    ));
+    for link in LAST - 9..=LAST {
+        let edge = format!("module/f -> module/C{link}/n");
+        assert!(found.contains(&edge), "{edge} of {}", found.len());
+    }
 }
 
 #[test]
@@ -226,10 +291,13 @@ fn a_chain_of_functions_ends() {
     let links = chain(|link, before| {
         format!("def f{link}() -> C:\n    return f{before}()\na{link} = f{before}()")
     });
-    assert!(
-        chained(format!(
-            "{CLASS}def f0() -> C: ...\n{links}a{LAST}.m()\nf{LAST}().m()\n"
-        )) > 0
+    let found = chained(format!(
+        "{CLASS}def f0() -> C: ...\n{links}a{LAST}.m()\nf{LAST}().m()\n"
+    ));
+    assert_edges(
+        &found,
+        5004,
+        &["module -> module/C/m", "module/f999 -> module/f998"],
     );
 }
 
@@ -238,10 +306,13 @@ fn a_chain_of_arguments_ends() {
     let links = chain(|link, before| {
         format!("def f{link}(x) -> C: ...\na{link} = f{before}(f{link}(a{before}))")
     });
-    assert!(
-        chained(format!(
-            "{CLASS}def f0(x) -> C: ...\na0 = C()\n{links}a{LAST}.m()\n"
-        )) > 0
+    let found = chained(format!(
+        "{CLASS}def f0(x) -> C: ...\na0 = C()\n{links}a{LAST}.m()\n"
+    ));
+    assert_edges(
+        &found,
+        5003,
+        &["module -> module/C/m", "module -> module/f999"],
     );
 }
 
@@ -258,7 +329,9 @@ fn a_chain_of_receivers_keeps_the_edges_of_its_file() {
 }
 
 #[test]
-fn a_chain_of_modules_ends() {
+fn a_chain_of_module_aliases_names_the_last_one() {
+    // Every module follows the aliases before it, so the work is quadratic.
+    const MODULES: usize = LINKS / 4;
     let text = |link: usize| match link {
         0 => format!("{CLASS}a = C\n"),
         link => format!(
@@ -266,7 +339,7 @@ fn a_chain_of_modules_ends() {
             link - 1
         ),
     };
-    let names = (0..LINKS / 4)
+    let names = (0..MODULES)
         .map(|link| format!("chain/m{link}"))
         .collect::<Vec<_>>();
     let mut modules = names
@@ -275,7 +348,14 @@ fn a_chain_of_modules_ends() {
         .map(|(link, name)| (name.as_str(), text(link)))
         .collect::<Vec<_>>();
     modules.push(("chain/__init__", String::new()));
-    assert!(!edges(&modules, 512).is_empty());
+    let found = edges(&modules, 512);
+    for edge in ["chain/m1 -> chain/m0/C/m", "chain/m249 -> chain/m248/a"] {
+        assert!(
+            found.contains(&edge.to_owned()),
+            "{edge} of {}",
+            found.len()
+        );
+    }
 }
 
 #[test]
