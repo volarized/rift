@@ -1748,6 +1748,19 @@ fn package_entries_take_declared_types_in_the_compiler_order() {
         ("", vec!["index.d.ts"], Some("index.d.ts")),
         ("", vec!["index.ts", "index.d.ts"], None),
         ("", vec!["index.tsx", "index.d.ts"], None),
+        (r#","main":"""#, vec!["index.d.ts"], Some("index.d.ts")),
+        (r#","main":".""#, vec!["index.d.ts"], Some("index.d.ts")),
+        (
+            r#","main":"./index.d.ts""#,
+            vec!["index.d.ts"],
+            Some("index.d.ts"),
+        ),
+        (
+            r#","main":"lib/types.d.mts""#,
+            vec!["index.d.ts", "lib/types.d.mts"],
+            Some("lib/types.d.mts"),
+        ),
+        (r#","main":"../index.d.ts""#, vec!["index.d.ts"], None),
         (r#","main":"./lib.js""#, vec!["index.d.ts"], None),
     ] {
         let files = members
