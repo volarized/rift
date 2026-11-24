@@ -183,11 +183,23 @@ pub enum StaticBindingKind {
     },
     /// A Python name assigned the `None` literal.
     PythonNone,
-    /// A Python `for` loop target bound to each element of the iterated value.
+    /// A Python `for` target, in a loop or a comprehension, bound to each element of the
+    /// iterated value or to one part of it.
     PythonElement {
         /// Authored iterated expression.
         iterable: ByteRange,
+        /// Place of the name in the target, absent for a target of one name.
+        position: Option<PythonPosition>,
     },
+    /// A Python assignment target bound to one part of the assigned value.
+    PythonUnpacked {
+        /// Authored value: a name, a member or a call.
+        value: ByteRange,
+        /// Place of the target among the targets.
+        position: PythonPosition,
+    },
+    /// A Python name assigned an empty list literal.
+    PythonEmptyList,
     /// A write to a Python member slot, separate from lexical bindings.
     PythonMemberWrite {
         /// Authored receiver of the assignment target.
@@ -231,6 +243,15 @@ pub enum StaticBindingKind {
         /// Authored initializer expression.
         initializer: ByteRange,
     },
+}
+
+/// Place of one name in a Python target that unpacks a value without a starred name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonPosition {
+    /// Zero-based place of the name.
+    pub index: u32,
+    /// Number of parts the target unpacks.
+    pub count: u32,
 }
 
 /// One named export forwarded directly from another module.
@@ -439,6 +460,9 @@ pub struct StaticFactsParts {
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
     /// after later statements of the enclosing scope.
     pub expression_scopes: Vec<ByteRange>,
+    /// Python comprehensions and the iterable of their first clause, which the enclosing scope
+    /// evaluates.
+    pub first_iterables: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -717,6 +741,12 @@ impl StaticFacts {
         &self.0.expression_scopes
     }
 
+    /// Python comprehensions and the iterable of their first clause.
+    #[must_use]
+    pub fn first_iterables(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.first_iterables
+    }
+
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     #[must_use]
     pub fn non_none_guards(&self) -> &[(ByteRange, ByteRange)] {
@@ -763,6 +793,7 @@ impl StaticFacts {
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
+            vector_capacity(&self.0.first_iterables),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_direct_writes),
             vector_capacity(&self.0.closure_calls),
@@ -825,6 +856,7 @@ impl StaticFacts {
             self.receiver_arguments().len(),
             self.loops().len(),
             self.expression_scopes().len(),
+            self.first_iterables().len(),
             self.non_none_guards().len(),
             self.commonjs_direct_writes().len(),
             self.closure_calls().len(),
@@ -921,6 +953,7 @@ impl StaticFacts {
         self.assignments()
             .iter()
             .chain(self.function_writes())
+            .chain(self.commonjs_direct_writes())
             .copied()
             .all(valid)
             && self.member_copies().iter().all(|copy| {
@@ -1025,12 +1058,7 @@ impl StaticFacts {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
         let rust = self.rust_rows_valid(&valid, limits);
-        let flow = self
-            .loops()
-            .iter()
-            .chain(self.expression_scopes())
-            .copied()
-            .all(valid);
+        let flow = self.python_flow_valid(valid);
         if !(edges
             && references
             && declared_types
@@ -1050,16 +1078,27 @@ impl StaticFacts {
             && unsupported
             && implementations
             && rust
-            && flow
-            && self.0.commonjs_direct_writes.iter().all(|row| valid(*row))
-            && self
-                .non_none_guards()
-                .iter()
-                .all(|(name, body)| valid(*name) && valid(*body) && name.end <= body.start))
+            && flow)
         {
             return errors::syntax::facts_range_invalid().fail();
         }
         Ok(())
+    }
+
+    fn python_flow_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
+        self.loops()
+            .iter()
+            .chain(self.expression_scopes())
+            .copied()
+            .all(&valid)
+            && self
+                .first_iterables()
+                .iter()
+                .all(|(scope, iterable)| valid(*iterable) && contains(*scope, *iterable))
+            && self
+                .non_none_guards()
+                .iter()
+                .all(|(name, body)| valid(*name) && valid(*body) && name.end <= body.start)
     }
 }
 
@@ -1108,7 +1147,12 @@ impl StaticBinding {
                 decorator,
             } => valid(annotation) && decorator.is_none_or(&valid),
             StaticBindingKind::PythonAlias { value } => valid(value),
-            StaticBindingKind::PythonElement { iterable } => valid(iterable),
+            StaticBindingKind::PythonElement { iterable, position } => {
+                valid(iterable) && position.is_none_or(|position| position.index < position.count)
+            }
+            StaticBindingKind::PythonUnpacked { value, position } => {
+                valid(value) && position.index < position.count
+            }
             StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
@@ -1116,6 +1160,7 @@ impl StaticBinding {
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
             | StaticBindingKind::PythonNone
+            | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonGlobal
             | StaticBindingKind::PythonNonlocal
             | StaticBindingKind::RustTypeParameter => true,
@@ -1229,6 +1274,17 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn finish(self) -> StaticFacts {
         self.facts
+    }
+
+    /// Finishes a Python capture with the facts that need the whole tree.
+    pub(crate) fn finish_python(
+        mut self,
+        root: tree_sitter::Node<'_>,
+    ) -> Result<StaticFacts, RiftError> {
+        if let Grammar::Python(kinds) = self.grammar {
+            kinds.close_lists(root, self.source, &mut self.facts.0)?;
+        }
+        Ok(self.facts)
     }
 
     pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {

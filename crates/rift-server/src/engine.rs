@@ -2058,10 +2058,10 @@ answer() {
 }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  file=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | sed 's|.*/||; s|"$||')
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
+  case "$body" in *'"uri":"'*) file=${body#*\"uri\":\"}; file=${file%%\"*}; file=${file##*/} ;; *) file= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       answer "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
@@ -2076,7 +2076,7 @@ while IFS= read -r header; do
     *'"method":"exit"'*)
       exit 0 ;;
     *'"id":'[0-9]*)
-      printf '%s\n' "$body" | grep -o '"method":"[^"]*"' | head -1 | sed 's/"method":"//; s/"$//' >> "$log"
+      method=${body#*\"method\":\"}; echo "${method%%\"*}" >> "$log"
       answer "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"file:///lib.rs\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]}" ;;
   esac
 done
@@ -2858,9 +2858,9 @@ done
 asked=0
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
@@ -3262,9 +3262,9 @@ done
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}" ;;
@@ -3431,9 +3431,9 @@ done
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;

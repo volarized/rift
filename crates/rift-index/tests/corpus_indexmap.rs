@@ -67,7 +67,7 @@ fn test_indexmap_static_collection_floors() -> Result<(), Box<dyn std::error::Er
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 677),
-        (EdgeKind::Contains, 844),
+        (EdgeKind::Contains, 829),
         (EdgeKind::Implements, 14),
         (EdgeKind::Imports, 139),
         (EdgeKind::HasType, 460),

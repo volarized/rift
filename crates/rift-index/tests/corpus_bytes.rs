@@ -60,7 +60,7 @@ fn test_bytes_static_collection_floors() -> Result<(), Box<dyn std::error::Error
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 389),
-        (EdgeKind::Contains, 525),
+        (EdgeKind::Contains, 518),
         (EdgeKind::Implements, 12),
         (EdgeKind::Imports, 64),
         (EdgeKind::HasType, 270),

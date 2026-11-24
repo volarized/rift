@@ -51,9 +51,9 @@ pub use provider::{SyntaxBound, SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use static_analysis::{
-    HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticCommonJsExport,
-    StaticConditionalItem, StaticDeclaredReturn, StaticFacts, StaticFactsParts,
-    StaticFunctionContext, StaticInherentImpl, StaticLiteralMember, StaticMember,
+    HeritageEdge, PythonPosition, StaticBinding, StaticBindingKind, StaticCall, StaticCallee,
+    StaticCommonJsExport, StaticConditionalItem, StaticDeclaredReturn, StaticFacts,
+    StaticFactsParts, StaticFunctionContext, StaticInherentImpl, StaticLiteralMember, StaticMember,
     StaticMemberAlias, StaticMemberCallback, StaticMemberCopy, StaticParameter, StaticReexport,
     StaticReference, StaticRustUse,
 };

@@ -244,6 +244,80 @@ fn test_rust_reexport_and_implementation_of_one_type_are_two_symbols() {
     }
 }
 
+/// A read lists the declaration that defines a symbol before the implementations of it and
+/// their members, whichever file sorts first (#1025).
+#[test]
+fn test_rust_definition_is_the_first_declaration_in_every_file_order() {
+    for module in ["facade", "zfacade"] {
+        let root = format!("pub mod task;\npub mod {module};\n");
+        let (_directory, index) = fixture_index(
+            PLAIN_MANIFEST,
+            &[
+                ("src/lib.rs", &root),
+                (
+                    "src/task.rs",
+                    "impl Drop for Task { fn drop(&mut self) {} }\npub struct Task { pub size: u8 }\n",
+                ),
+                (
+                    &format!("src/{module}.rs"),
+                    "pub use crate::task::Task;\nimpl Task { pub fn size(&self) -> u8 { 1 } }\npub mod inner { use crate::task::Task; impl Clone for Task { fn clone(&self) -> Self { Task { size: 0 } } } }\n",
+                ),
+            ],
+        );
+        let view = index.symbol_view().expect("symbols");
+        for (name, kind, total) in [
+            ("task/Task", "struct", 4),
+            ("task/Task/size", "field_declaration", 2),
+        ] {
+            let id = rift_core::SymbolId::new(format!("rift://symbol/local/rust/fixture/{name}"))
+                .expect("identity");
+            let object = view
+                .object_by_identity(&id)
+                .expect("object")
+                .expect("a declared symbol");
+            assert_eq!(object.facts().kind().0, kind, "{module}: {name}");
+            assert_eq!(
+                object.facts().visibility_spelling(),
+                Some("pub"),
+                "{module}: {name}"
+            );
+            let (held, count) = view
+                .symbols_by_identity_page(&id, 0, 10)
+                .expect("declarations");
+            assert_eq!(
+                (count, held[0].symbol.kind),
+                (total, kind),
+                "{module}: {name}"
+            );
+            assert_eq!(held[0].file.path().as_str(), "src/task.rs");
+            let (read, _) = index
+                .declarations_by_identity_page(&id, 0, 10)
+                .expect("declarations");
+            let first = held[0].symbol.item_range;
+            assert_eq!(
+                (read[0].range.start, read[0].range.end),
+                (first.start, first.end)
+            );
+            for (ordinal, declaration) in held.iter().enumerate() {
+                let position = declaration
+                    .file
+                    .syntax()
+                    .symbols()
+                    .iter()
+                    .position(|symbol| std::ptr::eq(symbol, declaration.symbol))
+                    .expect("held symbol");
+                assert_eq!(
+                    index
+                        .declaration_address(declaration.file.path(), position)
+                        .expect("address"),
+                    Some((id.clone(), ordinal)),
+                    "{module}: {name}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn test_rust_binding_does_not_shadow_its_own_initializer() {
     let directory = tempfile::tempdir().expect("workspace");
