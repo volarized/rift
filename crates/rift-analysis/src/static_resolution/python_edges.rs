@@ -332,18 +332,10 @@ impl<'source> Index<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<(Value<'source>, &'source str)> {
-        let mut prefix = None;
-        for call in file.python_calls.get(&range.start).into_iter().flatten() {
-            if !work.charge() {
-                return None;
-            }
-            if call.range.end <= range.end
-                && prefix.is_none_or(|previous: &StaticCall| previous.range.end < call.range.end)
-            {
-                prefix = Some(*call);
-            }
+        if !work.charge() {
+            return None;
         }
-        if let Some(call) = prefix {
+        if let Some(call) = file.python_longest_call(range) {
             let target = self.edge_python_call(file, call, work)?;
             let class = self.python_call_result(target, work)?;
             let rest = file
@@ -604,6 +596,15 @@ impl<'source> Index<'source> {
                 _ => return None,
             }
         }
+    }
+}
+
+impl<'source> File<'source> {
+    /// The longest call that starts where `range` starts and lies inside it.
+    fn python_longest_call(&self, range: ByteRange) -> Option<&'source StaticCall> {
+        let calls = self.python_calls.get(&range.start)?;
+        let inside = calls.partition_point(|call| call.range.end <= range.end);
+        calls.get(..inside)?.last().copied()
     }
 }
 

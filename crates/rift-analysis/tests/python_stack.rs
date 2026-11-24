@@ -246,13 +246,15 @@ fn a_chain_of_arguments_ends() {
 }
 
 #[test]
-fn a_chain_of_receivers_ends() {
+fn a_chain_of_receivers_keeps_the_edges_of_its_file() {
     let calls = ".n()".repeat(LAST);
     let text = format!(
         "class C:\n    def n(self) -> \"C\": return self\n    def m(self): pass\ndef f(x: C):\n    \
         x{calls}.m()\ndef g(x: C):\n    x.n().n().m()\n"
     );
-    edges(&module(text), 65_536);
+    let found = edges(&module(text), 65_536);
+    let called = "module/g -> module/C/m".to_owned();
+    assert!(found.contains(&called), "{} edges", found.len());
 }
 
 #[test]
