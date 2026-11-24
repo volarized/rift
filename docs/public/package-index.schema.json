@@ -1495,7 +1495,7 @@
           "items": {
             "$ref": "#/$defs/WheelTag"
           },
-          "maxItems": 64,
+          "maxItems": 1024,
           "type": "array"
         }
       },

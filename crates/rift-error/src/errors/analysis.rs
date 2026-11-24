@@ -187,8 +187,10 @@ __rift_error_definition!(
     message = "selected artifact field {field} is invalid: {violation}",
     action = "replace or rebuild the invalid publication, then retry",
     fields = {
+        bound: optional(unsigned),
         cause: optional(cause),
         field: required(string),
+        observed: optional(unsigned),
         violation: required(string),
     },
 );
