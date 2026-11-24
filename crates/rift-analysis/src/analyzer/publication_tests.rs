@@ -11,6 +11,7 @@ mod aliases;
 mod commonjs_literals;
 mod facts;
 mod graph;
+mod internal_modules;
 mod module_imports;
 mod returned_callables;
 mod rust_guard;

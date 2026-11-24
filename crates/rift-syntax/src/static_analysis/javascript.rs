@@ -4,9 +4,9 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBinding, StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts,
-    StaticFunctionContext, StaticMember, StaticMemberCopy, StaticParameter, StaticReexport,
-    StaticReference, binding, call, enclosing, field, identifier, kind,
+    StaticBinding, StaticBindingKind, StaticBodyMember, StaticCallee, StaticDeclaredReturn,
+    StaticFactsParts, StaticFunctionContext, StaticMember, StaticMemberCopy, StaticParameter,
+    StaticReexport, StaticReference, binding, call, enclosing, field, identifier, kind,
 };
 use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
@@ -363,9 +363,13 @@ impl Kinds {
         let id = syntax_element.kind_id();
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
+        self.record_body_member(visited, facts)?;
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
+        self.record_module_statement(visited, facts);
         self.record_module_syntax(visited, source, facts);
+        self.record_commonjs_write(visited, source, facts)?;
+        self.record_skippable(visited, facts)?;
         self.record_reference(visited, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
@@ -543,6 +547,215 @@ impl Kinds {
                 .push((byte_range(element)?, byte_range(object)?));
         }
         Ok(())
+    }
+
+    /// Records a member of an object literal, a type literal or a class with the syntax
+    /// element that holds the literal or class.
+    fn record_body_member(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let member = visited.syntax_element();
+        let Some(body) = self.member_body(visited) else {
+            return Ok(());
+        };
+        // A class expression is one value, whose holder stands around the class itself.
+        let body = match body.parent() {
+            Some(class) if body.syntax_element().kind_id() == self.scopes[7] => class,
+            _ => body,
+        };
+        // The syntax walk has admitted every enclosing element's depth.
+        let mut holder = body.parent();
+        while let Some(outer) = holder.filter(|outer| {
+            matches!(
+                outer.syntax_element().kind(),
+                "parenthesized_expression"
+                    | "parenthesized_type"
+                    | "as_expression"
+                    | "satisfies_expression"
+                    | "type_assertion"
+                    | "non_null_expression"
+                    | "type_annotation"
+            )
+        }) {
+            holder = outer.parent();
+        }
+        if let Some(holder) = holder {
+            facts.body_members.push(StaticBodyMember {
+                member: byte_range(member)?,
+                body: byte_range(body.syntax_element())?,
+                holder: byte_range(holder.syntax_element())?,
+            });
+        }
+        Ok(())
+    }
+
+    /// The object literal, type literal or class body a member is written in. A parameter of
+    /// a class method that declares a property is a member of the class.
+    fn member_body<'walk, 'tree>(
+        &self,
+        visited: Visited<'walk, 'tree>,
+    ) -> Option<Visited<'walk, 'tree>> {
+        let member = visited.syntax_element();
+        let parent = visited.parent()?;
+        let id = parent.syntax_element().kind_id();
+        if id == self.parameters && self.parameter_wrappers.contains(&member.kind_id()) {
+            let mut cursor = member.walk();
+            let property = member.children(&mut cursor).any(|child| {
+                matches!(
+                    child.kind(),
+                    "accessibility_modifier" | "override_modifier" | "readonly"
+                )
+            });
+            return parent
+                .parent()
+                .filter(|_| property)
+                .and_then(Visited::parent)
+                .filter(|body| body.syntax_element().kind_id() == self.scopes[7]);
+        }
+        let type_literal = self
+            .type_shapes
+            .as_ref()
+            .is_some_and(|shapes| shapes.signature_holders[1] == id);
+        ((id == self.object_literal[0] || id == self.scopes[7] || type_literal)
+            && matches!(
+                member.kind(),
+                "pair"
+                    | "shorthand_property_identifier"
+                    | "method_definition"
+                    | "property_signature"
+                    | "method_signature"
+                    | "abstract_method_signature"
+                    | "field_definition"
+                    | "public_field_definition"
+            ))
+        .then_some(parent)
+    }
+
+    /// Records a write of `module.exports` or of a computed key of `module` that runs while
+    /// its file does, and whether no condition encloses it.
+    fn record_commonjs_write(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
+        if element.kind_id() != self.assignment[0]
+            || !element.child_by_field_id(self.left).is_some_and(|left| {
+                text(left, source) == Some("module.exports")
+                    || (left.kind_id() == self.subscript
+                        && left
+                            .child_by_field_id(self.object)
+                            .and_then(|object| text(object, source))
+                            == Some("module"))
+            })
+        {
+            return Ok(());
+        }
+        let mut always = true;
+        // The syntax walk has admitted every enclosing element's depth.
+        let mut parent = visited.parent();
+        while let Some(candidate) = parent {
+            let id = candidate.syntax_element().kind_id();
+            if id == self.scopes[0] {
+                facts.commonjs_writes.push((byte_range(element)?, always));
+                break;
+            }
+            let called = self.immediately_called(candidate);
+            if !called && (id == self.scopes[7] || self.function_scopes.contains(&id)) {
+                break;
+            }
+            always &= called
+                || same_branches(candidate.syntax_element(), source)
+                || matches!(
+                    candidate.syntax_element().kind(),
+                    "assignment_expression"
+                        | "call_expression"
+                        | "else_clause"
+                        | "expression_statement"
+                        | "lexical_declaration"
+                        | "parenthesized_expression"
+                        | "statement_block"
+                        | "variable_declaration"
+                        | "variable_declarator"
+                );
+            parent = candidate.parent();
+        }
+        Ok(())
+    }
+
+    /// Records the source that the first `return` of the file or of an immediately called
+    /// function can skip.
+    fn record_skippable(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
+        if element.kind_id() != self.return_statement {
+            return Ok(());
+        }
+        // The syntax walk has admitted every enclosing element's depth.
+        let mut parent = visited.parent();
+        while let Some(candidate) = parent {
+            if self
+                .function_scopes
+                .contains(&candidate.syntax_element().kind_id())
+            {
+                break;
+            }
+            parent = candidate.parent();
+        }
+        let Some(function) = parent.filter(|function| {
+            function.syntax_element().kind_id() == self.scopes[0]
+                || self.immediately_called(*function)
+        }) else {
+            return Ok(());
+        };
+        let skipped = crate::ByteRange {
+            start: byte_range(element)?.start,
+            end: byte_range(function.syntax_element())?.end,
+        };
+        if facts
+            .skippable
+            .last()
+            .is_none_or(|last| !last.encloses(skipped))
+        {
+            facts.skippable.push(skipped);
+        }
+        Ok(())
+    }
+
+    /// Whether a function expression is called where it is written: `(function () { .. })()`.
+    fn immediately_called(&self, function: Visited<'_, '_>) -> bool {
+        let element = function.syntax_element();
+        if element.kind_id() != self.named_expression[0]
+            || element.child(0).map(|first| first.kind()) == Some("async")
+        {
+            return false;
+        }
+        let mut callee = function;
+        while let Some(outer) = callee
+            .parent()
+            .filter(|outer| outer.syntax_element().kind_id() == self.parenthesized)
+        {
+            callee = outer;
+        }
+        callee.parent().is_some_and(|call| {
+            call.syntax_element().kind_id() == self.call
+                && call.syntax_element().child_by_field_id(self.callee)
+                    == Some(callee.syntax_element())
+        })
+    }
+
+    fn record_module_statement(&self, visited: Visited<'_, '_>, facts: &mut StaticFactsParts) {
+        facts.javascript_module_statement |= [self.import, self.export]
+            .contains(&visited.syntax_element().kind_id())
+            && visited
+                .parent()
+                .is_some_and(|parent| parent.syntax_element().kind_id() == self.scopes[0]);
     }
 
     fn record_module_syntax(
@@ -2201,6 +2414,29 @@ impl Kinds {
         }
         Ok(())
     }
+}
+
+/// Whether an `if` statement runs the same source whether its condition holds or not.
+fn same_branches(statement: Node<'_>, source: &str) -> bool {
+    if statement.kind() != "if_statement" {
+        return false;
+    }
+    let branch = |element: Node<'_>| {
+        let written = text(element, source)?.trim();
+        let written = written
+            .strip_prefix('{')
+            .and_then(|inner| inner.strip_suffix('}'))
+            .unwrap_or(written);
+        Some(written.trim().trim_end_matches(';'))
+    };
+    let consequence = statement
+        .child_by_field_name("consequence")
+        .and_then(branch);
+    let alternative = statement
+        .child_by_field_name("alternative")
+        .and_then(|clause| clause.named_child(0))
+        .and_then(branch);
+    consequence.is_some() && consequence == alternative
 }
 
 fn text<'a>(syntax_element: Node<'_>, source: &'a str) -> Option<&'a str> {

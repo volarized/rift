@@ -204,6 +204,18 @@ fn one(metadata: &str, path: &str, source: &str) -> BTreeMap<String, SymbolId> {
     .collect()
 }
 
+/// Whether `anchors` names its declarations, every one by the module of a package path.
+fn in_path_module(anchors: &BTreeMap<String, SymbolId>, module: &str) -> bool {
+    !anchors.is_empty()
+        && anchors.values().all(|identity| {
+            SymbolIdentity::parse(identity.as_str())
+                .expect("canonical identity")
+                .qualified_path()
+                .first()
+                .is_some_and(|first| first == module)
+        })
+}
+
 #[test]
 fn captured_types_root_and_container_members_have_defining_module_names() {
     let found = one(
@@ -241,8 +253,8 @@ fn exact_prettier_export_types_target_selects_declarations_without_renaming_impl
     );
     assert!(found["index.d.ts"].contains_key("format"));
     assert!(
-        !found.contains_key("index.mjs"),
-        "unselected conditional implementation is unresolved"
+        in_path_module(&found["index.mjs"], "prettier/index.mjs"),
+        "an unselected conditional implementation takes no entry module"
     );
 }
 
@@ -401,10 +413,15 @@ fn unresolved_owner_metadata_conditions_and_paths_do_not_guess_module() {
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","types":"./other.d.ts"}"#,
         "not JSON",
     ] {
-        assert!(
-            one(metadata, "index.d.ts", "export class Example {}").is_empty(),
-            "{metadata}"
-        );
+        let found = one(metadata, "index.d.ts", "export class Example {}");
+        // Metadata of another package or that cannot be read names no file at all.
+        let described = metadata.starts_with(r#"{"name":"prettier","version":"3.8.5""#)
+            && !metadata.contains(r#""types":"./other.d.ts""#);
+        if described {
+            assert!(in_path_module(&found, "prettier/index.d.ts"), "{metadata}");
+        } else {
+            assert!(found.is_empty(), "{metadata}");
+        }
     }
     assert!(
         anchors(
@@ -419,8 +436,12 @@ fn unresolved_owner_metadata_conditions_and_paths_do_not_guess_module() {
 #[test]
 fn unselected_physical_module_and_parser_errors_remain_unresolved() {
     let source = "export class Example {}";
-    assert!(one(TYPES, "other.d.ts", source).is_empty());
+    assert!(in_path_module(
+        &one(TYPES, "other.d.ts", source),
+        "prettier/other.d.ts"
+    ));
     assert!(one(TYPES, "index.d.ts", "export function broken(").is_empty());
+    assert!(one(TYPES, "other.d.ts", "export function broken(").is_empty());
 }
 
 #[test]
@@ -428,9 +449,15 @@ fn types_target_precedence_and_export_conditions_preserve_observed_order() {
     let metadata =
         r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts","typings":"./other.d.ts"}"#;
     assert!(!one(metadata, "index.d.ts", "export class Example {}").is_empty());
-    assert!(one(metadata, "other.d.ts", "export class Example {}").is_empty());
+    assert!(in_path_module(
+        &one(metadata, "other.d.ts", "export class Example {}"),
+        "prettier/other.d.ts"
+    ));
     let metadata = r#"{"name":"prettier","version":"3.8.5","exports":{".":{"default":"./other.d.ts","types":"./index.d.ts"}}}"#;
-    assert!(one(metadata, "index.d.ts", "export class Example {}").is_empty());
+    assert!(in_path_module(
+        &one(metadata, "index.d.ts", "export class Example {}"),
+        "prettier/index.d.ts"
+    ));
 }
 
 fn mixed_entries(metadata: &str, types: &str, implementation: &str) -> super::PreparedNamespace {
@@ -569,7 +596,7 @@ fn unknown_first_conditions_establish_every_published_entry_point() {
         assert_eq!(identity.qualified_path(), qualified);
     }
     assert!(
-        !found.anchors.contains_key("src/index.ts"),
+        in_path_module(&found.anchors["src/index.ts"], "prettier/src/index.ts"),
         "no published consumer resolves the source condition"
     );
 }
@@ -844,7 +871,10 @@ fn missing_conditional_and_pattern_exports_leave_sources_unresolved() {
             &[("package.json", metadata.as_str())],
             &[("hub.ts", "export function beacon() {}")],
         );
-        assert!(found.anchors.is_empty(), "{metadata}");
+        assert!(
+            in_path_module(&found.anchors["hub.ts"], "prettier/hub.ts"),
+            "{metadata}"
+        );
         assert!(found.unresolved_exports, "{metadata}");
     }
 }
@@ -1081,17 +1111,23 @@ fn package_ambient_global_unquoted_and_outside_remain_unknown() {
     for source in [
         "declare namespace NodeJS { function isUtf8(): boolean; }",
         "declare global { function isUtf8(): boolean; }",
-        "export function isUtf8(): boolean;",
     ] {
         let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), source);
         assert!(found.anchors.is_empty(), "{source}");
     }
+    let module = "@types/node/buffer.d.ts";
+    let source = "export function isUtf8(): boolean;";
+    let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+    assert!(in_path_module(&found.anchors["buffer.d.ts"], module));
     let source = "export function outside(): boolean;\ndeclare module \"node:buffer\" { export function isUtf8(): boolean; global { interface GlobalMember {} } }\n";
     let (found, facts) = ambient_prepared(&types_node_owner(), Some(metadata), source);
     assert!(!facts.has_errors());
     let anchors = &found.anchors["buffer.d.ts"];
     assert!(anchors.contains_key("\"node:buffer\".isUtf8"));
-    assert!(!anchors.contains_key("outside"));
+    assert!(in_path_module(
+        &BTreeMap::from([("outside".to_owned(), anchors["outside"].clone())]),
+        module
+    ));
     assert!(!anchors.keys().any(|name| name.starts_with("global.")));
 }
 
@@ -1379,42 +1415,43 @@ fn commonjs_receiver_shadow_reassignment_qualified_and_ordinary_functions_remain
 #[test]
 fn commonjs_public_exports_require_entry_conditions_owner_and_mode() {
     let source = "exports.open=function(){};";
-    for (metadata, conditions, physical) in [
+    for (metadata, conditions, module) in [
         (
             r#"{"name":"wrong","version":"19.3.0","main":"index.js"}"#,
             &["node", "require"][..],
-            false,
+            None,
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"other.js"}"#,
             &["node", "require"][..],
-            false,
+            Some("react/index.js"),
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"index.js","type":"module"}"#,
             &["node", "require"][..],
-            true,
+            Some("react"),
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
             &[][..],
-            true,
+            Some("react"),
         ),
         (
             r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
             &["import"][..],
-            true,
+            Some("react"),
         ),
     ] {
         let (prepared, _) =
             commonjs_prepared(metadata, &[("index.js", source)], "index.js", conditions);
-        assert_eq!(
-            prepared
-                .anchors
-                .get("index.js")
-                .is_some_and(|anchors| anchors.contains_key("open")),
-            physical
-        );
+        match module {
+            Some(module) => {
+                let anchors = &prepared.anchors["index.js"];
+                assert!(anchors.contains_key("open"), "{metadata}");
+                assert!(in_path_module(anchors, module), "{metadata}");
+            }
+            None => assert!(prepared.anchors.is_empty(), "{metadata}"),
+        }
         assert!(prepared.public_names.is_empty());
         assert!(prepared.exports.is_empty());
         assert!(prepared.unresolved_exports);
@@ -1439,7 +1476,11 @@ fn commonjs_literal_forwarding_missing_dynamic_shadow_and_cycles_stay_bounded() 
             "index.js",
             &["node", "require"],
         );
-        assert!(!prepared.anchors.contains_key("child.js"), "{entry}");
+        assert!(!prepared.public_names.contains_key("child.js"), "{entry}");
+        assert!(
+            in_path_module(&prepared.anchors["child.js"], "react/child.js"),
+            "{entry}"
+        );
     }
     let (prepared, _) = commonjs_prepared(
         metadata,
@@ -1482,11 +1523,12 @@ fn commonjs_package_default_entry_and_extensionless_forwarder_are_checked_indepe
             &["node", "require"],
         );
         assert_eq!(
-            prepared
-                .anchors
-                .get("lib/child.js")
-                .is_some_and(|anchors| anchors.contains_key("open")),
+            prepared.public_names.contains_key("lib/child.js"),
             accepted,
+            "{metadata} {literal}"
+        );
+        assert!(
+            in_path_module(&prepared.anchors["lib/child.js"], "react/lib/child.js"),
             "{metadata} {literal}"
         );
     }
@@ -1505,7 +1547,11 @@ fn commonjs_forwarding_checks_the_exact_file_before_adding_a_javascript_extensio
         &["node", "require"],
     );
     assert!(prepared.anchors["lib/child"].contains_key("exact"));
-    assert!(!prepared.anchors.contains_key("lib/child.js"));
+    assert!(!prepared.public_names.contains_key("lib/child.js"));
+    assert!(in_path_module(
+        &prepared.anchors["lib/child.js"],
+        "react/lib/child.js"
+    ));
 }
 
 /// The states of the paths a manifest requests, over every member a package ships.
@@ -2122,7 +2168,14 @@ fn export_subpaths_of_one_file_keep_one_module() {
         let held = modules
             .iter()
             .map(|(module, paths)| (module.rsplit('/').next().expect("module"), paths.as_slice()))
+            // The other file of a dual entry is named by its path.
+            .filter(|row| *row != ("prettier%2Fs.cjs", ["s.cjs".to_owned()].as_slice()))
             .collect::<Vec<_>>();
+        assert_eq!(
+            held.len() < modules.len(),
+            path == "s.mjs",
+            "{exports} {modules:?}"
+        );
         match expected {
             Some(module) => assert_eq!(held, [(module, [path.to_owned()].as_slice())], "{exports}"),
             None => assert!(held.is_empty(), "{exports}"),

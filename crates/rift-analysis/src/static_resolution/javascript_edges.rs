@@ -691,6 +691,10 @@ impl<'source> Index<'source> {
                     .ok()?;
             return SymbolId::new(module.wire_identity()).ok();
         }
+        if !self.javascript.owner.is_local() {
+            // A package names a module by its entry or package path, never by `./`.
+            return None;
+        }
         let module = SymbolIdentity::new(
             self.javascript.owner.clone(),
             file.document.facts.language().clone(),

@@ -144,6 +144,10 @@ impl<'source> Exports<'_, 'source> {
             let (direct, stars) = self.export_candidates(file, name, mode, role, work)?;
             let Some(export) = direct else {
                 let default = matches!(name, ExportSlot::Default | ExportSlot::Named("default"));
+                // A forward another value can replace establishes no target.
+                if stars.iter().any(|star| !star.settled) {
+                    return None;
+                }
                 pending.extend(stars.into_iter().filter_map(|star| {
                     // Only `module.exports = require(..)` passes the module value on.
                     if default && !star.replaces_module {
@@ -423,9 +427,17 @@ impl<'source> Exports<'_, 'source> {
                 continue;
             }
             if binding.kind == SyntaxExportKind::All {
+                let module = literal_contents(file.text(binding.source?)?)?;
+                let settled = match file.module_value.forwarded(binding.range) {
+                    ModuleValue::Forward(value) if value != module => continue,
+                    ModuleValue::Replaced => continue,
+                    ModuleValue::Unsettled => false,
+                    ModuleValue::Forward(_) | ModuleValue::Unwritten => true,
+                };
                 stars.push(ExportStar {
-                    module: literal_contents(file.text(binding.source?)?)?,
+                    module,
                     replaces_module: written.starts_with("module.exports"),
+                    settled,
                 });
                 continue;
             }
@@ -667,6 +679,47 @@ impl<'source> ExportBindings<'source> {
 struct ExportStar<'source> {
     module: &'source str,
     replaces_module: bool,
+    /// Whether no other write of the file can give the module another value.
+    settled: bool,
+}
+
+/// What the writes of `module.exports` leave the module with.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ModuleValue<'source> {
+    /// The value the module starts with.
+    #[default]
+    Unwritten,
+    /// The module a forward requires, by the contents of its specifier.
+    Forward(&'source str),
+    /// A value the file writes itself, after every forward.
+    Replaced,
+    /// The value depends on a condition, a call or a computed key.
+    Unsettled,
+}
+
+/// The writes of `module.exports` in one file and what they leave the module with.
+#[derive(Default)]
+pub(super) struct ModuleValues<'source> {
+    /// Start offsets of the written targets, in source order.
+    writes: Vec<u64>,
+    value: ModuleValue<'source>,
+}
+
+impl<'source> ModuleValues<'source> {
+    /// The value of the module for an export binding that writes it, and the value before
+    /// every write for any other binding.
+    fn forwarded(&self, binding: rift_syntax::ByteRange) -> ModuleValue<'source> {
+        let first = self.writes.partition_point(|start| *start < binding.start);
+        if self
+            .writes
+            .get(first)
+            .is_some_and(|start| binding.contains(*start))
+        {
+            self.value
+        } else {
+            ModuleValue::Unwritten
+        }
+    }
 }
 
 type ExportCandidates<'source> = (Option<Export<'source>>, Vec<ExportStar<'source>>);
@@ -757,6 +810,15 @@ impl<'source> File<'source> {
                 self.binding(self.text(receiver)?, receiver.start, |_| true, work),
                 super::Binding::Missing
             ) {
+                if receiver == member.receiver
+                    && self.text(receiver) == Some("module")
+                    && self
+                        .written_key(member)
+                        .and_then(literal_contents)
+                        .is_none_or(|key| key == "exports")
+                {
+                    self.module_value.writes.push(range.start);
+                }
                 // A key bound to a symbol value names no export (D41); the exports that
                 // supply the key decide it.
                 if slot == ExportSlot::Unknown
@@ -775,7 +837,84 @@ impl<'source> File<'source> {
                     .or_insert(Some(range.start));
             }
         }
+        self.module_value.writes.sort_unstable();
+        self.module_value.value = self.module_value(work)?;
         Some(())
+    }
+
+    /// What the writes of `module.exports` leave the module with, or `None` once the work
+    /// bound is spent. The last write that always runs decides, unless a later one that can run
+    /// or not gives another value. A forward of the same module gives the same value.
+    fn module_value(&self, work: &mut Work) -> Option<ModuleValue<'source>> {
+        let writes = &self.module_value.writes;
+        if writes.is_empty() {
+            return Some(ModuleValue::Unwritten);
+        }
+        let mut forwards = Vec::<(rift_syntax::ByteRange, &str)>::new();
+        for binding in self.document.facts.export_bindings().unwrap_or_default() {
+            if !work.charge() {
+                return None;
+            }
+            if binding.kind == SyntaxExportKind::All
+                && binding.container.is_none()
+                && let Some(module) = binding
+                    .source
+                    .and_then(|source| literal_contents(self.text(source)?))
+            {
+                forwards.push((binding.range, module));
+            }
+        }
+        forwards.sort_unstable();
+        let forward = |start: u64| {
+            let after = forwards.partition_point(|(range, _)| range.start <= start);
+            forwards[..after]
+                .last()
+                .filter(|(range, _)| range.contains(start))
+                .map(|(_, module)| *module)
+        };
+        // The end of the source a `return` can skip, for each place where more of it starts.
+        let mut skipped = self.facts.skippable().to_vec();
+        skipped.sort_unstable();
+        let mut end = 0;
+        for range in &mut skipped {
+            end = range.end.max(end);
+            range.end = end;
+        }
+        let skippable = |write: &rift_syntax::ByteRange| {
+            let after = skipped.partition_point(|range| range.start <= write.start);
+            skipped[..after]
+                .last()
+                .is_some_and(|range| write.start < range.end)
+        };
+        let runs = self
+            .facts
+            .commonjs_writes()
+            .iter()
+            .map(|(write, always)| (write.start, (write.end, *always && !skippable(write))))
+            .collect::<BTreeMap<_, _>>();
+        // A write runs once its value is read, so the one that ends last runs last.
+        let last = writes
+            .iter()
+            .filter_map(|start| {
+                let (end, always) = *runs.get(start)?;
+                always.then_some((end, *start))
+            })
+            .max();
+        let Some((last_end, last)) = last else {
+            return Some(ModuleValue::Unsettled);
+        };
+        let last = forward(last);
+        // A write in a function called later, or under a condition after the last one.
+        let replaced = writes
+            .iter()
+            .filter(|start| runs.get(start).is_none_or(|(end, _)| *end > last_end))
+            .map(|start| forward(*start))
+            .any(|value| value.is_none() || value != last);
+        Some(match last {
+            _ if replaced => ModuleValue::Unsettled,
+            Some(module) => ModuleValue::Forward(module),
+            None => ModuleValue::Replaced,
+        })
     }
 
     /// Records a write to a member of the value an export assignment declares:
@@ -854,14 +993,9 @@ impl<'source> File<'source> {
         Some((member.receiver, slot))
     }
 
-    /// The name written as the key of `exports[key]` or `module.exports[key]`.
-    fn javascript_export_key(&self, member: &rift_syntax::StaticMember) -> Option<&'source str> {
-        if member.member.is_some()
-            || !matches!(
-                self.text(member.receiver),
-                Some("exports" | "module.exports")
-            )
-        {
+    /// The source between the brackets of `receiver[key]`.
+    fn written_key(&self, member: &rift_syntax::StaticMember) -> Option<&'source str> {
+        if member.member.is_some() {
             return None;
         }
         self.text(rift_syntax::ByteRange {
@@ -872,7 +1006,17 @@ impl<'source> File<'source> {
         .and_then(|key| key.strip_prefix('['))
         .and_then(|key| key.strip_suffix(']'))
         .map(str::trim)
-        .filter(|key| {
+    }
+
+    /// The name written as the key of `exports[key]` or `module.exports[key]`.
+    fn javascript_export_key(&self, member: &rift_syntax::StaticMember) -> Option<&'source str> {
+        if !matches!(
+            self.text(member.receiver),
+            Some("exports" | "module.exports")
+        ) {
+            return None;
+        }
+        self.written_key(member).filter(|key| {
             !key.is_empty()
                 && key
                     .chars()

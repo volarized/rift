@@ -58,9 +58,50 @@ pub(crate) struct PreparedNamespace {
     pub(crate) exports: Vec<ExportBinding>,
     pub(crate) alias_visibilities: BTreeMap<SymbolId, String>,
     pub(crate) unresolved_exports: bool,
+    /// Files with a module no consumer imports by path, because an `exports` map names the
+    /// package's entries, each with the names of the ambient modules it declares.
+    pub(crate) unreached_modules: BTreeMap<String, BTreeSet<String>>,
     /// Original file paths no namespace reaches by construction: their declarations carry
     /// no identity because the language assigns none there, not because analysis failed.
     pub(crate) outside_namespaces: BTreeSet<String>,
+}
+
+impl PreparedNamespace {
+    /// The names of each unreached file that stay public: its ambient modules, and every
+    /// name an alias of a reached file exposes, with `.` for a file exposed whole.
+    ///
+    /// A whole-file exposure exposes that file's own aliases in turn. Each file becomes
+    /// reached at most once, so the walk reads every export at most once.
+    pub(crate) fn exposed_names(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut exposed = self.unreached_modules.clone();
+        if exposed.is_empty() {
+            return exposed;
+        }
+        let mut exports = BTreeMap::<&str, Vec<&ExportBinding>>::new();
+        for export in &self.exports {
+            exports
+                .entry(export.path.as_str())
+                .or_default()
+                .push(export);
+        }
+        let mut reached = exports
+            .keys()
+            .copied()
+            .filter(|path| !self.unreached_modules.contains_key(*path))
+            .collect::<Vec<_>>();
+        while let Some(path) = reached.pop() {
+            for export in exports.remove(path).into_iter().flatten() {
+                let Some(names) = exposed.get_mut(&export.target_path) else {
+                    continue;
+                };
+                names.insert(export.target_qualified_name.clone());
+                if export.target_qualified_name == "." {
+                    reached.push(export.target_path.as_str());
+                }
+            }
+        }
+        exposed
+    }
 }
 
 pub(crate) fn placed_aliases(

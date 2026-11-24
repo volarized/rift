@@ -2,7 +2,7 @@ use rift_analysis::{
     ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageImportRoot, PackageSource,
 };
 use rift_core::{ContributionOrigin, PackageIdentity, ProjectPath, SourceKind, SourceLocation};
-use rift_protocol::identity::SymbolOwner;
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::RuntimeIdentity;
 
 use super::declaration_at;
@@ -169,30 +169,45 @@ fn an_unnamed_declaration_never_selects_the_named_enclosing_module() -> TestResu
         dialect: None,
     };
     let path = ProjectPath::new("internal.d.ts")?;
-    let text = "export declare class Hidden { get(): string; }\n";
-    let files = [PackageSource::new(&path, text)];
-    let manifest = ProjectPath::new("package.json")?;
-    let context = [PackageSource::new(
-        &manifest,
-        r#"{"name":"greeting","version":"1.0.0","types":"index.d.ts"}"#,
-    )];
-    let input = ExactPackageInput::new(
-        &owner,
-        &language,
-        &origin,
-        &files,
-        ExactPackageLimits::new(4, 4096),
-    )?
-    .with_framework_context(&context, &[])?;
-    let analysis = PackageAnalyzer::analyze(input, 1)?;
-    assert!(
-        declaration_at(
+    // A file no entry names is the module of its path. A name two members share and the
+    // declarations of a script keep no identity.
+    for (text, named) in [
+        (
+            "export declare class Hidden { get(): string; }\n",
+            Some("greeting/internal.d.ts/Hidden/get"),
+        ),
+        (
+            "export declare class Hidden { static get(): string; get(): string; }\n",
+            None,
+        ),
+        ("declare class Hidden { get(): string; }\n", None),
+    ] {
+        let files = [PackageSource::new(&path, text)];
+        let manifest = ProjectPath::new("package.json")?;
+        let context = [PackageSource::new(
+            &manifest,
+            r#"{"name":"greeting","version":"1.0.0","types":"index.d.ts"}"#,
+        )];
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(4, 4096),
+        )?
+        .with_framework_context(&context, &[])?;
+        let analysis = PackageAnalyzer::analyze(input, 1)?;
+        let found = declaration_at(
             &analysis,
             &path,
-            u64::try_from(text.find("get").ok_or("get")?)?
-        )
-        .is_err()
-    );
+            u64::try_from(text.find("get").ok_or("get")?)?,
+        );
+        let selected = found.ok().map(|found| {
+            SymbolIdentity::parse(found.symbol.as_str())
+                .map(|identity| identity.qualified_path().join("/"))
+        });
+        assert_eq!(selected.transpose()?.as_deref(), named, "{text}");
+    }
     Ok(())
 }
 
