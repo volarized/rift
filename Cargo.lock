@@ -7153,7 +7153,6 @@ dependencies = [
 [[package]]
 name = "ty_ide"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff?rev=fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1#fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1"
 dependencies = [
  "bitflags 2.13.1",
  "compact_str 0.10.0",
@@ -7215,7 +7214,6 @@ dependencies = [
 [[package]]
 name = "ty_project"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff?rev=fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1#fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -7295,7 +7293,6 @@ dependencies = [
 [[package]]
 name = "ty_python_semantic"
 version = "0.0.20"
-source = "git+https://github.com/astral-sh/ruff?rev=fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1#fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1"
 dependencies = [
  "bitflags 2.13.1",
  "char_str",
