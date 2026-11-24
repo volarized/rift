@@ -11,6 +11,7 @@ use std::{
 use crate::input::ArchiveMemberKind;
 use rift_core::{FileDigest, ProjectPath};
 use sha2::{Digest, Sha256, Sha512};
+use zstd::stream::raw::{self, Operation};
 
 /// Registry archive container.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,7 +340,8 @@ impl ArchiveBoundExceeded {
     /// Normalized path of the member that met the bound, with its original archive root.
     ///
     /// `None` when the bound was met before a member was decoded, or the member's path is not
-    /// a valid project path.
+    /// a valid project path. A refused extended header is named by its own path, such as
+    /// `@LongLink`: the reader refuses it before it reads the member the header describes.
     #[must_use]
     pub const fn member(&self) -> Option<&ProjectPath> {
         self.member.as_ref()
@@ -907,9 +909,10 @@ const ZSTD_WINDOW_LOG_OMITTED_MIN: u32 = 23;
 /// An omitted member can need a wider one to have its length checked, so its window reaches
 /// the recommended 8 MiB even when the member byte bound is narrower.
 struct ZstdMember<R: BufRead> {
-    decoder: zstd::stream::read::Decoder<'static, R>,
+    reader: zstd::stream::zio::Reader<R, ZstdFrames>,
     window_log: u32,
-    window_refused: bool,
+    /// Window bytes of the frame libzstd refused.
+    window_refused: Option<u64>,
 }
 
 impl<R: BufRead> ZstdMember<R> {
@@ -924,34 +927,134 @@ impl<R: BufRead> ZstdMember<R> {
             .checked_next_power_of_two()
             .map_or(ZSTD_WINDOW_LOG_MAX, usize::trailing_zeros)
             .clamp(window_log_min, ZSTD_WINDOW_LOG_MAX);
-        let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)
-            .map_err(|_| ArchiveError::InvalidArchive)?;
-        decoder
-            .window_log_max(window_log)
-            .map_err(|_| ArchiveError::InvalidArchive)?;
+        let frames = ZstdFrames::new(window_log).map_err(|_| ArchiveError::InvalidArchive)?;
         Ok(Self {
-            decoder,
+            reader: zstd::stream::zio::Reader::new(reader, frames),
             window_log,
-            window_refused: false,
+            window_refused: None,
         })
     }
 
     /// Names a frame window over the decoder's as the bound it exceeds.
     fn refusal(&self, error: ArchiveError, path: &str) -> ArchiveError {
-        if self.window_refused {
-            let maximum = 1_u64 << self.window_log;
-            ArchiveBound::WindowBytes.exceeded(maximum + 1, maximum, archive_path(path).ok())
-        } else {
-            error
-        }
+        let Some(observed) = self.window_refused else {
+            return error;
+        };
+        let maximum = 1_u64 << self.window_log;
+        ArchiveBound::WindowBytes.exceeded(observed, maximum, archive_path(path).ok())
     }
 }
 
 impl<R: BufRead> Read for ZstdMember<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.decoder.read(buffer).inspect_err(|error| {
-            self.window_refused |= error.to_string() == zstd_window_refusal();
+        let read = self.reader.read(buffer);
+        if let Err(error) = &read
+            && error.to_string() == zstd_window_refusal()
+        {
+            self.window_refused = self.reader.operation_mut().window();
+        }
+        read
+    }
+}
+
+/// `ZSTD_FRAMEHEADERSIZE_MAX`, the bytes of the longest Zstandard frame header.
+const ZSTD_FRAME_HEADER_BYTES_MAX: usize = 18;
+/// Bytes of the magic number a frame header starts with.
+const ZSTD_MAGIC_BYTES: usize = 4;
+/// Frame header descriptor bit of a frame whose window is its content size.
+const ZSTD_SINGLE_SEGMENT: u8 = 1 << 5;
+/// Dictionary identifier bytes by the two lowest descriptor bits.
+const ZSTD_DICTIONARY_BYTES: [usize; 4] = [0, 1, 2, 4];
+
+/// Decodes Zstandard frames and retains the header of the current one.
+///
+/// libzstd refuses a window over `window_log_max` without reporting its width, so the width
+/// is read from the header libzstd refused.
+struct ZstdFrames {
+    decoder: raw::Decoder<'static>,
+    header: [u8; ZSTD_FRAME_HEADER_BYTES_MAX],
+    retained: usize,
+}
+
+impl ZstdFrames {
+    fn new(window_log: u32) -> std::io::Result<Self> {
+        let mut decoder = raw::Decoder::new()?;
+        decoder.set_parameter(raw::DParameter::WindowLogMax(window_log))?;
+        Ok(Self {
+            decoder,
+            header: [0; ZSTD_FRAME_HEADER_BYTES_MAX],
+            retained: 0,
         })
+    }
+
+    fn retain(&mut self, input: &[u8]) {
+        for (byte, read) in self.header.iter_mut().skip(self.retained).zip(input) {
+            *byte = *read;
+            self.retained += 1;
+        }
+    }
+
+    /// Window bytes the retained header asks for, in the layout RFC 8878 section 3.1.1.1
+    /// defines.
+    fn window(&self) -> Option<u64> {
+        let header = self.header.get(ZSTD_MAGIC_BYTES..self.retained)?;
+        let (descriptor, fields) = header.split_first()?;
+        if descriptor & ZSTD_SINGLE_SEGMENT == 0 {
+            let window = fields.first()?;
+            let base = 1_u64 << (ZSTD_WINDOW_LOG_MIN + u32::from(window >> 3));
+            return Some(base + (base >> 3) * u64::from(window & 7));
+        }
+        let dictionary = ZSTD_DICTIONARY_BYTES.get(usize::from(descriptor & 3))?;
+        let size = fields.get(*dictionary..)?;
+        let length = 1_usize << (descriptor >> 6);
+        let mut content = [0; 8];
+        content
+            .get_mut(..length)?
+            .copy_from_slice(size.get(..length)?);
+        let content = u64::from_le_bytes(content);
+        // A two-byte content size starts at 256.
+        Some(if length == 2 { content + 256 } else { content })
+    }
+}
+
+impl Operation for ZstdFrames {
+    fn run<C: raw::WriteBuf + ?Sized>(
+        &mut self,
+        input: &mut raw::InBuffer<'_>,
+        output: &mut raw::OutBuffer<'_, C>,
+    ) -> std::io::Result<usize> {
+        let start = input.pos();
+        let hint = self.decoder.run(input, output);
+        // A refused header stays unread, so the whole input can hold it.
+        let end = if hint.is_ok() {
+            input.pos()
+        } else {
+            input.src.len()
+        };
+        self.retain(input.src.get(start..end).unwrap_or_default());
+        if matches!(hint, Ok(0)) {
+            self.retained = 0;
+        }
+        hint
+    }
+
+    fn flush<C: raw::WriteBuf + ?Sized>(
+        &mut self,
+        output: &mut raw::OutBuffer<'_, C>,
+    ) -> std::io::Result<usize> {
+        self.decoder.flush(output)
+    }
+
+    fn reinit(&mut self) -> std::io::Result<()> {
+        self.decoder.reinit()
+    }
+
+    fn finish<C: raw::WriteBuf + ?Sized>(
+        &mut self,
+        output: &mut raw::OutBuffer<'_, C>,
+        finished_frame: bool,
+    ) -> std::io::Result<usize> {
+        self.decoder.finish(output, finished_frame)
     }
 }
 

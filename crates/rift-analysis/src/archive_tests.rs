@@ -631,7 +631,7 @@ fn read(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveErro
 }
 
 #[test]
-fn archive_error_messages_are_generic() {
+fn archive_error_messages_name_no_path_but_a_bounded_member() {
     let errors = [
         ArchiveError::InvalidLimits,
         ArchiveError::CompressedLimit,
@@ -651,6 +651,10 @@ fn archive_error_messages_are_generic() {
         assert!(!message.is_empty());
         assert!(!message.contains("release/"), "{message}");
     }
+    let bounded = ArchiveBound::MemberBytes
+        .exceeded(2, 1, Some(fixture_path("release/a")))
+        .to_string();
+    assert_eq!(bounded.matches("release/a").count(), 1, "{bounded}");
 }
 
 #[test]
@@ -1645,7 +1649,7 @@ fn zstd_window_over_the_member_bound_is_refused_before_decoding() -> TestResult 
     for bytes in zstd_frame_zips(&zstd_frame(10, b"text")?, b"text")? {
         assert_eq!(
             read_zip_fixture(&bytes, limits).expect_err("Zstandard window over the member bound"),
-            ArchiveBound::WindowBytes.exceeded(4097, 4096, Some(fixture_path("release/a")))
+            ArchiveBound::WindowBytes.exceeded(1 << 20, 4096, Some(fixture_path("release/a")))
         );
     }
     // The default 64 MiB member bound refuses a 1 GiB window the same way.
@@ -1653,12 +1657,53 @@ fn zstd_window_over_the_member_bound_is_refused_before_decoding() -> TestResult 
         assert_eq!(
             read_zip_fixture(&bytes, ArchiveLimits::default())
                 .expect_err("Zstandard window over the default member bound"),
-            ArchiveBound::WindowBytes.exceeded(
-                (64 << 20) + 1,
-                64 << 20,
-                Some(fixture_path("release/a"))
-            )
+            ArchiveBound::WindowBytes.exceeded(1 << 30, 64 << 20, Some(fixture_path("release/a")))
         );
+    }
+    Ok(())
+}
+
+/// A refused window is the one its frame header asks for: a window descriptor with a
+/// mantissa, a single segment's content size in each width, and the header of a later frame
+/// that arrives one byte at a time.
+#[test]
+fn a_refused_zstd_window_reports_the_bytes_its_frame_asks_for() -> TestResult {
+    let limits = ArchiveLimits::new(64 * 1024, 64 * 1024, 1024, 16, 200)?;
+    let magic = [0x28, 0xb5, 0x2f, 0xfd];
+    let headers: [(&[u8], u64); 5] = [
+        // Exponent 1 and mantissa 5: 2 KiB and five eighths of it.
+        (&[0x00, (1 << 3) | 5], 2048 + 1280),
+        // A one-byte dictionary identifier before a two-byte content size.
+        (&[0x61, 0, 0x44, 0x0e], 0x0e44 + 256),
+        (&[0xa0, 0x39, 0x30, 0, 0], 12_345),
+        (&[0xe0, 0x01, 0, 0, 0, 1, 0, 0, 0], (1 << 32) + 1),
+        // The widest header: a four-byte dictionary identifier and an eight-byte size.
+        (&[0xe3, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0], 4096),
+    ];
+    for (header, expected) in headers {
+        for first in [Vec::new(), zstd_frame(0, b"text")?] {
+            for capacity in [1, 3, 8192] {
+                let mut frames = first.clone();
+                frames.extend_from_slice(&magic);
+                frames.extend_from_slice(header);
+                frames.extend_from_slice(&[0; 8]);
+                let reader = BufReader::with_capacity(capacity, frames.as_slice());
+                let mut member = ZstdMember::new(reader, limits, 1024)?;
+                member
+                    .read_to_end(&mut Vec::new())
+                    .expect_err("window over 1 KiB");
+                assert_eq!(
+                    member.refusal(ArchiveError::InvalidArchive, "release/a"),
+                    ArchiveBound::WindowBytes.exceeded(
+                        expected,
+                        1024,
+                        Some(fixture_path("release/a"))
+                    ),
+                    "{header:?} after {} bytes, {capacity} at a time",
+                    first.len()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2163,11 +2208,7 @@ fn omitted_zstd_windows_reach_the_recommended_width_and_no_further() -> TestResu
     for bytes in zstd_frame_zips(&zstd_frame(14, &binary)?, &binary)? {
         assert_eq!(
             read_zip_fixture(&bytes, skipping(&bytes)?).expect_err("window over 8 MiB"),
-            ArchiveBound::WindowBytes.exceeded(
-                (8 << 20) + 1,
-                8 << 20,
-                Some(fixture_path("release/a"))
-            )
+            ArchiveBound::WindowBytes.exceeded(16 << 20, 8 << 20, Some(fixture_path("release/a")))
         );
     }
     Ok(())
