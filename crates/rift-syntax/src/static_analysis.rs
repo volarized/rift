@@ -1091,7 +1091,11 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar {
-    Python(&'static python_edges::EdgePythonKinds),
+    Python(
+        &'static python_edges::EdgePythonKinds,
+        /// Range of the syntax root.
+        Option<ByteRange>,
+    ),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
@@ -1130,7 +1134,7 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn for_edge_python(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::Python(python_edges::edge_python_kinds()),
+            grammar: Grammar::Python(python_edges::edge_python_kinds(), None),
             source,
             facts: StaticFacts::default(),
             edge_heritage: heritage_edges::edge_python_kinds(),
@@ -1170,7 +1174,12 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
-            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
+            Grammar::Python(kinds, root) => {
+                if root.is_none() {
+                    *root = Some(crate::extract::byte_range(syntax_element)?);
+                }
+                kinds.record_edge(visited, self.source, &mut self.facts.0)
+            }
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }
@@ -1180,7 +1189,13 @@ impl<'source> Capture<'source> {
         }
     }
 
-    pub(crate) fn finish(self) -> StaticFacts {
+    pub(crate) fn finish(mut self) -> StaticFacts {
+        if let Grammar::Python(_, Some(root)) = self.grammar
+            && let Ok(end) = u64::try_from(self.source.len())
+        {
+            let file = ByteRange { start: 0, end };
+            python_edges::widen_module_scope(&mut self.facts.0, root, file);
+        }
         self.facts
     }
 

@@ -11,6 +11,7 @@ use super::{
     StaticBindingKind, StaticCallee, StaticFactsParts, StaticReference, binding, call, field,
     identifier, kind,
 };
+use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
 
 pub(super) struct EdgePythonKinds {
@@ -669,6 +670,27 @@ impl EdgePythonKinds {
                 }
                 _ => Ok(StaticBindingKind::Shadow),
             },
+        }
+    }
+}
+
+/// Gives the bindings of a module the whole file as their scope. The syntax root, `root`, leaves
+/// out the spaces, line ends and byte order mark the file starts with.
+pub(super) fn widen_module_scope(facts: &mut StaticFactsParts, root: ByteRange, file: ByteRange) {
+    if root == file {
+        return;
+    }
+    for binding in &mut facts.bindings {
+        if binding.scope == root {
+            binding.scope = file;
+            if binding.available_from == root.start {
+                binding.available_from = file.start;
+            }
+        }
+    }
+    for scope in &mut facts.unsupported_bindings {
+        if *scope == root {
+            *scope = file;
         }
     }
 }
