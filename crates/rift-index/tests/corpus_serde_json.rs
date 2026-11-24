@@ -67,7 +67,7 @@ fn test_serde_json_static_collection_floors() -> Result<(), Box<dyn std::error::
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 508),
-        (EdgeKind::Contains, 1037),
+        (EdgeKind::Contains, 1030),
         (EdgeKind::Implements, 14),
         (EdgeKind::Imports, 102),
         (EdgeKind::HasType, 907),

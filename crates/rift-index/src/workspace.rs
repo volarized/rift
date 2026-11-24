@@ -4303,6 +4303,42 @@ impl WorkspaceIndex {
         Ok((page, total))
     }
 
+    /// Orders one symbol's declarations as a read lists them: an exact name first, then the
+    /// declarations that define the symbol before its implementations.
+    fn order_declarations(&self, bindings: &mut Vec<(ProjectPath, usize)>) {
+        let declared = bindings
+            .iter()
+            .map(|(path, index)| self.declaration_match(path, *index))
+            .collect::<Vec<_>>();
+        let contributions = declared
+            .iter()
+            .map(|matched| {
+                let matched = matched.as_ref()?;
+                self.semantics
+                    .syntax_contribution(&matched.symbol.provider_address(
+                        &matched.file.syntax().language().identity_segment(),
+                        matched.file.path().as_str(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        let held = contributions.iter().copied().flatten().collect::<Vec<_>>();
+        let mut ranks = self.semantics.graph().definition_ranks(&held).into_iter();
+        let mut ordered = declared
+            .iter()
+            .zip(&contributions)
+            .zip(std::mem::take(bindings))
+            .map(|((matched, contribution), binding)| {
+                let rank = contribution.and_then(|_| ranks.next()).unwrap_or_default();
+                let key = matched
+                    .as_ref()
+                    .map(|matched| (matched.rank, rank, matched.symbol.qualified_name.as_str()));
+                (key, binding)
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(key, _)| *key);
+        bindings.extend(ordered.into_iter().map(|(_, binding)| binding));
+    }
+
     fn declaration_facts(
         &self,
         matched: SymbolMatch<'_>,
@@ -4502,11 +4538,9 @@ impl WorkspaceIndex {
             .canonical
             .values_mut()
             .chain(declarations.provider.values_mut())
+            .filter(|bindings| bindings.len() > 1)
         {
-            bindings.sort_by_key(|(path, index)| {
-                self.declaration_match(path, *index)
-                    .map(|matched| (matched.rank, matched.symbol.qualified_name.as_str()))
-            });
+            self.order_declarations(bindings);
         }
         for (identity, bindings) in &declarations.canonical {
             for (ordinal, binding) in bindings.iter().enumerate() {

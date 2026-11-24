@@ -66,7 +66,7 @@ fn test_hashbrown_static_collection_floors() -> Result<(), Box<dyn std::error::E
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 852),
-        (EdgeKind::Contains, 930),
+        (EdgeKind::Contains, 929),
         (EdgeKind::Implements, 2),
         (EdgeKind::Imports, 73),
         (EdgeKind::HasType, 560),

@@ -249,9 +249,9 @@ async fn test_edge_heritage_imports_aliases_and_outgoing_references_are_queryabl
 const EDGE_ANALYZING_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
@@ -326,10 +326,10 @@ started=$(date +%s)
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
+  case "$body" in *'"uri":"'*) uri=${body#*\"uri\":\"}; uri=${uri%%\"*} ;; *) uri= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"callHierarchyProvider\":true}}}"
@@ -423,11 +423,11 @@ starts=$(grep -c start "$1")
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   if [ "$length" -ge 65536 ] && [ "$starts" -le 4 ]; then sleep 3; fi
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
+  case "$body" in *'"uri":"'*) uri=${body#*\"uri\":\"}; uri=${uri%%\"*} ;; *) uri= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"callHierarchyProvider\":true}}}"
@@ -517,10 +517,10 @@ const OPEN_DOCUMENTS_ENGINE: &str = r#"opened=
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
+  case "$body" in *'"uri":"'*) uri=${body#*\"uri\":\"}; uri=${uri%%\"*} ;; *) uri= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"definitionProvider\":true}}}"
@@ -719,15 +719,15 @@ item() { printf '{"name":"%s","kind":%s,"uri":"%s","range":%s,"selectionRange":%
 cold=1
 while IFS= read -r header; do
   IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
+  length=${header%?}; length=${length##*[!0-9]}
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in *'"id":'*) id=${body#*\"id\":}; id=${id%%[!0-9]*} ;; *) id= ;; esac
   case "$body" in
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"definitionProvider\":true,\"callHierarchyProvider\":true,\"implementationProvider\":true,\"typeHierarchyProvider\":true}}}"
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"edge/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
     *'"method":"textDocument/didOpen"'*)
-      uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d '"' -f4) ;;
+      case "$body" in *'"uri":"'*) uri=${body#*\"uri\":\"}; uri=${uri%%\"*} ;; *) uri= ;; esac ;;
     *'"method":"textDocument/prepareCallHierarchy"'*)
       if [ "$cold" = 1 ]; then
         frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}"

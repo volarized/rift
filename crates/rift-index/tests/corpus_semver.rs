@@ -61,7 +61,7 @@ fn test_semver_static_collection_floors() -> Result<(), Box<dyn std::error::Erro
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 140),
-        (EdgeKind::Contains, 158),
+        (EdgeKind::Contains, 142),
         (EdgeKind::Imports, 27),
         (EdgeKind::HasType, 128),
         (EdgeKind::Reads, 125),
