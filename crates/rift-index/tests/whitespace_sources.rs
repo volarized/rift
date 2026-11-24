@@ -35,6 +35,7 @@ fn declares(index: &WorkspaceIndex, identity: &str) -> bool {
 
 #[test]
 fn python_modules_without_tokens_are_declared_and_contained() {
+    let mut empty_file_edges = None;
     for text in WITHOUT_TOKENS {
         let (_directory, index) = build(&[
             (
@@ -64,6 +65,24 @@ fn python_modules_without_tokens_are_declared_and_contained() {
             }),
             "{text:?}"
         );
+        let mut edges = index
+            .edges()
+            .edges()
+            .map(|edge| {
+                (
+                    format!("{:?}", edge.kind()),
+                    edge.from().as_str().to_owned(),
+                    edge.to().as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.sort();
+        // The first row is the file of no bytes: every other row has its containment.
+        assert_eq!(
+            &edges,
+            empty_file_edges.get_or_insert_with(|| edges.clone()),
+            "{text:?}"
+        );
         let module = index
             .files()
             .find(|file| file.path().as_str() == "pkg/a.py")
@@ -77,7 +96,7 @@ fn no_language_refuses_a_file_without_tokens() {
     for text in ["", "\n", "   \n\n", "\r\n", "\t"] {
         for path in [
             "a.rs", "a.py", "a.pyx", "a.ts", "a.tsx", "a.js", "a.mjs", "a.css", "a.html", "a.vue",
-            "a.svelte", "a.md", "a.yaml", "a.c", "a.cpp", "a.jsonc",
+            "a.svelte", "a.md", "a.yaml", "a.c", "a.cpp", "a.json", "a.jsonc", "a.toml",
         ] {
             let (_directory, index) = build(&[(path, text)]);
             assert!(

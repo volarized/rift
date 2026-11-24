@@ -7,7 +7,25 @@ use rift_analysis::{
     PackageImportRootOrigin, PackageSource,
 };
 use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
+use rift_protocol::index::PackagePublication;
 use rift_protocol::read::{Language, PackageIdentity};
+
+/// Every stored edge of a publication, as kinds, origin and target.
+fn stored_edges(publication: &PackagePublication) -> Vec<(String, String, String)> {
+    let mut edges = publication
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                format!("{:?}", edge.kinds),
+                edge.from.0.clone(),
+                edge.to.0.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    edges.sort();
+    edges
+}
 
 #[test]
 fn python_packages_keep_modules_without_tokens() {
@@ -97,9 +115,12 @@ fn python_packages_keep_modules_without_tokens() {
                 "{text:?}: {declared:?}"
             );
         }
+        // The first row is the file of no bytes: every other row has its declarations and
+        // its containment.
+        let facts = (declared, stored_edges(publication));
         assert_eq!(
-            &declared,
-            expected.get_or_insert(declared.clone()),
+            &facts,
+            expected.get_or_insert_with(|| facts.clone()),
             "{text:?}"
         );
     }
