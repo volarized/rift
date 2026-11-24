@@ -98,7 +98,15 @@ fn test_rust_impl_only_module_keeps_imported_calls_and_type_members() {
             .edges()
             .any(|edge| edge.kind() == EdgeKind::Contains
                 && edge.from().as_str().ends_with("/fixture/Task")
-                && edge.to().as_str().ends_with("/Task/run"))
+                && edge.to().as_str().ends_with("/fixture/Task/run"))
+    );
+    assert!(
+        index
+            .edges()
+            .edges()
+            .all(|edge| !edge.from().as_str().contains("/jobs/Task")
+                && !edge.to().as_str().contains("/jobs/Task")),
+        "the implementation belongs to the imported type"
     );
 }
 
@@ -2122,4 +2130,107 @@ fn test_rust_target_conditions_store_facts_of_the_host_target() {
     );
     assert!(index.edges().is_complete());
     assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+/// Every stored edge of one fixture without its occurrence.
+fn edge_rows(files: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String, String)> {
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, files);
+    assert!(index.edges().is_complete());
+    index
+        .edges()
+        .edges()
+        .map(|edge| {
+            (
+                format!("{:?}", edge.kind()),
+                edge.from().as_str().to_owned(),
+                edge.to().as_str().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_rust_leading_whitespace_keeps_every_row_of_a_reexporting_file() {
+    // #982: the parsed file starts at its first token and its `use` items apply to the file.
+    const OTHER: &str = "pub struct Item; impl Item { pub fn read(&self) -> u8 { 1 } } pub fn leaf() {} pub trait Tr { fn t(&self); }";
+    const FACADE: &str = "pub use crate::other::{leaf, Item, Tr};\npub use crate::other as renamed;\nuse crate::other::leaf as private;\nmod child;\n";
+    const USER: &str = "use crate::facade::{leaf, Item, Tr};\npub fn run(x: &Item) -> u8 { leaf(); x.read() }\npub fn path() { crate::facade::leaf(); crate::facade::renamed::leaf(); }\npub struct H;\nimpl Tr for H { fn t(&self) {} }\npub fn ty(x: crate::facade::Item) -> u8 { x.read() }\n";
+    const CHILD: &str = "pub fn inherited() { super::private() }\n";
+    let heads = ["", "\n", "   ", "\r\n", "\n// c\n", "// c\n"];
+    let module = heads.map(|head| {
+        let facade = format!("{head}{FACADE}");
+        edge_rows(&[
+            ("src/lib.rs", "pub mod other; pub mod facade; pub mod user;"),
+            ("src/other.rs", OTHER),
+            ("src/facade.rs", facade.as_str()),
+            ("src/facade/child.rs", CHILD),
+            ("src/user.rs", USER),
+        ])
+    });
+    let root = heads.map(|head| {
+        let library =
+            format!("{head}mod other; pub use other::{{leaf, Item, Tr}}; pub mod user;\n");
+        edge_rows(&[
+            ("src/lib.rs", library.as_str()),
+            ("src/other.rs", OTHER),
+            (
+                "src/user.rs",
+                "pub fn run(x: &crate::Item) -> u8 { crate::leaf(); x.read() }\n",
+            ),
+        ])
+    });
+    for rows in [module, root] {
+        assert!(
+            rows[0]
+                .iter()
+                .any(|(kind, _, to)| kind == "Calls" && to.ends_with("/other/leaf"))
+        );
+        for (head, found) in heads.iter().zip(&rows) {
+            assert_eq!(found, &rows[0], "{head:?}");
+        }
+    }
+}
+
+#[test]
+fn test_rust_imports_of_a_reexporting_module_start_at_the_module() {
+    // #983: the module of a file is the one its placement states, not the common parent of
+    // the names it declares.
+    for (library, module) in [
+        ("mod other; use other::leaf;", "/fixture"),
+        ("mod other; pub use other::leaf;", "/fixture"),
+        ("mod other; pub use other::{leaf, Item};", "/fixture"),
+        (
+            "mod other; pub use other::leaf; pub fn own() {}",
+            "/fixture",
+        ),
+        (
+            "mod other; pub use std::fmt::Debug; pub use other::leaf;",
+            "/fixture",
+        ),
+        (
+            "pub mod inner { pub fn leaf() {} pub mod deep { pub use super::leaf; } }",
+            "/inner/deep",
+        ),
+        ("pub mod other; pub mod user;", "/fixture/user"),
+        ("pub mod other; pub mod implement;", "/fixture/implement"),
+    ] {
+        let rows = edge_rows(&[
+            ("src/lib.rs", library),
+            ("src/other.rs", "pub struct Item; pub fn leaf() {}"),
+            ("src/user.rs", "pub use crate::other::leaf;"),
+            (
+                "src/implement.rs",
+                "use crate::other::Item; impl Item { pub fn read(&self) {} }",
+            ),
+        ]);
+        let importers = rows
+            .iter()
+            .filter(|(kind, _, _)| kind == "Imports")
+            .map(|(_, from, _)| from.as_str())
+            .collect::<Vec<_>>();
+        assert!(!importers.is_empty(), "{library}");
+        for importer in importers {
+            assert!(importer.ends_with(module), "{library}: {importer}");
+        }
+    }
 }

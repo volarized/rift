@@ -1041,6 +1041,23 @@ impl<'source> Index<'source> {
         Some(index)
     }
 
+    /// The site of an import whose declaration a dependency or the standard library owns.
+    fn external_import_occurrence(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<ExternalOccurrence> {
+        let target = self.external_import(file, binding, work)?;
+        let mut external =
+            Self::external_occurrence(file, range, range, ReferenceRole::Import, target)?;
+        if file.document.facts.language().name == "rust" {
+            external.edge_from = self.rust_module_from(file, range, work);
+        }
+        Some(external)
+    }
+
     /// Resolves every file and joins the results in path order.
     ///
     /// One file's pass reads the index and that file alone, so passes run across the
@@ -1242,16 +1259,7 @@ impl<'source> Index<'source> {
                 });
                 if occurrence.is_none()
                     && let Some(external) =
-                        self.external_import(file, binding, work)
-                            .and_then(|target| {
-                                Self::external_occurrence(
-                                    file,
-                                    range,
-                                    range,
-                                    ReferenceRole::Import,
-                                    target,
-                                )
-                            })
+                        self.external_import_occurrence(file, binding, range, work)
                 {
                     result.external.push(external);
                     continue;

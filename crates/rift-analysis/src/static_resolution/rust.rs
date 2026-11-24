@@ -215,10 +215,9 @@ impl<'source> Namespaces<'source> {
                     .iter()
                     .find(|(_, path)| path.as_slice() == module.as_slice())
                     .and_then(|(symbol, _)| symbol.body_range)
-                    .unwrap_or(ByteRange {
-                        start: 0,
-                        end: u64::try_from(file.document.source.len()).ok()?,
-                    });
+                    .unwrap_or(crate::analyzer::namespace::rust_file_scope(
+                        file.document.source,
+                    )?);
                 if imported.scope != scope {
                     continue;
                 }
@@ -724,7 +723,7 @@ impl<'source> Namespaces<'source> {
 
     fn index_file(&mut self, file: &File<'source>, work: &mut Work) -> Option<()> {
         let mut namespace = FileNamespace {
-            base: Vec::new(),
+            base: file.document.placement.module_path().to_vec(),
             inline: Vec::new(),
         };
         for symbol in file.document.facts.symbols() {
@@ -738,9 +737,6 @@ impl<'source> Namespaces<'source> {
             let Some(path) = target.admitted_path() else {
                 continue;
             };
-            if namespace.base.is_empty() {
-                namespace.base = declaring_module(target, &path)?;
-            }
             if file.inactive(symbol.item_range, work) {
                 if symbol.kind == "module" {
                     self.inactive_modules.insert(path);
@@ -779,22 +775,6 @@ impl<'source> Namespaces<'source> {
                 continue;
             }
             self.index_target(file, symbol, path, work);
-        }
-        if namespace.base.is_empty() {
-            for alias in file.document.placement.aliases() {
-                if !work.charge() {
-                    return None;
-                }
-                let identity =
-                    rift_protocol::identity::SymbolIdentity::parse(alias.identity.as_str()).ok()?;
-                let depth = alias.qualified_name.split("::").count();
-                let path = identity.qualified_path();
-                let base = path.get(..path.len().checked_sub(depth)?)?;
-                if !namespace.base.is_empty() && namespace.base != base {
-                    return None;
-                }
-                namespace.base = base.to_vec();
-            }
         }
         if let [crate_name] = namespace.base.as_slice() {
             self.crate_roots
@@ -904,10 +884,9 @@ impl<'source> Namespaces<'source> {
             .iter()
             .find(|(_, inline)| inline.as_slice() == path)
             .and_then(|(symbol, _)| symbol.body_range)
-            .unwrap_or(ByteRange {
-                start: 0,
-                end: u64::try_from(file.document.source.len()).ok()?,
-            });
+            .unwrap_or(crate::analyzer::namespace::rust_file_scope(
+                file.document.source,
+            )?);
         let imported = file
             .facts
             .rust_uses()
@@ -1513,10 +1492,9 @@ impl<'source> Namespaces<'source> {
                 .iter()
                 .find(|(_, path)| path.as_slice() == module)
                 .and_then(|(symbol, _)| symbol.body_range)
-                .unwrap_or(ByteRange {
-                    start: 0,
-                    end: u64::try_from(file.document.source.len()).ok()?,
-                });
+                .unwrap_or(crate::analyzer::namespace::rust_file_scope(
+                    file.document.source,
+                )?);
             if imported.scope == scope {
                 return None;
             }
@@ -1763,21 +1741,6 @@ fn inherent_member<'source>(
     })
 }
 
-/// The module path a declaration's file establishes, from the declaration's identity.
-fn declaring_module(target: Target<'_>, path: &[String]) -> Option<Vec<String>> {
-    let depth = if structural_owner(target) {
-        target
-            .symbol
-            .container
-            .as_deref()
-            .map_or(0, |container| container.split("::").count())
-            + 1
-    } else {
-        target.symbol.qualified_name.split("::").count()
-    };
-    Some(path.get(..path.len().checked_sub(depth)?)?.to_vec())
-}
-
 /// Files of a module that several `#[path]` alternatives declare, other than the one the
 /// admitted configuration selects.
 ///
@@ -1795,7 +1758,6 @@ fn unadmitted_alternatives<'source>(
         .iter()
         .filter(|(_, file)| file.document.facts.language().name == "rust")
     {
-        let mut base = None;
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
                 return None;
@@ -1807,15 +1769,13 @@ fn unadmitted_alternatives<'source>(
             let Some(qualified) = target.admitted_path() else {
                 continue;
             };
-            if base.is_none() {
-                base = declaring_module(target, &qualified);
-            }
             if symbol.kind == "module" && symbol.body_range.is_none() {
                 declared.push((file, symbol, qualified));
             }
         }
-        if let Some(base) = base {
-            modules.entry(base).or_default().push(path);
+        let base = file.document.placement.module_path();
+        if !base.is_empty() {
+            modules.entry(base.to_vec()).or_default().push(path);
         }
     }
     let mut unadmitted = BTreeSet::new();
@@ -1874,12 +1834,16 @@ fn unadmitted_chain_modules<'source>(
     if files.values().all(|file| file.chain_modules.is_empty()) {
         return Some(unadmitted);
     }
-    let mut bases = BTreeMap::<&'source str, Vec<String>>::new();
+    let mut bases = BTreeMap::<&'source str, &'source [String]>::new();
     let mut declared = BTreeSet::<Vec<String>>::new();
     for (&path, file) in files
         .iter()
         .filter(|(_, file)| file.document.facts.language().name == "rust")
     {
+        let base = file.document.placement.module_path();
+        if !base.is_empty() {
+            bases.insert(path, base);
+        }
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
                 return None;
@@ -1891,11 +1855,6 @@ fn unadmitted_chain_modules<'source>(
             let Some(qualified) = target.admitted_path() else {
                 continue;
             };
-            if !bases.contains_key(path)
-                && let Some(base) = declaring_module(target, &qualified)
-            {
-                bases.insert(path, base);
-            }
             if symbol.kind == "module" && symbol.body_range.is_none() {
                 declared.insert(qualified);
             }
@@ -1932,10 +1891,8 @@ fn unadmitted_chain_modules<'source>(
                         continue;
                     };
                     if last != name
-                        || declared.contains(base)
-                        || bases
-                            .get(parent)
-                            .is_some_and(|parent| parent.as_slice() != module)
+                        || declared.contains(*base)
+                        || bases.get(parent).is_some_and(|parent| *parent != module)
                     {
                         continue;
                     }

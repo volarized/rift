@@ -794,10 +794,16 @@ pub(super) fn capture_scope(
                 .and_then(|parent| syntax_elements.get(parent))
                 .is_some_and(|parent| parent.kind == "mod_item");
         if root || module {
-            rows.insert(
-                index,
-                (syntax_element.range, Vec::new(), !syntax_element.has_error),
-            );
+            // The parsed root starts at the first token; the scope is the whole file.
+            let range = if root {
+                ByteRange {
+                    start: 0,
+                    end: u64::try_from(source.len()).ok()?,
+                }
+            } else {
+                syntax_element.range
+            };
+            rows.insert(index, (range, Vec::new(), !syntax_element.has_error));
         }
     }
     for syntax_element in syntax_elements {

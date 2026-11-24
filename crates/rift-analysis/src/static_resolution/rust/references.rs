@@ -145,13 +145,33 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Import, target)?;
-        if let Some(source) = self.rust.import_source(file, range, work) {
-            let source = self.occurrence(file, range, range, ReferenceRole::Import, source)?;
-            if let rift_provider::NormalizedTarget::Symbol(from) = source.target {
-                occurrence.edge_from = Some(from);
-            }
-        }
+        occurrence.edge_from = self.rust_module_from(file, range, work);
         Some(occurrence)
+    }
+
+    /// The module whose `use` declaration stands at `range`. A reexport declares its name
+    /// there as well, and that name imports nothing.
+    pub(in crate::static_resolution) fn rust_module_from(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<rift_core::SymbolId> {
+        let imported = file
+            .facts
+            .rust_uses()
+            .iter()
+            .find(|imported| work.charge() && imported.range == range)?;
+        let scope = crate::analyzer::namespace::rust_file_scope(file.document.source)?;
+        if imported.scope == scope {
+            return file.document.placement.module().cloned();
+        }
+        let source = self.rust.import_source(file, range, work)?;
+        let source = self.occurrence(file, range, range, ReferenceRole::Import, source)?;
+        match source.target {
+            rift_provider::NormalizedTarget::Symbol(from) => Some(from),
+            rift_provider::NormalizedTarget::Contribution(_) => None,
+        }
     }
 
     fn rust_edge(

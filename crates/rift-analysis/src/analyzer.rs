@@ -505,6 +505,7 @@ fn place_namespace(
             .placement
             .clone()
             .with_identity_anchors(assigned)
+            .with_module(namespace.rust_modules.remove(held.file.path().as_str()))
             .with_logical_declarations(
                 namespace
                     .mappings

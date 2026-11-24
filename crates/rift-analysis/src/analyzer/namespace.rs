@@ -49,6 +49,8 @@ pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
     /// The source path and accepted crate namespace of a Cargo library root.
     pub(crate) rust_package_root: Option<(String, SymbolId)>,
+    /// The module of each Rust file a captured library's module tree reaches.
+    pub(crate) rust_modules: BTreeMap<String, SymbolId>,
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     /// Observed `CommonJS` files with a checked synchronized export object.
     pub(crate) commonjs_modules: BTreeSet<String>,
@@ -149,6 +151,7 @@ pub(crate) fn prepare_context(
     let rust = rust::prepare(input, selected);
     prepared.anchors.extend(rust.anchors);
     prepared.rust_package_root = rust.rust_package_root;
+    prepared.rust_modules = rust.rust_modules;
     prepared.exports.extend(rust.exports);
     prepared.alias_visibilities.extend(rust.alias_visibilities);
     prepared.unresolved_exports |= rust.unresolved_exports;
@@ -519,3 +522,4 @@ pub(crate) use rust::chain_modules as rust_chain_modules;
 pub(crate) use rust::configuration::{
     Configuration as RustConfiguration, Configurations as RustConfigurations,
 };
+pub(crate) use rust::file_scope as rust_file_scope;
