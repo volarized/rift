@@ -2721,16 +2721,16 @@ impl<'facts> PythonExports<'facts> {
 
     /// Whether `symbol`'s own name is public directly inside `owner`, or in the module.
     ///
-    /// A module that lists its names exports those alone. Elsewhere a leading underscore makes
-    /// a name private, except the special method of a class.
+    /// A leading underscore makes a name private, except a name the module lists and the
+    /// special method of a class. A name the module omits from its list stays public: another
+    /// module may re-export it or extend the class.
     fn is_name_public(&self, symbol: &SyntaxSymbol, owner: Option<&SyntaxSymbol>) -> bool {
-        if owner.is_none()
-            && symbol.kind != "module"
-            && let Some(listed) = &self.listed
-        {
-            return listed.contains(symbol.name.as_str());
-        }
-        if !symbol.name.starts_with('_') {
+        let listed = owner.is_none()
+            && self
+                .listed
+                .as_ref()
+                .is_some_and(|listed| listed.contains(symbol.name.as_str()));
+        if listed || !symbol.name.starts_with('_') {
             return true;
         }
         let special = symbol

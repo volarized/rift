@@ -727,7 +727,7 @@ class Session:
 }
 
 #[test]
-fn python_package_visibility_follows_the_names_a_module_lists() {
+fn python_package_visibility_adds_the_names_a_module_lists() {
     let source = r#"from .other import imported as imported
 
 __all__ = ["Session", "_listed", "imported"]
@@ -742,8 +742,12 @@ class Unlisted:
 class _Private:
     def open(self): pass
 
+class _Unlisted:
+    def open(self): pass
+
 def _listed(): pass
 def unlisted(): pass
+def _unlisted(): pass
 
 __all__ += ("_Private", "LIMIT")
 LIMIT = 1
@@ -778,17 +782,20 @@ def _hidden(): pass
         ("pkg/mod.py", "Session", true),
         ("pkg/mod.py", "Session.__init__", true),
         ("pkg/mod.py", "Session._hidden", false),
-        ("pkg/mod.py", "Unlisted", false),
-        ("pkg/mod.py", "Unlisted.open", false),
+        ("pkg/mod.py", "Unlisted", true),
+        ("pkg/mod.py", "Unlisted.open", true),
         ("pkg/mod.py", "_Private", true),
         ("pkg/mod.py", "_Private.open", true),
         ("pkg/mod.py", "_listed", true),
-        ("pkg/mod.py", "unlisted", false),
+        ("pkg/mod.py", "unlisted", true),
+        ("pkg/mod.py", "_Unlisted", false),
+        ("pkg/mod.py", "_Unlisted.open", false),
+        ("pkg/mod.py", "_unlisted", false),
         ("pkg/mod.py", "LIMIT", true),
-        ("pkg/mod.py", "OTHER", false),
+        ("pkg/mod.py", "OTHER", true),
         ("pkg/mod.py", "__all__", false),
         ("pkg/other.py", "imported", true),
-        ("pkg/empty.py", "run", false),
+        ("pkg/empty.py", "run", true),
         ("pkg/empty.py", "__all__", false),
         ("pkg/computed.py", "run", true),
         ("pkg/computed.py", "open", true),
@@ -815,6 +822,70 @@ def _hidden(): pass
         analysis.files().iter().all(|file| file.is_public(".")),
         "a module stays public whatever it lists"
     );
+}
+
+/// `__all__` states what a star import binds. Another module may still re-export a name it
+/// omits, or extend the class, so the omission hides nothing.
+#[test]
+fn python_package_visibility_keeps_the_names_a_module_omits_from_its_list() {
+    let analysis = analyzed(
+        ShippedLanguage::Python,
+        vec![
+            (
+                "pkg/__init__.py",
+                "from .client import Reexported as Reexported
+from .client import Imported
+",
+            ),
+            (
+                "pkg/client.py",
+                "__all__ = ['Client', '_listed']
+class BaseClient:
+    def build_request(self): pass
+    def _send(self):
+        sent = 1
+class Client(BaseClient): pass
+class Reexported:
+    def run(self): pass
+class Imported:
+    def run(self): pass
+class Extended:
+    def run(self): pass
+def _listed(): pass
+",
+            ),
+            (
+                "pkg/other.py",
+                "from .client import Extended
+class Derived(Extended): pass
+",
+            ),
+        ],
+    );
+    let held = analysis
+        .files()
+        .iter()
+        .find(|file| file.file().path().as_str() == "pkg/client.py")
+        .expect("module");
+    for (name, public) in [
+        ("Client", true),
+        ("BaseClient", true),
+        ("BaseClient.build_request", true),
+        ("BaseClient._send", false),
+        ("BaseClient._send.sent", false),
+        ("Reexported", true),
+        ("Reexported.run", true),
+        ("Imported", true),
+        ("Imported.run", true),
+        ("Extended", true),
+        ("Extended.run", true),
+        ("_listed", true),
+        ("__all__", false),
+    ] {
+        assert_eq!(held.is_public(name), public, "{name}");
+        let declaration = symbol_at(&analysis, "pkg/client.py", name).expect(name);
+        assert_eq!(declaration.public, public, "{name}");
+    }
 }
 
 /// A stub member whose class joined the module names the class the module declares as its
