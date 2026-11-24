@@ -365,6 +365,7 @@ impl Kinds {
         self.record_object_member(visited, facts)?;
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
+        self.record_module_statement(visited, facts);
         self.record_module_syntax(visited, source, facts);
         self.record_direct_write(visited, source, facts)?;
         self.record_reference(visited, facts)?;
@@ -584,6 +585,14 @@ impl Kinds {
             parent = candidate.parent();
         }
         Ok(())
+    }
+
+    fn record_module_statement(&self, visited: Visited<'_, '_>, facts: &mut StaticFactsParts) {
+        facts.javascript_module_statement |= [self.import, self.export]
+            .contains(&visited.syntax_element().kind_id())
+            && visited
+                .parent()
+                .is_some_and(|parent| parent.syntax_element().kind_id() == self.scopes[0]);
     }
 
     fn record_module_syntax(

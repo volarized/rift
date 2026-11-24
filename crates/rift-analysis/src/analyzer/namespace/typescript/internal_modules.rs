@@ -2,8 +2,8 @@
 
 use super::{
     BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SymbolId, SymbolIdentity, SymbolKind, SymbolOwner, declaration_anchors,
-    prepare_file, selected_source_is_valid,
+    SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_file,
+    selected_source_is_valid,
 };
 use serde::Deserialize;
 
@@ -46,7 +46,7 @@ pub(super) fn prepare(
         {
             continue;
         }
-        if is_script(file, &ambient) {
+        if is_script(file) {
             continue;
         }
         let module = format!("{}/{path}", metadata.name);
@@ -70,32 +70,16 @@ pub(super) fn prepare(
 }
 
 /// Whether a TypeScript file is no module: what it declares belongs to the global scope and
-/// to the ambient modules it names.
-///
-/// A file that declares ambient modules is a module only when it exports a name itself, since
-/// the exports written inside them are theirs.
-fn is_script(file: &SelectedFile<'_>, ambient: &BTreeMap<String, SymbolId>) -> bool {
-    let syntax = file.syntax;
-    if syntax.language().name != "typescript" {
-        return false;
-    }
-    if !syntax
-        .static_facts()
-        .is_some_and(rift_syntax::StaticFacts::has_javascript_module_syntax)
-    {
-        return true;
-    }
-    let exports = syntax
-        .export_bindings()
-        .unwrap_or_default()
-        .iter()
-        .any(|binding| binding.container.is_none())
-        || syntax.symbols().iter().any(|symbol| {
-            symbol.container.is_none()
-                && symbol.kinds.contains(&SymbolKind::Public)
-                && !ambient.contains_key(&symbol.qualified_name)
-        });
-    !ambient.is_empty() && !exports
+/// to the ambient modules it names. A `.mts` or `.cts` source is always a module.
+fn is_script(file: &SelectedFile<'_>) -> bool {
+    file.syntax.language().name == "typescript"
+        && ![".mts", ".cts"]
+            .iter()
+            .any(|extension| file.path.as_str().ends_with(extension))
+        && !file
+            .syntax
+            .static_facts()
+            .is_some_and(rift_syntax::StaticFacts::has_javascript_module_statement)
 }
 
 /// The file that holds each module an established anchor names, or `None` for a module

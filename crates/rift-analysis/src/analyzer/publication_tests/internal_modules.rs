@@ -309,6 +309,46 @@ fn an_alias_of_an_entry_keeps_the_aliased_declaration_and_its_members_public() {
 }
 
 #[test]
+fn a_typescript_script_names_no_module_by_its_path() {
+    let files = [
+        ("index.js", "export function load() {}\n"),
+        (
+            "ambient.d.ts",
+            "/** Documented. */\ndeclare module 'other' { import { A } from 'a'; export function g(a: A): void }\n",
+        ),
+        (
+            "ns.d.ts",
+            "declare namespace NS { export interface I { a: 1 } }\ndeclare function beside(): void;\n",
+        ),
+        (
+            "ns2.d.ts",
+            "declare namespace NS { export interface I { b: 1 } }\n",
+        ),
+    ];
+    let analysis = analyze(MAIN, &files);
+    for (path, file) in declared(&analysis).into_keys() {
+        assert!(!path[0].ends_with(".d.ts"), "{path:?} {file}");
+    }
+    let modules = analyze(
+        MAIN,
+        &[
+            files[0],
+            ("empty.ts", "export {};\nfunction inEmpty() {}\n"),
+            ("imports.ts", "import './s';\nfunction inImports() {}\n"),
+            ("always.mts", "function inMts() {}\n"),
+        ],
+    );
+    for (name, file) in [
+        ("inEmpty", "empty.ts"),
+        ("inImports", "imports.ts"),
+        ("inMts", "always.mts"),
+    ] {
+        let module = format!("beacon/{file}");
+        assert!(public(&modules, &[&module, name], file).is_some(), "{file}");
+    }
+}
+
+#[test]
 fn a_forward_another_value_can_replace_reaches_no_target() {
     let user = "var i = require('./index');
 var { open } = require('./index');

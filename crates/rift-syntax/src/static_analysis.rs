@@ -343,6 +343,8 @@ pub struct StaticFactsParts {
     pub javascript_module_syntax: bool,
     /// Assignments to `module.exports` or `exports` that stand directly in the source file.
     pub commonjs_direct_writes: Vec<ByteRange>,
+    /// Whether an ECMAScript import or export statement stands directly in the source file.
+    pub javascript_module_statement: bool,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
@@ -439,6 +441,13 @@ impl StaticFacts {
     #[must_use]
     pub fn has_javascript_module_syntax(&self) -> bool {
         self.0.javascript_module_syntax
+    }
+
+    /// Whether an import or export statement stands directly in the ECMAScript source file,
+    /// outside every ambient module and namespace.
+    #[must_use]
+    pub fn has_javascript_module_statement(&self) -> bool {
+        self.0.javascript_module_statement
     }
 
     /// Assignments to `module.exports` or `exports` in a statement of the source file itself.

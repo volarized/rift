@@ -233,6 +233,33 @@ fn test_commonjs_direct_export_witness_refuses_conditional_and_wrapper_escapes()
 }
 
 #[test]
+fn test_module_statements_stand_directly_in_the_source_file() {
+    let checked = |source| {
+        parsed(ShippedLanguage::TypeScript, source)
+            .facts()
+            .static_facts()
+            .expect("static facts")
+            .has_javascript_module_statement()
+    };
+    for source in [
+        "import './s';",
+        "export {};",
+        "export declare const a: 1;",
+        "import a = require('a');",
+    ] {
+        assert!(checked(source), "{source}");
+    }
+    for source in [
+        "declare module 'm' { import { A } from 'a'; export function g(a: A): void }",
+        "declare namespace N { export interface I {} }",
+        "declare function beside(): void;",
+        "const loaded = import('a');",
+    ] {
+        assert!(!checked(source), "{source}");
+    }
+}
+
+#[test]
 fn test_direct_commonjs_writes_run_without_a_condition() {
     let checked = |source| {
         parsed(ShippedLanguage::JavaScript, source)
