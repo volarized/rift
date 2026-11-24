@@ -1,4 +1,7 @@
-use super::{PACKAGE_ARTIFACT_BYTES_MAX, PackageArtifact, WheelTag, python_identifier_is_valid};
+use super::{
+    PACKAGE_ARTIFACT_BYTES_MAX, PACKAGE_ARTIFACT_TAGS_MAX, PackageArtifact, WheelTag,
+    python_identifier_is_valid,
+};
 use crate::identity::SourceDigest;
 
 #[test]
@@ -89,20 +92,77 @@ fn tags_preserve_base64_abi_and_validate_python_identifiers() {
     );
 }
 
+// Issue #1057.
+#[test]
+fn published_compressed_tags_expand_past_64() {
+    let python = "cp38.cp39.cp310.cp311.cp312.cp313";
+    let abi = "cp38.cp39.cp310.cp311.cp312.cp313";
+    let platform = "manylinux_2_17_x86_64.manylinux2014_x86_64";
+    let tags = WheelTag::parse(&format!("{python}-{abi}-{platform}")).expect("72 expanded tags");
+    assert_eq!(tags.len(), 72);
+    let filename = format!("beacon-1.0.0-{python}-{abi}-{platform}.whl");
+    let digest = SourceDigest::parse(&"f".repeat(64)).expect("artifact digest");
+    assert!(PackageArtifact::new(&filename, digest, &tags).is_ok());
+}
+
+#[test]
+fn a_python_part_that_names_no_interpreter_adds_no_tag() {
+    let py2 = WheelTag::parse("py2-none-any").expect("py2 tag");
+    for value in ["py2.7-none-any", "py2.7.2-none-any", "2.py2.7-none-any"] {
+        assert_eq!(WheelTag::parse(value).expect(value), py2, "{value}");
+    }
+    let digest = SourceDigest::parse(&"f".repeat(64)).expect("artifact digest");
+    assert!(PackageArtifact::new("beacon-1.0.0-py2.7-none-any.whl", digest, &py2).is_ok());
+    for value in [
+        "7-none-any",
+        "2.7-none-any",
+        "py2..7-none-any",
+        "py2.7 -none-any",
+    ] {
+        assert_eq!(
+            WheelTag::parse(value).map_err(|error| error_violation(&error)),
+            Err("Tag".to_owned()),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn length_refusals_name_the_observed_quantity_and_its_bound() {
+    let quantities = |error: &rift_error::RiftError| {
+        ["observed", "bound"].map(|name| {
+            error
+                .context()
+                .find(|(key, _)| *key == name)
+                .expect("registered quantity")
+                .1
+        })
+    };
+    let python = (0..=PACKAGE_ARTIFACT_TAGS_MAX)
+        .map(|number| format!("p{number}"))
+        .collect::<Vec<_>>()
+        .join(".");
+    let error = WheelTag::parse(&format!("{python}-none-any")).expect_err("one tag too many");
+    assert_eq!(quantities(&error), ["1025", "1024"]);
+    let abi = "a".repeat(PACKAGE_ARTIFACT_BYTES_MAX - 5);
+    let error = WheelTag::new("py3", &abi, "any").expect_err("one byte too many");
+    assert_eq!(quantities(&error), ["65537", "65536"]);
+}
+
 #[test]
 fn tag_limits_apply_before_cartesian_expansion_and_lowercase_copy() {
-    let python = (0..64)
+    let python = (0..PACKAGE_ARTIFACT_TAGS_MAX)
         .map(|number| format!("py{number}"))
         .collect::<Vec<_>>()
         .join(".");
     assert_eq!(
         WheelTag::parse(&format!("{python}-none-any"))
-            .expect("exact64 tags")
+            .expect("tags at the bound")
             .len(),
-        64
+        PACKAGE_ARTIFACT_TAGS_MAX
     );
     assert_eq!(
-        WheelTag::parse(&format!("{python}.py64-none-any"))
+        WheelTag::parse(&format!("{python}.py1024-none-any"))
             .map_err(|error| error_violation(&error)),
         Err("Length".to_owned())
     );
@@ -230,8 +290,12 @@ fn artifact_factories_refuse_unbounded_fields() {
         Err("Path".to_owned())
     );
     assert_eq!(
-        PackageArtifact::new("six.whl", digest.clone(), &vec![tags[0].clone(); 65])
-            .map_err(|error| error_violation(&error)),
+        PackageArtifact::new(
+            "six.whl",
+            digest.clone(),
+            &vec![tags[0].clone(); PACKAGE_ARTIFACT_TAGS_MAX + 1]
+        )
+        .map_err(|error| error_violation(&error)),
         Err("Length".to_owned())
     );
     let large_tag = WheelTag::new("py3", &"a".repeat(PACKAGE_ARTIFACT_BYTES_MAX - 6), "any")
@@ -251,6 +315,6 @@ fn artifact_factories_refuse_unbounded_fields() {
         serde_json::to_value(schemars::schema_for!(PackageArtifact)).expect("artifact schema");
     assert_eq!(
         schema["properties"]["tags"]["maxItems"],
-        serde_json::json!(64)
+        serde_json::json!(PACKAGE_ARTIFACT_TAGS_MAX)
     );
 }

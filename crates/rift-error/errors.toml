@@ -78,7 +78,7 @@ fields = { violation = { type = "string" } }
 [error.analysis.package_artifact_invalid]
 message = "selected artifact field {field} is invalid: {violation}"
 action = "replace or rebuild the invalid publication, then retry"
-fields = { field = { type = "string" }, violation = { type = "string" }, cause = { type = "rift_error", role = "cause", optional = true } }
+fields = { field = { type = "string" }, violation = { type = "string" }, observed = { type = "unsigned", optional = true }, bound = { type = "unsigned", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.server.search_exact_release_unavailable]
 message = "exact release {release} has no accepted publication"
@@ -1095,6 +1095,11 @@ fields = { path = { type = "path", format = "display", optional = true } }
 message = "package source path appears more than once"
 action = "send each package source path once and retry"
 fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.analysis.package_input_import_limit_exceeded]
+message = "package import roots exceed their accepted limit"
+action = "reduce package import roots below their accepted limit and retry"
+fields = { field = { type = "string" }, bound = { type = "unsigned" }, observed = { type = "unsigned" } }
 
 [error.analysis.package_input_too_many_files]
 message = "package source count exceeds its accepted limit"

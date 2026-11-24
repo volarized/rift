@@ -177,7 +177,8 @@ pub enum DocumentationSelectionReason {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationLicense {
-    /// Declared expression; collection does not infer a license from source text.
+    /// Declared expression, absent when the source declares none; a blank one is refused.
+    /// Collection does not infer a license from source text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expression: Option<String>,
     /// License files whose bytes the adapter verified.

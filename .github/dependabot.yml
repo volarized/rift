@@ -1,5 +1,11 @@
 version: 2
 
+# TEMPORARY PAUSE (2026-11-24): version updates are off and open pull requests are not
+# rebased, so that dependency runs do not hold the macOS runners a release needs (#1067).
+# Security updates are not affected. To undo: delete every `open-pull-requests-limit: 0`
+# and `rebase-strategy: "disabled"` line below and put back the limit of 5 for the two bun
+# entries and cargo.
+
 # Commit prefixes carry 🤖 so Dependabot's commits match the repo's
 # emoji-prefixed convention and are greppable as machine-authored.
 #
@@ -21,7 +27,8 @@ updates:
     directory: /docs
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "🤖 build"
       prefix-development: "🤖 build"
@@ -47,7 +54,8 @@ updates:
     directory: /tools/mcp-conformance
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "🤖 build"
       prefix-development: "🤖 build"
@@ -62,7 +70,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "🤖 build"
       include: scope
@@ -76,6 +85,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "🤖 build"
       include: scope
@@ -87,6 +98,8 @@ updates:
     directory: /dev
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "🤖 build"
       prefix-development: "🤖 build"

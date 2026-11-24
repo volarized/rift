@@ -1624,7 +1624,8 @@ pub struct DocumentationHit {
 )]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationLicense {
-    /// Declared expression; collection does not infer a license from source text.
+    /// Declared expression, absent when the source declares none; a blank one is refused.
+    /// Collection does not infer a license from source text.
     pub expression: Option<String>,
     /// License files whose bytes the adapter verified.
     #[validate(nested)]

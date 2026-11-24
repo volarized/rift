@@ -23,6 +23,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.analysis.package_identity_invalid",
     "rift.analysis.package_input_duplicate_path",
     "rift.analysis.package_input_identity_invalid",
+    "rift.analysis.package_input_import_limit_exceeded",
     "rift.analysis.package_input_origin_invalid",
     "rift.analysis.package_input_too_many_bytes",
     "rift.analysis.package_input_too_many_files",

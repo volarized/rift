@@ -3100,3 +3100,63 @@ fn a_pax_size_that_differs_from_its_header_is_refused_in_both_modes() -> TestRes
     }
     Ok(())
 }
+
+// Issue #1064.
+#[test]
+fn a_second_extended_header_of_one_member_is_refused_by_the_header_pass() -> TestResult {
+    let size = pax_record("size", "1");
+    let path = pax_record("path", "release/a");
+    for (flag, first, second) in [
+        (b'x', size.as_bytes(), size.as_bytes()),
+        (b'x', path.as_bytes(), size.as_bytes()),
+        (b'L', b"release/a\0".as_slice(), b"release/a\0".as_slice()),
+    ] {
+        let tar = [
+            raw_member("first", flag, first)?,
+            raw_member("second", flag, second)?,
+            raw_member("release/a", b'0', b"x")?,
+        ]
+        .concat();
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                check_tar_headers(tar.as_slice(), limits).expect_err("a second extended header"),
+                ArchiveError::InvalidArchive
+            );
+            assert_eq!(
+                read(&gzip(&tar)?, limits).expect_err("a second extended header"),
+                ArchiveError::InvalidArchive
+            );
+        }
+    }
+    // One member may have a GNU long name and a PAX header, in either order.
+    let local = raw_member("PaxHeaders/a", b'x', pax_record("comment", "x").as_bytes())?;
+    let long_name = raw_member("././@LongLink", b'L', b"release/a\0")?;
+    let member = raw_member("release/x", b'0', b"x")?;
+    for tar in [[&local, &long_name, &member], [&long_name, &local, &member]] {
+        for limits in both_modes(ArchiveLimits::default()) {
+            let bytes = gzip(&tar.map(Vec::as_slice).concat())?;
+            assert_eq!(retained(&read(&bytes, limits)?), [("a", b"x".as_slice())]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_pax_size_records_agree_with_their_header() -> TestResult {
+    let equal = pax_record("size", "1").repeat(1_000);
+    for (records, accepted) in [
+        (equal.clone(), true),
+        (format!("{equal}{}", pax_record("size", "2")), false),
+        (format!("{}{equal}", pax_record("size", "2")), false),
+    ] {
+        let tar = [
+            raw_member("PaxHeaders/a", b'x', records.as_bytes())?,
+            raw_member("release/a", b'0', b"x")?,
+        ]
+        .concat();
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(read(&gzip(&tar)?, limits).is_ok(), accepted);
+        }
+    }
+    Ok(())
+}

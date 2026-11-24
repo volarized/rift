@@ -7,7 +7,10 @@ use rift_protocol::{identity::SymbolOwner, index::python_identifier_is_valid, re
 use super::PackageSource;
 
 /// Maximum retained import roots and module entries for one selected artifact.
-pub const PACKAGE_IMPORT_ENTRIES_MAX: usize = 64;
+///
+/// [`PACKAGE_IMPORT_BYTES_MAX`] leaves 16 bytes for each entry, so it bounds a package of
+/// longer names first. Module placement compares each source path with every entry.
+pub const PACKAGE_IMPORT_ENTRIES_MAX: usize = 4_096;
 /// Maximum aggregate UTF-8 bytes in retained import roots and module names.
 pub const PACKAGE_IMPORT_BYTES_MAX: usize = 65_536;
 
@@ -45,8 +48,8 @@ impl PackageImportRoot {
     ///
     /// # Errors
     ///
-    /// Returns an identity error for empty or invalid modules, duplicate modules,
-    /// an empty explicit prefix, or an exceeded count or byte bound.
+    /// Returns an identity error for empty or invalid modules, duplicate modules, or an empty
+    /// explicit prefix, and a limit error that names an exceeded count or byte bound.
     pub fn new(
         prefix: Option<ProjectPath>,
         modules: Vec<String>,
@@ -54,19 +57,18 @@ impl PackageImportRoot {
     ) -> Result<Self, RiftError> {
         if origin == PackageImportRootOrigin::Runtime
             || modules.is_empty()
-            || modules.len() > PACKAGE_IMPORT_ENTRIES_MAX
             || prefix.as_ref().is_some_and(|path| path.as_str().is_empty())
         {
             return invalid();
         }
+        within_entries(modules.len())?;
         let mut bytes = prefix.as_ref().map_or(0, |path| path.as_str().len());
         for module in &modules {
             bytes = bytes
                 .checked_add(module.len())
                 .ok_or_else(|| errors::analysis::package_input_identity_invalid().error())?;
-            if bytes > PACKAGE_IMPORT_BYTES_MAX
-                || !module.split('.').all(python_identifier_is_valid)
-            {
+            within_bytes(bytes)?;
+            if !module.split('.').all(python_identifier_is_valid) {
                 return invalid();
             }
         }
@@ -90,8 +92,8 @@ impl PackageImportRoot {
     /// `python` and `cpython` retain their supplied runtime names.
     ///
     /// # Errors
-    /// Returns the existing identity refusal for a different runtime, invalid version,
-    /// empty explicit prefix, or exceeded byte bound.
+    /// Returns the existing identity refusal for a different runtime, invalid version, or empty
+    /// explicit prefix, and a limit error that names an exceeded byte bound.
     pub fn runtime(owner: SymbolOwner, prefix: Option<ProjectPath>) -> Result<Self, RiftError> {
         owner.validate().map_err(|source| {
             errors::analysis::package_input_identity_invalid()
@@ -109,9 +111,7 @@ impl PackageImportRoot {
             origin: PackageImportRootOrigin::Runtime,
             runtime: Some(owner),
         };
-        if root.bytes() > PACKAGE_IMPORT_BYTES_MAX {
-            return invalid();
-        }
+        within_bytes(root.bytes())?;
         Ok(root)
     }
 
@@ -144,9 +144,7 @@ impl PackageImportRoot {
 }
 
 pub(crate) fn validate_roots(roots: &[PackageImportRoot]) -> Result<(), RiftError> {
-    if roots.len() > PACKAGE_IMPORT_ENTRIES_MAX {
-        return invalid();
-    }
+    within_entries(roots.len())?;
     let mut modules = 0_usize;
     let mut bytes = 0_usize;
     for root in roots {
@@ -156,9 +154,8 @@ pub(crate) fn validate_roots(roots: &[PackageImportRoot]) -> Result<(), RiftErro
         bytes = bytes
             .checked_add(root.bytes())
             .ok_or_else(|| errors::analysis::package_input_identity_invalid().error())?;
-        if modules > PACKAGE_IMPORT_ENTRIES_MAX || bytes > PACKAGE_IMPORT_BYTES_MAX {
-            return invalid();
-        }
+        within_entries(modules)?;
+        within_bytes(bytes)?;
     }
     let mut prefixes = BTreeSet::new();
     for root in roots {
@@ -167,6 +164,33 @@ pub(crate) fn validate_roots(roots: &[PackageImportRoot]) -> Result<(), RiftErro
         }
     }
     Ok(())
+}
+
+fn within_entries(observed: usize) -> Result<(), RiftError> {
+    within(
+        "package_import_entries_max",
+        observed,
+        PACKAGE_IMPORT_ENTRIES_MAX,
+    )
+}
+
+fn within_bytes(observed: usize) -> Result<(), RiftError> {
+    within(
+        "package_import_bytes_max",
+        observed,
+        PACKAGE_IMPORT_BYTES_MAX,
+    )
+}
+
+fn within(field: &str, observed: usize, bound: usize) -> Result<(), RiftError> {
+    if observed <= bound {
+        return Ok(());
+    }
+    errors::analysis::package_input_import_limit_exceeded()
+        .field(field)
+        .bound(bound as u64)
+        .observed(observed as u64)
+        .fail()
 }
 
 fn invalid<T>() -> Result<T, RiftError> {

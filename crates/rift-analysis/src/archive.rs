@@ -670,11 +670,13 @@ impl Read for GzipMembers<'_> {
 /// Records that GNU and PAX extended headers hold for the next tar member.
 #[derive(Default)]
 struct TarExtension {
-    /// Whether an extended header of the next member was read.
-    pending: bool,
+    /// Whether a PAX header of the next member was read.
+    local: bool,
     long_name: Option<Vec<u8>>,
     path: Option<Vec<u8>>,
-    sizes: Vec<Vec<u8>>,
+    size: Option<Vec<u8>>,
+    /// Whether two PAX sizes name different quantities.
+    sizes_differ: bool,
 }
 
 impl TarExtension {
@@ -688,12 +690,24 @@ impl TarExtension {
         member_path(std::str::from_utf8(path).ok()?).filter(|path| !path.as_str().is_empty())
     }
 
+    /// Whether an extended header of the next member was read.
+    fn pending(&self) -> bool {
+        self.local || self.long_name.is_some()
+    }
+
+    /// Keeps the first PAX size and whether another one differs from it.
+    fn record_size(&mut self, size: &[u8]) {
+        let first = self.size.get_or_insert_with(|| size.to_vec());
+        self.sizes_differ |= first != size;
+    }
+
     /// Whether any PAX size names another quantity than the member's own header.
     fn disagrees(&self, size: u64) -> bool {
-        let size = size.to_string();
-        self.sizes
-            .iter()
-            .any(|recorded| recorded != size.as_bytes())
+        self.sizes_differ
+            || self
+                .size
+                .as_deref()
+                .is_some_and(|recorded| recorded != size.to_string().as_bytes())
     }
 }
 
@@ -741,8 +755,13 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
             return Err(ArchiveError::UnsupportedEntry);
         }
         // The tar library gives pending records to a global header instead of their member.
-        if global && extended.pending {
+        if global && extended.pending() {
             return Err(ArchiveError::UnsupportedEntry);
+        }
+        // The tar library refuses a second one too, after it read the first.
+        let local = kind.is_pax_local_extensions();
+        if (local && extended.local) || (kind.is_gnu_longname() && extended.long_name.is_some()) {
+            return Err(ArchiveError::InvalidArchive);
         }
         let size = entry.size();
         if size > limits.member_bytes as u64 && !(kind.is_file() && limits.omits(size)) {
@@ -780,13 +799,13 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
                             .path
                             .get_or_insert_with(|| value.value_bytes().to_vec());
                     }
-                    b"size" => extended.sizes.push(value.value_bytes().to_vec()),
+                    b"size" => extended.record_size(value.value_bytes()),
                     _ => {}
                 }
             }
         }
         if extension {
-            extended.pending |= !global;
+            extended.local |= local;
         } else {
             // A PAX size over the header's would move the reader past headers checked here.
             if extended.disagrees(size) {
