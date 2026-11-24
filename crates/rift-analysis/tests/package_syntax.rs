@@ -987,3 +987,47 @@ fn explicit_package_dialect_refuses_facts_from_default_extension_provider() {
         );
     }
 }
+
+// Issue #1052.
+#[test]
+fn a_member_name_no_record_retains_is_left_out_of_the_package() {
+    for control in ['\u{1}', '\u{007f}', '\u{0085}'] {
+        let text = format!(
+            "export const o = {{ '{control}a': 1, '{control}b'() {{ return o; }}, kept: 2 }};\n"
+        );
+        let mut retained = Vec::new();
+        let analysis = analyze(
+            "1.0.0",
+            ShippedLanguage::TypeScript,
+            &[("index.js", &text)],
+            SyntaxLimits::default(),
+            |source| capture(source, &mut retained),
+        )
+        .expect("package with a left out member");
+        let publication = analysis.publication();
+        assert!(
+            publication
+                .objects
+                .iter()
+                .all(|object| object.name_is_retained(text.len())),
+            "{control:?}"
+        );
+        assert!(
+            publication
+                .objects
+                .iter()
+                .any(|object| object.name == "kept"),
+            "{control:?}"
+        );
+        assert!(
+            publication
+                .coverage
+                .iter()
+                .any(|coverage| !coverage.inventory_complete),
+            "{control:?}"
+        );
+        for syntax in &retained {
+            checked_restored(syntax, &text);
+        }
+    }
+}

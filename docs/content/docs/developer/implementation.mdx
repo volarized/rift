@@ -1497,8 +1497,24 @@ maximum, and the member path when the reader decoded one. A regular file over `m
 refuses the archive unless the caller selects `OversizedMembers::Skip` through
 `ArchiveLimits::with_oversized_members`. That mode decodes the file without retaining it, so its
 size still counts toward `expanded_size` and a size that differs from its header still refuses the
-archive. `ArchiveFiles::omissions` lists each such path and size. An omitted file can be
-a source file, so the caller reads `omissions` before it treats its file selection as complete.
+archive. A member whose name does not use Unicode NFC has no project path, so the reader checks and
+counts it as any other member and leaves it out. `ArchiveFiles::omissions` lists each member left
+out with its path, kind, reason, and size. An omitted file can be a source file, so the caller reads
+`omissions` before it treats its file selection as complete. `ArchiveError::UnsafePath` names the
+member or the archive root it refuses.
+
+A PAX global header, such as the one `git archive` writes, names no member and lies under no root.
+It is bounded as every extended header: by `extension_size`, by `member_size`, and by a count with
+the maximum `members`. Extended headers are no members; directories and links are. A global record
+that changes the path, link target, or size of later members refuses the archive.
+
+The last regular file of one path is kept, in archive order for tar and in central directory order
+for ZIP. `ArchiveFiles::replaced` lists the path when an earlier file of it had different bytes.
+Every repeated member counts toward the archive bounds. A repeated directory or link, and a path
+that changes its member type, refuse the archive.
+
+NUL bytes that pad the end of a gzip stream count toward `compressed_size` and not toward
+`expansion_ratio`; any other data after the stream refuses the archive.
 
 <VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
 

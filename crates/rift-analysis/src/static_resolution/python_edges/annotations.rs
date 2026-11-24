@@ -13,14 +13,8 @@ impl<'source> Index<'source> {
         annotation: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        if !work.charge() {
-            return None;
-        }
-        let written = file.text(annotation)?;
-        let text = written.trim().trim_matches(['\'', '"']);
-        if let Some(inner) = self.python_optional_member(file, annotation, written, text, work) {
-            return self.python_annotation(file, inner, work);
-        }
+        let annotation = self.python_stated_annotation(file, annotation, work)?;
+        let text = annotation_text(file.text(annotation)?);
         let mut alternatives = text
             .split('|')
             .map(str::trim)
@@ -32,8 +26,9 @@ impl<'source> Index<'source> {
         let name = name.split('[').next()?.trim();
         let mut names = name.split('.').map(str::trim);
         let binding = edge_python_binding(self, file, names.next()?, annotation.start, work)?;
-        // Annotation lookup follows declarations and imports only, so cyclic annotations cannot recurse.
-        let mut value = self.declaration_value(file, binding, work)?;
+        // Annotation lookup follows declarations and imports only, so cyclic annotations cannot
+        // recurse: a name typed by what it iterates or unpacks names no class.
+        let mut value = self.declared_value(file, binding, work)?;
         for member in names {
             if !work.charge() {
                 return None;
@@ -51,8 +46,30 @@ impl<'source> Index<'source> {
             .filter(|target| target.symbol.kinds.contains(&SymbolKind::Constructible))
     }
 
+    /// The annotation inside every `Optional[...]`, and every `Union` beside `None`, around it.
+    ///
+    /// Each pass enters a strictly shorter part of the written text.
+    pub(super) fn python_stated_annotation(
+        &self,
+        file: &File<'source>,
+        mut annotation: ByteRange,
+        work: &mut Work,
+    ) -> Option<ByteRange> {
+        loop {
+            if !work.charge() {
+                return None;
+            }
+            let written = file.text(annotation)?;
+            let text = annotation_text(written);
+            match self.python_optional_member(file, annotation, written, text, work) {
+                Some(inner) => annotation = inner,
+                None => return Some(annotation),
+            }
+        }
+    }
+
     /// The one member of `Optional[X]` or of a `Union` whose other members are `None`.
-    pub(super) fn python_optional_member(
+    fn python_optional_member(
         &self,
         file: &File<'source>,
         annotation: ByteRange,
@@ -79,6 +96,11 @@ impl<'source> Index<'source> {
         };
         slice_range(annotation, written, member.trim())
     }
+}
+
+/// A written annotation without the quotes of a string annotation.
+pub(super) fn annotation_text(written: &str) -> &str {
+    written.trim().trim_matches(['\'', '"'])
 }
 
 /// The source range of `slice`, a part of `written`, the text at `range`.

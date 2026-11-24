@@ -452,13 +452,55 @@ fn competing_library_roots_stay_unresolved() {
     );
 }
 
+// Issue #1049: `.` names the folder it stands in, as Cargo reads a target path.
+#[test]
+fn current_folder_segments_keep_the_target_path() {
+    for path in ["./src/lib.rs", "src/./lib.rs", "././src/lib.rs"] {
+        let manifest = format!("{MANIFEST}[lib]\npath='{path}'\n");
+        let found = anchors(
+            &[("Cargo.toml", &manifest)],
+            "src/lib.rs",
+            "pub struct Runner;",
+        );
+        assert_eq!(
+            found["Runner"].as_str(),
+            "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Runner",
+            "{path}"
+        );
+        let found = anchors(
+            &[("nested/Cargo.toml", &manifest)],
+            "nested/src/lib.rs",
+            "pub struct Runner;",
+        );
+        assert!(found.contains_key("Runner"), "{path}");
+        let found = project_anchors(
+            &rift_protocol::identity::SymbolOwner::Local,
+            &[("Cargo.toml", &manifest)],
+            &[("src/lib.rs", "pub struct Root;")],
+        );
+        assert_eq!(
+            found["src/lib.rs"]["Root"].as_str(),
+            "rift://symbol/local/rust/crate_root/Root",
+            "{path}"
+        );
+    }
+}
+
 #[test]
 fn unsafe_library_paths_and_unsupported_crate_names_stay_unresolved() {
     for field in [
         "path='../lib.rs'",
+        "path='./../lib.rs'",
+        "path='src/./../src/lib.rs'",
         "path='/lib.rs'",
+        "path='/./src/lib.rs'",
+        "path='.//src/lib.rs'",
+        "path='.'",
+        "path='./'",
         "path=''",
-        "name='wrong-name'",
+        "name='wrong.name'",
+        "name='4-wrong'",
+        "name='wrong-nam\u{e9}'",
         "name=''",
         "name='4wrong'",
     ] {
@@ -471,6 +513,61 @@ fn unsafe_library_paths_and_unsupported_crate_names_stay_unresolved() {
             )
             .is_empty()
         );
+    }
+}
+
+// Issue #1037: manifests published before RFC 940 spell a library name with a hyphen.
+#[test]
+fn hyphenated_library_names_form_crate_names() {
+    let manifest = format!("{MANIFEST}[lib]\nname='actual-library-name'\n");
+    let root = "pub mod a; pub struct Runner;";
+    let found = selected_anchors(
+        &[("Cargo.toml", &manifest)],
+        &[("src/lib.rs", root), ("src/a.rs", "pub struct Sender;")],
+        None,
+        false,
+    );
+    assert_eq!(
+        found["src/lib.rs"]["Runner"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/actual_library_name/Runner"
+    );
+    assert_eq!(
+        found["src/a.rs"]["Sender"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/actual_library_name/a/Sender"
+    );
+    let selected = [("src/lib.rs", "pub struct Root;")];
+    let local = project_anchors(
+        &rift_protocol::identity::SymbolOwner::Local,
+        &[("Cargo.toml", &manifest)],
+        &selected,
+    );
+    assert_eq!(
+        local["src/lib.rs"]["Root"].as_str(),
+        "rift://symbol/local/rust/actual_library_name/Root"
+    );
+    let runtime = runtime_anchors(&[("Cargo.toml", &manifest)], &selected);
+    assert_eq!(
+        runtime["src/lib.rs"]["Root"].as_str(),
+        "rift://symbol/stdlib/rust/rust/actual_library_name/Root"
+    );
+}
+
+#[test]
+fn library_names_equal_as_crate_names_compete() {
+    let hyphenated = "[package]\nname='first'\nversion='1.0.0'\n[lib]\nname='shared-name'\n";
+    for other in [
+        "[package]\nname='second'\nversion='1.0.0'\n[lib]\nname='shared_name'\n",
+        "[package]\nname='shared-name'\nversion='1.0.0'\n",
+    ] {
+        let found = project_anchors(
+            &rift_protocol::identity::SymbolOwner::Local,
+            &[("a/Cargo.toml", hyphenated), ("b/Cargo.toml", other)],
+            &[
+                ("a/src/lib.rs", "pub struct Root;"),
+                ("b/src/lib.rs", "pub struct Root;"),
+            ],
+        );
+        assert!(found.is_empty(), "{other}");
     }
 }
 
@@ -1251,6 +1348,52 @@ fn selected_library_context_refuses_admitted_manifest_with_wrong_release_or_targ
         );
         assert!(input.namespace_input().library().is_none());
     }
+}
+
+#[test]
+fn selected_library_context_accepts_a_hyphenated_library_name() {
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("exact owner")
+            .owner()
+            .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual owner origin");
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let root_path = ProjectPath::new("src/lib.rs").expect("library path");
+    let files = [PackageSource::new(&root_path, "pub struct Example;\n")];
+    let manifest = format!("{MANIFEST}[lib]\nname='crate-root'\n");
+    let metadata = [PackageSource::new(&manifest_path, &manifest)];
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &files,
+        ExactPackageLimits::new(20, 16 * 1024 * 1024),
+    )
+    .expect("bounded original sources")
+    .with_framework_context(&metadata, &[])
+    .expect("original metadata");
+    let accepted = input
+        .with_library(&owner, metadata[0], files[0])
+        .expect("hyphenated library name");
+    let (manifest, root) = accepted
+        .namespace_input()
+        .library()
+        .expect("captured selected context");
+    assert_eq!(manifest.path(), &manifest_path);
+    assert_eq!(root.path(), &root_path);
 }
 
 #[test]

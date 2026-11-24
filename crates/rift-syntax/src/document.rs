@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rift_core::{FileDigest, ProjectPath, is_portable_name};
-use rift_protocol::read::{Documentation, Language, Signature, SymbolKind};
+use rift_protocol::read::{
+    Documentation, Language, Signature, SymbolKind, symbol_name_is_retained,
+};
 
 use crate::markdown::MarkdownFacts;
 
@@ -336,18 +338,27 @@ fn number_declarations(symbols: &mut [SyntaxSymbol]) {
     }
 }
 
-/// Keeps Contribution-admitted declarations in `symbols` and retains the full omitted facts.
-/// The provider's source and syntax element bounds apply to both collections.
-fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> Vec<SyntaxSymbol> {
+/// Keeps Contribution-admitted declarations in `symbols` and returns the other declarations
+/// whose names a record may retain, with the count of every declaration left out.
+///
+/// A declaration whose name no record may retain, such as a quoted member name with a control
+/// character, is counted alone. The provider's source and syntax element bounds apply to both
+/// collections.
+fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> (Vec<SyntaxSymbol>, usize) {
+    let retained = |name: &str| symbol_name_is_retained(name, usize::MAX);
     let mut left_out = Vec::new();
+    let mut count = 0;
     for symbol in std::mem::take(symbols) {
         if is_portable_name(&symbol.name) && is_portable_name(&symbol.qualified_name) {
             symbols.push(symbol);
-        } else {
+            continue;
+        }
+        count += 1;
+        if retained(&symbol.name) && retained(&symbol.qualified_name) {
             left_out.push(symbol);
         }
     }
-    left_out
+    (left_out, count)
 }
 
 impl SyntaxDocument {
@@ -471,8 +482,7 @@ impl SyntaxDocument {
             }
         }
         let macro_invocations = captured.or_else(|| Self::invocations(&language, &syntax_elements));
-        let left_out_symbols = leave_out_refused_names(&mut symbols);
-        let left_out_declarations = left_out_symbols.len();
+        let (left_out_symbols, left_out_declarations) = leave_out_refused_names(&mut symbols);
         Self {
             path,
             facts: Arc::new(SyntaxFacts {
