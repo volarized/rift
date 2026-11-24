@@ -13,7 +13,11 @@ use super::{ExportBinding, PreparedNamespace, SelectedFile};
 use crate::NamespaceInput;
 
 pub(crate) mod commonjs;
+mod entry;
 mod observations;
+
+pub(super) use entry::build_paths;
+use entry::{Entry, PackageFiles};
 
 /// Establishes declarations in an entry module from captured owner and metadata.
 /// Conditional targets without selected conditions and uncaptured module roots remain unresolved.
@@ -23,11 +27,33 @@ pub(super) fn prepare(
 ) -> PreparedNamespace {
     let metadata = captured_metadata(input);
     let mut prepared = PreparedNamespace::default();
+    // Every entry of the package is decided over the files captured once here.
+    let files = PackageFiles::captured(input);
     if let Some(metadata) = &metadata {
         let entries = ["typescript", "javascript"].map(|language| {
-            let (modules, unresolved) = entry_modules(metadata, language);
+            let has_files = selected
+                .iter()
+                .any(|file| file.syntax.language().name == language);
+            let (modules, unresolved) = entry_modules(&files, metadata, language, has_files);
             prepared.unresolved_exports |= unresolved;
             (language, modules)
+        });
+        // The file an admitted observation names holds its module before any file the
+        // manifest alone names. Two admitted observations of one module still share its
+        // identity (#995).
+        let observed = observations::observed_files(input, &files, metadata, selected);
+        let entries = entries.map(|(language, modules)| {
+            let kept = modules
+                .into_iter()
+                .filter(|(path, module)| {
+                    module.as_deref().is_none_or(|module| {
+                        observed
+                            .get(&(language, module))
+                            .is_none_or(|files| files.contains(path))
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+            (language, kept)
         });
         let inventory = selected
             .iter()
@@ -73,9 +99,9 @@ pub(super) fn prepare(
                 }
             }
         }
-        map_declared_types(input, metadata, selected, &mut prepared);
+        map_declared_types(input, &files, metadata, selected, &mut prepared);
     }
-    observations::prepare(input, metadata.as_ref(), selected, &mut prepared);
+    observations::prepare(input, &files, metadata.as_ref(), selected, &mut prepared);
     if input.owner().is_local() {
         for file in selected {
             let language = file.syntax.language();
@@ -308,17 +334,17 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
 }
 
 fn entry_modules(
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     language: &str,
+    has_files: bool,
 ) -> (BTreeMap<ProjectPath, Option<String>>, bool) {
     let Some(Exports::Subpaths(exports)) = &metadata.exports else {
-        return (
-            entry_path(metadata, language)
-                .map(|path| (path, Some(metadata.name.clone())))
-                .into_iter()
-                .collect(),
-            false,
-        );
+        return match entry::resolve(files, metadata, language) {
+            Entry::File(path) => (BTreeMap::from([(path, Some(metadata.name.clone()))]), false),
+            Entry::Unknown => (BTreeMap::new(), has_files),
+            Entry::Absent => (BTreeMap::new(), false),
+        };
     };
     let mut modules = BTreeMap::new();
     let mut unresolved = false;
@@ -387,14 +413,19 @@ fn entry_path(metadata: &PackageMetadata, language: &str) -> Option<ProjectPath>
 /// Callable facts establish category, not parameter or return equivalence.
 fn map_declared_types(
     input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     selected: &[SelectedFile<'_>],
     prepared: &mut PreparedNamespace,
 ) {
-    let Some(types_path) = entry_path(metadata, "typescript") else {
+    // Two written implementations leave open which one the types describe.
+    if matches!((&metadata.main, &metadata.module), (Some(main), Some(module)) if main != module) {
+        return;
+    }
+    let Entry::File(types_path) = entry::resolve(files, metadata, "typescript") else {
         return;
     };
-    let Some(implementation_path) = entry_path(metadata, "javascript") else {
+    let Entry::File(implementation_path) = entry::resolve(files, metadata, "javascript") else {
         return;
     };
     if types_path == implementation_path {

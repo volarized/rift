@@ -12,6 +12,8 @@ use rift_syntax::{
 
 use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
 
+type PathStates = BTreeMap<rift_protocol::read::ProjectPath, Option<crate::ArchiveMemberKind>>;
+
 const TYPES: &str = r#"{"name":"prettier","version":"3.8.5","types":"./index.d.ts"}"#;
 
 #[test]
@@ -73,6 +75,17 @@ fn prepared_languages(
     files: &[(&str, &str)],
     languages: Option<&[ShippedLanguage]>,
 ) -> super::PreparedNamespace {
+    prepared_observed(language, metadata, files, languages, None)
+}
+
+/// The same, with the path states a caller observed for the package.
+fn prepared_observed(
+    language: ShippedLanguage,
+    metadata: &[(&str, &str)],
+    files: &[(&str, &str)],
+    languages: Option<&[ShippedLanguage]>,
+    observed: Option<&PathStates>,
+) -> super::PreparedNamespace {
     let owner =
         SymbolIdentity::parse("rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format")
             .expect("exact package owner")
@@ -119,6 +132,10 @@ fn prepared_languages(
     .expect("bounded captured input")
     .with_framework_context(&context, &[])
     .expect("captured package metadata");
+    let input = match observed {
+        Some(observed) => input.with_build_paths(observed).expect("observed paths"),
+        None => input,
+    };
     let facts = sources
         .iter()
         .enumerate()
@@ -1337,4 +1354,413 @@ fn commonjs_forwarding_checks_the_exact_file_before_adding_a_javascript_extensio
     );
     assert!(prepared.anchors["lib/child"].contains_key("exact"));
     assert!(!prepared.anchors.contains_key("lib/child.js"));
+}
+
+/// The states of the paths a manifest requests, over every member a package ships.
+fn shipped_states(manifest: &str, members: &[&str]) -> PathStates {
+    let path = ProjectPath::new("package.json").expect("manifest path");
+    super::build_paths(PackageSource::new(&path, manifest), 16 * 1024)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let folder = format!("{}/", path.0);
+            let kind = if members.contains(&path.0.as_str()) {
+                Some(crate::ArchiveMemberKind::File)
+            } else {
+                members
+                    .iter()
+                    .any(|member| member.starts_with(&folder))
+                    .then_some(crate::ArchiveMemberKind::Directory)
+            };
+            (path, kind)
+        })
+        .collect()
+}
+
+/// The files published under the package entry, with the members the package ships observed.
+fn entry_files(
+    language: ShippedLanguage,
+    metadata: &str,
+    files: &[&str],
+    members: &[&str],
+) -> (Vec<String>, bool) {
+    let manifest = format!(r#"{{"name":"prettier","version":"3.8.5"{metadata}}}"#);
+    let states = shipped_states(&manifest, members);
+    entry_files_observed(language, &manifest, files, Some(&states))
+}
+
+fn entry_files_observed(
+    language: ShippedLanguage,
+    manifest: &str,
+    files: &[&str],
+    observed: Option<&PathStates>,
+) -> (Vec<String>, bool) {
+    let text = if language == ShippedLanguage::TypeScript {
+        "export declare function load(): void;"
+    } else {
+        "exports.load = function () {};"
+    };
+    let files = files.iter().map(|path| (*path, text)).collect::<Vec<_>>();
+    let found = prepared_observed(
+        language,
+        &[("package.json", manifest)],
+        &files,
+        None,
+        observed,
+    );
+    let placed = files
+        .iter()
+        .filter(|(path, _)| {
+            found
+                .anchors
+                .get(*path)
+                .and_then(|anchors| anchors.get("load"))
+                .is_some_and(|identity| {
+                    SymbolIdentity::parse(identity.as_str())
+                        .is_ok_and(|identity| identity.qualified_path() == ["prettier", "load"])
+                })
+        })
+        .map(|(path, _)| (*path).to_owned())
+        .collect();
+    (placed, found.unresolved_exports)
+}
+
+#[test]
+fn package_entries_follow_node_resolution_over_observed_members() {
+    let javascript = ShippedLanguage::JavaScript;
+    for (metadata, members, entry) in [
+        (r#","main":"index.js""#, vec!["index.js"], Some("index.js")),
+        (
+            r#","type":"commonjs","main":"index.js""#,
+            vec!["index.js"],
+            Some("index.js"),
+        ),
+        (
+            r#","main":"./index.cjs""#,
+            vec!["index.cjs"],
+            Some("index.cjs"),
+        ),
+        // ms@2.1.3 writes its entry this way.
+        (r#","main":"./index""#, vec!["index.js"], Some("index.js")),
+        (r#","main":"index""#, vec!["index.js"], Some("index.js")),
+        (r#","main":".""#, vec!["index.js"], Some("index.js")),
+        ("", vec!["index.js"], Some("index.js")),
+        (r#","main":"""#, vec!["index.js"], Some("index.js")),
+        (
+            r#","main":"lib""#,
+            vec!["index.js", "lib/index.js"],
+            Some("lib/index.js"),
+        ),
+        (
+            r#","main":"./lib/""#,
+            vec!["index.js", "lib/index.js"],
+            Some("lib/index.js"),
+        ),
+        (
+            r#","main":"lib//index""#,
+            vec!["index.js", "lib/index.js"],
+            Some("lib/index.js"),
+        ),
+        (
+            r#","main":"./lib/./index.js""#,
+            vec!["lib/index.js"],
+            Some("lib/index.js"),
+        ),
+        (
+            r#","main":"lib/../index""#,
+            vec!["index.js", "lib/index.js"],
+            Some("index.js"),
+        ),
+        (r#","main":"./gone""#, vec!["index.js"], Some("index.js")),
+        (
+            r#","main":"index""#,
+            vec!["index", "index.js"],
+            Some("index"),
+        ),
+        (
+            r#","main":"./data.json""#,
+            vec!["index.js", "data.json"],
+            None,
+        ),
+        (
+            r#","main":"./native""#,
+            vec!["index.js", "native.node"],
+            None,
+        ),
+        (r#","main":"./gone""#, vec!["other.js"], None),
+        (r#","main":"../index""#, vec!["index.js"], None),
+        (r#","main":"/index""#, vec!["index.js"], None),
+        (r#","main":"lib""#, vec!["lib/other.js"], None),
+        ("", vec!["other.js"], None),
+        (
+            r#","module":"./esm.js""#,
+            vec!["index.js", "esm.js"],
+            Some("index.js"),
+        ),
+        (r#","module":"./esm.js""#, vec!["esm.js"], Some("esm.js")),
+        (
+            r#","main":"./main.js","module":"./esm.js""#,
+            vec!["main.js", "esm.js"],
+            Some("main.js"),
+        ),
+        (
+            r#","main":"./index","exports":{"./sub":"./sub.js"}"#,
+            vec!["index.js"],
+            None,
+        ),
+    ] {
+        let files = members
+            .iter()
+            .copied()
+            .filter(|path| !matches!(path.rsplit_once('.'), Some((_, "json" | "node"))))
+            .collect::<Vec<_>>();
+        let (placed, _) = entry_files(javascript, metadata, &files, &members);
+        assert_eq!(
+            placed,
+            entry.into_iter().collect::<Vec<_>>(),
+            "{metadata} {members:?}"
+        );
+    }
+}
+
+#[test]
+fn package_entries_take_declared_types_in_the_compiler_order() {
+    let typescript = ShippedLanguage::TypeScript;
+    for (metadata, members, entry) in [
+        (
+            r#","types":"./index.d.ts""#,
+            vec!["index.d.ts"],
+            Some("index.d.ts"),
+        ),
+        (
+            r#","types":"./index""#,
+            vec!["index.d.ts"],
+            Some("index.d.ts"),
+        ),
+        (
+            r#","types":"./index""#,
+            vec!["index.ts", "index.d.ts"],
+            Some("index.ts"),
+        ),
+        (
+            r#","typings":"lib""#,
+            vec!["lib/index.d.ts"],
+            Some("lib/index.d.ts"),
+        ),
+        ("", vec!["index.d.ts"], Some("index.d.ts")),
+        ("", vec!["index.ts", "index.d.ts"], None),
+        ("", vec!["index.tsx", "index.d.ts"], None),
+        (r#","main":"./lib.js""#, vec!["index.d.ts"], None),
+    ] {
+        let files = members
+            .iter()
+            .copied()
+            .filter(|path| !matches!(path.rsplit_once('.'), Some((_, "tsx"))))
+            .collect::<Vec<_>>();
+        let (placed, _) = entry_files(typescript, metadata, &files, &members);
+        assert_eq!(
+            placed,
+            entry.into_iter().collect::<Vec<_>>(),
+            "{metadata} {members:?}"
+        );
+    }
+}
+
+/// A selection is no evidence of absence: an installed source captures the callee's file and
+/// the manifest alone.
+#[test]
+fn package_entries_refuse_a_path_whose_state_is_not_captured() {
+    let javascript = ShippedLanguage::JavaScript;
+    let manifest = |metadata: &str| format!(r#"{{"name":"prettier","version":"3.8.5"{metadata}}}"#);
+    for metadata in [
+        r#","main":"dist/a.js""#,
+        r#","main":"./index""#,
+        r#","main":"./data.json""#,
+        r#","main":"./native""#,
+        r#","main":"lib""#,
+    ] {
+        let manifest = manifest(metadata);
+        let (placed, unresolved) = entry_files_observed(javascript, &manifest, &["index.js"], None);
+        assert!(placed.is_empty(), "{metadata}");
+        assert!(unresolved, "{metadata}");
+    }
+    // One earlier path without a state is enough; a link's target is not captured either.
+    let written = manifest(r#","main":"dist/a""#);
+    for (path, state) in [
+        ("dist/a.js", None),
+        ("dist/a", Some(Some(crate::ArchiveMemberKind::Link))),
+    ] {
+        let mut states = shipped_states(&written, &["index.js"]);
+        states.remove(&rift_protocol::read::ProjectPath("dist".to_owned()));
+        let key = rift_protocol::read::ProjectPath(path.to_owned());
+        match state {
+            Some(state) => {
+                states.insert(key, state);
+            }
+            None => {
+                states.remove(&key);
+            }
+        }
+        let (placed, unresolved) =
+            entry_files_observed(javascript, &written, &["index.js"], Some(&states));
+        assert!(placed.is_empty() && unresolved, "{path}");
+    }
+    let (placed, unresolved) = entry_files_observed(javascript, &manifest(""), &["other.js"], None);
+    assert!(
+        placed.is_empty() && unresolved,
+        "an unknown index.js names no entry"
+    );
+    let (placed, _) = entry_files_observed(javascript, &manifest(""), &["index.js"], None);
+    assert_eq!(
+        placed,
+        ["index.js"],
+        "the first candidate needs no other evidence"
+    );
+    let (placed, _) = entry_files_observed(
+        javascript,
+        &manifest(r#","module":"./esm.js""#),
+        &["esm.js"],
+        None,
+    );
+    assert_eq!(
+        placed,
+        ["esm.js"],
+        "a package with only module keeps its entry"
+    );
+}
+
+#[test]
+fn package_entry_paths_are_requested_within_the_source_bound() {
+    let path = ProjectPath::new("package.json").expect("manifest path");
+    let manifest = r#"{"name":"prettier","version":"3.8.5","main":"lib"}"#;
+    let requested = |source_bytes_max| {
+        super::build_paths(PackageSource::new(&path, manifest), source_bytes_max)
+    };
+    let paths = requested(manifest.len()).expect("requested paths");
+    assert!(paths.iter().any(|path| path.0 == "lib/index.js"));
+    assert!(
+        paths.len() <= 16,
+        "a manifest requests a fixed number of paths"
+    );
+    assert!(requested(manifest.len() - 1).is_none());
+    let nested = ProjectPath::new("nested/package.json").expect("nested manifest path");
+    assert!(super::build_paths(PackageSource::new(&nested, manifest), 1024).is_none());
+}
+
+/// An observed `import` build holds the module; the file `main` names takes no second copy.
+#[test]
+fn observed_module_builds_hold_their_module_before_main() {
+    let metadata = r#"{"name":"react","version":"19.3.0","types":"./index.d.ts","main":"./main.js","module":"./esm.js"}"#;
+    let files = [
+        ("main.js", "export function load() {}"),
+        ("esm.js", "export function load() {}"),
+        ("index.d.ts", "export declare function load(): void;"),
+    ];
+    let holders = |observed: Option<(&str, &[&str])>| {
+        let prepared = observed_declarations(metadata, &files, observed);
+        prepared
+            .anchors
+            .iter()
+            .filter(|(path, anchors)| {
+                !path.ends_with(".d.ts")
+                    && anchors
+                        .get(".")
+                        .is_some_and(|module| module.as_str().ends_with("/javascript/react"))
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(holders(None), ["main.js"]);
+    assert_eq!(holders(Some(("esm.js", &["import"]))), ["esm.js"]);
+    assert_eq!(holders(Some(("main.js", &["require"]))), ["main.js"]);
+    // An observation the manifest does not describe decides nothing.
+    assert_eq!(holders(Some(("esm.js", &["require"]))), ["main.js"]);
+}
+
+fn observed_declarations(
+    metadata: &str,
+    files: &[(&str, &str)],
+    observed: Option<(&str, &[&str])>,
+) -> super::PreparedNamespace {
+    let owner = SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react/javascript/react/load")
+        .expect("package owner")
+        .owner()
+        .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "npm".to_owned(),
+                registry: "npmjs.org".to_owned(),
+                name: "react".to_owned(),
+                version: "19.3.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("package origin");
+    let paths = files
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("path"))
+        .collect::<Vec<_>>();
+    let sources = paths
+        .iter()
+        .zip(files)
+        .map(|(path, (_, text))| PackageSource::new(path, text))
+        .collect::<Vec<_>>();
+    let source = |wanted: &str| {
+        sources
+            .iter()
+            .find(|source| source.path().as_str() == wanted)
+            .copied()
+            .expect("selected source")
+    };
+    let declarations = [source("index.d.ts")];
+    let observations = observed
+        .into_iter()
+        .map(|(entry, conditions)| {
+            crate::NamespaceModule::new("react", source(entry), &declarations, conditions)
+        })
+        .collect::<Vec<_>>();
+    let manifest = ProjectPath::new("package.json").expect("manifest path");
+    let context = [PackageSource::new(&manifest, metadata)];
+    let language = ShippedLanguage::JavaScript.language();
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(20, 16 * 1024 * 1024),
+    )
+    .expect("bounded sources")
+    .with_framework_context(&context, &[])
+    .expect("manifest")
+    .with_modules(&observations)
+    .expect("observations");
+    let facts = sources
+        .iter()
+        .map(|source| {
+            let text = SyntaxSource {
+                path: source.path(),
+                text: source.text(),
+            };
+            if source.path().as_str().ends_with(".d.ts") {
+                TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript)
+                    .analyze(text, input.limits().syntax())
+            } else {
+                JavaScriptSyntaxProvider::default().analyze(text, input.limits().syntax())
+            }
+            .expect("source parses")
+            .into_facts()
+        })
+        .collect::<Vec<_>>();
+    let selected = sources
+        .iter()
+        .zip(&facts)
+        .map(|(source, syntax)| super::SelectedFile {
+            path: source.path(),
+            source: source.text(),
+            syntax,
+        })
+        .collect::<Vec<_>>();
+    super::prepare(&input.namespace_input(), &selected)
 }
