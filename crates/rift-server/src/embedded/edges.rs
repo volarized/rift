@@ -183,4 +183,93 @@ mod tests {
             "{answer}"
         );
     }
+
+    /// A pair of implicit type aliases that name each other, and a caller of the function
+    /// that returns one of them.
+    const RECURSIVE_ALIASES: &str = "from typing import Dict, Tuple, Union\n\nJsonValue = Union[str, \"JsonDict\", Tuple[\"JsonValue\"]]\nJsonDict = Dict[str, JsonValue]\n\n\ndef as_json() -> JsonDict:\n    return {}\n";
+    const RECURSIVE_ALIASES_CALLER: &str =
+        "from a import as_json\n\n\ndef submit():\n    return as_json()\n";
+
+    /// The variable that names the file, the line and the character the probe asks about.
+    const RECURSIVE_ALIASES_POSITION: &str = "RIFT_TEST_RECURSIVE_ALIASES_POSITION";
+
+    /// The wall limit of one definition request, its database build included.
+    const RECURSIVE_ALIASES_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    #[test]
+    #[ignore = "a child process of the test that bounds it"]
+    fn recursive_aliases_end_a_definition_probe() {
+        let position = std::env::var(RECURSIVE_ALIASES_POSITION).expect("the probed position");
+        let [file, line, character] = position.split(':').collect::<Vec<_>>()[..] else {
+            panic!("a position is `file:line:character`: {position}");
+        };
+        let line: u64 = line.parse().expect("a line");
+        let character: u64 = character.parse().expect("a character");
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        std::fs::write(root.join("a.py"), RECURSIVE_ALIASES).expect("aliases");
+        std::fs::write(root.join("b.py"), RECURSIVE_ALIASES_CALLER).expect("caller");
+        let params = json!({
+            "textDocument": {"uri": super::super::path_to_uri(&root.join(file)).expect("URI")},
+            "position": {"line": line, "character": character},
+        });
+        let answer = super::super::with_database(root, |database, canonical_root| {
+            definitions(
+                database,
+                &Exchange {
+                    spelled_root: root,
+                    canonical_root,
+                    sent_text: None,
+                },
+                &params,
+            )
+        })
+        .expect("definition");
+        assert_eq!(
+            answer[0]["uri"],
+            json!(super::super::path_to_uri(&root.join("a.py")).expect("URI")),
+            "{answer}"
+        );
+        assert_eq!(
+            answer[0]["range"]["start"],
+            json!({"line": 6, "character": 4}),
+            "{answer}"
+        );
+    }
+
+    /// A request ty does not end cannot be canceled from inside the process, so each
+    /// position runs in a child the test kills at its wall limit.
+    #[test]
+    fn recursive_aliases_end_a_definition() {
+        for position in ["b.py:4:11", "b.py:0:14", "a.py:6:4"] {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                    .args([
+                        "--exact",
+                        "embedded::edges::tests::recursive_aliases_end_a_definition_probe",
+                        "--ignored",
+                    ])
+                    .env(RECURSIVE_ALIASES_POSITION, position)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("the probe starts");
+            let deadline = std::time::Instant::now() + RECURSIVE_ALIASES_WAIT;
+            while child.try_wait().expect("the probe's state").is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("the probe is killed");
+                    child.wait().expect("the probe is reaped");
+                    panic!("{position} did not end within {RECURSIVE_ALIASES_WAIT:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().expect("the probe's output");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{position}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }

@@ -5,7 +5,7 @@
 
 [package]
 name = "ty_python_semantic"
-version = "0.0.20"
+version = "0.0.20+rift.1"
 description = "This is an internal component crate of Ruff"
 authors = ["Charlie Marsh <charlie.r.marsh@gmail.com>"]
 edition = "2024"

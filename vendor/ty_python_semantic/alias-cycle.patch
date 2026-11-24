@@ -1,0 +1,28 @@
+--- a/src/types/infer.rs
++++ b/src/types/infer.rs
+@@ -117,7 +117,24 @@
+         }
+     },
+     cycle_fn=|db, cycle: &salsa::Cycle, _: &LegacyTypeAliasInference<'db>, mut result: LegacyTypeAliasInference<'db>, definition: Definition<'db>, parameters: Option<crate::types::GenericContext<'db>>| {
+-        let recover = |ty| RecursiveType::recover(db, definition, cycle.id(), parameters, ty);
++        // The alias's value is inferred through definition queries of the same cycle, whose
++        // provisional values carry `Divergent` markers. An alias that has not converged within
++        // the tainted iterations is wrapping its previous value in one more layer each time:
++        // from then on reduce the nesting as the other cycle functions do. Earlier iterations
++        // stay as inferred, so cycles that converge on their own are unchanged. A value with an
++        // unguarded cycle stays as inferred too: the reduction drops a bare marker from a union,
++        // and `RecursiveType::recover` needs it to report the invalid alias.
++        let env = ProgramEnvironment::from_definition(definition);
++        let recover = |ty: Type<'db>| {
++            let ty = if cycle.iteration() > crate::TAINTED_CYCLES
++                && !ty.has_unguarded_alias_cycle(db)
++            {
++                ty.recursive_type_normalized(db, &env, cycle)
++            } else {
++                ty
++            };
++            RecursiveType::recover(db, definition, cycle.id(), parameters, ty)
++        };
+         result.ty = result.ty.map(recover).map_err(|error| CyclicTypeAliasError {
+             fallback_type: recover(error.fallback_type),
+         });

@@ -7292,7 +7292,7 @@ dependencies = [
 
 [[package]]
 name = "ty_python_semantic"
-version = "0.0.20"
+version = "0.0.20+rift.1"
 dependencies = [
  "bitflags 2.13.1",
  "char_str",
