@@ -277,7 +277,8 @@ impl ArchiveFiles {
 
     /// Admitted normalized member paths and entry kinds before source selection.
     /// Paths retain the original archive root even when regular files remove it. A member
-    /// omitted as [`ArchiveOmissionReason::NonCanonicalUnicode`] is not admitted.
+    /// omitted as [`ArchiveOmissionReason::NonCanonicalUnicode`] is not admitted, so a caller
+    /// that derives the archive root from these paths reads [`Self::omissions`] too.
     #[must_use]
     pub const fn members(&self) -> &BTreeMap<String, ArchiveMemberKind> {
         &self.members
@@ -539,7 +540,8 @@ impl std::error::Error for ArchiveError {}
 /// Every repeated member consumes the same member, decompressed-byte, and work bounds.
 /// A regular file over the member byte bound refuses the archive unless the limits select
 /// [`OversizedMembers::Skip`]. A member whose name does not use Unicode NFC is checked and
-/// counted as any other and listed in [`ArchiveFiles::omissions`].
+/// counted as any other and listed in [`ArchiveFiles::omissions`]. Collisions compare the
+/// archive's own spelling, so two names that are equal only in Unicode NFC stay two members.
 ///
 /// # Errors
 /// Returns [`ArchiveError`] when the digest, paths, member types, container, or bounds fail.
@@ -787,7 +789,7 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
             extended.pending |= !global;
         } else {
             // A PAX size over the header's would move the reader past headers checked here.
-            if limits.oversized_members == OversizedMembers::Skip && extended.disagrees(size) {
+            if extended.disagrees(size) {
                 return Err(ArchiveError::InvalidArchive);
             }
             extended = TarExtension::default();
@@ -806,7 +808,8 @@ fn read_tar_members(reader: impl Read, output: &mut ArchiveOutput<'_>) -> Result
     {
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
-        // The header pass counted every global header.
+        // The header pass counted every global header. Its name is the writer's own and names
+        // no member: POSIX defaults it to a path below the writer's temporary directory.
         if kind.is_pax_global_extensions() {
             continue;
         }

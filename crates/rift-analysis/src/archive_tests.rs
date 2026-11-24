@@ -3061,3 +3061,42 @@ fn extended_headers_have_their_own_count() -> TestResult {
     }
     Ok(())
 }
+
+// Issue #1053.
+#[test]
+fn a_pax_size_that_differs_from_its_header_is_refused_in_both_modes() -> TestResult {
+    let hidden = [
+        raw_member("release/dev", b'3', b"")?,
+        raw_member("release/fifo", b'6', b"")?,
+    ]
+    .concat();
+    for (size, content) in [("0", hidden.as_slice()), ("1024", b""), ("5", b"text")] {
+        let record = pax_record("size", size);
+        let extended = raw_member("PaxHeaders/a", b'x', record.as_bytes())?;
+        let member = raw_member("release/a", b'0', content)?;
+        let after = raw_member("release/b", b'0', SOURCE)?;
+        let bytes = gzip(&[extended.as_slice(), &member, &after, &[0; 1024]].concat())?;
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                read(&bytes, limits).expect_err("PAX size differs from its header"),
+                ArchiveError::InvalidArchive,
+                "{size}"
+            );
+        }
+    }
+    let record = pax_record("size", "4");
+    let bytes = gzip(
+        &[
+            raw_member("PaxHeaders/a", b'x', record.as_bytes())?,
+            raw_member("release/a", b'0', b"text")?,
+        ]
+        .concat(),
+    )?;
+    for limits in both_modes(ArchiveLimits::default()) {
+        assert_eq!(
+            retained(&read(&bytes, limits)?),
+            [("a", b"text".as_slice())]
+        );
+    }
+    Ok(())
+}
