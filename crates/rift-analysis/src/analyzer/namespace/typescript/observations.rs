@@ -1,12 +1,13 @@
 use super::{
-    BTreeMap, BTreeSet, ByteRange, LogicalDeclaration, NamespaceInput, PackageMetadata,
-    PreparedNamespace, ProjectPath, SelectedFile, SymbolOwner, SyntaxExportKind, binding_name,
-    commonjs, map_files, prepare_file, selected_source_is_valid,
+    BTreeMap, BTreeSet, ByteRange, Entry, LogicalDeclaration, NamespaceInput, PackageFiles,
+    PackageMetadata, PreparedNamespace, ProjectPath, SelectedFile, SymbolOwner, SyntaxExportKind,
+    binding_name, commonjs, map_files, prepare_file, selected_source_is_valid,
 };
 use crate::NamespaceModule;
 
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: Option<&PackageMetadata>,
     selected: &[SelectedFile<'_>],
     prepared: &mut PreparedNamespace,
@@ -25,6 +26,7 @@ pub(super) fn prepare(
         if observation.declarations().is_empty() {
             commonjs::prepare(
                 input,
+                files,
                 metadata,
                 selected,
                 observation,
@@ -43,7 +45,7 @@ pub(super) fn prepare(
                 continue;
             }
             let containers = if let Some(metadata) = metadata {
-                if !package_observation(metadata, observation, declarations) {
+                if !package_observation(files, metadata, observation, declarations) {
                     prepared.unresolved_exports = true;
                     continue;
                 }
@@ -100,6 +102,7 @@ fn selected_file<'selected, 'source>(
 }
 
 fn package_observation(
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     observation: &NamespaceModule<'_>,
     declarations: &SelectedFile<'_>,
@@ -121,34 +124,36 @@ fn package_observation(
         if conditions.is_empty() {
             return false;
         }
-        exports.observed_targets(&metadata.name, observation.module(), conditions)
+        exports
+            .observed_targets(&metadata.name, observation.module(), conditions)
+            .and_then(|(types, implementation)| target_path(types).zip(target_path(implementation)))
     } else if observation.module() == metadata.name {
         let implementation = match (&metadata.main, &metadata.module) {
             (Some(main), Some(module)) if main != module => {
                 if conditions == ["import"] {
-                    Some(module.as_str())
+                    target_path(module)
                 } else if conditions == ["require"] {
-                    Some(main.as_str())
+                    established(files.runtime(Some(main), None))
                 } else {
                     None
                 }
             }
-            (Some(main), _) => Some(main.as_str()),
-            (_, Some(module)) => Some(module.as_str()),
-            _ => None,
+            (main, module) => established(files.runtime(main.as_deref(), module.as_deref())),
         };
-        metadata
-            .types
-            .as_deref()
-            .or(metadata.typings.as_deref())
-            .zip(implementation)
+        established(files.types(metadata)).zip(implementation)
     } else {
         None
     };
     targets.is_some_and(|(types, implementation)| {
-        target_path(types).as_ref() == Some(declarations.path)
-            && target_path(implementation).as_ref() == Some(observation.implementation().path())
+        &types == declarations.path && &implementation == observation.implementation().path()
     })
+}
+
+fn established(entry: Entry) -> Option<ProjectPath> {
+    match entry {
+        Entry::File(path) => Some(path),
+        Entry::Unknown | Entry::Absent => None,
+    }
 }
 
 pub(super) fn target_path(target: &str) -> Option<ProjectPath> {

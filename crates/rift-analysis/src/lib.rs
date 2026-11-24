@@ -3,7 +3,7 @@
 #[cfg(feature = "collector")]
 mod analyzer;
 #[cfg(feature = "collector")]
-pub use analyzer::namespace::python::build_paths;
+pub use analyzer::namespace::build_paths;
 #[cfg(feature = "archive")]
 pub mod archive;
 mod chunk;

@@ -133,6 +133,17 @@ pub(super) fn prepare(
     prepare_context(&input.namespace_input(), selected)
 }
 
+/// Requests the path states that decide a build manifest's import roots or entry, without
+/// using selected-file absence as evidence.
+#[must_use]
+pub fn build_paths(
+    metadata: crate::PackageSource<'_>,
+    files: &[crate::PackageSource<'_>],
+    syntax: rift_syntax::SyntaxLimits,
+) -> Option<Vec<rift_protocol::read::ProjectPath>> {
+    typescript::build_paths(metadata).or_else(|| python::build_paths(metadata, files, syntax))
+}
+
 pub(crate) fn rust_configuration_is_valid(flags: &[&str]) -> bool {
     rust::configuration::valid_flags(flags)
 }

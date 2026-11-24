@@ -222,7 +222,7 @@ fn package_paths<'source>(
 
 /// Requests path observations without using selected-file absence as filesystem evidence.
 #[must_use]
-pub fn build_paths(
+pub(super) fn build_paths(
     metadata: PackageSource<'_>,
     files: &[PackageSource<'_>],
     syntax: SyntaxLimits,

@@ -1,5 +1,5 @@
 use super::{
-    BTreeMap, BTreeSet, NamespaceInput, PackageMembers, PackageMetadata, PreparedNamespace,
+    BTreeMap, BTreeSet, Entry, NamespaceInput, PackageFiles, PackageMetadata, PreparedNamespace,
     ProjectPath, SelectedFile, SyntaxExportKind, declaration_anchors_with_public,
     export_subpath_is_valid, observations, selected_source_is_valid,
 };
@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: Option<&PackageMetadata>,
     selected: &[SelectedFile<'_>],
     observation: &NamespaceModule<'_>,
@@ -23,7 +24,7 @@ pub(super) fn prepare(
     };
     if observation.export_conditions() != ["node", "require"]
         || is_mjs(implementation.path)
-        || !entry_matches(input, metadata, observation)
+        || !entry_matches(files, metadata, observation)
     {
         prepared.unresolved_exports = true;
         return;
@@ -116,7 +117,7 @@ pub(crate) fn admit_file(
 }
 
 fn entry_matches(
-    input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     observation: &NamespaceModule<'_>,
 ) -> bool {
@@ -129,7 +130,10 @@ fn entry_matches(
             )
             .and_then(|(_, implementation)| observations::target_path(implementation))
     } else if observation.module() == metadata.name {
-        PackageMembers::captured(input).main(metadata.main.as_deref())
+        match files.runtime(metadata.main.as_deref(), None) {
+            Entry::File(path) => Some(path),
+            Entry::Unknown | Entry::Absent => None,
+        }
     } else {
         None
     };

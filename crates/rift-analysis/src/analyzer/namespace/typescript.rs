@@ -13,7 +13,11 @@ use super::{ExportBinding, PreparedNamespace, SelectedFile};
 use crate::NamespaceInput;
 
 pub(crate) mod commonjs;
+mod entry;
 mod observations;
+
+pub(super) use entry::build_paths;
+use entry::{Entry, PackageFiles};
 
 /// Establishes declarations in an entry module from captured owner and metadata.
 /// Conditional targets without selected conditions and uncaptured module roots remain unresolved.
@@ -23,9 +27,14 @@ pub(super) fn prepare(
 ) -> PreparedNamespace {
     let metadata = captured_metadata(input);
     let mut prepared = PreparedNamespace::default();
+    // Every entry of the package is decided over the files captured once here.
+    let files = PackageFiles::captured(input);
     if let Some(metadata) = &metadata {
         let entries = ["typescript", "javascript"].map(|language| {
-            let (modules, unresolved) = entry_modules(input, metadata, language);
+            let has_files = selected
+                .iter()
+                .any(|file| file.syntax.language().name == language);
+            let (modules, unresolved) = entry_modules(&files, metadata, language, has_files);
             prepared.unresolved_exports |= unresolved;
             (language, modules)
         });
@@ -73,9 +82,9 @@ pub(super) fn prepare(
                 }
             }
         }
-        map_declared_types(input, metadata, selected, &mut prepared);
+        map_declared_types(input, &files, metadata, selected, &mut prepared);
     }
-    observations::prepare(input, metadata.as_ref(), selected, &mut prepared);
+    observations::prepare(input, &files, metadata.as_ref(), selected, &mut prepared);
     if input.owner().is_local() {
         for file in selected {
             let language = file.syntax.language();
@@ -308,18 +317,17 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
 }
 
 fn entry_modules(
-    input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     language: &str,
+    has_files: bool,
 ) -> (BTreeMap<ProjectPath, Option<String>>, bool) {
     let Some(Exports::Subpaths(exports)) = &metadata.exports else {
-        return (
-            entry_path(input, metadata, language)
-                .map(|path| (path, Some(metadata.name.clone())))
-                .into_iter()
-                .collect(),
-            false,
-        );
+        return match entry::resolve(files, metadata, language) {
+            Entry::File(path) => (BTreeMap::from([(path, Some(metadata.name.clone()))]), false),
+            Entry::Unknown => (BTreeMap::new(), has_files),
+            Entry::Absent => (BTreeMap::new(), false),
+        };
     };
     let mut modules = BTreeMap::new();
     let mut unresolved = false;
@@ -378,151 +386,8 @@ fn export_subpath_is_valid(path: &str) -> bool {
             .all(|segment| !matches!(segment, "" | "." | ".." | "node_modules"))
 }
 
-/// The file a consumer of `language` loads for the package itself. An `exports` target names
-/// its file exactly; `types`, `main` and their defaults are resolved over the captured files.
-fn entry_path(
-    input: &NamespaceInput<'_>,
-    metadata: &PackageMetadata,
-    language: &str,
-) -> Option<ProjectPath> {
-    if let Some(exports) = &metadata.exports {
-        return package_path(exports.target(language)?);
-    }
-    let members = PackageMembers::captured(input);
-    match language {
-        "typescript" => declared_types_path(metadata, &members),
-        "javascript" => match (&metadata.main, &metadata.module) {
-            (Some(main), Some(module)) => {
-                let main = members.runtime(main)?;
-                (members.runtime(module)? == main).then_some(main)
-            }
-            (Some(target), None) | (None, Some(target)) => members.runtime(target),
-            (None, None) => members.main(None),
-        },
-        _ => None,
-    }
-}
-
-/// The declared types of a package without `exports`: `types` or `typings`, else the file
-/// beside `main`, else the package's own index.
-fn declared_types_path(
-    metadata: &PackageMetadata,
-    members: &PackageMembers<'_>,
-) -> Option<ProjectPath> {
-    if metadata.types_versions.is_some() {
-        return None;
-    }
-    if let Some(types) = metadata.types.as_deref().or(metadata.typings.as_deref()) {
-        return members
-            .file(types, &TYPES_EXTENSIONS)
-            .or_else(|| members.index(types, &TYPES_EXTENSIONS))
-            .or_else(|| package_path(types));
-    }
-    let Some(main) = &metadata.main else {
-        // Nothing written names the entry: only a declaration file is declared types.
-        return members.index("", &[".d.ts"]);
-    };
-    let beside = [
-        (".mjs", [".mts", ".d.mts"].as_slice()),
-        (".cjs", &[".cts", ".d.cts"]),
-        (".js", &TYPES_EXTENSIONS),
-    ]
-    .into_iter()
-    .find_map(|(runtime, declared)| Some((main.strip_suffix(runtime)?, declared)));
-    match beside {
-        Some((stem, declared)) => members.with_extension(stem, declared),
-        None => members
-            .with_extension(main, &TYPES_EXTENSIONS)
-            .or_else(|| members.index(main, &TYPES_EXTENSIONS)),
-    }
-}
-
-/// Extensions Node tries after an exact file name, in its order.
-const RUNTIME_EXTENSIONS: [&str; 3] = [".js", ".json", ".node"];
-/// Extensions TypeScript tries for a declared types path, in its order.
-const TYPES_EXTENSIONS: [&str; 3] = [".ts", ".tsx", ".d.ts"];
-
-/// The files the package ships, as far as they are captured.
-struct PackageMembers<'input>(BTreeSet<&'input str>);
-
-impl<'input> PackageMembers<'input> {
-    fn captured(input: &NamespaceInput<'input>) -> Self {
-        Self(
-            input
-                .files()
-                .iter()
-                .chain(input.context_sources())
-                .map(|source| source.path().as_str())
-                .collect(),
-        )
-    }
-
-    /// The file Node loads for the package: what a written `main` names, else its index.
-    fn main(&self, main: Option<&str>) -> Option<ProjectPath> {
-        match main.filter(|main| !main.is_empty()) {
-            Some(main) => self.runtime(main),
-            None => self.index("", &RUNTIME_EXTENSIONS),
-        }
-    }
-
-    /// Node's `LOAD_AS_DIRECTORY` for a written `main`: the file, the folder's index, then
-    /// the package's own index. A target outside the package, or one nothing answers for,
-    /// stays the spelled path.
-    fn runtime(&self, target: &str) -> Option<ProjectPath> {
-        folder(target)?;
-        self.file(target, &RUNTIME_EXTENSIONS)
-            .or_else(|| self.index(target, &RUNTIME_EXTENSIONS))
-            .or_else(|| self.index("", &RUNTIME_EXTENSIONS))
-            .or_else(|| package_path(target))
-    }
-
-    /// The exact file, or the first one an extension completes the name to.
-    fn file(&self, target: &str, extensions: &[&str]) -> Option<ProjectPath> {
-        let path = folder(target)?;
-        if self.0.contains(path) {
-            return ProjectPath::new(path).ok();
-        }
-        self.with_extension(path, extensions)
-    }
-
-    fn with_extension(&self, target: &str, extensions: &[&str]) -> Option<ProjectPath> {
-        let path = folder(target).filter(|path| !path.is_empty())?;
-        extensions.iter().find_map(|extension| {
-            let candidate = format!("{path}{extension}");
-            self.0
-                .contains(candidate.as_str())
-                .then(|| ProjectPath::new(candidate).ok())
-                .flatten()
-        })
-    }
-
-    /// The index file of a folder of the package; the empty folder is the package itself.
-    fn index(&self, target: &str, extensions: &[&str]) -> Option<ProjectPath> {
-        let path = folder(target)?;
-        let stem = if path.is_empty() {
-            "index".to_owned()
-        } else {
-            format!("{path}/index")
-        };
-        self.with_extension(&stem, extensions)
-    }
-}
-
-/// A written entry without its `./` and its trailing slash. `None` when a segment leaves the
-/// package or names no file.
-fn folder(target: &str) -> Option<&str> {
-    let path = target.strip_prefix("./").unwrap_or(target);
-    let path = path.strip_suffix('/').unwrap_or(path);
-    let path = if path == "." { "" } else { path };
-    (!path.starts_with('/')
-        && path
-            .split('/')
-            .all(|segment| segment != ".." && segment != "."))
-    .then_some(path)
-}
-
-/// The path a target spells exactly.
-fn package_path(target: &str) -> Option<ProjectPath> {
+fn entry_path(metadata: &PackageMetadata, language: &str) -> Option<ProjectPath> {
+    let target = entry_target(metadata, language)?;
     let path = ProjectPath::new(target.strip_prefix("./").unwrap_or(target)).ok()?;
     (!path.as_str().is_empty()).then_some(path)
 }
@@ -531,14 +396,19 @@ fn package_path(target: &str) -> Option<ProjectPath> {
 /// Callable facts establish category, not parameter or return equivalence.
 fn map_declared_types(
     input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     selected: &[SelectedFile<'_>],
     prepared: &mut PreparedNamespace,
 ) {
-    let Some(types_path) = entry_path(input, metadata, "typescript") else {
+    // Two written implementations leave open which one the types describe.
+    if matches!((&metadata.main, &metadata.module), (Some(main), Some(module)) if main != module) {
+        return;
+    }
+    let Entry::File(types_path) = entry::resolve(files, metadata, "typescript") else {
         return;
     };
-    let Some(implementation_path) = entry_path(input, metadata, "javascript") else {
+    let Entry::File(implementation_path) = entry::resolve(files, metadata, "javascript") else {
         return;
     };
     if types_path == implementation_path {
@@ -691,6 +561,28 @@ fn named_export_targets_in<'facts>(
         }
     }
     exports
+}
+
+fn entry_target<'metadata>(
+    metadata: &'metadata PackageMetadata,
+    language: &str,
+) -> Option<&'metadata str> {
+    if let Some(exports) = &metadata.exports {
+        return exports.target(language);
+    }
+    if metadata.types_versions.is_some() {
+        return None;
+    }
+    match language {
+        "typescript" => metadata.types.as_deref().or(metadata.typings.as_deref()),
+        "javascript" => match (&metadata.main, &metadata.module) {
+            (Some(main), Some(module)) if main != module => None,
+            (Some(main), _) => Some(main),
+            (_, Some(module)) => Some(module),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]

@@ -3540,3 +3540,97 @@ export { Derived, Own, Outside }
             .any(|edge| { edge.kind() == EdgeKind::Writes && edge.from() == edge.to() })
     );
 }
+
+/// The entry a workspace package names holds its package identity, whatever form its
+/// manifest writes; any other file keeps the identity of its own path.
+#[test]
+fn test_npm_entries_follow_extensions_folders_and_index_files() {
+    let load = "exports.load = function () {};\n";
+    let types = "export declare function load(): void;\n";
+    for (metadata, files, entry) in [
+        (r#","main":"index.js""#, vec!["index.js"], Some("index.js")),
+        (
+            r#","type":"commonjs","main":"index.js""#,
+            vec!["index.js"],
+            Some("index.js"),
+        ),
+        (
+            r#","main":"./index.cjs""#,
+            vec!["index.cjs"],
+            Some("index.cjs"),
+        ),
+        (r#","main":"./index""#, vec!["index.js"], Some("index.js")),
+        (r#","main":"index""#, vec!["index.js"], Some("index.js")),
+        (r#","main":".""#, vec!["index.js"], Some("index.js")),
+        ("", vec!["index.js"], Some("index.js")),
+        (
+            r#","main":"lib""#,
+            vec!["index.js", "lib/index.js"],
+            Some("lib/index.js"),
+        ),
+        (
+            r#","main":"./lib/""#,
+            vec!["index.js", "lib/index.js"],
+            Some("lib/index.js"),
+        ),
+        (r#","main":"./gone""#, vec!["index.js"], Some("index.js")),
+        (
+            r#","main":"./data.json""#,
+            vec!["index.js", "data.json"],
+            None,
+        ),
+        (
+            r#","types":"./index""#,
+            vec!["index.d.ts"],
+            Some("index.d.ts"),
+        ),
+        ("", vec!["index.d.ts"], Some("index.d.ts")),
+        (r#","main":"../index""#, vec!["index.js"], None),
+        (r#","main":"lib""#, vec!["lib/other.js"], None),
+    ] {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("package.json"),
+            format!(r#"{{"name":"beacon","version":"1.0.0"{metadata}}}"#),
+        )
+        .expect("manifest");
+        std::fs::create_dir(directory.path().join("lib")).expect("folder");
+        for path in &files {
+            let text = match path.rsplit_once('.') {
+                Some((_, "ts")) => types,
+                Some((_, "json")) => "{}",
+                _ => load,
+            };
+            std::fs::write(directory.path().join(path), text).expect("source");
+        }
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("index");
+        let view = index.symbol_view().expect("view");
+        let placed = view
+            .normalized_graph()
+            .records()
+            .iter()
+            .filter(|record| {
+                record
+                    .identity()
+                    .is_some_and(|identity| identity.as_str().ends_with("/beacon/load"))
+            })
+            .count();
+        assert_eq!(placed, usize::from(entry.is_some()), "{metadata} {files:?}");
+        let own = entry.map(|entry| format!("%2F{}/load", entry.replace('/', "%2F")));
+        assert!(
+            !view.normalized_graph().records().iter().any(|record| {
+                record.identity().is_some_and(|identity| {
+                    own.as_ref()
+                        .is_some_and(|own| identity.as_str().ends_with(own.as_str()))
+                })
+            }),
+            "{metadata} the entry has no second identity"
+        );
+    }
+}
