@@ -1,10 +1,12 @@
 //! Modules of npm package files that no entry names.
 
+use super::entry::{Entry, PackageFiles};
 use super::{
     BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
     SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_anchors,
     selected_source_is_valid,
 };
+use crate::static_resolution::is_declaration_file;
 use serde::Deserialize;
 
 mod scopes;
@@ -18,6 +20,7 @@ mod scopes;
 /// in more than one scope takes no identity, since one path would name distinct declarations.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
     metadata: &PackageMetadata,
     entries: &BTreeSet<(&str, ProjectPath)>,
     selected: &[SelectedFile<'_>],
@@ -28,6 +31,15 @@ pub(super) fn prepare(
     }
     let foreign = foreign_directories(input, &metadata.name);
     let mut modules = held_modules(prepared);
+    // The declaration script's path is known before a compiler version selects an entry.
+    let versioned_script = if metadata.types_versions.is_some() && metadata.exports.is_none() {
+        match files.unversioned_types(metadata) {
+            Entry::File(path) if is_declaration_file(path.as_str()) => Some(path),
+            _ => None,
+        }
+    } else {
+        None
+    };
     for file in selected {
         let language = file.syntax.language();
         let supported = matches!(language.name.as_str(), "javascript" | "typescript")
@@ -49,7 +61,8 @@ pub(super) fn prepare(
         {
             continue;
         }
-        if is_script(file) {
+        let script = is_script(file);
+        if script && versioned_script.as_ref() != Some(file.path) {
             continue;
         }
         let module = format!("{}/{path}", metadata.name);
@@ -73,7 +86,7 @@ pub(super) fn prepare(
         });
         if prepare_anchors(input, file, &module, anchors, prepared) {
             modules.insert((language.name.clone(), module), Some(path.to_owned()));
-            if metadata.exports.is_some() {
+            if metadata.exports.is_some() || script {
                 prepared
                     .unreached_modules
                     .insert(path.to_owned(), ambient.into_keys().collect());

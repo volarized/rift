@@ -92,6 +92,57 @@ pub(super) fn public(analysis: &PackageAnalysis, segments: &[&str], file: &str) 
 }
 
 #[test]
+fn versioned_types_entry_scripts_keep_their_file_identities() {
+    let manifest = r#"{"name":"beacon","version":"1.0.0","main":"","types":"index.d.ts","typesVersions":{"<=5.6":{"*":["ts5.6/*"]}}}"#;
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![(
+            "index.d.ts",
+            "interface MediaMetrics { ready: boolean }\ndeclare var Probe: MediaMetrics;\n",
+        )],
+        None,
+        Some(("package.json", manifest)),
+    )
+    .expect("published declaration script");
+    let rows = declared(&analysis);
+    let module = "beacon/index.d.ts";
+    let file = "index.d.ts".to_owned();
+    let identities = [
+        path(&[module, "MediaMetrics"]),
+        path(&[module, "MediaMetrics", "ready"]),
+        path(&[module, "Probe"]),
+    ];
+    for identity in &identities {
+        assert_eq!(
+            rows.get(&(identity.clone(), file.clone())),
+            Some(&false),
+            "{rows:?}"
+        );
+    }
+    assert!(
+        rows.keys()
+            .all(|(path, _)| path.first().is_some_and(|name| name == module))
+    );
+    let found = edges(&analysis);
+    assert!(
+        found.contains(&(
+            identities[0].clone(),
+            EdgeKind::Contains,
+            identities[1].clone()
+        )),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            identities[2].clone(),
+            EdgeKind::HasType,
+            identities[0].clone()
+        )),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn a_required_file_is_a_module_named_by_its_path() {
     let files = [("index.js", ENTRY), ("lib/inner.js", INNER)];
     for (manifest, importable) in [(MAIN, true), (EXPORTS, false)] {
