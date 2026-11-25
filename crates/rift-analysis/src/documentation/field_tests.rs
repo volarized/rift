@@ -397,6 +397,14 @@ fn a_collection_records_its_left_out_fields_once_while_their_count_stays() {
         .capture("warn")
         .install()
         .expect("recorder");
+    // Another thread reaches the record first, as a parallel collection can.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| collect_documentation(&set(), &[]).map(drop))
+            .join()
+            .expect("the other thread ends")
+            .expect("the other thread's collection");
+    });
     let first = collect_documentation(&set(), &[]).expect("first collection");
     collect_documentation_incremental(Some(&first), &set(), &[]).expect("unchanged collection");
     let records = drain.queued_records();
