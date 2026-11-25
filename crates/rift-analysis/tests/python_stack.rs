@@ -177,7 +177,7 @@ fn a_chain_of_aliases_ends() {
     ));
     assert_edges(
         &found,
-        1008,
+        1007,
         &[
             "module -> module/C/m",
             "module/D -> module/C",
@@ -217,7 +217,7 @@ fn a_chain_of_reexports_ends() {
     );
     assert_edges(
         &found,
-        1008,
+        1007,
         &["module/K -> module/C", "module -> module/C/m"],
     );
 }
@@ -298,7 +298,7 @@ fn a_class_with_many_bases_inherits_from_each() {
     );
     assert_edges(
         &found,
-        16_007,
+        16_005,
         &[
             "module -> module/B0/m0",
             "module -> module/B3999/m3999",
@@ -332,14 +332,11 @@ fn many_bases_that_share_a_base_merge_in_the_c3_order() {
     );
     assert!(!called("module/Root/m"));
     assert!(called("module/Root/r"));
-    let reads = found
+    let calls = found
         .iter()
         .filter(|edge| *edge == "module -> module/Root/r")
         .count();
-    assert_eq!(
-        reads, 2,
-        "the call and the name of `K().r`, none of `Wrong().r`"
-    );
+    assert_eq!(calls, 1, "the call of `K().r`, none of `Wrong().r`");
 }
 
 // Issue #1065.
@@ -356,7 +353,7 @@ fn a_long_base_class_chain_keeps_the_edges_of_its_file() {
     ));
     assert_edges(
         &found,
-        30_008,
+        30_006,
         &[
             "module/sentinel -> module/Zed/m",
             "module/C9999 -> module/C9998",
@@ -370,7 +367,7 @@ fn a_long_base_class_chain_keeps_the_edges_of_its_file() {
     ));
     assert_edges(
         &found,
-        7 * LINKS + 4,
+        7 * LINKS + 2,
         &[
             "module/sentinel -> module/Zed/m",
             "module/C999/m -> module/C998/m",
@@ -386,7 +383,7 @@ fn a_chain_of_bases_ends() {
     ));
     assert_edges(
         &found,
-        3002,
+        3001,
         &["module -> module/C0/m", "module/C999 -> module/C998"],
     );
 }
@@ -416,7 +413,7 @@ fn a_chain_of_functions_ends() {
     ));
     assert_edges(
         &found,
-        5004,
+        5002,
         &["module -> module/C/m", "module/f999 -> module/f998"],
     );
 }
@@ -431,7 +428,7 @@ fn a_chain_of_arguments_ends() {
     ));
     assert_edges(
         &found,
-        5003,
+        5002,
         &["module -> module/C/m", "module -> module/f999"],
     );
 }

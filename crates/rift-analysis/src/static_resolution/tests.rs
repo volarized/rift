@@ -650,6 +650,7 @@ const WORK_MAX: usize = 10_000;
 
 mod python_aliases;
 mod python_ancestry;
+mod python_callees;
 mod python_class_rebinding;
 mod python_conditional_methods;
 mod python_decorators;

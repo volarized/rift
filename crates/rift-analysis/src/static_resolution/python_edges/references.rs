@@ -1,8 +1,11 @@
 //! Python containment, member accesses, overrides, and annotation uses.
 
-use rift_core::ReferenceRole;
+use std::collections::BTreeMap;
+
+use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::read::{EdgeKind, SymbolKind};
-use rift_syntax::ByteRange;
+use rift_provider::NormalizedTarget;
+use rift_syntax::{ByteRange, StaticReference};
 
 use super::super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 use super::Value;
@@ -14,6 +17,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
+        let callees = established_callees(result);
         for reference in file.facts.references() {
             if !work.charge() {
                 return;
@@ -41,7 +45,9 @@ impl<'source> Index<'source> {
                     }
                     Some(occurrence)
                 });
-            result.record(occurrence);
+            if !names_callee(&callees, reference, occurrence.as_ref()) {
+                result.record(occurrence);
+            }
         }
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
@@ -118,11 +124,11 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         range: ByteRange,
         target: Target<'source>,
-    ) -> Option<rift_core::SymbolId> {
+    ) -> Option<SymbolId> {
         let occurrence = self.occurrence(file, range, range, ReferenceRole::Read, target)?;
         match occurrence.target {
-            rift_provider::NormalizedTarget::Symbol(symbol) => Some(symbol),
-            rift_provider::NormalizedTarget::Contribution(_) => None,
+            NormalizedTarget::Symbol(symbol) => Some(symbol),
+            NormalizedTarget::Contribution(_) => None,
         }
     }
 
@@ -139,4 +145,41 @@ impl<'source> Index<'source> {
         occurrence.edge_from = Some(self.python_identity(file, range, from)?);
         Some(occurrence)
     }
+}
+
+/// The callees whose calls in one file have a target, with the declaration each call names
+/// in the selection.
+fn established_callees(result: &StaticResolution) -> BTreeMap<ByteRange, Option<SymbolId>> {
+    let external = result.external.iter();
+    let mut callees = external
+        .filter(|call| call.role == ReferenceRole::Call)
+        .map(|call| (call.callee_range, None))
+        .collect::<BTreeMap<_, _>>();
+    for call in &result.occurrences {
+        if call.role == ReferenceRole::Call
+            && let NormalizedTarget::Symbol(called) = &call.target
+        {
+            callees.insert(call.callee_range, Some(called.clone()));
+        }
+    }
+    callees
+}
+
+/// Whether the read of a callee names what its call names, or names nothing beside it. A
+/// callee that is read through another name, such as an attribute that holds the called
+/// class, is a fact of its own.
+fn names_callee(
+    callees: &BTreeMap<ByteRange, Option<SymbolId>>,
+    reference: &StaticReference,
+    occurrence: Option<&StaticOccurrence>,
+) -> bool {
+    let Some(called) = callees.get(&reference.target) else {
+        return false;
+    };
+    let read = occurrence.map(|occurrence| &occurrence.target);
+    reference.role == ReferenceRole::Read
+        && match (called, read) {
+            (Some(called), Some(NormalizedTarget::Symbol(read))) => called == read,
+            (_, read) => read.is_none(),
+        }
 }
