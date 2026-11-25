@@ -1,4 +1,5 @@
 mod imports;
+mod macro_scopes;
 mod macros;
 mod references;
 
@@ -226,7 +227,8 @@ impl Kinds {
         }
         let id = syntax_element.kind_id();
         if id == self.macro_definition {
-            return self.record_macro_definition(visited, source, macros);
+            self.record_macro_definition(visited, source, macros)?;
+            return self.record_textual_macro_definition(visited, facts);
         }
         self.record_reference(visited, facts)?;
         if self.block_type_items.contains(&id) {
@@ -274,6 +276,12 @@ impl Kinds {
         } else if id == self.edge_macro {
             facts.unsupported_bindings.push(byte_range(syntax_element)?);
             self.record_macro_binding(visited, source, macros, facts)?;
+            self.record_macro_invocation(visited, source, facts)?;
+        } else if id == self.local_type_items[2]
+            && syntax_element.child_by_field_id(self.body).is_none()
+        {
+            // A file-backed module can carry a macro_use inner attribute.
+            self.record_macro_scope_barrier(visited, facts)?;
         } else if id == self.impl_item {
             self.record_impl(syntax_element, facts)?;
         } else if id == self.type_item {
@@ -424,7 +432,11 @@ impl Kinds {
         let name = name.and_then(|name| source.get(name.byte_range()));
         let conditional_attribute = name == Some("cfg")
             || (name == Some("cfg_attr") && self.contains_cfg(syntax_element, source));
-        if !conditional_attribute {
+        let opaque_macro_attribute = !matches!(
+            name,
+            Some("allow" | "cfg" | "deny" | "doc" | "forbid" | "macro_export" | "warn")
+        );
+        if !conditional_attribute && !opaque_macro_attribute {
             return Ok(());
         }
         let parent = visited.parent().map(Visited::syntax_element);
@@ -444,11 +456,16 @@ impl Kinds {
             }
             next
         };
-        if let Some(conditional) = conditional {
-            facts.conditional_items.push(super::StaticConditionalItem {
-                range: byte_range(conditional)?,
-                attribute: byte_range(syntax_element)?,
-            });
+        if let Some(item) = conditional {
+            if conditional_attribute {
+                facts.conditional_items.push(super::StaticConditionalItem {
+                    range: byte_range(item)?,
+                    attribute: byte_range(syntax_element)?,
+                });
+            }
+            if opaque_macro_attribute {
+                self.record_macro_attribute_barrier(visited, item, facts)?;
+            }
         }
         Ok(())
     }

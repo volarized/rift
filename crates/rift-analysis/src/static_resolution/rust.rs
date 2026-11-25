@@ -2,6 +2,7 @@
 
 mod deref;
 mod field_sites;
+mod macro_calls;
 mod receivers;
 mod references;
 mod value_reads;
@@ -32,6 +33,7 @@ pub(super) struct Namespaces<'source> {
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
     fields: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    exported_macros: BTreeMap<Vec<String>, Option<Target<'source>>>,
     member_calls: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
@@ -830,6 +832,18 @@ impl<'source> Namespaces<'source> {
                 &mut self.members
             };
             insert(members, path.clone(), target);
+        }
+        if symbol.kind == "macro"
+            && symbol.visibility.as_deref() == Some("pub")
+            && let Some(crate_name) = path.first()
+        {
+            // Exported macro_rules definitions are visible at the crate root; their
+            // retained declaration keeps its physical source and module.
+            insert(
+                &mut self.exported_macros,
+                vec![crate_name.clone(), symbol.name.clone()],
+                target,
+            );
         }
         if matches!(symbol.kind, "constant" | "static") && file.is_module_item(symbol) {
             insert(&mut self.constants_and_statics, path, target);

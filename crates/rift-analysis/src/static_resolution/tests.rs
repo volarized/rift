@@ -2563,6 +2563,170 @@ pub mod inside {
 }
 
 #[test]
+fn rust_root_macro_calls_keep_the_export_declaration_and_binding_guard() {
+    let source = r#"
+mod macros;
+macro_rules! wire { () => { 1u8 }; }
+macro_rules! wrap { ($value:expr) => { $value }; }
+pub fn leaf() -> u8 { 2 }
+pub fn read() -> u8 { leaf() + crate::wire!() }
+pub fn direct() -> u8 { wire!() }
+pub fn nested() -> u8 { wrap!(crate::wire!()) }
+pub fn standard() -> usize { std::concat!("a", "b").len() }
+pub fn disabled() -> u8 { crate::inactive!() }
+pub fn private() -> u8 { crate::local!() }
+"#;
+    let definitions = r"
+#[macro_export]
+macro_rules! wire { () => { 3u8 }; }
+#[cfg(any())]
+#[macro_export]
+macro_rules! inactive { () => { 4u8 }; }
+macro_rules! local { () => { 5u8 }; }
+";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source), ("src/macros.rs", definitions)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let observed = calls(&result, "src/lib.rs")
+        .map(|edge| (source_of(edge, source), target(edge)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        [
+            ("leaf()", "rift://symbol/local/rust/fixture/leaf"),
+            (
+                "crate::wire!()",
+                "rift://symbol/local/rust/fixture/macros/wire"
+            ),
+            ("wire!()", "rift://symbol/local/rust/fixture/wire"),
+            (
+                "wrap!(crate::wire!())",
+                "rift://symbol/local/rust/fixture/wrap",
+            ),
+        ]
+    );
+    let (supplemental, _) = result.supplemental_start.expect("deferred macro site");
+    let row = result.occurrences[supplemental..]
+        .iter()
+        .find(|edge| edge.role == ReferenceRole::Call)
+        .expect("supplemental macro call");
+    assert_eq!(source_of(row, source), "crate::wire!()");
+    let start =
+        u64::try_from(source.find("crate::wire!()").expect("macro call")).expect("source offset");
+    assert!(result.edge_calls.values().any(|coverage| {
+        !coverage.unavailable && coverage.unresolved.iter().any(|range| range.start == start)
+    }));
+    assert!(!result.ended);
+}
+
+#[test]
+fn rust_textual_macro_calls_respect_order_and_physical_sibling_scopes() {
+    let source = r"
+macro_rules! picked { () => { 1u8 }; }
+pub const fn earlier() -> u8 { picked!() }
+pub const fn scoped() -> u8 {
+    let before = picked!();
+    macro_rules! picked { () => { 2u8 }; }
+    let inside = picked!();
+    let nested = {
+        macro_rules! picked { () => { 3u8 }; }
+        picked!()
+    };
+    before + inside + nested + picked!()
+}
+pub const fn sibling() -> u8 { picked!() }
+";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let declaration = |literal| {
+        u64::try_from(source.find(literal).expect("macro definition")).expect("macro byte offset")
+    };
+    let outer = declaration("macro_rules! picked { () => { 1u8");
+    let inner = declaration("macro_rules! picked { () => { 2u8");
+    let nested = declaration("macro_rules! picked { () => { 3u8");
+    let observed = calls(&result, "src/lib.rs")
+        .map(|call| {
+            assert_eq!(source_of(call, source), "picked!()");
+            call.target_binding
+                .as_ref()
+                .expect("physical macro")
+                .range()
+                .start()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observed, [outer, outer, inner, nested, inner, outer]);
+    assert!(!result.ended);
+}
+
+#[test]
+fn rust_textual_macro_calls_wait_for_later_proven_definitions_after_opacity() {
+    let source = r"
+macro_rules! selected { () => { 1u8 }; }
+pub const fn before() -> u8 { selected!() }
+
+macro_rules! install { () => { const OTHER: u8 = 9; }; }
+install!();
+pub const fn after_expansion() -> u8 { selected!() }
+
+macro_rules! selected { () => { 2u8 }; }
+pub const fn restored() -> u8 { selected!() }
+
+#[macro_use]
+mod brought_in { macro_rules! selected { () => { 7u8 }; } }
+pub const fn after_module() -> u8 { selected!() }
+
+macro_rules! selected { () => { 3u8 }; }
+#[cfg(any())]
+mod absent;
+pub const fn after_inactive() -> u8 { selected!() }
+
+mod file_backed;
+pub const fn after_file() -> u8 { selected!() }
+
+macro_rules! selected { () => { 4u8 }; }
+pub const fn recovered() -> u8 { selected!() }
+";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/file_backed.rs",
+                "#![macro_use]\nmacro_rules! selected { () => { 8u8 }; }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let observed = calls(&result, "src/lib.rs")
+        .filter(|call| source_of(call, source) == "selected!()")
+        .map(|call| call.binding.range().start())
+        .collect::<Vec<_>>();
+    let site = |owner| {
+        let start = source.find(owner).expect("authored function");
+        let offset = source[start..].find("selected!()").expect("authored call");
+        u64::try_from(start + offset).expect("call byte offset")
+    };
+    assert_eq!(
+        observed,
+        [
+            site("fn before"),
+            site("fn restored"),
+            site("fn after_inactive"),
+            site("fn recovered"),
+        ]
+    );
+    assert!(!result.ended);
+}
+
+#[test]
 fn rust_literal_and_pattern_field_labels_keep_physical_owners_and_roles() {
     let source = "pub struct Left { pub x: u8, pub y: u8 }\n\
         pub struct Right { pub x: u8, pub y: u8 }\n\

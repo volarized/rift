@@ -14,7 +14,7 @@ mod rust;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use rift_core::{
@@ -209,7 +209,13 @@ enum DeferredReferences<'source> {
         names: Option<python_edges::PythonNameSites>,
         imports: Vec<python_edges::PythonImportQualifier<'source>>,
     },
+    PythonQualifiers {
+        imports: Vec<python_edges::PythonImportQualifier<'source>>,
+        names: Vec<ByteRange>,
+    },
     Rust,
+    RustRootMacros,
+    RustTextualMacros,
 }
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
@@ -1364,8 +1370,11 @@ impl<'source> Index<'source> {
                 if let Some(sites) = apart.deferred_references {
                     let remaining = file_work.max(file).saturating_sub(apart.used);
                     let queue = match sites {
-                        DeferredReferences::Python { .. } => &mut deferred_references,
-                        DeferredReferences::Rust => &mut rust_qualifiers,
+                        DeferredReferences::Python { .. }
+                        | DeferredReferences::PythonQualifiers { .. } => &mut deferred_references,
+                        DeferredReferences::Rust
+                        | DeferredReferences::RustRootMacros
+                        | DeferredReferences::RustTextualMacros => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
                 }
@@ -1390,22 +1399,41 @@ impl<'source> Index<'source> {
             resolution.supplemental_start =
                 Some((resolution.occurrences.len(), resolution.external.len()));
         }
-        let mut python_qualifiers = Vec::new();
-        for (file, remaining, sites) in references {
+        let mut existing = VecDeque::from(references);
+        let mut macro_sites = VecDeque::new();
+        while let Some((file, remaining, sites)) =
+            existing.pop_front().or_else(|| macro_sites.pop_front())
+        {
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
-            let python = match sites {
+            let next = match sites {
                 DeferredReferences::Python { names, imports } => {
                     let names = names.map_or_else(Vec::new, |sites| {
                         self.python_name_references(file, sites, &mut deferred, resolution)
                     });
-                    (!names.is_empty() || !imports.is_empty()).then_some((imports, names))
+                    (!names.is_empty() || !imports.is_empty())
+                        .then_some(DeferredReferences::PythonQualifiers { imports, names })
+                }
+                DeferredReferences::PythonQualifiers { imports, names } => {
+                    self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
+                    None
                 }
                 DeferredReferences::Rust => {
                     self.rust_call_qualifiers(file, &mut deferred, resolution);
                     self.rust_value_reads(file, &mut deferred, resolution);
                     self.rust_field_sites(file, &mut deferred, resolution);
+                    (!file.facts.rust_root_macro_calls().is_empty()
+                        || !file.facts.rust_textual_macro_calls().is_empty())
+                    .then_some(DeferredReferences::RustRootMacros)
+                }
+                DeferredReferences::RustRootMacros => {
+                    self.rust_root_macro_calls(file, &mut deferred, resolution);
+                    (!file.facts.rust_textual_macro_calls().is_empty())
+                        .then_some(DeferredReferences::RustTextualMacros)
+                }
+                DeferredReferences::RustTextualMacros => {
+                    self.rust_textual_macro_calls(file, &mut deferred, resolution);
                     None
                 }
             };
@@ -1415,21 +1443,14 @@ impl<'source> Index<'source> {
                 .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
             work.budget = LoopBudget::new(left.saturating_sub(used));
             resolution.ended |= deferred.exhausted;
-            if let Some((imports, names)) = python {
-                python_qualifiers.push((file, remaining.saturating_sub(used), imports, names));
+            if let Some(next) = next {
+                let queue = if matches!(next, DeferredReferences::PythonQualifiers { .. }) {
+                    &mut existing
+                } else {
+                    &mut macro_sites
+                };
+                queue.push_back((file, remaining.saturating_sub(used), next));
             }
-        }
-        for (file, remaining, imports, names) in python_qualifiers {
-            let left = work.budget.remaining();
-            let budget = left.min(remaining);
-            let mut deferred = Work::new(budget);
-            self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
-            let used = budget.saturating_sub(deferred.budget.remaining());
-            #[cfg(test)]
-            self.performed
-                .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
-            work.budget = LoopBudget::new(left.saturating_sub(used));
-            resolution.ended |= deferred.exhausted;
         }
     }
 
@@ -1567,7 +1588,9 @@ impl<'source> Index<'source> {
                 self.rust_references(file, work, result);
                 (!file.facts.calls().is_empty()
                     || !file.facts.rust_value_reads().is_empty()
-                    || !file.facts.rust_field_sites().is_empty())
+                    || !file.facts.rust_field_sites().is_empty()
+                    || !file.facts.rust_root_macro_calls().is_empty()
+                    || !file.facts.rust_textual_macro_calls().is_empty())
                 .then_some(DeferredReferences::Rust)
             }
             _ => None,

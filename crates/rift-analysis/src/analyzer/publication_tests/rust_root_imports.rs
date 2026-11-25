@@ -157,3 +157,48 @@ fn library_root_does_not_materialize_from_unchecked_scope_or_non_external_import
         );
     }
 }
+
+#[test]
+fn package_publishes_proven_macro_calls_at_authored_invocations() {
+    let source = r"
+mod exported;
+macro_rules! local { () => { 1u8 }; }
+pub fn ordinary() -> u8 { 2 }
+pub fn all() -> u8 { ordinary() + crate::exported!() + local!() }
+";
+    let other = "#[macro_export]\nmacro_rules! exported { () => { 3u8 }; }\n";
+    let publication = analyze_rust_root(
+        vec![("src/lib.rs", source), ("src/exported.rs", other)],
+        MANIFEST,
+    );
+    let publication = publication.publication();
+    let caller = format!("{ROOT}/all");
+    let calls = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.from.as_str() == caller && edge.kinds == [EdgeKind::Calls])
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3);
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "src/lib.rs")
+        .expect("source unit");
+    for (authored, target) in [
+        ("ordinary()", "ordinary"),
+        ("crate::exported!()", "exported/exported"),
+        ("local!()", "local"),
+    ] {
+        let start = source.rfind(authored).expect("invocation site");
+        let range = TextRange {
+            start: u64::try_from(start).expect("invocation byte start"),
+            end: u64::try_from(start + authored.len()).expect("invocation byte end"),
+        };
+        assert!(calls.iter().any(|edge| {
+            edge.to.as_str() == format!("{ROOT}/{target}")
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == unit.unit && occurrence.range == range
+                })
+        }));
+    }
+}
