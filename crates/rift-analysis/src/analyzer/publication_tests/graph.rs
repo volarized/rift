@@ -499,6 +499,57 @@ fn package_rust_initializer_local_types_do_not_name_the_module_type() {
     }
 }
 
+#[test]
+fn package_calls_keep_their_javascript_initializer_owners() {
+    let source = "function load() { return 1; }\n\
+                  export const value = load();\n\
+                  export const items = [load()];\n\
+                  export const object = { property: load() };\n\
+                  export class Owner { field = load(); static shared = load(); }\n\
+                  export function run() { const local = load(); return local; }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.js"}"#,
+        )),
+    )
+    .expect("admitted JavaScript package");
+    let mut calls = analysis
+        .publication()
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/load"))
+        .map(|edge| {
+            let span = edge.occurrence.as_ref().expect("written call");
+            let start = usize::try_from(span.range.start).expect("start");
+            let end = usize::try_from(span.range.end).expect("end");
+            assert_eq!(source.get(start..end), Some("load()"));
+            (start, edge.from.as_str())
+        })
+        .collect::<Vec<_>>();
+    calls.sort_unstable();
+    let owners = [
+        "value",
+        "items",
+        "object/property",
+        "Owner/field",
+        "Owner/shared",
+        "run",
+    ];
+    assert_eq!(calls.len(), owners.len(), "{calls:?}");
+    for ((start, owner), (expected, (position, _))) in calls.into_iter().zip(
+        owners
+            .into_iter()
+            .zip(source.match_indices("load()").skip(1)),
+    ) {
+        assert_eq!(start, position);
+        assert!(owner.ends_with(&format!("/beacon/{expected}")), "{owner}");
+    }
+}
+
 struct GraphFixture {
     analysis: PackageAnalysis,
     owner: SymbolOwner,

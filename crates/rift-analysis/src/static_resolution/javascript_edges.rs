@@ -33,16 +33,17 @@ impl<'source> Index<'source> {
             // holding that value is the caller: the callable it defines, or the
             // variable, field or object member whose initializer builds it.
             (Some(value), _) => scopes.definitions.resolve(value.start, value.end).copied(),
-            // Outside every function, an instance field initializer runs with its field.
+            // Outside every function, the declaration receiving an initializer owns its calls.
             (None, None) => scopes
                 .definitions
                 .resolve(range.start, range.end)
                 .copied()
-                .filter(|symbol| {
-                    matches!(
-                        symbol.syntax_element_kind,
-                        Some("field_definition" | "public_field_definition")
-                    )
+                .filter(|symbol| match symbol.syntax_element_kind {
+                    Some("field_definition" | "public_field_definition") => true,
+                    Some("variable_declarator" | "pair") => symbol
+                        .name_range
+                        .is_some_and(|name| name.end <= range.start),
+                    _ => false,
                 }),
             (None, Some(_)) => None,
         };
