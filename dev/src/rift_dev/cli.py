@@ -26,6 +26,7 @@ from rift_dev import (
     check_rust_architecture,
     generated,
     release_tag,
+    standard_methods,
     suites,
     worktrees,
 )
@@ -280,6 +281,12 @@ def generate(
 ) -> None:
     """Write the schemas, analyzer manifest, API client, and CLI help transcript."""
     generated.generate(check)
+
+
+@app.command("standard-methods")
+def standard_method_table(documentation: Annotated[Path, typer.Argument()]) -> None:
+    """Write the table of standard inherent methods from a folder of rustdoc pages."""
+    typer.echo(f"std {standard_methods.write_table(documentation)}")
 
 
 @app.command()

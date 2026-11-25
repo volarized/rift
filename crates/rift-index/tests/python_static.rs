@@ -598,3 +598,111 @@ fn test_python_declared_container_elements_store_calls_and_reads() {
     assert!(index.edges().is_complete());
     assert_eq!(index.edges().dropped_edges(), 0);
 }
+
+/// The stored `has_type` and `reads` edges from the declarations of `use.py`, as
+/// `kind from -> to` without the package prefix.
+fn written_types(source: &str) -> Vec<String> {
+    let (_directory, index) = build(&[
+        ("p/__init__.py", "from . import a as exported\n"),
+        (
+            "p/a.py",
+            "class Base:\n    class Inner: pass\ndef call(): pass\nAlias = Base\n",
+        ),
+        ("p/sub/__init__.py", ""),
+        ("p/sub/deep.py", "class Deep: pass\n"),
+        ("use.py", source),
+    ]);
+    let mut found = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            matches!(
+                edge.kind(),
+                rift_protocol::read::EdgeKind::HasType | rift_protocol::read::EdgeKind::Reads
+            )
+        })
+        .filter_map(|edge| {
+            let name = |id: &str| id.rsplit_once("/python/").map(|(_, name)| name.to_owned());
+            let from = name(edge.from().as_str())?;
+            let to = name(edge.to().as_str())?;
+            let from = from.strip_prefix("use/")?.to_owned();
+            to.starts_with("p/")
+                .then(|| format!("{:?} {from} -> {to}", edge.kind()))
+        })
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[test]
+fn test_python_dotted_annotations_have_the_type_and_read_the_module() {
+    // #1089: only the last name of a dotted annotation or base is a type of the declaration;
+    // the interpreter reads each module and class before it.
+    let typed = ["HasType g -> p/a/Base"];
+    let read = ["HasType g -> p/a/Base", "Reads g -> p/a"];
+    let deep = [
+        "HasType g -> p/sub/deep/Deep",
+        "Reads g -> p/sub",
+        "Reads g -> p/sub/deep",
+    ];
+    for (source, expected) in [
+        ("import p.a\ndef g(v: p.a.Base) -> None: pass\n", &read[..]),
+        ("import p.a\ndef g() -> p.a.Base: pass\n", &read),
+        ("import p.a\ndef g(*v: p.a.Base): pass\n", &read),
+        ("import p.a\ndef g(v: p.a.Base | None): pass\n", &read),
+        (
+            "import p.a\nfrom typing import Optional\ndef g(v: Optional[p.a.Base]): pass\n",
+            &read,
+        ),
+        (
+            "import p.a\nfrom typing import Union\ndef g(v: Union[int, list[p.a.Base]]): pass\n",
+            &read,
+        ),
+        (
+            "import p.a\nfrom typing import Callable\ndef g(v: Callable[[p.a.Base], int]): pass\n",
+            &read,
+        ),
+        (
+            "import p.sub.deep\ndef g(v: p.sub.deep.Deep): pass\n",
+            &deep,
+        ),
+        // A quoted annotation is not evaluated, and one name is read by no attribute.
+        ("import p.a\ndef g(v: 'p.a.Base'): pass\n", &typed),
+        (
+            "import p.a\nfrom typing import Optional\ndef g(v: Optional['p.a.Base']): pass\n",
+            &typed,
+        ),
+        ("import p.a as m\ndef g(v: m.Base): pass\n", &typed),
+        ("from p import a\ndef g(v: a.Base): pass\n", &typed),
+        ("from p import a as m\ndef g(v: m.Base): pass\n", &typed),
+        (
+            "import p\ndef g(v: p.exported.Base): pass\n",
+            &["HasType g -> p/a/Base", "Reads g -> p/a"],
+        ),
+        (
+            "from p import a\ndef g(v: a.Base.Inner): pass\n",
+            &["HasType g -> p/a/Base/Inner", "Reads g -> p/a/Base"],
+        ),
+        (
+            "from p import a\ndef g(v: a.Alias): pass\n",
+            &["HasType g -> p/a/Alias"],
+        ),
+        // A module or a function is no type, whatever spells it.
+        ("from p import a\ndef g(v: a): pass\n", &[]),
+        ("import p.a as m\ndef g(v: m): pass\n", &[]),
+        ("import p.a\ndef g(v: p.a): pass\n", &[]),
+        ("import p.a\ndef g(v: 'p.a'): pass\n", &[]),
+        ("from p import a\ndef g(v: a.call): pass\n", &[]),
+        ("from p.a import call\ndef g(v: call): pass\n", &[]),
+        // Bases and the metaclass of a class.
+        ("import p.a\nclass g(p.a.Base): pass\n", &read),
+        ("from p import a\nclass g(a.Base): pass\n", &typed),
+        ("import p.a\nclass g(list[p.a.Base]): pass\n", &read),
+        ("import p.a\nclass g(metaclass=p.a.Base): pass\n", &read),
+        ("import p.a\ng: p.a.Base\n", &read),
+        ("import p.a\ng: p.a.Base = None\n", &read),
+    ] {
+        assert_eq!(written_types(source), expected, "{source}");
+    }
+}

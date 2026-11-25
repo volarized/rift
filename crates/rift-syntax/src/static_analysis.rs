@@ -464,9 +464,10 @@ pub struct StaticFactsParts {
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
     /// after later statements of the enclosing scope.
     pub expression_scopes: Vec<ByteRange>,
-    /// Python comprehensions and the iterable of their first clause, which the enclosing scope
-    /// evaluates.
-    pub first_iterables: Vec<(ByteRange, ByteRange)>,
+    /// Python scopes and the part of each that the enclosing scope evaluates: the iterable of a
+    /// comprehension's first clause, the parameters and return annotation of a function, the
+    /// parameters of a lambda, the arguments of a class.
+    pub evaluated_outside: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -754,8 +755,8 @@ impl StaticFacts {
 
     /// Python comprehensions and the iterable of their first clause.
     #[must_use]
-    pub fn first_iterables(&self) -> &[(ByteRange, ByteRange)] {
-        &self.0.first_iterables
+    pub fn evaluated_outside(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.evaluated_outside
     }
 
     /// Python names checked for a non-`None` value and the bodies the checks admit.
@@ -804,7 +805,7 @@ impl StaticFacts {
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
-            vector_capacity(&self.0.first_iterables),
+            vector_capacity(&self.0.evaluated_outside),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_writes),
             vector_capacity(&self.0.skippable),
@@ -868,7 +869,7 @@ impl StaticFacts {
             self.receiver_arguments().len(),
             self.loops().len(),
             self.expression_scopes().len(),
-            self.first_iterables().len(),
+            self.evaluated_outside().len(),
             self.non_none_guards().len(),
             self.commonjs_writes().len(),
             self.skippable().len(),
@@ -1106,7 +1107,7 @@ impl StaticFacts {
             .copied()
             .all(&valid)
             && self
-                .first_iterables()
+                .evaluated_outside()
                 .iter()
                 .all(|(scope, iterable)| valid(*iterable) && contains(*scope, *iterable))
             && self
@@ -1197,7 +1198,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar {
-    Python(&'static python_edges::EdgePythonKinds),
+    Python(&'static python_edges::EdgePythonKinds, python_edges::Names),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     /// With the places the parser could not read.
     Rust(&'static rust::Kinds, rift_core::LoopBudget, Vec<ByteRange>),
@@ -1237,7 +1238,10 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn for_edge_python(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::Python(python_edges::edge_python_kinds()),
+            grammar: Grammar::Python(
+                python_edges::edge_python_kinds(),
+                python_edges::Names::default(),
+            ),
             source,
             facts: StaticFacts::default(),
             edge_heritage: heritage_edges::edge_python_kinds(),
@@ -1278,7 +1282,9 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
-            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
+            Grammar::Python(kinds, names) => {
+                kinds.record_edge(visited, self.source, &mut self.facts.0, names)
+            }
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }
@@ -1300,8 +1306,9 @@ impl<'source> Capture<'source> {
         mut self,
         root: tree_sitter::Node<'_>,
     ) -> Result<StaticFacts, RiftError> {
-        if let Grammar::Python(kinds) = self.grammar {
+        if let Grammar::Python(kinds, names) = self.grammar {
             kinds.close_lists(root, self.source, &mut self.facts.0)?;
+            names.close(self.source, &mut self.facts.0);
         }
         Ok(self.facts)
     }

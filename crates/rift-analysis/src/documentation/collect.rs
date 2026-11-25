@@ -6,10 +6,10 @@ use std::sync::Arc;
 use rift_core::line::{line_of, line_starts, lines_inclusive};
 use rift_protocol::documentation::{
     DocumentationBlock, DocumentationBlockKind, DocumentationCoverage, DocumentationDigest,
-    DocumentationHeading, DocumentationIndex, DocumentationLink, DocumentationLinkResolution,
-    DocumentationReference, DocumentationReferenceCandidate, DocumentationSourceFormat,
-    DocumentationStage, DocumentationUnresolvedReason, DocumentationWarning,
-    DocumentationWarningKind, NotebookCellKind,
+    DocumentationFieldsOmitted, DocumentationHeading, DocumentationIndex, DocumentationLink,
+    DocumentationLinkResolution, DocumentationReference, DocumentationReferenceCandidate,
+    DocumentationSourceFormat, DocumentationStage, DocumentationUnresolvedReason,
+    DocumentationWarning, DocumentationWarningKind, NotebookCellKind,
 };
 use rift_protocol::read::TextRange;
 use rift_syntax::{
@@ -61,7 +61,30 @@ pub fn collect_documentation_incremental(
         .map(|input| input.source().clone())
         .collect::<Vec<_>>();
     let resolution_cache = resolve_collected(previous, declarations, &records, &mut output)?;
-    build_collection(sources, output, cache, resolution_cache)
+    let collection = build_collection(sources, output, cache, resolution_cache)?;
+    record_fields_omitted(previous, &collection);
+    Ok(collection)
+}
+
+/// Records how many fields the collection left out, when that differs from the prior build.
+fn record_fields_omitted(
+    previous: Option<&DocumentationCollection>,
+    collection: &DocumentationCollection,
+) {
+    let omitted = collection.index().coverage.fields_omitted;
+    let before = previous
+        .map(|previous| previous.index().coverage.fields_omitted)
+        .unwrap_or_default();
+    if omitted == before {
+        return;
+    }
+    rift_tracing::warn!(
+        component = "documentation",
+        operation = "documentation.fields_omitted",
+        limit_exceeded = omitted.limit_exceeded,
+        omitted_range = omitted.omitted_range,
+        "documentation fields left out of their sources"
+    );
 }
 
 /// One source's extraction key and facts: reused from `previous` when the key matches,
@@ -210,6 +233,7 @@ fn build_collection(
                 parsed: selected - output.omitted,
                 omitted: output.omitted,
                 truncated: 0,
+                fields_omitted: output.fields_omitted,
             },
             warnings: output.warnings,
         },
@@ -233,6 +257,7 @@ pub(super) struct Collected<B = CollectedBlock> {
     fragments: Vec<super::DocumentationFragment>,
     candidates: Vec<DocumentationReferenceCandidate>,
     warnings: Vec<DocumentationWarning>,
+    fields_omitted: DocumentationFieldsOmitted,
     omitted: u32,
 }
 
@@ -248,6 +273,7 @@ impl<B> Default for Collected<B> {
             fragments: Vec::new(),
             candidates: Vec::new(),
             warnings: Vec::new(),
+            fields_omitted: DocumentationFieldsOmitted::default(),
             omitted: 0,
         }
     }
@@ -294,6 +320,7 @@ pub(super) struct ExtractionCache {
     warning_count: usize,
 }
 
+mod admission;
 mod retained_size;
 
 #[derive(Debug)]
@@ -516,6 +543,7 @@ fn extract_source_facts(
         facts.omitted = 1;
         warn(input, &mut facts, kind, 1);
     }
+    admission::leave_out_refused_fields(input, &mut facts)?;
     Ok(Arc::new(facts))
 }
 
@@ -561,6 +589,14 @@ fn merge_source(
         warn(input, output, warning.kind, warning.count);
     }
     output.omitted = output.omitted.saturating_add(facts.omitted);
+    output.fields_omitted.limit_exceeded = output
+        .fields_omitted
+        .limit_exceeded
+        .saturating_add(facts.fields_omitted.limit_exceeded);
+    output.fields_omitted.omitted_range = output
+        .fields_omitted
+        .omitted_range
+        .saturating_add(facts.fields_omitted.omitted_range);
     true
 }
 

@@ -421,6 +421,21 @@ pub struct DocumentationCoverage {
     pub omitted: u32,
     /// Sources whose output reached a collection bound.
     pub truncated: u32,
+    /// Fields left out of parsed sources, counted apart from the warnings a collection
+    /// retains.
+    pub fields_omitted: DocumentationFieldsOmitted,
+}
+
+/// Headings, languages, links, and reference spellings left out of parsed sources, by
+/// reason. A heading counts once per source.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationFieldsOmitted {
+    /// Fields an accepted text or heading bound cannot hold.
+    pub limit_exceeded: u64,
+    /// Fields their block cannot place: a range outside the block, a repeated link range,
+    /// or a heading that is blank or out of level order.
+    pub omitted_range: u64,
 }
 
 /// The collection step reporting incomplete documentation.
@@ -735,9 +750,48 @@ impl DocumentationConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{DOCUMENTATION_PATTERNS_MAX, DocumentationDigest};
+    use super::{
+        DOCUMENTATION_PATTERNS_MAX, DocumentationCoverage, DocumentationDigest,
+        DocumentationFieldsOmitted,
+    };
     use crate::configuration::{ConfigurationViolation, WorkspaceConfiguration};
     use crate::read::PathPattern;
+
+    #[test]
+    fn coverage_always_states_left_out_fields() {
+        let coverage = DocumentationCoverage {
+            selected: 1,
+            parsed: 1,
+            ..DocumentationCoverage::default()
+        };
+        let mut written = serde_json::to_value(&coverage).expect("coverage");
+        assert_eq!(
+            written["fields_omitted"],
+            serde_json::json!({"limit_exceeded": 0, "omitted_range": 0})
+        );
+        let read: DocumentationCoverage =
+            serde_json::from_value(written.clone()).expect("stated zero counts");
+        assert_eq!(read, coverage);
+
+        let left_out = DocumentationCoverage {
+            fields_omitted: DocumentationFieldsOmitted {
+                limit_exceeded: 1,
+                omitted_range: 2,
+            },
+            ..coverage
+        };
+        let read: DocumentationCoverage =
+            serde_json::from_value(serde_json::to_value(&left_out).expect("coverage"))
+                .expect("stated counts");
+        assert_eq!(read, left_out);
+
+        written
+            .as_object_mut()
+            .expect("coverage object")
+            .remove("fields_omitted");
+        serde_json::from_value::<DocumentationCoverage>(written)
+            .expect_err("coverage without left out fields");
+    }
 
     #[test]
     fn documentation_digest_schema_requires_full_sha256() {

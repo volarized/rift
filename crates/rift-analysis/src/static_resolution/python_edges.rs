@@ -14,9 +14,11 @@ pub(super) use classes::{ClassOrders, MemberOwners};
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::read::SymbolKind;
-use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
+use rift_syntax::{
+    ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol,
+};
 
-use super::{File, Index, StaticOccurrence, Target, Work};
+use super::{Binding, File, Index, StaticOccurrence, Target, Work};
 use crate::analyzer::namespace::python::python_import_target;
 
 pub(super) struct EdgePythonModules(BTreeMap<String, Option<String>>);
@@ -728,92 +730,191 @@ fn edge_python_binding<'source>(
     position: u64,
     work: &mut Work,
 ) -> Option<&'source StaticBinding> {
-    if file.blocked(position, work) {
-        return None;
+    match index.python_binding(file, name, position, work) {
+        Binding::Found(binding) => Some(binding),
+        Binding::Missing | Binding::Blocked => None,
     }
-    let callable = file.enclosing_callable(ByteRange {
-        start: position,
-        end: position.saturating_add(1),
-    });
-    let in_body = callable.is_some_and(|callable| {
-        callable
-            .symbol
-            .body_range
-            .is_some_and(|body| body.contains(position))
-    });
-    let around = ByteRange {
-        start: position,
-        end: position.checked_add(1)?,
-    };
-    let bindings = &file.bindings_around(name, around).collect::<Vec<_>>();
-    let mut excluded = BTreeSet::new();
-    let mut global = false;
-    let mut nonlocal = false;
-    loop {
-        let mut best: Option<Scope> = None;
-        for &binding in bindings {
-            if !work.charge() {
-                return None;
-            }
-            let scope = Scope::of(file, binding);
-            if !scope.range.contains(position)
-                || excluded.contains(&scope)
-                || (global && !scope.module)
-                || (nonlocal && scope.module)
-                || (in_body && !scope.module && file.class_scopes.contains(&scope.range))
-                || (!scope.module && file.python_evaluated_outside(scope.range, position))
-            {
-                continue;
-            }
-            if best.is_none_or(|best| best.holds(scope)) {
-                best = Some(scope);
-            }
+}
+
+/// The scope one position reads a name in.
+struct NameScope {
+    scope: Scope,
+    /// Whether a scope that declares the name `global` or `nonlocal` binds it as well.
+    rebound: bool,
+}
+
+enum ScopeLookup {
+    Found(NameScope),
+    /// No scope the read reaches binds the name.
+    Missing,
+    /// The work ended or the declarations of the name conflict.
+    Blocked,
+}
+
+impl<'source> Index<'source> {
+    /// The binding a read of `name` at `position` selects; missing when no scope the read
+    /// reaches binds the name.
+    pub(super) fn python_binding(
+        &self,
+        file: &File<'source>,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> Binding<'source> {
+        if file.blocked(position, work) {
+            return Binding::Blocked;
         }
-        let scope = best?;
-        let mut declaration = None;
-        let mut selected = false;
-        for &binding in bindings {
-            if !work.charge() {
-                return None;
-            }
-            if Scope::of(file, binding) != scope {
-                continue;
-            }
-            match binding.kind {
-                StaticBindingKind::PythonGlobal => declaration = Some(true),
-                StaticBindingKind::PythonNonlocal => declaration = Some(false),
-                _ => {
-                    selected = true;
+        let Some(end) = position.checked_add(1) else {
+            return Binding::Blocked;
+        };
+        let around = ByteRange {
+            start: position,
+            end,
+        };
+        let bindings = &file.bindings_around(name, around).collect::<Vec<_>>();
+        let selected = match file.python_scope(bindings, position, work) {
+            ScopeLookup::Found(selected) => selected,
+            ScopeLookup::Missing => return Binding::Missing,
+            ScopeLookup::Blocked => return Binding::Blocked,
+        };
+        (!selected.rebound)
+            .then(|| {
+                self.python_scope_binding(file, name, selected.scope, bindings, position, work)
+            })
+            .flatten()
+            .map_or(Binding::Blocked, Binding::Found)
+    }
+
+    /// The binding of `scope` that a read at `position` selects.
+    fn python_scope_binding(
+        &self,
+        file: &File<'source>,
+        name: &str,
+        scope: Scope,
+        bindings: &[&'source StaticBinding],
+        position: u64,
+        work: &mut Work,
+    ) -> Option<&'source StaticBinding> {
+        let later = later_bindings(file, bindings, scope, position, work)?;
+        let candidates = bindings.iter().copied().filter(|binding| {
+            Scope::of(file, binding) == scope && !later.contains(&binding.name.start)
+        });
+        let selected = match self.python_binding_group(file, candidates.clone(), work) {
+            Some(selected) => selected,
+            None => self
+                .python_receiver_join(file, scope, candidates.clone(), work)
+                .or_else(|| {
+                    self.python_guarded_receiver(file, name, scope, position, candidates, work)
+                })?,
+        };
+        (selected.available_from <= position
+            && file.python_guard_available(selected, position, work))
+        .then_some(selected)
+    }
+}
+
+impl File<'_> {
+    /// The scope a read at `position` finds a name of `bindings` in.
+    fn python_scope(
+        &self,
+        bindings: &[&StaticBinding],
+        position: u64,
+        work: &mut Work,
+    ) -> ScopeLookup {
+        let mut excluded = BTreeSet::new();
+        let mut global = false;
+        let mut nonlocal = false;
+        let mut rebound = false;
+        loop {
+            let mut best: Option<Scope> = None;
+            for &binding in bindings {
+                if !work.charge() {
+                    return ScopeLookup::Blocked;
+                }
+                let scope = Scope::of(self, binding);
+                if !scope.range.contains(position)
+                    || excluded.contains(&scope)
+                    || (global && !scope.module)
+                    || (nonlocal && scope.module)
+                    || (!scope.module
+                        && (self.python_evaluated_outside(scope.range, position)
+                            || (self.class_scopes.contains(&scope.range)
+                                && self.python_class_hidden(scope.range, position))))
+                {
+                    continue;
+                }
+                if best.is_none_or(|best| best.holds(scope)) {
+                    best = Some(scope);
                 }
             }
-        }
-        if let Some(is_global) = declaration {
-            if selected || global || (nonlocal && is_global) {
-                return None;
+            let Some(scope) = best else {
+                return ScopeLookup::Missing;
+            };
+            let mut declaration = None;
+            let mut selected = false;
+            for &binding in bindings {
+                if !work.charge() {
+                    return ScopeLookup::Blocked;
+                }
+                if Scope::of(self, binding) != scope {
+                    continue;
+                }
+                match binding.kind {
+                    StaticBindingKind::PythonGlobal => declaration = Some(true),
+                    StaticBindingKind::PythonNonlocal => declaration = Some(false),
+                    _ => {
+                        selected = true;
+                    }
+                }
             }
+            let Some(is_global) = declaration else {
+                return ScopeLookup::Found(NameScope { scope, rebound });
+            };
+            if global || (nonlocal && is_global) {
+                return ScopeLookup::Blocked;
+            }
+            rebound |= selected;
             excluded.insert(scope);
             global = is_global;
             nonlocal = !is_global;
-        } else {
-            let later = later_bindings(file, bindings, scope, position, callable, in_body, work)?;
-            let candidates = bindings.iter().copied().filter(|binding| {
-                Scope::of(file, binding) == scope && !later.contains(&binding.name.start)
-            });
-            let selected = match index.python_binding_group(file, candidates.clone(), work) {
-                Some(selected) => selected,
-                None => index
-                    .python_receiver_join(file, scope, candidates.clone(), work)
-                    .or_else(|| {
-                        index.python_guarded_receiver(file, name, scope, position, candidates, work)
-                    })?,
-            };
-            if selected.available_from > position {
-                return None;
-            }
-            return file
-                .python_guard_available(selected, position, work)
-                .then_some(selected);
         }
+    }
+
+    /// Whether the code at `position` runs in a function, class, lambda, comprehension or
+    /// generator expression inside `class`, whose names it does not read.
+    fn python_class_hidden(&self, class: ByteRange, position: u64) -> bool {
+        let end = position.saturating_add(1);
+        let runs = |callable: &&SyntaxSymbol| {
+            class.encloses(callable.item_range)
+                && callable
+                    .body_range
+                    .is_some_and(|body| body.contains(position))
+        };
+        let callable = match self.callables.containing(position, end) {
+            Some(mut around) => around.any(runs),
+            None => self.callables.resolve(position, end).is_some_and(runs),
+        };
+        let nested = |inner: &&SyntaxSymbol| {
+            let inner = inner.item_range;
+            class != inner
+                && class.encloses(inner)
+                && inner.contains(position)
+                && !self.python_evaluated_outside(inner, position)
+        };
+        callable
+            || match self.classes.containing(position, end) {
+                Some(mut around) => around.any(nested),
+                None => self.classes.resolve(position, end).is_some_and(nested),
+            }
+            || self
+                .python_expressions
+                .containing(position, end)
+                .into_iter()
+                .flatten()
+                .any(|expression| {
+                    class.encloses(*expression)
+                        && !self.python_evaluated_outside(*expression, position)
+                })
     }
 }
 
@@ -827,20 +928,23 @@ fn later_bindings(
     bindings: &[&StaticBinding],
     scope: Scope,
     position: u64,
-    callable: Option<Target<'_>>,
-    in_body: bool,
     work: &mut Work,
 ) -> Option<BTreeSet<u64>> {
     let mut later = BTreeSet::new();
+    let end = position.saturating_add(1);
+    let callable = file.enclosing_callable(ByteRange {
+        start: position,
+        end,
+    });
+    let in_body = callable.is_some_and(|callable| {
+        let body = callable.symbol.body_range;
+        body.is_some_and(|body| body.contains(position))
+    });
     let ordered = ((in_body
         && !scope.module
         && callable.is_some_and(|callable| callable.symbol.item_range == scope.range))
         || (scope.module && !in_body && !file.in_python_annotation(position)))
-        && !file
-            .facts
-            .expression_scopes()
-            .iter()
-            .any(|range| range.contains(position));
+        && file.python_expressions.resolve(position, end).is_none();
     if !ordered {
         return Some(later);
     }
@@ -861,12 +965,11 @@ fn later_bindings(
 }
 
 impl File<'_> {
-    /// Whether `position` is in the first iterable of the comprehension at `scope`, which the
-    /// enclosing scope evaluates.
+    /// Whether `position` is in the part of `scope` that the enclosing scope evaluates.
     fn python_evaluated_outside(&self, scope: ByteRange, position: u64) -> bool {
-        self.python_first_iterables
+        self.python_evaluated_outside
             .get(&scope)
-            .is_some_and(|iterable| iterable.contains(position))
+            .is_some_and(|part| part.contains(position))
     }
 
     fn python_guard_available(

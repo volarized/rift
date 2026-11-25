@@ -40,14 +40,6 @@ fn configured_collection(
     configuration: &rift_protocol::documentation::DocumentationConfiguration,
     previous: Option<&DocumentationCollection>,
 ) -> DocumentationCollection {
-    configured_collection_result(text, configuration, previous).expect("collection")
-}
-
-fn configured_collection_result(
-    text: &str,
-    configuration: &rift_protocol::documentation::DocumentationConfiguration,
-    previous: Option<&DocumentationCollection>,
-) -> Result<DocumentationCollection, rift_error::RiftError> {
     let limits = DocumentationLimits::from_configuration(configuration).expect("accepted bounds");
     let input = DocumentationInput::with_limits(
         source("guide.md", text, DocumentationSourceFormat::Markdown),
@@ -56,7 +48,20 @@ fn configured_collection_result(
     )
     .expect("accepted source");
     let sources = DocumentationSourceSet::with_limits(vec![input], &limits).expect("source set");
-    collect_documentation_incremental(previous, &sources, &[])
+    collect_documentation_incremental(previous, &sources, &[]).expect("collection")
+}
+
+/// Fields the collection left out because a bound cannot hold them.
+fn fields_past_bound(collection: &DocumentationCollection) -> u64 {
+    use rift_protocol::documentation::DocumentationWarningKind;
+    let warnings = &collection.index().warnings;
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.kind == DocumentationWarningKind::LimitExceeded),
+        "{warnings:#?}"
+    );
+    warnings.iter().map(|warning| warning.count).sum()
 }
 
 #[test]
@@ -83,12 +88,11 @@ fn documentation_text_bounds_can_raise_above_default() {
     let name = "x".repeat(rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize + 1);
     let text = format!("# {name}\n");
     let configuration = rift_protocol::documentation::DocumentationConfiguration::default();
-    let error = configured_collection_result(&text, &configuration, None)
-        .expect_err("default heading text bound");
-    assert_eq!(
-        error.slug().as_str(),
-        "rift.analysis.documentation_order_invalid"
-    );
+    let default = configured_collection(&text, &configuration, None);
+    assert_eq!(fields_past_bound(&default), 1);
+    assert_eq!(default.index().coverage.omitted, 0);
+    assert_eq!(default.index().blocks.len(), 1);
+    assert!(default.index().blocks[0].heading_path.is_empty());
     let raised = rift_protocol::documentation::DocumentationConfiguration {
         max_text: rift_protocol::configuration::ByteSize::from_bytes(name.len() as u64),
         ..configuration
@@ -101,17 +105,16 @@ fn documentation_text_bounds_can_raise_above_default() {
 }
 
 #[test]
-fn documentation_language_text_preserves_default_and_accepts_raising() {
+fn documentation_language_text_past_default_is_left_out_and_accepts_raising() {
     let language =
         "x".repeat(rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize + 1);
     let text = format!("```{language}\nbody\n```\n");
     let configuration = rift_protocol::documentation::DocumentationConfiguration::default();
-    let error = configured_collection_result(&text, &configuration, None)
-        .expect_err("default language text bound");
-    assert_eq!(
-        error.slug().as_str(),
-        "rift.analysis.documentation_format_invalid"
-    );
+    let default = configured_collection(&text, &configuration, None);
+    assert_eq!(fields_past_bound(&default), 1);
+    assert_eq!(default.index().coverage.omitted, 0);
+    assert_eq!(default.index().blocks.len(), 1);
+    assert_eq!(default.index().blocks[0].language, None);
     let raised = rift_protocol::documentation::DocumentationConfiguration {
         max_text: rift_protocol::configuration::ByteSize::from_bytes(language.len() as u64),
         ..configuration
@@ -127,19 +130,18 @@ fn documentation_language_text_preserves_default_and_accepts_raising() {
 }
 
 #[test]
-fn documentation_link_text_preserves_default_refusal_and_accepts_raising() {
+fn documentation_link_text_past_default_is_left_out_and_accepts_raising() {
     let authored = format!(
         "https://example.test/{}",
         "x".repeat(rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize)
     );
     let text = format!("[guide]({authored})\n");
     let configuration = rift_protocol::documentation::DocumentationConfiguration::default();
-    let error = configured_collection_result(&text, &configuration, None)
-        .expect_err("default link text bound");
-    assert_eq!(
-        error.slug().as_str(),
-        "rift.analysis.documentation_range_invalid"
-    );
+    let default = configured_collection(&text, &configuration, None);
+    assert_eq!(fields_past_bound(&default), 1);
+    assert_eq!(default.index().coverage.omitted, 0);
+    assert_eq!(default.index().blocks.len(), 1);
+    assert!(default.index().links.is_empty());
     let raised = rift_protocol::documentation::DocumentationConfiguration {
         max_text: rift_protocol::configuration::ByteSize::from_bytes(authored.len() as u64),
         ..configuration

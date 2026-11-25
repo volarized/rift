@@ -18,6 +18,8 @@ use crate::NamespaceInput;
 
 mod names;
 
+pub(super) use names::{RUST_RUNTIME_CRATES, rust_prelude};
+
 const CARGO_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 const NPM_SECTIONS: [&str; 4] = [
     "dependencies",
@@ -610,7 +612,7 @@ impl<'source> Index<'source> {
         if file.javascript_reassigned(head, None) {
             return None;
         }
-        let mut path = match file.binding(head, position, |_| true, work) {
+        let mut path = match self.python_binding(file, head, position, work) {
             Binding::Found(binding) => python_binding_path(file, binding, work)?,
             Binding::Missing
                 if names::PYTHON_BUILTINS.binary_search(&head.as_str()).is_ok()

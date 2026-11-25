@@ -2,6 +2,9 @@
 
 mod guards;
 mod lists;
+mod names;
+
+pub(super) use names::Names;
 
 use std::sync::OnceLock;
 
@@ -62,7 +65,9 @@ pub(super) struct EdgePythonKinds {
     left: u16,
     right: u16,
     guards: guards::TypeGuards,
+    names: names::NameKinds,
     return_type: u16,
+    parameter_list: u16,
     loops: [u16; 2],
     /// Compound statements and clauses a class body may define methods under.
     conditional: [u16; 6],
@@ -135,7 +140,9 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             left: field("left"),
             right: field("right"),
             guards: guards::TypeGuards::new(&grammar),
+            names: names::NameKinds::new(&grammar),
             return_type: field("return_type"),
+            parameter_list: field("parameters"),
             loops: [id("for_statement"), id("while_statement")],
             conditional: [
                 id("if_statement"),
@@ -156,6 +163,7 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         source: &str,
         facts: &mut StaticFactsParts,
+        names: &mut Names,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let id = syntax_element.kind_id();
@@ -164,6 +172,7 @@ impl EdgePythonKinds {
         } else if self.scopes[3..].contains(&id) {
             facts.expression_scopes.push(byte_range(syntax_element)?);
             self.edge_first_iterable(syntax_element, facts)?;
+            self.edge_evaluated_outside(syntax_element, facts)?;
         }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
@@ -187,6 +196,7 @@ impl EdgePythonKinds {
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
             self.edge_type_parameters(syntax_element, facts)?;
+            self.edge_evaluated_outside(syntax_element, facts)?;
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
@@ -199,6 +209,8 @@ impl EdgePythonKinds {
             if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
                 self.edge_shadow(name, visited, facts)?;
             }
+        } else if id == self.names.type_alias {
+            self.edge_type_alias(visited, facts)?;
         } else if (id == self.global || id == self.nonlocal)
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
@@ -241,6 +253,7 @@ impl EdgePythonKinds {
             }
         }
         self.guards.record(visited, source, facts)?;
+        self.edge_name_target(visited, facts, names)?;
         self.edge_reference(visited, source, facts)?;
         Ok(())
     }
@@ -283,8 +296,28 @@ impl EdgePythonKinds {
             .find(|child| child.kind_id() == self.assignment[3]);
         if let Some(iterable) = clause.and_then(|clause| clause.child_by_field_id(self.right)) {
             facts
-                .first_iterables
+                .evaluated_outside
                 .push((byte_range(comprehension)?, byte_range(iterable)?));
+        }
+        Ok(())
+    }
+
+    /// The parameters and return annotation of a function or lambda, and the arguments of a
+    /// class, which the enclosing scope evaluates.
+    fn edge_evaluated_outside(
+        &self,
+        scope: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let part = |field| scope.child_by_field_id(field).map(byte_range).transpose();
+        if let Some(arguments) = part(self.superclasses)? {
+            facts
+                .evaluated_outside
+                .push((byte_range(scope)?, arguments));
+        } else if let Some(parameters) = part(self.parameter_list)? {
+            let end = part(self.return_type)?.unwrap_or(parameters).end;
+            let outside = ByteRange { end, ..parameters };
+            facts.evaluated_outside.push((byte_range(scope)?, outside));
         }
         Ok(())
     }
@@ -296,6 +329,12 @@ impl EdgePythonKinds {
     ) -> Result<(), RiftError> {
         let Some(parameters) = definition.child_by_field_name("type_parameters") else {
             return Ok(());
+        };
+        // Python reads these names in a scope of their own around the definition's, which
+        // holds its parameters, annotations and arguments too.
+        let scope = ByteRange {
+            end: byte_range(definition)?.end,
+            ..byte_range(parameters)?
         };
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
@@ -313,12 +352,12 @@ impl EdgePythonKinds {
                 candidate = element.named_child(0);
             }
             if let Some(name) = name {
-                facts.bindings.push(self.scoped_binding(
-                    name,
-                    definition,
-                    byte_range(definition)?.start,
-                    StaticBindingKind::Shadow,
-                )?);
+                facts.bindings.push(StaticBinding {
+                    name: byte_range(name)?,
+                    scope,
+                    available_from: scope.start,
+                    kind: StaticBindingKind::Shadow,
+                });
             } else {
                 facts.unsupported_bindings.push(byte_range(definition)?);
             }
@@ -465,28 +504,30 @@ impl EdgePythonKinds {
                     .child_by_field_id(self.name.get())
                     .or_else(|| parameter.named_child(0))
             };
+            // An annotated `*args` or `**kwargs` holds its name under the splat, and its
+            // annotation states each element.
+            let splat = name.filter(|name| self.patterns[3..].contains(&name.kind_id()));
+            let name = splat.map_or(name, |splat| splat.named_child(0));
+            let collects = splat.is_some() || self.patterns.contains(&parameter.kind_id());
             if let Some(name) = name.filter(|name| name.kind_id() == self.identifier) {
                 let annotated = parameter
                     .child_by_field_id(self.type_field)
+                    .filter(|_| !collects)
                     .map(byte_range)
                     .transpose()?;
-                facts.bindings.push(
-                    self.scoped_binding(
-                        name,
-                        scope,
-                        self.scope_range(scope)?.start,
-                        match class_name
-                            .filter(|_| first && !self.patterns.contains(&parameter.kind_id()))
-                        {
-                            Some(class_name) => StaticBindingKind::PythonReceiver {
-                                class_name: byte_range(class_name)?,
-                            },
-                            None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
-                                StaticBindingKind::PythonAnnotation { annotation }
-                            }),
+                facts.bindings.push(self.scoped_binding(
+                    name,
+                    scope,
+                    self.scope_range(scope)?.start,
+                    match class_name.filter(|_| first && !collects) {
+                        Some(class_name) => StaticBindingKind::PythonReceiver {
+                            class_name: byte_range(class_name)?,
                         },
-                    )?,
-                );
+                        None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
+                            StaticBindingKind::PythonAnnotation { annotation }
+                        }),
+                    },
+                )?);
             }
             first = false;
         }
@@ -596,7 +637,7 @@ impl EdgePythonKinds {
         if annotation {
             facts.references.push(StaticReference {
                 target: range,
-                role: ReferenceRole::Type,
+                role: self.annotation_role(parent),
             });
         } else if id == self.attribute {
             let mut target_element = element;
@@ -635,6 +676,16 @@ impl EdgePythonKinds {
             }
         }
         Ok(())
+    }
+
+    /// The role of one name of a written type: `a` and `a.b` of `a.b.C` are read to reach
+    /// the type that `C` names.
+    fn annotation_role(&self, parent: Option<Node<'_>>) -> rift_core::ReferenceRole {
+        if parent.is_some_and(|parent| parent.kind_id() == self.attribute) {
+            rift_core::ReferenceRole::Read
+        } else {
+            rift_core::ReferenceRole::Type
+        }
     }
 
     fn edge_shadow(
