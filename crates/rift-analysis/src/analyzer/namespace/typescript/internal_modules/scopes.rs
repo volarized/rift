@@ -168,9 +168,7 @@ impl<'source> FileScopes<'source> {
         }
         let scope = self.lexical(symbol, file.source);
         let exported = symbol.kinds.contains(&SymbolKind::Public)
-            || [".d.ts", ".d.mts", ".d.cts"]
-                .iter()
-                .any(|extension| file.path.as_str().ends_with(extension));
+            || crate::static_resolution::is_declaration_file(file.path.as_str());
         if exported && self.namespaces.contains(&(container, scope.end)) {
             return Scope::Static;
         }

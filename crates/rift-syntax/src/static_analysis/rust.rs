@@ -10,7 +10,14 @@ use super::{
     StaticBindingKind, StaticCallee, StaticFactsParts, StaticInherentImpl, binding, call,
     enclosing, field, identifier, kind,
 };
+use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
+
+/// Most names one unread place can bind; a place with more costs its scope.
+const UNREAD_NAMES_MAX: usize = 64;
+
+/// Most unread places of one file that cost less than their scope.
+const UNREAD_PLACES_MAX: usize = 1024;
 
 pub(super) struct Kinds {
     identifier: u16,
@@ -235,16 +242,27 @@ impl Kinds {
         Ok(())
     }
 
+    /// Records a place the parser could not read.
+    ///
+    /// The place costs the calls of the smallest syntax element the parser closed around it,
+    /// and every name written in the unread text: it can bind one in the enclosing scope. The
+    /// declarations and statements beside that element keep their structure when the unread
+    /// text closes every delimiter it opens. A place that stands among the statements of a
+    /// file or block, or that leaves a delimiter open, can tear its neighbors apart and costs
+    /// the whole scope.
     pub(super) fn record_error(
         &self,
         visited: Visited<'_, '_>,
+        source: &str,
+        unread: &mut Vec<ByteRange>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
         let mut ancestor = visited.parent();
         let mut scope = None;
         while let Some(current) = ancestor {
             let element = current.syntax_element();
-            if element.kind_id() == self.macro_definition {
+            if element.kind_id() == self.macro_definition || element.is_error() {
                 return Ok(());
             }
             if scope.is_none() && self.scopes.contains(&element.kind_id()) {
@@ -252,10 +270,83 @@ impl Kinds {
             }
             ancestor = current.parent();
         }
-        if let Some(scope) = scope {
+        let Some((scope, parent)) = scope.zip(visited.parent().map(Visited::syntax_element)) else {
+            return Ok(());
+        };
+        let text = source.get(element.byte_range()).unwrap_or_default();
+        // Only a declaration list admits nothing but whole items around the place.
+        let place = if !self.scopes.contains(&parent.kind_id()) {
+            Some(parent)
+        } else if parent.kind_id() == self.scopes[2] && element.is_error() {
+            Some(element)
+        } else {
+            None
+        };
+        let names = identifiers(text)
+            .take(UNREAD_NAMES_MAX + 1)
+            .collect::<Vec<_>>();
+        let Some(place) = place.filter(|place| {
+            !place.byte_range().is_empty()
+                && closed(text)
+                && names.len() <= UNREAD_NAMES_MAX
+                && unread.len() < UNREAD_PLACES_MAX
+        }) else {
             facts.unsupported_bindings.push(byte_range(scope)?);
+            return Ok(());
+        };
+        let place = byte_range(place)?;
+        facts.unsupported_bindings.push(place);
+        unread.push(place);
+        let scope_start = byte_range(scope)?.start;
+        let start = byte_range(element)?.start;
+        for name in names {
+            let name = ByteRange {
+                start: start + name.start as u64,
+                end: start + name.end as u64,
+            };
+            // An item is in its whole scope, a pattern in what follows it.
+            for available_from in [scope_start, place.end] {
+                facts.bindings.push(super::StaticBinding {
+                    name,
+                    scope: byte_range(scope)?,
+                    available_from,
+                    kind: StaticBindingKind::Shadow,
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Takes the type of every binding away whose own text holds an unread place or whose
+    /// initializer starts in one: the parser read something else there.
+    pub(super) fn close_unread(mut unread: Vec<ByteRange>, facts: &mut StaticFactsParts) {
+        if unread.is_empty() {
+            return;
+        }
+        unread.sort_unstable();
+        // Every place overlapping an earlier one extends it, so a search by start finds it.
+        let mut places: Vec<ByteRange> = Vec::with_capacity(unread.len());
+        for place in unread {
+            match places.last_mut() {
+                Some(last) if place.start < last.end => last.end = last.end.max(place.end),
+                _ => places.push(place),
+            }
+        }
+        let holds = |position: u64| {
+            let next = places.partition_point(|place| place.start <= position);
+            next.checked_sub(1)
+                .is_some_and(|index| position < places[index].end)
+        };
+        for binding in &mut facts.bindings {
+            let typed = match binding.kind {
+                StaticBindingKind::RustValue { initializer } => holds(initializer.start),
+                StaticBindingKind::RustReceiver { .. } => false,
+                _ => continue,
+            };
+            if typed || holds(binding.name.start) {
+                binding.kind = StaticBindingKind::Shadow;
+            }
+        }
     }
 
     fn record_attribute(
@@ -872,4 +963,34 @@ impl Kinds {
         }
         Ok(())
     }
+}
+
+/// Whether `text` closes every delimiter it opens and none it does not.
+fn closed(text: &str) -> bool {
+    let mut open = Vec::new();
+    for character in text.chars() {
+        match character {
+            '(' => open.push(')'),
+            '[' => open.push(']'),
+            '{' => open.push('}'),
+            ')' | ']' | '}' if open.pop() != Some(character) => return false,
+            _ => {}
+        }
+    }
+    open.is_empty()
+}
+
+/// The identifiers written in `text`.
+fn identifiers(text: &str) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let part = |character: char| character.is_alphanumeric() || character == '_';
+    text.split(move |character| !part(character))
+        .filter(|word| {
+            word.chars()
+                .next()
+                .is_some_and(|first| first.is_alphabetic() || first == '_')
+        })
+        .map(move |word| {
+            let start = word.as_ptr() as usize - text.as_ptr() as usize;
+            start..start + word.len()
+        })
 }
