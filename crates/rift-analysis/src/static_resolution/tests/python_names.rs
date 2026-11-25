@@ -283,3 +283,107 @@ fn test_python_names_without_one_declaration_are_counted() {
 fn test_python_locals_below_a_star_import_are_not_counted() {
     assert_refused(&[("from x import *\ndef run(f): return f\n", 0)]);
 }
+
+/// The reads of `main.py` beside the modules of a package, with the external ones last, and
+/// the count of reads left without a target.
+fn imported(body: &str) -> (Vec<String>, u64) {
+    let (mut found, result) = accesses(&[
+        ("main.py", body),
+        (
+            "pkg/__init__.py",
+            "from .leaf import g as h\nfrom . import leaf\n",
+        ),
+        (
+            "pkg/leaf.py",
+            "def g(): pass\nclass K: pass\nV = 1\nif V: V = 2\ntry: from .other import both\nexcept ImportError: from .more import both\ntry: from .other import two\nexcept ImportError: from .more import two\n",
+        ),
+        (
+            "pkg/other.py",
+            "from .base import both\nfrom .base import one as two\n",
+        ),
+        ("pkg/more.py", "from .base import both, two\n"),
+        ("pkg/base.py", "both = one = two = 1\n"),
+        ("pkg/circle.py", "from .ring import z\n"),
+        ("pkg/ring.py", "from .circle import z\n"),
+    ]);
+    found.extend(
+        result
+            .external
+            .iter()
+            .filter(|external| external.role == ReferenceRole::Read)
+            .map(|external| {
+                external
+                    .target
+                    .as_str()
+                    .rsplit("/python/")
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+    );
+    let refused = result.omitted.get(&EdgeKind::Reads).copied();
+    (found, refused.unwrap_or_default())
+}
+
+#[test]
+fn test_python_imported_names_read_the_declaration_the_import_ends_at() {
+    for (body, expected, refused) in [
+        ("from pkg.leaf import g\nx = g\n", "1  reads pkg/leaf/g", 0),
+        ("from pkg import h\nx = h\n", "1  reads pkg/leaf/g", 0),
+        (
+            "from pkg.leaf import K as L\ndef f(): return L\n",
+            "1 main/f reads pkg/leaf/K",
+            0,
+        ),
+        ("from pkg.leaf import V\nx = V\n", "1  reads pkg/leaf/V", 0),
+        ("from pkg import leaf\nx = leaf\n", "1  reads pkg/leaf", 0),
+        ("import pkg.leaf as m\nx = m\n", "1  reads pkg/leaf", 0),
+        ("import pkg.leaf\nx = pkg\n", "1  reads pkg", 0),
+        (
+            "def f():\n    from pkg.leaf import g\n    return g\n",
+            "2 main/f reads pkg/leaf/g",
+            0,
+        ),
+        (
+            "try: from pkg.leaf import g\nexcept ImportError: from pkg import h as g\nx = g\n",
+            "2  reads pkg/leaf/g",
+            0,
+        ),
+        (
+            "from pkg.leaf import both\nx = both\n",
+            "1  reads pkg/base/both",
+            0,
+        ),
+        ("import os\nx = os\n", "os", 0),
+        (
+            "from os import path as p\ndef f(): return p\n",
+            "os/path",
+            0,
+        ),
+        ("from pkg.leaf import two\nx = two\n", "", 1),
+        ("from pkg.circle import z\nx = z\n", "", 1),
+        ("from pkg.leaf import missing\nx = missing\n", "", 1),
+        (
+            "try: from pkg.leaf import g\nexcept ImportError: g = None\nx = g\n",
+            "",
+            1,
+        ),
+        (
+            "try: from pkg.leaf import g\nexcept ImportError: from pkg.leaf import K as g\nx = g\n",
+            "",
+            1,
+        ),
+        ("from pkg.leaf import g\nfor g in (): pass\nx = g\n", "", 1),
+        (
+            "import os\ndef f():\n    global os\n    os = None\ndef g(): return os\n",
+            "",
+            1,
+        ),
+        ("import os\ndef f(os): return os\n", "", 0),
+        ("def f():\n    import os\ndef g(): return os\n", "", 0),
+    ] {
+        let (found, omitted) = imported(body);
+        assert_eq!(found.join(" "), expected, "{body}");
+        assert_eq!(omitted, refused, "{body}");
+    }
+}
