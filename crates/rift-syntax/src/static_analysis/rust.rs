@@ -50,6 +50,7 @@ pub(super) struct Kinds {
     inner_attribute: u16,
     impl_item: u16,
     trait_item: u16,
+    type_item: u16,
     type_parameter: u16,
     where_predicate: u16,
     non_method_bounds: [u16; 2],
@@ -121,6 +122,7 @@ pub(super) fn kinds() -> &'static Kinds {
             inner_attribute: id("inner_attribute_item"),
             impl_item: id("impl_item"),
             trait_item: id("trait_item"),
+            type_item: id("type_item"),
             type_parameter: id("type_parameter"),
             where_predicate: id("where_predicate"),
             non_method_bounds: [id("lifetime"), id("removed_trait_bound")],
@@ -224,6 +226,16 @@ impl Kinds {
             facts.unsupported_bindings.push(byte_range(syntax_element)?);
         } else if id == self.impl_item {
             self.record_impl(syntax_element, facts)?;
+        } else if id == self.type_item {
+            if let Some(name) = syntax_element.child_by_field_id(self.name)
+                && let Some(value) = syntax_element.child_by_field_id(self.value_type)
+                && !name.is_missing()
+                && !value.is_missing()
+            {
+                facts
+                    .declared_types
+                    .push((byte_range(name)?, byte_range(value)?));
+            }
         } else if id == self.type_parameter || id == self.where_predicate {
             self.record_bounds(visited, facts)?;
         } else if id == self.attribute || id == self.inner_attribute {
@@ -682,6 +694,7 @@ impl Kinds {
                     self.functions[1],
                     self.impl_item,
                     self.trait_item,
+                    self.type_item,
                 ],
             )
             .map(Visited::syntax_element)
