@@ -3483,3 +3483,270 @@ fn a_reported_length_other_than_the_bytes_read_is_refused() -> TestResult {
     }
     Ok(())
 }
+
+/// A reader that serves `before` until its operation `changes_at`, and `after` from it on. An
+/// operation is one read, of at most 32 KiB, or one seek.
+struct Changing<'a> {
+    before: &'a [u8],
+    after: &'a [u8],
+    position: u64,
+    operations: usize,
+    changes_at: usize,
+}
+
+impl<'a> Changing<'a> {
+    fn new(before: &'a [u8], after: &'a [u8], changes_at: usize) -> Self {
+        Self {
+            before,
+            after,
+            position: 0,
+            operations: 0,
+            changes_at,
+        }
+    }
+
+    fn serve(&mut self) -> Cursor<&'a [u8]> {
+        self.operations += 1;
+        let changed = self.operations >= self.changes_at;
+        let mut cursor = Cursor::new(if changed { self.after } else { self.before });
+        cursor.set_position(self.position);
+        cursor
+    }
+}
+
+impl Read for Changing<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let length = buffer.len().min(32 * 1024);
+        let mut cursor = self.serve();
+        let read = cursor.read(&mut buffer[..length])?;
+        self.position = cursor.position();
+        Ok(read)
+    }
+}
+
+impl Seek for Changing<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.position = self.serve().seek(position)?;
+        Ok(self.position)
+    }
+}
+
+/// Reads `before`, which changes to `after` at operation `changes_at`, and the operations it took.
+fn read_changing(
+    (format, before): (ArchiveFormat, &[u8]),
+    after: &[u8],
+    changes_at: usize,
+) -> (Result<ArchiveFiles, ArchiveError>, usize) {
+    let digest = ArchiveDigest::Sha256(Sha256::digest(before).into());
+    let mut reader = Changing::new(before, after, changes_at);
+    let limits = ArchiveLimits::default();
+    let result = read_archive_from(
+        &mut reader,
+        format,
+        &digest,
+        Some("release"),
+        limits,
+        &|_, _| true,
+    );
+    (result, reader.operations)
+}
+
+/// The operations of the digest pass, after which another digest is refused.
+fn digest_operations(bytes: &[u8]) -> usize {
+    let mut reader = Changing::new(bytes, bytes, usize::MAX);
+    let result = read_archive_from(
+        &mut reader,
+        ArchiveFormat::TarGzip,
+        &ArchiveDigest::Sha256([0; 32]),
+        None,
+        ArchiveLimits::default(),
+        &|_, _| true,
+    );
+    assert_eq!(
+        result.expect_err("another digest"),
+        ArchiveError::DigestMismatch
+    );
+    reader.operations
+}
+
+/// Bytes gzip and deflate store almost unchanged.
+fn incompressible(length: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut bytes = Vec::with_capacity(length);
+    while bytes.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.push(state.to_be_bytes()[0]);
+    }
+    bytes
+}
+
+/// Marks the central record of ZIP member `name` as a block device.
+fn mark_zip_device(bytes: &mut [u8], name: &[u8]) {
+    for start in 0..bytes
+        .len()
+        .saturating_sub(ZIP_CENTRAL_HEADER_BYTES + name.len())
+    {
+        let path = start + ZIP_CENTRAL_HEADER_BYTES;
+        if bytes[start..].starts_with(b"PK\x01\x02") && bytes[path..].starts_with(name) {
+            bytes[start + 38..start + 42].copy_from_slice(&(0o060_644_u32 << 16).to_le_bytes());
+        }
+    }
+}
+
+// The reader of the review of #1077: each change is made at every operation.
+#[test]
+fn a_reader_that_changes_is_refused_or_changes_nothing() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let large = incompressible(400 * 1024);
+    let other = [large.as_slice(), b"x"].concat();
+    let entries = [
+        ("release/a", SOURCE, regular),
+        ("release/large", &large, regular),
+    ];
+    let mut variants = vec![
+        (
+            "other bytes",
+            [
+                ("release/a", b"VALUE = 2\n".as_slice(), regular),
+                entries[1],
+            ],
+        ),
+        ("traversal", [("../../a/b", SOURCE, regular), entries[1]]),
+        ("longer", [entries[0], ("release/large", &other, regular)]),
+        ("device", entries),
+    ];
+    variants[3].1[0].2 = tar::EntryType::Block;
+    let archives = member_archives(&entries)?;
+    for (variant, entries) in variants {
+        let mut changed = member_archives(&entries)?;
+        if variant == "device" {
+            for (_, format, bytes) in &mut changed {
+                if *format == ArchiveFormat::Zip {
+                    mark_zip_device(bytes, b"release/a");
+                }
+            }
+            // A device holds no bytes, so its tar header declares none.
+            let device = raw_member("release/a", b'4', b"")?;
+            changed[0].2 = gzip(&device)?;
+        }
+        for ((archive, format, before), (_, _, after)) in archives.iter().zip(&changed) {
+            assert!(
+                read_format(after, *format, ArchiveLimits::default()).is_ok()
+                    == matches!(variant, "other bytes" | "longer"),
+                "{archive} {variant}"
+            );
+            let unchanged = read_format(before, *format, ArchiveLimits::default())?;
+            let digest_operations = digest_operations(before);
+            let (mut refused, mut complete) = (0, false);
+            for changes_at in 1..10_000 {
+                let (result, operations) = read_changing((*format, before), after, changes_at);
+                let label = format!("{archive} {variant} at {changes_at} of {operations}");
+                match result {
+                    Ok(files) => {
+                        assert_eq!(files.digest(), unchanged.digest(), "{label}");
+                        assert_eq!(files.files(), unchanged.files(), "{label}");
+                        assert_eq!(files.members(), unchanged.members(), "{label}");
+                        assert_eq!(files.omissions(), unchanged.omissions(), "{label}");
+                    }
+                    Err(ArchiveError::ReaderChanged) => refused += 1,
+                    Err(ArchiveError::DigestMismatch) => {
+                        assert!(changes_at <= digest_operations, "{label}");
+                    }
+                    Err(error) => panic!("{label}: {error:?}"),
+                }
+                complete = operations < changes_at;
+                if complete {
+                    break;
+                }
+            }
+            assert!(complete, "{archive} {variant}: every operation was changed");
+            assert!(refused > 10, "{archive} {variant}: {refused} refused");
+        }
+    }
+    Ok(())
+}
+
+// Issue #1077.
+#[test]
+fn every_byte_changed_after_the_digest_is_refused() -> TestResult {
+    let entries = [("release/a", SOURCE, tar::EntryType::Regular)];
+    for (archive, format, bytes) in member_archives(&entries)? {
+        let changes_at = digest_operations(&bytes) + 1;
+        for position in 0..bytes.len() {
+            for bits in [0x01, 0x80, 0xff] {
+                let mut changed = bytes.clone();
+                changed[position] ^= bits;
+                let (result, _) = read_changing((format, &bytes), &changed, changes_at);
+                assert_eq!(
+                    result.expect_err("a changed byte"),
+                    ArchiveError::ReaderChanged,
+                    "{archive} byte {position} of {}",
+                    bytes.len()
+                );
+            }
+        }
+    }
+    // More blocks than are held at once, each changed at its first, middle, and last byte.
+    let large = incompressible(700 * 1024);
+    let entries = [
+        ("release/large", large.as_slice(), tar::EntryType::Regular),
+        entries[0],
+    ];
+    for (archive, format, bytes) in member_archives(&entries)? {
+        let changes_at = digest_operations(&bytes) + 1;
+        let blocks = bytes.len().div_ceil(BLOCK_BYTES);
+        assert!(blocks > 2 * BLOCKS_HELD, "{archive}: {blocks} blocks");
+        for block in 0..blocks {
+            let start = block * BLOCK_BYTES;
+            let end = bytes.len().min(start + BLOCK_BYTES);
+            for position in [start, usize::midpoint(start, end), end - 1] {
+                let mut changed = bytes.clone();
+                changed[position] ^= 0x01;
+                let (result, _) = read_changing((format, &bytes), &changed, changes_at);
+                assert_eq!(
+                    result.expect_err("a changed byte"),
+                    ArchiveError::ReaderChanged,
+                    "{archive} byte {position} of {}",
+                    bytes.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reader_shorter_than_its_digest_pass_is_refused() -> TestResult {
+    let large = incompressible(400 * 1024);
+    let entries = [("release/large", large.as_slice(), tar::EntryType::Regular)];
+    for (archive, format, bytes) in member_archives(&entries)? {
+        let shorter = &bytes[..bytes.len() - 1];
+        let changes_at = digest_operations(&bytes) + 1;
+        let (result, _) = read_changing((format, &bytes), shorter, changes_at);
+        assert_eq!(
+            result.expect_err("a shorter reader"),
+            ArchiveError::ReaderChanged,
+            "{archive}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn block_reads_consume_a_work_bound() -> TestResult {
+    let bytes = incompressible(3 * BLOCK_BYTES);
+    let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+    for (blocks, expected) in [(3, None), (2, Some(ArchiveError::WorkLimit))] {
+        let mut cursor = Cursor::new(&bytes);
+        let mut source = Source::verified(&mut cursor, &digest, ArchiveLimits::default())?;
+        source.reads = blocks as u64;
+        let mut read = Vec::new();
+        let result = source.read_to_end(&mut read);
+        assert_eq!(result.is_ok(), expected.is_none());
+        assert_eq!(source.failure, expected);
+        assert_eq!(read, bytes[..blocks * BLOCK_BYTES]);
+    }
+    Ok(())
+}

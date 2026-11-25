@@ -484,7 +484,7 @@ pub enum ArchiveError {
     InvalidArchive,
     /// A member or decompressed quantity exceeds its bound.
     BoundExceeded(ArchiveBoundExceeded),
-    /// Archive metadata reads or seeks exceed their work bound.
+    /// Archive reads or seeks exceed their work bound.
     WorkLimit,
     /// A member name or the caller's archive root is absolute, traverses parents, or is
     /// otherwise no [`ArchivePath`].
@@ -519,7 +519,7 @@ impl std::fmt::Display for ArchiveError {
             Self::CompressedLimit => "archive exceeds its compressed byte bound",
             Self::DigestMismatch => "archive digest differs from exact release metadata",
             Self::InvalidArchive => "archive data is invalid",
-            Self::WorkLimit => "archive metadata exceeds its work bound",
+            Self::WorkLimit => "archive reads exceed their work bound",
             Self::DuplicatePath => "archive contains a duplicate path",
             Self::UnsupportedEntry => "archive entry type is unsupported",
             Self::RootMismatch => "archive member is outside its exact release root",
@@ -580,12 +580,15 @@ pub fn read_archive(
 /// [`ArchiveOmissionReason::Unselected`].
 ///
 /// The reader is read from its start: once for the digest, and then in two passes for tar and
-/// by member for ZIP. Its bytes must not change meanwhile. The reader keeps buffers, the member
-/// inventory, and the selected files; the container is never held whole.
+/// by member for ZIP. It serves exactly the bytes whose digest was established: each block read
+/// later is compared with the digest of the first pass before a byte of it is used. The reader
+/// keeps buffers, the digest states of its blocks, the member inventory, and the selected files;
+/// the container is never held whole.
 ///
 /// # Errors
-/// Returns [`ArchiveError`] as [`read_archive`] does, and [`ArchiveError::Read`] when the reader
-/// fails.
+/// Returns [`ArchiveError`] as [`read_archive`] does, [`ArchiveError::Read`] when the reader
+/// fails, [`ArchiveError::ReaderChanged`] when it serves other bytes than before, and
+/// [`ArchiveError::WorkLimit`] when the container makes it read more blocks than its bound.
 pub fn read_archive_from(
     mut reader: impl Read + Seek,
     format: ArchiveFormat,
@@ -594,13 +597,16 @@ pub fn read_archive_from(
     limits: ArchiveLimits,
     keep: &dyn Fn(&ProjectPath, u64) -> bool,
 ) -> Result<ArchiveFiles, ArchiveError> {
-    let mut source = Source {
-        reader: &mut reader,
-        failed: None,
-    };
-    let result = read_source(&mut source, format, expected, root, limits, keep);
-    match source.failed {
-        Some(kind) => Err(ArchiveError::Read(kind)),
+    if let Some(root) = root {
+        let path = ProjectPath::new(root).map_err(|_| ArchiveError::unsafe_path(root))?;
+        if path.as_str().is_empty() || root.contains('/') {
+            return Err(ArchiveError::unsafe_path(root));
+        }
+    }
+    let mut source = Source::verified(&mut reader, expected, limits)?;
+    let result = read_source(&mut source, format, root, limits, keep);
+    match source.failure {
+        Some(error) => Err(error),
         None => result,
     }
 }
@@ -608,121 +614,202 @@ pub fn read_archive_from(
 fn read_source<R: Read + Seek>(
     source: &mut Source<'_, R>,
     format: ArchiveFormat,
-    expected: &ArchiveDigest,
     root: Option<&str>,
     limits: ArchiveLimits,
     keep: &dyn Fn(&ProjectPath, u64) -> bool,
 ) -> Result<ArchiveFiles, ArchiveError> {
-    let compressed = source
-        .seek(SeekFrom::End(0))
-        .map_err(|_| ArchiveError::InvalidArchive)?;
-    let compressed = usize::try_from(compressed)
-        .ok()
-        .filter(|compressed| (1..=limits.compressed_bytes).contains(compressed))
-        .ok_or(ArchiveError::CompressedLimit)?;
-    let digest = verified_digest(source, compressed, expected)?;
-    if let Some(root) = root {
-        let path = ProjectPath::new(root).map_err(|_| ArchiveError::unsafe_path(root))?;
-        if path.as_str().is_empty() || root.contains('/') {
-            return Err(ArchiveError::unsafe_path(root));
-        }
-    }
+    let compressed = usize::try_from(source.length).map_err(|_| ArchiveError::CompressedLimit)?;
     let mut output = ArchiveOutput::new(root, limits, limits.expanded(compressed));
     output.keep = keep;
     match format {
         ArchiveFormat::TarGzip => read_tar(source, compressed, &mut output)?,
         ArchiveFormat::Zip => read_zip(source, compressed, &mut output)?,
     }
-    Ok(output.into_files(digest))
+    Ok(output.into_files(source.digest))
 }
 
-/// Digests the whole reader through a fixed buffer and compares it with the expected digest.
-/// The reader serves exactly the `compressed` bytes it reported, so every later bound counts
-/// the bytes the digest covers.
-fn verified_digest<R: Read + Seek>(
-    source: &mut Source<'_, R>,
-    compressed: usize,
-    expected: &ArchiveDigest,
-) -> Result<FileDigest, ArchiveError> {
-    source.restart()?;
-    let mut sha256 = Sha256::new();
-    let mut sha512 = matches!(expected, ArchiveDigest::Sha512(_)).then(Sha512::new);
-    let mut buffer = vec![0; SOURCE_BUFFER_BYTES];
-    let mut read = 0;
-    loop {
-        let length = source
-            .read(&mut buffer)
-            .map_err(|_| ArchiveError::InvalidArchive)?;
-        let Some(bytes) = buffer.get(..length).filter(|bytes| !bytes.is_empty()) else {
-            break;
-        };
-        read += length;
-        if read > compressed {
-            return Err(ArchiveError::ReaderChanged);
-        }
-        sha256.update(bytes);
-        if let Some(sha512) = &mut sha512 {
-            sha512.update(bytes);
+/// Bytes of one block of the caller's reader, read and compared at once.
+const BLOCK_BYTES: usize = 64 * 1024;
+/// Blocks held at once.
+const BLOCKS_HELD: usize = 4;
+
+/// Reads until `buffer` is full or the reader ends.
+fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> Result<usize, ArchiveError> {
+    let mut filled = 0;
+    while let Some(rest) = buffer.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+        match reader.read(rest) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(ArchiveError::Read(error.kind())),
         }
     }
-    if read != compressed {
-        return Err(ArchiveError::ReaderChanged);
-    }
-    let actual = <[u8; 32]>::from(sha256.finalize());
-    let verified = match expected {
-        ArchiveDigest::Sha256(expected) => actual == *expected,
-        ArchiveDigest::Sha512(expected) => {
-            sha512.is_some_and(|sha512| <[u8; 64]>::from(sha512.finalize()) == *expected)
-        }
-    };
-    if !verified {
-        return Err(ArchiveError::DigestMismatch);
-    }
-    Ok(FileDigest::from_bytes(actual))
+    Ok(filled)
 }
 
-/// Bytes read from the caller's reader at once.
-const SOURCE_BUFFER_BYTES: usize = 64 * 1024;
-
-/// The caller's reader, with the first failure it reported.
+/// The caller's reader, after one pass over it established its digest.
 ///
-/// The container libraries report a failed read as a malformed container.
+/// That pass keeps the state of the digest before every block. A block read later must lead
+/// from its state to the next one, and every byte is served from such a block, so no byte is
+/// used that the archive's digest does not cover. Comparing a block costs one digest of it, and
+/// the states take about 112 bytes for each block of the compressed byte bound.
 struct Source<'a, R> {
     reader: &'a mut R,
-    failed: Option<ErrorKind>,
+    digest: FileDigest,
+    length: u64,
+    /// The digest of the archive before each block, and after the last one.
+    states: Vec<Sha256>,
+    /// The blocks held, the latest first.
+    held: Vec<(usize, Vec<u8>)>,
+    position: u64,
+    /// Block reads the container may still cost.
+    reads: u64,
+    failure: Option<ArchiveError>,
 }
 
-impl<R: Read + Seek> Source<'_, R> {
-    fn restart(&mut self) -> Result<(), ArchiveError> {
-        self.seek(SeekFrom::Start(0))
-            .map(|_| ())
-            .map_err(|_| ArchiveError::InvalidArchive)
+impl<'a, R: Read + Seek> Source<'a, R> {
+    /// Reads the whole reader through one block and compares its digest with the expected one.
+    /// The reader serves exactly the bytes it reports, so every later bound counts the bytes
+    /// the digest covers.
+    fn verified(
+        reader: &'a mut R,
+        expected: &ArchiveDigest,
+        limits: ArchiveLimits,
+    ) -> Result<Self, ArchiveError> {
+        let failed = |error: std::io::Error| ArchiveError::Read(error.kind());
+        let length = reader.seek(SeekFrom::End(0)).map_err(failed)?;
+        if length == 0 || length > limits.compressed_bytes as u64 {
+            return Err(ArchiveError::CompressedLimit);
+        }
+        reader.seek(SeekFrom::Start(0)).map_err(failed)?;
+        let mut sha256 = Sha256::new();
+        let mut sha512 = matches!(expected, ArchiveDigest::Sha512(_)).then(Sha512::new);
+        let mut states = vec![Sha256::new()];
+        let mut buffer = vec![0; BLOCK_BYTES];
+        let mut served = 0_u64;
+        loop {
+            let read = fill(reader, &mut buffer)?;
+            let Some(block) = buffer.get(..read).filter(|block| !block.is_empty()) else {
+                break;
+            };
+            served += read as u64;
+            if served > length {
+                return Err(ArchiveError::ReaderChanged);
+            }
+            sha256.update(block);
+            if let Some(sha512) = &mut sha512 {
+                sha512.update(block);
+            }
+            states.push(sha256.clone());
+        }
+        if served != length {
+            return Err(ArchiveError::ReaderChanged);
+        }
+        let actual = <[u8; 32]>::from(sha256.finalize());
+        let verified = match expected {
+            ArchiveDigest::Sha256(expected) => actual == *expected,
+            ArchiveDigest::Sha512(expected) => {
+                sha512.is_some_and(|sha512| <[u8; 64]>::from(sha512.finalize()) == *expected)
+            }
+        };
+        if !verified {
+            return Err(ArchiveError::DigestMismatch);
+        }
+        // Two passes read every block, and a member costs a few blocks of its own.
+        let reads = (states.len() as u64 + limits.members as u64 + 1024).saturating_mul(4);
+        Ok(Self {
+            reader,
+            digest: FileDigest::from_bytes(actual),
+            length,
+            states,
+            held: Vec::with_capacity(BLOCKS_HELD),
+            position: 0,
+            reads,
+            failure: None,
+        })
     }
 
-    fn record<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
-        if let Err(error) = &result {
-            self.failed.get_or_insert(error.kind());
+    fn restart(&mut self) {
+        self.position = 0;
+    }
+
+    /// Moves block `index` to the front of the blocks held, reading and comparing it when it
+    /// is not one of them.
+    fn hold(&mut self, index: usize) -> Result<(), ArchiveError> {
+        if let Some(held) = self.held.iter().position(|(block, _)| *block == index) {
+            if let Some(held) = self.held.get_mut(..=held) {
+                held.rotate_right(1);
+            }
+            return Ok(());
         }
-        result
+        self.reads = self.reads.checked_sub(1).ok_or(ArchiveError::WorkLimit)?;
+        let [before, after] = self.states.get(index..index + 2).unwrap_or_default() else {
+            return Err(ArchiveError::ReaderChanged);
+        };
+        let start = index as u64 * BLOCK_BYTES as u64;
+        let mut block = if self.held.len() < BLOCKS_HELD {
+            Vec::new()
+        } else {
+            self.held.pop().map(|(_, block)| block).unwrap_or_default()
+        };
+        let length = BLOCK_BYTES.min(usize::try_from(self.length - start).unwrap_or(BLOCK_BYTES));
+        block.resize(length, 0);
+        self.reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|error| ArchiveError::Read(error.kind()))?;
+        let read = fill(self.reader, &mut block)?;
+        let state = before.clone().chain_update(&block);
+        if read != length || state.finalize() != after.clone().finalize() {
+            return Err(ArchiveError::ReaderChanged);
+        }
+        self.held.insert(0, (index, block));
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> BufRead for Source<'_, R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.position >= self.length {
+            return Ok(&[]);
+        }
+        let failed = || std::io::Error::other("archive reader failed");
+        if self.failure.is_some() {
+            return Err(failed());
+        }
+        let block = BLOCK_BYTES as u64;
+        let index = usize::try_from(self.position / block).map_err(|_| failed())?;
+        if let Err(error) = self.hold(index) {
+            self.failure = Some(error);
+            return Err(failed());
+        }
+        let offset = usize::try_from(self.position % block).map_err(|_| failed())?;
+        let held = self.held.first().and_then(|(_, held)| held.get(offset..));
+        held.ok_or_else(failed)
+    }
+
+    fn consume(&mut self, length: usize) {
+        self.position += length as u64;
     }
 }
 
 impl<R: Read + Seek> Read for Source<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            let result = self.reader.read(buffer);
-            match &result {
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Ok(_) | Err(_) => return self.record(result),
-            }
-        }
+        let mut bytes = self.fill_buf()?;
+        let read = bytes.read(buffer)?;
+        self.consume(read);
+        Ok(read)
     }
 }
 
-impl<R: Read + Seek> Seek for Source<'_, R> {
+impl<R> Seek for Source<'_, R> {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        let result = self.reader.seek(position);
-        self.record(result)
+        let position = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(offset) => self.length.checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+        };
+        self.position = position.ok_or(ErrorKind::InvalidInput)?;
+        Ok(self.position)
     }
 }
 
@@ -734,7 +821,7 @@ fn read_tar<R: Read + Seek>(
     compressed: usize,
     output: &mut ArchiveOutput<'_>,
 ) -> Result<(), ArchiveError> {
-    source.restart()?;
+    source.restart();
     let mut stream = gzip_stream(&mut *source, output.expanded);
     let checked = check_tar_headers(&mut stream, output.limits);
     // The rest of the stream decides the byte bound and gzip's own checks before a header
@@ -742,17 +829,13 @@ fn read_tar<R: Read + Seek>(
     std::io::copy(&mut stream, &mut std::io::sink()).map_err(|_| ArchiveError::InvalidArchive)?;
     check_expansion(&stream, compressed, output)?;
     checked?;
-    source.restart()?;
+    source.restart();
     let stream = gzip_stream(source, output.expanded);
     read_tar_members(stream, output)
 }
 
 /// The gzip stream of `source`, up to one byte past the decompressed byte bound.
-fn gzip_stream<R: Read>(
-    source: R,
-    expanded: ExpandedBound,
-) -> std::io::Take<GzipMembers<BufReader<R>>> {
-    let source = BufReader::with_capacity(SOURCE_BUFFER_BYTES, source);
+fn gzip_stream<B: BufRead>(source: B, expanded: ExpandedBound) -> std::io::Take<GzipMembers<B>> {
     GzipMembers::new(source).take(expanded.maximum as u64 + 1)
 }
 
@@ -1027,7 +1110,7 @@ fn read_zip<R: Read + Seek>(
     compressed: usize,
     output: &mut ArchiveOutput<'_>,
 ) -> Result<(), ArchiveError> {
-    source.restart()?;
+    source.restart();
     let limits = output.limits;
     let refused = OnceCell::new();
     let metadata = Cell::new(true);
@@ -1617,7 +1700,7 @@ impl<'a, 'source, R: Read + Seek> ZipReadGuard<'a, 'source, R> {
         (work, self.source)
     }
 
-    /// Reads until `buffer` is full or the reader ends.
+    /// Reads until `buffer` is full or the archive ends.
     fn fill(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let mut filled = 0;
         while let Some(rest) = buffer.get_mut(filled..).filter(|rest| !rest.is_empty()) {
