@@ -18,8 +18,12 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            let occurrence = self
-                .edge_python_name(file, reference.target, work)
+            let named = if reference.role == ReferenceRole::Type {
+                self.python_type(file, reference.target, work)
+            } else {
+                self.edge_python_name(file, reference.target, work)
+            };
+            let occurrence = named
                 .or_else(|| {
                     (reference.role == ReferenceRole::Write)
                         .then(|| self.python_written_module_name(file, reference.target, work))
@@ -73,6 +77,20 @@ impl<'source> Index<'source> {
                 }
             }
         }
+    }
+
+    /// The declaration a written type names. A module or a function is no type.
+    pub(in crate::static_resolution) fn python_type(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        self.edge_python_name(file, range, work).filter(|target| {
+            let kinds = &target.symbol.kinds;
+            kinds.contains(&SymbolKind::Constructible)
+                || !(kinds.contains(&SymbolKind::Module) || kinds.contains(&SymbolKind::Callable))
+        })
     }
 
     /// The declaration a write to `module.name` names: the module's own declaration of `name`,

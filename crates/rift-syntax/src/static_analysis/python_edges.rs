@@ -596,7 +596,7 @@ impl EdgePythonKinds {
         if annotation {
             facts.references.push(StaticReference {
                 target: range,
-                role: ReferenceRole::Type,
+                role: self.annotation_role(parent),
             });
         } else if id == self.attribute {
             let mut target_element = element;
@@ -635,6 +635,16 @@ impl EdgePythonKinds {
             }
         }
         Ok(())
+    }
+
+    /// The role of one name of a written type: `a` and `a.b` of `a.b.C` are read to reach
+    /// the type that `C` names.
+    fn annotation_role(&self, parent: Option<Node<'_>>) -> rift_core::ReferenceRole {
+        if parent.is_some_and(|parent| parent.kind_id() == self.attribute) {
+            rift_core::ReferenceRole::Read
+        } else {
+            rift_core::ReferenceRole::Type
+        }
     }
 
     fn edge_shadow(

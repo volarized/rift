@@ -1609,7 +1609,7 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         match file.document.facts.language().name.as_str() {
             "javascript" | "typescript" => self.edge_javascript_target(file, range, work),
-            "python" => self.edge_python_name(file, range, work),
+            "python" => self.python_type(file, range, work),
             "rust" => self.rust.edge_type_target(file, range, work),
             _ => None,
         }
