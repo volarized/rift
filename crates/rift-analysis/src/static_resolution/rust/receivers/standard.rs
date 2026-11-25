@@ -5,6 +5,11 @@
 //! unstable method when a trait method of the name applies, so unstable methods are absent.
 //! Types are named by their path in `std`, primitives by their own name. `slice:X` and
 //! `array:X` hold methods of slices and arrays of the element type `X` alone.
+//!
+//! `rift-dev standard-methods <folder of rustdoc pages>` writes the rows and the release above
+//! from the `rust-docs` component of a toolchain. The rows decide alone: no toolchain is read
+//! when Rift is built or runs. A method `std` gains in a later release is absent, so a call of
+//! it names the package trait method of that name until the rows are written again.
 
 use super::Reference::{self, Shared, Unique};
 
