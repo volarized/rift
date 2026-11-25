@@ -453,8 +453,10 @@ struct File<'source> {
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_whole: python_edges::WholeFile,
-    /// The iterable of each comprehension's first clause, by the comprehension's range.
-    python_first_iterables: BTreeMap<ByteRange, ByteRange>,
+    /// The part of a Python scope that the enclosing scope evaluates, by the scope's range.
+    python_evaluated_outside: BTreeMap<ByteRange, ByteRange>,
+    /// The Python lambdas, comprehensions and generator expressions around a position.
+    python_expressions: EnclosingDefinitions<ByteRange>,
     /// Python annotation ranges by start, which can be evaluated after later statements.
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
@@ -602,7 +604,8 @@ impl<'source> File<'source> {
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
             python_whole: python_edges::WholeFile::Module,
-            python_first_iterables: BTreeMap::new(),
+            python_evaluated_outside: BTreeMap::new(),
+            python_expressions: EnclosingDefinitions::new([]),
             python_annotations: BTreeMap::new(),
             python_non_none: BTreeMap::new(),
             python_receivers: BTreeMap::new(),
@@ -660,12 +663,20 @@ impl<'source> File<'source> {
                 .or_default()
                 .push((name, body));
         }
-        for &(comprehension, iterable) in self.facts.first_iterables() {
+        for &(scope, part) in self.facts.evaluated_outside() {
             if !work.charge() {
                 return None;
             }
-            self.python_first_iterables.insert(comprehension, iterable);
+            self.python_evaluated_outside.insert(scope, part);
         }
+        let mut expressions = Vec::new();
+        for &range in self.facts.expression_scopes() {
+            if !work.charge() {
+                return None;
+            }
+            expressions.push((range.start, range.end, range));
+        }
+        self.python_expressions = EnclosingDefinitions::new(expressions);
         for binding in self.facts.bindings() {
             if !work.charge() {
                 return None;
