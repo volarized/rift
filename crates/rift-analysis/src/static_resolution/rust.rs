@@ -124,7 +124,7 @@ impl<'source> Namespaces<'source> {
             return self.available(target).then_some(target);
         }
         if let [name] = parts.as_slice()
-            && let Some(target) = Self::local_type(file, range.start, name, work)
+            && let Some(target) = self.local_type(file, range.start, name, work).ok()?
         {
             return self.available(target).then_some(target);
         }
@@ -168,15 +168,65 @@ impl<'source> Namespaces<'source> {
             })
     }
 
+    /// A type item in a block can be used only inside its own module. A nearer type
+    /// import or type parameter takes precedence, while a value-only import can coexist.
     fn local_type(
+        &self,
         file: &File<'source>,
         position: u64,
         name: &str,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
-        Self::local_named(file, position, name, work, |target| {
-            target.symbol.kinds.contains(&SymbolKind::Type)
-        })
+    ) -> Result<Option<Target<'source>>, ()> {
+        let binding = match file.binding(
+            name,
+            position,
+            |kind| kind == StaticBindingKind::RustBlockType,
+            work,
+        ) {
+            Binding::Found(binding) => binding,
+            Binding::Missing => return Ok(None),
+            Binding::Blocked => return Err(()),
+        };
+        let module = self.module(file, position, work).ok_or(())?;
+        if self.module(file, binding.name.start, work) != Some(module) {
+            return Ok(None);
+        }
+        match file.binding(name, position, is_type_binding, work) {
+            Binding::Found(closer)
+                if closer.scope != binding.scope && binding.scope.encloses(closer.scope) =>
+            {
+                let StaticBindingKind::RustUse { path } = closer.kind else {
+                    return Err(());
+                };
+                let imported = self.import_path(file, path, work).ok_or(())?;
+                if let Some(target) =
+                    self.lookup(file, path.start, &imported, Namespace::Type, work)
+                {
+                    return Ok(Some(target));
+                }
+                if self
+                    .lookup(file, path.start, &imported, Namespace::Value, work)
+                    .is_none()
+                    && self
+                        .lookup(
+                            file,
+                            path.start,
+                            &imported,
+                            Namespace::ConstantOrStatic,
+                            work,
+                        )
+                        .is_none()
+                {
+                    return Err(());
+                }
+            }
+            Binding::Blocked => return Err(()),
+            _ => {}
+        }
+        file.target_at(binding.name)
+            .filter(|target| target.symbol.kinds.contains(&SymbolKind::Type))
+            .map(Some)
+            .ok_or(())
     }
 
     fn local_named(
@@ -813,14 +863,23 @@ impl<'source> Namespaces<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        let path = self.import_path(file, range, work)?;
+        self.lookup(file, range.start, &path, Namespace::Value, work)
+            .or_else(|| self.lookup(file, range.start, &path, Namespace::Type, work))
+    }
+
+    fn import_path(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Vec<String>> {
         if file.conditional(range, work) || file.blocked(range.start, work) {
             return None;
         }
         let parts = file.use_parts(range, work)?;
         let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
-        let path = self.absolute_path(file, range.start, &parts, work)?;
-        self.lookup(file, range.start, &path, Namespace::Value, work)
-            .or_else(|| self.lookup(file, range.start, &path, Namespace::Type, work))
+        self.absolute_path(file, range.start, &parts, work)
     }
 
     fn import_source(
@@ -1033,9 +1092,11 @@ impl<'source> Namespaces<'source> {
                     .or_else(|| {
                         // `Name(..)` with a struct `Name` calls its tuple constructor.
                         // A struct declared in an enclosing body comes first.
-                        Self::local_type(file, position, name, work)
-                            .filter(|target| self.available(*target))
-                            .or_else(|| self.lookup(file, position, &path, Namespace::Type, work))
+                        if let Some(target) = self.local_type(file, position, name, work).ok()? {
+                            return (target.symbol.kind == "struct" && self.available(target))
+                                .then_some(target);
+                        }
+                        self.lookup(file, position, &path, Namespace::Type, work)
                             .filter(|target| target.symbol.kind == "struct")
                     })
             }
@@ -1067,7 +1128,7 @@ impl<'source> Namespaces<'source> {
         let position = call.range.start;
         // A struct declared in an enclosing body shadows module items of its name.
         if let [name] = parts.as_slice()
-            && let Some(target) = Self::local_type(file, position, name, work)
+            && let Some(target) = self.local_type(file, position, name, work).ok()?
         {
             return (target.symbol.kind == "struct" && self.available(target)).then_some(target);
         }

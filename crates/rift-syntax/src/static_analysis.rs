@@ -256,6 +256,8 @@ pub enum StaticBindingKind {
         /// Authored type or constructor path.
         type_path: ByteRange,
     },
+    /// The name of a type item bound inside a Rust block.
+    RustBlockType,
     /// Rust type parameter whose declared bounds remain in its lexical scope.
     RustTypeParameter,
     /// Local Rust value whose initializer can establish its declared return owner.
@@ -1285,6 +1287,7 @@ impl StaticBinding {
             | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonGlobal
             | StaticBindingKind::PythonNonlocal
+            | StaticBindingKind::RustBlockType
             | StaticBindingKind::RustTypeParameter => true,
         };
         valid(self.name)

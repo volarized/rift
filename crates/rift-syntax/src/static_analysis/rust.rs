@@ -59,6 +59,7 @@ pub(super) struct Kinds {
     impl_item: u16,
     trait_item: u16,
     type_item: u16,
+    block_type_items: [u16; 5],
     type_parameter: u16,
     where_predicate: u16,
     non_method_bounds: [u16; 2],
@@ -140,6 +141,13 @@ pub(super) fn kinds() -> &'static Kinds {
             impl_item: id("impl_item"),
             trait_item: id("trait_item"),
             type_item: id("type_item"),
+            block_type_items: [
+                id("struct_item"),
+                id("enum_item"),
+                id("union_item"),
+                id("trait_item"),
+                id("type_item"),
+            ],
             type_parameter: id("type_parameter"),
             where_predicate: id("where_predicate"),
             non_method_bounds: [id("lifetime"), id("removed_trait_bound")],
@@ -204,6 +212,9 @@ impl Kinds {
         }
         let id = syntax_element.kind_id();
         self.record_reference(visited, facts)?;
+        if self.block_type_items.contains(&id) {
+            self.record_block_type(visited, facts)?;
+        }
         if id == self.call {
             self.record_call(syntax_element, facts)?;
         } else if id == self.struct_expression {
@@ -852,6 +863,33 @@ impl Kinds {
             facts
                 .declared_types
                 .push((byte_range(name)?, byte_range(result)?));
+        }
+        Ok(())
+    }
+
+    /// A named type item inside a block binds for the whole block.
+    fn record_block_type(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let scope = enclosing(visited, &self.scopes)
+            .map(Visited::syntax_element)
+            .filter(|scope| scope.kind_id() == self.scopes[1]);
+        let name = visited
+            .syntax_element()
+            .child_by_field_id(self.name)
+            .filter(|name| {
+                !name.is_missing()
+                    && [self.identifier, self.type_identifier].contains(&name.kind_id())
+            });
+        if let Some((name, scope)) = name.zip(scope) {
+            facts.bindings.push(binding(
+                name,
+                scope,
+                byte_range(scope)?.start,
+                StaticBindingKind::RustBlockType,
+            )?);
         }
         Ok(())
     }
