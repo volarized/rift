@@ -407,55 +407,76 @@ fn admit_external<'a>(
     }
 }
 
+fn admit_occurrences<'a>(
+    occurrences: &'a [StaticOccurrence],
+    spans: &'a DefinitionSpans,
+    edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
+    admitted: &mut BTreeMap<&'a SymbolId, Vec<Edge>>,
+) {
+    for occurrence in occurrences {
+        if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
+            continue;
+        }
+        let NormalizedTarget::Symbol(to) = &occurrence.target else {
+            continue;
+        };
+        let Some(from) = occurrence
+            .edge_from
+            .as_ref()
+            .or_else(|| spans.resolve(edge_modules, &occurrence.binding))
+        else {
+            continue;
+        };
+        let edge = Edge {
+            from: from.clone(),
+            to: to.clone(),
+            kind: occurrence
+                .edge_kind
+                .unwrap_or_else(|| role_kind(occurrence.role)),
+            occurrence: occurrence.binding.clone(),
+            static_callee: (occurrence.role == ReferenceRole::Call)
+                .then_some(occurrence.callee_range),
+            from_graph: false,
+            derivation: if occurrence.edge_kind.is_some() {
+                rift_protocol::read::EdgeDerivation::Syntax
+            } else {
+                rift_protocol::read::EdgeDerivation::Resolution
+            },
+        };
+        admitted.entry(from).or_default().push(edge);
+    }
+}
+
 impl EdgeStore {
     fn add_static(
         &mut self,
         spans: &DefinitionSpans,
-        occurrences: &[StaticOccurrence],
-        external: &[ExternalOccurrence],
+        resolution: &mut StaticResolution,
         edges_max: usize,
     ) {
-        if occurrences.is_empty() && external.is_empty() {
+        let supplemental_start = resolution.supplemental_start.take();
+        if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
+        let (internal, external) =
+            supplemental_start.unwrap_or((resolution.occurrences.len(), resolution.external.len()));
+        let (occurrences, supplemental) = resolution.occurrences.split_at(internal);
+        let (external, supplemental_external) = resolution.external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut admitted = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        for occurrence in occurrences {
-            if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
-                continue;
-            }
-            let NormalizedTarget::Symbol(to) = &occurrence.target else {
-                continue;
-            };
-            let Some(from) = occurrence
-                .edge_from
-                .as_ref()
-                .or_else(|| spans.resolve(&self.edge_modules, &occurrence.binding))
-            else {
-                continue;
-            };
-            let edge = Edge {
-                from: from.clone(),
-                to: to.clone(),
-                kind: occurrence
-                    .edge_kind
-                    .unwrap_or_else(|| role_kind(occurrence.role)),
-                occurrence: occurrence.binding.clone(),
-                static_callee: (occurrence.role == ReferenceRole::Call)
-                    .then_some(occurrence.callee_range),
-                from_graph: false,
-                derivation: if occurrence.edge_kind.is_some() {
-                    rift_protocol::read::EdgeDerivation::Syntax
-                } else {
-                    rift_protocol::read::EdgeDerivation::Resolution
-                },
-            };
-            admitted.entry(from).or_default().push(edge);
-        }
-        admit_external(external, spans, &self.edge_modules, &mut admitted);
-        for (from, mut edges) in admitted {
+        let mut primary = BTreeMap::<&SymbolId, Vec<Edge>>::new();
+        let mut additional = BTreeMap::<&SymbolId, Vec<Edge>>::new();
+        admit_occurrences(occurrences, spans, &self.edge_modules, &mut primary);
+        admit_external(external, spans, &self.edge_modules, &mut primary);
+        admit_occurrences(supplemental, spans, &self.edge_modules, &mut additional);
+        admit_external(
+            supplemental_external,
+            spans,
+            &self.edge_modules,
+            &mut additional,
+        );
+        for (from, edges) in primary.iter_mut().chain(additional.iter_mut()) {
             edges.sort_by(edge_order);
             edges.dedup();
             let existing = self.outgoing(from);
@@ -464,6 +485,18 @@ impl EdgeStore {
                     .binary_search_by(|other| edge_order(other, edge))
                     .is_err()
             });
+        }
+        for (from, edges) in &mut additional {
+            if let Some(primary) = primary.get(from) {
+                // Count a shared primary row once, even when the cap drops both copies.
+                edges.retain(|edge| {
+                    primary
+                        .binary_search_by(|other| edge_order(other, edge))
+                        .is_err()
+                });
+            }
+        }
+        for (from, mut edges) in primary.into_iter().chain(additional) {
             let fits = edges.len().min(remaining);
             self.dropped_edges = self
                 .dropped_edges
@@ -526,14 +559,9 @@ impl EdgeStore {
         resolve: impl FnOnce() -> StaticResolution,
     ) -> (Self, StaticResolution) {
         let (mut store, spans) = Self::build_with_spans(graph, modules, edges_max);
-        let resolution = resolve();
+        let mut resolution = resolve();
         store.resolution_ended = resolution.ended;
-        store.add_static(
-            &spans,
-            &resolution.occurrences,
-            &resolution.external,
-            edges_max,
-        );
+        store.add_static(&spans, &mut resolution, edges_max);
         (store, resolution)
     }
 
@@ -1071,6 +1099,73 @@ mod tests {
     }
 
     #[test]
+    fn supplemental_static_edges_use_only_the_capacity_left_by_primary_calls() {
+        use super::{StaticOccurrence, StaticResolution};
+        use rift_provider::NormalizedTarget;
+
+        let path = "src/lib.rs";
+        let alpha = fixture_symbol("alpha");
+        let zeta = fixture_symbol("zeta");
+        let callee = fixture_symbol("callee");
+        let graph = graph(vec![
+            definition("alpha", alpha.as_str(), path, (0, 20)),
+            definition("zeta", zeta.as_str(), path, (20, 40)),
+            definition("callee", callee.as_str(), path, (40, 60)),
+        ]);
+        let occurrence = |from: &SymbolId, start, role| StaticOccurrence {
+            binding: binding(path, start, start + 1),
+            target: NormalizedTarget::Symbol(callee.clone()),
+            target_binding: None,
+            source_digest: rift_core::FileDigest::of(b"supplemental fixture"),
+            callee_range: rift_syntax::ByteRange {
+                start,
+                end: start + 1,
+            },
+            role,
+            edge_from: Some(from.clone()),
+            edge_kind: None,
+        };
+        let resolution = |additional| {
+            let mut occurrences = vec![
+                occurrence(&alpha, 5, ReferenceRole::Call),
+                occurrence(&zeta, 25, ReferenceRole::Call),
+            ];
+            if additional {
+                occurrences.push(occurrence(&alpha, 3, ReferenceRole::Read));
+                occurrences.push(occurrence(&zeta, 25, ReferenceRole::Call));
+            }
+            StaticResolution {
+                occurrences,
+                supplemental_start: additional.then_some((2, 0)),
+                ..StaticResolution::default()
+            }
+        };
+        let build = |cap, additional| {
+            EdgeStore::build_resolving(&graph, super::BTreeMap::new(), cap, || {
+                resolution(additional)
+            })
+            .0
+        };
+        let baseline = build(2, false);
+        assert!(baseline.is_complete());
+        assert_eq!(baseline.edges().count(), 2);
+
+        let expanded = build(2, true);
+        assert_eq!(expanded.dropped_edges(), 1);
+        assert!(!expanded.is_complete());
+        assert_eq!(expanded.outgoing(&zeta), baseline.outgoing(&zeta));
+        assert_eq!(expanded.outgoing(&alpha), baseline.outgoing(&alpha));
+        assert_eq!(expanded.incoming(&callee), baseline.incoming(&callee));
+        assert_eq!(build(1, true).dropped_edges(), 2);
+
+        let room = build(3, true);
+        assert!(room.is_complete());
+        assert_eq!(room.edges().count(), 3);
+        assert_eq!(room.outgoing(&alpha).len(), 2);
+        assert_eq!(room.outgoing(&zeta), baseline.outgoing(&zeta));
+    }
+
+    #[test]
     fn shared_definitions_preserve_capped_graph_and_static_edge_admission() {
         use super::{
             DEFINITION_BUILDS, ExternalOccurrence, StaticOccurrence, StaticResolution,
@@ -1133,13 +1228,7 @@ mod tests {
 
             let mut separate = EdgeStore::build_capped(&graph, cap);
             let fresh = UnitDefinitions::build(&graph);
-            let separate_resolution = resolution();
-            separate.add_static(
-                &fresh.spans,
-                &separate_resolution.occurrences,
-                &separate_resolution.external,
-                cap,
-            );
+            separate.add_static(&fresh.spans, &mut resolution(), cap);
             assert_eq!(DEFINITION_BUILDS.get() - before, 3, "cap {cap}");
             assert_eq!(
                 shared, separate,

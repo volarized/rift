@@ -62,6 +62,8 @@ pub(crate) struct StaticOccurrence {
 #[derive(Debug, Default)]
 pub(crate) struct StaticResolution {
     pub(crate) occurrences: Vec<StaticOccurrence>,
+    /// First internal and external occurrence from a pass that uses the capacity left by primary edges.
+    pub(crate) supplemental_start: Option<(usize, usize)>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -1366,6 +1368,10 @@ impl<'source> Index<'source> {
         work: &mut Work,
         resolution: &mut StaticResolution,
     ) {
+        if !names.is_empty() {
+            resolution.supplemental_start =
+                Some((resolution.occurrences.len(), resolution.external.len()));
+        }
         for (file, remaining, sites) in names {
             let left = work.budget.remaining();
             let budget = left.min(remaining);
