@@ -965,11 +965,13 @@ fn later_bindings(
 }
 
 impl File<'_> {
-    /// Whether `position` is in the part of `scope` that the enclosing scope evaluates.
+    /// Whether `position` is in a part of `scope` that the enclosing scope evaluates.
     fn python_evaluated_outside(&self, scope: ByteRange, position: u64) -> bool {
+        // The parts of one scope are disjoint. Check the last one that starts by this position.
         self.python_evaluated_outside
-            .get(&scope)
-            .is_some_and(|part| part.contains(position))
+            .range((scope, 0)..=(scope, position))
+            .next_back()
+            .is_some_and(|(_, &end)| position < end)
     }
 
     fn python_guard_available(

@@ -42,6 +42,8 @@ fn test_python_targets_outside_assignments_bind_local_names() {
         "def f(*h: int, **o: int): h(); o()\n",
         "def f():\n    del h\n    h()\n",
         "def f():\n    del (h, [o])\n    h(); o()\n",
+        "def f(x):\n    del h\n    h()\n    x.h = 1\n",
+        "def f(x):\n    del h\n    h()\n    for x.h in (): pass\n",
         "def f():\n    type h = int\n    h()\n",
         "def f():\n    type h[T] = list[T]\n    h()\n",
     ] {
@@ -110,7 +112,12 @@ fn test_python_defaults_annotations_and_class_arguments_read_the_enclosing_scope
             vec![],
         ),
         ("class C(metaclass=h()):\n    h = 1\n", vec!["C -> h"]),
-        ("def f[h](value=h()): pass\n", vec![]),
+        (
+            "def f[h](value=h(), *, other=h()): h()\n",
+            vec!["f -> h", "f -> h"],
+        ),
+        ("def f[h](value: h() = h()) -> h(): pass\n", vec!["f -> h"]),
+        ("def f[h]():\n    def g[h](value=h()): pass\n", vec![]),
         ("class C[h](metaclass=h()): pass\n", vec![]),
         ("class C[h]:\n    def m(self): h()\n", vec![]),
     ] {
