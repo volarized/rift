@@ -24,8 +24,8 @@ use rift_core::{
 use rift_protocol::read::SymbolKind;
 use rift_provider::{NormalizedGraph, NormalizedTarget};
 use rift_syntax::{
-    ByteRange, DocumentPlacement, SYNTAX_PROVIDER_ID, StaticBinding, StaticBindingKind, StaticCall,
-    StaticFacts, SyntaxFacts, SyntaxSymbol,
+    ByteRange, DocumentPlacement, PythonDeletion, SYNTAX_PROVIDER_ID, StaticBinding,
+    StaticBindingKind, StaticCall, StaticFacts, SyntaxFacts, SyntaxSymbol,
 };
 
 pub(crate) use external::ExternalOccurrence;
@@ -453,6 +453,8 @@ struct File<'source> {
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_whole: python_edges::WholeFile,
+    /// Deleted Python names, by spelling and function.
+    python_deletions: BTreeMap<(&'source str, ByteRange), Vec<&'source PythonDeletion>>,
     /// The end of each part that the enclosing scope evaluates, by scope and start.
     python_evaluated_outside: BTreeMap<(ByteRange, u64), u64>,
     /// The Python lambdas, comprehensions and generator expressions around a position.
@@ -604,6 +606,7 @@ impl<'source> File<'source> {
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
             python_whole: python_edges::WholeFile::Module,
+            python_deletions: BTreeMap::new(),
             python_evaluated_outside: BTreeMap::new(),
             python_expressions: EnclosingDefinitions::new([]),
             python_annotations: BTreeMap::new(),
@@ -645,11 +648,27 @@ impl<'source> File<'source> {
             ));
         }
         file.conditions = Conditions::new(conditions);
+        file.index_python_deletions(work)?;
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         file.index_javascript_members(work)?;
         file.callbacks = javascript_callbacks::Callbacks::index(facts, work)?;
         Some(file)
+    }
+
+    /// Deleted names indexed by function and spelling.
+    fn index_python_deletions(&mut self, work: &mut Work) -> Option<()> {
+        for deletion in self.facts.python_deletions() {
+            if !work.charge() {
+                return None;
+            }
+            let name = self.text(deletion.name)?;
+            self.python_deletions
+                .entry((name, deletion.function))
+                .or_default()
+                .push(deletion);
+        }
+        Some(())
     }
 
     fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
@@ -873,12 +892,13 @@ impl<'source> File<'source> {
         Some(())
     }
 
-    /// Captured calls, references, bindings, heritage edges, and declarations.
+    /// Captured calls, references, bindings, deleted names, heritage edges, and declarations.
     fn elements(&self) -> usize {
         [
             self.facts.calls().len(),
             self.facts.references().len(),
             self.facts.bindings().len(),
+            self.facts.python_deletions().len(),
             self.facts.heritage_edges().len(),
             self.document.facts.symbols().len(),
         ]

@@ -90,6 +90,51 @@ fn test_python_deleted_local_keeps_its_receiver() {
 }
 
 #[test]
+fn test_python_deleted_receivers_stop_at_the_deletion() {
+    let classes = "class A:\n    def m(self): pass\nclass B:\n    def m(self): pass\n";
+    for (body, expected) in [
+        (
+            "def f():\n    value = A()\n    value.m()\n    del value\n    value.m()\n",
+            vec!["f -> A", "f -> A/m"],
+        ),
+        (
+            "def f():\n    value = A()\n    del value\n    value = B()\n    value.m()\n",
+            vec!["f -> A", "f -> B", "f -> B/m"],
+        ),
+        (
+            "def f():\n    value = A()\n    del value\n    value: B\n    value.m()\n",
+            vec!["f -> A"],
+        ),
+        (
+            "def f():\n    value = A()\n    del value\n    value: B = B()\n    value.m()\n",
+            vec!["f -> A", "f -> B", "f -> B/m"],
+        ),
+        (
+            "def f():\n    value = A()\n    del value\n    if isinstance(value, B): value.m()\n",
+            vec!["f -> A"],
+        ),
+        (
+            "def f(flag):\n    value = A()\n    if flag:\n        del value\n        return value.m()\n    return value.m()\n",
+            vec!["f -> A", "f -> A/m"],
+        ),
+        ("def f(value: A):\n    del value\n    value.m()\n", vec![]),
+        (
+            "def f():\n    value = A()\n    value.other = 1\n    del value.other\n    value.m()\n",
+            vec!["f -> A", "f -> A/m"],
+        ),
+    ] {
+        let source = format!("{classes}{body}");
+        assert_eq!(called(&source), expected, "{body}");
+    }
+}
+
+#[test]
+fn test_python_local_receiver_uses_the_selected_assignment() {
+    let source = "class A:\n    def m(self): pass\nclass B:\n    def m(self): pass\ndef f():\n    value = A()\n    value.m()\n    value = B()\n";
+    assert_eq!(called(source), ["f -> A", "f -> A/m", "f -> B"]);
+}
+
+#[test]
 fn test_python_annotated_collected_parameters_hold_no_instance() {
     let body = "class C:\n    def m(self): pass\n    def n(*args: int): args.m()\ndef f(*args: C, **kwargs: C):\n    args.m()\n    kwargs.m()\n";
     assert_eq!(called(body), Vec::<String>::new());
