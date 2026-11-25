@@ -1197,7 +1197,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar {
-    Python(&'static python_edges::EdgePythonKinds),
+    Python(&'static python_edges::EdgePythonKinds, python_edges::Names),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
@@ -1236,7 +1236,10 @@ impl<'source> Capture<'source> {
 
     pub(crate) fn for_edge_python(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::Python(python_edges::edge_python_kinds()),
+            grammar: Grammar::Python(
+                python_edges::edge_python_kinds(),
+                python_edges::Names::default(),
+            ),
             source,
             facts: StaticFacts::default(),
             edge_heritage: heritage_edges::edge_python_kinds(),
@@ -1276,7 +1279,9 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
-            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
+            Grammar::Python(kinds, names) => {
+                kinds.record_edge(visited, self.source, &mut self.facts.0, names)
+            }
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }
@@ -1295,8 +1300,9 @@ impl<'source> Capture<'source> {
         mut self,
         root: tree_sitter::Node<'_>,
     ) -> Result<StaticFacts, RiftError> {
-        if let Grammar::Python(kinds) = self.grammar {
+        if let Grammar::Python(kinds, names) = self.grammar {
             kinds.close_lists(root, self.source, &mut self.facts.0)?;
+            names.close(self.source, &mut self.facts.0);
         }
         Ok(self.facts)
     }

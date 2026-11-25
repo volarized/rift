@@ -660,6 +660,7 @@ mod python_joins;
 mod python_optional;
 mod python_overloads;
 mod python_property_writes;
+mod python_scopes;
 
 #[test]
 fn test_python_property_returns_resolve_instance_members_and_aliases() {

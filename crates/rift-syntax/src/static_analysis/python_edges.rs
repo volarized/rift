@@ -2,6 +2,9 @@
 
 mod guards;
 mod lists;
+mod names;
+
+pub(super) use names::Names;
 
 use std::sync::OnceLock;
 
@@ -62,6 +65,7 @@ pub(super) struct EdgePythonKinds {
     left: u16,
     right: u16,
     guards: guards::TypeGuards,
+    names: names::NameKinds,
     return_type: u16,
     loops: [u16; 2],
     /// Compound statements and clauses a class body may define methods under.
@@ -135,6 +139,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             left: field("left"),
             right: field("right"),
             guards: guards::TypeGuards::new(&grammar),
+            names: names::NameKinds::new(&grammar),
             return_type: field("return_type"),
             loops: [id("for_statement"), id("while_statement")],
             conditional: [
@@ -156,6 +161,7 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         source: &str,
         facts: &mut StaticFactsParts,
+        names: &mut Names,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let id = syntax_element.kind_id();
@@ -199,6 +205,8 @@ impl EdgePythonKinds {
             if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
                 self.edge_shadow(name, visited, facts)?;
             }
+        } else if id == self.names.type_alias {
+            self.edge_type_alias(visited, facts)?;
         } else if (id == self.global || id == self.nonlocal)
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
@@ -241,6 +249,7 @@ impl EdgePythonKinds {
             }
         }
         self.guards.record(visited, source, facts)?;
+        self.edge_name_target(visited, facts, names)?;
         self.edge_reference(visited, source, facts)?;
         Ok(())
     }
@@ -465,28 +474,30 @@ impl EdgePythonKinds {
                     .child_by_field_id(self.name.get())
                     .or_else(|| parameter.named_child(0))
             };
+            // An annotated `*args` or `**kwargs` holds its name under the splat, and its
+            // annotation states each element.
+            let splat = name.filter(|name| self.patterns[3..].contains(&name.kind_id()));
+            let name = splat.map_or(name, |splat| splat.named_child(0));
+            let collects = splat.is_some() || self.patterns.contains(&parameter.kind_id());
             if let Some(name) = name.filter(|name| name.kind_id() == self.identifier) {
                 let annotated = parameter
                     .child_by_field_id(self.type_field)
+                    .filter(|_| !collects)
                     .map(byte_range)
                     .transpose()?;
-                facts.bindings.push(
-                    self.scoped_binding(
-                        name,
-                        scope,
-                        self.scope_range(scope)?.start,
-                        match class_name
-                            .filter(|_| first && !self.patterns.contains(&parameter.kind_id()))
-                        {
-                            Some(class_name) => StaticBindingKind::PythonReceiver {
-                                class_name: byte_range(class_name)?,
-                            },
-                            None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
-                                StaticBindingKind::PythonAnnotation { annotation }
-                            }),
+                facts.bindings.push(self.scoped_binding(
+                    name,
+                    scope,
+                    self.scope_range(scope)?.start,
+                    match class_name.filter(|_| first && !collects) {
+                        Some(class_name) => StaticBindingKind::PythonReceiver {
+                            class_name: byte_range(class_name)?,
                         },
-                    )?,
-                );
+                        None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
+                            StaticBindingKind::PythonAnnotation { annotation }
+                        }),
+                    },
+                )?);
             }
             first = false;
         }
