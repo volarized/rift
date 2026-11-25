@@ -148,6 +148,47 @@ fn test_python_names_read_as_values_name_their_declaration() {
 }
 
 #[test]
+fn test_python_lexical_reads_follow_definite_deletions() {
+    for (source, expected) in [
+        (
+            "def old(): pass\ndef run():\n    global old\n    saved = old\n    del old\n    return old\n",
+            &["3 main/run reads main/old"][..],
+        ),
+        (
+            "def old(): pass\ndef new(): pass\ndef run():\n    global old\n    del old\n    old = new\n    old()\n    return old\n",
+            &["5 main/run reads main/new", "7 main/run reads main/old"][..],
+        ),
+        (
+            "def outer():\n    def old(): pass\n    def run():\n        nonlocal old\n        saved = old\n        del old\n        return old\n",
+            &["4 main/outer/run reads main/outer/old"][..],
+        ),
+        (
+            "def outer():\n    def old(): pass\n    def new(): pass\n    def run():\n        nonlocal old\n        del old\n        old = new\n        old()\n        return old\n",
+            &[
+                "6 main/outer/run reads main/outer/new",
+                "8 main/outer/run reads main/outer/old",
+            ][..],
+        ),
+        (
+            "def run():\n    def old(): pass\n    saved = old\n    del old\n    return old\n",
+            &["2 main/run reads main/run/old"][..],
+        ),
+        (
+            "def run():\n    def old(): pass\n    del old\n    def old(): pass\n    return old\n",
+            &["4 main/run reads main/run/old"][..],
+        ),
+        (
+            "def old(): pass\ndef run():\n    global old\n    if False:\n        del old\n    return old\n",
+            &["5 main/run reads main/old"][..],
+        ),
+    ] {
+        let (mut found, _) = module(source);
+        found.retain(|access| access.contains(" reads "));
+        assert_eq!(found, expected, "{source}");
+    }
+}
+
+#[test]
 fn test_python_callees_and_stated_names_are_no_reads() {
     assert_reads(&[
         ("f()\n", &[]),

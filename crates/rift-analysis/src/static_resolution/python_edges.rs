@@ -747,6 +747,21 @@ struct NameScope {
     rebound: bool,
 }
 
+impl NameScope {
+    /// A definite deletion in the body that redirects the name to an enclosing scope.
+    fn redirected_deletion(
+        &self,
+        file: &File<'_>,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<(Scope, u64)> {
+        let scope = self.redirected?;
+        let end = file.python_deletion_before(name, scope, position, work)?;
+        Some((scope, end))
+    }
+}
+
 enum ScopeLookup {
     Found(NameScope),
     /// No scope the read reaches binds the name.
@@ -797,11 +812,7 @@ impl<'source> Index<'source> {
     ) -> Option<&'source StaticBinding> {
         // After a definite deletion, only assignments in the deleting body can restore
         // the binding before this use, even when it is stored in an enclosing scope.
-        let redirected_deletion = selected.redirected.and_then(|scope| {
-            file.python_deletion_before(name, scope, position, work)
-                .map(|end| (scope, end))
-        });
-        let (scope, deletion) = match redirected_deletion {
+        let (scope, deletion) = match selected.redirected_deletion(file, name, position, work) {
             Some((scope, end)) => (scope, Some(end)),
             None if selected.rebound => return None,
             None => (

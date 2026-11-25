@@ -127,15 +127,23 @@ impl<'source> Index<'source> {
             .bindings_around(name, range)
             .filter(|binding| !matches!(binding.kind, StaticBindingKind::PythonGuard { .. }))
             .collect::<Vec<_>>();
-        let scope = match file.python_scope(&bindings, range.start, work) {
-            ScopeLookup::Found(selected) => Some(selected.scope),
-            ScopeLookup::Missing => None,
+        let selected = match file.python_scope(&bindings, range.start, work) {
+            ScopeLookup::Found(selected) => selected,
+            ScopeLookup::Missing => return self.python_module_name(file, name, range.start, work),
             ScopeLookup::Blocked => return Name::Refused,
         };
-        // A `global` statement can bind a name that no module statement binds.
-        let Some(scope) = scope.filter(|scope| !scope.module) else {
-            return self.python_module_name(file, name, range.start, work);
+        let scope = selected.scope;
+        let rebound = |work: &mut Work| {
+            self.edge_python_name(file, range, work)
+                .map_or(Name::Refused, Name::Declared)
         };
+        let redirected = selected.redirected_deletion(file, name, range.start, work);
+        if scope.module {
+            if redirected.is_some() {
+                return rebound(work);
+            }
+            return self.python_module_name(file, name, range.start, work);
+        }
         let held = bindings
             .into_iter()
             .filter(|binding| Scope::of(file, binding) == scope)
@@ -143,6 +151,13 @@ impl<'source> Index<'source> {
         let class = file.class_scopes.contains(&scope.range);
         if !class && !held.iter().any(|binding| shares(binding.kind)) {
             return Name::Local;
+        }
+        if redirected.is_some()
+            || file
+                .python_deletion_before(name, scope, range.start, work)
+                .is_some()
+        {
+            return rebound(work);
         }
         // A parameter beside a declaration is a value of its own.
         let parameter = !class
