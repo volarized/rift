@@ -69,6 +69,7 @@ pub(super) struct EdgePythonKinds {
     return_type: u16,
     parameter_list: u16,
     default_value: u16,
+    type_parameter_default: u16,
     loops: [u16; 2],
     /// Compound statements and clauses a class body may define methods under.
     conditional: [u16; 6],
@@ -145,6 +146,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             return_type: field("return_type"),
             parameter_list: field("parameters"),
             default_value: field("value"),
+            type_parameter_default: id("type_parameter_default"),
             loops: [id("for_statement"), id("while_statement")],
             conditional: [
                 id("if_statement"),
@@ -216,6 +218,8 @@ impl EdgePythonKinds {
             }
         } else if id == self.names.type_alias {
             self.edge_type_alias(visited, facts)?;
+        } else if id == self.type_parameter_default {
+            self.edge_type_parameter_default(syntax_element, source, facts, names)?;
         } else if (id == self.global || id == self.nonlocal)
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
@@ -260,6 +264,25 @@ impl EdgePythonKinds {
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts, names)?;
         self.edge_pattern_path(visited, facts)?;
+        Ok(())
+    }
+
+    fn edge_type_parameter_default(
+        &self,
+        parameter: Node<'_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+        names: &mut Names,
+    ) -> Result<(), RiftError> {
+        if let Some(value) = parameter.child_by_field_id(self.default_value) {
+            // Type parameter defaults are evaluated lazily in an annotation scope.
+            facts.unsupported_bindings.push(byte_range(value)?);
+            // The upstream expression grammar can admit a leading splat. Only a tuple of
+            // type variables has the starred default form.
+            names.invalid_type_parameter_default |= source.as_bytes().get(value.start_byte())
+                == Some(&b'*')
+                && parameter.child(0).is_none_or(|prefix| prefix.kind() != "*");
+        }
         Ok(())
     }
 
@@ -352,7 +375,11 @@ impl EdgePythonKinds {
         }
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
-            let mut candidate = Some(parameter);
+            let mut candidate = if parameter.kind_id() == self.type_parameter_default {
+                parameter.child_by_field_id(self.left)
+            } else {
+                Some(parameter)
+            };
             let mut name = None;
             // A declared name sits below `type`, `constrained_type` or `splat_type` wrappers.
             for _ in 0..4 {
@@ -610,6 +637,7 @@ impl EdgePythonKinds {
             && parent.is_some_and(|parent| parent.kind_id() == self.attribute);
         if parent.is_some_and(|parent| {
             parent.kind_id() == self.member_type
+                || self.is_defaulted_type_parameter_name(parent, element)
                 || (in_path
                     && parent
                         .child_by_field_id(self.member)
@@ -712,6 +740,13 @@ impl EdgePythonKinds {
             });
         }
         Ok(())
+    }
+
+    fn is_defaulted_type_parameter_name(&self, parent: Node<'_>, name: Node<'_>) -> bool {
+        parent.kind_id() == self.type_parameter_default
+            && parent
+                .child_by_field_id(self.left)
+                .is_some_and(|binding| binding.id() == name.id())
     }
 
     /// The role of one name of a written type: `a` and `a.b` of `a.b.C` are read to reach

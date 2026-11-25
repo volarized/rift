@@ -29,6 +29,8 @@ enum RustSymbolKind {
     Trait,
     /// Type alias.
     TypeAlias,
+    /// Opaque type declared in a foreign block.
+    ExternType,
     /// Constant.
     Constant,
     /// Static item.
@@ -60,6 +62,7 @@ impl RustSymbolKind {
             Self::Enum => "enum",
             Self::Trait => "trait",
             Self::TypeAlias => "type_alias",
+            Self::ExternType => "extern_type",
             Self::Constant => "constant",
             Self::Static => "static",
             Self::Module => "module",
@@ -77,7 +80,7 @@ impl RustSymbolKind {
     fn kinds(self) -> Vec<SymbolKind> {
         match self {
             Self::Function | Self::Closure => vec![SymbolKind::Value, SymbolKind::Callable],
-            Self::Struct | Self::Enum | Self::Union => vec![SymbolKind::Type],
+            Self::Struct | Self::Enum | Self::Union | Self::ExternType => vec![SymbolKind::Type],
             Self::Trait => vec![
                 SymbolKind::Type,
                 SymbolKind::Implementable,
@@ -107,9 +110,12 @@ impl RustSymbolKind {
             | Self::Union
             | Self::Impl => Some(RustGrammarField::Body),
             Self::Constant | Self::Static => Some(RustGrammarField::Value),
-            Self::TypeAlias | Self::Macro | Self::Field | Self::AssociatedType | Self::Closure => {
-                None
-            }
+            Self::TypeAlias
+            | Self::ExternType
+            | Self::Macro
+            | Self::Field
+            | Self::AssociatedType
+            | Self::Closure => None,
         }
     }
 }
@@ -151,6 +157,8 @@ enum RustGrammarSyntaxKind {
     TraitItem,
     /// `type_item` declaration.
     TypeItem,
+    /// Opaque type under an extern block.
+    ExternTypeItem,
     /// `visibility_modifier` marker on one declaration.
     VisibilityModifier,
     /// `field_declaration`: one named field.
@@ -186,6 +194,7 @@ impl RustGrammarSyntaxKind {
             Self::StructItem => "struct_item",
             Self::TraitItem => "trait_item",
             Self::TypeItem => "type_item",
+            Self::ExternTypeItem => "extern_type_item",
             Self::VisibilityModifier => "visibility_modifier",
             Self::FieldDeclaration => "field_declaration",
             Self::UnionItem => "union_item",
@@ -214,6 +223,7 @@ impl RustGrammarSyntaxKind {
             Self::EnumVariant => Some(RustSymbolKind::Variant),
             Self::TraitItem => Some(RustSymbolKind::Trait),
             Self::TypeItem => Some(RustSymbolKind::TypeAlias),
+            Self::ExternTypeItem => Some(RustSymbolKind::ExternType),
             Self::ConstItem => Some(RustSymbolKind::Constant),
             Self::StaticItem => Some(RustSymbolKind::Static),
             Self::ModItem => Some(RustSymbolKind::Module),
@@ -1142,6 +1152,52 @@ mod tests {
         let load = text.find("load").expect("fixture contains method") as u64;
         assert!(document.syntax_elements_at(load).len() >= 3);
         assert!(!document.has_errors());
+    }
+
+    #[test]
+    fn test_legacy_try_macros_and_foreign_types_keep_authored_ranges() {
+        let text = "unsafe extern \"C\" { pub type Opaque; fn f(); }\nfn run() { try!(f()); try { leaf(); } }";
+        let document = analyze(text);
+        assert!(!document.has_errors());
+        let opaque = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "Opaque")
+            .expect("opaque type");
+        let function = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("foreign function");
+        assert_eq!(opaque.kind, "extern_type");
+        assert_eq!(opaque.visibility.as_deref(), Some("pub"));
+        assert_eq!(function.visibility.as_deref(), Some("private"));
+        assert_eq!(
+            text_at(text, function.name_range.expect("function range")),
+            "f"
+        );
+        let static_facts = document.facts().static_facts().expect("Rust static facts");
+        assert_eq!(
+            static_facts
+                .unsupported_bindings()
+                .iter()
+                .map(|range| text_at(text, *range))
+                .collect::<Vec<_>>(),
+            ["try!(f())"]
+        );
+        let query =
+            RustQuery::new("(try_block) @block (macro_invocation macro: (identifier) @macro)")
+                .expect("Rust query");
+        assert_eq!(
+            query
+                .captures(text, 8)
+                .expect("grammar captures")
+                .iter()
+                .map(|capture| (capture.name.as_str(), text_at(text, capture.range)))
+                .collect::<Vec<_>>(),
+            [("macro", "try"), ("block", "try { leaf(); }")]
+        );
+        assert!(analyze("fn broken() { try!(leaf() }").has_errors());
     }
 
     #[test]

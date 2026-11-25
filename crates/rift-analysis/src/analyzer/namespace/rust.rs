@@ -729,7 +729,9 @@ pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
             return None;
         }
         let metadata: CargoMetadata = toml::from_str(source.text()).ok()?;
-        let package = metadata.package?;
+        let package = metadata
+            .package
+            .or_else(|| metadata.project?.try_into().ok())?;
         if package.name != *name || package.version != *version {
             continue;
         }
@@ -867,6 +869,8 @@ fn crate_name_is_valid(name: &str) -> bool {
 #[derive(Deserialize)]
 struct CargoMetadata {
     package: Option<CargoPackage>,
+    // Cargo reads the legacy project section only when the manifest has no package section.
+    project: Option<toml::Table>,
     lib: Option<CargoLibrary>,
 }
 

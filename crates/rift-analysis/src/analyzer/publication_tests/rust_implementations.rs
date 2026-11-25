@@ -354,3 +354,57 @@ fn assert_defined(modules: &[(&str, &str)], defined: &Defined<'_>) {
         });
     assert_eq!(document, defined.document, "{modules:?}");
 }
+
+#[test]
+fn supported_rust_forms_keep_their_neighboring_package_calls() {
+    const PREFIX: &str = "pub struct U; impl U { pub fn k(&self) -> Result<u32, u32> { Ok(1) } } pub struct Held { a: u8, b: u8 } pub fn leaf() {}";
+    const AFTER: &str = "pub fn after(u: U) -> Result<u32,u32> { leaf(); u.k() }";
+    for (body, leaf_calls, foreign) in [
+        (
+            "pub fn run(u: U) -> Result<u32,u32> { leaf(); try!(u.k()); u.k() }",
+            1,
+            false,
+        ),
+        (
+            "pub fn run(u: U, held: Held) { leaf(); let Held { a, #[cfg(all())] b } = held; let _ = u.k(); }",
+            1,
+            false,
+        ),
+        (
+            "pub fn run(u: U) { leaf(); { let Held { a, #[cfg(all())] b } = Held { a: 1, b: 2 }; leaf(); } let _ = u.k(); }",
+            2,
+            false,
+        ),
+        (
+            "unsafe extern \"C\" { pub type Opaque; fn f(); } pub fn run(u: U) { leaf(); unsafe { f(); } let _ = u.k(); }",
+            1,
+            true,
+        ),
+    ] {
+        let source = format!("{PREFIX}\n{body}\n{AFTER}");
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::Rust,
+            vec![("src/lib.rs", &source)],
+            None,
+            Some(("Cargo.toml", "[package]\nname='beacon'\nversion='1.0.0'\n")),
+        )
+        .expect("Rust package");
+        let publication = analysis.publication();
+        let count = |caller: &str, callee: &str| {
+            publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds.contains(&EdgeKind::Calls)
+                        && edge.from.as_str().ends_with(caller)
+                        && edge.to.as_str().ends_with(callee)
+                })
+                .count()
+        };
+        assert_eq!(count("/run", "/leaf"), leaf_calls, "{body}");
+        assert_eq!(count("/run", "/U/k"), 1, "{body}");
+        assert_eq!(count("/after", "/leaf"), 1, "{body}");
+        assert_eq!(count("/after", "/U/k"), 1, "{body}");
+        assert_eq!(count("/run", "/f"), usize::from(foreign), "{body}");
+    }
+}

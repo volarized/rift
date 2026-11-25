@@ -12,6 +12,84 @@ use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, Publicat
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
 
 #[test]
+fn package_preserves_python_edges_beside_type_parameter_defaults() {
+    let prefix = "import math\ndef leaf(): pass\ndef f(): leaf()\n";
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let report = |suffix| {
+        let source = format!("{prefix}{suffix}");
+        publication(&[("click.py", &source)], None, &["click"])
+    };
+    let f = format!("{module}/f");
+    let leaf = format!("{module}/leaf");
+    for (suffix, bound) in [
+        ("class A[T: int]: pass\n", true),
+        ("class A[T = int]: pass\n", false),
+        ("class A[T: int = int]: pass\n", true),
+        (
+            "def identity[T = leaf()](value: T) -> T: return value\n",
+            false,
+        ),
+        ("type Values[T = int] = list[T]\n", false),
+        (
+            "class A[*Ts = *tuple[int, str], **P = [int, str]]: pass\n",
+            false,
+        ),
+    ] {
+        let result = report(suffix);
+        let calls = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Calls])
+            .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(calls, [(f.as_str(), leaf.as_str())], "{suffix}");
+        assert!(
+            !result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.from.as_str().ends_with("/identity")
+                    && edge.to.as_str() == leaf
+            }),
+            "{suffix}"
+        );
+        assert_eq!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::HasType]
+                    && edge.from.as_str().ends_with("/A")
+                    && edge.to.as_str().ends_with("/builtins/int")
+            }),
+            bound,
+            "{suffix}"
+        );
+        for member in [&f, &leaf] {
+            assert!(
+                result.edges.iter().any(|edge| {
+                    edge.kinds == [EdgeKind::Contains]
+                        && edge.from.as_str() == module
+                        && edge.to.as_str() == member.as_str()
+                }),
+                "{suffix}"
+            );
+        }
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| { edge.kinds == [EdgeKind::Imports] && edge.from.as_str() == module }),
+            "{suffix}"
+        );
+    }
+    for suffix in [
+        "class A[T = : pass\n",
+        "class A[41 = int]: pass\n",
+        "class A[T = *tuple[int]]: pass\n",
+        "class A[**P = *tuple[int]]: pass\n",
+        "def invalid(value: list[T = int]): pass\n",
+    ] {
+        assert!(report(suffix).edges.is_empty(), "{suffix}");
+    }
+}
+
+#[test]
 fn package_stores_typescript_imported_type_uses_at_each_written_site() {
     use rift_protocol::read::EdgeProvider;
 
