@@ -5,7 +5,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::EdgeKind;
 use std::collections::{BTreeMap, BTreeSet};
 
-const MAIN: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#;
+pub(super) const MAIN: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#;
 const EXPORTS: &str = r#"{"name":"beacon","version":"1.0.0","exports":"./index.js"}"#;
 const ENTRY: &str = "var inner = require('./lib/inner');
 module.exports = function load() { return inner() };
@@ -78,14 +78,14 @@ pub(super) fn edges(analysis: &PackageAnalysis) -> BTreeSet<(Vec<String>, EdgeKi
         .collect()
 }
 
-fn path(segments: &[&str]) -> Vec<String> {
+pub(super) fn path(segments: &[&str]) -> Vec<String> {
     segments
         .iter()
         .map(|segment| (*segment).to_owned())
         .collect()
 }
 
-fn public(analysis: &PackageAnalysis, segments: &[&str], file: &str) -> Option<bool> {
+pub(super) fn public(analysis: &PackageAnalysis, segments: &[&str], file: &str) -> Option<bool> {
     declared(analysis)
         .get(&(path(segments), file.to_owned()))
         .copied()

@@ -72,6 +72,7 @@ pub(super) fn record<'tree>(
             ));
         }
         let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
+            record_conditional_forward(syntax_element, source.text, kinds, bindings)?;
             continue;
         };
         if binding.kind == SyntaxExportKind::Named && !body.keeps(syntax_element) {
@@ -463,15 +464,7 @@ fn record_calls(
             }
             bindings.insert(
                 call.id(),
-                SyntaxExportBinding {
-                    kind: SyntaxExportKind::All,
-                    range: extract::byte_range(call)?,
-                    local: None,
-                    exported: None,
-                    source: Some(extract::byte_range(target)?),
-                    container: None,
-                    type_only: false,
-                },
+                forward_binding(extract::byte_range(call)?, target)?,
             );
             continue;
         }
@@ -1227,36 +1220,79 @@ fn assignment(
             type_only: false,
         }));
     }
-    if value.kind() != "call_expression"
-        || value
-            .child_by_field_name("function")
-            .and_then(|function| source.get(function.byte_range()))
-            != Some("require")
-    {
-        return Ok(None);
+    if let Some(module) = required_module(value, source) {
+        return Ok(Some(forward_binding(range, module)?));
     }
-    let Some(arguments) = value.child_by_field_name("arguments") else {
+    // `module.exports = require("./module").name` exports that export of the module.
+    let property = kinds
+        .child(value, EcmaScriptGrammarField::Property)
+        .filter(|property| {
+            value.kind_id() == kinds.member_expression
+                && property.kind_id() == kinds.property_identifier
+        });
+    let module = kinds
+        .child(value, EcmaScriptGrammarField::Object)
+        .and_then(|object| required_module(object, source));
+    let (Some(property), Some(module)) = (property, module) else {
         return Ok(None);
     };
-    let mut arguments = named_children(arguments);
-    let Some(argument) = arguments
-        .next()
-        .filter(|argument| argument.kind() == "string")
-    else {
-        return Ok(None);
-    };
-    if arguments.next().is_some() {
-        return Ok(None);
-    }
     Ok(Some(SyntaxExportBinding {
+        kind: SyntaxExportKind::Default,
+        local: Some(extract::byte_range(property)?),
+        ..forward_binding(range, module)?
+    }))
+}
+
+/// All exports of a required module.
+fn forward_binding(
+    range: crate::ByteRange,
+    module: Node<'_>,
+) -> Result<SyntaxExportBinding, RiftError> {
+    Ok(SyntaxExportBinding {
         kind: SyntaxExportKind::All,
         range,
         local: None,
         exported: None,
-        source: Some(extract::byte_range(argument)?),
+        source: Some(extract::byte_range(module)?),
         container: None,
         type_only: false,
-    }))
+    })
+}
+
+/// `module.exports = condition ? require("./a") : require("./b")`: one forward for each
+/// module, over one assignment.
+fn record_conditional_forward(
+    assignment: Node<'_>,
+    source: &str,
+    kinds: &EcmaScriptKinds,
+    bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
+) -> Result<(), RiftError> {
+    let left = kinds.child(assignment, EcmaScriptGrammarField::Left);
+    if left.and_then(|left| kinds.export_target(left, source)) != Some(ExportTarget::Module) {
+        return Ok(());
+    }
+    let Some(value) = kinds
+        .child(assignment, EcmaScriptGrammarField::Right)
+        .map(|value| kinds.expression_value(value))
+        .filter(|value| value.kind() == "ternary_expression")
+    else {
+        return Ok(());
+    };
+    let branches = ["consequence", "alternative"].map(|field| {
+        value
+            .child_by_field_name(field)
+            .map(|branch| kinds.expression_value(branch))
+            .and_then(|branch| Some((branch, required_module(branch, source)?)))
+    });
+    if let [Some(first), Some(second)] = branches {
+        for (branch, module) in [first, second] {
+            bindings.insert(
+                branch.id(),
+                forward_binding(extract::byte_range(assignment)?, module)?,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `exports.name = value`: an identifier exports the declaration it names, a chain ending
