@@ -10,7 +10,7 @@ use super::{EdgePythonKinds, edge_enclosing};
 use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
 use crate::static_analysis::{
-    StaticBinding, StaticBindingKind, StaticFactsParts, StaticReference, kind,
+    PythonDeletion, StaticBinding, StaticBindingKind, StaticFactsParts, StaticReference, kind,
 };
 
 /// Syntax elements around a name that state its use.
@@ -236,6 +236,15 @@ impl EdgePythonKinds {
                 available_from: binding.scope.start,
                 ..binding
             });
+            if scope.kind_id() == self.scopes[1]
+                && let Some(block) = edge_enclosing(visited, &[self.block])
+            {
+                facts.python_deletions.push(PythonDeletion {
+                    name: binding.name,
+                    function: binding.scope,
+                    block: byte_range(block)?,
+                });
+            }
         }
         names.writes.push((range, binding.scope, name_use));
         Ok(())

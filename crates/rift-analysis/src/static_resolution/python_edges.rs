@@ -797,10 +797,37 @@ impl<'source> Index<'source> {
         position: u64,
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
+        let deletion = file.python_deletion_before(name, scope, position, work);
+        if work.exhausted {
+            return None;
+        }
         let later = later_bindings(file, bindings, scope, position, work)?;
         let candidates = bindings.iter().copied().filter(|binding| {
-            Scope::of(file, binding) == scope && !later.contains(&binding.name.start)
+            Scope::of(file, binding) == scope
+                && !later.contains(&binding.name.start)
+                && deletion.is_none_or(|end| {
+                    end <= binding.name.start
+                        && binding.name.end <= position
+                        && match binding.kind {
+                            // An assignment with a value extends past its annotation.
+                            StaticBindingKind::PythonAnnotation { annotation } => {
+                                file.target_at(binding.name).is_some_and(|target| {
+                                    annotation.end < target.symbol.item_range.end
+                                })
+                            }
+                            _ => true,
+                        }
+                })
         });
+        if deletion.is_some() {
+            // A guard can narrow a rebound value. It cannot give a deleted name a value.
+            let rebound = candidates.clone().any(|binding| {
+                !work.charge() || !matches!(binding.kind, StaticBindingKind::PythonGuard { .. })
+            });
+            if !rebound || work.exhausted {
+                return None;
+            }
+        }
         let selected = match self.python_binding_group(file, candidates.clone(), work) {
             Some(selected) => selected,
             None => self
@@ -816,6 +843,41 @@ impl<'source> Index<'source> {
 }
 
 impl File<'_> {
+    /// The last deletion before a read in the same function and block.
+    fn python_deletion_before(
+        &self,
+        name: &str,
+        scope: Scope,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<u64> {
+        let deletions = self.python_deletions.get(&(name, scope.range))?;
+        let end = position.checked_add(1)?;
+        let callable = self.enclosing_callable(ByteRange {
+            start: position,
+            end,
+        })?;
+        if callable.symbol.item_range != scope.range
+            || callable
+                .symbol
+                .body_range
+                .is_none_or(|body| !body.contains(position))
+            || self.python_expressions.resolve(position, end).is_some()
+        {
+            return None;
+        }
+        let mut latest = None;
+        for deletion in deletions {
+            if !work.charge() {
+                return None;
+            }
+            if deletion.name.end <= position && deletion.block.contains(position) {
+                latest = latest.max(Some(deletion.name.end));
+            }
+        }
+        latest
+    }
+
     /// The scope a read at `position` finds a name of `bindings` in.
     fn python_scope(
         &self,

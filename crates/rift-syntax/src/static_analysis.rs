@@ -467,6 +467,8 @@ pub struct StaticFactsParts {
     /// Python scopes and the parts of each that the enclosing scope evaluates. Includes
     /// function defaults evaluated outside the type parameter scope.
     pub evaluated_outside: Vec<(ByteRange, ByteRange)>,
+    /// Python names deleted in a function, with the function and the block that deletes them.
+    pub python_deletions: Vec<PythonDeletion>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -477,6 +479,17 @@ pub struct StaticFactsParts {
 /// Calls and binding evidence retained after the syntax tree is released.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFacts(StaticFactsParts);
+
+/// A Python `del` target and the block in its function that executes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonDeletion {
+    /// The deleted name.
+    pub name: ByteRange,
+    /// The function that contains the statement.
+    pub function: ByteRange,
+    /// The block that contains the statement.
+    pub block: ByteRange,
+}
 
 impl StaticFacts {
     /// Whether captured ECMAScript syntax requires module interpretation without an explicit mode.
@@ -758,6 +771,12 @@ impl StaticFacts {
         &self.0.evaluated_outside
     }
 
+    /// Python `del` targets and their function and block.
+    #[must_use]
+    pub fn python_deletions(&self) -> &[PythonDeletion] {
+        &self.0.python_deletions
+    }
+
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     #[must_use]
     pub fn non_none_guards(&self) -> &[(ByteRange, ByteRange)] {
@@ -805,6 +824,7 @@ impl StaticFacts {
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
             vector_capacity(&self.0.evaluated_outside),
+            vector_capacity(&self.0.python_deletions),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_writes),
             vector_capacity(&self.0.skippable),
@@ -869,6 +889,7 @@ impl StaticFacts {
             self.loops().len(),
             self.expression_scopes().len(),
             self.evaluated_outside().len(),
+            self.python_deletions().len(),
             self.non_none_guards().len(),
             self.commonjs_writes().len(),
             self.skippable().len(),
@@ -1109,6 +1130,13 @@ impl StaticFacts {
                 .evaluated_outside()
                 .iter()
                 .all(|(scope, iterable)| valid(*iterable) && contains(*scope, *iterable))
+            && self.python_deletions().iter().all(|deletion| {
+                valid(deletion.function)
+                    && valid(deletion.block)
+                    && valid(deletion.name)
+                    && contains(deletion.function, deletion.block)
+                    && contains(deletion.block, deletion.name)
+            })
             && self
                 .non_none_guards()
                 .iter()
