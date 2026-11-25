@@ -93,19 +93,55 @@ pub(super) fn declaration_start(visited: Visited<'_, '_>, text: &str) -> usize {
         })
 }
 
-/// Whether one of the declaration's attached outer attributes is `#[<name>]`.
-///
-/// The attribute's own text between `#[` and `]` is compared whole, so
-/// `#[macro_export]` matches `macro_export` and `#[macro_export(local_inner_macros)]`
-/// does not; the run is the one [`declaration_start`] extends over.
-pub(super) fn has_attached_attribute(visited: Visited<'_, '_>, text: &str, name: &str) -> bool {
+/// Whether a macro carries a direct `macro_export` outer attribute.
+pub(super) fn exports_macro(visited: Visited<'_, '_>, text: &str) -> bool {
+    outer_attributes(visited).any(|item| {
+        let mut cursor = item.walk();
+        let Some(attribute) = item
+            .named_children(&mut cursor)
+            .find(|child| !child.is_extra())
+            .filter(|child| child.kind() == "attribute")
+        else {
+            return false;
+        };
+        if item.has_error()
+            || semantic_attribute_name(attribute, text) != Some("macro_export")
+            || attribute.child_by_field_name("value").is_some()
+        {
+            return false;
+        }
+        let Some(arguments) = attribute.child_by_field_name("arguments") else {
+            return true;
+        };
+        let mut cursor = arguments.walk();
+        let mut tokens = arguments
+            .children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .map(|child| text.get(child.byte_range()).unwrap_or_default());
+        if tokens.next() != Some("(") || tokens.next() != Some("local_inner_macros") {
+            return false;
+        }
+        let mut close = tokens.next();
+        if close == Some(",") {
+            close = tokens.next();
+        }
+        close == Some(")") && tokens.next().is_none()
+    })
+}
+
+fn outer_attributes<'walk, 'tree>(
+    visited: Visited<'walk, 'tree>,
+) -> impl Iterator<Item = Node<'tree>> + use<'walk, 'tree> {
     let kinds = attachment_kinds();
-    attached_run(visited, text)
-        .into_iter()
-        .any(|(sibling, sibling_text)| {
-            sibling.kind_id() == kinds.attribute_item
-                && attribute_name(sibling_text).is_some_and(|attribute| attribute == name)
-        })
+    std::iter::successors(visited.previous_sibling(), |sibling| {
+        sibling.previous_sibling()
+    })
+    .map(Visited::syntax_element)
+    .take_while(|sibling| {
+        let kind = sibling.kind_id();
+        kind == kinds.attribute_item || kind == kinds.line_comment || kind == kinds.block_comment
+    })
+    .filter(|sibling| sibling.kind_id() == kinds.attribute_item)
 }
 
 /// Captures semantic module attributes independently of documentation attachment gaps.
@@ -113,7 +149,6 @@ pub(super) fn module_path(
     visited: Visited<'_, '_>,
     text: &str,
 ) -> Result<crate::RustModulePath, RiftError> {
-    let kinds = attachment_kinds();
     if let Some(body) = visited.syntax_element().child_by_field_name("body") {
         let mut cursor = body.walk();
         for syntax_element in body.named_children(&mut cursor) {
@@ -143,18 +178,7 @@ pub(super) fn module_path(
         }
     }
     let mut state = crate::RustModulePath::Absent;
-    let mut previous = visited.previous_sibling();
-    while let Some(sibling) = previous {
-        let syntax_element = sibling.syntax_element();
-        if syntax_element.kind_id() == kinds.line_comment
-            || syntax_element.kind_id() == kinds.block_comment
-        {
-            previous = sibling.previous_sibling();
-            continue;
-        }
-        if syntax_element.kind_id() != kinds.attribute_item {
-            break;
-        }
+    for syntax_element in outer_attributes(visited) {
         let Some(attribute) = syntax_element
             .named_child(0)
             .filter(|syntax_element| syntax_element.kind() == "attribute")
@@ -183,7 +207,6 @@ pub(super) fn module_path(
             "cfg_attr" if documentation_cfg_attribute(attribute, text) => {}
             _ => return Ok(crate::RustModulePath::Unknown),
         }
-        previous = sibling.previous_sibling();
     }
     Ok(state)
 }
@@ -294,15 +317,6 @@ fn literal_path(attribute: Node<'_>, text: &str) -> Result<crate::RustModulePath
         path,
         range: extract::byte_range(content)?,
     })
-}
-
-/// The name inside `#[...]`, trimmed; `None` for text that is not an attribute item.
-fn attribute_name(attribute_text: &str) -> Option<&str> {
-    attribute_text
-        .trim()
-        .strip_prefix("#[")
-        .and_then(|inner| inner.strip_suffix(']'))
-        .map(str::trim)
 }
 
 /// The attached outer attributes and doc comments standing before the

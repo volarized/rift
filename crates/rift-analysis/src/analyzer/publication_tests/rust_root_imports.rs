@@ -24,6 +24,42 @@ fn analyze_rust_root(files: Vec<(&str, &str)>, manifest: &str) -> PackageAnalysi
 }
 
 #[test]
+fn package_publishes_direct_macro_export_visibility() {
+    let source = "#[macro_export]\nmacro_rules! plain_export { () => { 8u8 }; }\n\
+                  #[macro_export (/* comment */ local_inner_macros, )]\n\n\
+                  // comment\nmacro_rules! qualified_export { () => { 7u8 }; }\n\
+                  #[cfg_attr(any(), macro_export(local_inner_macros))]\n\
+                  macro_rules! conditional { () => { 9u8 }; }\n\
+                  macro_rules! private_macro { () => { 0u8 }; }\n";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid package facts");
+    let [unit] = publication.units.as_slice() else {
+        panic!("one published source unit");
+    };
+    let macros = publication
+        .declarations
+        .iter()
+        .filter(|row| row.syntax_element_kind.as_deref() == Some("macro_definition"))
+        .collect::<Vec<_>>();
+    assert_eq!(macros.len(), 4);
+    for (name, public) in [
+        ("plain_export", true),
+        ("qualified_export", true),
+        ("conditional", false),
+        ("private_macro", false),
+    ] {
+        let id = format!("{ROOT}/{name}");
+        let declaration = macros
+            .iter()
+            .find(|row| row.symbol.as_str() == id)
+            .expect("published macro declaration");
+        assert_eq!(declaration.unit, unit.unit);
+        assert_eq!(declaration.public, public, "{name}");
+    }
+}
+
+#[test]
 fn library_root_publishes_stored_external_import_and_preserves_authored_rows() {
     let (publication, files, semantics, _) = analyze_rust_root(
         vec![("src/lib.rs", SOURCE), ("src/sibling.rs", SIBLING)],
@@ -213,6 +249,7 @@ use crate::root_export as root_import;
 const NAMED_MACRO_IMPORT_CONSUMER: &str = r"
 use crate::definitions::{source, source as alias};
 use crate::root_export as exported;
+use crate::local_export as local;
 use crate::definitions::hidden;
 use crate::opaque::uncertain;
 pub fn before_shadow() -> u8 { alias!() }
@@ -227,6 +264,8 @@ macro_rules! hidden { () => { 3u8 }; }
 use hidden;
 #[macro_export]
 macro_rules! root_export { () => { 4u8 }; }
+#[macro_export(local_inner_macros)]
+macro_rules! local_export { () => { 9u8 }; }
 ";
 
 const NAMED_MACRO_IMPORT_OPAQUE: &str = r"
@@ -286,6 +325,11 @@ fn named_macro_imports_keep_the_written_path_and_defining_module() {
     assert_eq!(
         imports,
         [
+            (
+                "src/consumer.rs",
+                "crate::local_export",
+                "definitions/local_export"
+            ),
             (
                 "src/consumer.rs",
                 "crate::root_export",

@@ -896,9 +896,6 @@ fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
     Some(name)
 }
 
-/// The attribute that exports a `macro_rules!` macro from its crate.
-const MACRO_EXPORT_ATTRIBUTE: &str = "macro_export";
-
 /// A declaration's visibility: its `visibility_modifier`, or, for a `macro_rules!`
 /// macro that carries no modifier, `pub` when `#[macro_export]` is attached.
 fn declared_visibility(
@@ -909,7 +906,7 @@ fn declared_visibility(
     let authored = declaration_visibility(visited.syntax_element(), text);
     if kind == RustSymbolKind::Macro
         && authored == RustVisibility::Private
-        && attachment::has_attached_attribute(visited, text, MACRO_EXPORT_ATTRIBUTE)
+        && attachment::exports_macro(visited, text)
     {
         return RustVisibility::Public;
     }
@@ -1569,6 +1566,10 @@ mod tests {
         let document = analyze(
             "#[macro_export]\nmacro_rules! shown { () => {}; }\n\
              #[macro_export(local_inner_macros)]\nmacro_rules! local { () => {}; }\n\
+             #[macro_export (/* comment */ local_inner_macros, )]\n\n\
+             // comment\nmacro_rules! across_comment { () => {}; }\n\
+             #[cfg_attr(any(), macro_export(local_inner_macros))]\n\
+             macro_rules! conditional { () => {}; }\n\
              macro_rules! hidden { () => {}; }\n",
         );
         let visibilities = document
@@ -1580,11 +1581,22 @@ mod tests {
             visibilities,
             [
                 ("shown", Some("pub")),
-                ("local", Some("private")),
+                ("local", Some("pub")),
+                ("across_comment", Some("pub")),
+                ("conditional", Some("private")),
                 ("hidden", Some("private")),
             ]
         );
-        assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
+        assert!(
+            document.symbols()[..3]
+                .iter()
+                .all(|symbol| symbol.kinds.contains(&SymbolKind::Public))
+        );
+        assert!(
+            document.symbols()[3..]
+                .iter()
+                .all(|symbol| !symbol.kinds.contains(&SymbolKind::Public))
+        );
     }
 
     #[test]
