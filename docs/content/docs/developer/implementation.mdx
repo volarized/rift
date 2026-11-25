@@ -1584,7 +1584,8 @@ only when a named file re-exports it.
 In a paired module the stub defines the public set, and a stub declaration with no implementation
 answers from the stub alone.
 
-Two publications are comparable by their own fields. `format_revision` states the shape;
+Two publications are comparable by their own fields. `format_revision`, which is `6`, states the
+shape; a consumer refuses another value.
 `analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
 version and checksum and the content digest of every source file that decides what a
 publication holds: all Rust source in `rift-core`, `rift-analysis`, `rift-index`, `rift-provider`,
@@ -1602,6 +1603,10 @@ The analyzer manifest is generated beside the served schemas and committed at
 that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
 exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
+`documentation.coverage` always states `fields_omitted`: the headings, languages, links, and
+reference spellings left out of parsed documentation sources, as `limit_exceeded` and
+`omitted_range` counts. Either count is zero when no field was left out for that reason.
+
 ### External producer facts
 
 <VersionBadge version="v0.0.73" />
@@ -1610,7 +1615,7 @@ The shipped syntax providers see one file at a time, so the edges package analys
 finds stop where a language's own resolution would go further. An external producer - a
 program or script outside Rift, for one language - reads a package's source and writes facts
 Rift imports into the same `PackagePublication`. Rift neither runs nor ships producers, and
-`format_revision` 5 carries what they write:
+the publication carries what they write:
 
 - `producer` on an edge or an occurrence names the program that emitted it: a `name`
   such as `demo-indexer` and a `revision` such as `0.6.1`. A fact without `producer` came from

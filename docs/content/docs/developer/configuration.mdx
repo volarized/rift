@@ -314,7 +314,11 @@ The collection bounds apply to local documentation and exact-package documentati
 - `max_mappings` caps the ranking identity mappings that layer holds, 1 to 300000000
 
 The collector leaves out a source whose parsing or facts pass a bound and retains a warning within
-`max_warnings`. A selected-source count past `max_sources` refuses collection. Attached comments
+`max_warnings`. A heading, language, destination, or reference spelling past `max_text`, or a
+heading past `max_heading_depth`, is left out on its own: its block and source stay. The collection's
+coverage counts every field left out, also past `max_warnings`, as `fields_omitted.limit_exceeded`,
+and a field its block cannot place as `fields_omitted.omitted_range`. A Markdown heading's name holds the
+names of the headings above it, so `max_text` bounds them together. A selected-source count past `max_sources` refuses collection. Attached comments
 use the declaration syntax pass, whose parsing bounds come from [`[providers.syntax]`](#providers).
 
 A documentation layer maps ranking identities to their documentation blocks. Its block and mapping
