@@ -58,8 +58,8 @@ pub(crate) struct PreparedNamespace {
     pub(crate) exports: Vec<ExportBinding>,
     pub(crate) alias_visibilities: BTreeMap<SymbolId, String>,
     pub(crate) unresolved_exports: bool,
-    /// Files with a module no consumer imports by path, because an `exports` map names the
-    /// package's entries, each with the names of the ambient modules it declares.
+    /// Files whose declarations require an export alias or an ambient module name to be
+    /// public, with the names of their ambient modules.
     pub(crate) unreached_modules: BTreeMap<String, BTreeSet<String>>,
     /// Original file paths no namespace reaches by construction: their declarations carry
     /// no identity because the language assigns none there, not because analysis failed.
