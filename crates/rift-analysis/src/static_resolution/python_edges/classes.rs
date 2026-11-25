@@ -565,6 +565,7 @@ impl<'source> Index<'source> {
             .container
             .as_deref()
             .and_then(|name| file.qualified_target(name))
+            .filter(|container| container.symbol.kinds.contains(&SymbolKind::Constructible))
         else {
             return false;
         };

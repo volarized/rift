@@ -7,7 +7,9 @@ use tree_sitter::Language;
 
 use super::{EdgePythonKinds, edge_enclosing};
 use crate::extract::{Visited, byte_range};
-use crate::static_analysis::{StaticBinding, StaticBindingKind, StaticFactsParts, kind};
+use crate::static_analysis::{
+    PythonDeletion, StaticBinding, StaticBindingKind, StaticFactsParts, kind,
+};
 
 /// Syntax elements around a name that state its use.
 pub(super) struct NameKinds {
@@ -120,10 +122,21 @@ impl EdgePythonKinds {
         let binding = self.scoped_binding(name, scope, end, StaticBindingKind::Shadow)?;
         match target {
             NameTarget::Bound => facts.bindings.push(binding),
-            NameTarget::Deleted => names.deleted.push(StaticBinding {
-                available_from: binding.scope.start,
-                ..binding
-            }),
+            NameTarget::Deleted => {
+                names.deleted.push(StaticBinding {
+                    available_from: binding.scope.start,
+                    ..binding
+                });
+                if scope.kind_id() == self.scopes[1]
+                    && let Some(block) = edge_enclosing(visited, &[self.block])
+                {
+                    facts.python_deletions.push(PythonDeletion {
+                        name: binding.name,
+                        function: binding.scope,
+                        block: byte_range(block)?,
+                    });
+                }
+            }
         }
         Ok(())
     }
