@@ -925,6 +925,8 @@ struct TarExtension {
     /// Whether a PAX header of the next member was read.
     local: bool,
     long_name: Option<Vec<u8>>,
+    /// Whether a GNU target header belongs to the next link.
+    long_link: bool,
     path: Option<Vec<u8>>,
     size: Option<Vec<u8>>,
     /// Whether two PAX sizes name different quantities.
@@ -962,6 +964,11 @@ impl TarExtension {
             self.long_name = Some(name);
             return Ok(());
         }
+        if kind.is_gnu_longlink() {
+            // The next link is skipped. The entry loop drains the bounded target bytes.
+            self.long_link = true;
+            return Ok(());
+        }
         self.local |= !global;
         let mut payload =
             vec![0; usize::try_from(entry.limit()).map_err(|_| ArchiveError::InvalidArchive)?];
@@ -988,7 +995,7 @@ impl TarExtension {
 
     /// Whether an extended header of the next member was read.
     fn pending(&self) -> bool {
-        self.local || self.long_name.is_some()
+        self.local || self.long_name.is_some() || self.long_link
     }
 
     /// Keeps the first PAX size and whether another one differs from it.
@@ -1119,6 +1126,7 @@ fn read_tar_entries(
         }
         if (kind.is_pax_local_extensions() && extended.local)
             || (kind.is_gnu_longname() && extended.long_name.is_some())
+            || (kind.is_gnu_longlink() && extended.long_link)
         {
             return Err(ArchiveError::InvalidArchive);
         }
@@ -1138,7 +1146,8 @@ fn read_tar_entries(
             extended.read(kind, &mut entry)?;
         } else {
             // A different PAX size would make another reader use different member boundaries.
-            if extended.disagrees(size) {
+            // A GNU long target header belongs to a link member.
+            if extended.disagrees(size) || (extended.long_link && !link) {
                 return Err(ArchiveError::InvalidArchive);
             }
             if read.is_ok() {
@@ -1171,7 +1180,8 @@ fn is_extended_header(header: &tar::Header) -> bool {
     let kind = header.entry_type();
     let recognized = header.as_gnu().is_some() || header.as_ustar().is_some();
     kind.is_pax_global_extensions()
-        || (recognized && (kind.is_gnu_longname() || kind.is_pax_local_extensions()))
+        || (recognized
+            && (kind.is_gnu_longname() || kind.is_gnu_longlink() || kind.is_pax_local_extensions()))
 }
 
 fn push_tar_member(
