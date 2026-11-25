@@ -84,6 +84,20 @@ pub(crate) fn invalid_declarations(
                 .flatten(),
             // Zero in JavaScript, which has no object type.
             members: grammar.id_for_node_kind("object_type", true),
+            // A Rust declaration is named apart from the generic arguments of the types it
+            // writes and from its where clause. Both kinds are zero in other grammars.
+            unnamed: if *language == ShippedLanguage::Rust.language() {
+                ["type_arguments", "where_clause"].map(|kind| {
+                    let id = grammar.id_for_node_kind(kind, true);
+                    assert_ne!(
+                        id, 0,
+                        "shipped grammar must define header element: kind={kind}"
+                    );
+                    id
+                })
+            } else {
+                [0; 2]
+            },
         },
     )
 }
@@ -99,6 +113,8 @@ struct HeaderRules {
     value: Option<NonZeroU16>,
     /// Kind of a braced member list that can be a declaration's whole value.
     members: u16,
+    /// Kinds of elements that name no part of the declaration whose header holds them.
+    unnamed: [u16; 2],
 }
 
 fn invalid_ranges(
@@ -178,7 +194,7 @@ fn header_has_error(
         .recovered
         .and_then(|field| syntax_element.child_by_field_id(field.get()));
     if body.is_none() && recovered.is_none() {
-        return syntax_element.has_error();
+        return has_named_error(syntax_element, rules);
     }
     if let Some(function) = function
         && header_children_have_error(function, body, None, rules)
@@ -205,7 +221,27 @@ fn header_children_have_error(
             let header_ended = rules.terminator == Some(child.kind_id()) && !child.is_missing();
             Some(*child) != end && !header_ended
         })
-        .any(|child| child.has_error() && Some(child) != recovered)
+        .any(|child| Some(child) != recovered && has_named_error(child, rules))
+}
+
+/// Whether `element` holds an error outside the elements that name no declaration.
+///
+/// Reads each element below `element` at most once, and only those that hold an error.
+fn has_named_error(element: Node<'_>, rules: HeaderRules) -> bool {
+    if !element.has_error() || rules.unnamed == [0; 2] {
+        return element.has_error();
+    }
+    let mut pending = vec![element];
+    let mut cursor = element.walk();
+    while let Some(element) = pending.pop() {
+        if element.is_error() || element.is_missing() {
+            return true;
+        }
+        if !rules.unnamed.contains(&element.kind_id()) {
+            pending.extend(element.children(&mut cursor).filter(Node::has_error));
+        }
+    }
+    false
 }
 
 // The Rust grammar parses macro matchers as token trees. Their contents do not
@@ -358,6 +394,48 @@ mod tests {
                 .map(|symbol| symbol.name.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(names, expected, "{extension}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn rust_generic_argument_and_where_clause_errors_keep_the_declaration() {
+        // #1099: neither part names the declaration whose header holds it.
+        for (text, expected) in [
+            ("pub type Hours = Ranged<-25, 25>;", &[][..]),
+            ("pub struct Item { hours: Ranged<-25, 25> }", &[][..]),
+            (
+                "fn hours(value: Ranged<-25, 25>) -> Ranged<-1, 1> {}",
+                &[][..],
+            ),
+            ("impl Read for Ranged<-25, 25> {}", &[][..]),
+            ("fn empty() where (): Copy {}", &[][..]),
+            // An error in another part of the header still refuses the declaration.
+            ("fn broken(x: ) {}", &["broken"][..]),
+            ("struct Broken where Item: Sized;", &["Broken"][..]),
+            ("pub type Broken<-1> = Item;", &["Broken"][..]),
+        ] {
+            let path = ProjectPath::new("main.rs").expect("source path");
+            let source = SyntaxSource { path: &path, text };
+            let provider = crate::registry::provider_for_extension("rs").expect("provider");
+            let document = provider
+                .analyze(source, SyntaxLimits::DEFAULT)
+                .expect("source facts");
+            assert!(document.has_errors(), "{text:?}");
+            let ranges = document
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            let invalid = provider
+                .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+                .expect("declaration validation");
+            let names = document
+                .symbols()
+                .iter()
+                .filter(|symbol| invalid.contains(&symbol.item_range))
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected, "{text:?}");
         }
     }
 

@@ -560,6 +560,51 @@ exports.open = open;
 }
 
 #[test]
+fn commonjs_values_bind_a_required_property_and_each_conditional_module() {
+    let bound = |source: &str| {
+        let document = analyze(&JavaScriptSyntaxProvider::default(), source);
+        commonjs_bindings(source, &document)
+            .into_iter()
+            .map(|(kind, _, local, module)| {
+                (kind, local.map(str::to_owned), module.map(str::to_owned))
+            })
+            .collect::<Vec<_>>()
+    };
+    let all = |module: &str| (SyntaxExportKind::All, None, Some(module.to_owned()));
+    for source in [
+        "module.exports = require('./x').K;",
+        "exports = module.exports = require('./x').K;",
+    ] {
+        assert_eq!(
+            bound(source),
+            [(
+                SyntaxExportKind::Default,
+                Some("K".to_owned()),
+                Some("'./x'".to_owned())
+            )],
+            "{source}"
+        );
+    }
+    assert_eq!(
+        bound("module.exports = c ? require('./a') : (require('./b'));"),
+        [all("'./a'"), all("'./b'")]
+    );
+    for source in [
+        "module.exports = c ? require('./a') : other;",
+        "module.exports = c ? require('./a').K : require('./b');",
+        "module.exports = require('./x')[K];",
+        "module.exports = require('./x').K();",
+        "module.exports = require(name).K;",
+        "exports.name = c ? require('./a') : require('./b');",
+    ] {
+        assert!(
+            bound(source).iter().all(|(_, _, module)| module.is_none()),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn commonjs_literals_bind_pairs_no_later_property_replaces() {
     let bound = |literal: &str| {
         let source = format!("module.exports = {literal};\nfunction check() {{}}\n");

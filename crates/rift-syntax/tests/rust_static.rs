@@ -484,3 +484,57 @@ fn test_rust_function_pointer_results_keep_authored_types_and_receivers() {
     );
     assert!(facts.calls().iter().any(|call| matches!(call.callee, rift_syntax::StaticCallee::Member { receiver, member } if text(receiver) == "(table.make)()" && text(member) == "read")));
 }
+
+/// The texts of the places whose calls and bindings the parser could not read.
+fn unsupported(source: &str) -> Vec<&str> {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    document
+        .facts()
+        .static_facts()
+        .expect("static facts")
+        .unsupported_bindings()
+        .iter()
+        .map(|range| {
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")]
+        })
+        .collect()
+}
+
+#[test]
+fn test_rust_unread_source_is_bounded_by_the_element_around_it() {
+    // #1099: the parser closed the element around each place.
+    for (source, expected) in [
+        ("type H = R<-1, 2>;\nfn f() {}\n", &["<-1, 2>"][..]),
+        ("fn h() where (): Copy {}\n", &["()"]),
+        ("extern \"C\" { pub type Opaque; }\n", &["pub type Opaque"]),
+        ("fn f() { let made = try!(u); }\n", &["let made = try!(u);"]),
+    ] {
+        let mut found = unsupported(source);
+        found.dedup();
+        assert_eq!(found, expected, "{source}");
+    }
+    // A delimiter left open by a place moves the end of what stands beside it.
+    let open = unsupported("fn f() { let Held { #[cfg(all())] u, .. } = held; }\nfn g() {}\n");
+    let scope = "{ let Held { #[cfg(all())] u, .. } = held; }";
+    assert!(open.contains(&scope), "{open:?}");
+    assert!(open.iter().all(|place| scope.contains(place)), "{open:?}");
+    let names = (0..65).fold(String::new(), |names, name| names + &format!(" n{name}"));
+    let many = format!("extern \"C\" {{ pub type{names}; }}\n");
+    let found = unsupported(&many);
+    assert!(
+        found
+            .iter()
+            .any(|place| place.starts_with('{') && place.ends_with('}')),
+        "a place with too many names costs its scope: {found:?}"
+    );
+}

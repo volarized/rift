@@ -412,6 +412,7 @@ impl<'source> Index<'source> {
         let resolver = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
+            names: None,
         };
         let value = match binding.kind {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => resolver.resolve(
@@ -571,7 +572,8 @@ impl<'source> Index<'source> {
             file.text(module)?,
             work,
         )?;
-        let imported = super::javascript_exports::module_file(&self.files, &path, true)?;
+        let imported =
+            super::javascript_exports::module_file(&self.files, &self.javascript, &path, true)?;
         self.javascript_import_module_occurrence(file, export.range, imported, work)
     }
 
@@ -613,7 +615,7 @@ impl<'source> Index<'source> {
             Some(written) if written.document.path == terminal.file.path => return None,
             Some(written) => written,
             None if file.document.path.as_str().ends_with(".d.ts") => {
-                super::javascript_exports::module_file(&self.files, &path, true)?
+                super::javascript_exports::module_file(&self.files, &self.javascript, &path, true)?
             }
             None => return None,
         };
