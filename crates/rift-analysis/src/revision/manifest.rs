@@ -37,7 +37,7 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 50] = [
+const ANALYZED_SOURCES: [&str; 64] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
     "crates/rift-dependency/src",
@@ -65,6 +65,20 @@ const ANALYZED_SOURCES: [&str; 50] = [
     "vendor/tree-sitter-angular/src/tree_sitter/array.h",
     "vendor/tree-sitter-angular/src/tree_sitter/parser.h",
     "vendor/tree-sitter-angular/src/tree_sitter/html.parser.h",
+    "vendor/tree-sitter-rust/Cargo.toml",
+    "vendor/tree-sitter-rust/bindings/rust",
+    "vendor/tree-sitter-rust/grammar.js",
+    "vendor/tree-sitter-rust/queries/highlights.scm",
+    "vendor/tree-sitter-rust/queries/injections.scm",
+    "vendor/tree-sitter-rust/queries/tags.scm",
+    "vendor/tree-sitter-rust/src/grammar.json",
+    "vendor/tree-sitter-rust/src/node-types.json",
+    "vendor/tree-sitter-rust/src/parser.c",
+    "vendor/tree-sitter-rust/src/scanner.c",
+    "vendor/tree-sitter-rust/src/tree_sitter/alloc.h",
+    "vendor/tree-sitter-rust/src/tree_sitter/array.h",
+    "vendor/tree-sitter-rust/src/tree_sitter/parser.h",
+    "vendor/tree-sitter-rust/tree-sitter.json",
     "vendor/tree-sitter-typescript/Cargo.toml",
     "vendor/tree-sitter-typescript/bindings/rust",
     "vendor/tree-sitter-typescript/common/define-grammar.js",
@@ -429,6 +443,10 @@ mod tests {
             "vendor/tree-sitter-angular/src/scanner.c",
             "vendor/tree-sitter-angular/src/node-types.json",
             "vendor/tree-sitter-angular/bindings/rust/lib.rs",
+            "vendor/tree-sitter-rust/bindings/rust/lib.rs",
+            "vendor/tree-sitter-rust/grammar.js",
+            "vendor/tree-sitter-rust/src/parser.c",
+            "vendor/tree-sitter-rust/src/node-types.json",
             "vendor/tree-sitter-typescript/common/define-grammar.js",
             "vendor/tree-sitter-typescript/common/scanner.h",
             "vendor/tree-sitter-typescript/tsx/src/parser.c",
