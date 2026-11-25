@@ -147,7 +147,7 @@
       "properties": {
         "fields_omitted": {
           "$ref": "#/$defs/DocumentationFieldsOmitted",
-          "description": "Fields left out of parsed sources, counted apart from the warnings a collection\nretains. Absent when every field was kept."
+          "description": "Fields left out of parsed sources, counted apart from the warnings a collection\nretains."
         },
         "omitted": {
           "description": "Sources omitted because their format or content was refused.",
@@ -178,7 +178,8 @@
         "selected",
         "parsed",
         "omitted",
-        "truncated"
+        "truncated",
+        "fields_omitted"
       ],
       "type": "object"
     },
