@@ -145,6 +145,10 @@
       "additionalProperties": false,
       "description": "Counts recording what one collection parsed or omitted.",
       "properties": {
+        "fields_omitted": {
+          "$ref": "#/$defs/DocumentationFieldsOmitted",
+          "description": "Fields left out of parsed sources, counted apart from the warnings a collection\nretains. Absent when every field was kept."
+        },
         "omitted": {
           "description": "Sources omitted because their format or content was refused.",
           "format": "uint32",
@@ -187,6 +191,29 @@
       "minLength": 64,
       "pattern": "^[0-9a-f]{64}$",
       "type": "string"
+    },
+    "DocumentationFieldsOmitted": {
+      "additionalProperties": false,
+      "description": "Headings, languages, links, and reference spellings left out of parsed sources, by\nreason. A heading counts once per source.",
+      "properties": {
+        "limit_exceeded": {
+          "description": "Fields an accepted text or heading bound cannot hold.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "omitted_range": {
+          "description": "Fields their block cannot place: a range outside the block, a repeated link range,\nor a heading that is blank or out of level order.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "limit_exceeded",
+        "omitted_range"
+      ],
+      "type": "object"
     },
     "DocumentationFormat": {
       "description": "Which markup the text is written in, since whoever displays a doc comment is the one that\nrenders it.",

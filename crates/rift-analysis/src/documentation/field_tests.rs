@@ -2,7 +2,8 @@
 //! addresses its own source bytes.
 
 use rift_protocol::documentation::{
-    DocumentationBlock, DocumentationConfiguration, DocumentationLink, DocumentationLinkResolution,
+    DOCUMENTATION_WARNINGS_MAX, DocumentationBlock, DocumentationConfiguration,
+    DocumentationFieldsOmitted, DocumentationLink, DocumentationLinkResolution,
     DocumentationWarningKind,
 };
 use rift_protocol::read::TextRange;
@@ -10,6 +11,7 @@ use rift_protocol::read::TextRange;
 use super::collect_tests::input;
 use super::{
     DocumentationCollection, DocumentationLimits, DocumentationSourceSet, collect_documentation,
+    collect_documentation_incremental,
 };
 
 fn collect(
@@ -321,6 +323,90 @@ fn every_link_after_many_literal_blocks_names_its_own_prose() {
     }
     let named: std::collections::BTreeSet<_> = index.links.iter().map(|link| &link.block).collect();
     assert_eq!(named.len(), LITERALS + 1);
+}
+
+#[test]
+fn the_count_of_left_out_fields_survives_the_warning_cap() {
+    const SOURCES: u64 = 300;
+    let long = "x".repeat(4_097);
+    let text = format!("[kept](other.md) ![badge]({long}) `{long}`\n");
+    let paths: Vec<_> = (0..SOURCES)
+        .map(|ordinal| format!("{ordinal:03}.md"))
+        .collect();
+    let sources: Vec<_> = paths
+        .iter()
+        .map(|path| (path.as_str(), text.as_str()))
+        .collect();
+    for max_warnings in [1, DOCUMENTATION_WARNINGS_MAX] {
+        let configuration = DocumentationConfiguration {
+            max_warnings,
+            ..DocumentationConfiguration::default()
+        };
+        let collection = collect(&sources, &configuration);
+        let index = collection.index();
+        assert_eq!(index.warnings.len(), max_warnings as usize);
+        assert_eq!(
+            index.coverage.fields_omitted,
+            DocumentationFieldsOmitted {
+                limit_exceeded: 2 * SOURCES,
+                omitted_range: 0,
+            }
+        );
+        assert_eq!(index.coverage.omitted, 0);
+        assert_eq!(index.links.len() as u64, SOURCES);
+
+        let limits =
+            DocumentationLimits::from_configuration(&configuration).expect("accepted bounds");
+        let inputs = sources
+            .iter()
+            .map(|(path, text)| input(path, text))
+            .collect();
+        let set = DocumentationSourceSet::with_limits(inputs, &limits).expect("source set");
+        let next = collect_documentation_incremental(Some(&collection), &set, &[])
+            .expect("incremental collection");
+        assert_eq!(next.index(), index);
+    }
+}
+
+#[test]
+fn left_out_fields_are_counted_apart_by_reason() {
+    let long = "x".repeat(4_097);
+    let markdown = format!("# {long}\n\n[a]({long})\n");
+    let collection = collect(
+        &[
+            ("guide.md", markdown.as_str()),
+            ("guide.rst", "\u{2028}\n-\n\nBody.\n"),
+            ("plain.md", "Plain.\n"),
+        ],
+        &DocumentationConfiguration::default(),
+    );
+    assert_eq!(
+        collection.index().coverage.fields_omitted,
+        DocumentationFieldsOmitted {
+            limit_exceeded: 2,
+            omitted_range: 1,
+        }
+    );
+}
+
+#[test]
+fn a_collection_records_its_left_out_fields_once_while_their_count_stays() {
+    let long = format!("[a]({})\n", "x".repeat(4_097));
+    let set = || DocumentationSourceSet::new(vec![input("guide.md", &long)]).expect("source set");
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .capture("warn")
+        .install()
+        .expect("recorder");
+    let first = collect_documentation(&set(), &[]).expect("first collection");
+    collect_documentation_incremental(Some(&first), &set(), &[]).expect("unchanged collection");
+    let records = drain.queued_records();
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0].component(), "documentation");
+    assert_eq!(records[0].operation(), "documentation.fields_omitted");
+    let fields: serde_json::Value =
+        serde_json::from_str(records[0].fields()).expect("record fields");
+    assert_eq!(fields["limit_exceeded"], "1");
+    assert_eq!(fields["omitted_range"], "0");
 }
 
 /// Pieces that open, close, continue, and interrupt reStructuredText and Markdown blocks.

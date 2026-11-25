@@ -188,6 +188,7 @@ impl DocumentationCollection {
                 parsed: selected,
                 omitted: 0,
                 truncated: 0,
+                fields_omitted: rift_protocol::documentation::DocumentationFieldsOmitted::default(),
             },
             warnings: Vec::new(),
         };

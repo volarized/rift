@@ -421,6 +421,30 @@ pub struct DocumentationCoverage {
     pub omitted: u32,
     /// Sources whose output reached a collection bound.
     pub truncated: u32,
+    /// Fields left out of parsed sources, counted apart from the warnings a collection
+    /// retains. Absent when every field was kept.
+    #[serde(default, skip_serializing_if = "DocumentationFieldsOmitted::is_empty")]
+    pub fields_omitted: DocumentationFieldsOmitted,
+}
+
+/// Headings, languages, links, and reference spellings left out of parsed sources, by
+/// reason. A heading counts once per source.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationFieldsOmitted {
+    /// Fields an accepted text or heading bound cannot hold.
+    pub limit_exceeded: u64,
+    /// Fields their block cannot place: a range outside the block, a repeated link range,
+    /// or a heading that is blank or out of level order.
+    pub omitted_range: u64,
+}
+
+impl DocumentationFieldsOmitted {
+    /// Returns whether every field was kept.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.limit_exceeded == 0 && self.omitted_range == 0
+    }
 }
 
 /// The collection step reporting incomplete documentation.
