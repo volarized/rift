@@ -884,6 +884,67 @@ fn tar_symlink_and_hard_link_entries_are_skipped_and_named() -> TestResult {
 }
 
 #[test]
+fn gnu_long_link_targets_are_bounded_and_the_links_stay_skipped() -> TestResult {
+    let target = "nested-directory/".repeat(8) + "data.txt";
+    let target_bytes = target.len() + 1;
+    for kind in [tar::EntryType::Symlink, tar::EntryType::Link] {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(kind);
+        link.set_size(0);
+        link.set_mode(0o644);
+        builder.append_link(&mut link, "release/link", &target)?;
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(4);
+        builder.append_data(&mut file, "release/regular", b"text".as_slice())?;
+        let bytes = gzip(&builder.into_inner()?)?;
+        let limits = ArchiveLimits::default().with_extension_size(target_bytes)?;
+        let archive = read(&bytes, limits)?;
+        assert_eq!(retained(&archive), [("regular", b"text".as_slice())]);
+        assert_eq!(archive.skipped_links(), &[ProjectPath::new("link")?]);
+        assert_eq!(
+            read(&bytes, limits.with_extension_size(target_bytes - 1)?)
+                .expect_err("overbound target extension"),
+            ArchiveBound::ExtensionBytes.exceeded(
+                u64::try_from(target_bytes)?,
+                u64::try_from(target_bytes - 1)?,
+                Some(fixture_path("@LongLink")),
+            )
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_gnu_long_link_target_requires_exactly_one_link_member() -> TestResult {
+    let target = "nested-directory/".repeat(8) + "data.txt\0";
+    let extension = (
+        "././@LongLink",
+        target.as_bytes(),
+        tar::EntryType::GNULongLink,
+    );
+    let regular = (
+        "release/regular",
+        b"text".as_slice(),
+        tar::EntryType::Regular,
+    );
+    let link = ("release/link", b"".as_slice(), tar::EntryType::Symlink);
+    for members in [
+        &[extension][..],
+        &[extension, regular],
+        &[extension, extension, link],
+    ] {
+        assert_eq!(
+            read(&tar_bytes(members)?, ArchiveLimits::default())
+                .expect_err("unmatched or repeated link target extension"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn link_naming_the_archive_root_is_refused() -> TestResult {
     let bytes = tar_bytes(&[("./", b"", tar::EntryType::Symlink)])?;
     assert_eq!(
