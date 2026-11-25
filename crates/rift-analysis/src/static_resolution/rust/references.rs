@@ -2,10 +2,13 @@
 
 use rift_core::ReferenceRole;
 use rift_protocol::read::{EdgeKind, SymbolKind};
-use rift_syntax::{ByteRange, StaticBindingKind, SyntaxSymbol};
+use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
 
 use super::receivers::split_references;
-use super::{Namespaces, RECEIVER_DEPTH_MAX, inherent_member, is_type_binding, is_value_binding};
+use super::{
+    Namespace, Namespaces, RECEIVER_DEPTH_MAX, inherent_member, is_type_binding, is_value_binding,
+    path_segments,
+};
 use crate::static_resolution::{
     Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
 };
@@ -16,6 +19,90 @@ pub(super) enum ReceiverOwner<'source> {
 }
 
 impl<'source> Index<'source> {
+    /// Reads the module and type tokens written before a qualified callee's final name.
+    pub(in crate::static_resolution) fn rust_call_qualifiers(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for call in file.facts.calls() {
+            if !work.charge() {
+                return;
+            }
+            if call.callee == StaticCallee::Qualified
+                && !file.conditional(call.range, work)
+                && !file.blocked(call.range.start, work)
+            {
+                let _ = self.rust_qualified_callee(file, call, work, result);
+            }
+        }
+    }
+
+    fn rust_qualified_callee(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) -> Option<()> {
+        let position = call.range.start;
+        let text = file.text(call.callee_range)?;
+        let parts = path_segments(text, work)?;
+        let head = *parts.first()?;
+        // Associated paths through a trait's Self need an implementing type, even when
+        // the final name resolves to a trait item.
+        if parts.len() < 2 || head == "Self" {
+            return None;
+        }
+        // A body-local item can shadow a module declaration without itself being in the
+        // module index. No path through that body-local item is admitted here.
+        if !matches!(head, "crate" | "self" | "super")
+            && Namespaces::local_named(file, position, head, work, qualifier_kind).is_some()
+        {
+            return None;
+        }
+        for (index, part) in parts.iter().take(parts.len().saturating_sub(1)).enumerate() {
+            let prefix = &parts[..=index];
+            // Resolving and copying the prefix takes work for every written segment.
+            if !prefix.iter().all(|_| work.charge()) {
+                return None;
+            }
+            let Some(target) = self
+                .rust
+                .resolved_path(file, position, prefix, work)
+                .and_then(|path| {
+                    self.rust
+                        .lookup(file, position, &path, Namespace::Type, work)
+                })
+                .filter(|target| qualifier_kind(*target))
+            else {
+                continue;
+            };
+            let token = text.as_bytes().subslice_range(part.as_bytes())?;
+            let range = ByteRange {
+                start: call
+                    .callee_range
+                    .start
+                    .checked_add(u64::try_from(token.start).ok()?)?,
+                end: call
+                    .callee_range
+                    .start
+                    .checked_add(u64::try_from(token.end).ok()?)?,
+            };
+            if let Some(occurrence) =
+                self.occurrence(file, range, range, ReferenceRole::Read, target)
+                && matches!(
+                    occurrence.target,
+                    rift_provider::NormalizedTarget::Symbol(_)
+                )
+            {
+                result.occurrences.push(occurrence);
+            }
+        }
+        Some(())
+    }
+
     /// The local target of one captured Rust reference.
     fn rust_reference_occurrence(
         &self,
@@ -192,6 +279,11 @@ impl<'source> Index<'source> {
         occurrence.edge_from = Some(from);
         Some(occurrence)
     }
+}
+
+fn qualifier_kind(target: Target<'_>) -> bool {
+    target.symbol.kinds.contains(&SymbolKind::Module)
+        || target.symbol.kinds.contains(&SymbolKind::Type)
 }
 
 impl<'source> Namespaces<'source> {

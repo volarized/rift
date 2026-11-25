@@ -197,11 +197,16 @@ fn resolve_by<'source>(
 /// What one file's pass adds, held apart until the files join in path order.
 struct FileResolution {
     resolution: StaticResolution,
-    python_names: Option<python_edges::PythonNameSites>,
+    deferred_references: Option<DeferredReferences>,
     /// Budget the pass consumed.
     used: usize,
     /// Whether the pass ended on its budget.
     exhausted: bool,
+}
+
+enum DeferredReferences {
+    PythonNames(python_edges::PythonNameSites),
+    Rust,
 }
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
@@ -1311,7 +1316,8 @@ impl<'source> Index<'source> {
     ) {
         let files = self.files.values().collect::<Vec<_>>();
         let mut pending = files.as_slice();
-        let mut python_names = Vec::new();
+        let mut deferred_references = Vec::new();
+        let mut rust_qualifiers = Vec::new();
         while !pending.is_empty() && !work.exhausted {
             let run = file_work.run(pending, work.budget.remaining());
             let (run, rest) = pending.split_at(run.max(1));
@@ -1348,41 +1354,53 @@ impl<'source> Index<'source> {
                 work.exhausted = apart.exhausted && left < file_work.max(file);
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
-                if let Some(sites) = apart.python_names {
+                if let Some(sites) = apart.deferred_references {
                     let remaining = file_work.max(file).saturating_sub(apart.used);
-                    python_names.push((*file, remaining, sites));
+                    let queue = match sites {
+                        DeferredReferences::PythonNames(_) => &mut deferred_references,
+                        DeferredReferences::Rust => &mut rust_qualifiers,
+                    };
+                    queue.push((*file, remaining, sites));
                 }
                 resolution.join(file, apart.resolution, over_share);
             }
         }
         if !work.exhausted {
-            self.resolve_python_names(python_names, work, resolution);
+            deferred_references.extend(rust_qualifiers);
+            self.resolve_deferred_references(deferred_references, work, resolution);
         }
     }
 
-    /// Reads plain names after resolving calls, member accesses, and types in every file.
+    /// Reads additional references after resolving calls, member accesses, and types in every file.
     /// A cut here affects the static pass, but it cannot make a file's call coverage unavailable.
-    fn resolve_python_names(
+    fn resolve_deferred_references(
         &self,
-        names: Vec<(&File<'source>, usize, python_edges::PythonNameSites)>,
+        references: Vec<(&File<'source>, usize, DeferredReferences)>,
         work: &mut Work,
         resolution: &mut StaticResolution,
     ) {
-        if !names.is_empty() {
+        if !references.is_empty() {
             resolution.supplemental_start =
                 Some((resolution.occurrences.len(), resolution.external.len()));
         }
-        for (file, remaining, sites) in names {
+        for (file, remaining, sites) in references {
             let left = work.budget.remaining();
             let budget = left.min(remaining);
-            let mut names_work = Work::new(budget);
-            self.python_name_references(file, sites, &mut names_work, resolution);
-            let used = budget.saturating_sub(names_work.budget.remaining());
+            let mut deferred = Work::new(budget);
+            match sites {
+                DeferredReferences::PythonNames(sites) => {
+                    self.python_name_references(file, sites, &mut deferred, resolution);
+                }
+                DeferredReferences::Rust => {
+                    self.rust_call_qualifiers(file, &mut deferred, resolution);
+                }
+            }
+            let used = budget.saturating_sub(deferred.budget.remaining());
             #[cfg(test)]
             self.performed
                 .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
             work.budget = LoopBudget::new(left.saturating_sub(used));
-            resolution.ended |= names_work.exhausted;
+            resolution.ended |= deferred.exhausted;
         }
     }
 
@@ -1406,14 +1424,14 @@ impl<'source> Index<'source> {
                 },
             );
         }
-        let python_names = self.resolve_file(file, &mut work, &mut resolution);
+        let deferred_references = self.resolve_file(file, &mut work, &mut resolution);
         let used = budget.saturating_sub(work.budget.remaining());
         #[cfg(test)]
         self.performed
             .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
         FileResolution {
             resolution,
-            python_names,
+            deferred_references,
             used,
             exhausted: work.exhausted,
         }
@@ -1472,7 +1490,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) -> Option<python_edges::PythonNameSites> {
+    ) -> Option<DeferredReferences> {
         for range in file.facts.unsupported_bindings() {
             if file.inactive(*range, work) {
                 continue;
@@ -1553,16 +1571,20 @@ impl<'source> Index<'source> {
         ) {
             self.javascript_edges(file, work, result);
         }
-        let python_names = (file.document.facts.language().name == "python")
-            .then(|| self.python_references(file, work, result))
-            .flatten();
-        if file.document.facts.language().name == "rust" {
-            self.rust_references(file, work, result);
-        }
+        let deferred = match file.document.facts.language().name.as_str() {
+            "python" => self
+                .python_references(file, work, result)
+                .map(DeferredReferences::PythonNames),
+            "rust" => {
+                self.rust_references(file, work, result);
+                (!file.facts.calls().is_empty()).then_some(DeferredReferences::Rust)
+            }
+            _ => None,
+        };
         if !work.exhausted {
             result.analyzed_sources += 1;
         }
-        python_names
+        deferred
     }
 
     fn call_occurrence(

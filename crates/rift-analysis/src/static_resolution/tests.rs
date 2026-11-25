@@ -2249,6 +2249,80 @@ fn rust_uses_admitted_module_paths_and_excludes_conditional_candidates() {
 }
 
 #[test]
+fn rust_qualified_calls_read_the_written_module_and_type_tokens() {
+    let source = "pub mod definitions {\n\
+        pub fn begin() {}\n\
+        pub struct Wrapper<T>(pub T);\n\
+        impl Wrapper<u8> { pub fn make() {} }\n\
+        pub mod nested { pub fn from_parent() { super::begin(); } }\n\
+    }\n\
+    use crate::definitions as imported;\n\
+    pub fn run() {\n\
+        crate::definitions::begin();\n\
+        self::definitions::begin();\n\
+        imported::begin();\n\
+        crate::definitions::Wrapper::<u8>::make();\n\
+    }\n\
+    pub fn unrelated<Wrapper>(value: u8) {\n\
+        unknown_module::begin();\n\
+        Wrapper::make();\n\
+        value.to_string();\n\
+    }\n\
+    pub fn shadowed() {\n\
+        struct imported;\n\
+        impl imported { fn begin() {} }\n\
+        imported::begin();\n\
+    }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let read = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .map(|edge| (source_of(edge, source), target(edge)))
+        .collect::<Vec<_>>();
+    let module = "rift://symbol/local/rust/fixture/definitions";
+    assert_eq!(
+        read,
+        [
+            ("super", module),
+            ("definitions", module),
+            ("definitions", module),
+            ("imported", module),
+            ("definitions", module),
+            (
+                "Wrapper",
+                "rift://symbol/local/rust/fixture/definitions/Wrapper"
+            ),
+        ]
+    );
+    let controls = u64::try_from(source.find("pub fn unrelated").expect("control boundary"))
+        .expect("control offset");
+    let leaf = "rift://symbol/local/rust/fixture/definitions/begin";
+    assert_eq!(
+        calls(&result, "src/lib.rs")
+            .filter(|call| call.binding.range().start() < controls)
+            .map(|call| (source_of(call, source), target(call)))
+            .collect::<Vec<_>>(),
+        [
+            ("super::begin()", leaf),
+            ("crate::definitions::begin()", leaf),
+            ("self::definitions::begin()", leaf),
+            ("imported::begin()", leaf),
+            (
+                "crate::definitions::Wrapper::<u8>::make()",
+                "rift://symbol/local/rust/fixture/definitions/Wrapper/make"
+            ),
+        ],
+    );
+    assert!(!result.ended);
+}
+
+#[test]
 fn rust_shadowed_value_and_conditional_module_do_not_reach_decoys() {
     let source = "#[cfg(test)] mod tasks;\n\
                   fn run() {}\n\

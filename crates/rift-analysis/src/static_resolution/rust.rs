@@ -170,6 +170,18 @@ impl<'source> Namespaces<'source> {
         name: &str,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        Self::local_named(file, position, name, work, |target| {
+            target.symbol.kinds.contains(&SymbolKind::Type)
+        })
+    }
+
+    fn local_named(
+        file: &File<'source>,
+        position: u64,
+        name: &str,
+        work: &mut Work,
+        accepts: impl Fn(Target<'source>) -> bool,
+    ) -> Option<Target<'source>> {
         let enclosing = file.enclosing_callable(ByteRange {
             start: position,
             end: position,
@@ -180,8 +192,9 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
             let qualified = format!("{container}::{name}");
-            if let Some(target) = file.qualified_target(&qualified)
-                && target.symbol.kinds.contains(&SymbolKind::Type)
+            if let Some(target) = file
+                .qualified_target(&qualified)
+                .filter(|target| accepts(*target))
             {
                 return Some(target);
             }
