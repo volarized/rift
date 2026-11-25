@@ -13,7 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rift_protocol::read::SymbolKind;
-use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, StaticBindingKind, StaticCall, StaticCallee, StaticRustUse, SyntaxSymbol,
+};
 
 use super::{Binding, File, Target, Work};
 
@@ -45,6 +47,7 @@ pub(super) struct Namespaces<'source> {
     modules: BTreeMap<Vec<String>, Option<Target<'source>>>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
     exports: BTreeMap<Vec<String>, Option<Export<'source>>>,
+    glob_imports: BTreeMap<&'source str, Vec<&'source StaticRustUse>>,
 }
 
 struct Export<'source> {
@@ -69,6 +72,21 @@ enum Namespace {
     Type,
     Value,
     ConstantOrStatic,
+}
+
+#[derive(Clone, Copy)]
+enum GlobTarget<'source> {
+    Resolved(Target<'source>),
+    Ambiguous,
+}
+
+impl<'source> GlobTarget<'source> {
+    fn target(self) -> Option<Target<'source>> {
+        match self {
+            Self::Resolved(target) => Some(target),
+            Self::Ambiguous => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +142,7 @@ impl<'source> Namespaces<'source> {
             return self.available(target).then_some(target);
         }
         if let [name] = parts.as_slice()
-            && let Some(target) = Self::local_type(file, range.start, name, work)
+            && let Some(target) = self.local_type(file, range.start, name, work).ok()?
         {
             return self.available(target).then_some(target);
         }
@@ -168,15 +186,70 @@ impl<'source> Namespaces<'source> {
             })
     }
 
+    /// A type item in a block can be used only inside its own module. A nearer type
+    /// import or type parameter takes precedence, while a value-only import can coexist.
     fn local_type(
+        &self,
         file: &File<'source>,
         position: u64,
         name: &str,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
-        Self::local_named(file, position, name, work, |target| {
-            target.symbol.kinds.contains(&SymbolKind::Type)
-        })
+    ) -> Result<Option<Target<'source>>, ()> {
+        let binding = match file.binding(
+            name,
+            position,
+            |kind| kind == StaticBindingKind::RustBlockType,
+            work,
+        ) {
+            Binding::Found(binding) => binding,
+            Binding::Missing => return Ok(None),
+            Binding::Blocked => return Err(()),
+        };
+        let module = self.module(file, position, work).ok_or(())?;
+        if self.module(file, binding.name.start, work) != Some(module) {
+            return Ok(None);
+        }
+        match file.binding(name, position, is_type_binding, work) {
+            Binding::Found(closer)
+                if closer.scope != binding.scope && binding.scope.encloses(closer.scope) =>
+            {
+                let StaticBindingKind::RustUse { path } = closer.kind else {
+                    return Err(());
+                };
+                let imported = self.import_path(file, path, work).ok_or(())?;
+                if let Some(target) =
+                    self.lookup(file, path.start, &imported, Namespace::Type, work)
+                {
+                    return Ok(Some(target));
+                }
+                if self
+                    .lookup(file, path.start, &imported, Namespace::Value, work)
+                    .is_none()
+                    && self
+                        .lookup(
+                            file,
+                            path.start,
+                            &imported,
+                            Namespace::ConstantOrStatic,
+                            work,
+                        )
+                        .is_none()
+                {
+                    return Err(());
+                }
+            }
+            Binding::Blocked => return Err(()),
+            _ => {}
+        }
+        file.target_at(binding.name)
+            .filter(|target| {
+                // A type inside a const or static initializer can be stored with
+                // a module name. The block binding cannot justify that endpoint.
+                target.symbol.kinds.contains(&SymbolKind::Type)
+                    && !file.is_module_item(target.symbol)
+            })
+            .map(Some)
+            .ok_or(())
     }
 
     fn local_named(
@@ -250,16 +323,18 @@ impl<'source> Namespaces<'source> {
             .values()
             .filter(|file| file.document.facts.language().name == "rust")
         {
-            for imported in file
-                .facts
-                .rust_uses()
-                .iter()
-                .filter(|imported| !imported.glob)
-            {
+            for imported in file.facts.rust_uses() {
                 if !work.charge() {
                     return None;
                 }
                 if file.conditional(imported.range, work) {
+                    continue;
+                }
+                if imported.glob {
+                    self.glob_imports
+                        .entry(file.document.path.as_str())
+                        .or_default()
+                        .push(imported);
                     continue;
                 }
                 let Some(module) = self
@@ -813,14 +888,23 @@ impl<'source> Namespaces<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        let path = self.import_path(file, range, work)?;
+        self.lookup(file, range.start, &path, Namespace::Value, work)
+            .or_else(|| self.lookup(file, range.start, &path, Namespace::Type, work))
+    }
+
+    fn import_path(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Vec<String>> {
         if file.conditional(range, work) || file.blocked(range.start, work) {
             return None;
         }
         let parts = file.use_parts(range, work)?;
         let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
-        let path = self.absolute_path(file, range.start, &parts, work)?;
-        self.lookup(file, range.start, &path, Namespace::Value, work)
-            .or_else(|| self.lookup(file, range.start, &path, Namespace::Type, work))
+        self.absolute_path(file, range.start, &parts, work)
     }
 
     fn import_source(
@@ -1014,33 +1098,59 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Target<'source>> {
         let name = file.text(call.callee_range)?;
         let position = call.range.start;
-        match file.binding(name, position, is_value_binding, work) {
-            Binding::Found(binding) => match binding.kind {
-                StaticBindingKind::Local => Self::local_callable(file, binding.name, work),
+        let (module, inline_scope) =
+            self.module_at_with_scope(file.document.path.as_str(), position, work)?;
+        let binding = match file.binding(name, position, is_value_binding, work) {
+            Binding::Found(binding) if self.module(file, binding.name.start, work)? == module => {
+                Some(binding)
+            }
+            Binding::Found(_) | Binding::Missing => None,
+            Binding::Blocked => return None,
+        };
+        if let Some(binding) = binding {
+            if let Some(imported) = self.glob_target(
+                file,
+                position,
+                name,
+                Namespace::Value,
+                Some(binding.scope),
+                work,
+            ) {
+                return imported.target().filter(callable_value);
+            }
+            if work.exhausted {
+                return None;
+            }
+            return match binding.kind {
+                StaticBindingKind::Local => {
+                    Self::local_callable(file, binding.name, work).filter(|target| {
+                        !file.is_module_item(target.symbol)
+                            || inline_scope.or_else(|| {
+                                crate::analyzer::namespace::rust_file_scope(file.document.source)
+                            }) == Some(binding.scope)
+                    })
+                }
                 StaticBindingKind::RustUse { path } => {
-                    let imported = self.import(file, path, work)?;
-                    (imported.symbol.kinds.contains(&SymbolKind::Callable)
-                        || matches!(imported.symbol.kind, "struct" | "variant"))
-                    .then_some(imported)
+                    self.import(file, path, work).filter(callable_value)
                 }
                 _ => None,
-            },
-            Binding::Missing => {
-                let mut path = self.module(file, position, work)?.to_vec();
-                path.push(name.to_owned());
-                self.lookup(file, position, &path, Namespace::Value, work)
-                    .or_else(|| self.glob_target(file, position, name, Namespace::Value, work))
-                    .or_else(|| {
-                        // `Name(..)` with a struct `Name` calls its tuple constructor.
-                        // A struct declared in an enclosing body comes first.
-                        Self::local_type(file, position, name, work)
-                            .filter(|target| self.available(*target))
-                            .or_else(|| self.lookup(file, position, &path, Namespace::Type, work))
-                            .filter(|target| target.symbol.kind == "struct")
-                    })
-            }
-            Binding::Blocked => None,
+            };
         }
+        let mut path = module.to_vec();
+        path.push(name.to_owned());
+        if let Some(target) = self.lookup(file, position, &path, Namespace::Value, work) {
+            return Some(target);
+        }
+        if let Some(imported) = self.glob_target(file, position, name, Namespace::Value, None, work)
+        {
+            return imported.target().filter(callable_value);
+        }
+        // A tuple constructor can also be named by an admitted type path.
+        if let Some(target) = self.local_type(file, position, name, work).ok()? {
+            return (target.symbol.kind == "struct" && self.available(target)).then_some(target);
+        }
+        self.lookup(file, position, &path, Namespace::Type, work)
+            .filter(|target| target.symbol.kind == "struct")
     }
 
     fn local_callable(
@@ -1048,7 +1158,7 @@ impl<'source> Namespaces<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let target = file.target_at(range)?.callable()?;
+        let target = file.target_at(range).filter(callable_value)?;
         if file.conditional(target.symbol.item_range, work)
             || file.in_impl_or_trait(target.symbol, work)
         {
@@ -1067,7 +1177,7 @@ impl<'source> Namespaces<'source> {
         let position = call.range.start;
         // A struct declared in an enclosing body shadows module items of its name.
         if let [name] = parts.as_slice()
-            && let Some(target) = Self::local_type(file, position, name, work)
+            && let Some(target) = self.local_type(file, position, name, work).ok()?
         {
             return (target.symbol.kind == "struct" && self.available(target)).then_some(target);
         }
@@ -1465,8 +1575,9 @@ impl<'source> Namespaces<'source> {
                 path.extend(parts.iter().map(|part| (*part).to_owned()));
                 if !self.types.contains_key(&path)
                     && !self.values.contains_key(&path)
-                    && let Some(target) =
-                        self.glob_target(file, position, head, Namespace::Type, work)
+                    && let Some(target) = self
+                        .glob_target(file, position, head, Namespace::Type, None, work)
+                        .and_then(GlobTarget::target)
                 {
                     let mut path = target.admitted_path()?;
                     path.extend(tail.iter().map(|part| (*part).to_owned()));
@@ -1521,20 +1632,31 @@ impl<'source> Namespaces<'source> {
         Some(path)
     }
 
+    /// A glob in the nearest scope that imports this name. An equal-scope conflict
+    /// has an applicable binding but no one target.
     fn glob_target(
         &self,
         file: &File<'source>,
         position: u64,
         name: &str,
         namespace: Namespace,
+        outer: Option<ByteRange>,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
-        let mut selected: Option<Target<'source>> = None;
-        for imported in file.facts.rust_uses() {
+    ) -> Option<GlobTarget<'source>> {
+        let imports = self.glob_imports.get(file.document.path.as_str())?;
+        let module = self.module(file, position, work)?;
+        let mut selected: Option<(ByteRange, GlobTarget<'source>)> = None;
+        for imported in imports {
             if !work.charge() {
                 return None;
             }
-            if !imported.glob || !imported.scope.contains(position) {
+            let scope = imported.scope;
+            if !scope.contains(position)
+                || outer.is_some_and(|outer| scope == outer || !outer.encloses(scope))
+                || selected
+                    .is_some_and(|(previous, _)| previous != scope && scope.encloses(previous))
+                || self.module(file, imported.range.start, work)? != module
+            {
                 continue;
             }
             let parts = file.use_parts(imported.range, work)?;
@@ -1547,12 +1669,20 @@ impl<'source> Namespaces<'source> {
             let Some(target) = self.lookup(file, position, &path, namespace, work) else {
                 continue;
             };
-            if selected.is_some_and(|previous| previous.symbol != target.symbol) {
-                return None;
-            }
-            selected = Some(target);
+            let target = match selected {
+                Some((previous, selected))
+                    if previous == scope
+                        && selected
+                            .target()
+                            .is_none_or(|previous| previous.symbol != target.symbol) =>
+                {
+                    GlobTarget::Ambiguous
+                }
+                _ => GlobTarget::Resolved(target),
+            };
+            selected = Some((scope, target));
         }
-        selected
+        selected.map(|(_, target)| target)
     }
 
     fn module(&self, file: &File<'source>, position: u64, work: &mut Work) -> Option<&[String]> {
@@ -1967,6 +2097,11 @@ fn receiver_form(source: &str, binding: &rift_syntax::StaticBinding) -> Option<S
         ([receivers::Reference::Unique], "") => SelfKind::Unique,
         _ => SelfKind::Other,
     })
+}
+
+fn callable_value(target: &Target<'_>) -> bool {
+    target.symbol.kinds.contains(&SymbolKind::Callable)
+        || matches!(target.symbol.kind, "struct" | "variant")
 }
 
 fn structural_owner(target: Target<'_>) -> bool {

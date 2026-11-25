@@ -158,6 +158,295 @@ fn package_stores_typescript_imported_type_uses_at_each_written_site() {
     assert_eq!(rows(&publication.edges), expected);
 }
 
+#[test]
+fn package_rust_constructors_and_fields_use_their_block_owner() {
+    use rift_core::ReferenceRole;
+    use rift_provider::NormalizedTarget;
+
+    const ROOT: &str = "pub struct Target { pub item: u8 }";
+    const LOCAL: &str = "struct Target { item: u16 }";
+    const READ: &str = "let value = Target { item: 7 }; value.item";
+    for (body, returns, owner, definition, field) in [
+        (
+            format!("{{ {LOCAL} }} {READ}"),
+            "u8",
+            "Target",
+            ROOT,
+            "pub item: u8",
+        ),
+        (
+            format!("let value = Target {{ item: 7 }}; {{ {LOCAL} }} value.item"),
+            "u8",
+            "Target",
+            ROOT,
+            "pub item: u8",
+        ),
+        (READ.to_owned(), "u8", "Target", ROOT, "pub item: u8"),
+        (
+            format!("{{ {LOCAL} {READ} }}"),
+            "u16",
+            "run/Target",
+            LOCAL,
+            "item: u16",
+        ),
+        (
+            format!("{{ let value = Target {{ item: 7 }}; {LOCAL} value.item }}"),
+            "u16",
+            "run/Target",
+            LOCAL,
+            "item: u16",
+        ),
+    ] {
+        let source = format!("{ROOT}\npub fn run() -> {returns} {{ {body} }}");
+        let analysis =
+            fixture::package_result(ShippedLanguage::Rust, vec![("src/lib.rs", &source)], None)
+                .expect("admitted Rust package");
+        let (_, _, semantics, _) = analysis.into_parts();
+        let written = |binding: &DeclarationBinding| {
+            let range = binding.range();
+            &source[offset_in(range.start())..offset_in(range.end())]
+        };
+        for (role, text, target, authored) in [
+            (
+                ReferenceRole::Call,
+                "Target { item: 7 }",
+                format!("/beacon/{owner}"),
+                definition,
+            ),
+            (
+                ReferenceRole::Read,
+                "value.item",
+                format!("/beacon/{owner}/item"),
+                field,
+            ),
+        ] {
+            let found = semantics
+                .static_occurrences()
+                .iter()
+                .filter(|edge| edge.role == role && written(&edge.binding) == text)
+                .collect::<Vec<_>>();
+            let [edge] = found.as_slice() else {
+                panic!("expected one {role:?} of {text} in {body}, got {found:?}");
+            };
+            assert!(
+                matches!(&edge.target, NormalizedTarget::Symbol(id) if id.as_str().ends_with(&target)),
+                "{body}: {:?}",
+                edge.target
+            );
+            assert_eq!(
+                written(edge.target_binding.as_ref().expect("physical target")),
+                authored,
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn package_rust_same_name_block_constructors_keep_distinct_physical_targets() {
+    use rift_core::ReferenceRole;
+
+    let source = "pub fn run() -> u16 {\n\
+        let first = { struct Target { item: u8 } let value = Target { item: 1 }; value.item };\n\
+        let second = { struct Target { item: u16 } let value = Target { item: 2 }; value.item };\n\
+        u16::from(first) + second\n}";
+    let analysis =
+        fixture::package_result(ShippedLanguage::Rust, vec![("src/lib.rs", source)], None)
+            .expect("admitted Rust package");
+    let (_, files, semantics, _) = analysis.into_parts();
+    let qualified = files[0]
+        .file()
+        .syntax()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "Target")
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(qualified, ["run::Target", "run::Target"]);
+
+    let written = |binding: &DeclarationBinding| {
+        let range = binding.range();
+        &source[offset_in(range.start())..offset_in(range.end())]
+    };
+    for (label, declaration) in [
+        ("Target { item: 1 }", "struct Target { item: u8 }"),
+        ("Target { item: 2 }", "struct Target { item: u16 }"),
+    ] {
+        let found = semantics
+            .static_occurrences()
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Call && written(&edge.binding) == label)
+            .collect::<Vec<_>>();
+        let [edge] = found.as_slice() else {
+            panic!("expected one Call of {label}, got {found:?}");
+        };
+        assert_eq!(
+            written(edge.target_binding.as_ref().expect("physical target")),
+            declaration
+        );
+    }
+}
+
+#[test]
+fn package_rust_block_types_respect_import_namespaces_and_inline_modules() {
+    use rift_core::ReferenceRole;
+    use rift_provider::NormalizedTarget;
+
+    for (source, target, constructor, field) in [
+        (
+            r"pub mod src { pub struct Target { pub item: u8 } }
+
+pub fn run() -> u8 {
+    struct Target { item: u16 }
+    {
+        use crate::src::Target;
+        let value = Target { item: 7 };
+        value.item
+    }
+}",
+            "src/Target",
+            "pub struct Target { pub item: u8 }",
+            "pub item: u8",
+        ),
+        (
+            r"pub fn run() -> u8 {
+    struct Target { item: u16 }
+    mod inner {
+        pub struct Target { pub item: u8 }
+        pub fn read() -> u8 {
+            let value = Target { item: 7 };
+            value.item
+        }
+    }
+    inner::read()
+}",
+            "run/inner/Target",
+            "pub struct Target { pub item: u8 }",
+            "pub item: u8",
+        ),
+        (
+            r"pub mod src { pub fn maker() -> u8 { 1 } }
+
+pub fn run() -> u16 {
+    struct Target { item: u16 }
+    {
+        use crate::src::maker as Target;
+        let value = Target { item: 7 };
+        let _ = Target();
+        value.item
+    }
+}",
+            "run/Target",
+            "struct Target { item: u16 }",
+            "item: u16",
+        ),
+    ] {
+        let analysis =
+            fixture::package_result(ShippedLanguage::Rust, vec![("src/lib.rs", source)], None)
+                .expect("admitted Rust package");
+        let (_, _, semantics, _) = analysis.into_parts();
+        let written = |binding: &DeclarationBinding| {
+            let range = binding.range();
+            &source[offset_in(range.start())..offset_in(range.end())]
+        };
+        for (role, occurrence, suffix, definition) in [
+            (
+                ReferenceRole::Call,
+                "Target { item: 7 }",
+                format!("/beacon/{target}"),
+                constructor,
+            ),
+            (
+                ReferenceRole::Read,
+                "value.item",
+                format!("/beacon/{target}/item"),
+                field,
+            ),
+        ] {
+            let found = semantics
+                .static_occurrences()
+                .iter()
+                .filter(|edge| edge.role == role && written(&edge.binding) == occurrence)
+                .collect::<Vec<_>>();
+            let [edge] = found.as_slice() else {
+                panic!("expected one {role:?} of {occurrence} in {source}, got {found:?}");
+            };
+            assert!(
+                matches!(&edge.target, NormalizedTarget::Symbol(id) if id.as_str().ends_with(&suffix)),
+                "{source}: {:?}",
+                edge.target,
+            );
+            assert_eq!(
+                written(edge.target_binding.as_ref().expect("physical target")),
+                definition,
+                "{source}",
+            );
+        }
+    }
+}
+
+#[test]
+fn package_rust_initializer_local_types_do_not_name_the_module_type() {
+    use rift_core::ReferenceRole;
+    use rift_provider::NormalizedTarget;
+
+    let module_target =
+        |id: &str| id.ends_with("/beacon/Target") || id.ends_with("/beacon/Target/item");
+    for (label, source) in [
+        (
+            "named const",
+            "pub struct Target { pub item: u8 }\npub const CHECK: u16 = {\nstruct Target { item: u16 }\nlet value = Target { item: 7 };\nvalue.item\n};\n",
+        ),
+        (
+            "named static",
+            "pub struct Target { pub item: u8 }\npub static CHECK: u16 = {\nstruct Target { item: u16 }\nlet value = Target { item: 7 };\nvalue.item\n};\n",
+        ),
+        (
+            "tuple const",
+            "pub struct Target(pub u8);\npub const CHECK: u16 = {\nstruct Target(u16);\nlet value = Target(7);\nvalue.0\n};\n",
+        ),
+    ] {
+        let source = format!(
+            "{source}\npub mod visible {{ pub struct Target {{ pub item: u8 }} }}\n\
+             pub const EXPLICIT: u8 = crate::visible::Target {{ item: 1 }}.item;\n"
+        );
+        let analysis =
+            fixture::package_result(ShippedLanguage::Rust, vec![("src/lib.rs", &source)], None)
+                .expect("admitted Rust package");
+        let initializer =
+            u64::try_from(source.find("CHECK:").expect("initializer")).expect("offset");
+        let edges = &analysis.publication().edges;
+        assert!(
+            edges.iter().all(|edge| {
+                !module_target(edge.to.as_str())
+                    || !edge
+                        .kinds
+                        .iter()
+                        .any(|kind| matches!(kind, EdgeKind::Calls | EdgeKind::Reads))
+                    || edge
+                        .occurrence
+                        .as_ref()
+                        .is_none_or(|site| site.range.start < initializer)
+            }),
+            "{label}: {edges:?}",
+        );
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kinds.contains(&EdgeKind::Calls)
+                    && edge.to.as_str().ends_with("/beacon/visible/Target")
+            }),
+            "missing explicit constructor in {label}: {edges:?}"
+        );
+        let (_, _, semantics, _) = analysis.into_parts();
+        let leaked = semantics.static_occurrences().iter().find(|edge| {
+            edge.binding.range().start() >= initializer
+                && matches!(edge.role, ReferenceRole::Call | ReferenceRole::Read)
+                && matches!(&edge.target, NormalizedTarget::Symbol(id) if module_target(id.as_str()))
+        });
+        assert!(leaked.is_none(), "{label}: {leaked:?}");
+    }
+}
+
 struct GraphFixture {
     analysis: PackageAnalysis,
     owner: SymbolOwner,

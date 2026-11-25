@@ -71,19 +71,27 @@ impl<'source> Index<'source> {
             };
             let target = match bare.as_ref() {
                 Some(Binding::Found(binding)) if binding.kind == StaticBindingKind::Local => {
-                    // A function in a const or static initializer can share a module item's
-                    // stored name. Its lexical binding still belongs to the initializer block.
+                    // Declarations inside initializers sometimes have the same stored name
+                    // as module items, but their lexical bounds still stop at the block.
                     if self.rust.module_scope(file, position, work) != Some(binding.scope) {
                         continue;
                     }
-                    let Some(function) = Namespaces::local_callable(file, binding.name, work)
-                        .filter(|target| {
-                            target.symbol.kind == "function" && file.is_module_item(target.symbol)
-                        })
-                    else {
+                    let Some(value) = file.target_at(binding.name).filter(|target| {
+                        file.is_module_item(target.symbol)
+                            && self.rust.available(*target)
+                            && !file.conditional(target.symbol.item_range, work)
+                    }) else {
                         continue;
                     };
-                    Some(function)
+                    match value.symbol.kind {
+                        "constant" => Some(value),
+                        "static" if !read.pattern => Some(value),
+                        "struct" if !read.pattern && value_constructor(value) => Some(value),
+                        "function" if !read.pattern => {
+                            Namespaces::local_callable(file, binding.name, work)
+                        }
+                        _ => None,
+                    }
                 }
                 Some(Binding::Found(binding))
                     if !matches!(binding.kind, StaticBindingKind::RustUse { .. }) =>

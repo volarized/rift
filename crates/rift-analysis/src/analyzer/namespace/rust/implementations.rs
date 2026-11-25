@@ -293,7 +293,10 @@ impl Types {
             if admitted == Some(false) {
                 continue;
             }
-            let nominal = matches!(symbol.kind, "struct" | "enum" | "union_item");
+            let nominal = matches!(
+                symbol.kind,
+                "struct" | "enum" | "union_item" | "extern_type"
+            );
             let declared = self.declared.entry(path).or_insert(Declared {
                 nominal,
                 admitted: false,

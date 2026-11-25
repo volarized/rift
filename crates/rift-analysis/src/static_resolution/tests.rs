@@ -2589,7 +2589,7 @@ fn rust_literal_and_pattern_field_labels_keep_physical_owners_and_roles() {
 }
 
 #[test]
-fn rust_field_sites_refuse_sibling_block_owners() {
+fn rust_field_sites_keep_visible_owners_and_refuse_hidden_fields() {
     let source = r"
 pub struct Target { pub item: u8 }
 pub fn before() -> u8 { { struct Target { item: u16 } } let value = Target { item: 7 }; value.item }
@@ -2597,8 +2597,12 @@ pub fn after() -> u8 { let value = Target { item: 7 }; { struct Target { item: u
 pub fn clear() -> u8 { let value = Target { item: 7 }; value.item }
 pub fn qualified() -> u8 { struct Target { item: u16 } let value = crate::Target { item: 7 }; value.item }
 pub fn in_block() -> u16 { struct Local { item: u16 } let value = Local { item: 7 }; value.item }
-pub fn wrong_pattern(value: Target) -> u8 { { struct Target { item: u16 } } let Target { item } = value; item }
+pub fn sibling_pattern(value: Target) -> u8 { { struct Target { item: u16 } } let Target { item } = value; item }
 pub fn valid_pattern(value: Target) -> u8 { let Target { item } = value; item }
+mod hidden { pub struct Target { item: u8 } }
+pub fn private_pattern(value: hidden::Target) -> u8 { let hidden::Target { item } = value; item }
+pub fn private_initializer() -> hidden::Target { hidden::Target { item: 7 } }
+pub fn unavailable_pattern(value: foreign::Target) -> u8 { let foreign::Target { item } = value; item }
 ";
     let result = resolution(
         "rust",
@@ -2611,12 +2615,17 @@ pub fn valid_pattern(value: Target) -> u8 { let Target { item } = value; item }
         .iter()
         .filter(|edge| edge.edge_kind.is_none() && source_of(edge, source) == "item")
         .map(|edge| {
+            let physical = edge.target_binding.as_ref().expect("physical field");
+            assert_eq!(physical.unit(), edge.binding.unit());
+            let byte = |offset| usize::try_from(offset).expect("field offset");
+            let range = physical.range();
             (
                 edge.binding.range().start(),
                 edge.role,
                 target(edge)
                     .strip_prefix("rift://symbol/local/rust/fixture/")
                     .expect("package declaration"),
+                &source[byte(range.start())..byte(range.end())],
             )
         })
         .collect::<Vec<_>>();
@@ -2632,34 +2641,31 @@ pub fn valid_pattern(value: Target) -> u8 { let Target { item } = value; item }
             .expect("field label");
         u64::try_from(start + field + 2).expect("fixture offset")
     };
+    // A sibling block's type is invisible at the literal and pattern. Keep the
+    // physical module field there and the physical local field inside its block.
+    let module_field = |statement, role| (position(statement), role, "Target/item", "pub item: u8");
     assert_eq!(
         sites,
         [
-            (
-                position("pub fn clear"),
-                ReferenceRole::Write,
-                "Target/item"
-            ),
-            (
-                position("pub fn qualified"),
-                ReferenceRole::Write,
-                "Target/item"
-            ),
+            module_field("pub fn before", ReferenceRole::Write),
+            module_field("pub fn after", ReferenceRole::Write),
+            module_field("pub fn clear", ReferenceRole::Write),
+            module_field("pub fn qualified", ReferenceRole::Write),
             (
                 position("pub fn in_block"),
                 ReferenceRole::Write,
-                "in_block/Local/item"
+                "in_block/Local/item",
+                "item: u16"
             ),
-            (
-                position("pub fn valid_pattern"),
-                ReferenceRole::Read,
-                "Target/item"
-            ),
+            module_field("pub fn sibling_pattern", ReferenceRole::Read),
+            module_field("pub fn valid_pattern", ReferenceRole::Read),
         ],
     );
+    // The private-field literal is still withheld. Neither hidden nor unavailable
+    // pattern contributes a read to the exact set above.
     assert_eq!(
         result.omitted.get(&rift_protocol::read::EdgeKind::Writes),
-        Some(&2)
+        Some(&1)
     );
 }
 
@@ -3665,6 +3671,103 @@ fn test_rust_pattern_field_attributes_control_just_the_field_binding() {
             calls_leaf,
             "{source}"
         );
+    }
+}
+
+#[test]
+fn test_rust_near_value_declarations_hide_outer_functions() {
+    for (body, expected) in [
+        ("pub fn run() { static leaf: fn() = other; leaf(); }", None),
+        ("pub fn run() { const leaf: fn() = other; leaf(); }", None),
+        (
+            "pub fn run() { struct leaf(u8); leaf(1); }",
+            Some("run/leaf"),
+        ),
+        (
+            "pub fn run() { unsafe extern \"C\" { fn leaf(); } unsafe { leaf() }; }",
+            Some("run/leaf"),
+        ),
+        (
+            "pub enum E { leaf(u8) } pub fn run() { use E::*; leaf(1); }",
+            Some("E/leaf"),
+        ),
+        (
+            "pub mod m { use super::*; pub static leaf: fn(u8) = |_| (); pub fn run() { leaf(1); } }",
+            None,
+        ),
+        (
+            "pub mod m { use super::*; pub struct leaf(pub u8); pub fn run() { leaf(1); } }",
+            Some("m/leaf"),
+        ),
+        (
+            "pub mod m { use super::*; unsafe extern \"C\" { pub fn leaf(); } pub fn run() { unsafe { leaf() }; } }",
+            Some("m/leaf"),
+        ),
+        ("pub fn run() { fn leaf() {} leaf(); }", Some("run/leaf")),
+        (
+            "pub fn run() { const leaf: fn() = other; crate::leaf(); }",
+            Some("leaf"),
+        ),
+        (
+            "pub mod m { use super::*; pub fn run() { leaf(); } }",
+            Some("leaf"),
+        ),
+        (
+            "pub fn run() { struct leaf { field: u8 } leaf(); }",
+            Some("leaf"),
+        ),
+        (
+            "pub struct Item; impl Item { const leaf: fn() = other; pub fn run() { leaf(); } }",
+            Some("leaf"),
+        ),
+        (
+            "pub enum E { leaf(u8) } use E::*; pub fn run() { leaf(); }",
+            Some("leaf"),
+        ),
+    ] {
+        let source = format!("pub fn leaf() {{}}\npub fn other() {{}}\n{body}");
+        let manifest = [("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")];
+        let result = resolution("rust", &[("src/lib.rs", &source)], &manifest, WORK_MAX);
+        assert!(!result.exhausted, "{body}");
+        let expected = expected.map(|name| format!("rift://symbol/local/rust/fixture/{name}"));
+        let found = calls(&result, "src/lib.rs").map(target).collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            expected.as_deref().into_iter().collect::<Vec<_>>(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_declarative_macro_bindings_have_statement_scope() {
+    const BIND: &str = "macro_rules! bind { ($name:ident) => { let $name = other; }; }";
+    const INSPECT: &str = "macro_rules! bind { ($name:ident) => { let local = $name; }; }";
+    const CALL: &str = "/* call */ ";
+    for body in [
+        format!("{BIND} bind!(leaf); leaf();"),
+        format!("{CALL}leaf(); {BIND} bind!(leaf); leaf();"),
+        format!("{BIND} {{ bind!(leaf); leaf(); }} {CALL}leaf();"),
+        format!("{BIND} bind!(leaf); {CALL}crate::leaf();"),
+        format!("{BIND} bind!(other); {CALL}leaf();"),
+        format!("{INSPECT} bind!(leaf); {CALL}leaf();"),
+        format!("{BIND} {INSPECT} bind!(leaf); {CALL}leaf();"),
+        format!("{INSPECT} #[cfg(any())] {BIND} bind!(leaf); {CALL}leaf();"),
+    ] {
+        let source = format!("pub fn leaf() {{}}\npub fn other() {{}}\npub fn run() {{ {body} }}");
+        let manifest = [("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")];
+        let result = resolution("rust", &[("src/lib.rs", &source)], &manifest, WORK_MAX);
+        assert!(!result.exhausted, "{body}");
+        let expected = source
+            .find(CALL)
+            .map(|marker| u64::try_from(marker + CALL.len()).expect("offset"));
+        let found = calls(&result, "src/lib.rs")
+            .map(|edge| {
+                assert!(target(edge).ends_with("/fixture/leaf"), "{body}");
+                edge.callee_range.start
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found, expected.into_iter().collect::<Vec<_>>(), "{body}");
     }
 }
 

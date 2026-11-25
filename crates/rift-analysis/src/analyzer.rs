@@ -2540,10 +2540,6 @@ pub enum PackageLanguage {
     Jsonc,
 }
 
-/// Rust container kinds whose private members a `pub` container exports: a trait's
-/// items and an enum's variants carry no visibility of their own.
-const PUBLIC_MEMBER_CONTAINERS: [&str; 2] = ["trait", "enum"];
-
 /// JavaScript container kinds whose members an exported container exports: a class's
 /// methods carry no `export` of their own.
 const JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS: [&str; 1] = ["class"];
@@ -2623,25 +2619,9 @@ impl PackageLanguage {
         }
     }
 
-    fn is_public(
-        self,
-        symbol: &SyntaxSymbol,
-        by_name: &BTreeMap<&str, &SyntaxSymbol>,
-        python: Option<&PythonExports<'_>>,
-    ) -> bool {
+    fn is_public(self, symbol: &SyntaxSymbol, python: Option<&PythonExports<'_>>) -> bool {
         match self {
-            Self::Rust => match symbol.visibility.as_deref() {
-                Some("pub") => true,
-                Some("private") => symbol
-                    .container
-                    .as_deref()
-                    .and_then(|container| by_name.get(container))
-                    .is_some_and(|container| {
-                        PUBLIC_MEMBER_CONTAINERS.contains(&container.kind)
-                            && container.visibility.as_deref() == Some("pub")
-                    }),
-                _ => false,
-            },
+            Self::Rust => symbol.visibility.as_deref() == Some("pub"),
             Self::Python | Self::Cython => python.is_some_and(|exports| exports.is_public(symbol)),
             Self::TypeScript | Self::Vue | Self::Svelte => !symbol
                 .visibility
@@ -2681,7 +2661,7 @@ impl ExportRule {
         python: Option<&PythonExports<'_>>,
     ) -> bool {
         match self {
-            Self::Language(rules) => rules.is_public(symbol, by_name, python),
+            Self::Language(rules) => rules.is_public(symbol, python),
             Self::JavaScriptModule => is_javascript_export(symbol, by_name),
         }
     }
@@ -2823,13 +2803,13 @@ pub fn public_qualified_names(
         ExportRule::Language(PackageLanguage::Python | PackageLanguage::Cython)
     )
     .then(|| PythonExports::new(source, facts));
-    let by_name = if python.is_some() {
-        BTreeMap::new()
-    } else {
+    let by_name = if rule == ExportRule::JavaScriptModule {
         symbols
             .iter()
             .map(|symbol| (symbol.qualified_name.as_str(), symbol))
             .collect()
+    } else {
+        BTreeMap::new()
     };
     let public = |symbol| rule.is_public(symbol, &by_name, python.as_ref());
     if python.is_some() {
@@ -3212,6 +3192,38 @@ mod tests {
             [Some("function_item"), Some("function_item")],
             "each declaration names its item syntax element's grammar kind"
         );
+    }
+
+    #[test]
+    fn test_rust_publication_keeps_inherent_member_visibility_in_both_orders() {
+        let definition = "pub enum Task { Ready }";
+        let implementation = "impl Task { fn helper(&self) {} }";
+        for items in [[definition, implementation], [implementation, definition]] {
+            let source = format!(
+                "{}\n{}\npub trait Run {{ fn execute(&self); }}\n",
+                items[0], items[1]
+            );
+            let publication = analyzed(ShippedLanguage::Rust, vec![("src/lib.rs", &source)]);
+            let documents = document_identities(&publication, PackageDocumentKind::Symbol);
+            for (name, expected_public) in [
+                ("Task/helper", false),
+                ("Task/Ready", true),
+                ("Run/execute", true),
+            ] {
+                let symbol = format!("rift://symbol/cargo/crates.io/beacon/rust/beacon/{name}");
+                let declaration = publication
+                    .declarations
+                    .iter()
+                    .find(|declaration| declaration.symbol.as_str() == symbol)
+                    .expect("source declaration is retained");
+                assert_eq!(declaration.public, expected_public, "{name} in {source}");
+                assert_eq!(
+                    documents.contains(&symbol.as_str()),
+                    expected_public,
+                    "{name} in {source}"
+                );
+            }
+        }
     }
 
     #[test]

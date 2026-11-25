@@ -256,6 +256,8 @@ pub enum StaticBindingKind {
         /// Authored type or constructor path.
         type_path: ByteRange,
     },
+    /// The name of a type item bound inside a Rust block.
+    RustBlockType,
     /// Rust type parameter whose declared bounds remain in its lexical scope.
     RustTypeParameter,
     /// Local Rust value whose initializer can establish its declared return owner.
@@ -1285,6 +1287,7 @@ impl StaticBinding {
             | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonGlobal
             | StaticBindingKind::PythonNonlocal
+            | StaticBindingKind::RustBlockType
             | StaticBindingKind::RustTypeParameter => true,
         };
         valid(self.name)
@@ -1304,15 +1307,20 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
     items.capacity().saturating_mul(std::mem::size_of::<T>())
 }
 
-enum Grammar {
+enum Grammar<'source> {
     Python(&'static python_edges::EdgePythonKinds, python_edges::Names),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     /// With the places the parser could not read.
-    Rust(&'static rust::Kinds, rift_core::LoopBudget, Vec<ByteRange>),
+    Rust(
+        &'static rust::Kinds,
+        rift_core::LoopBudget,
+        Vec<ByteRange>,
+        rust::Macros<'source>,
+    ),
 }
 
 pub(crate) struct Capture<'source> {
-    grammar: Grammar,
+    grammar: Grammar<'source>,
     source: &'source str,
     facts: StaticFacts,
     edge_heritage: &'static heritage_edges::EdgeHeritageKinds,
@@ -1361,6 +1369,7 @@ impl<'source> Capture<'source> {
                 rust::kinds(),
                 rift_core::LoopBudget::new(limits.syntax_elements_max()),
                 Vec::new(),
+                rust::Macros::default(),
             ),
             edge_heritage: heritage_edges::edge_rust_kinds(),
             source,
@@ -1374,7 +1383,7 @@ impl<'source> Capture<'source> {
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         if (syntax_element.is_error() || syntax_element.is_missing())
-            && let Grammar::Rust(kinds, _, unread) = &mut self.grammar
+            && let Grammar::Rust(kinds, _, unread, _) = &mut self.grammar
         {
             kinds.record_error(visited, self.source, unread, &mut self.facts.0)?;
         }
@@ -1395,14 +1404,14 @@ impl<'source> Capture<'source> {
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }
-            Grammar::Rust(kinds, budget, _) => {
-                kinds.record(visited, self.source, &mut self.facts.0, budget)
+            Grammar::Rust(kinds, budget, _, macros) => {
+                kinds.record(visited, self.source, &mut self.facts.0, budget, macros)
             }
         }
     }
 
     pub(crate) fn finish(mut self) -> StaticFacts {
-        if let Grammar::Rust(_, _, unread) = self.grammar {
+        if let Grammar::Rust(_, _, unread, _) = self.grammar {
             rust::Kinds::close_unread(unread, &mut self.facts.0);
         }
         self.facts
