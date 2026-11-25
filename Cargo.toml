@@ -5,12 +5,15 @@ exclude = [
     "vendor/toasty-driver-sqlite",
     "vendor/tree-sitter-angular",
     "vendor/tree-sitter-typescript",
+    "vendor/ty_ide",
+    "vendor/ty_project",
+    "vendor/ty_python_semantic",
     "tools/tracing-fixtures/consumer",
     "tools/tracing-fixtures/facade",
 ]
 
 [workspace.package]
-version = "0.0.100"
+version = "0.0.101"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -200,8 +203,11 @@ zstd = { version = "=0.14.4", default-features = false }
 
 # Embedded ty pins the Ruff revision that moved its archive reader to zip 9.
 # Use deflate for the bundled typeshed archive.
-ty_project = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1", default-features = false, features = ["deflate"] }
-ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+# `ty_project` and `ty_ide` are that revision's sources under `vendor/`, because they depend on
+# `ty_python_semantic`, which carries one patch (`vendor/ty_python_semantic/ORIGIN.md`). Every
+# other ruff and ty crate comes from the git revision; move all of them together.
+ty_project = { version = "=0.0.0", path = "vendor/ty_project", default-features = false, features = ["deflate"] }
+ty_ide = { version = "=0.0.0", path = "vendor/ty_ide" }
 ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1", features = ["os"] }
 ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }

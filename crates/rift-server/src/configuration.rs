@@ -288,7 +288,10 @@ mod tests {
                 "docs/public/**",
                 "plugins/claude/skills/**",
                 "dev/**",
-                "docs/**"
+                "docs/**",
+                "vendor/ty_ide/**",
+                "vendor/ty_project/**",
+                "vendor/ty_python_semantic/**"
             ]
         );
         assert!(configuration.source.respect_gitignore);
