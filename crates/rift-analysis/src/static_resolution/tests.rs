@@ -4035,13 +4035,45 @@ fn test_rust_declarative_macro_bindings_have_statement_scope() {
         let expected = source
             .find(CALL)
             .map(|marker| u64::try_from(marker + CALL.len()).expect("offset"));
-        let found = calls(&result, "src/lib.rs")
-            .map(|edge| {
-                assert!(target(edge).ends_with("/fixture/leaf"), "{body}");
-                edge.callee_range.start
-            })
+        let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+        assert_eq!(found.len(), 1 + usize::from(expected.is_some()), "{body}");
+        let ordinary = found
+            .iter()
+            .filter(|edge| target(edge).ends_with("/fixture/leaf"))
+            .map(|edge| edge.callee_range.start)
             .collect::<Vec<_>>();
-        assert_eq!(found, expected.into_iter().collect::<Vec<_>>(), "{body}");
+        assert_eq!(ordinary, expected.into_iter().collect::<Vec<_>>(), "{body}");
+
+        let binding = found
+            .into_iter()
+            .find(|edge| target(edge).ends_with("/fixture/run/bind"))
+            .expect("authored macro call");
+        let invocation = if body.contains("bind!(other)") {
+            "bind!(other)"
+        } else {
+            "bind!(leaf)"
+        };
+        let invocation_start = source.find(invocation).expect("macro invocation");
+        assert_eq!(source_of(binding, &source), invocation, "{body}");
+        assert_eq!(
+            binding.binding.range().start(),
+            u64::try_from(invocation_start).expect("invocation offset"),
+            "{body}",
+        );
+        let definition_start = source
+            .find(INSPECT)
+            .or_else(|| source.find(BIND))
+            .expect("active macro definition");
+        assert_eq!(
+            binding
+                .target_binding
+                .as_ref()
+                .expect("macro target")
+                .range()
+                .start(),
+            u64::try_from(definition_start).expect("definition offset"),
+            "{body}",
+        );
     }
 }
 
