@@ -224,6 +224,49 @@ fn supplemental_python_read_keeps_primary_package_calls_at_the_edge_cap() {
     }));
 }
 
+#[test]
+fn supplemental_python_from_module_keeps_primary_calls_at_the_edge_cap() {
+    let calls = "    callee()\n".repeat(128);
+    let importer = format!("from .b import callee\n\ndef zeta():\n{calls}");
+    let provider = "def callee(): pass\n";
+    let limits = || ExactPackageLimits::new(2, 1 << 20);
+    let full = analyze(limits(), &importer, provider).expect("fully admitted imports and calls");
+    let edges = full.semantics.edges();
+    let qualifier = |edge: &crate::Edge| {
+        edge.kind() == rift_protocol::read::EdgeKind::Imports
+            && edge.to().as_str().ends_with("/pkg/b")
+            && edge.occurrence().unit().key().as_str() == "pkg/a.py"
+            && edge.occurrence().range().start() == 5
+            && edge.occurrence().range().end() == 7
+    };
+    assert!(edges.is_complete());
+    assert_eq!(edges.edges().filter(|edge| qualifier(edge)).count(), 1);
+    let expected = edges
+        .edges()
+        .filter(|edge| !qualifier(edge))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|edge| edge.kind() == rift_protocol::read::EdgeKind::Calls)
+            .count(),
+        128
+    );
+    let bounded = analyze(
+        limits()
+            .with_edges(expected.len())
+            .expect("preserved primary edge capacity"),
+        &importer,
+        provider,
+    )
+    .expect("bounded qualifier package");
+    assert_eq!(
+        bounded.semantics.edges().edges().collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(bounded.semantics.edges().dropped_edges(), 1);
+}
+
 fn source(count: u32) -> String {
     (0..count).fold(String::new(), |mut text, index| {
         writeln!(text, "def f{index}(): pass").expect("string write");

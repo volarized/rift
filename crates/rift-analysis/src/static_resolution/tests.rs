@@ -2883,7 +2883,8 @@ fn test_python_static_imports_keep_submodules_and_captured_external_exports() {
         imported,
         [
             "rift://symbol/local/python/pkg/models",
-            "rift://symbol/local/python/pkg/bridge"
+            "rift://symbol/local/python/pkg/bridge",
+            "rift://symbol/local/python/pkg"
         ],
         "{result:?}"
     );
@@ -2979,7 +2980,7 @@ fn test_python_static_reexports_keep_module_import_owners() {
         .iter()
         .filter(|edge| edge.role == ReferenceRole::Import)
         .collect::<Vec<_>>();
-    assert_eq!(imports.len(), 3, "{result:?}");
+    assert_eq!(imports.len(), 4, "{result:?}");
     let written = imports
         .iter()
         .find(|edge| {

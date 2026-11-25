@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 
 use rift_core::ReferenceRole;
-use rift_protocol::read::EdgeKind;
+use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
 
-use super::super::{ExternalOccurrence, File, Index, StaticResolution, Target, Work};
+use super::super::{
+    ExternalOccurrence, File, Index, StaticOccurrence, StaticResolution, Target, Work,
+};
 use super::{EdgePythonModules, ModuleName, Scope, ScopeLookup};
 
 /// What one read or written name names.
@@ -62,6 +64,22 @@ impl<'source> Index<'source> {
             }
         };
         result.record_kind(occurrence, EdgeKind::Reads);
+    }
+
+    /// The written root name of an already resolved path, when it names a module.
+    pub(super) fn python_member_module_qualifier(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let Name::Declared(target) = self.python_shared_name(file, range, work) else {
+            return None;
+        };
+        if !target.symbol.kinds.contains(&SymbolKind::Module) {
+            return None;
+        }
+        self.python_access(file, range, ReferenceRole::Read, target)
     }
 
     /// Records one write of a name that the module or a class holds.

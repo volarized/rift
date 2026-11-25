@@ -25,6 +25,34 @@ use rift_syntax::{
 use super::{Binding, File, Index, StaticOccurrence, Target, Work};
 use crate::analyzer::namespace::python::python_import_target;
 
+/// An established import terminal beside its written from-module token.
+pub(super) struct PythonImportQualifier<'source> {
+    pub(super) module: ByteRange,
+    terminal: Target<'source>,
+    from: rift_core::SymbolId,
+}
+
+impl<'source> PythonImportQualifier<'source> {
+    pub(super) fn from_import(
+        binding: &StaticBinding,
+        terminal: Target<'source>,
+        occurrence: &StaticOccurrence,
+    ) -> Option<Self> {
+        let StaticBindingKind::PythonImport {
+            module,
+            export: Some(_),
+        } = binding.kind
+        else {
+            return None;
+        };
+        Some(Self {
+            module,
+            terminal,
+            from: occurrence.edge_from.as_ref()?.clone(),
+        })
+    }
+}
+
 pub(super) struct EdgePythonModules(BTreeMap<String, Option<String>>);
 
 impl EdgePythonModules {
@@ -429,6 +457,32 @@ impl<'source> Index<'source> {
             written.qualified_target(".")?,
         )?;
         occurrence.edge_from = Some(original.edge_from.as_ref()?.clone());
+        Some(occurrence)
+    }
+
+    pub(super) fn python_import_qualifier(
+        &self,
+        file: &File<'source>,
+        site: PythonImportQualifier<'source>,
+    ) -> Option<StaticOccurrence> {
+        let text = file.text(site.module)?;
+        if text.bytes().all(|byte| byte == b'.') {
+            return None;
+        }
+        let name = EdgePythonModules::name(file, text)?;
+        let written = self.files.get(self.edge_python.path(&name)?)?;
+        let target = written.qualified_target(".")?;
+        if site.terminal.symbol.kind == "module" && site.terminal.file.path == target.file.path {
+            return None;
+        }
+        let mut occurrence = self.occurrence(
+            file,
+            site.module,
+            site.module,
+            rift_core::ReferenceRole::Import,
+            target,
+        )?;
+        occurrence.edge_from = Some(site.from);
         Some(occurrence)
     }
 

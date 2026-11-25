@@ -97,23 +97,58 @@ impl<'source> Index<'source> {
         (!work.exhausted && !names.is_empty()).then_some(PythonNameSites { names, paths })
     }
 
-    /// Resolve plain names using the work left by the other facts of every file.
+    /// Resolve plain names and retain suppressed module qualifier sites for later.
     pub(in crate::static_resolution) fn python_name_references(
         &self,
         file: &File<'source>,
         sites: PythonNameSites,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) {
+    ) -> Vec<ByteRange> {
+        let mut qualifiers = Vec::new();
         for reference in sites.names {
             if !work.charge() {
-                return;
+                break;
             }
             let name = reference.target;
             if reference.role == ReferenceRole::Write {
                 self.python_name_write(file, name, work, result);
-            } else if !(sites.paths.contains(&name.start) && file.python_path_starts(name)) {
+            } else if sites.paths.contains(&name.start) && file.python_path_starts(name) {
+                qualifiers.push(name);
+            } else {
                 self.python_name_read(file, name, work, result);
+            }
+        }
+        qualifiers
+    }
+
+    /// Resolves qualifiers after the established edge passes have run in every file.
+    pub(in crate::static_resolution) fn python_module_qualifiers(
+        &self,
+        file: &File<'source>,
+        imports: Vec<super::PythonImportQualifier<'source>>,
+        names: Vec<ByteRange>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let mut written = BTreeSet::new();
+        for import in imports {
+            if !work.charge() {
+                return;
+            }
+            if !written.contains(&import.module)
+                && let Some(occurrence) = self.python_import_qualifier(file, import)
+            {
+                written.insert(occurrence.callee_range);
+                result.record(Some(occurrence));
+            }
+        }
+        for name in names {
+            if !work.charge() {
+                return;
+            }
+            if let Some(occurrence) = self.python_member_module_qualifier(file, name, work) {
+                result.record(Some(occurrence));
             }
         }
     }
