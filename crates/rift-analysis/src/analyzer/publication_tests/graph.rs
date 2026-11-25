@@ -12,6 +12,58 @@ use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, Publicat
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
 
 #[test]
+fn package_collects_python_generic_aliases_in_their_own_scope() {
+    let source = "class T: pass\nclass Bound: pass\n\
+                  type Plain = T\n\
+                  type Values[T] = T\n\
+                  type WithDefault[T = int] = T\n\
+                  type Bounded[\n    T: Bound,  # bound of the alias\n] = list[T]\n\
+                  def accept(value: Values[int]) -> Values[int]: return value\n";
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let identity = |name| format!("{module}/{name}");
+    for alias in ["Plain", "Values", "WithDefault", "Bounded"] {
+        let name = identity(alias);
+        assert!(
+            result
+                .objects
+                .iter()
+                .any(|object| { object.id.as_ref().is_some_and(|id| id.as_str() == name) }),
+            "{alias}"
+        );
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Contains]
+                    && edge.from.as_str() == module
+                    && edge.to.as_str() == name
+            }),
+            "{alias}"
+        );
+    }
+    let module_type = identity("T");
+    let plain_alias = identity("Plain");
+    let uses = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::HasType] && edge.to.as_str() == module_type)
+        .map(|edge| edge.from.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(uses, [plain_alias.as_str()]);
+    for (source, target) in [("Bounded", "Bound"), ("accept", "Values")] {
+        let from = identity(source);
+        let to = identity(target);
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::HasType]
+                    && edge.from.as_str() == from
+                    && edge.to.as_str() == to
+            }),
+            "{source} -> {target}"
+        );
+    }
+}
+
+#[test]
 fn package_preserves_python_edges_beside_type_parameter_defaults() {
     let prefix = "import math\ndef leaf(): pass\ndef f(): leaf()\n";
     let module = "rift://symbol/pypi/pypi.org/click/python/click";
