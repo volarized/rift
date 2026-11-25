@@ -93,6 +93,26 @@ fn module(text: impl Into<String>) -> [(&'static str, String); 1] {
     [("module", text.into())]
 }
 
+#[test]
+fn many_lexical_reads_keep_containment_in_the_package() {
+    let mut source = "N = 0\n".repeat(1_800);
+    source.push_str(&"N\n".repeat(4_000));
+    source.push_str("class Tail:\n    def member(self): pass\n");
+    let found = edges(
+        &[
+            ("module", source),
+            ("other", "def leaf(): pass\ndef run(): leaf()\n".to_owned()),
+        ],
+        512,
+    );
+    assert!(
+        found
+            .iter()
+            .any(|edge| edge == "module/Tail -> module/Tail/member")
+    );
+    assert!(found.iter().any(|edge| edge == "other/run -> other/leaf"));
+}
+
 /// One line for each link of a chain, from the number of the link and the one before it.
 fn chain(line: impl Fn(usize, usize) -> String) -> String {
     chain_of(LINKS, line)
@@ -151,7 +171,7 @@ fn a_chain_of_constructed_values_ends() {
     let found = chained(format!("{CLASS}a0 = C\n{links}a{LAST}.m()\n"));
     assert_edges(
         &found,
-        1003,
+        1005,
         &["module/C -> module/C/m", "module -> module/C"],
     );
 }
@@ -164,7 +184,7 @@ fn a_chain_of_constructed_attributes_ends() {
     ));
     assert_edges(
         &found,
-        3005,
+        3006,
         &["module/A -> module/A/f", "module/A/f -> module/A/a998"],
     );
 }
@@ -177,7 +197,7 @@ fn a_chain_of_aliases_ends() {
     ));
     assert_edges(
         &found,
-        1008,
+        2007,
         &[
             "module -> module/C/m",
             "module/D -> module/C",
@@ -192,7 +212,7 @@ fn a_chain_of_container_aliases_ends() {
     let found = chained(format!(
         "{CLASS}from typing import List\na0: List[C] = []\n{links}for x in a{LAST}:\n    x.m()\n"
     ));
-    assert_edges(&found, 1005, &["module -> module/a998"]);
+    assert_edges(&found, 2005, &["module -> module/a998"]);
 }
 
 #[test]
@@ -217,7 +237,7 @@ fn a_chain_of_reexports_ends() {
     );
     assert_edges(
         &found,
-        1008,
+        1007,
         &["module/K -> module/C", "module -> module/C/m"],
     );
 }
@@ -298,7 +318,7 @@ fn a_class_with_many_bases_inherits_from_each() {
     );
     assert_edges(
         &found,
-        16_007,
+        16_005,
         &[
             "module -> module/B0/m0",
             "module -> module/B3999/m3999",
@@ -332,14 +352,11 @@ fn many_bases_that_share_a_base_merge_in_the_c3_order() {
     );
     assert!(!called("module/Root/m"));
     assert!(called("module/Root/r"));
-    let reads = found
+    let calls = found
         .iter()
         .filter(|edge| *edge == "module -> module/Root/r")
         .count();
-    assert_eq!(
-        reads, 2,
-        "the call and the name of `K().r`, none of `Wrong().r`"
-    );
+    assert_eq!(calls, 1, "the call of `K().r`, none of `Wrong().r`");
 }
 
 // Issue #1065.
@@ -356,7 +373,7 @@ fn a_long_base_class_chain_keeps_the_edges_of_its_file() {
     ));
     assert_edges(
         &found,
-        30_008,
+        30_006,
         &[
             "module/sentinel -> module/Zed/m",
             "module/C9999 -> module/C9998",
@@ -370,7 +387,7 @@ fn a_long_base_class_chain_keeps_the_edges_of_its_file() {
     ));
     assert_edges(
         &found,
-        7 * LINKS + 4,
+        7 * LINKS + 2,
         &[
             "module/sentinel -> module/Zed/m",
             "module/C999/m -> module/C998/m",
@@ -386,7 +403,7 @@ fn a_chain_of_bases_ends() {
     ));
     assert_edges(
         &found,
-        3002,
+        3001,
         &["module -> module/C0/m", "module/C999 -> module/C998"],
     );
 }
@@ -416,7 +433,7 @@ fn a_chain_of_functions_ends() {
     ));
     assert_edges(
         &found,
-        5004,
+        5002,
         &["module -> module/C/m", "module/f999 -> module/f998"],
     );
 }
@@ -431,7 +448,7 @@ fn a_chain_of_arguments_ends() {
     ));
     assert_edges(
         &found,
-        5003,
+        6001,
         &["module -> module/C/m", "module -> module/f999"],
     );
 }

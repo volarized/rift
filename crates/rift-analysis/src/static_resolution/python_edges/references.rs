@@ -1,11 +1,20 @@
 //! Python containment, member accesses, overrides, and annotation uses.
 
-use rift_core::ReferenceRole;
+use std::collections::{BTreeMap, BTreeSet};
+
+use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::read::{EdgeKind, SymbolKind};
-use rift_syntax::ByteRange;
+use rift_provider::NormalizedTarget;
+use rift_syntax::{ByteRange, StaticReference};
 
 use super::super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 use super::Value;
+
+/// Plain names read after member, annotation, and containment facts have been resolved.
+pub(in crate::static_resolution) struct PythonNameSites {
+    names: Vec<StaticReference>,
+    paths: BTreeSet<u64>,
+}
 
 impl<'source> Index<'source> {
     pub(in crate::static_resolution) fn python_references(
@@ -13,43 +22,50 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) {
+    ) -> Option<PythonNameSites> {
+        let callees = established_callees(result);
+        let mut paths = callees
+            .keys()
+            .map(|callee| callee.start)
+            .collect::<BTreeSet<_>>();
+        let mut names = Vec::new();
         for reference in file.facts.references() {
-            if !work.charge() {
-                return;
+            // A member access spells its receiver. A name alone states no member.
+            if reference.role != ReferenceRole::Type
+                && file
+                    .text(reference.target)
+                    .is_some_and(|text| !text.contains('.'))
+            {
+                names.push(*reference);
+                continue;
             }
-            let named = if reference.role == ReferenceRole::Type {
+            if !work.charge() {
+                return None;
+            }
+            let target = if reference.role == ReferenceRole::Type {
                 self.python_type(file, reference.target, work)
             } else {
                 self.edge_python_name(file, reference.target, work)
             };
-            let occurrence = named
+            let occurrence = target
                 .or_else(|| {
                     (reference.role == ReferenceRole::Write)
                         .then(|| self.python_written_module_name(file, reference.target, work))
                         .flatten()
                 })
                 .and_then(|target| {
-                    let mut occurrence = self.occurrence(
-                        file,
-                        reference.target,
-                        reference.target,
-                        reference.role,
-                        target,
-                    )?;
-                    // An annotation belongs to its declaration. Accesses belong to the enclosing callable.
-                    if reference.role != ReferenceRole::Type
-                        && let Some(caller) = file.enclosing_callable(reference.target)
-                    {
-                        occurrence.edge_from = self.python_identity(file, reference.target, caller);
-                    }
-                    Some(occurrence)
+                    self.python_access(file, reference.target, reference.role, target)
                 });
-            result.record(occurrence);
+            if occurrence.is_some() {
+                paths.insert(reference.target.start);
+            }
+            if !names_callee(&callees, reference, occurrence.as_ref()) {
+                result.record(occurrence);
+            }
         }
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
-                return;
+                return None;
             }
             if symbol.qualified_name == "." {
                 continue;
@@ -77,6 +93,46 @@ impl<'source> Index<'source> {
                 }
             }
         }
+        self.named_type_references(file, work, result);
+        (!work.exhausted && !names.is_empty()).then_some(PythonNameSites { names, paths })
+    }
+
+    /// Resolve plain names using the work left by the other facts of every file.
+    pub(in crate::static_resolution) fn python_name_references(
+        &self,
+        file: &File<'source>,
+        sites: PythonNameSites,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for reference in sites.names {
+            if !work.charge() {
+                return;
+            }
+            let name = reference.target;
+            if reference.role == ReferenceRole::Write {
+                self.python_name_write(file, name, work, result);
+            } else if !(sites.paths.contains(&name.start) && file.python_path_starts(name)) {
+                self.python_name_read(file, name, work, result);
+            }
+        }
+    }
+
+    /// An access belongs to the enclosing callable, an annotation to its declaration.
+    pub(super) fn python_access(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        role: ReferenceRole,
+        target: Target<'source>,
+    ) -> Option<StaticOccurrence> {
+        let mut occurrence = self.occurrence(file, range, range, role, target)?;
+        if role != ReferenceRole::Type
+            && let Some(caller) = file.enclosing_callable(range)
+        {
+            occurrence.edge_from = self.python_identity(file, range, caller);
+        }
+        Some(occurrence)
     }
 
     /// The declaration a written type names. A module or a function is no type.
@@ -136,11 +192,11 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         range: ByteRange,
         target: Target<'source>,
-    ) -> Option<rift_core::SymbolId> {
+    ) -> Option<SymbolId> {
         let occurrence = self.occurrence(file, range, range, ReferenceRole::Read, target)?;
         match occurrence.target {
-            rift_provider::NormalizedTarget::Symbol(symbol) => Some(symbol),
-            rift_provider::NormalizedTarget::Contribution(_) => None,
+            NormalizedTarget::Symbol(symbol) => Some(symbol),
+            NormalizedTarget::Contribution(_) => None,
         }
     }
 
@@ -156,5 +212,57 @@ impl<'source> Index<'source> {
         occurrence.edge_kind = Some(kind);
         occurrence.edge_from = Some(self.python_identity(file, range, from)?);
         Some(occurrence)
+    }
+}
+
+/// The callees whose calls in one file have a target, with the declaration each call names
+/// in the selection.
+fn established_callees(result: &StaticResolution) -> BTreeMap<ByteRange, Option<SymbolId>> {
+    let external = result.external.iter();
+    let mut callees = external
+        .filter(|call| call.role == ReferenceRole::Call)
+        .map(|call| (call.callee_range, None))
+        .collect::<BTreeMap<_, _>>();
+    for call in &result.occurrences {
+        if call.role == ReferenceRole::Call
+            && let NormalizedTarget::Symbol(called) = &call.target
+        {
+            callees.insert(call.callee_range, Some(called.clone()));
+        }
+    }
+    callees
+}
+
+/// Whether the read of a callee names what its call names, or names nothing beside it. A
+/// callee that is read through another name, such as an attribute that holds the called
+/// class, is a fact of its own.
+fn names_callee(
+    callees: &BTreeMap<ByteRange, Option<SymbolId>>,
+    reference: &StaticReference,
+    occurrence: Option<&StaticOccurrence>,
+) -> bool {
+    let Some(called) = callees.get(&reference.target) else {
+        return false;
+    };
+    let read = occurrence.map(|occurrence| &occurrence.target);
+    reference.role == ReferenceRole::Read
+        && match (called, read) {
+            (Some(called), Some(NormalizedTarget::Symbol(read))) => called == read,
+            (_, read) => read.is_none(),
+        }
+}
+
+impl File<'_> {
+    /// Whether the name is the first of a member path.
+    fn python_path_starts(&self, name: ByteRange) -> bool {
+        let rest = usize::try_from(name.end)
+            .ok()
+            .and_then(|end| self.document.source.get(end..));
+        rest.is_some_and(|rest| {
+            rest.trim_start_matches(|character: char| {
+                character.is_whitespace() || character == '\\'
+            })
+            .starts_with('.')
+        })
     }
 }

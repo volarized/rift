@@ -3,6 +3,7 @@
 mod annotations;
 mod classes;
 mod elements;
+mod names;
 mod overloads;
 mod rebinding;
 mod receiver_guards;
@@ -10,6 +11,7 @@ mod references;
 mod slots;
 
 pub(super) use classes::{ClassOrders, MemberOwners};
+pub(super) use references::PythonNameSites;
 
 use std::collections::{BTreeMap, BTreeSet};
 

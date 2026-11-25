@@ -195,6 +195,7 @@ fn resolve_by<'source>(
 /// What one file's pass adds, held apart until the files join in path order.
 struct FileResolution {
     resolution: StaticResolution,
+    python_names: Option<python_edges::PythonNameSites>,
     /// Budget the pass consumed.
     used: usize,
     /// Whether the pass ended on its budget.
@@ -457,6 +458,10 @@ struct File<'source> {
     python_evaluated_outside: BTreeMap<(ByteRange, u64), u64>,
     /// The Python lambdas, comprehensions and generator expressions around a position.
     python_expressions: EnclosingDefinitions<ByteRange>,
+    /// The Python loop statements around a position.
+    python_loops: EnclosingDefinitions<ByteRange>,
+    /// The bindings of each Python name in the scopes that declare it `global`.
+    python_globals: Bindings<'source>,
     /// Python annotation ranges by start, which can be evaluated after later statements.
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
@@ -606,6 +611,8 @@ impl<'source> File<'source> {
             python_whole: python_edges::WholeFile::Module,
             python_evaluated_outside: BTreeMap::new(),
             python_expressions: EnclosingDefinitions::new([]),
+            python_loops: EnclosingDefinitions::new([]),
+            python_globals: BTreeMap::new(),
             python_annotations: BTreeMap::new(),
             python_non_none: BTreeMap::new(),
             python_receivers: BTreeMap::new(),
@@ -652,7 +659,8 @@ impl<'source> File<'source> {
         Some(file)
     }
 
-    fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
+    /// Python guards, scopes, expressions and loops, indexed for lookup by position.
+    fn index_python_flow(&mut self, work: &mut Work) -> Option<()> {
         for &(name, body) in self.facts.non_none_guards() {
             if !work.charge() {
                 return None;
@@ -678,6 +686,19 @@ impl<'source> File<'source> {
             expressions.push((range.start, range.end, range));
         }
         self.python_expressions = EnclosingDefinitions::new(expressions);
+        let mut loops = Vec::new();
+        for &range in self.facts.loops() {
+            if !work.charge() {
+                return None;
+            }
+            loops.push((range.start, range.end, range));
+        }
+        self.python_loops = EnclosingDefinitions::new(loops);
+        Some(())
+    }
+
+    fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
+        self.index_python_flow(work)?;
         for binding in self.facts.bindings() {
             if !work.charge() {
                 return None;
@@ -714,6 +735,7 @@ impl<'source> File<'source> {
                     .insert(annotation.start, annotation.end);
             }
         }
+        self.index_python_globals(work)?;
         for (name, bindings) in &self.by_name {
             if bindings.len() <= SCANNED_BINDINGS_MAX {
                 continue;
@@ -753,6 +775,33 @@ impl<'source> File<'source> {
             }
         }
         self.index_written_types(work)
+    }
+
+    /// The bindings that a `global` statement gives to the module.
+    fn index_python_globals(&mut self, work: &mut Work) -> Option<()> {
+        for (name, bindings) in &self.by_name {
+            let global = bindings
+                .iter()
+                .filter(|binding| binding.kind == StaticBindingKind::PythonGlobal)
+                .map(|binding| binding.scope)
+                .collect::<BTreeSet<_>>();
+            if global.is_empty() {
+                continue;
+            }
+            for &binding in bindings {
+                if !work.charge() {
+                    return None;
+                }
+                let bound = !matches!(
+                    binding.kind,
+                    StaticBindingKind::PythonGlobal | StaticBindingKind::PythonGuard { .. }
+                );
+                if bound && global.contains(&binding.scope) {
+                    self.python_globals.entry(name).or_default().push(binding);
+                }
+            }
+        }
+        Some(())
     }
 
     /// Declared and element types, function writes, spread values, type signatures and
@@ -1240,6 +1289,7 @@ impl<'source> Index<'source> {
     ) {
         let files = self.files.values().collect::<Vec<_>>();
         let mut pending = files.as_slice();
+        let mut python_names = Vec::new();
         while !pending.is_empty() && !work.exhausted {
             let run = file_work.run(pending, work.budget.remaining());
             let (run, rest) = pending.split_at(run.max(1));
@@ -1276,8 +1326,37 @@ impl<'source> Index<'source> {
                 work.exhausted = apart.exhausted && left < file_work.max(file);
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+                if let Some(sites) = apart.python_names {
+                    let remaining = file_work.max(file).saturating_sub(apart.used);
+                    python_names.push((*file, remaining, sites));
+                }
                 resolution.join(file, apart.resolution, over_share);
             }
+        }
+        if !work.exhausted {
+            self.resolve_python_names(python_names, work, resolution);
+        }
+    }
+
+    /// Reads plain names after resolving calls, member accesses, and types in every file.
+    /// A cut here affects the static pass, but it cannot make a file's call coverage unavailable.
+    fn resolve_python_names(
+        &self,
+        names: Vec<(&File<'source>, usize, python_edges::PythonNameSites)>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        for (file, remaining, sites) in names {
+            let left = work.budget.remaining();
+            let budget = left.min(remaining);
+            let mut names_work = Work::new(budget);
+            self.python_name_references(file, sites, &mut names_work, resolution);
+            let used = budget.saturating_sub(names_work.budget.remaining());
+            #[cfg(test)]
+            self.performed
+                .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+            work.budget = LoopBudget::new(left.saturating_sub(used));
+            resolution.ended |= names_work.exhausted;
         }
     }
 
@@ -1301,13 +1380,14 @@ impl<'source> Index<'source> {
                 },
             );
         }
-        self.resolve_file(file, &mut work, &mut resolution);
+        let python_names = self.resolve_file(file, &mut work, &mut resolution);
         let used = budget.saturating_sub(work.budget.remaining());
         #[cfg(test)]
         self.performed
             .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
         FileResolution {
             resolution,
+            python_names,
             used,
             exhausted: work.exhausted,
         }
@@ -1361,27 +1441,32 @@ impl<'source> Index<'source> {
         true
     }
 
-    fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
+    fn resolve_file(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) -> Option<python_edges::PythonNameSites> {
         for range in file.facts.unsupported_bindings() {
             if file.inactive(*range, work) {
                 continue;
             }
             if !work.charge() {
-                return;
+                return None;
             }
             if let Some(coverage) = result.edge_calls.get_mut(file.document.placement.unit()) {
                 coverage.unresolved.push(*range);
             }
         }
         if !self.resolve_file_calls(file, work, result) {
-            return;
+            return None;
         }
         for edge in file.facts.heritage_edges() {
             if file.inactive(edge.from, work) {
                 continue;
             }
             if !work.charge() {
-                return;
+                return None;
             }
             let occurrence = self.edge_heritage_occurrence(file, edge, work);
             if occurrence.is_none()
@@ -1398,7 +1483,7 @@ impl<'source> Index<'source> {
                 continue;
             }
             if !work.charge() {
-                return;
+                return None;
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
                 let mut written = None;
@@ -1442,17 +1527,16 @@ impl<'source> Index<'source> {
         ) {
             self.javascript_edges(file, work, result);
         }
-        if file.document.facts.language().name == "python" {
-            self.python_references(file, work, result);
-        }
+        let python_names = (file.document.facts.language().name == "python")
+            .then(|| self.python_references(file, work, result))
+            .flatten();
         if file.document.facts.language().name == "rust" {
             self.rust_references(file, work, result);
-        } else if file.document.facts.language().name == "python" {
-            self.named_type_references(file, work, result);
         }
         if !work.exhausted {
             result.analyzed_sources += 1;
         }
+        python_names
     }
 
     fn call_occurrence(
