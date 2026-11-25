@@ -1012,7 +1012,9 @@ fn validate_export_bindings(
             crate::SyntaxExportKind::Namespace => {
                 binding.source.is_some() && binding.exported.is_some() && binding.local.is_none()
             }
-            crate::SyntaxExportKind::Default => binding.source.is_none(),
+            crate::SyntaxExportKind::Default => {
+                binding.source.is_none() || (binding.local.is_some() && binding.exported.is_none())
+            }
         };
         if !form_valid {
             return Err(errors::syntax::facts_structure_invalid().error());

@@ -4726,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "axum",
  "clap",
@@ -4775,7 +4775,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "data-encoding",
  "flate2",
@@ -4812,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "anyhow",
  "axum",
@@ -4843,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "rift-collect"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "rift-core",
  "rift-lsp",
@@ -4859,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "get-size2",
  "percent-encoding",
@@ -4877,7 +4877,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "ignore",
  "rift-core",
@@ -4891,14 +4891,14 @@ dependencies = [
 
 [[package]]
 name = "rift-error"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "rift-error-macros",
 ]
 
 [[package]]
 name = "rift-error-codegen"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "rift-error",
  "serde",
@@ -4909,11 +4909,11 @@ dependencies = [
 
 [[package]]
 name = "rift-error-macros"
-version = "0.0.100"
+version = "0.0.102"
 
 [[package]]
 name = "rift-history"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "data-encoding",
  "digest-io",
@@ -4928,7 +4928,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history-store"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4943,7 +4943,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "async-trait",
  "data-encoding",
@@ -4977,7 +4977,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4994,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "axum",
  "data-encoding",
@@ -5042,7 +5042,7 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "get-size2",
  "jsonschema",
@@ -5062,7 +5062,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "get-size2",
  "rift-core",
@@ -5074,7 +5074,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "data-encoding",
  "get-size2",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "jsonschema",
  "rift-analysis",
@@ -5103,7 +5103,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "axum",
  "candle-core",
@@ -5138,7 +5138,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -5186,7 +5186,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "cpu-time",
  "get-size2",
@@ -5219,7 +5219,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "getrandom 0.4.3",
  "jiff",
@@ -5258,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing-macros"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -7153,7 +7153,6 @@ dependencies = [
 [[package]]
 name = "ty_ide"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff?rev=fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1#fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1"
 dependencies = [
  "bitflags 2.13.1",
  "compact_str 0.10.0",
@@ -7215,7 +7214,6 @@ dependencies = [
 [[package]]
 name = "ty_project"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff?rev=fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1#fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -7294,8 +7292,7 @@ dependencies = [
 
 [[package]]
 name = "ty_python_semantic"
-version = "0.0.20"
-source = "git+https://github.com/astral-sh/ruff?rev=fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1#fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1"
+version = "0.0.20+rift.1"
 dependencies = [
  "bitflags 2.13.1",
  "char_str",
@@ -7999,7 +7996,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.100"
+version = "0.0.102"
 dependencies = [
  "rift-error-codegen",
  "tempfile",

@@ -1,0 +1,97 @@
+# Written out from crates/ty_ide/Cargo.toml of https://github.com/astral-sh/ruff at
+# fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1: every `workspace = true` is replaced by the value the
+# ruff workspace gives it, and the development dependencies and test targets are left out.
+# See UPSTREAM.md.
+
+[package]
+name = "ty_ide"
+version = "0.0.0"
+authors = ["Charlie Marsh <charlie.r.marsh@gmail.com>"]
+edition = "2024"
+rust-version = "1.97"
+homepage = "https://docs.astral.sh/ruff"
+documentation = "https://docs.astral.sh/ruff"
+repository = "https://github.com/astral-sh/ruff"
+license = "MIT"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+bitflags = { version = "2.5.0", default-features = false }
+compact_str = { version = "0.10.0", default-features = false, features = ["std"] }
+get-size2 = { version = "0.11.0", default-features = false, features = ["compact-str", "derive", "hashbrown", "ordermap", "smallvec", "std", "thin-vec"] }
+indexmap = { version = "2.6.0", default-features = false, features = ["std"] }
+itertools = { version = "0.15.0", default-features = false, features = ["use_std"] }
+rayon = { version = "1.10.0", default-features = false }
+regex = { version = "1.10.2", default-features = false, features = ["perf", "std", "unicode"] }
+ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1", default-features = false }
+ruff_diagnostics = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_index = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_memory_usage = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_python_literal = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_python_stdlib = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_python_trivia = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_source_file = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+rustc-hash = { version = "2.0.0", default-features = false, features = ["std"] }
+salsa = { version = "0.28.5", default-features = false, features = ["compact_str", "macros", "salsa_unstable", "inventory"] }
+smallvec = { version = "1.13.2", default-features = false, features = ["union", "const_generics", "const_new"] }
+strum = { version = "0.28.0", default-features = false, features = ["std", "strum_macros"] }
+strum_macros = { version = "0.28.0", default-features = false }
+toml_parser = { version = "1.0.0", default-features = false, features = ["std"] }
+tracing = { version = "0.1.40", default-features = false, features = ["attributes", "std"] }
+ty_module_resolver = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+ty_project = { version = "=0.0.0", path = "../ty_project", default-features = false }
+ty_python_core = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1", features = ["serde"] }
+ty_python_semantic = { version = "=0.0.20", path = "../ty_python_semantic" }
+ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
+
+[lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(codspeed)"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+disallowed_methods = "allow"
+assert_is_empty = "allow"
+char_lit_as_u8 = "allow"
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+implicit_hasher = "allow"
+map_unwrap_or = "allow"
+match_same_arms = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+nonstandard_macro_braces = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+too_many_lines = "allow"
+collapsible_match = "allow"
+needless_continue = "allow"
+unnecessary_debug_formatting = "allow"
+needless_raw_string_hashes = "allow"
+ignore_without_reason = "allow"
+iter_over_hash_type = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+empty_drop = "warn"
+empty_structs_with_brackets = "warn"
+exit = "warn"
+get_unwrap = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+redundant_clone = "warn"
+debug_assert_with_mut_call = "warn"
+unused_peekable = "warn"
+if_not_else = "allow"
+
+# An empty workspace table keeps the crate outside the Rift workspace.
+[workspace]

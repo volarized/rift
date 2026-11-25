@@ -119,7 +119,7 @@ skip = [
   { name = "thiserror", version = "1.0.69" },
   { name = "thiserror-impl", version = "1.0.69" },
 
-  # The embedded ty stack (git-pinned ruff workspace crates) pins one older
+  # The embedded ty stack (ruff workspace crates at one pinned revision) pins one older
   # version beside the workspace's own of each entry below; none can be
   # aligned from this workspace, the ruff workspace pins them itself.
   { name = "compact_str", version = "0.9.1" },
@@ -132,8 +132,8 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# ty_project and ty_ide are unpublished, so the embedded ty engine's crates
-# come from the ruff repository at a pinned revision.
+# The embedded ty engine's crates are unpublished and come from the ruff
+# repository at a pinned revision, except the three under `vendor/`.
 # The Cython grammar is unpublished and pinned in the workspace dependencies.
 allow-git = [
   "https://github.com/oxigraph/oxigraph",
