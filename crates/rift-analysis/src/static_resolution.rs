@@ -453,8 +453,8 @@ struct File<'source> {
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_whole: python_edges::WholeFile,
-    /// The part of a Python scope that the enclosing scope evaluates, by the scope's range.
-    python_evaluated_outside: BTreeMap<ByteRange, ByteRange>,
+    /// The end of each part that the enclosing scope evaluates, by scope and start.
+    python_evaluated_outside: BTreeMap<(ByteRange, u64), u64>,
     /// The Python lambdas, comprehensions and generator expressions around a position.
     python_expressions: EnclosingDefinitions<ByteRange>,
     /// Python annotation ranges by start, which can be evaluated after later statements.
@@ -667,7 +667,8 @@ impl<'source> File<'source> {
             if !work.charge() {
                 return None;
             }
-            self.python_evaluated_outside.insert(scope, part);
+            self.python_evaluated_outside
+                .insert((scope, part.start), part.end);
         }
         let mut expressions = Vec::new();
         for &range in self.facts.expression_scopes() {
