@@ -11,6 +11,7 @@ fn verified_archive_digest_is_retained_for_both_algorithms() -> TestResult {
         tar::EntryType::Regular,
     )];
     for (format, bytes) in [
+        (ArchiveFormat::Tar, uncompressed_tar_bytes(&members)?),
         (ArchiveFormat::TarGzip, tar_bytes(&members)?),
         (ArchiveFormat::Zip, zip_members_bytes(&members)?),
     ] {
@@ -680,6 +681,15 @@ fn repeated_members_consume_member_and_expanded_byte_bounds() -> TestResult {
 fn tar_bytes(
     entries: &[(&str, &[u8], tar::EntryType)],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let tar = uncompressed_tar_bytes(entries)?;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&tar)?;
+    Ok(gzip.finish()?)
+}
+
+fn uncompressed_tar_bytes(
+    entries: &[(&str, &[u8], tar::EntryType)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut builder = tar::Builder::new(Vec::new());
     for &(path, bytes, kind) in entries {
         let mut header = tar::Header::new_gnu();
@@ -694,10 +704,35 @@ fn tar_bytes(
         header.set_cksum();
         builder.append(&header, bytes)?;
     }
-    let tar = builder.into_inner()?;
-    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gzip.write_all(&tar)?;
-    Ok(gzip.finish()?)
+    Ok(builder.into_inner()?)
+}
+
+#[test]
+fn uncompressed_tar_checks_container_and_member_bounds() -> TestResult {
+    let entries = [
+        ("release/a.js", b"a".as_slice(), tar::EntryType::Regular),
+        ("release/b.js", b"bc".as_slice(), tar::EntryType::Regular),
+    ];
+    let bytes = uncompressed_tar_bytes(&entries)?;
+    let length = bytes.len();
+    let limits = ArchiveLimits::new(length, length, 2, 2, 1)?;
+    assert_eq!(
+        read_format(&bytes, ArchiveFormat::Tar, limits)?
+            .files()
+            .len(),
+        2
+    );
+    let limits = ArchiveLimits::new(length, length - 1, 2, 2, 1)?;
+    assert_eq!(
+        read_format(&bytes, ArchiveFormat::Tar, limits).expect_err("expanded archive bytes"),
+        ArchiveBound::ExpandedBytes.exceeded(length as u64, length as u64 - 1, None)
+    );
+    let limits = ArchiveLimits::new(length, length, 2, 1, 1)?;
+    assert_eq!(
+        read_format(&bytes, ArchiveFormat::Tar, limits).expect_err("second archive member"),
+        ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/b.js")))
+    );
+    Ok(())
 }
 
 fn fixture_path(path: &str) -> ProjectPath {
@@ -880,6 +915,67 @@ fn tar_symlink_and_hard_link_entries_are_skipped_and_named() -> TestResult {
         files.skipped_links(),
         &[ProjectPath::new("link.txt")?, ProjectPath::new("hard.txt")?]
     );
+    Ok(())
+}
+
+#[test]
+fn gnu_long_link_targets_are_bounded_and_the_links_stay_skipped() -> TestResult {
+    let target = "nested-directory/".repeat(8) + "data.txt";
+    let target_bytes = target.len() + 1;
+    for kind in [tar::EntryType::Symlink, tar::EntryType::Link] {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(kind);
+        link.set_size(0);
+        link.set_mode(0o644);
+        builder.append_link(&mut link, "release/link", &target)?;
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(4);
+        builder.append_data(&mut file, "release/regular", b"text".as_slice())?;
+        let bytes = gzip(&builder.into_inner()?)?;
+        let limits = ArchiveLimits::default().with_extension_size(target_bytes)?;
+        let archive = read(&bytes, limits)?;
+        assert_eq!(retained(&archive), [("regular", b"text".as_slice())]);
+        assert_eq!(archive.skipped_links(), &[ProjectPath::new("link")?]);
+        assert_eq!(
+            read(&bytes, limits.with_extension_size(target_bytes - 1)?)
+                .expect_err("overbound target extension"),
+            ArchiveBound::ExtensionBytes.exceeded(
+                u64::try_from(target_bytes)?,
+                u64::try_from(target_bytes - 1)?,
+                Some(fixture_path("@LongLink")),
+            )
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_gnu_long_link_target_requires_exactly_one_link_member() -> TestResult {
+    let target = "nested-directory/".repeat(8) + "data.txt\0";
+    let extension = (
+        "././@LongLink",
+        target.as_bytes(),
+        tar::EntryType::GNULongLink,
+    );
+    let regular = (
+        "release/regular",
+        b"text".as_slice(),
+        tar::EntryType::Regular,
+    );
+    let link = ("release/link", b"".as_slice(), tar::EntryType::Symlink);
+    for members in [
+        &[extension][..],
+        &[extension, regular],
+        &[extension, extension, link],
+    ] {
+        assert_eq!(
+            read(&tar_bytes(members)?, ArchiveLimits::default())
+                .expect_err("unmatched or repeated link target extension"),
+            ArchiveError::InvalidArchive
+        );
+    }
     Ok(())
 }
 
@@ -2388,6 +2484,92 @@ fn both_modes(limits: ArchiveLimits) -> [ArchiveLimits; 2] {
         limits,
         limits.with_oversized_members(OversizedMembers::Skip),
     ]
+}
+
+#[test]
+fn ustar_directory_capacity_leaves_the_following_file_readable() -> TestResult {
+    let mut directory = tar::Header::new_ustar();
+    directory.set_path("release/docs")?;
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o755);
+    directory.set_size(4096);
+    directory.set_cksum();
+    let member = raw_member("release/docs/readme.txt", b'0', b"hello\n")?;
+    let bytes = gzip(&[directory.as_bytes().as_slice(), &member, &[0; 1024]].concat())?;
+    let files = read(&bytes, ArchiveLimits::default())?;
+    assert_eq!(files.files().len(), 1);
+    assert_eq!(files.files()[&fixture_path("docs/readme.txt")], b"hello\n");
+    assert_eq!(
+        files.members()["release/docs"],
+        ArchiveMemberKind::Directory
+    );
+    Ok(())
+}
+
+#[test]
+fn tar_refuses_a_bad_header_checksum_or_incomplete_member() -> TestResult {
+    let mut member = raw_member("release/readme.txt", b'0', b"hello\n")?;
+    let truncated = member[..513].to_vec();
+    member[0] = b'R';
+    for input in [member, truncated] {
+        let bytes = gzip(&input)?;
+        assert_eq!(
+            read(&bytes, ArchiveLimits::default()).expect_err("invalid tar data"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn pax_multiline_comment_leaves_following_records_readable() -> TestResult {
+    let records = [
+        pax_record("comment", "first\nsecond café\n"),
+        pax_record("path", "release/readme.txt"),
+    ]
+    .concat();
+    let archive = gzip(
+        &[
+            raw_member("PaxHeaders/readme.txt", b'x', records.as_bytes())?,
+            raw_member("release/original.txt", b'0', b"hello\n")?,
+        ]
+        .concat(),
+    )?;
+    for limits in both_modes(ArchiveLimits::default()) {
+        let files = read(&archive, limits)?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(
+            files
+                .files()
+                .get(&fixture_path("readme.txt"))
+                .map(Vec::as_slice),
+            Some(b"hello\n".as_slice())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_pax_record_lengths_are_refused() -> TestResult {
+    for record in [
+        "0 comment=note\n",
+        "6 comment=note\n",
+        "15 comment=note",
+        "9999999999999999999999999999999999999 comment=note\n",
+    ] {
+        let archive = gzip(
+            &[
+                raw_member("PaxHeaders/readme.txt", b'x', record.as_bytes())?,
+                raw_member("release/readme.txt", b'0', b"hello\n")?,
+            ]
+            .concat(),
+        )?;
+        assert_eq!(
+            read(&archive, ArchiveLimits::default()).expect_err("malformed PAX record"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
 }
 
 // Issue #1033.

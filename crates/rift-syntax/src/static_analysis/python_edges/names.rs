@@ -82,7 +82,7 @@ impl NameKinds {
     }
 }
 
-/// The names of one file that wait for its other bindings.
+/// Python names and syntax checks collected during one walk.
 #[derive(Default)]
 pub(in crate::static_analysis) struct Names {
     deleted: Vec<StaticBinding>,
@@ -91,6 +91,7 @@ pub(in crate::static_analysis) struct Names {
     reads: Vec<ByteRange>,
     /// Written names with the scope that holds the target.
     writes: Vec<(ByteRange, ByteRange, NameUse)>,
+    pub(in crate::static_analysis) invalid_type_parameter_default: bool,
 }
 
 /// What one name does where it is written.

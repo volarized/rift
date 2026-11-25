@@ -2881,6 +2881,60 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_cargo_library_accepts_legacy_project_coordinates() {
+        let package = identity();
+        let owner = package.owner().expect("fixture owner");
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Dependency { package }),
+            SourceKind::Authored,
+        )
+        .expect("exact release origin");
+        let language = language(ShippedLanguage::Rust);
+        let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+        let root_path = ProjectPath::new("src/chosen.rs").expect("library path");
+        let root = PackageSource::new(&root_path, "pub fn serve() {}\n");
+        let sources = [root];
+        let cases = [
+            ("[project]\nname = 'beacon'\nversion = '1.0.0'\n", true),
+            ("[project]\nname = 'beacon'\nversion = '2.0.0'\n", false),
+            (
+                "[package]\nname = 'beacon'\nversion = '1.0.0'\n[project]\ndescription = 'historical'\n",
+                true,
+            ),
+            (
+                "[package]\nname = 'other'\nversion = '1.0.0'\n[project]\nname = 'beacon'\nversion = '1.0.0'\n",
+                false,
+            ),
+        ];
+        for (sections, accepted) in cases {
+            let metadata = format!("{sections}[lib]\nname = 'chosen'\npath = 'src/chosen.rs'\n");
+            let manifest = PackageSource::new(&manifest_path, &metadata);
+            let context = [manifest];
+            let input = ExactPackageInput::new(
+                &owner,
+                &language,
+                &origin,
+                &sources,
+                ExactPackageLimits::new(2, 4096),
+            )
+            .expect("bounded release input")
+            .with_framework_context(&context, &[])
+            .expect("original metadata");
+            let selected = input.with_library(&owner, manifest, root);
+            if accepted {
+                let publication = PackageAnalyzer::analyze(selected.expect("library witness"), 1)
+                    .expect("release analysis");
+                assert!(publication.publication().declarations.iter().any(|row| {
+                    row.symbol.as_str().ends_with("/chosen/serve")
+                        && row.unit.as_str().ends_with("/src/chosen.rs")
+                }));
+            } else {
+                assert!(selected.is_err(), "manifest release differs from the owner");
+            }
+        }
+    }
+
+    #[test]
     fn runtime_publication_preserves_exact_owner_and_document_origin() {
         let runtime = rift_protocol::read::RuntimeIdentity {
             runtime: "cpython".to_owned(),

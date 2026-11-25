@@ -3231,6 +3231,29 @@ fn test_rust_default_feature_conditions_preserve_exact_call_source_and_target() 
 }
 
 #[test]
+fn test_rust_pattern_field_attributes_control_just_the_field_binding() {
+    let manifest = [("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")];
+    for (condition, calls_leaf) in [("all()", false), ("any()", true)] {
+        let source = format!(
+            "pub fn cfg() {{}} pub fn leaf() {{}} pub struct Held {{ leaf: fn() }} pub fn run(held: Held) {{ let Held {{ #[cfg({condition})] leaf, .. }} = held; cfg(); leaf(); }}"
+        );
+        let result = resolution("rust", &[("src/lib.rs", &source)], &manifest, WORK_MAX);
+        assert!(!result.exhausted, "{source}");
+        let found = calls(&result, "src/lib.rs").map(target).collect::<Vec<_>>();
+        assert_eq!(found.len(), 1 + usize::from(calls_leaf), "{source}");
+        assert!(
+            found.iter().any(|target| target.ends_with("/fixture/cfg")),
+            "{source}"
+        );
+        assert_eq!(
+            found.iter().any(|target| target.ends_with("/fixture/leaf")),
+            calls_leaf,
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_unknown_import_does_not_establish_a_receiver_type() {
     let source =
         "mod known; #[cfg(unknown)] use crate::known::Item; fn root(item: &Item) { item.read(); }";

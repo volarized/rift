@@ -73,6 +73,7 @@ pub(super) struct Kinds {
     condition: u16,
     type_arguments: u16,
     named_patterns: [u16; 3],
+    field_pattern: u16,
     shorthand_field: u16,
     value_type: u16,
     return_type: u16,
@@ -153,6 +154,7 @@ pub(super) fn kinds() -> &'static Kinds {
                 id("tuple_struct_pattern"),
                 id("generic_pattern"),
             ],
+            field_pattern: id("field_pattern"),
             shorthand_field: id("shorthand_field_identifier"),
             value_type: field("type"),
             return_type: field("return_type"),
@@ -377,8 +379,11 @@ impl Kinds {
         if !conditional_attribute {
             return Ok(());
         }
-        let conditional = if syntax_element.kind_id() == self.inner_attribute {
-            visited.parent().map(Visited::syntax_element)
+        let parent = visited.parent().map(Visited::syntax_element);
+        let conditional = if syntax_element.kind_id() == self.inner_attribute
+            || parent.is_some_and(|parent| parent.kind_id() == self.field_pattern)
+        {
+            parent
         } else {
             // Consecutive attributes are source-ordered siblings. A cfg at the end of
             // a list owns the next item only when that item exists.
@@ -910,6 +915,7 @@ impl Kinds {
                 self.scoped_identifier,
                 self.scoped_type_identifier,
                 self.type_identifier,
+                self.attribute,
             ]
             .contains(&kind)
             {

@@ -1259,14 +1259,14 @@ impl SyntaxProvider for PythonSyntaxProvider {
             source.text,
         )?);
         export_bindings.sort_by_key(|binding| binding.range.start);
-        let static_facts = capture.finish_python(tree.root_node())?;
+        let (static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
             syntax_elements,
             symbols,
-            tree.root_node().has_error(),
+            tree.root_node().has_error() || invalid_default,
         )
         .with_export_bindings(export_bindings)
         .with_source_witness(source.text)

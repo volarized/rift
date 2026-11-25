@@ -516,19 +516,21 @@ fn test_rust_unread_source_is_bounded_by_the_element_around_it() {
     for (source, expected) in [
         ("type H = R<-1, 2>;\nfn f() {}\n", &["<-1, 2>"][..]),
         ("fn h() where (): Copy {}\n", &["()"]),
-        ("extern \"C\" { pub type Opaque; }\n", &["pub type Opaque"]),
-        ("fn f() { let made = try!(u); }\n", &["let made = try!(u);"]),
+        (
+            "extern \"C\" { pub type Broken = ; fn adjacent(); }\n",
+            &["pub type Broken = ;"],
+        ),
+        (
+            "extern \"C\" { pub type Broken = [ ; fn adjacent(); }\n",
+            &["{ pub type Broken = [ ; fn adjacent(); }"],
+        ),
     ] {
         let mut found = unsupported(source);
         found.dedup();
         assert_eq!(found, expected, "{source}");
     }
-    // A delimiter left open by a place moves the end of what stands beside it.
-    let open = unsupported("fn f() { let Held { #[cfg(all())] u, .. } = held; }\nfn g() {}\n");
-    let scope = "{ let Held { #[cfg(all())] u, .. } = held; }";
-    assert!(open.contains(&scope), "{open:?}");
-    assert!(open.iter().all(|place| scope.contains(place)), "{open:?}");
-    let names = (0..65).fold(String::new(), |names, name| names + &format!(" n{name}"));
+    // The parser can recognize the names bordering the unread part of this item.
+    let names = (0..67).fold(String::new(), |names, name| names + &format!(" n{name}"));
     let many = format!("extern \"C\" {{ pub type{names}; }}\n");
     let found = unsupported(&many);
     assert!(
@@ -537,4 +539,12 @@ fn test_rust_unread_source_is_bounded_by_the_element_around_it() {
             .any(|place| place.starts_with('{') && place.ends_with('}')),
         "a place with too many names costs its scope: {found:?}"
     );
+}
+
+#[test]
+fn test_rust_supported_syntax_keeps_only_the_unread_macro_range() {
+    let source = "extern \"C\" { pub type Opaque; }\n\
+                  fn f() { let Held { #[cfg(all())] u, .. } = held; let made = try!(u); }\n\
+                  fn g() {}\n";
+    assert_eq!(unsupported(source), ["try!(u)"]);
 }
