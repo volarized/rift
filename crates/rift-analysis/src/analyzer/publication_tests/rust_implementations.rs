@@ -408,3 +408,64 @@ fn supported_rust_forms_keep_their_neighboring_package_calls() {
         assert_eq!(count("/run", "/f"), usize::from(foreign), "{body}");
     }
 }
+
+#[test]
+fn a_foreign_type_defines_its_cross_module_implementation_identity() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::Rust,
+        vec![
+            ("src/lib.rs", "pub mod task; pub mod facade;\n"),
+            (
+                "src/task.rs",
+                "unsafe extern \"C\" {\n    /// The type.\n    pub type Task;\n    pub static LIMIT: u32;\n    pub fn external();\n}\n",
+            ),
+            (
+                "src/facade.rs",
+                "use crate::task::Task;\n/// The implementation.\nimpl Task { pub fn start() {} }\n",
+            ),
+        ],
+        None,
+        Some(("Cargo.toml", "[package]\nname='beacon'\nversion='1.0.0'\n")),
+    )
+    .expect("Rust package with a foreign type and an implementation");
+    let publication = analysis.publication();
+    for (name, expected_kind) in [
+        ("task/Task", "extern_type"),
+        ("task/LIMIT", "static"),
+        ("task/external", "function"),
+        ("task/Task/start", "function"),
+    ] {
+        let id = format!("{ROOT}/{name}");
+        let object = publication
+            .objects
+            .iter()
+            .find(|item| item.id.as_ref().is_some_and(|symbol| symbol.as_str() == id))
+            .unwrap_or_else(|| panic!("missing published object {name}"));
+        assert_eq!(object.kind.0, expected_kind, "{name}");
+    }
+    let type_id = format!("{ROOT}/task/Task");
+    let owners = publication
+        .declarations
+        .iter()
+        .filter(|item| item.symbol.as_str() == type_id)
+        .map(|item| {
+            (
+                item.unit.0.rsplit('/').next(),
+                item.syntax_element_kind.as_deref(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        owners,
+        [
+            (Some("task.rs"), Some("extern_type_item")),
+            (Some("facade.rs"), Some("impl_item")),
+        ]
+        .into()
+    );
+    assert!(
+        publication.documents.iter().any(|document| {
+            document.identity == type_id && document.unit.0.ends_with("/task.rs")
+        })
+    );
+}
