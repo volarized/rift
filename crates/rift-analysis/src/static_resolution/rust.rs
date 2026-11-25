@@ -1560,8 +1560,29 @@ impl<'source> Namespaces<'source> {
     }
 
     fn module_at(&self, file: &str, position: u64, work: &mut Work) -> Option<&[String]> {
+        self.module_at_with_scope(file, position, work)
+            .map(|(path, _)| path)
+    }
+
+    fn module_scope(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<ByteRange> {
+        let (_, inline) = self.module_at_with_scope(file.document.path.as_str(), position, work)?;
+        inline.or_else(|| crate::analyzer::namespace::rust_file_scope(file.document.source))
+    }
+
+    fn module_at_with_scope(
+        &self,
+        file: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<(&[String], Option<ByteRange>)> {
         let namespace = self.files.get(file)?;
         let mut path = namespace.base.as_slice();
+        let mut scope = None;
         let crate_name = path.first()?;
         if self
             .crate_roots
@@ -1575,11 +1596,10 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
             if inline.len() > path.len()
-                && symbol
-                    .body_range
-                    .is_some_and(|body| body.contains(position))
+                && let Some(body) = symbol.body_range.filter(|body| body.contains(position))
             {
                 path = inline;
+                scope = Some(body);
             }
         }
         for length in 1..=path.len() {
@@ -1587,7 +1607,7 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
         }
-        Some(path)
+        Some((path, scope))
     }
 
     fn module_unavailable(&self, path: &[String]) -> bool {

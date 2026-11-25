@@ -2473,6 +2473,59 @@ fn value_shadow(named: u8) -> u8 { let local = named; local }
 }
 
 #[test]
+fn rust_value_reads_exclude_initializer_local_functions() {
+    let source = r#"
+pub fn named() -> u8 { 1 }
+pub const CHOICE: fn() -> u16 = {
+    fn named() -> u16 { 9 }
+    let constant = named;
+    constant
+};
+pub static OTHER: fn() -> u32 = {
+    fn named() -> u32 { 8 }
+    let stored = named;
+    stored
+};
+pub fn root_value() -> fn() -> u8 { let root = named; root }
+pub mod inside {
+    fn named() -> u64 { 4 }
+    pub fn inline_value() -> fn() -> u64 { let inline = named; inline }
+}
+"#;
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let seen = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .map(|edge| (edge.binding.range().start(), target(edge)))
+        .collect::<Vec<_>>();
+    let position = |text: &str| {
+        u64::try_from(
+            source.find(text).expect("selected function binding") + text.len() - "named".len(),
+        )
+        .expect("fixture offset")
+    };
+    assert_eq!(
+        seen,
+        [
+            (
+                position("let root = named"),
+                "rift://symbol/local/rust/fixture/named"
+            ),
+            (
+                position("let inline = named"),
+                "rift://symbol/local/rust/fixture/inside/named"
+            ),
+        ]
+    );
+}
+
+#[test]
 fn rust_literal_and_pattern_field_labels_keep_physical_owners_and_roles() {
     let source = "pub struct Left { pub x: u8, pub y: u8 }\n\
         pub struct Right { pub x: u8, pub y: u8 }\n\
