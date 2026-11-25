@@ -759,9 +759,46 @@ impl DocumentationConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{DOCUMENTATION_PATTERNS_MAX, DocumentationDigest};
+    use super::{
+        DOCUMENTATION_PATTERNS_MAX, DocumentationCoverage, DocumentationDigest,
+        DocumentationFieldsOmitted,
+    };
     use crate::configuration::{ConfigurationViolation, WorkspaceConfiguration};
     use crate::read::PathPattern;
+
+    #[test]
+    fn coverage_writes_left_out_fields_only_when_one_was_left_out() {
+        let kept = serde_json::json!({"selected": 1, "parsed": 1, "omitted": 0, "truncated": 0});
+        let coverage: DocumentationCoverage =
+            serde_json::from_value(kept.clone()).expect("coverage without left out fields");
+        assert!(coverage.fields_omitted.is_empty());
+        assert_eq!(serde_json::to_value(&coverage).expect("coverage"), kept);
+        for fields_omitted in [
+            DocumentationFieldsOmitted {
+                limit_exceeded: 1,
+                omitted_range: 0,
+            },
+            DocumentationFieldsOmitted {
+                limit_exceeded: 0,
+                omitted_range: 2,
+            },
+        ] {
+            let left_out = DocumentationCoverage {
+                fields_omitted,
+                ..coverage.clone()
+            };
+            let written = serde_json::to_value(&left_out).expect("coverage");
+            assert_eq!(
+                written["fields_omitted"],
+                serde_json::json!({
+                    "limit_exceeded": fields_omitted.limit_exceeded,
+                    "omitted_range": fields_omitted.omitted_range,
+                })
+            );
+            let read: DocumentationCoverage = serde_json::from_value(written).expect("read");
+            assert_eq!(read, left_out);
+        }
+    }
 
     #[test]
     fn documentation_digest_schema_requires_full_sha256() {
