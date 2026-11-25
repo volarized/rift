@@ -294,6 +294,7 @@ pub(super) struct ExtractionCache {
     warning_count: usize,
 }
 
+mod admission;
 mod retained_size;
 
 #[derive(Debug)]
@@ -516,6 +517,7 @@ fn extract_source_facts(
         facts.omitted = 1;
         warn(input, &mut facts, kind, 1);
     }
+    admission::leave_out_refused_fields(input, &mut facts);
     Ok(Arc::new(facts))
 }
 
