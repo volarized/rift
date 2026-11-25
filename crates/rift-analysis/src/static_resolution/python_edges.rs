@@ -741,8 +741,25 @@ fn edge_python_binding<'source>(
 /// The scope one position reads a name in.
 struct NameScope {
     scope: Scope,
+    /// The innermost scope that redirects this name with `global` or `nonlocal`.
+    redirected: Option<Scope>,
     /// Whether a scope that declares the name `global` or `nonlocal` binds it as well.
     rebound: bool,
+}
+
+impl NameScope {
+    /// A definite deletion in the body that redirects the name to an enclosing scope.
+    fn redirected_deletion(
+        &self,
+        file: &File<'_>,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<(Scope, u64)> {
+        let scope = self.redirected?;
+        let end = file.python_deletion_before(name, scope, position, work)?;
+        Some((scope, end))
+    }
 }
 
 enum ScopeLookup {
@@ -779,11 +796,7 @@ impl<'source> Index<'source> {
             ScopeLookup::Missing => return Binding::Missing,
             ScopeLookup::Blocked => return Binding::Blocked,
         };
-        (!selected.rebound)
-            .then(|| {
-                self.python_scope_binding(file, name, selected.scope, bindings, position, work)
-            })
-            .flatten()
+        self.python_scope_binding(file, name, &selected, bindings, position, work)
             .map_or(Binding::Blocked, Binding::Found)
     }
 
@@ -792,15 +805,51 @@ impl<'source> Index<'source> {
         &self,
         file: &File<'source>,
         name: &str,
-        scope: Scope,
+        selected: &NameScope,
         bindings: &[&'source StaticBinding],
         position: u64,
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
+        // After a definite deletion, only assignments in the deleting body can restore
+        // the binding before this use, even when it is stored in an enclosing scope.
+        let (scope, deletion) = match selected.redirected_deletion(file, name, position, work) {
+            Some((scope, end)) => (scope, Some(end)),
+            None if selected.rebound => return None,
+            None => (
+                selected.scope,
+                file.python_deletion_before(name, selected.scope, position, work),
+            ),
+        };
+        if work.exhausted {
+            return None;
+        }
         let later = later_bindings(file, bindings, scope, position, work)?;
         let candidates = bindings.iter().copied().filter(|binding| {
-            Scope::of(file, binding) == scope && !later.contains(&binding.name.start)
+            Scope::of(file, binding) == scope
+                && !later.contains(&binding.name.start)
+                && deletion.is_none_or(|end| {
+                    end <= binding.name.start
+                        && binding.name.end <= position
+                        && match binding.kind {
+                            // An assignment with a value extends past its annotation.
+                            StaticBindingKind::PythonAnnotation { annotation } => {
+                                file.target_at(binding.name).is_some_and(|target| {
+                                    annotation.end < target.symbol.item_range.end
+                                })
+                            }
+                            _ => true,
+                        }
+                })
         });
+        if deletion.is_some() {
+            // A guard can narrow a rebound value. It cannot give a deleted name a value.
+            let rebound = candidates.clone().any(|binding| {
+                !work.charge() || !matches!(binding.kind, StaticBindingKind::PythonGuard { .. })
+            });
+            if !rebound || work.exhausted {
+                return None;
+            }
+        }
         let selected = match self.python_binding_group(file, candidates.clone(), work) {
             Some(selected) => selected,
             None => self
@@ -816,6 +865,41 @@ impl<'source> Index<'source> {
 }
 
 impl File<'_> {
+    /// The last deletion before a read in the same function and block.
+    fn python_deletion_before(
+        &self,
+        name: &str,
+        scope: Scope,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<u64> {
+        let deletions = self.python_deletions.get(&(name, scope.range))?;
+        let end = position.checked_add(1)?;
+        let callable = self.enclosing_callable(ByteRange {
+            start: position,
+            end,
+        })?;
+        if callable.symbol.item_range != scope.range
+            || callable
+                .symbol
+                .body_range
+                .is_none_or(|body| !body.contains(position))
+            || self.python_expressions.resolve(position, end).is_some()
+        {
+            return None;
+        }
+        let mut latest = None;
+        for deletion in deletions {
+            if !work.charge() {
+                return None;
+            }
+            if deletion.name.end <= position && deletion.block.contains(position) {
+                latest = latest.max(Some(deletion.name.end));
+            }
+        }
+        latest
+    }
+
     /// The scope a read at `position` finds a name of `bindings` in.
     fn python_scope(
         &self,
@@ -827,6 +911,7 @@ impl File<'_> {
         let mut global = false;
         let mut nonlocal = false;
         let mut rebound = false;
+        let mut redirected = None;
         loop {
             let mut best: Option<Scope> = None;
             for &binding in bindings {
@@ -870,11 +955,16 @@ impl File<'_> {
                 }
             }
             let Some(is_global) = declaration else {
-                return ScopeLookup::Found(NameScope { scope, rebound });
+                return ScopeLookup::Found(NameScope {
+                    scope,
+                    redirected,
+                    rebound,
+                });
             };
             if global || (nonlocal && is_global) {
                 return ScopeLookup::Blocked;
             }
+            redirected.get_or_insert(scope);
             rebound |= selected;
             excluded.insert(scope);
             global = is_global;

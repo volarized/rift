@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use rift_core::LoopBudget;
 use rift_protocol::read::SymbolKind;
 
-use super::super::{File, FileWork, Index, Target, Work};
+use super::super::{Binding, File, FileWork, Index, Target, Work};
 use super::{Value, edge_python_binding};
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
 
@@ -112,9 +112,16 @@ const BUILTIN_CLASSES: [&str; 96] = [
 /// Modules that provide the typing names.
 pub(super) const TYPING_MODULES: [&str; 2] = ["typing", "typing_extensions"];
 
+fn typing_name(qualified: &str, expected: &str) -> bool {
+    qualified
+        .rsplit_once('.')
+        .is_some_and(|(module, name)| name == expected && TYPING_MODULES.contains(&module))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ClassKey<'source> {
     Declaration(&'source str, &'source str),
+    Object,
     Generic,
     /// A base declared outside the selected sources, named by its written base expression.
     /// Its own ancestors are outside the selected sources too.
@@ -128,7 +135,7 @@ impl ClassKey<'_> {
             Self::Generic => name.starts_with('_'),
             // Any member may be declared by a class outside the selected sources.
             Self::External(..) => true,
-            Self::Declaration(..) => false,
+            Self::Object | Self::Declaration(..) => false,
         }
     }
 }
@@ -150,12 +157,21 @@ struct ClassOrder<'source> {
 
 /// The classes of one order, the class itself first.
 enum OrderedClasses<'source> {
+    /// No order satisfies the bases of this class or one of its ancestors.
+    Invalid,
     /// The class, then the order of its only base.
     Inherited(ClassKey<'source>),
     Merged(Vec<ClassKey<'source>>),
 }
 
 impl<'source> ClassOrder<'source> {
+    fn inherited(base: ClassKey<'source>, complete: bool) -> Self {
+        Self {
+            classes: OrderedClasses::Inherited(base),
+            complete,
+        }
+    }
+
     fn merged(classes: Vec<ClassKey<'source>>, complete: bool) -> Self {
         Self {
             classes: OrderedClasses::Merged(classes),
@@ -165,6 +181,13 @@ impl<'source> ClassOrder<'source> {
 
     fn partial(class: ClassKey<'source>) -> Self {
         Self::merged(vec![class], false)
+    }
+
+    fn invalid() -> Self {
+        Self {
+            classes: OrderedClasses::Invalid,
+            complete: false,
+        }
     }
 }
 
@@ -183,6 +206,7 @@ fn ordered<'orders, 'source>(
         }
         let class = inherited.take()?;
         match &orders.get(&class)?.classes {
+            OrderedClasses::Invalid => Some(class),
             OrderedClasses::Inherited(base) => {
                 inherited = Some(*base);
                 Some(class)
@@ -259,10 +283,16 @@ impl<'source> Index<'source> {
             .fold(0, usize::saturating_add)
             .min(work.budget.remaining());
         let mut apart = Work::new(bound);
-        let mut orders = BTreeMap::from([(
-            ClassKey::Generic,
-            ClassOrder::merged(vec![ClassKey::Generic], true),
-        )]);
+        let mut orders = BTreeMap::from([
+            (
+                ClassKey::Object,
+                ClassOrder::merged(vec![ClassKey::Object], true),
+            ),
+            (
+                ClassKey::Generic,
+                ClassOrder::inherited(ClassKey::Object, true),
+            ),
+        ]);
         let bases = self.python_bases(&mut apart);
         order_classes(bases, &mut orders, &mut apart);
         let used = bound.saturating_sub(apart.budget.remaining());
@@ -322,31 +352,31 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return None;
             }
-            let base = if self.python_generic_marker(file, range, work) {
+            let library = self.python_library_name(file, range, work);
+            let base = if library
+                .as_deref()
+                .is_some_and(|name| typing_name(name, "Generic"))
+            {
                 Some(ClassKey::Generic)
             } else if let Some(base) = self.edge_python_base(file, range, work) {
                 Some(key(base))
             } else {
-                self.python_external_class(file, range, work)
-                    .then_some(ClassKey::External(file.document.path.as_str(), range.start))
+                self.python_external_base(file, range, library.as_deref(), work)
             };
             bases.push(base);
         }
         (!work.exhausted).then_some(bases)
     }
 
-    /// A base expression names a class outside the selected sources: an unbound name (a
-    /// builtin class), or a name every binding of which imports it from a module outside them,
-    /// directly or through modules of the selected sources.
-    fn python_external_class(
+    /// The class an external base expression names. The builtin `object` has one shared key.
+    fn python_external_base(
         &self,
         file: &File<'source>,
         range: ByteRange,
+        library: Option<&str>,
         work: &mut Work,
-    ) -> bool {
-        let Some(text) = file.text(range) else {
-            return false;
-        };
+    ) -> Option<ClassKey<'source>> {
+        let text = file.text(range)?;
         // A subscripted or called base can supply other bases through `__mro_entries__`; the
         // captured base range holds only the name before its subscript or arguments.
         let applied = usize::try_from(range.end)
@@ -358,11 +388,19 @@ impl<'source> Index<'source> {
                 !part.is_empty() && part.chars().all(|c| c == '_' || c.is_alphanumeric())
             });
         let mut parts = text.split('.').map(str::trim);
-        let Some(name) = parts.next().filter(|_| named) else {
-            return false;
-        };
+        let name = parts.next().filter(|_| named)?;
+        if library == Some("builtins.object")
+            || (text == "object"
+                && matches!(
+                    self.python_binding(file, name, range.start, work),
+                    Binding::Missing
+                ))
+        {
+            return Some(ClassKey::Object);
+        }
         let dotted = parts.next().is_some();
         self.python_external_name(file, name, range.start, dotted, work)
+            .then_some(ClassKey::External(file.document.path.as_str(), range.start))
     }
 
     /// Whether every binding the name reaches is one outside the selected sources. A name of
@@ -440,15 +478,6 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn python_generic_marker(
-        &self,
-        file: &File<'source>,
-        range: ByteRange,
-        work: &mut Work,
-    ) -> bool {
-        self.python_typing_name(file, range, "Generic", work)
-    }
-
     /// Whether the expression at `range` names `expected` of `typing` or `typing_extensions`,
     /// imported by name or read through the module.
     pub(super) fn python_typing_name(
@@ -459,11 +488,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> bool {
         self.python_library_name(file, range, work)
-            .is_some_and(|qualified| {
-                qualified.rsplit_once('.').is_some_and(|(module, name)| {
-                    name == expected && TYPING_MODULES.contains(&module)
-                })
-            })
+            .is_some_and(|qualified| typing_name(&qualified, expected))
     }
 
     /// The module path and name the dotted expression at `range` reads from a module outside
@@ -565,6 +590,7 @@ impl<'source> Index<'source> {
             .container
             .as_deref()
             .and_then(|name| file.qualified_target(name))
+            .filter(|container| container.symbol.kinds.contains(&SymbolKind::Constructible))
         else {
             return false;
         };
@@ -1061,7 +1087,7 @@ fn order_classes<'source>(
                 return;
             }
             if let ClassKey::External(..) = base {
-                orders.insert(*base, ClassOrder::merged(vec![*base], true));
+                orders.insert(*base, ClassOrder::inherited(ClassKey::Object, true));
             } else if !orders.contains_key(base) {
                 missing += 1;
                 derived.entry(*base).or_default().push(*class);
@@ -1081,7 +1107,7 @@ fn order_classes<'source>(
         if work.exhausted {
             return;
         }
-        orders.insert(class, order.unwrap_or_else(|| ClassOrder::partial(class)));
+        orders.insert(class, order.unwrap_or_else(ClassOrder::invalid));
         for derived in derived.remove(&class).into_iter().flatten() {
             if !work.charge() {
                 return;
@@ -1111,13 +1137,17 @@ fn merge_order<'source>(
     if !work.charge() {
         return None;
     }
+    if bases.is_empty() {
+        return Some(ClassOrder::inherited(ClassKey::Object, true));
+    }
     if let [base] = bases {
         let Some(base) = base else {
             return Some(ClassOrder::partial(class));
         };
-        return Some(ClassOrder {
-            classes: OrderedClasses::Inherited(*base),
-            complete: orders.get(base)?.complete,
+        let order = orders.get(base)?;
+        return Some(match order.classes {
+            OrderedClasses::Invalid => ClassOrder::invalid(),
+            _ => ClassOrder::inherited(*base, order.complete),
         });
     }
     let mut known = BTreeSet::new();
@@ -1131,7 +1161,11 @@ fn merge_order<'source>(
                 if !known.insert(*base) {
                     return None;
                 }
-                complete &= orders.get(base)?.complete;
+                let order = orders.get(base)?;
+                if matches!(order.classes, OrderedClasses::Invalid) {
+                    return Some(ClassOrder::invalid());
+                }
+                complete &= order.complete;
             }
             None => complete = false,
         }
