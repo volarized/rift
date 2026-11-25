@@ -32,6 +32,15 @@ pub struct StaticReference {
     pub role: rift_core::ReferenceRole,
 }
 
+/// One written Rust path in a value expression or a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticRustValueRead {
+    /// Complete written path, including its qualifiers.
+    pub range: ByteRange,
+    /// Whether the path appears in a pattern.
+    pub pattern: bool,
+}
+
 /// One member expression with its original receiver and property spans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticMember {
@@ -452,6 +461,10 @@ pub struct StaticFactsParts {
     pub unsupported_bindings: Vec<ByteRange>,
     /// Rust use paths.
     pub rust_uses: Vec<StaticRustUse>,
+    /// Rust value paths and named pattern terminals.
+    pub rust_value_reads: Vec<StaticRustValueRead>,
+    /// Hoisted block-local value names with their scopes.
+    pub rust_local_values: Vec<(ByteRange, ByteRange)>,
     /// Authored Rust implementations.
     pub inherent_impls: Vec<StaticInherentImpl>,
     /// Items whose admission depends on Rust configuration.
@@ -741,6 +754,18 @@ impl StaticFacts {
         &self.0.rust_uses
     }
 
+    /// Rust paths written as values or named patterns.
+    #[must_use]
+    pub fn rust_value_reads(&self) -> &[StaticRustValueRead] {
+        &self.0.rust_value_reads
+    }
+
+    /// Hoisted block-local value names and their scopes.
+    #[must_use]
+    pub fn rust_local_values(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.rust_local_values
+    }
+
     /// Rust implementation headers.
     #[must_use]
     pub fn inherent_impls(&self) -> &[StaticInherentImpl] {
@@ -819,6 +844,8 @@ impl StaticFacts {
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
+            vector_capacity(&self.0.rust_value_reads),
+            vector_capacity(&self.0.rust_local_values),
             vector_capacity(&self.0.conditional_items),
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
@@ -884,6 +911,8 @@ impl StaticFacts {
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
             self.rust_uses().len(),
+            self.rust_value_reads().len(),
+            self.rust_local_values().len(),
             self.conditional_items().len(),
             self.receiver_arguments().len(),
             self.loops().len(),
@@ -940,7 +969,13 @@ impl StaticFacts {
                         .iter()
                         .all(|argument| valid(*argument) && contains(*call, *argument))
             });
-        imports && conditional
+        imports
+            && conditional
+            && self.rust_value_reads().iter().all(|read| valid(read.range))
+            && self
+                .rust_local_values()
+                .iter()
+                .all(|(name, scope)| valid(*name) && valid(*scope) && scope.encloses(*name))
     }
 
     /// Whether the facts that connect function values and bound names to written types

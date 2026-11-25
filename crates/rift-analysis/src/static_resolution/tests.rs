@@ -2323,6 +2323,156 @@ fn rust_qualified_calls_read_the_written_module_and_type_tokens() {
 }
 
 #[test]
+fn rust_writes_value_path_terminal_reads_without_competing_call_facts() {
+    let source = "pub mod values {\n\
+        pub const MAX: u8 = 4;\n\
+        pub static INITIAL: u8 = 2;\n\
+        pub enum Choice { Plain, Wrapped(u8) }\n\
+        pub struct Flag;\n\
+        pub struct Signal(pub u8);\n\
+        pub fn leaf() -> u8 { 1 }\n\
+        pub fn constructors() { let _ = Signal; }\n\
+    }\n\
+    use crate::values::leaf as function;\n\
+    pub fn examine(choice: values::Choice) -> u8 {\n\
+        let _ = values::MAX;\n\
+        let _ = values::INITIAL;\n\
+        let _ = values::Choice::Plain;\n\
+        let _ = values::Choice::Wrapped;\n\
+        let _ = values::leaf;\n\
+        let _ = values::leaf();\n\
+        let _ = function;\n\
+        let _ = values::Flag;\n\
+        match choice {\n\
+            values::Choice::Plain => 0,\n\
+            values::Choice::Wrapped(value) => value,\n\
+        }\n\
+    }\n\
+    pub fn shadowed(function: fn() -> u8) { let _ = function; }\n\
+    pub fn through_glob() -> u8 { use values::*; MAX }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let read = result
+        .occurrences
+        .iter()
+        .filter(|edge| {
+            edge.role == ReferenceRole::Read
+                && edge.edge_kind.is_none()
+                && target(edge) != "rift://symbol/local/rust/fixture/values"
+        })
+        .map(|edge| {
+            (
+                source_of(edge, source),
+                target(edge)
+                    .strip_prefix("rift://symbol/local/rust/fixture/values/")
+                    .expect("resolved authored value"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read,
+        [
+            ("Signal", "Signal"),
+            ("MAX", "MAX"),
+            ("INITIAL", "INITIAL"),
+            ("Plain", "Choice/Plain"),
+            ("Wrapped", "Choice/Wrapped"),
+            ("leaf", "leaf"),
+            ("function", "leaf"),
+            ("Flag", "Flag"),
+            ("Plain", "Choice/Plain"),
+            ("Wrapped", "Choice/Wrapped"),
+        ],
+    );
+    assert_eq!(
+        calls(&result, "src/lib.rs")
+            .map(|call| source_of(call, source))
+            .collect::<Vec<_>>(),
+        ["values::leaf()"],
+    );
+    assert_eq!(
+        result.omitted.get(&rift_protocol::read::EdgeKind::Reads),
+        Some(&1)
+    );
+    assert!(!result.ended);
+}
+
+#[test]
+fn rust_value_reads_respect_local_item_block_scopes() {
+    let source = r#"
+const RATE: u8 = 1;
+static PULSE: u8 = 2;
+struct Maker(pub u8);
+struct Flag;
+fn named() -> u8 { 1 }
+mod keys { pub const OTHER: u8 = 3; }
+use keys::OTHER as IMPORTED;
+fn ordinary() -> u8 { let _ = RATE; PULSE }
+fn bare_const() -> u8 { const RATE: u8 = 9; RATE }
+fn bare_static() -> u8 { static PULSE: u8 = 9; PULSE }
+fn via_import() -> u8 { const IMPORTED: u8 = 9; IMPORTED }
+fn sibling() -> u8 { let _ = { const RATE: u8 = 9; RATE }; { RATE } }
+fn qualified() -> u8 { const RATE: u8 = 9; crate::RATE }
+fn imported() -> u8 { IMPORTED }
+fn before_declaration() -> u8 { let result = RATE; const RATE: u8 = 9; result }
+fn inner_import() -> u8 { const IMPORTED: u8 = 9; { use crate::keys::OTHER as IMPORTED; IMPORTED } }
+fn inactive_item() -> u8 { #[cfg(any())] const RATE: u8 = 9; RATE }
+fn local_tuple() { struct Maker(u16); let _ = Maker; }
+fn local_unit() { struct Flag; let _ = Flag; }
+fn module_constructors() { let _ = Maker; let _ = Flag; }
+fn type_only() -> u8 { struct named { field: u16 } let f = named; f() }
+fn function_shadow() -> u8 { fn named() -> u8 { 9 } let f = named; f() }
+fn value_shadow(named: u8) -> u8 { let local = named; local }
+"#;
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let seen = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .map(|edge| {
+            (
+                edge.binding.range().start(),
+                target(edge)
+                    .strip_prefix("rift://symbol/local/rust/fixture/")
+                    .expect("package declaration"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let position = |statement, token: &str| {
+        let line = source
+            .lines()
+            .find(|line| line.starts_with(statement))
+            .expect("fixture line");
+        let start = source.find(line).expect("fixture line start");
+        u64::try_from(start + line.rfind(token).expect("read token")).expect("fixture offset")
+    };
+    assert_eq!(
+        seen,
+        [
+            (position("fn ordinary", "RATE"), "RATE"),
+            (position("fn ordinary", "PULSE"), "PULSE"),
+            (position("fn sibling", "RATE"), "RATE"),
+            (position("fn qualified", "RATE"), "RATE"),
+            (position("fn imported", "IMPORTED"), "keys/OTHER"),
+            (position("fn inner_import", "IMPORTED"), "keys/OTHER"),
+            (position("fn inactive_item", "RATE"), "RATE"),
+            (position("fn module_constructors", "Maker"), "Maker"),
+            (position("fn module_constructors", "Flag"), "Flag"),
+            (position("fn type_only", "named"), "named"),
+        ],
+    );
+}
+
+#[test]
 fn rust_shadowed_value_and_conditional_module_do_not_reach_decoys() {
     let source = "#[cfg(test)] mod tasks;\n\
                   fn run() {}\n\

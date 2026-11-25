@@ -3,6 +3,7 @@
 mod deref;
 mod receivers;
 mod references;
+mod value_reads;
 
 // Exhausting initializer lookup depth leaves the authored site unresolved.
 const RECEIVER_DEPTH_MAX: usize = 64;
@@ -22,6 +23,7 @@ pub(super) struct Namespaces<'source> {
     /// The file scopes where type aliases declare their right-hand types.
     source_files: Arc<BTreeMap<&'source str, File<'source>>>,
     values: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    constants_and_statics: BTreeMap<Vec<String>, Option<Target<'source>>>,
     types: BTreeMap<Vec<String>, Option<Target<'source>>>,
     structural_types: BTreeMap<(String, String), Option<Target<'source>>>,
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
@@ -65,6 +67,7 @@ struct Method<'source> {
 enum Namespace {
     Type,
     Value,
+    ConstantOrStatic,
 }
 
 #[derive(Clone, Copy)]
@@ -752,7 +755,9 @@ impl<'source> Namespaces<'source> {
             };
             insert(members, path.clone(), target);
         }
-        if symbol.kind == "variant" {
+        if matches!(symbol.kind, "constant" | "static") && file.is_module_item(symbol) {
+            insert(&mut self.constants_and_statics, path, target);
+        } else if symbol.kind == "variant" {
             insert(&mut self.values, path, target);
         } else if symbol.kinds.contains(&SymbolKind::Type) && file.is_module_item(symbol) {
             insert(&mut self.types, path, target);
@@ -1265,6 +1270,7 @@ impl<'source> Namespaces<'source> {
         let index = match namespace {
             Namespace::Type => &self.types,
             Namespace::Value => &self.values,
+            Namespace::ConstantOrStatic => &self.constants_and_statics,
         };
         // A `use` binding of a module names its target there. Without a declaration or an
         // alias at the path, a visible binding (a private import of an ancestor module, too)

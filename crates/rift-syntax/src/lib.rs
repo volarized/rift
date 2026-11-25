@@ -55,7 +55,7 @@ pub use static_analysis::{
     StaticBodyMember, StaticCall, StaticCallee, StaticCommonJsExport, StaticConditionalItem,
     StaticDeclaredReturn, StaticFacts, StaticFactsParts, StaticFunctionContext, StaticInherentImpl,
     StaticMember, StaticMemberAlias, StaticMemberCallback, StaticMemberCopy, StaticParameter,
-    StaticReexport, StaticReference, StaticRustUse,
+    StaticReexport, StaticReference, StaticRustUse, StaticRustValueRead,
 };
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};
