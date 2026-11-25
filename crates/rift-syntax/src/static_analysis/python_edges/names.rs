@@ -58,10 +58,11 @@ impl NameKinds {
     }
 }
 
-/// The names of one file that wait for its other bindings.
+/// Python names and syntax checks collected during one walk.
 #[derive(Default)]
 pub(in crate::static_analysis) struct Names {
     deleted: Vec<StaticBinding>,
+    pub(in crate::static_analysis) invalid_type_parameter_default: bool,
 }
 
 impl Names {

@@ -1304,12 +1304,14 @@ impl<'source> Capture<'source> {
     pub(crate) fn finish_python(
         mut self,
         root: tree_sitter::Node<'_>,
-    ) -> Result<StaticFacts, RiftError> {
-        if let Grammar::Python(kinds, names) = self.grammar {
-            kinds.close_lists(root, self.source, &mut self.facts.0)?;
-            names.close(self.source, &mut self.facts.0);
-        }
-        Ok(self.facts)
+    ) -> Result<(StaticFacts, bool), RiftError> {
+        let Grammar::Python(kinds, names) = self.grammar else {
+            return Ok((self.facts, false));
+        };
+        kinds.close_lists(root, self.source, &mut self.facts.0)?;
+        let invalid_default = names.invalid_type_parameter_default;
+        names.close(self.source, &mut self.facts.0);
+        Ok((self.facts, invalid_default))
     }
 
     pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {
