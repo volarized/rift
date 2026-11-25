@@ -273,6 +273,56 @@ fn a_heading_past_the_depth_bound_is_left_out_once_per_source() {
     );
 }
 
+#[test]
+fn rst_whitespace_after_a_literal_block_is_no_block() {
+    for whitespace in ["\u{2028}", "\u{a0}"] {
+        let text = format!("a::\n\n  literal\n{whitespace}\n");
+        let collection = collect_one("guide.rst", &text);
+        assert_eq!(
+            block_texts(&collection, &text),
+            ["a::\n\n  ", "literal"],
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn rst_blocks_leave_out_a_crlf_line_end() {
+    let text = "Head\n====\n\nprose\n\n* item\n* other\n\nterm\n  def\n\n  > quote\n\na::\n\n  literal\nafter link_\n\n.. code-block:: python\n\n   x = 1\n\nb::\n\n  literal\n";
+    let blocks = |text: &str| {
+        let collection = collect_one("guide.rst", text);
+        block_texts(&collection, text)
+            .into_iter()
+            .map(|block| block.replace("\r\n", "\n"))
+            .collect::<Vec<_>>()
+    };
+    let expected = blocks(text);
+    assert!(expected.contains(&"after link_".to_owned()));
+    assert_eq!(blocks(&text.replace('\n', "\r\n")), expected);
+    assert_eq!(block_texts(&collect_one("guide.rst", "\r"), "\r"), [""; 0]);
+}
+
+#[test]
+fn every_link_after_many_literal_blocks_names_its_own_prose() {
+    const LITERALS: usize = 2_000;
+    let text = "a link_::\n\n  literal\n".repeat(LITERALS) + "end link_\n";
+    let collection = collect_one("guide.rst", &text);
+    let index = collection.index();
+    assert_eq!(index.blocks.len(), 2 * LITERALS + 1);
+    assert_eq!(index.links.len(), LITERALS + 1);
+    let blocks: std::collections::BTreeMap<_, _> = index
+        .blocks
+        .iter()
+        .map(|block| (&block.identity, &block.range))
+        .collect();
+    for link in &index.links {
+        let block = blocks[&link.block];
+        assert!(block.start <= link.range.start && link.range.end <= block.end);
+    }
+    let named: std::collections::BTreeSet<_> = index.links.iter().map(|link| &link.block).collect();
+    assert_eq!(named.len(), LITERALS + 1);
+}
+
 /// Pieces that open, close, continue, and interrupt reStructuredText and Markdown blocks.
 const PIECES: &[&str] = &[
     "\n",

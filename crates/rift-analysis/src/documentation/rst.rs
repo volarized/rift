@@ -390,11 +390,11 @@ fn collect_section_facts(
         sections.push(SectionDraft {
             syntax_element_id: syntax_element.id(),
             section_start: syntax_element.start_byte(),
-            title_range: byte_range(title)?,
+            title_range: block_range(title, text)?,
             level,
             name,
         });
-        section_title_ranges.insert(syntax_element.id(), byte_range(title)?);
+        section_title_ranges.insert(syntax_element.id(), block_range(title, text)?);
     }
 
     let mut section_stack = Vec::<(u32, RstHeading)>::new();
@@ -486,9 +486,7 @@ fn collect_entry(
     let mut current_block = entry.parent.and_then(|parent| {
         let prose = paragraph_prose.get(&parent).and_then(|prose| {
             let start = syntax_element.start_byte() as u64;
-            prose
-                .iter()
-                .find(|range| range.start <= start && start < range.end)
+            prose_range_at(prose, start)
         });
         prose
             .or_else(|| block_for_syntax_element.get(&parent))
@@ -506,7 +504,7 @@ fn collect_entry(
             let body = syntax_element.child_by_field_id(kinds.body_field);
             let code = body.and_then(|body| child_of_kind(body, kinds.content));
             if let Some(code) = code {
-                let range = byte_range(code)?;
+                let range = block_range(code, text)?;
                 let line = line_of(starts, range.start);
                 let language = body
                     .and_then(|body| child_of_kind(body, kinds.arguments))
@@ -572,7 +570,7 @@ fn collect_entry(
             paragraph_prose.insert(syntax_element.id(), prose);
         }
     } else if syntax_element.kind_id() == kinds.literal_block {
-        let range = byte_range(syntax_element)?;
+        let range = block_range(syntax_element, text)?;
         let line = line_of(starts, range.start);
         facts.blocks.push(RstBlockFact {
             range: range.clone(),
@@ -588,7 +586,7 @@ fn collect_entry(
         || syntax_element.kind_id() == kinds.definition_list
         || syntax_element.kind_id() == kinds.field_list
     {
-        let range = byte_range(syntax_element)?;
+        let range = block_range(syntax_element, text)?;
         let line = line_of(starts, range.start);
         facts.blocks.push(RstBlockFact {
             range: range.clone(),
@@ -602,7 +600,7 @@ fn collect_entry(
     } else if syntax_element.kind_id() == kinds.block_quote
         || syntax_element.kind_id() == kinds.line_block
     {
-        let range = byte_range(syntax_element)?;
+        let range = block_range(syntax_element, text)?;
         let line = line_of(starts, range.start);
         facts.blocks.push(RstBlockFact {
             range: range.clone(),
@@ -688,6 +686,22 @@ fn inline_range(syntax_element: Node<'_>, text: &str) -> Range<usize> {
     range.start..range.start + trimmed
 }
 
+/// Byte range of one block, without the carriage return the grammar keeps at a CRLF line end.
+fn block_bytes(syntax_element: Node<'_>, text: &str) -> Range<usize> {
+    let range = syntax_element.byte_range();
+    let end = text
+        .get(range.clone())
+        .and_then(|raw| raw.strip_suffix('\r'))
+        .filter(|block| !block.is_empty())
+        .map_or(range.end, |block| range.start + block.len());
+    range.start..end
+}
+
+fn block_range(syntax_element: Node<'_>, text: &str) -> Result<TextRange, RiftError> {
+    let range = block_bytes(syntax_element, text);
+    text_range(range.start, range.end)
+}
+
 /// The prose ranges of one paragraph, in source order.
 ///
 /// The grammar keeps a line that follows a literal block without a blank line in the same
@@ -707,11 +721,22 @@ fn paragraph_prose_ranges(
         push_prose_range(text, start, literal.start_byte(), &mut ranges)?;
         start = literal.end_byte();
     }
-    push_prose_range(text, start, paragraph.end_byte(), &mut ranges)?;
+    let end = block_bytes(paragraph, text).end;
+    push_prose_range(text, start, end, &mut ranges)?;
     Ok(ranges)
 }
 
-/// Appends the prose between `start` and `end`, without the whitespace before it.
+/// The range holding `start`, of `ranges` in source order.
+fn prose_range_at(ranges: &[TextRange], start: u64) -> Option<&TextRange> {
+    let following = ranges.partition_point(|range| range.start <= start);
+    ranges
+        .get(following.checked_sub(1)?)
+        .filter(|range| start < range.end)
+}
+
+/// Appends the prose between `start` and `end`, without the whitespace before it. Unicode
+/// whitespace alone is no prose; ahead of prose it stays, since the grammar can start a
+/// reference name with it.
 fn push_prose_range(
     text: &str,
     start: usize,
@@ -722,7 +747,7 @@ fn push_prose_range(
         return Ok(());
     };
     let prose = raw.trim_ascii_start();
-    if !prose.is_empty() {
+    if !prose.trim().is_empty() {
         ranges.push(text_range(end - prose.len(), end)?);
     }
     Ok(())
@@ -942,6 +967,18 @@ mod tests {
 
     fn extract(text: &str) -> RstFacts {
         extract_rst_facts(text, &path()).expect("RST source parses")
+    }
+
+    #[test]
+    fn a_prose_range_is_found_by_position() {
+        let ranges = [text_range(2, 4), text_range(6, 9)].map(|range| range.expect("range"));
+        let found = [0, 2, 3, 4, 5, 6, 8, 9]
+            .map(|start| prose_range_at(&ranges, start).map(|range| range.start));
+        assert_eq!(
+            found,
+            [None, Some(2), Some(2), None, None, Some(6), Some(6), None]
+        );
+        assert_eq!(prose_range_at(&[], 0), None);
     }
 
     #[test]
