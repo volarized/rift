@@ -3162,6 +3162,71 @@ fn test_rust_default_feature_conditions_preserve_exact_call_source_and_target() 
 }
 
 #[test]
+fn test_rust_near_value_declarations_hide_outer_functions() {
+    for (body, expected) in [
+        ("pub fn run() { static leaf: fn() = other; leaf(); }", None),
+        ("pub fn run() { const leaf: fn() = other; leaf(); }", None),
+        (
+            "pub fn run() { struct leaf(u8); leaf(1); }",
+            Some("run/leaf"),
+        ),
+        (
+            "pub fn run() { unsafe extern \"C\" { fn leaf(); } unsafe { leaf() }; }",
+            Some("run/leaf"),
+        ),
+        (
+            "pub enum E { leaf(u8) } pub fn run() { use E::*; leaf(1); }",
+            Some("E/leaf"),
+        ),
+        (
+            "pub mod m { use super::*; pub static leaf: fn(u8) = |_| (); pub fn run() { leaf(1); } }",
+            None,
+        ),
+        (
+            "pub mod m { use super::*; pub struct leaf(pub u8); pub fn run() { leaf(1); } }",
+            Some("m/leaf"),
+        ),
+        (
+            "pub mod m { use super::*; unsafe extern \"C\" { pub fn leaf(); } pub fn run() { unsafe { leaf() }; } }",
+            Some("m/leaf"),
+        ),
+        ("pub fn run() { fn leaf() {} leaf(); }", Some("run/leaf")),
+        (
+            "pub fn run() { const leaf: fn() = other; crate::leaf(); }",
+            Some("leaf"),
+        ),
+        (
+            "pub mod m { use super::*; pub fn run() { leaf(); } }",
+            Some("leaf"),
+        ),
+        (
+            "pub fn run() { struct leaf { field: u8 } leaf(); }",
+            Some("leaf"),
+        ),
+        (
+            "pub struct Item; impl Item { const leaf: fn() = other; pub fn run() { leaf(); } }",
+            Some("leaf"),
+        ),
+        (
+            "pub enum E { leaf(u8) } use E::*; pub fn run() { leaf(); }",
+            Some("leaf"),
+        ),
+    ] {
+        let source = format!("pub fn leaf() {{}}\npub fn other() {{}}\n{body}");
+        let manifest = [("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")];
+        let result = resolution("rust", &[("src/lib.rs", &source)], &manifest, WORK_MAX);
+        assert!(!result.exhausted, "{body}");
+        let expected = expected.map(|name| format!("rift://symbol/local/rust/fixture/{name}"));
+        let found = calls(&result, "src/lib.rs").map(target).collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            expected.as_deref().into_iter().collect::<Vec<_>>(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_unknown_import_does_not_establish_a_receiver_type() {
     let source =
         "mod known; #[cfg(unknown)] use crate::known::Item; fn root(item: &Item) { item.read(); }";
