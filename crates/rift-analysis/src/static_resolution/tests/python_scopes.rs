@@ -74,10 +74,6 @@ fn test_python_names_beside_targets_read_the_module() {
             "def f(x):\n    del x.h, x[o]\n    h(); o()\n",
             ["f -> h", "f -> o"],
         ),
-        (
-            "def f():\n    global h\n    del h\n    h(); o()\n",
-            ["f -> h", "f -> o"],
-        ),
     ] {
         assert_eq!(called(body), expected, "{body}");
     }
@@ -125,6 +121,34 @@ fn test_python_deleted_receivers_stop_at_the_deletion() {
     ] {
         let source = format!("{classes}{body}");
         assert_eq!(called(&source), expected, "{body}");
+    }
+}
+
+#[test]
+fn test_python_redirected_names_follow_local_deletions() {
+    for (body, expected) in [
+        (
+            "def f():\n    global h\n    del h\n    h(); o()\n",
+            vec!["f -> o"],
+        ),
+        (
+            "def f():\n    global h\n    h()\n    del h\n    h()\n",
+            vec!["f -> h"],
+        ),
+        (
+            "def f():\n    global h\n    del h\n    h = o\n    h()\n",
+            vec!["f -> o"],
+        ),
+        (
+            "def f():\n    def h(): pass\n    def g():\n        nonlocal h\n        h()\n        del h\n        h()\n",
+            vec!["f/g -> f/h"],
+        ),
+        (
+            "def f():\n    def h(): pass\n    def o(): pass\n    def g():\n        nonlocal h\n        del h\n        h = o\n        h()\n",
+            vec!["f/g -> f/o"],
+        ),
+    ] {
+        assert_eq!(called(body), expected, "{body}");
     }
 }
 

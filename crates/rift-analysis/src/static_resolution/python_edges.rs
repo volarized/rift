@@ -741,6 +741,8 @@ fn edge_python_binding<'source>(
 /// The scope one position reads a name in.
 struct NameScope {
     scope: Scope,
+    /// The innermost scope that redirects this name with `global` or `nonlocal`.
+    redirected: Option<Scope>,
     /// Whether a scope that declares the name `global` or `nonlocal` binds it as well.
     rebound: bool,
 }
@@ -779,11 +781,7 @@ impl<'source> Index<'source> {
             ScopeLookup::Missing => return Binding::Missing,
             ScopeLookup::Blocked => return Binding::Blocked,
         };
-        (!selected.rebound)
-            .then(|| {
-                self.python_scope_binding(file, name, selected.scope, bindings, position, work)
-            })
-            .flatten()
+        self.python_scope_binding(file, name, &selected, bindings, position, work)
             .map_or(Binding::Blocked, Binding::Found)
     }
 
@@ -792,12 +790,25 @@ impl<'source> Index<'source> {
         &self,
         file: &File<'source>,
         name: &str,
-        scope: Scope,
+        selected: &NameScope,
         bindings: &[&'source StaticBinding],
         position: u64,
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
-        let deletion = file.python_deletion_before(name, scope, position, work);
+        // After a definite deletion, only assignments in the deleting body can restore
+        // the binding before this use, even when it is stored in an enclosing scope.
+        let redirected_deletion = selected.redirected.and_then(|scope| {
+            file.python_deletion_before(name, scope, position, work)
+                .map(|end| (scope, end))
+        });
+        let (scope, deletion) = match redirected_deletion {
+            Some((scope, end)) => (scope, Some(end)),
+            None if selected.rebound => return None,
+            None => (
+                selected.scope,
+                file.python_deletion_before(name, selected.scope, position, work),
+            ),
+        };
         if work.exhausted {
             return None;
         }
@@ -889,6 +900,7 @@ impl File<'_> {
         let mut global = false;
         let mut nonlocal = false;
         let mut rebound = false;
+        let mut redirected = None;
         loop {
             let mut best: Option<Scope> = None;
             for &binding in bindings {
@@ -932,11 +944,16 @@ impl File<'_> {
                 }
             }
             let Some(is_global) = declaration else {
-                return ScopeLookup::Found(NameScope { scope, rebound });
+                return ScopeLookup::Found(NameScope {
+                    scope,
+                    redirected,
+                    rebound,
+                });
             };
             if global || (nonlocal && is_global) {
                 return ScopeLookup::Blocked;
             }
+            redirected.get_or_insert(scope);
             rebound |= selected;
             excluded.insert(scope);
             global = is_global;
