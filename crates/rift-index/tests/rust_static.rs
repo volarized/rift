@@ -2581,3 +2581,110 @@ fn test_rust_implementation_headers_are_contained_where_their_owner_is() {
             .any(|edge| { edge.kind() == EdgeKind::Contains && edge.from() == edge.to() })
     );
 }
+
+/// A crate whose one unreadable place is `unread`, after or before readable items.
+fn unread_fixture(first: &str, last: &str) -> (tempfile::TempDir, WorkspaceIndex) {
+    let source = format!(
+        "{first}\npub struct R<const A: i8, const B: i8>;\npub struct U;\nimpl U {{ pub fn k(&self) -> u32 {{ 1 }} pub fn n(&self) -> u32 {{ self.k() }} }}\nfn leaf() {{}}\npub fn f(u: U) {{ leaf(); u.k(); U::k(&u); }}\n{last}\n"
+    );
+    fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", &source)])
+}
+
+#[test]
+fn test_rust_source_that_is_not_parsed_costs_its_own_facts_only() {
+    // #1099: each place is valid Rust the grammar reports an error for, at the start or at
+    // the end of the file.
+    for unread in [
+        "",
+        "pub type H = R<-1, 2>;",
+        "pub type H = R<1, -2>;",
+        "pub type H = R<-1, -2>;",
+        "pub fn h() -> R<-1, 2> { R }",
+        "pub struct H { pub field: R<-1, 2> }",
+        "impl Copied for R<-1, 2> {} pub trait Copied {}",
+        "pub struct H<'a>(std::sync::Arc<dyn 'a + Fn() -> u8>);",
+        "pub struct H where U: Sized;",
+        "pub fn h() where (): Copy {}",
+        "pub struct V; impl V { pub fn one(&self) where (): Copy {} pub fn two(&self) { leaf() } }",
+        "pub fn h(#[cfg(all())] value: u8) -> u8 { value }",
+        "pub fn h() { let _ = vec![1_u8].len(); }",
+        "extern \"C\" { pub type Opaque; }",
+    ] {
+        for (first, last) in [(unread, ""), ("", unread)] {
+            let (_directory, index) = unread_fixture(first, last);
+            for (from, to) in [
+                ("/fixture/U/n", "/fixture/U/k"),
+                ("/fixture/f", "/fixture/U/k"),
+                ("/fixture/f", "/fixture/leaf"),
+            ] {
+                assert!(
+                    has_edge(&index, EdgeKind::Calls, from, to),
+                    "{unread:?}: missing {from} -> {to}"
+                );
+            }
+            if unread.starts_with("pub struct V") {
+                assert!(has_edge(&index, EdgeKind::Calls, "/V/two", "/fixture/leaf"));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_rust_declarations_keep_their_identity_when_a_generic_argument_is_not_parsed() {
+    // #1099: the error is in the arguments of a type the declaration writes, which names
+    // nothing of the declaration.
+    for (unread, from, to) in [
+        ("pub type H = R<-1, 2>;", "/fixture/H", "/fixture/R"),
+        (
+            "pub struct H { pub field: R<-1, 2> }",
+            "/fixture/H/field",
+            "/fixture/R",
+        ),
+        ("pub fn h(value: R<-1, 2>) {}", "/fixture/h", "/fixture/R"),
+        ("pub fn h() -> R<1, -2> { R }", "/fixture/h", "/fixture/R"),
+    ] {
+        let (_directory, index) = unread_fixture(unread, "");
+        assert!(
+            has_edge(&index, EdgeKind::HasType, from, to),
+            "{unread:?}: missing {from} -> {to}"
+        );
+        assert!(
+            index
+                .symbol_view()
+                .expect("symbols")
+                .normalized_graph()
+                .records()
+                .iter()
+                .all(|record| record.identity().is_some()),
+            "{unread:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_source_that_is_not_parsed_hides_the_names_it_can_bind() {
+    // Each place can bind a name, or leaves open where the declarations after it stand.
+    for (body, hidden) in [
+        // The macro is read as a call whose result types `made`.
+        ("let made = try!(make(u)); made.k();", "/fixture/U/k"),
+        ("let made = make![u]; made.k();", "/fixture/U/k"),
+        // The pattern's attribute ends the statement for the parser.
+        (
+            "let Held { #[cfg(all())] u, .. } = held; u.k();",
+            "/fixture/U/k",
+        ),
+    ] {
+        let source = format!(
+            "pub struct U; pub struct Other; pub struct Held {{ pub u: Other, pub rest: u8 }}\nimpl U {{ pub fn k(&self) -> u32 {{ 1 }} }}\nimpl Other {{ pub fn k(&self) -> u32 {{ 2 }} }}\npub fn make(u: U) -> U {{ u }}\npub fn f(u: U, held: Held) {{ {body} }}\npub fn g(u: U) {{ u.k(); }}\n"
+        );
+        let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", &source)]);
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "/fixture/f", hidden),
+            "{body}"
+        );
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "/fixture/g", "/fixture/U/k"),
+            "{body}"
+        );
+    }
+}
