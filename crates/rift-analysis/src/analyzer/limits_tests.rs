@@ -177,6 +177,53 @@ fn test_edge_configuration_preserves_declaration_only_package_analysis() {
     );
 }
 
+#[test]
+fn supplemental_python_read_keeps_primary_package_calls_at_the_edge_cap() {
+    let variants = |returned| {
+        let calls = "    callee()\n".repeat(128);
+        format!(
+            "def callee(): pass\n\ndef alpha():\n    callee()\n    return {returned}\n\ndef zeta():\n{calls}"
+        )
+    };
+    let baseline = variants("None  ");
+    let expanded = variants("callee");
+    let limits = || ExactPackageLimits::new(2, 1 << 20);
+    let full = analyze(limits(), &baseline, "").expect("baseline package");
+    let count = full.semantics.edges().edges().count();
+    assert!(
+        full.semantics
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == rift_protocol::read::EdgeKind::Calls)
+            .count()
+            >= 129
+    );
+    let limited = |source, edges| {
+        let limits = limits().with_edges(edges).expect("exact edge cap");
+        analyze(limits, source, "").expect("bounded package")
+    };
+    let before = limited(&baseline, count);
+    let after = limited(&expanded, count);
+    assert!(before.semantics.edges().is_complete());
+    assert_eq!(
+        before.semantics.edges().edges().collect::<Vec<_>>(),
+        after.semantics.edges().edges().collect::<Vec<_>>()
+    );
+    assert_eq!(after.semantics.edges().dropped_edges(), 1);
+    assert!(after.publication().warnings.iter().any(|warning| matches!(
+        warning,
+        rift_protocol::index::PackageAnalysisWarning::PublicationTruncated { collection, .. }
+            if collection == "edges"
+    )));
+    let room = limited(&expanded, count + 1);
+    assert!(room.semantics.edges().is_complete());
+    assert!(room.semantics.edges().edges().any(|edge| {
+        edge.kind() == rift_protocol::read::EdgeKind::Reads
+            && edge.from().as_str().ends_with("/alpha")
+            && edge.to().as_str().ends_with("/callee")
+    }));
+}
+
 fn source(count: u32) -> String {
     (0..count).fold(String::new(), |mut text, index| {
         writeln!(text, "def f{index}(): pass").expect("string write");

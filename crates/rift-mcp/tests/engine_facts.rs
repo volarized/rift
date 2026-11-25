@@ -431,13 +431,22 @@ async fn rust_recorded_server_adds_facts_to_the_static_answer() -> TestResult {
         counts,
         [
             ("calls", 6, 9),
-            ("references", 15, 19),
+            ("references", 16, 19),
             ("hasType", 9, 9),
             ("extends", 0, 0),
             ("implements", 3, 3),
         ]
     );
     assert_more(&counts, &["calls", "references"]);
+    let reads = static_facts.structural.get("reads").expect("static reads");
+    for source in ["total", "Square/default"] {
+        assert!(
+            reads
+                .iter()
+                .any(|(from, to)| from == source && to == "Square"),
+            "{source} reads the written Square token"
+        );
+    }
     for (from, to) in [
         ("each", "Circle/area"),
         ("first", "Circle/area"),

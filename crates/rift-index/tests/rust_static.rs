@@ -2147,8 +2147,8 @@ impl Through for &Value {
 #[test]
 fn test_rust_paths_through_private_imports_of_a_parent_module() {
     // `use super::Bucket` names what the parent module imported as `Bucket`; the import is
-    // private to the parent and its descendants, so a path from elsewhere stays unresolved.
-    // A cycle of private imports resolves nothing.
+    // private to the parent and its descendants. An outside path may read the visible
+    // module prefix, but cannot access the imported type. A private import cycle resolves nothing.
     let source = "mod inner { pub struct Bucket { pub value: u8 } }\npub mod map {\n    use crate::inner::Bucket;\n    pub mod iter {\n        use super::Bucket;\n        pub fn new() -> u8 { Bucket { value: 1 }.value }\n    }\n}\npub mod other {\n    pub fn outside() -> u8 { crate::map::Bucket { value: 2 }.value }\n}\npub mod first { use crate::second::Loop; pub fn run() -> u8 { Loop { value: 3 }.value } }\npub mod second { use crate::first::Loop; }\n";
     let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
     for (kind, from, to) in [
@@ -2160,11 +2160,28 @@ fn test_rust_paths_through_private_imports_of_a_parent_module() {
             "missing {kind:?} {from} -> {to}"
         );
     }
-    assert!(!index.edges().edges().any(|edge| {
-        (edge.from().as_str().ends_with("/other/outside")
-            || edge.from().as_str().ends_with("/first/run"))
-            && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
-    }));
+    let blocked_site_edges = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            (edge.from().as_str().ends_with("/other/outside")
+                || edge.from().as_str().ends_with("/first/run"))
+                && matches!(
+                    edge.kind(),
+                    EdgeKind::Calls | EdgeKind::Reads | EdgeKind::Writes
+                )
+        })
+        .collect::<Vec<_>>();
+    let [prefix] = blocked_site_edges.as_slice() else {
+        panic!("only the visible module prefix is established: {blocked_site_edges:?}");
+    };
+    let start = source.find("crate::map::Bucket").expect("outside path") + "crate::".len();
+    let start = u64::try_from(start).expect("qualifier start");
+    assert_eq!(prefix.kind(), EdgeKind::Reads);
+    assert!(prefix.from().as_str().ends_with("/other/outside"));
+    assert!(prefix.to().as_str().ends_with("/fixture/map"));
+    assert_eq!(prefix.occurrence().range().start(), start);
+    assert_eq!(prefix.occurrence().range().end(), start + 3);
 }
 
 #[test]

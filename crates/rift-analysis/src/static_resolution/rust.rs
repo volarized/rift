@@ -1,8 +1,10 @@
 //! Resolves Rust paths admitted by the captured crate and module inventory.
 
 mod deref;
+mod field_sites;
 mod receivers;
 mod references;
+mod value_reads;
 
 // Exhausting initializer lookup depth leaves the authored site unresolved.
 const RECEIVER_DEPTH_MAX: usize = 64;
@@ -22,6 +24,7 @@ pub(super) struct Namespaces<'source> {
     /// The file scopes where type aliases declare their right-hand types.
     source_files: Arc<BTreeMap<&'source str, File<'source>>>,
     values: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    constants_and_statics: BTreeMap<Vec<String>, Option<Target<'source>>>,
     types: BTreeMap<Vec<String>, Option<Target<'source>>>,
     structural_types: BTreeMap<(String, String), Option<Target<'source>>>,
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
@@ -65,6 +68,7 @@ struct Method<'source> {
 enum Namespace {
     Type,
     Value,
+    ConstantOrStatic,
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +174,18 @@ impl<'source> Namespaces<'source> {
         name: &str,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        Self::local_named(file, position, name, work, |target| {
+            target.symbol.kinds.contains(&SymbolKind::Type)
+        })
+    }
+
+    fn local_named(
+        file: &File<'source>,
+        position: u64,
+        name: &str,
+        work: &mut Work,
+        accepts: impl Fn(Target<'source>) -> bool,
+    ) -> Option<Target<'source>> {
         let enclosing = file.enclosing_callable(ByteRange {
             start: position,
             end: position,
@@ -180,8 +196,9 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
             let qualified = format!("{container}::{name}");
-            if let Some(target) = file.qualified_target(&qualified)
-                && target.symbol.kinds.contains(&SymbolKind::Type)
+            if let Some(target) = file
+                .qualified_target(&qualified)
+                .filter(|target| accepts(*target))
             {
                 return Some(target);
             }
@@ -739,7 +756,9 @@ impl<'source> Namespaces<'source> {
             };
             insert(members, path.clone(), target);
         }
-        if symbol.kind == "variant" {
+        if matches!(symbol.kind, "constant" | "static") && file.is_module_item(symbol) {
+            insert(&mut self.constants_and_statics, path, target);
+        } else if symbol.kind == "variant" {
             insert(&mut self.values, path, target);
         } else if symbol.kinds.contains(&SymbolKind::Type) && file.is_module_item(symbol) {
             insert(&mut self.types, path, target);
@@ -1252,6 +1271,7 @@ impl<'source> Namespaces<'source> {
         let index = match namespace {
             Namespace::Type => &self.types,
             Namespace::Value => &self.values,
+            Namespace::ConstantOrStatic => &self.constants_and_statics,
         };
         // A `use` binding of a module names its target there. Without a declaration or an
         // alias at the path, a visible binding (a private import of an ancestor module, too)
@@ -1540,8 +1560,29 @@ impl<'source> Namespaces<'source> {
     }
 
     fn module_at(&self, file: &str, position: u64, work: &mut Work) -> Option<&[String]> {
+        self.module_at_with_scope(file, position, work)
+            .map(|(path, _)| path)
+    }
+
+    fn module_scope(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<ByteRange> {
+        let (_, inline) = self.module_at_with_scope(file.document.path.as_str(), position, work)?;
+        inline.or_else(|| crate::analyzer::namespace::rust_file_scope(file.document.source))
+    }
+
+    fn module_at_with_scope(
+        &self,
+        file: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<(&[String], Option<ByteRange>)> {
         let namespace = self.files.get(file)?;
         let mut path = namespace.base.as_slice();
+        let mut scope = None;
         let crate_name = path.first()?;
         if self
             .crate_roots
@@ -1555,11 +1596,10 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
             if inline.len() > path.len()
-                && symbol
-                    .body_range
-                    .is_some_and(|body| body.contains(position))
+                && let Some(body) = symbol.body_range.filter(|body| body.contains(position))
             {
                 path = inline;
+                scope = Some(body);
             }
         }
         for length in 1..=path.len() {
@@ -1567,7 +1607,7 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
         }
-        Some(path)
+        Some((path, scope))
     }
 
     fn module_unavailable(&self, path: &[String]) -> bool {
