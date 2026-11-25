@@ -42,9 +42,6 @@ use crate::revision::Revision;
 /// refuses the publication rather than reading fields it cannot place.
 pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 7;
 
-/// The flat publication format retained artifacts can still use.
-pub const LEGACY_PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 6;
-
 /// Source units one publication may carry.
 pub const PACKAGE_UNITS_MAX: u32 = 100_000;
 /// Symbols one publication may carry.

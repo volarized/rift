@@ -7,11 +7,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, value::RawValue};
 
 use super::{
-    LEGACY_PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_DOCUMENTS_CEILING,
-    PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_CEILING, PACKAGE_SYMBOLS_CEILING,
-    PACKAGE_UNITS_CEILING, PackageAnalysisWarning, PackageArtifact, PackageCoverage,
-    PackageDocument, PackageOccurrence, PackagePublication, PackageSourceUnit, PackageSymbol,
-    StoredEdge,
+    PACKAGE_DOCUMENTS_CEILING, PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_CEILING,
+    PACKAGE_SYMBOLS_CEILING, PACKAGE_UNITS_CEILING, PackageAnalysisWarning, PackageArtifact,
+    PackageCoverage, PackageDocument, PackageOccurrence, PackagePublication, PackageSourceUnit,
+    PackageSymbol, StoredEdge,
 };
 use crate::canonical::{canonical_json, record_digest_without_member};
 use crate::documentation::DocumentationIndex;
@@ -26,6 +25,7 @@ use crate::revision::Revision;
 mod tests;
 
 const UNIT_ROWS: [&str; 4] = ["declarations", "edges", "occurrences", "documents"];
+const FRAME_PREFIX: &str = "{\"header\":";
 
 type Object = Map<String, Value>;
 
@@ -166,50 +166,29 @@ fn json_error(error: &serde_json::Error) -> RiftError {
         .error()
 }
 
-/// Encodes a package publication in the canonical form for its revision.
-///
-/// A retained flat publication keeps its original format so an exact read can verify
-/// its stored artifact address. Fresh publications write records under source units.
+/// Encodes a package publication with records grouped under source units.
 ///
 /// # Errors
 /// Refuses an unsupported revision or records the selected format cannot represent.
 pub fn encode_package_publication(publication: &PackagePublication) -> Result<String, RiftError> {
-    match publication.format_revision {
-        PACKAGE_PUBLICATION_FORMAT_REVISION => encode_package_records(publication),
-        LEGACY_PACKAGE_PUBLICATION_FORMAT_REVISION if publication.target.is_none() => {
-            canonical_json(publication).map_err(|error| json_error(&error))
-        }
-        _ => Err(invalid("publication record format revision differs")),
+    if publication.format_revision != PACKAGE_PUBLICATION_FORMAT_REVISION {
+        return Err(invalid("publication record format revision differs"));
     }
-}
-
-#[derive(Deserialize)]
-struct EncodedHeader<'input> {
-    #[serde(default, borrow)]
-    header: Option<&'input RawValue>,
+    encode_package_records(publication)
 }
 
 /// Reads a canonical package publication and restores its logical records.
 ///
-/// Callers apply their artifact byte bound before decoding. The returned publication
-/// keeps the format revision of the stored bytes.
+/// Callers apply their artifact byte bound before decoding. Stored bytes must use
+/// the current publication format revision.
 ///
 /// # Errors
 /// Refuses an unsupported revision or a malformed publication.
 pub fn decode_package_publication(bytes: &[u8]) -> Result<PackagePublication, RiftError> {
-    let encoded: EncodedHeader<'_> =
-        serde_json::from_slice(bytes).map_err(|error| json_error(&error))?;
-    if encoded.header.is_some() {
-        return decode_package_records(bytes);
-    }
-    let publication: PackagePublication =
-        serde_json::from_slice(bytes).map_err(|error| json_error(&error))?;
-    if publication.format_revision != LEGACY_PACKAGE_PUBLICATION_FORMAT_REVISION
-        || publication.target.is_some()
-    {
+    if !bytes.starts_with(FRAME_PREFIX.as_bytes()) {
         return Err(invalid("publication record format revision differs"));
     }
-    Ok(publication)
+    decode_package_records(bytes)
 }
 
 /// Writes a publication with its rows grouped by source unit.
@@ -312,11 +291,10 @@ fn encode_package_records(publication: &PackagePublication) -> Result<String, Ri
 }
 
 fn encode_frame(mut header: Header, records: &Records) -> Result<String, RiftError> {
-    const PREFIX: &str = "{\"header\":";
     const RECORDS: &str = ",\"records\":";
     let records = canonical_json(records).map_err(|error| json_error(&error))?;
     let first = canonical_json(&header).map_err(|error| json_error(&error))?;
-    let fixed_bytes = PREFIX.len() + first.len() - 1 + RECORDS.len() + records.len() + 1;
+    let fixed_bytes = FRAME_PREFIX.len() + first.len() - 1 + RECORDS.len() + records.len() + 1;
     let mut length = fixed_bytes + 1;
     loop {
         let next = fixed_bytes + length.to_string().len();
@@ -328,7 +306,7 @@ fn encode_frame(mut header: Header, records: &Records) -> Result<String, RiftErr
     header.canonical_bytes = length;
     let header = canonical_json(&header).map_err(|error| json_error(&error))?;
     let mut artifact = String::with_capacity(length);
-    artifact.push_str(PREFIX);
+    artifact.push_str(FRAME_PREFIX);
     artifact.push_str(&header);
     artifact.push_str(RECORDS);
     artifact.push_str(&records);

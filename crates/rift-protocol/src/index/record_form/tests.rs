@@ -254,15 +254,11 @@ fn package_records_conform_to_the_publication_schema() {
 }
 
 #[test]
-fn package_records_restore_retained_flat_bytes_and_require_the_revisioned_shape() {
+fn package_records_accept_only_the_current_revision_and_shape() {
     let mut expected = publication();
     let legacy = crate::canonical::canonical_json(&expected).expect("flat artifact");
-    let restored = super::decode_package_publication(legacy.as_bytes()).expect("decode revision 6");
-    assert_eq!(restored, expected);
-    assert_eq!(
-        super::encode_package_publication(&restored).expect("retain legacy bytes"),
-        legacy,
-    );
+    assert!(super::decode_package_publication(legacy.as_bytes()).is_err());
+    assert!(super::encode_package_publication(&expected).is_err());
 
     expected.format_revision = crate::index::PACKAGE_PUBLICATION_FORMAT_REVISION;
     let packed = super::encode_package_publication(&expected).expect("encode revision 7");
