@@ -242,7 +242,12 @@ impl<'source> Namespaces<'source> {
             _ => {}
         }
         file.target_at(binding.name)
-            .filter(|target| target.symbol.kinds.contains(&SymbolKind::Type))
+            .filter(|target| {
+                // A type inside a const or static initializer can be stored with
+                // a module name. The block binding cannot justify that endpoint.
+                target.symbol.kinds.contains(&SymbolKind::Type)
+                    && !file.is_module_item(target.symbol)
+            })
             .map(Some)
             .ok_or(())
     }
@@ -1093,7 +1098,8 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Target<'source>> {
         let name = file.text(call.callee_range)?;
         let position = call.range.start;
-        let module = self.module(file, position, work)?;
+        let (module, inline_scope) =
+            self.module_at_with_scope(file.document.path.as_str(), position, work)?;
         let binding = match file.binding(name, position, is_value_binding, work) {
             Binding::Found(binding) if self.module(file, binding.name.start, work)? == module => {
                 Some(binding)
@@ -1116,7 +1122,14 @@ impl<'source> Namespaces<'source> {
                 return None;
             }
             return match binding.kind {
-                StaticBindingKind::Local => Self::local_callable(file, binding.name, work),
+                StaticBindingKind::Local => {
+                    Self::local_callable(file, binding.name, work).filter(|target| {
+                        !file.is_module_item(target.symbol)
+                            || inline_scope.or_else(|| {
+                                crate::analyzer::namespace::rust_file_scope(file.document.source)
+                            }) == Some(binding.scope)
+                    })
+                }
                 StaticBindingKind::RustUse { path } => {
                     self.import(file, path, work).filter(callable_value)
                 }

@@ -385,6 +385,68 @@ pub fn run() -> u16 {
     }
 }
 
+#[test]
+fn package_rust_initializer_local_types_do_not_name_the_module_type() {
+    use rift_core::ReferenceRole;
+    use rift_provider::NormalizedTarget;
+
+    let module_target =
+        |id: &str| id.ends_with("/beacon/Target") || id.ends_with("/beacon/Target/item");
+    for (label, source) in [
+        (
+            "named const",
+            "pub struct Target { pub item: u8 }\npub const CHECK: u16 = {\nstruct Target { item: u16 }\nlet value = Target { item: 7 };\nvalue.item\n};\n",
+        ),
+        (
+            "named static",
+            "pub struct Target { pub item: u8 }\npub static CHECK: u16 = {\nstruct Target { item: u16 }\nlet value = Target { item: 7 };\nvalue.item\n};\n",
+        ),
+        (
+            "tuple const",
+            "pub struct Target(pub u8);\npub const CHECK: u16 = {\nstruct Target(u16);\nlet value = Target(7);\nvalue.0\n};\n",
+        ),
+    ] {
+        let source = format!(
+            "{source}\npub mod visible {{ pub struct Target {{ pub item: u8 }} }}\n\
+             pub const EXPLICIT: u8 = crate::visible::Target {{ item: 1 }}.item;\n"
+        );
+        let analysis =
+            fixture::package_result(ShippedLanguage::Rust, vec![("src/lib.rs", &source)], None)
+                .expect("admitted Rust package");
+        let initializer =
+            u64::try_from(source.find("CHECK:").expect("initializer")).expect("offset");
+        let edges = &analysis.publication().edges;
+        assert!(
+            edges.iter().all(|edge| {
+                !module_target(edge.to.as_str())
+                    || !edge
+                        .kinds
+                        .iter()
+                        .any(|kind| matches!(kind, EdgeKind::Calls | EdgeKind::Reads))
+                    || edge
+                        .occurrence
+                        .as_ref()
+                        .is_none_or(|site| site.range.start < initializer)
+            }),
+            "{label}: {edges:?}",
+        );
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kinds.contains(&EdgeKind::Calls)
+                    && edge.to.as_str().ends_with("/beacon/visible/Target")
+            }),
+            "missing explicit constructor in {label}: {edges:?}"
+        );
+        let (_, _, semantics, _) = analysis.into_parts();
+        let leaked = semantics.static_occurrences().iter().find(|edge| {
+            edge.binding.range().start() >= initializer
+                && matches!(edge.role, ReferenceRole::Call | ReferenceRole::Read)
+                && matches!(&edge.target, NormalizedTarget::Symbol(id) if module_target(id.as_str()))
+        });
+        assert!(leaked.is_none(), "{label}: {leaked:?}");
+    }
+}
+
 struct GraphFixture {
     analysis: PackageAnalysis,
     owner: SymbolOwner,
