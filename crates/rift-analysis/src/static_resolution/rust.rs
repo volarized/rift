@@ -1,6 +1,7 @@
 //! Resolves Rust paths admitted by the captured crate and module inventory.
 
 mod deref;
+mod field_sites;
 mod receivers;
 mod references;
 mod value_reads;

@@ -5,7 +5,9 @@ use rift_error::RiftError;
 
 use super::Kinds;
 use crate::extract::{Visited, byte_range};
-use crate::static_analysis::{StaticFactsParts, StaticReference, StaticRustValueRead, enclosing};
+use crate::static_analysis::{
+    StaticFactsParts, StaticReference, StaticRustFieldSite, StaticRustValueRead, enclosing,
+};
 
 impl Kinds {
     pub(super) fn record_reference(
@@ -30,7 +32,15 @@ impl Kinds {
         {
             self.record_value_path(visited, facts)?;
         }
-        if id == self.field_expression {
+        if (id == self.local_value_struct || self.local_type_items.contains(&id))
+            && let Some(block) = self.local_item_block(visited)
+        {
+            facts
+                .rust_local_types
+                .push((byte_range(element)?, byte_range(block)?));
+        } else if id == self.field_pattern || self.field_initializers.contains(&id) {
+            self.record_field_site(visited, facts)?;
+        } else if id == self.field_expression {
             self.record_access(visited, facts)?;
         } else if [self.type_identifier, self.scoped_type_identifier].contains(&id) {
             let Some(parent) = visited.parent().map(Visited::syntax_element) else {
@@ -52,9 +62,7 @@ impl Kinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let scope = enclosing(visited, &self.scopes)
-            .map(Visited::syntax_element)
-            .filter(|node| node.kind_id() == self.scopes[1]);
+        let scope = self.local_item_block(visited);
         let name = visited
             .syntax_element()
             .child_by_field_id(self.name)
@@ -68,6 +76,15 @@ impl Kinds {
                 .push((byte_range(name)?, byte_range(scope)?));
         }
         Ok(())
+    }
+
+    fn local_item_block<'tree>(
+        &self,
+        visited: Visited<'_, 'tree>,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        enclosing(visited, &self.scopes)
+            .map(Visited::syntax_element)
+            .filter(|node| node.kind_id() == self.scopes[1])
     }
 
     fn record_value_path(
@@ -97,6 +114,71 @@ impl Kinds {
                 pattern: terminal_pattern,
             });
         }
+        Ok(())
+    }
+
+    fn record_field_site(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
+        let Some(parent) = visited.parent() else {
+            return Ok(());
+        };
+        let pattern = element.kind_id() == self.field_pattern;
+        let Some(construct) = (if pattern {
+            Some(parent)
+        } else {
+            parent.parent()
+        })
+        .map(Visited::syntax_element)
+        .filter(|construct| {
+            construct.kind_id()
+                == if pattern {
+                    self.struct_pattern
+                } else {
+                    self.struct_expression
+                }
+        }) else {
+            return Ok(());
+        };
+        let owner_field = if pattern { self.value_type } else { self.name };
+        let Some(owner) = construct
+            .child_by_field_id(owner_field)
+            .and_then(|owner| self.named_type(owner))
+        else {
+            return Ok(());
+        };
+        // Attributes at an initializer can remove exactly this field before evaluation.
+        let mut cursor = element.walk();
+        if element
+            .named_children(&mut cursor)
+            .any(|child| child.kind_id() == self.attribute)
+        {
+            return Ok(());
+        }
+        let field = if pattern {
+            element.child_by_field_id(self.name)
+        } else if element.kind_id() == self.field_initializers[0] {
+            element.child_by_field_id(self.member)
+        } else {
+            element
+                .named_children(&mut cursor)
+                .find(|child| child.kind_id() == self.identifier)
+        };
+        let Some(field) = field.filter(|field| {
+            !field.is_missing()
+                && [self.identifier, self.field_identifier, self.shorthand_field]
+                    .contains(&field.kind_id())
+        }) else {
+            return Ok(());
+        };
+        facts.rust_field_sites.push(StaticRustFieldSite {
+            owner: byte_range(owner)?,
+            field: byte_range(field)?,
+            literal: (!pattern).then(|| byte_range(construct)).transpose()?,
+        });
         Ok(())
     }
 

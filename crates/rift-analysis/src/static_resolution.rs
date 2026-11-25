@@ -1394,6 +1394,7 @@ impl<'source> Index<'source> {
                 DeferredReferences::Rust => {
                     self.rust_call_qualifiers(file, &mut deferred, resolution);
                     self.rust_value_reads(file, &mut deferred, resolution);
+                    self.rust_field_sites(file, &mut deferred, resolution);
                 }
             }
             let used = budget.saturating_sub(deferred.budget.remaining());
@@ -1578,8 +1579,10 @@ impl<'source> Index<'source> {
                 .map(DeferredReferences::PythonNames),
             "rust" => {
                 self.rust_references(file, work, result);
-                (!file.facts.calls().is_empty() || !file.facts.rust_value_reads().is_empty())
-                    .then_some(DeferredReferences::Rust)
+                (!file.facts.calls().is_empty()
+                    || !file.facts.rust_value_reads().is_empty()
+                    || !file.facts.rust_field_sites().is_empty())
+                .then_some(DeferredReferences::Rust)
             }
             _ => None,
         };

@@ -2473,6 +2473,144 @@ fn value_shadow(named: u8) -> u8 { let local = named; local }
 }
 
 #[test]
+fn rust_literal_and_pattern_field_labels_keep_physical_owners_and_roles() {
+    let source = "pub struct Left { pub x: u8, pub y: u8 }\n\
+        pub struct Right { pub x: u8, pub y: u8 }\n\
+        pub enum State { Named { x: u8 } }\n\
+        pub fn left(x: u8) -> Left { Left { x, y: 1 } }\n\
+        pub fn right(x: u8) -> Right { Right { x: x, y: 1 } }\n\
+        pub fn unpack(left: Left) -> u8 { let Left { x, y: other } = left; x + other }\n\
+        pub fn state(x: u8) -> u8 {\n\
+            let state = State::Named { x };\n\
+            match state { State::Named { x: value } => value }\n\
+        }\n\
+        pub fn direct_left(left: Left) -> u8 { left.x }\n\
+        pub fn direct_right(right: Right) -> u8 { right.x }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let accesses = |role| {
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| {
+                edge.role == role
+                    && edge.edge_kind.is_none()
+                    && (target(edge).ends_with("/x") || target(edge).ends_with("/y"))
+            })
+            .map(|edge| {
+                (
+                    source_of(edge, source),
+                    target(edge)
+                        .strip_prefix("rift://symbol/local/rust/fixture/")
+                        .expect("owned Rust field"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        accesses(ReferenceRole::Write),
+        [
+            ("x", "Left/x"),
+            ("y", "Left/y"),
+            ("x", "Right/x"),
+            ("y", "Right/y"),
+            ("x", "State/Named/x"),
+        ],
+    );
+    assert_eq!(
+        accesses(ReferenceRole::Read),
+        [
+            ("left.x", "Left/x"),
+            ("right.x", "Right/x"),
+            ("x", "Left/x"),
+            ("y", "Left/y"),
+            ("x", "State/Named/x"),
+        ],
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 3);
+    assert!(!result.ended);
+}
+
+#[test]
+fn rust_field_sites_refuse_sibling_block_owners() {
+    let source = r#"
+pub struct Target { pub item: u8 }
+pub fn before() -> u8 { { struct Target { item: u16 } } let value = Target { item: 7 }; value.item }
+pub fn after() -> u8 { let value = Target { item: 7 }; { struct Target { item: u16 } } value.item }
+pub fn clear() -> u8 { let value = Target { item: 7 }; value.item }
+pub fn qualified() -> u8 { struct Target { item: u16 } let value = crate::Target { item: 7 }; value.item }
+pub fn in_block() -> u16 { struct Local { item: u16 } let value = Local { item: 7 }; value.item }
+pub fn wrong_pattern(value: Target) -> u8 { { struct Target { item: u16 } } let Target { item } = value; item }
+pub fn valid_pattern(value: Target) -> u8 { let Target { item } = value; item }
+"#;
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let sites = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.edge_kind.is_none() && source_of(edge, source) == "item")
+        .map(|edge| {
+            (
+                edge.binding.range().start(),
+                edge.role,
+                target(edge)
+                    .strip_prefix("rift://symbol/local/rust/fixture/")
+                    .expect("package declaration"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let position = |statement| {
+        let line = source
+            .lines()
+            .find(|line| line.starts_with(statement))
+            .expect("fixture line");
+        let start = source.find(line).expect("fixture line start");
+        let field = line
+            .find("{ item: 7 }")
+            .or_else(|| line.find("{ item }"))
+            .expect("field label");
+        u64::try_from(start + field + 2).expect("fixture offset")
+    };
+    assert_eq!(
+        sites,
+        [
+            (
+                position("pub fn clear"),
+                ReferenceRole::Write,
+                "Target/item"
+            ),
+            (
+                position("pub fn qualified"),
+                ReferenceRole::Write,
+                "Target/item"
+            ),
+            (
+                position("pub fn in_block"),
+                ReferenceRole::Write,
+                "in_block/Local/item"
+            ),
+            (
+                position("pub fn valid_pattern"),
+                ReferenceRole::Read,
+                "Target/item"
+            ),
+        ],
+    );
+    assert_eq!(
+        result.omitted.get(&rift_protocol::read::EdgeKind::Writes),
+        Some(&2)
+    );
+}
+
+#[test]
 fn rust_shadowed_value_and_conditional_module_do_not_reach_decoys() {
     let source = "#[cfg(test)] mod tasks;\n\
                   fn run() {}\n\

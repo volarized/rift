@@ -41,6 +41,17 @@ pub struct StaticRustValueRead {
     pub pattern: bool,
 }
 
+/// One named field in a Rust struct literal or pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticRustFieldSite {
+    /// Written path of the struct or variant owning the field.
+    pub owner: ByteRange,
+    /// Written field label, including a shorthand name.
+    pub field: ByteRange,
+    /// Complete struct expression for a write. Patterns read the field.
+    pub literal: Option<ByteRange>,
+}
+
 /// One member expression with its original receiver and property spans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticMember {
@@ -465,6 +476,10 @@ pub struct StaticFactsParts {
     pub rust_value_reads: Vec<StaticRustValueRead>,
     /// Hoisted block-local value names with their scopes.
     pub rust_local_values: Vec<(ByteRange, ByteRange)>,
+    /// Block-local type and module items with their lexical blocks.
+    pub rust_local_types: Vec<(ByteRange, ByteRange)>,
+    /// Rust field labels in struct literals and patterns.
+    pub rust_field_sites: Vec<StaticRustFieldSite>,
     /// Authored Rust implementations.
     pub inherent_impls: Vec<StaticInherentImpl>,
     /// Items whose admission depends on Rust configuration.
@@ -760,10 +775,22 @@ impl StaticFacts {
         &self.0.rust_value_reads
     }
 
+    /// Named Rust fields in literals and patterns.
+    #[must_use]
+    pub fn rust_field_sites(&self) -> &[StaticRustFieldSite] {
+        &self.0.rust_field_sites
+    }
+
     /// Hoisted block-local value names and their scopes.
     #[must_use]
     pub fn rust_local_values(&self) -> &[(ByteRange, ByteRange)] {
         &self.0.rust_local_values
+    }
+
+    /// Block-local type and module item ranges with their scopes.
+    #[must_use]
+    pub fn rust_local_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.rust_local_types
     }
 
     /// Rust implementation headers.
@@ -846,6 +873,8 @@ impl StaticFacts {
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.rust_value_reads),
             vector_capacity(&self.0.rust_local_values),
+            vector_capacity(&self.0.rust_local_types),
+            vector_capacity(&self.0.rust_field_sites),
             vector_capacity(&self.0.conditional_items),
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
@@ -913,6 +942,8 @@ impl StaticFacts {
             self.rust_uses().len(),
             self.rust_value_reads().len(),
             self.rust_local_values().len(),
+            self.rust_local_types().len(),
+            self.rust_field_sites().len(),
             self.conditional_items().len(),
             self.receiver_arguments().len(),
             self.loops().len(),
@@ -976,6 +1007,20 @@ impl StaticFacts {
                 .rust_local_values()
                 .iter()
                 .all(|(name, scope)| valid(*name) && valid(*scope) && scope.encloses(*name))
+            && self
+                .rust_local_types()
+                .iter()
+                .all(|(item, scope)| valid(*item) && valid(*scope) && scope.encloses(*item))
+            && self.rust_field_sites().iter().all(|site| {
+                valid(site.owner)
+                    && valid(site.field)
+                    && site.owner.end <= site.field.start
+                    && site.literal.is_none_or(|literal| {
+                        valid(literal)
+                            && literal.encloses(site.owner)
+                            && literal.encloses(site.field)
+                    })
+            })
     }
 
     /// Whether the facts that connect function values and bound names to written types
