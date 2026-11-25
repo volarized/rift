@@ -11,6 +11,7 @@ fn verified_archive_digest_is_retained_for_both_algorithms() -> TestResult {
         tar::EntryType::Regular,
     )];
     for (format, bytes) in [
+        (ArchiveFormat::Tar, uncompressed_tar_bytes(&members)?),
         (ArchiveFormat::TarGzip, tar_bytes(&members)?),
         (ArchiveFormat::Zip, zip_members_bytes(&members)?),
     ] {
@@ -680,6 +681,15 @@ fn repeated_members_consume_member_and_expanded_byte_bounds() -> TestResult {
 fn tar_bytes(
     entries: &[(&str, &[u8], tar::EntryType)],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let tar = uncompressed_tar_bytes(entries)?;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&tar)?;
+    Ok(gzip.finish()?)
+}
+
+fn uncompressed_tar_bytes(
+    entries: &[(&str, &[u8], tar::EntryType)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut builder = tar::Builder::new(Vec::new());
     for &(path, bytes, kind) in entries {
         let mut header = tar::Header::new_gnu();
@@ -694,10 +704,35 @@ fn tar_bytes(
         header.set_cksum();
         builder.append(&header, bytes)?;
     }
-    let tar = builder.into_inner()?;
-    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gzip.write_all(&tar)?;
-    Ok(gzip.finish()?)
+    Ok(builder.into_inner()?)
+}
+
+#[test]
+fn uncompressed_tar_checks_container_and_member_bounds() -> TestResult {
+    let entries = [
+        ("release/a.js", b"a".as_slice(), tar::EntryType::Regular),
+        ("release/b.js", b"bc".as_slice(), tar::EntryType::Regular),
+    ];
+    let bytes = uncompressed_tar_bytes(&entries)?;
+    let length = bytes.len();
+    let limits = ArchiveLimits::new(length, length, 2, 2, 1)?;
+    assert_eq!(
+        read_format(&bytes, ArchiveFormat::Tar, limits)?
+            .files()
+            .len(),
+        2
+    );
+    let limits = ArchiveLimits::new(length, length - 1, 2, 2, 1)?;
+    assert_eq!(
+        read_format(&bytes, ArchiveFormat::Tar, limits).expect_err("expanded archive bytes"),
+        ArchiveBound::ExpandedBytes.exceeded(length as u64, length as u64 - 1, None)
+    );
+    let limits = ArchiveLimits::new(length, length, 2, 1, 1)?;
+    assert_eq!(
+        read_format(&bytes, ArchiveFormat::Tar, limits).expect_err("second archive member"),
+        ArchiveBound::Members.exceeded(2, 1, Some(fixture_path("release/b.js")))
+    );
+    Ok(())
 }
 
 fn fixture_path(path: &str) -> ProjectPath {

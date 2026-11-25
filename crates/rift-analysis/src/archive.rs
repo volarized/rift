@@ -19,6 +19,8 @@ use zstd::stream::raw::{self, Operation};
 /// Registry archive container.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveFormat {
+    /// Uncompressed tar archive.
+    Tar,
     /// Gzip-compressed tar archive.
     TarGzip,
     /// ZIP archive with a supported compression method.
@@ -618,12 +620,20 @@ fn read_source<R: Read + Seek>(
     limits: ArchiveLimits,
     keep: &dyn Fn(&ProjectPath, u64) -> bool,
 ) -> Result<ArchiveFiles, ArchiveError> {
-    let compressed = usize::try_from(source.length).map_err(|_| ArchiveError::CompressedLimit)?;
-    let mut output = ArchiveOutput::new(root, limits, limits.expanded(compressed));
+    let input_bytes = usize::try_from(source.length).map_err(|_| ArchiveError::CompressedLimit)?;
+    let expanded = limits.expanded(input_bytes);
+    let mut output = ArchiveOutput::new(root, limits, expanded);
     output.keep = keep;
     match format {
-        ArchiveFormat::TarGzip => read_tar(source, compressed, &mut output)?,
-        ArchiveFormat::Zip => read_zip(source, compressed, &mut output)?,
+        ArchiveFormat::Tar => {
+            if input_bytes > expanded.maximum {
+                return Err(expanded.exceeded(input_bytes as u64, None));
+            }
+            source.restart();
+            read_tar_entries(&mut *source, &mut output)??;
+        }
+        ArchiveFormat::TarGzip => read_tar_gzip(source, input_bytes, &mut output)?,
+        ArchiveFormat::Zip => read_zip(source, input_bytes, &mut output)?,
     }
     Ok(output.into_files(source.digest))
 }
@@ -816,7 +826,7 @@ impl<R> Seek for Source<'_, R> {
 const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_DEFAULT;
 
 /// Decodes the gzip stream once, checking every header and reading every member.
-fn read_tar<R: Read + Seek>(
+fn read_tar_gzip<R: Read + Seek>(
     source: &mut Source<'_, R>,
     compressed: usize,
     output: &mut ArchiveOutput<'_>,
