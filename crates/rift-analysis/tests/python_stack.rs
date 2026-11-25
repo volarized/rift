@@ -151,7 +151,7 @@ fn a_chain_of_constructed_values_ends() {
     let found = chained(format!("{CLASS}a0 = C\n{links}a{LAST}.m()\n"));
     assert_edges(
         &found,
-        1004,
+        1005,
         &["module/C -> module/C/m", "module -> module/C"],
     );
 }

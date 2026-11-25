@@ -456,3 +456,52 @@ fn test_python_writes_without_one_declaration_are_counted() {
         assert_eq!(refused(EdgeKind::Writes), writes, "{body}");
     }
 }
+
+#[test]
+fn test_python_first_names_are_read_where_the_path_is_not_established_further() {
+    assert_reads(&[
+        ("x = N.real\n", &["0  reads N"]),
+        ("x = N.real.imag\n", &["0  reads N"]),
+        ("N.append(f.x)\n", &["0  reads N", "0  reads f"]),
+        ("class D:\n    m = 1\nx = D.m\n", &[]),
+        ("class D:\n    m = 1\nx = D.m.real\n", &[]),
+        ("class D:\n    def m(self): pass\nD.m()\n", &[]),
+        ("class D:\n    m = 1\nD.n = D.m\n", &["2  reads D"]),
+        ("x = N[0].y\n", &["0  reads N"]),
+        ("x = (N\n     .real)\n", &["0  reads N"]),
+        ("def run(N): return N.real\n", &[]),
+        ("def run(x: N.real): pass\n", &[]),
+        ("class D(C.x): pass\n", &[]),
+        ("match x:\n    case C.red: pass\n", &["1  reads C"]),
+        (
+            "class D:\n    red = 1\nmatch x:\n    case D.red: pass\n",
+            &[],
+        ),
+        (
+            "class D:\n    @property\n    def v(self): pass\n    @v.setter\n    def v(self, x): pass\n",
+            &["3 D/v reads D/v"],
+        ),
+        ("del N.x\n", &["0  reads N"]),
+        ("N.x += 1\n", &["0  reads N"]),
+    ]);
+}
+
+#[test]
+fn test_python_first_names_of_imported_modules_are_read_once() {
+    for (body, expected, refused) in [
+        ("import pkg.leaf as m\nx = m.g\n", "", 0),
+        (
+            "import pkg.leaf as m\nx = m.missing\n",
+            "1  reads pkg/leaf",
+            0,
+        ),
+        ("from pkg import leaf\nleaf.g()\n", "", 0),
+        ("import os\nos.getcwd()\n", "", 0),
+        ("import os\nx = os.environ\n", "os", 0),
+        ("from pkg.leaf import two\nx = two.y\n", "", 1),
+    ] {
+        let (found, omitted) = imported(body);
+        assert_eq!(found.join(" "), expected, "{body}");
+        assert_eq!(omitted, refused, "{body}");
+    }
+}

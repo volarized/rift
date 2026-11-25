@@ -257,6 +257,7 @@ impl EdgePythonKinds {
         }
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts, names)?;
+        self.edge_pattern_path(visited, facts)?;
         Ok(())
     }
 
@@ -595,9 +596,14 @@ impl EdgePythonKinds {
             return Ok(());
         }
         let parent = visited.parent().map(Visited::syntax_element);
+        let in_path = id == self.identifier
+            && parent.is_some_and(|parent| parent.kind_id() == self.attribute);
         if parent.is_some_and(|parent| {
-            (parent.kind_id() == self.attribute && id == self.identifier)
-                || parent.kind_id() == self.member_type
+            parent.kind_id() == self.member_type
+                || (in_path
+                    && parent
+                        .child_by_field_id(self.member)
+                        .is_some_and(|member| member.id() == element.id()))
         }) || visited
             .parent()
             .and_then(Visited::parent)
@@ -638,47 +644,62 @@ impl EdgePythonKinds {
         }
         let range = byte_range(element)?;
         if annotation {
-            facts.references.push(StaticReference {
-                target: range,
-                role: ReferenceRole::Type,
-            });
+            if !in_path {
+                facts.references.push(StaticReference {
+                    target: range,
+                    role: ReferenceRole::Type,
+                });
+            }
         } else if id == self.identifier {
             self.edge_name(visited, facts, names)?;
         } else if id == self.attribute {
-            let mut target_element = element;
-            let mut ancestor = visited.parent();
-            while let Some(current) = ancestor {
-                if !self.patterns.contains(&current.syntax_element().kind_id()) {
-                    break;
-                }
-                target_element = current.syntax_element();
-                ancestor = current.parent();
+            self.edge_member_access(visited, facts)?;
+        }
+        Ok(())
+    }
+
+    /// Records the read and the write of one member access.
+    fn edge_member_access(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        use rift_core::ReferenceRole;
+        let element = visited.syntax_element();
+        let range = byte_range(element)?;
+        let mut target_element = element;
+        let mut ancestor = visited.parent();
+        while let Some(current) = ancestor {
+            if !self.patterns.contains(&current.syntax_element().kind_id()) {
+                break;
             }
-            let assignment = ancestor
-                .map(Visited::syntax_element)
-                .filter(|parent| self.assignment.contains(&parent.kind_id()));
-            let target = assignment.and_then(|parent| parent.child_by_field_id(self.left));
-            let written = target.is_some_and(|target| target.id() == target_element.id());
-            if written
-                && assignment.is_some_and(|parent| {
-                    parent.kind_id() == self.assignment[0]
-                        && parent.child_by_field_id(self.right).is_none()
-                })
-            {
-                return Ok(());
-            }
-            if !written || assignment.is_some_and(|parent| parent.kind_id() == self.augmented) {
-                facts.references.push(StaticReference {
-                    target: range,
-                    role: ReferenceRole::Read,
-                });
-            }
-            if written {
-                facts.references.push(StaticReference {
-                    target: range,
-                    role: ReferenceRole::Write,
-                });
-            }
+            target_element = current.syntax_element();
+            ancestor = current.parent();
+        }
+        let assignment = ancestor
+            .map(Visited::syntax_element)
+            .filter(|parent| self.assignment.contains(&parent.kind_id()));
+        let target = assignment.and_then(|parent| parent.child_by_field_id(self.left));
+        let written = target.is_some_and(|target| target.id() == target_element.id());
+        if written
+            && assignment.is_some_and(|parent| {
+                parent.kind_id() == self.assignment[0]
+                    && parent.child_by_field_id(self.right).is_none()
+            })
+        {
+            return Ok(());
+        }
+        if !written || assignment.is_some_and(|parent| parent.kind_id() == self.augmented) {
+            facts.references.push(StaticReference {
+                target: range,
+                role: ReferenceRole::Read,
+            });
+        }
+        if written {
+            facts.references.push(StaticReference {
+                target: range,
+                role: ReferenceRole::Write,
+            });
         }
         Ok(())
     }

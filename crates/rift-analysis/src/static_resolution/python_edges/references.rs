@@ -1,6 +1,6 @@
 //! Python containment, member accesses, overrides, and annotation uses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::read::{EdgeKind, SymbolKind};
@@ -18,6 +18,11 @@ impl<'source> Index<'source> {
         result: &mut StaticResolution,
     ) {
         let callees = established_callees(result);
+        let mut paths = callees
+            .keys()
+            .map(|callee| callee.start)
+            .collect::<BTreeSet<_>>();
+        let mut names = Vec::new();
         for reference in file.facts.references() {
             if !work.charge() {
                 return;
@@ -28,11 +33,7 @@ impl<'source> Index<'source> {
                     .text(reference.target)
                     .is_some_and(|text| !text.contains('.'))
             {
-                if reference.role == ReferenceRole::Read {
-                    self.python_name_read(file, reference.target, work, result);
-                } else {
-                    self.python_name_write(file, reference.target, work, result);
-                }
+                names.push(reference);
                 continue;
             }
             let occurrence = self
@@ -45,8 +46,22 @@ impl<'source> Index<'source> {
                 .and_then(|target| {
                     self.python_access(file, reference.target, reference.role, target)
                 });
+            if occurrence.is_some() {
+                paths.insert(reference.target.start);
+            }
             if !names_callee(&callees, reference, occurrence.as_ref()) {
                 result.record(occurrence);
+            }
+        }
+        for reference in names {
+            if !work.charge() {
+                return;
+            }
+            let name = reference.target;
+            if reference.role == ReferenceRole::Write {
+                self.python_name_write(file, name, work, result);
+            } else if !(paths.contains(&name.start) && file.python_path_starts(name)) {
+                self.python_name_read(file, name, work, result);
             }
         }
         for symbol in file.document.facts.symbols() {
@@ -199,4 +214,19 @@ fn names_callee(
             (Some(called), Some(NormalizedTarget::Symbol(read))) => called == read,
             (_, read) => read.is_none(),
         }
+}
+
+impl File<'_> {
+    /// Whether the name is the first of a member path.
+    fn python_path_starts(&self, name: ByteRange) -> bool {
+        let rest = usize::try_from(name.end)
+            .ok()
+            .and_then(|end| self.document.source.get(end..));
+        rest.is_some_and(|rest| {
+            rest.trim_start_matches(|character: char| {
+                character.is_whitespace() || character == '\\'
+            })
+            .starts_with('.')
+        })
+    }
 }

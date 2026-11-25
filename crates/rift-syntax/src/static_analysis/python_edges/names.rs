@@ -75,6 +75,13 @@ impl NameKinds {
     }
 }
 
+impl NameKinds {
+    /// Whether a pattern of this kind reads the dotted name it holds.
+    fn holds_path(&self, pattern: u16) -> bool {
+        pattern == self.class_pattern || self.captures.contains(&pattern)
+    }
+}
+
 /// The names of one file that wait for its other bindings.
 #[derive(Default)]
 pub(in crate::static_analysis) struct Names {
@@ -229,6 +236,26 @@ impl EdgePythonKinds {
         Ok(())
     }
 
+    /// Records a member path in a `match` pattern, which reads it.
+    pub(super) fn edge_pattern_path(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let path = visited.syntax_element();
+        let pattern = visited
+            .parent()
+            .map(|pattern| pattern.syntax_element().kind_id());
+        if path.kind_id() == self.names.dotted
+            && path.named_child_count() > 1
+            && pattern.is_some_and(|pattern| self.names.holds_path(pattern))
+        {
+            let path = byte_range(path)?;
+            facts.references.push(reference(path, ReferenceRole::Read));
+        }
+        Ok(())
+    }
+
     /// Binds the name a `type` statement declares.
     pub(super) fn edge_type_alias(
         &self,
@@ -317,26 +344,22 @@ impl EdgePythonKinds {
             };
         }
         if id == names.dotted {
-            let pattern = parent.parent().map(Visited::syntax_element);
-            let pattern = pattern
-                .filter(|_| holder.named_child_count() == 1)
-                .map(|pattern| pattern.kind_id());
-            return match pattern {
-                Some(pattern) if names.captures.contains(&pattern) => NameUse::Bound,
-                Some(pattern) if pattern == names.class_pattern => NameUse::Read,
+            let captures = holder.named_child_count() == 1;
+            let first = holder
+                .named_child(0)
+                .is_some_and(|first| first.id() == name.id());
+            return match parent
+                .parent()
+                .map(|pattern| pattern.syntax_element().kind_id())
+            {
+                Some(pattern) if captures && names.captures.contains(&pattern) => NameUse::Bound,
+                Some(pattern) if first && names.holds_path(pattern) => NameUse::Read,
                 _ => NameUse::Stated,
             };
         }
         let stated = (id == self.call && at(self.function))
             || (self.definitions.contains(&id) && at(self.name.get()))
-            || [
-                self.decorator,
-                self.attribute,
-                self.aliased,
-                self.global,
-                self.nonlocal,
-            ]
-            .contains(&id);
+            || [self.decorator, self.aliased, self.global, self.nonlocal].contains(&id);
         if stated {
             NameUse::Stated
         } else {
