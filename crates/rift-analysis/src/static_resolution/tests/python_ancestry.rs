@@ -2,6 +2,59 @@ use super::{WORK_MAX, calls, resolution, source_of, target};
 use rift_protocol::read::EdgeKind;
 
 #[test]
+fn test_python_explicit_object_base_orders_like_an_implicit_base() {
+    for (imports, object) in [
+        ("", "object"),
+        ("from builtins import object as root\n", "root"),
+        ("import builtins as runtime\n", "runtime.object"),
+    ] {
+        let source = format!(
+            "{imports}class A:\n    def m(self): pass\nclass B({object}): pass\nclass K(B, A): pass\ndef f(x: K): x.m()\n"
+        );
+        let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX);
+        assert_eq!(
+            calls(&result, "main.py")
+                .filter(|edge| source_of(edge, &source) == "x.m()")
+                .map(target)
+                .collect::<Vec<_>>(),
+            ["rift://symbol/local/python/main/A/m"],
+            "{source}"
+        );
+        assert!(!result.exhausted);
+    }
+}
+
+#[test]
+fn test_python_local_object_base_keeps_its_members() {
+    let source =
+        "class object:\n    def m(self): pass\nclass Child(object): pass\ndef f(x: Child): x.m()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/main/object/m"]
+    );
+    assert!(!result.exhausted);
+}
+
+#[test]
+fn test_python_inconsistent_class_order_leaves_descendants_with_own_members() {
+    for bases in ["A, B", "A, A", "object, A"] {
+        let source = format!(
+            "class A:\n    def m(self): pass\nclass B(A): pass\nclass X({bases}):\n    def x(self): pass\nclass C:\n    def c(self): pass\nclass Y(X, C):\n    def y(self): pass\nclass W(Y): pass\ndef f(y: Y, w: W):\n    y.x()\n    y.c()\n    w.x()\n    y.m()\n    w.y()\n    y.y()\n"
+        );
+        let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX);
+        assert_eq!(
+            calls(&result, "main.py")
+                .map(|edge| (source_of(edge, &source), target(edge)))
+                .collect::<Vec<_>>(),
+            [("y.y()", "rift://symbol/local/python/main/Y/y")],
+            "{source}"
+        );
+        assert!(!result.exhausted);
+    }
+}
+
+#[test]
 fn test_python_generic_mro_keeps_the_shared_marker_order() {
     let source = "from typing import Generic, TypeVar\nT = TypeVar('T')\nclass Root:\n    def leaf(self): return 1\nclass Left(Generic[T], Root): pass\nclass Right(Generic[T]):\n    def leaf(self): return 2\nclass Child(Left[T], Right[T]):\n    def use(self): return self.leaf()\n";
     let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
