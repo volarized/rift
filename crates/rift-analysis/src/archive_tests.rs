@@ -2390,6 +2390,57 @@ fn both_modes(limits: ArchiveLimits) -> [ArchiveLimits; 2] {
     ]
 }
 
+#[test]
+fn pax_multiline_comment_leaves_following_records_readable() -> TestResult {
+    let records = [
+        pax_record("comment", "first\nsecond café\n"),
+        pax_record("path", "release/readme.txt"),
+    ]
+    .concat();
+    let archive = gzip(
+        &[
+            raw_member("PaxHeaders/readme.txt", b'x', records.as_bytes())?,
+            raw_member("release/original.txt", b'0', b"hello\n")?,
+        ]
+        .concat(),
+    )?;
+    for limits in both_modes(ArchiveLimits::default()) {
+        let files = read(&archive, limits)?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(
+            files
+                .files()
+                .get(&fixture_path("readme.txt"))
+                .map(Vec::as_slice),
+            Some(b"hello\n".as_slice())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_pax_record_lengths_are_refused() -> TestResult {
+    for record in [
+        "0 comment=note\n",
+        "6 comment=note\n",
+        "15 comment=note",
+        "9999999999999999999999999999999999999 comment=note\n",
+    ] {
+        let archive = gzip(
+            &[
+                raw_member("PaxHeaders/readme.txt", b'x', record.as_bytes())?,
+                raw_member("release/readme.txt", b'0', b"hello\n")?,
+            ]
+            .concat(),
+        )?;
+        assert_eq!(
+            read(&archive, ArchiveLimits::default()).expect_err("malformed PAX record"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
 // Issue #1033.
 #[test]
 fn pax_global_headers_are_metadata_under_no_root() -> TestResult {

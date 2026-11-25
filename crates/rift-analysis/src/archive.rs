@@ -960,22 +960,23 @@ impl TarExtension {
             return Ok(());
         }
         self.local |= !global;
-        let values = entry
-            .pax_extensions()
+        let mut payload =
+            vec![0; usize::try_from(entry.size()).map_err(|_| ArchiveError::InvalidArchive)?];
+        entry
+            .read_exact(&mut payload)
             .map_err(|_| ArchiveError::InvalidArchive)?;
-        for value in values.into_iter().flatten() {
-            let value = value.map_err(|_| ArchiveError::InvalidArchive)?;
-            let key = value.key_bytes();
+        let mut records = payload.as_slice();
+        while !records.is_empty() {
+            let (key, value) = take_pax_record(&mut records)?;
             if is_sparse(key) || (global && changes_members(key)) {
                 return Err(ArchiveError::UnsupportedEntry);
             }
             match key {
                 // The first path record counts, as in the tar library.
                 b"path" => {
-                    self.path
-                        .get_or_insert_with(|| value.value_bytes().to_vec());
+                    self.path.get_or_insert_with(|| value.to_vec());
                 }
-                b"size" => self.record_size(value.value_bytes()),
+                b"size" => self.record_size(value),
                 _ => {}
             }
         }
@@ -1001,6 +1002,33 @@ impl TarExtension {
                 .as_deref()
                 .is_some_and(|recorded| recorded != size.to_string().as_bytes())
     }
+}
+
+/// Reads the next PAX record. Its byte count includes the digits and final newline.
+fn take_pax_record<'header>(
+    bytes: &mut &'header [u8],
+) -> Result<(&'header [u8], &'header [u8]), ArchiveError> {
+    let space = bytes
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or(ArchiveError::InvalidArchive)?;
+    let length = std::str::from_utf8(&bytes[..space])
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or(ArchiveError::InvalidArchive)?;
+    let (record, remaining) = bytes
+        .split_at_checked(length)
+        .ok_or(ArchiveError::InvalidArchive)?;
+    let body = record
+        .get(space + 1..)
+        .and_then(|value| value.strip_suffix(b"\n"))
+        .ok_or(ArchiveError::InvalidArchive)?;
+    let equals = body
+        .iter()
+        .position(|byte| *byte == b'=')
+        .ok_or(ArchiveError::InvalidArchive)?;
+    *bytes = remaining;
+    Ok((&body[..equals], &body[equals + 1..]))
 }
 
 /// Whether a PAX record names another path, link target, or size for a member.
