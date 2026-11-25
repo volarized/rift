@@ -1,7 +1,7 @@
 //! Bounded reStructuredText facts from the pinned Tree-sitter grammar.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 
 use rift_core::{ProjectPath, line::line_of, line::line_starts};
 use rift_protocol::read::TextRange;
@@ -440,6 +440,7 @@ fn collect_entry_facts(
         facts: RstFacts::default(),
         omitted_syntax_element_ids: HashSet::new(),
         block_for_syntax_element: HashMap::with_capacity(entries.len()),
+        paragraph_prose: HashMap::new(),
     };
     for entry in entries {
         collect_entry(entry, text, kinds, starts, sections, &mut state)?;
@@ -452,6 +453,8 @@ struct RstEntryState {
     facts: RstFacts,
     omitted_syntax_element_ids: HashSet<usize>,
     block_for_syntax_element: HashMap<usize, TextRange>,
+    /// Prose ranges of each paragraph that continues after a literal block.
+    paragraph_prose: HashMap<usize, Vec<TextRange>>,
 }
 
 #[expect(
@@ -470,6 +473,7 @@ fn collect_entry(
         facts,
         omitted_syntax_element_ids,
         block_for_syntax_element,
+        paragraph_prose,
     } = state;
     let syntax_element = entry.syntax_element;
     if entry
@@ -479,9 +483,17 @@ fn collect_entry(
         omitted_syntax_element_ids.insert(syntax_element.id());
         return Ok(());
     }
-    let mut current_block = entry
-        .parent
-        .and_then(|parent| block_for_syntax_element.get(&parent).cloned());
+    let mut current_block = entry.parent.and_then(|parent| {
+        let prose = paragraph_prose.get(&parent).and_then(|prose| {
+            let start = syntax_element.start_byte() as u64;
+            prose
+                .iter()
+                .find(|range| range.start <= start && start < range.end)
+        });
+        prose
+            .or_else(|| block_for_syntax_element.get(&parent))
+            .cloned()
+    });
 
     if syntax_element.kind_id() == kinds.directive {
         let name = syntax_element
@@ -544,23 +556,20 @@ fn collect_entry(
         });
         current_block = Some(title_range);
     } else if syntax_element.kind_id() == kinds.paragraph {
-        let full = byte_range(syntax_element)?;
-        let literal = child_of_kind(syntax_element, kinds.literal_block);
-        let range = literal.map_or(full.clone(), |literal| TextRange {
-            start: full.start,
-            end: byte_range(literal).map_or(full.end, |range| range.start),
-        });
-        if range.start < range.end {
-            let line = line_of(starts, range.start);
+        let prose = paragraph_prose_ranges(syntax_element, text, kinds.literal_block)?;
+        for range in &prose {
             facts.blocks.push(RstBlockFact {
                 range: range.clone(),
-                line,
+                line: line_of(starts, range.start),
                 kind: RstBlockKind::Prose,
                 structure: "paragraph",
                 heading_path: heading_path_at(&sections.events, syntax_element.start_byte()),
                 language: None,
             });
-            current_block = Some(range);
+        }
+        current_block = prose.first().cloned().or(current_block);
+        if prose.len() > 1 {
+            paragraph_prose.insert(syntax_element.id(), prose);
         }
     } else if syntax_element.kind_id() == kinds.literal_block {
         let range = byte_range(syntax_element)?;
@@ -668,6 +677,57 @@ fn child_of_kind(syntax_element: Node<'_>, kind: u16) -> Option<Node<'_>> {
         .find(|child| child.kind_id() == kind)
 }
 
+/// Byte range of one inline element, without the line ending the grammar can keep in it.
+///
+/// An element at the end of a CRLF line can hold the carriage return.
+fn inline_range(syntax_element: Node<'_>, text: &str) -> Range<usize> {
+    let range = syntax_element.byte_range();
+    let trimmed = text
+        .get(range.clone())
+        .map_or(range.len(), |raw| raw.trim_end_matches(['\r', '\n']).len());
+    range.start..range.start + trimmed
+}
+
+/// The prose ranges of one paragraph, in source order.
+///
+/// The grammar keeps a line that follows a literal block without a blank line in the same
+/// paragraph, so a paragraph can hold prose before, between, and after its literal blocks.
+fn paragraph_prose_ranges(
+    paragraph: Node<'_>,
+    text: &str,
+    literal_kind: u16,
+) -> Result<Vec<TextRange>, RiftError> {
+    let mut ranges = Vec::new();
+    let mut start = paragraph.start_byte();
+    let mut cursor = paragraph.walk();
+    let literals = paragraph
+        .children(&mut cursor)
+        .filter(|child| child.kind_id() == literal_kind);
+    for literal in literals {
+        push_prose_range(text, start, literal.start_byte(), &mut ranges)?;
+        start = literal.end_byte();
+    }
+    push_prose_range(text, start, paragraph.end_byte(), &mut ranges)?;
+    Ok(ranges)
+}
+
+/// Appends the prose between `start` and `end`, without the whitespace before it.
+fn push_prose_range(
+    text: &str,
+    start: usize,
+    end: usize,
+    ranges: &mut Vec<TextRange>,
+) -> Result<(), RiftError> {
+    let Some(raw) = text.get(start..end) else {
+        return Ok(());
+    };
+    let prose = raw.trim_ascii_start();
+    if !prose.is_empty() {
+        ranges.push(text_range(end - prose.len(), end)?);
+    }
+    Ok(())
+}
+
 fn section_adornment(syntax_element: Node<'_>, kind: u16, text: &str) -> Option<char> {
     let mut cursor = syntax_element.walk();
     for child in syntax_element.children(&mut cursor) {
@@ -697,17 +757,7 @@ fn collect_target(
 ) -> Result<(), RiftError> {
     if syntax_element.kind_id() == kinds.target {
         if let Some(name) = syntax_element.child_by_field_id(kinds.name_field) {
-            let raw_range = byte_range(name)?;
-            let mut start = usize::try_from(raw_range.start).map_err(|_| {
-                errors::analysis::documentation_range_invalid()
-                    .field("rst_range")
-                    .error()
-            })?;
-            let mut end = usize::try_from(raw_range.end).map_err(|_| {
-                errors::analysis::documentation_range_invalid()
-                    .field("rst_range")
-                    .error()
-            })?;
+            let Range { mut start, mut end } = inline_range(name, text);
             let raw = text.get(start..end).ok_or_else(|| {
                 errors::analysis::documentation_range_invalid()
                     .field("rst_range")
@@ -743,9 +793,7 @@ fn collect_target(
             });
         }
     } else if syntax_element.kind_id() == kinds.inline_target {
-        let full = byte_range(syntax_element)?;
-        let mut start = usize::try_from(full.start).unwrap_or(text.len());
-        let mut end = usize::try_from(full.end).unwrap_or(text.len());
+        let Range { mut start, mut end } = inline_range(syntax_element, text);
         if text
             .get(start..end)
             .is_some_and(|raw| raw.starts_with("_`"))
@@ -776,7 +824,11 @@ fn collect_link(
         return Ok(());
     };
     let (authored_range, kind) = if syntax_element.kind_id() == kinds.standalone_hyperlink {
-        (Some(byte_range(syntax_element)?), RstLinkKind::Destination)
+        let range = inline_range(syntax_element, text);
+        (
+            Some(text_range(range.start, range.end)?),
+            RstLinkKind::Destination,
+        )
     } else if syntax_element.kind_id() == kinds.reference {
         (
             reference_name_range(syntax_element, text)?,
@@ -802,17 +854,7 @@ fn reference_name_range(
     syntax_element: Node<'_>,
     text: &str,
 ) -> Result<Option<TextRange>, RiftError> {
-    let mut range = byte_range(syntax_element)?;
-    let mut start = usize::try_from(range.start).map_err(|_| {
-        errors::analysis::documentation_range_invalid()
-            .field("rst_range")
-            .error()
-    })?;
-    let mut end = usize::try_from(range.end).map_err(|_| {
-        errors::analysis::documentation_range_invalid()
-            .field("rst_range")
-            .error()
-    })?;
+    let Range { mut start, mut end } = inline_range(syntax_element, text);
     let Some(raw) = text.get(start..end) else {
         return errors::analysis::documentation_range_invalid()
             .field("rst_range")
@@ -829,7 +871,7 @@ fn reference_name_range(
     if text.get(start..end).is_some_and(|name| name.ends_with('`')) {
         end = end.saturating_sub(1);
     }
-    range = text_range(start, end)?;
+    let range = text_range(start, end)?;
     Ok((range.start < range.end).then_some(range))
 }
 

@@ -8,6 +8,8 @@ mod context;
 #[cfg(all(test, feature = "collector"))]
 mod coverage_tests;
 pub(crate) mod failure;
+#[cfg(all(test, feature = "collector"))]
+mod field_tests;
 mod identity;
 mod input;
 mod limits;
