@@ -6,19 +6,20 @@
 //!
 //! Every collection is in stable identity order and every stored record carries a digest
 //! over its own canonical content, so two publications are comparable record by record.
-//! The whole publication renders as RFC 8785 canonical JSON through
-//! [`canonical_json`](crate::canonical::canonical_json), and carries no host-absolute
-//! path: a unit is addressed by its package-relative path and its
-//! [`SourceUnitId`].
+//! [`encode_package_publication`] writes an RFC 8785 canonical artifact. The artifact
+//! carries package-relative source paths. [`decode_package_publication`] restores the
+//! logical records and their [`SourceUnitId`] values.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod artifact;
+mod record_form;
 pub use artifact::{
     PACKAGE_ARTIFACT_BYTES_MAX, PACKAGE_ARTIFACT_TAGS_MAX, PackageArtifact, WheelTag,
     python_identifier_is_valid,
 };
+pub use record_form::{decode_package_publication, encode_package_publication};
 
 pub use crate::stored_edge::StoredEdge;
 
@@ -39,7 +40,7 @@ use crate::revision::Revision;
 /// It changes only when the publication shape or a record identity changes in a way a
 /// consumer cannot read past: a consumer that meets a higher revision than it knows
 /// refuses the publication rather than reading fields it cannot place.
-pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 6;
+pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 7;
 
 /// Source units one publication may carry.
 pub const PACKAGE_UNITS_MAX: u32 = 100_000;
@@ -89,6 +90,9 @@ pub struct PackagePublication {
     /// The one release this publication analyzed, a release revision of `owner`, as
     /// `rift://revision/cargo/crates.io/demo@1.0.0`.
     pub revision: Revision,
+    /// The selected target triple. Absent when the analysis has no target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// The digest of the package source this publication was produced from, over every
     /// unit's path and content in unit order.
     pub source_digest: Digest,

@@ -314,7 +314,10 @@ fn artifact_name_bytes_and_public_name_characters_keep_distinct_bounds() {
             serde_json::from_str(&rift_protocol::schema::package_index_schema_document())
                 .expect("artifact schema");
         let validator = jsonschema::validator_for(&schema).expect("artifact schema compiles");
-        assert!(validator.is_valid(&serde_json::to_value(&publication).expect("artifact")));
+        let artifact = rift_protocol::index::encode_package_publication(&publication)
+            .expect("publication records");
+        let value = serde_json::from_str(&artifact).expect("artifact");
+        assert!(validator.is_valid(&value));
     }
     for name in ["n".repeat(8193), "é".repeat(4097)] {
         assert!(!rift_core::is_portable_name(&name));
@@ -807,7 +810,9 @@ fn four_byte_names_keep_full_artifact_facts_and_neighbor_publication() {
             if field == "name" && *bound == 4096 && qualified_name == &name)),
             characters > 4096
         );
-        let wire = serde_json::to_value(publication).expect("full artifact encoding");
+        let encoded = rift_protocol::index::encode_package_publication(publication)
+            .expect("full artifact encoding");
+        let wire = serde_json::from_str(&encoded).expect("artifact");
         let schema: serde_json::Value =
             serde_json::from_str(&rift_protocol::schema::package_index_schema_document())
                 .expect("artifact schema");
@@ -816,8 +821,8 @@ fn four_byte_names_keep_full_artifact_facts_and_neighbor_publication() {
                 .expect("schema validator")
                 .is_valid(&wire)
         );
-        let restored: PackagePublication =
-            serde_json::from_value(wire).expect("full artifact restore");
+        let restored = rift_protocol::index::decode_package_publication(encoded.as_bytes())
+            .expect("full artifact restore");
         assert_eq!(&restored, publication);
     }
 }

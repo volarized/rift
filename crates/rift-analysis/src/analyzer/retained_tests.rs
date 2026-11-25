@@ -80,7 +80,9 @@ fn explicit_retention_keeps_complete_source_and_current_declaration_ranges() {
         serde_json::from_str(&rift_protocol::schema::package_index_schema_document())
             .expect("schema");
     let validator = jsonschema::validator_for(&schema).expect("schema validator");
-    let instance = serde_json::to_value(&complete).expect("publication JSON");
+    let artifact =
+        rift_protocol::index::encode_package_publication(&complete).expect("publication records");
+    let instance = serde_json::from_str(&artifact).expect("publication JSON");
     let errors = validator
         .iter_errors(&instance)
         .map(|error| error.to_string())
