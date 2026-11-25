@@ -387,3 +387,72 @@ fn test_python_imported_names_read_the_declaration_the_import_ends_at() {
         assert_eq!(omitted, refused, "{body}");
     }
 }
+
+/// Asserts the reads and writes of each body.
+fn assert_accesses(cases: &[(&str, &[&str])]) {
+    for (body, expected) in cases {
+        assert_eq!(below(body), *expected, "{body}");
+    }
+}
+
+#[test]
+fn test_python_names_of_the_module_and_classes_are_written() {
+    assert_accesses(&[
+        ("N += 1\n", &["0  reads N", "0  writes N"]),
+        ("del N\n", &["0  writes N"]),
+        (
+            "del f, (C, [N])\n",
+            &["0  writes f", "0  writes C", "0  writes N"],
+        ),
+        ("def run():\n    global N\n    N = 2\n", &["2 run writes N"]),
+        (
+            "def run():\n    global N\n    N += 2\n",
+            &["2 run reads N", "2 run writes N"],
+        ),
+        (
+            "def run():\n    global f\n    f = N\n",
+            &["2 run writes f", "2 run reads N"],
+        ),
+        ("def run():\n    global N\n    del N\n", &["2 run writes N"]),
+        (
+            "def run():\n    global N\n    for N in (): pass\n",
+            &["2 run writes N"],
+        ),
+        (
+            "def run():\n    global N\n    with x as N: pass\n",
+            &["2 run writes N"],
+        ),
+        ("def run():\n    global G\n    G = 1\n", &["2 run writes G"]),
+        (
+            "def run():\n    def inner():\n        global N\n        N = 1\n",
+            &["3 run/inner writes N"],
+        ),
+        (
+            "class D:\n    m = 1\n    m += 1\n    del m\n",
+            &["2  reads D/m", "2  writes D/m", "3  writes D/m"],
+        ),
+        ("class D:\n    N += 1\n", &["1  reads N"]),
+        ("N = 2\n", &[]),
+        ("def run():\n    N = 1\n    N += 1\n    del N\n", &[]),
+        (
+            "def run(N):\n    def inner():\n        nonlocal N\n        N += 1\n",
+            &[],
+        ),
+        ("def run():\n    global H\n    with x as H: pass\n", &[]),
+    ]);
+}
+
+#[test]
+fn test_python_writes_without_one_declaration_are_counted() {
+    for (body, reads, writes) in [
+        ("import os\nos += 1\n", 0, 1),
+        ("import os\ndef run():\n    global os\n    os = 1\n", 0, 1),
+        ("from x import *\nN = 1\ndel N\n", 0, 1),
+    ] {
+        let (found, result) = accesses(&[("main.py", body)]);
+        assert_eq!(found, Vec::<String>::new(), "{body}");
+        let refused = |kind| result.omitted.get(&kind).copied().unwrap_or_default();
+        assert_eq!(refused(EdgeKind::Reads), reads, "{body}");
+        assert_eq!(refused(EdgeKind::Writes), writes, "{body}");
+    }
+}

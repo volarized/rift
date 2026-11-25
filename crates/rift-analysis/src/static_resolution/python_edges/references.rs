@@ -30,6 +30,8 @@ impl<'source> Index<'source> {
             {
                 if reference.role == ReferenceRole::Read {
                     self.python_name_read(file, reference.target, work, result);
+                } else {
+                    self.python_name_write(file, reference.target, work, result);
                 }
                 continue;
             }

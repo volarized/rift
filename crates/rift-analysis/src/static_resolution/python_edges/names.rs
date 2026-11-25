@@ -64,6 +64,55 @@ impl<'source> Index<'source> {
         result.record_kind(occurrence, EdgeKind::Reads);
     }
 
+    /// Records one write of a name that the module or a class holds.
+    pub(super) fn python_name_write(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let occurrence = match self.python_written_name(file, range, work) {
+            Name::Local => return,
+            Name::Declared(target) => self.python_access(file, range, ReferenceRole::Write, target),
+            Name::Refused | Name::External(_) => None,
+        };
+        result.record_kind(occurrence, EdgeKind::Writes);
+    }
+
+    /// The declaration of the name that a module or class holds. An import declares nothing
+    /// here, so a write that replaces it names no declaration.
+    fn python_written_name(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Name<'source> {
+        let Some(name) = file.text(range) else {
+            return Name::Refused;
+        };
+        if file.blocked(range.start, work) {
+            return Name::Refused;
+        }
+        let around = file.bindings_around(name, range).collect::<Vec<_>>();
+        let scope = match file.python_scope(&around, range.start, work) {
+            ScopeLookup::Found(selected) => Some(selected.scope),
+            ScopeLookup::Missing => None,
+            ScopeLookup::Blocked => return Name::Refused,
+        };
+        let held: Vec<_> = match scope.filter(|scope| !scope.module) {
+            Some(scope) => around
+                .into_iter()
+                .filter(|binding| Scope::of(file, binding) == scope)
+                .collect(),
+            None => file.python_held_bindings(name),
+        };
+        if held.iter().copied().any(imports) {
+            return Name::Refused;
+        }
+        self.python_one_declaration(file, &held, work)
+    }
+
     /// The declaration every binding of the read scope names.
     fn python_shared_name(
         &self,
@@ -290,9 +339,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Name<'source>> {
         let file = self.files.get(path)?;
-        let mut bindings = file.python_module_bindings(name);
-        let global = file.python_globals.get(name).into_iter().flatten();
-        bindings.extend(global.copied());
+        let bindings = file.python_held_bindings(name);
         if bindings.is_empty() {
             let module = file.qualified_target(".")?.admitted_path()?.join(".");
             return self.python_module_target(&format!("{module}.{name}"));
@@ -352,6 +399,14 @@ impl<'source> File<'source> {
                     && !matches!(binding.kind, StaticBindingKind::PythonGuard { .. })
             })
             .collect()
+    }
+
+    /// The bindings of a name in module statements, then under `global`.
+    fn python_held_bindings(&self, name: &str) -> Vec<&'source StaticBinding> {
+        let mut bindings = self.python_module_bindings(name);
+        let global = self.python_globals.get(name).into_iter().flatten();
+        bindings.extend(global.copied());
+        bindings
     }
 
     /// The bindings of `scope` that can have run before a read at `position`.
