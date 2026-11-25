@@ -4,6 +4,7 @@ use rift_core::ReferenceRole;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_syntax::{ByteRange, StaticBindingKind, SyntaxSymbol};
 
+use super::receivers::split_references;
 use super::{Namespaces, RECEIVER_DEPTH_MAX, inherent_member, is_type_binding, is_value_binding};
 use crate::static_resolution::{
     Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
@@ -249,7 +250,7 @@ impl<'source> Namespaces<'source> {
         let type_path = match self.receiver_owner_at_depth(file, receiver, work, depth)? {
             ReceiverOwner::Target(owner) => {
                 return self
-                    .receiver_method_of(file, receiver.start, owner, member, work)
+                    .receiver_method_of(file, Some(receiver), receiver.start, (owner, member), work)
                     .or_else(|| {
                         self.returned_deref_member(file, receiver, owner, member, work, depth)
                     });
@@ -698,7 +699,7 @@ fn closure_parameter_position(closure: &str, offset: usize) -> Option<(usize, Op
 }
 
 /// Comma-separated parts at nesting depth zero; unbalanced text gives none.
-fn split_top_level(text: &str) -> Option<Vec<&str>> {
+pub(super) fn split_top_level(text: &str) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     let mut depth = 0_usize;
     let mut start = 0;
@@ -753,25 +754,8 @@ fn closure_bound_parameter(bound: &str, position: usize) -> Option<&str> {
 }
 
 /// A written type without leading `&`, `&mut` and lifetime references.
-fn strip_reference(mut written: &str) -> &str {
-    // Each step removes at least one byte of the bounded type text.
-    loop {
-        let trimmed = written.trim();
-        let Some(rest) = trimmed.strip_prefix('&') else {
-            return trimmed;
-        };
-        let mut rest = rest.trim_start();
-        if let Some(lifetime) = rest.strip_prefix('\'') {
-            rest = lifetime.trim_start_matches(|character: char| {
-                character.is_alphanumeric() || character == '_'
-            });
-        }
-        let rest = rest.trim_start();
-        written = rest
-            .strip_prefix("mut")
-            .filter(|after| after.starts_with(char::is_whitespace))
-            .unwrap_or(rest);
-    }
+fn strip_reference(written: &str) -> &str {
+    split_references(written).1
 }
 
 /// The elements of a parenthesized tuple type or expression with at least one comma.

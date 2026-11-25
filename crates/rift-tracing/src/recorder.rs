@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::{SpanContextLayer, log_capture};
@@ -61,6 +62,8 @@ static UNSCOPED_TRIED: AtomicBool = AtomicBool::new(false);
 static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// SDK providers remain open until the test process exits.
 static TEST_EXPORTS: OnceLock<Mutex<Vec<OtlpExport>>> = OnceLock::new();
+/// A dispatcher that enables nothing, registered until the test process exits.
+static SECOND_DISPATCHER: OnceLock<tracing::Dispatch> = OnceLock::new();
 static TEST_METERS: OnceLock<()> = OnceLock::new();
 static TEST_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TEST_SHUTDOWN_HOOK: OnceLock<bool> = OnceLock::new();
@@ -113,6 +116,18 @@ fn install_test_process_export(filter: tracing_subscriber::EnvFilter) {
             export.recorder_metric_reader(),
         );
         retain_export(export);
+    });
+}
+
+/// Registers a dispatcher beside the recorder's, so a callsite asks every dispatcher whether
+/// it is enabled.
+///
+/// While a process holds one dispatcher, `tracing-core` 0.1.36 asks the default of the thread
+/// that reaches a callsite first (`Rebuilder::JustOne`, `callsite.rs`) and caches the answer
+/// for every thread. A thread without a recorder would answer `never` for the recorder's.
+fn register_second_dispatcher() {
+    SECOND_DISPATCHER.get_or_init(|| {
+        tracing::Dispatch::new(tracing_subscriber::registry().with(LevelFilter::OFF))
     });
 }
 
@@ -376,6 +391,7 @@ impl ScopedRecorderBuilder {
     pub fn install(self) -> Result<(ScopedRecorder, LogDrain), LogFilterError> {
         let filter = recorder_filter(self.capture.as_deref())?;
         RECORDER_INSTALLED.store(true, Ordering::Relaxed);
+        register_second_dispatcher();
         #[cfg(any(test, feature = "fixtures"))]
         install_test_process_export(filter.clone());
         let (sink, drain) = log_capture();

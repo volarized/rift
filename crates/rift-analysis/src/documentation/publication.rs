@@ -188,6 +188,7 @@ impl DocumentationCollection {
                 parsed: selected,
                 omitted: 0,
                 truncated: 0,
+                fields_omitted: rift_protocol::documentation::DocumentationFieldsOmitted::default(),
             },
             warnings: Vec::new(),
         };
@@ -815,12 +816,8 @@ fn validate_block(
     validate_chunks(block, source)
 }
 
-fn valid_text(text: &str, limits: Option<&super::DocumentationLimits>) -> bool {
-    !text.is_empty()
-        && text.len() as u64
-            <= limits.map_or(u64::from(DOCUMENTATION_TEXT_BYTES_CEILING), |limits| {
-                limits.text_bytes_max
-            })
+pub(super) fn valid_text(text: &str, limits: Option<&super::DocumentationLimits>) -> bool {
+    !text.is_empty() && text_fits(text, limits)
 }
 
 fn valid_symbol_identity(symbol: &SymbolId) -> bool {
@@ -880,15 +877,23 @@ fn validate_chunks(
     Ok(())
 }
 
-fn contains(outer: &TextRange, inner: &TextRange) -> bool {
+/// Whether `text` fits the accepted text bound.
+pub(super) fn text_fits(text: &str, limits: Option<&super::DocumentationLimits>) -> bool {
+    text.len() as u64
+        <= limits.map_or(u64::from(DOCUMENTATION_TEXT_BYTES_CEILING), |limits| {
+            limits.text_bytes_max
+        })
+}
+
+pub(super) fn contains(outer: &TextRange, inner: &TextRange) -> bool {
     outer.start <= inner.start && inner.start < inner.end && inner.end <= outer.end
 }
 
-fn contains_link_range(block: &DocumentationBlock, range: &TextRange) -> bool {
+pub(super) fn contains_link_range(block: &TextRange, range: &TextRange) -> bool {
     if range.start == range.end {
-        block.range.start <= range.start && range.start <= block.range.end
+        block.start <= range.start && range.start <= block.end
     } else {
-        contains(&block.range, range)
+        contains(block, range)
     }
 }
 
@@ -905,14 +910,18 @@ fn validate_links(
                 .field("link.block")
                 .error()
         })?;
-        let unique = addresses.insert(link_address(link));
-        let range_valid = contains_link_range(block, &link.range);
-        let text_bounded = link.authored.len() as u64
-            <= limits.map_or(u64::from(DOCUMENTATION_TEXT_BYTES_CEILING), |limits| {
-                limits.text_bytes_max
-            });
-        if !unique || !range_valid || !text_bounded {
+        if !addresses.insert(link_address(link)) {
+            return errors::analysis::documentation_identity_invalid()
+                .field("link")
+                .fail();
+        }
+        if !contains_link_range(&block.range, &link.range) {
             return errors::analysis::documentation_range_invalid()
+                .field("link")
+                .fail();
+        }
+        if !text_fits(&link.authored, limits) {
+            return errors::analysis::documentation_limit_exceeded()
                 .field("link")
                 .fail();
         }
@@ -1778,6 +1787,33 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_link_names_its_own_reason() {
+        let base = index(vec![source("README.md", "hello world")]);
+        let refusal = |links: Vec<DocumentationLink>| {
+            let mut candidate = base.clone();
+            candidate.links = links;
+            let error = DocumentationCollection::new(candidate).expect_err("refused link");
+            crate::documentation::failure::violation(&error)
+        };
+        let accepted = link(&base.blocks[0], "next.md");
+        let mut outside = accepted.clone();
+        outside.range.end = base.blocks[0].range.end + 1;
+        let mut past_bound = accepted.clone();
+        past_bound.authored =
+            "x".repeat(rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_CEILING as usize + 1);
+
+        assert_eq!(
+            refusal(vec![accepted.clone(), accepted]),
+            DocumentationViolation::Identity
+        );
+        assert_eq!(refusal(vec![outside]), DocumentationViolation::Range);
+        assert_eq!(
+            refusal(vec![past_bound]),
+            DocumentationViolation::LimitExceeded
+        );
+    }
+
+    #[test]
     fn block_link_and_reference_edges_refuse_invalid_ranges() {
         let source_record = source("README.md", "hello world");
         let base = index(vec![source_record.clone()]);
@@ -1799,6 +1835,12 @@ mod tests {
         bad_link.links.push(link(&bad_link.blocks[0], "next.md"));
         bad_link.links.push(bad_link.links[0].clone());
         refused_field(bad_link, "link");
+
+        let mut outside_link = base.clone();
+        let mut authored = link(&outside_link.blocks[0], "next.md");
+        authored.range.end = outside_link.blocks[0].range.end + 1;
+        outside_link.links.push(authored);
+        refused_field(outside_link, "link");
 
         let mut bad_reference = base;
         bad_reference.references.push(DocumentationReference {

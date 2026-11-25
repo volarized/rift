@@ -10,6 +10,7 @@ use rift_core::ProjectPath;
 mod aliases;
 mod commonjs_literals;
 mod facts;
+mod forwarded_names;
 mod graph;
 mod internal_modules;
 mod module_imports;

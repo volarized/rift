@@ -124,6 +124,28 @@ fn nested_recorders_restore_the_previous_default_when_dropped() -> TestResult {
     Ok(())
 }
 
+/// The callsite's first emit is on a thread without a recorder, which decides nothing for the
+/// recorder's thread.
+#[test]
+fn a_recorder_captures_a_callsite_another_thread_reached_first() -> TestResult {
+    fn emit() {
+        crate::warn!("reached from two threads");
+    }
+
+    let (recorder, mut drain) = ScopedRecorder::builder().capture("warn").install()?;
+    std::thread::spawn(emit)
+        .join()
+        .expect("the thread without a recorder ends");
+    emit();
+    drop(recorder);
+
+    assert_eq!(
+        messages(&drain.queued_records()),
+        ["reached from two threads"]
+    );
+    Ok(())
+}
+
 /// A thread the test spawns runs under its own default: the installing thread's recorder
 /// captures nothing from it. The thread installs a recorder of its own and hands its
 /// drain back through `join`, which also orders the reads after the emits.

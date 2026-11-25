@@ -1200,7 +1200,8 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 enum Grammar {
     Python(&'static python_edges::EdgePythonKinds, python_edges::Names),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
-    Rust(&'static rust::Kinds, rift_core::LoopBudget),
+    /// With the places the parser could not read.
+    Rust(&'static rust::Kinds, rift_core::LoopBudget, Vec<ByteRange>),
 }
 
 pub(crate) struct Capture<'source> {
@@ -1252,6 +1253,7 @@ impl<'source> Capture<'source> {
             grammar: Grammar::Rust(
                 rust::kinds(),
                 rift_core::LoopBudget::new(limits.syntax_elements_max()),
+                Vec::new(),
             ),
             edge_heritage: heritage_edges::edge_rust_kinds(),
             source,
@@ -1265,9 +1267,9 @@ impl<'source> Capture<'source> {
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         if (syntax_element.is_error() || syntax_element.is_missing())
-            && let Grammar::Rust(kinds, _) = &self.grammar
+            && let Grammar::Rust(kinds, _, unread) = &mut self.grammar
         {
-            kinds.record_error(visited, &mut self.facts.0)?;
+            kinds.record_error(visited, self.source, unread, &mut self.facts.0)?;
         }
         if syntax_element.is_missing() {
             return Ok(());
@@ -1286,13 +1288,16 @@ impl<'source> Capture<'source> {
             Grammar::JavaScript(kinds, documentation) => {
                 kinds.record(visited, self.source, documentation, &mut self.facts.0)
             }
-            Grammar::Rust(kinds, budget) => {
+            Grammar::Rust(kinds, budget, _) => {
                 kinds.record(visited, self.source, &mut self.facts.0, budget)
             }
         }
     }
 
-    pub(crate) fn finish(self) -> StaticFacts {
+    pub(crate) fn finish(mut self) -> StaticFacts {
+        if let Grammar::Rust(_, _, unread) = self.grammar {
+            rust::Kinds::close_unread(unread, &mut self.facts.0);
+        }
         self.facts
     }
 

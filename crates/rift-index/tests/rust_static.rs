@@ -2581,3 +2581,453 @@ fn test_rust_implementation_headers_are_contained_where_their_owner_is() {
             .any(|edge| { edge.kind() == EdgeKind::Contains && edge.from() == edge.to() })
     );
 }
+
+/// A crate whose one unreadable place is `unread`, after or before readable items.
+fn unread_fixture(first: &str, last: &str) -> (tempfile::TempDir, WorkspaceIndex) {
+    let source = format!(
+        "{first}\npub struct R<const A: i8, const B: i8>;\npub struct U;\nimpl U {{ pub fn k(&self) -> u32 {{ 1 }} pub fn n(&self) -> u32 {{ self.k() }} }}\nfn leaf() {{}}\npub fn f(u: U) {{ leaf(); u.k(); U::k(&u); }}\n{last}\n"
+    );
+    fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", &source)])
+}
+
+#[test]
+fn test_rust_source_that_is_not_parsed_costs_its_own_facts_only() {
+    // #1099: each place is valid Rust the grammar reports an error for, at the start or at
+    // the end of the file.
+    for unread in [
+        "",
+        "pub type H = R<-1, 2>;",
+        "pub type H = R<1, -2>;",
+        "pub type H = R<-1, -2>;",
+        "pub fn h() -> R<-1, 2> { R }",
+        "pub struct H { pub field: R<-1, 2> }",
+        "impl Copied for R<-1, 2> {} pub trait Copied {}",
+        "pub struct H<'a>(std::sync::Arc<dyn 'a + Fn() -> u8>);",
+        "pub struct H where U: Sized;",
+        "pub fn h() where (): Copy {}",
+        "pub struct V; impl V { pub fn one(&self) where (): Copy {} pub fn two(&self) { leaf() } }",
+        "pub fn h(#[cfg(all())] value: u8) -> u8 { value }",
+        "pub fn h() { let _ = vec![1_u8].len(); }",
+        "extern \"C\" { pub type Opaque; }",
+    ] {
+        for (first, last) in [(unread, ""), ("", unread)] {
+            let (_directory, index) = unread_fixture(first, last);
+            for (from, to) in [
+                ("/fixture/U/n", "/fixture/U/k"),
+                ("/fixture/f", "/fixture/U/k"),
+                ("/fixture/f", "/fixture/leaf"),
+            ] {
+                assert!(
+                    has_edge(&index, EdgeKind::Calls, from, to),
+                    "{unread:?}: missing {from} -> {to}"
+                );
+            }
+            if unread.starts_with("pub struct V") {
+                assert!(has_edge(&index, EdgeKind::Calls, "/V/two", "/fixture/leaf"));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_rust_declarations_keep_their_identity_when_a_generic_argument_is_not_parsed() {
+    // #1099: the error is in the arguments of a type the declaration writes, which names
+    // nothing of the declaration.
+    for (unread, from, to) in [
+        ("pub type H = R<-1, 2>;", "/fixture/H", "/fixture/R"),
+        (
+            "pub struct H { pub field: R<-1, 2> }",
+            "/fixture/H/field",
+            "/fixture/R",
+        ),
+        ("pub fn h(value: R<-1, 2>) {}", "/fixture/h", "/fixture/R"),
+        ("pub fn h() -> R<1, -2> { R }", "/fixture/h", "/fixture/R"),
+    ] {
+        let (_directory, index) = unread_fixture(unread, "");
+        assert!(
+            has_edge(&index, EdgeKind::HasType, from, to),
+            "{unread:?}: missing {from} -> {to}"
+        );
+        assert!(
+            index
+                .symbol_view()
+                .expect("symbols")
+                .normalized_graph()
+                .records()
+                .iter()
+                .all(|record| record.identity().is_some()),
+            "{unread:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_source_that_is_not_parsed_hides_the_names_it_can_bind() {
+    // Each place can bind a name, or leaves open where the declarations after it stand.
+    for (body, hidden) in [
+        // The macro is read as a call whose result types `made`.
+        ("let made = try!(make(u)); made.k();", "/fixture/U/k"),
+        ("let made = make![u]; made.k();", "/fixture/U/k"),
+        // The pattern's attribute ends the statement for the parser.
+        (
+            "let Held { #[cfg(all())] u, .. } = held; u.k();",
+            "/fixture/U/k",
+        ),
+    ] {
+        let source = format!(
+            "pub struct U; pub struct Other; pub struct Held {{ pub u: Other, pub rest: u8 }}\nimpl U {{ pub fn k(&self) -> u32 {{ 1 }} }}\nimpl Other {{ pub fn k(&self) -> u32 {{ 2 }} }}\npub fn make(u: U) -> U {{ u }}\npub fn f(u: U, held: Held) {{ {body} }}\npub fn g(u: U) {{ u.k(); }}\n"
+        );
+        let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", &source)]);
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "/fixture/f", hidden),
+            "{body}"
+        );
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "/fixture/g", "/fixture/U/k"),
+            "{body}"
+        );
+    }
+}
+
+/// The targets below `fixture` that `n` of an implementation calls and reads.
+fn method_targets(header: &str, member: &str, caller: &str) -> Vec<String> {
+    let source = format!(
+        "use std::boxed::Box as Boxed;\npub type Bytes = Vec<u8>;\npub trait R {{ {member}; {}; }}\nimpl{header} {{ {member} {{ loop {{}} }} {caller} }}\n",
+        caller.split_once(" {").expect("caller body").0
+    );
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", &source)]);
+    let targets = |kind: EdgeKind| {
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == kind && edge.from().as_str().ends_with("/n"))
+            .filter_map(|edge| {
+                let (_, name) = edge.to().as_str().split_once("/rust/fixture/")?;
+                Some(name.to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    let calls = targets(EdgeKind::Calls);
+    if caller.contains("self.") {
+        assert_eq!(targets(EdgeKind::Reads), calls, "{header} {caller}");
+    }
+    calls
+}
+
+/// #1095: implementation header, trait method and caller of calls that run the inherent method
+/// of the standard library when rustc 1.98.1 compiles them.
+const STANDARD_FIRST: &[(&str, &str, &str)] = &[
+    (
+        "<T> R for [T]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+    ),
+    (
+        " R for [u8]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+    ),
+    (
+        " R for [u8]",
+        "fn is_ascii(&self) -> bool",
+        "fn n(&self) -> bool { self.is_ascii() }",
+    ),
+    (
+        "<T> R for [T]",
+        "fn len(&self) -> usize",
+        "fn n(&mut self) -> usize { self.len() }",
+    ),
+    (
+        "<T> R for [T]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { let x = self; x.len() }",
+    ),
+    (
+        "<T> R for [T]",
+        "fn len(&self) -> usize",
+        "fn n(x: &Self) -> usize { x.len() }",
+    ),
+    (
+        "<T> R for [T]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { Self::len(self) }",
+    ),
+    (
+        "<T, const N: usize> R for [T; N]",
+        "fn as_slice(&self) -> &[u8]",
+        "fn n(&self) -> &[u8] { self.as_slice() }",
+    ),
+    (
+        "<T> R for &[T]",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    (
+        "<T> R for &[T]",
+        "fn len(self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    (
+        "<T> R for &[T]",
+        "fn len(self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+    ),
+    (
+        " R for &str",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    (
+        "<T> R for &Vec<T>",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    (
+        "<T> R for &std::vec::Vec<T>",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    (
+        " R for &String",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    (
+        " R for &u8",
+        "fn is_ascii(self) -> bool",
+        "fn n(self) -> bool { self.is_ascii() }",
+    ),
+    (
+        "<T> R for &Option<T>",
+        "fn is_some(self) -> bool",
+        "fn n(self) -> bool { self.is_some() }",
+    ),
+    (
+        "<T, E> R for &Result<T, E>",
+        "fn is_ok(self) -> bool",
+        "fn n(self) -> bool { self.is_ok() }",
+    ),
+    // A type alias of the file.
+    (
+        " R for &Bytes",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+    ),
+    // Owners that are no reference, slice or array.
+    (
+        "<T> R for Vec<T>",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+    ),
+    (
+        " R for str",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+    ),
+    (
+        " R for String",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+    ),
+    (
+        " R for i64",
+        "fn abs(self) -> i64",
+        "fn n(self) -> i64 { self.abs() }",
+    ),
+    (
+        " R for char",
+        "fn is_numeric(self) -> bool",
+        "fn n(self) -> bool { self.is_numeric() }",
+    ),
+    (
+        " R for bool",
+        "fn then_some(self, v: u8) -> Option<u8>",
+        "fn n(self) -> Option<u8> { self.then_some(1) }",
+    ),
+    (
+        "<T> R for Option<T>",
+        "fn is_some(&self) -> bool",
+        "fn n(&self) -> bool { self.is_some() }",
+    ),
+];
+
+#[test]
+fn test_rust_inherent_methods_of_the_standard_library_come_before_trait_methods() {
+    for &(header, member, caller) in STANDARD_FIRST {
+        assert!(
+            method_targets(header, member, caller).is_empty(),
+            "{header} {member} {caller}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_calls_of_standard_inherent_methods_are_left_without_a_target() {
+    // #1095: the call coverage of the file counts the site.
+    for (member, complete) in [("len", false), ("beacon", true)] {
+        let source = format!(
+            "pub trait R {{ fn {member}(&self) -> usize; fn n(&self) -> usize; }}\nimpl<T> R for [T] {{ fn {member}(&self) -> usize {{ 0 }} fn n(&self) -> usize {{ self.{member}() }} }}\n"
+        );
+        let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", &source)]);
+        let path = rift_core::ProjectPath::new("src/lib.rs").expect("path");
+        assert_eq!(
+            index.static_edge_calls_complete(&path, None),
+            complete,
+            "{member}"
+        );
+    }
+}
+
+/// #1095: the same, with the target, of calls that run the trait method.
+const TRAIT_FIRST: &[(&str, &str, &str, &str)] = &[
+    (
+        "<T> R for [T]",
+        "fn beacon(&self) -> usize",
+        "fn n(&self) -> usize { self.beacon() }",
+        "%5BT%5D/beacon",
+    ),
+    // `reverse` of a slice takes `&mut self`, which a later probe finds.
+    (
+        "<T> R for [T]",
+        "fn reverse(&self) -> usize",
+        "fn n(&self) -> usize { self.reverse() }",
+        "%5BT%5D/reverse",
+    ),
+    // `is_ascii` is declared for slices of bytes.
+    (
+        "<T> R for [T]",
+        "fn is_ascii(&self) -> usize",
+        "fn n(&self) -> usize { self.is_ascii() }",
+        "%5BT%5D/is_ascii",
+    ),
+    // An unstable method gives way.
+    (
+        "<T> R for [T]",
+        "fn partition_dedup(&mut self) -> usize",
+        "fn n(&mut self) -> usize { self.partition_dedup() }",
+        "%5BT%5D/partition_dedup",
+    ),
+    // An array becomes a slice after every probe of its own type.
+    (
+        "<T, const N: usize> R for [T; N]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+        "%5BT;N%5D/len",
+    ),
+    (
+        "<T, const N: usize> R for [T; N]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { Self::len(self) }",
+        "%5BT;N%5D/len",
+    ),
+    // The value is a reference to the owner.
+    (
+        "<T> R for &[T]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+        "&%5BT%5D/len",
+    ),
+    (
+        "<T> R for &[T]",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { Self::len(self) }",
+        "&%5BT%5D/len",
+    ),
+    (
+        "<T> R for &&[T]",
+        "fn len(self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+        "&&%5BT%5D/len",
+    ),
+    (
+        "<T> R for &mut [T]",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+        "&mut%20%5BT%5D/len",
+    ),
+    (
+        " R for &str",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+        "&str/len",
+    ),
+    (
+        "<T> R for &Vec<T>",
+        "fn is_sorted(self) -> usize",
+        "fn n(self) -> usize { self.is_sorted() }",
+        "&Vec/is_sorted",
+    ),
+    (
+        " R for &String",
+        "fn trim(self) -> usize",
+        "fn n(self) -> usize { self.trim() }",
+        "&String/trim",
+    ),
+    (
+        "<T> R for &Boxed<[T]>",
+        "fn len(&self) -> usize",
+        "fn n(self) -> usize { self.len() }",
+        "&Boxed/len",
+    ),
+    (
+        " R for &u32",
+        "fn count_ones(&self) -> u32",
+        "fn n(self) -> u32 { self.count_ones() }",
+        "&u32/count_ones",
+    ),
+    (
+        " R for &char",
+        "fn is_alphabetic(&self) -> bool",
+        "fn n(self) -> bool { self.is_alphabetic() }",
+        "&char/is_alphabetic",
+    ),
+    (
+        "<A, B> R for (A, B)",
+        "fn len(&self) -> usize",
+        "fn n(&self) -> usize { self.len() }",
+        "(A,B)/len",
+    ),
+];
+
+#[test]
+fn test_rust_trait_methods_stay_targets_where_the_probe_takes_them_first() {
+    for &(header, member, caller, target) in TRAIT_FIRST {
+        assert_eq!(
+            method_targets(header, member, caller),
+            [target],
+            "{header} {member} {caller}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_reference_receivers_probe_the_type_their_method_receives() {
+    // #1095: in `n(&self)` of an implementation for `&Value` the receiver is `&&Value`, so the
+    // trait method of `&Value` comes before the inherent method of `Value`.
+    let source = "pub trait R { fn len(&self) -> u8; fn n(&self) -> u8; fn m(self) -> u8; }\npub struct Value;\nimpl Value { pub fn len(&self) -> u8 { 0 } }\nimpl R for &Value { fn len(&self) -> u8 { 1 } fn n(&self) -> u8 { self.len() } fn m(self) -> u8 { self.len() } }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/&Value/n",
+        "/&Value/len"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/&Value/n",
+        "/fixture/Value/len"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/&Value/m",
+        "/fixture/Value/len"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/&Value/m",
+        "/&Value/len"
+    ));
+}

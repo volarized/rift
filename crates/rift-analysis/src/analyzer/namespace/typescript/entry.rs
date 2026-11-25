@@ -6,6 +6,7 @@ use rift_core::ProjectPath;
 use rift_protocol::read::ProjectPath as ObservationPath;
 
 use super::{PackageMetadata, entry_path};
+use crate::static_resolution::is_declaration_file;
 use crate::{ArchiveMemberKind, NamespaceInput, PackageSource};
 
 /// Extensions Node tries after an exact file name, in its order.
@@ -131,15 +132,27 @@ impl<'input> PackageFiles<'input> {
             return types_candidates(types)
                 .map_or(Entry::Absent, |candidates| self.first(candidates));
         }
-        if metadata.main.is_some() {
-            return Entry::Absent;
-        }
-        match self.first(TYPES_EXTENSIONS.map(|extension| format!("index{extension}"))) {
-            // A source index is no declared types entry.
-            Entry::File(path) if !path.as_str().ends_with(".d.ts") => Entry::Absent,
-            entry => entry,
+        match default_types(metadata.main.as_deref()).map(|candidates| self.first(candidates)) {
+            // A source file is no declared types entry.
+            Some(Entry::File(path)) if !is_declaration_file(path.as_str()) => Entry::Absent,
+            Some(entry) => entry,
+            None => Entry::Absent,
         }
     }
+}
+
+/// The types entry without `types` and `typings`: a declaration file `main` spells, or the
+/// package's index. `None` for a `main` that names something else.
+fn default_types(main: Option<&str>) -> Option<Vec<String>> {
+    let main = main.map_or_else(|| Some(String::new()), normalized)?;
+    if main.is_empty() {
+        return Some(
+            TYPES_EXTENSIONS
+                .map(|extension| format!("index{extension}"))
+                .to_vec(),
+        );
+    }
+    is_declaration_file(&main).then(|| vec![main])
 }
 
 /// The entry of a package for one language. `exports` names its file exactly.
@@ -232,10 +245,7 @@ pub(in crate::analyzer) fn build_paths(
     let types = metadata.types.as_deref().or(metadata.typings.as_deref());
     let declared = match types {
         Some(types) => types_candidates(types).unwrap_or_default(),
-        None if metadata.main.is_none() => TYPES_EXTENSIONS
-            .map(|extension| format!("index{extension}"))
-            .to_vec(),
-        None => Vec::new(),
+        None => default_types(metadata.main.as_deref()).unwrap_or_default(),
     };
     let paths = runtime_candidates(metadata.main.as_deref())
         .unwrap_or_default()
