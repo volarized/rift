@@ -128,6 +128,11 @@ impl<'input> PackageFiles<'input> {
         if metadata.types_versions.is_some() {
             return Entry::Absent;
         }
+        self.unversioned_types(metadata)
+    }
+
+    /// The TypeScript entry before compiler-version redirects.
+    pub(super) fn unversioned_types(&self, metadata: &PackageMetadata) -> Entry {
         if let Some(types) = metadata.types.as_deref().or(metadata.typings.as_deref()) {
             return types_candidates(types)
                 .map_or(Entry::Absent, |candidates| self.first(candidates));

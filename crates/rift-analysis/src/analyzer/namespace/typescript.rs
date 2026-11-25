@@ -103,7 +103,14 @@ pub(super) fn prepare(
         &mut prepared,
     );
     if let Some(metadata) = &metadata {
-        internal_modules::prepare(input, metadata, &entry_files, selected, &mut prepared);
+        internal_modules::prepare(
+            input,
+            &files,
+            metadata,
+            &entry_files,
+            selected,
+            &mut prepared,
+        );
     }
     if input.owner().is_local() {
         for file in selected {
