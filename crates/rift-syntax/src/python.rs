@@ -48,6 +48,8 @@ mod variable_scopes;
 
 #[cfg(test)]
 mod declaration_tests;
+#[cfg(test)]
+mod name_tests;
 
 /// Grammar spelling of a function definition, `async def` included.
 const FUNCTION_KIND: &str = "function_definition";

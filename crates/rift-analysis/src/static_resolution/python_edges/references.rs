@@ -22,6 +22,14 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
+            // A member access spells its receiver. A name alone states no member.
+            if reference.role != ReferenceRole::Type
+                && file
+                    .text(reference.target)
+                    .is_some_and(|text| !text.contains('.'))
+            {
+                continue;
+            }
             let occurrence = self
                 .edge_python_name(file, reference.target, work)
                 .or_else(|| {

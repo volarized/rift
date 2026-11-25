@@ -194,6 +194,9 @@ impl EdgePythonKinds {
                     .push(call(expression, expression, self.edge_callee(expression)?)?);
             }
         } else if self.definitions.contains(&id) {
+            if id == self.definitions[1] {
+                names.class(byte_range(syntax_element)?);
+            }
             self.edge_definition(visited, facts)?;
             self.edge_type_parameters(syntax_element, facts)?;
             self.edge_evaluated_outside(syntax_element, facts)?;
@@ -253,8 +256,7 @@ impl EdgePythonKinds {
             }
         }
         self.guards.record(visited, source, facts)?;
-        self.edge_name_target(visited, facts, names)?;
-        self.edge_reference(visited, source, facts)?;
+        self.edge_reference(visited, source, facts, names)?;
         Ok(())
     }
 
@@ -577,6 +579,7 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         source: &str,
         facts: &mut StaticFactsParts,
+        names: &mut Names,
     ) -> Result<(), RiftError> {
         use rift_core::ReferenceRole;
         let element = visited.syntax_element();
@@ -639,6 +642,8 @@ impl EdgePythonKinds {
                 target: range,
                 role: ReferenceRole::Type,
             });
+        } else if id == self.identifier {
+            self.edge_name(visited, facts, names)?;
         } else if id == self.attribute {
             let mut target_element = element;
             let mut ancestor = visited.parent();
