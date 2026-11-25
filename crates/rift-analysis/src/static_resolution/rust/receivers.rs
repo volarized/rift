@@ -222,9 +222,9 @@ impl<'source> Namespaces<'source> {
     }
 
     /// The written type of a structural owner, then the types it dereferences to.
-    fn written_bases(
-        &self,
-        file: &File<'source>,
+    fn written_bases<'index>(
+        &'index self,
+        mut file: &'index File<'source>,
         owner: Target<'source>,
         work: &mut Work,
     ) -> Option<Vec<Base>> {
@@ -232,7 +232,7 @@ impl<'source> Namespaces<'source> {
         if owner.file.path != file.document.path {
             return Some(Vec::new());
         }
-        let range = owner.symbol.name_range?;
+        let mut range = owner.symbol.name_range?;
         let mut written = file.text(range)?.to_owned();
         let mut bases = Vec::new();
         // References an alias is written behind.
@@ -240,9 +240,17 @@ impl<'source> Namespaces<'source> {
         for _ in 0..BASES_MAX {
             let (mut references, inner) = split_references(&written);
             references.splice(0..0, before.drain(..));
-            if let Some(value) = self.aliased_type(file, range.start, inner, work) {
+            if let Some(alias) = self.type_alias(file, range.start, inner, work) {
+                if alias.file.path != file.document.path {
+                    file = self.source_files.get(alias.file.path.as_str())?;
+                }
+                range = file
+                    .declared_types
+                    .get(&alias.symbol.name_range?)
+                    .copied()
+                    .flatten()?;
                 before = references;
-                written = value.to_owned();
+                written = file.text(range)?.to_owned();
                 continue;
             }
             let names = self.standard_names(file, range.start, inner, work)?;
@@ -256,28 +264,18 @@ impl<'source> Namespaces<'source> {
         Some(bases)
     }
 
-    /// The type a written path names through an alias of the same file without parameters.
-    fn aliased_type(
+    /// The type alias named by a written path.
+    fn type_alias(
         &self,
         file: &File<'source>,
         position: u64,
         written: &str,
         work: &mut Work,
-    ) -> Option<&'source str> {
+    ) -> Option<Target<'source>> {
         let parts = path_segments(written, work)?;
         let path = self.resolved_path(file, position, &parts, work)?;
-        let alias = self.lookup(file, position, &path, Namespace::Type, work)?;
-        if alias.symbol.kind != "type_alias" || alias.file.path != file.document.path {
-            return None;
-        }
-        let (declaration, value) = file
-            .text(ByteRange {
-                start: alias.symbol.name_range?.end,
-                end: alias.symbol.item_range.end,
-            })?
-            .strip_suffix(';')?
-            .split_once('=')?;
-        declaration.trim().is_empty().then_some(value.trim())
+        self.lookup(file, position, &path, Namespace::Type, work)
+            .filter(|alias| alias.symbol.kind == "type_alias")
     }
 
     /// The names under which the standard library declares the methods of a written type;
