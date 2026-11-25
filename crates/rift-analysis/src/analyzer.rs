@@ -29,7 +29,7 @@ use rift_core::{
     SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId,
 };
 use rift_error::{RiftError, errors};
-use rift_protocol::canonical::canonical_json;
+use rift_protocol::canonical::package_record_digest;
 use rift_protocol::documentation::{
     DocumentationChunk, DocumentationContentIdentity, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
@@ -643,6 +643,7 @@ fn publish(
             analyzer_revision: analyzer_revision(),
             owner: package.clone(),
             revision: input.release()?,
+            target: None,
             source_digest,
             units: records.units,
             coverage,
@@ -2385,22 +2386,12 @@ fn truncation(collection: &str, bound: u64) -> PackageAnalysisWarning {
 /// The member is dropped rather than left empty so a record's digest covers what the
 /// record says and nothing about the digest field itself.
 fn digest_of<T: Serialize>(record: &T, package: &SymbolOwner) -> Result<Digest, RiftError> {
-    let mut value = serde_json::to_value(record).map_err(|error| {
+    package_record_digest(record).map_err(|error| {
         errors::analysis::package_provider_failed()
             .package(package_label(package))
             .source(error)
             .error()
-    })?;
-    if let Some(object) = value.as_object_mut() {
-        object.remove("digest");
-    }
-    let rendered = canonical_json(&value).map_err(|error| {
-        errors::analysis::package_provider_failed()
-            .package(package_label(package))
-            .source(error)
-            .error()
-    })?;
-    Ok(text_digest(&rendered))
+    })
 }
 
 /// One publication bound as the in-memory count a collection compares against.
@@ -3325,7 +3316,9 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(&package_index_schema_document()).expect("schema parses");
         let validator = jsonschema::validator_for(&schema).expect("schema compiles");
-        let instance = serde_json::to_value(publication).expect("publication serializes");
+        let artifact = rift_protocol::index::encode_package_publication(publication)
+            .expect("publication records");
+        let instance = serde_json::from_str(&artifact).expect("publication serializes");
         let refusals: Vec<String> = validator
             .iter_errors(&instance)
             .map(|refusal| format!("{}: {refusal}", refusal.instance_path()))

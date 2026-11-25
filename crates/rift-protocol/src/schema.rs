@@ -6,6 +6,8 @@
 //! names are proven against the model structs by the `property!` macro, and
 //! wire values come from serializing the model enums themselves.
 
+mod package_records;
+
 /// Renders the JSON Schema for workspace configuration.
 #[must_use]
 pub fn configuration_schema_document() -> String {
@@ -18,7 +20,16 @@ pub fn configuration_schema_document() -> String {
 /// ([`strip_optional_null_arms`]).
 #[must_use]
 pub fn package_index_schema_document() -> String {
-    let mut document = schemars::schema_for!(crate::index::PackagePublication).to_value();
+    package_publication_document(crate::index::PACKAGE_PUBLICATION_FORMAT_REVISION)
+}
+
+pub(crate) fn package_publication_document(revision: u32) -> String {
+    let logical = schemars::schema_for!(crate::index::PackagePublication).to_value();
+    let mut document = if revision >= 7 {
+        package_records::document(logical, revision)
+    } else {
+        logical
+    };
     if let Some(schema) = document.as_object_mut() {
         strip_optional_null_arms(schema);
     }

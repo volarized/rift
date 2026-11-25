@@ -520,7 +520,7 @@ impl SymbolOwner {
         (!self.is_local()).then(|| format!("{}@{}", self.wire_owner(), encode_component(version)))
     }
 
-    fn wire_owner(&self) -> String {
+    pub(crate) fn wire_owner(&self) -> String {
         match self {
             Self::Local => LOCAL_SCOPE_PREFIX.to_owned(),
             Self::NamedLocal { name } => {

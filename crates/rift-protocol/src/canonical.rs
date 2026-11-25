@@ -8,6 +8,9 @@
 //! `Serialize` implementation with no intermediate value.
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+
+use crate::read::Digest;
 
 /// Renders `value` as RFC 8785 canonical JSON.
 ///
@@ -17,6 +20,27 @@ use serde::Serialize;
 /// when it holds a map whose keys are not strings.
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     serde_json_canonicalizer::to_string(value)
+}
+
+/// Digests one package record's canonical JSON without its `digest` member.
+///
+/// # Errors
+/// Returns the serializer's error if the record cannot be represented in canonical JSON.
+pub fn package_record_digest<T: Serialize>(value: &T) -> Result<Digest, serde_json::Error> {
+    let mut value = serde_json::to_value(value)?;
+    if let Some(record) = value.as_object_mut() {
+        record.remove("digest");
+    }
+    record_digest_without_member(&value)
+}
+
+pub(crate) fn record_digest_without_member<T: Serialize>(
+    value: &T,
+) -> Result<Digest, serde_json::Error> {
+    let rendered = canonical_json(value)?;
+    let [first, second, third, fourth, ..]: [u8; 32] = Sha256::digest(rendered.as_bytes()).into();
+    let prefix = u32::from_be_bytes([first, second, third, fourth]);
+    Ok(Digest(format!("{prefix:08x}")))
 }
 
 #[cfg(test)]
