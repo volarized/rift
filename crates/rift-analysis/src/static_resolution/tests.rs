@@ -2403,7 +2403,7 @@ fn rust_writes_value_path_terminal_reads_without_competing_call_facts() {
 
 #[test]
 fn rust_value_reads_respect_local_item_block_scopes() {
-    let source = r#"
+    let source = r"
 const RATE: u8 = 1;
 static PULSE: u8 = 2;
 struct Maker(pub u8);
@@ -2427,7 +2427,7 @@ fn module_constructors() { let _ = Maker; let _ = Flag; }
 fn type_only() -> u8 { struct named { field: u16 } let f = named; f() }
 fn function_shadow() -> u8 { fn named() -> u8 { 9 } let f = named; f() }
 fn value_shadow(named: u8) -> u8 { let local = named; local }
-"#;
+";
     let result = resolution(
         "rust",
         &[("src/lib.rs", source)],
@@ -2474,7 +2474,7 @@ fn value_shadow(named: u8) -> u8 { let local = named; local }
 
 #[test]
 fn rust_value_reads_exclude_initializer_local_functions() {
-    let source = r#"
+    let source = r"
 pub fn named() -> u8 { 1 }
 pub const CHOICE: fn() -> u16 = {
     fn named() -> u16 { 9 }
@@ -2491,7 +2491,7 @@ pub mod inside {
     fn named() -> u64 { 4 }
     pub fn inline_value() -> fn() -> u64 { let inline = named; inline }
 }
-"#;
+";
     let result = resolution(
         "rust",
         &[("src/lib.rs", source)],
@@ -2590,7 +2590,7 @@ fn rust_literal_and_pattern_field_labels_keep_physical_owners_and_roles() {
 
 #[test]
 fn rust_field_sites_refuse_sibling_block_owners() {
-    let source = r#"
+    let source = r"
 pub struct Target { pub item: u8 }
 pub fn before() -> u8 { { struct Target { item: u16 } } let value = Target { item: 7 }; value.item }
 pub fn after() -> u8 { let value = Target { item: 7 }; { struct Target { item: u16 } } value.item }
@@ -2599,7 +2599,7 @@ pub fn qualified() -> u8 { struct Target { item: u16 } let value = crate::Target
 pub fn in_block() -> u16 { struct Local { item: u16 } let value = Local { item: 7 }; value.item }
 pub fn wrong_pattern(value: Target) -> u8 { { struct Target { item: u16 } } let Target { item } = value; item }
 pub fn valid_pattern(value: Target) -> u8 { let Target { item } = value; item }
-"#;
+";
     let result = resolution(
         "rust",
         &[("src/lib.rs", source)],
