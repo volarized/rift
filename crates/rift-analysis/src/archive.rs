@@ -948,8 +948,11 @@ impl TarExtension {
     }
 
     /// Reads the records of one extended header, whose bytes the caller bounded.
-    fn read(&mut self, entry: &mut tar::Entry<'_, impl Read>) -> Result<(), ArchiveError> {
-        let kind = entry.header().entry_type();
+    fn read(
+        &mut self,
+        kind: tar::EntryType,
+        entry: &mut std::io::Take<impl Read>,
+    ) -> Result<(), ArchiveError> {
         let global = kind.is_pax_global_extensions();
         if kind.is_gnu_longname() {
             let mut name = Vec::new();
@@ -961,7 +964,7 @@ impl TarExtension {
         }
         self.local |= !global;
         let mut payload =
-            vec![0; usize::try_from(entry.size()).map_err(|_| ArchiveError::InvalidArchive)?];
+            vec![0; usize::try_from(entry.limit()).map_err(|_| ArchiveError::InvalidArchive)?];
         entry
             .read_exact(&mut payload)
             .map_err(|_| ArchiveError::InvalidArchive)?;
@@ -1043,32 +1046,59 @@ fn is_sparse(key: &[u8]) -> bool {
     key.starts_with(b"GNU.sparse") || key == b"SCHILY.filetype"
 }
 
+const TAR_BLOCK_BYTES: u64 = 512;
+
+/// Reads past zero blocks to the next complete header and verifies its checksum.
+fn read_tar_header(reader: &mut impl Read) -> Result<Option<tar::Header>, ArchiveError> {
+    let mut header = tar::Header::new_old();
+    loop {
+        let read = fill(reader, header.as_mut_bytes()).map_err(|_| ArchiveError::InvalidArchive)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if read != header.as_bytes().len() {
+            return Err(ArchiveError::InvalidArchive);
+        }
+        if header.as_bytes().iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        let expected = header.cksum().map_err(|_| ArchiveError::InvalidArchive)?;
+        let mut checked = header.clone();
+        checked.set_cksum();
+        if checked.cksum().ok() != Some(expected) {
+            return Err(ArchiveError::InvalidArchive);
+        }
+        return Ok(Some(header));
+    }
+}
+
 /// Reads every tar entry in one pass, and checks its header before its contents are read.
 ///
-/// The iteration is raw: the tar library exposes GNU and PAX extended headers before it
-/// allocates their contents, and this reader applies them itself.
+/// Reads raw headers so the archive bounds apply before allocating GNU and PAX extended data.
 ///
 /// The outer error is the first header refusal. The inner one is the first member refusal: the
 /// headers after it are still checked, and no member after it is read.
 fn read_tar_entries(
-    reader: impl Read,
+    mut reader: impl Read,
     output: &mut ArchiveOutput<'_>,
 ) -> Result<Result<(), ArchiveError>, ArchiveError> {
     let limits = output.limits;
-    let mut raw = tar::Archive::new(reader);
-    raw.set_ignore_zeros(true);
     let mut extended = TarExtension::default();
     let mut read = Ok(());
     let mut members = 0_u64;
     let mut extended_headers = 0_u64;
-    for entry in raw
-        .entries()
-        .map_err(|_| ArchiveError::InvalidArchive)?
-        .raw(true)
-    {
-        let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
-        let kind = entry.header().entry_type();
-        let extension = is_extended_header(entry.header());
+    while let Some(header) = read_tar_header(&mut reader)? {
+        let size = header
+            .entry_size()
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        let kind = header.entry_type();
+        // In ustar a directory's size field records capacity. It has no data blocks.
+        let size = if kind.is_dir() && header.as_ustar().is_some() {
+            0
+        } else {
+            size
+        };
+        let extension = is_extended_header(&header);
         let (bound, count) = if extension {
             (ArchiveBound::ExtendedHeaders, &mut extended_headers)
         } else {
@@ -1076,7 +1106,7 @@ fn read_tar_entries(
         };
         *count += 1;
         if *count > limits.members as u64 {
-            let member = extended.member_path(&entry.path_bytes());
+            let member = extended.member_path(&header.path_bytes());
             return Err(bound.exceeded(*count, limits.members as u64, member));
         }
         let link = kind.is_symlink() || kind.is_hard_link();
@@ -1092,30 +1122,41 @@ fn read_tar_entries(
         {
             return Err(ArchiveError::InvalidArchive);
         }
-        let size = entry.size();
         if size > limits.member_bytes as u64 && !(kind.is_file() && limits.omits(size)) {
-            let member = extended.member_path(&entry.path_bytes());
+            let member = extended.member_path(&header.path_bytes());
             return Err(limits.member_bytes_exceeded(size, member));
         }
+        let mut entry = reader.by_ref().take(size);
         if extension {
             if size > limits.extension_bytes as u64 {
                 return Err(ArchiveBound::ExtensionBytes.exceeded(
                     size,
                     limits.extension_bytes as u64,
-                    extended.member_path(&entry.path_bytes()),
+                    extended.member_path(&header.path_bytes()),
                 ));
             }
-            extended.read(&mut entry)?;
-            continue;
+            extended.read(kind, &mut entry)?;
+        } else {
+            // A different PAX size would make another reader use different member boundaries.
+            if extended.disagrees(size) {
+                return Err(ArchiveError::InvalidArchive);
+            }
+            if read.is_ok() {
+                read = push_tar_member(&extended, &header, &mut entry, output);
+            }
+            extended = TarExtension::default();
         }
-        // A PAX size over the header's would move another reader past headers checked here.
-        if extended.disagrees(size) {
+        let padding = (TAR_BLOCK_BYTES - size % TAR_BLOCK_BYTES) % TAR_BLOCK_BYTES;
+        let remaining = entry
+            .limit()
+            .checked_add(padding)
+            .ok_or(ArchiveError::InvalidArchive)?;
+        let mut unread = entry.into_inner().take(remaining);
+        let discarded = std::io::copy(&mut unread, &mut std::io::sink())
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        if discarded != remaining {
             return Err(ArchiveError::InvalidArchive);
         }
-        if read.is_ok() {
-            read = push_tar_member(&extended, &mut entry, output);
-        }
-        extended = TarExtension::default();
     }
     if extended.pending() {
         read = read.and(Err(ArchiveError::InvalidArchive));
@@ -1135,17 +1176,18 @@ fn is_extended_header(header: &tar::Header) -> bool {
 
 fn push_tar_member(
     extended: &TarExtension,
-    entry: &mut tar::Entry<'_, impl Read>,
+    header: &tar::Header,
+    entry: &mut std::io::Take<impl Read>,
     output: &mut ArchiveOutput<'_>,
 ) -> Result<(), ArchiveError> {
-    let path = extended.path_bytes(&entry.path_bytes()).to_vec();
+    let path = extended.path_bytes(&header.path_bytes()).to_vec();
     let path = String::from_utf8(path)
         .map_err(|error| ArchiveError::unsafe_path(&String::from_utf8_lossy(error.as_bytes())))?;
-    let kind = entry.header().entry_type();
+    let kind = header.entry_type();
     if kind.is_symlink() || kind.is_hard_link() {
         return output.push_skipped_link(&path);
     }
-    output.push(&path, kind.is_dir(), entry.size(), entry)
+    output.push(&path, kind.is_dir(), entry.limit(), entry)
 }
 
 fn read_zip<R: Read + Seek>(
