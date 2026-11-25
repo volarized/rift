@@ -560,3 +560,62 @@ fn class_orders_past_their_share_keep_the_other_edges_and_report_it() {
         .fold(String::new(), |text, line| text + line + "\n");
     assert_eq!(sentinel(&short), (true, true, 0));
 }
+
+#[test]
+fn supplemental_rust_macro_import_keeps_prior_edges_at_the_cap() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = format!(
+        "macro_rules! chosen {{ () => {{ 0u8 }}; }}\npub(crate) use chosen;\n\
+         pub fn callee() {{}}\npub fn many() {{ {} }}",
+        "callee(); ".repeat(128),
+    );
+    let package = identity();
+    let owner = package.owner().expect("package owner");
+    let language = language(ShippedLanguage::Rust);
+    let origin = origin(&package);
+    let root = ProjectPath::new("src/lib.rs").expect("library path");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let files = [PackageSource::new(&root, &source)];
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname='beacon'\nversion='1.0.0'\nedition='2024'\n",
+    )];
+    let limits = || ExactPackageLimits::new(2, 1 << 20);
+    let collect = |limits| {
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+            .expect("bounded package input")
+            .with_framework_context(&metadata, &[])
+            .expect("captured Cargo manifest");
+        PackageAnalyzer::analyze(input, 1).expect("bounded package")
+    };
+    let full = collect(limits());
+    let edges = full.semantics.edges();
+    let mut primary = Vec::new();
+    let mut supplemental = 0;
+    for edge in edges.edges() {
+        if edge.kind() == EdgeKind::Imports && edge.to().as_str().ends_with("/chosen") {
+            supplemental += 1;
+        } else {
+            primary.push(edge);
+        }
+    }
+    assert_eq!(supplemental, 1);
+    assert_eq!(
+        primary
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Calls)
+            .count(),
+        128
+    );
+    let limited = collect(
+        limits()
+            .with_edges(primary.len())
+            .expect("exact primary cap"),
+    );
+    assert_eq!(
+        limited.semantics.edges().edges().collect::<Vec<_>>(),
+        primary
+    );
+    assert_eq!(limited.semantics.edges().dropped_edges(), 1);
+}

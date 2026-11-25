@@ -213,9 +213,22 @@ enum DeferredReferences<'source> {
         imports: Vec<python_edges::PythonImportQualifier<'source>>,
         names: Vec<ByteRange>,
     },
-    Rust,
-    RustRootMacros,
-    RustTextualMacros,
+    Rust {
+        pass: RustReferencePass,
+        macro_imports: Vec<ByteRange>,
+    },
+}
+
+enum RustReferencePass {
+    Paths,
+    RootMacros,
+    TextualMacros,
+    MacroImports,
+}
+
+struct DeferredImports<'source> {
+    python_qualifiers: Vec<python_edges::PythonImportQualifier<'source>>,
+    rust_macros: Vec<ByteRange>,
 }
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
@@ -1372,9 +1385,7 @@ impl<'source> Index<'source> {
                     let queue = match sites {
                         DeferredReferences::Python { .. }
                         | DeferredReferences::PythonQualifiers { .. } => &mut deferred_references,
-                        DeferredReferences::Rust
-                        | DeferredReferences::RustRootMacros
-                        | DeferredReferences::RustTextualMacros => &mut rust_qualifiers,
+                        DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
                 }
@@ -1419,22 +1430,44 @@ impl<'source> Index<'source> {
                     self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
                     None
                 }
-                DeferredReferences::Rust => {
-                    self.rust_call_qualifiers(file, &mut deferred, resolution);
-                    self.rust_value_reads(file, &mut deferred, resolution);
-                    self.rust_field_sites(file, &mut deferred, resolution);
-                    (!file.facts.rust_root_macro_calls().is_empty()
-                        || !file.facts.rust_textual_macro_calls().is_empty())
-                    .then_some(DeferredReferences::RustRootMacros)
-                }
-                DeferredReferences::RustRootMacros => {
-                    self.rust_root_macro_calls(file, &mut deferred, resolution);
-                    (!file.facts.rust_textual_macro_calls().is_empty())
-                        .then_some(DeferredReferences::RustTextualMacros)
-                }
-                DeferredReferences::RustTextualMacros => {
-                    self.rust_textual_macro_calls(file, &mut deferred, resolution);
-                    None
+                DeferredReferences::Rust {
+                    pass,
+                    macro_imports,
+                } => {
+                    let next = match pass {
+                        RustReferencePass::Paths => {
+                            self.rust_call_qualifiers(file, &mut deferred, resolution);
+                            self.rust_value_reads(file, &mut deferred, resolution);
+                            self.rust_field_sites(file, &mut deferred, resolution);
+                            (!file.facts.rust_root_macro_calls().is_empty()
+                                || !file.facts.rust_textual_macro_calls().is_empty()
+                                || !macro_imports.is_empty())
+                            .then_some(RustReferencePass::RootMacros)
+                        }
+                        RustReferencePass::RootMacros => {
+                            self.rust_root_macro_calls(file, &mut deferred, resolution);
+                            (!file.facts.rust_textual_macro_calls().is_empty()
+                                || !macro_imports.is_empty())
+                            .then_some(RustReferencePass::TextualMacros)
+                        }
+                        RustReferencePass::TextualMacros => {
+                            self.rust_textual_macro_calls(file, &mut deferred, resolution);
+                            (!macro_imports.is_empty()).then_some(RustReferencePass::MacroImports)
+                        }
+                        RustReferencePass::MacroImports => {
+                            self.rust_macro_imports(
+                                file,
+                                &macro_imports,
+                                &mut deferred,
+                                resolution,
+                            );
+                            None
+                        }
+                    };
+                    next.map(|pass| DeferredReferences::Rust {
+                        pass,
+                        macro_imports,
+                    })
                 }
             };
             let used = budget.saturating_sub(deferred.budget.remaining());
@@ -1571,7 +1604,10 @@ impl<'source> Index<'source> {
             }
             result.record_kind(occurrence, edge.kind);
         }
-        let imports = self.resolve_imports(file, work, result)?;
+        let DeferredImports {
+            python_qualifiers: imports,
+            rust_macros,
+        } = self.resolve_imports(file, work, result)?;
         if matches!(
             file.document.facts.language().name.as_str(),
             "javascript" | "typescript"
@@ -1590,8 +1626,12 @@ impl<'source> Index<'source> {
                     || !file.facts.rust_value_reads().is_empty()
                     || !file.facts.rust_field_sites().is_empty()
                     || !file.facts.rust_root_macro_calls().is_empty()
-                    || !file.facts.rust_textual_macro_calls().is_empty())
-                .then_some(DeferredReferences::Rust)
+                    || !file.facts.rust_textual_macro_calls().is_empty()
+                    || !rust_macros.is_empty())
+                .then_some(DeferredReferences::Rust {
+                    pass: RustReferencePass::Paths,
+                    macro_imports: rust_macros,
+                })
             }
             _ => None,
         };
@@ -1606,9 +1646,10 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) -> Option<Vec<python_edges::PythonImportQualifier<'source>>> {
+    ) -> Option<DeferredImports<'source>> {
         let mut written_python_imports = BTreeSet::new();
         let mut qualifiers = Vec::new();
+        let mut rust_macros = Vec::new();
         for binding in file.facts.bindings() {
             if file.inactive(binding.name, work) {
                 continue;
@@ -1654,6 +1695,10 @@ impl<'source> Index<'source> {
                     result.external.push(external);
                     continue;
                 }
+                if occurrence.is_none() && matches!(binding.kind, StaticBindingKind::RustUse { .. })
+                {
+                    rust_macros.push(range);
+                }
                 result.record_kind(occurrence, rift_protocol::read::EdgeKind::Imports);
                 if let Some(written) = written
                     && written_python_imports.insert(written.callee_range)
@@ -1663,7 +1708,10 @@ impl<'source> Index<'source> {
             }
         }
         qualifiers.retain(|site| !written_python_imports.contains(&site.module));
-        Some(qualifiers)
+        Some(DeferredImports {
+            python_qualifiers: qualifiers,
+            rust_macros,
+        })
     }
 
     fn call_occurrence(

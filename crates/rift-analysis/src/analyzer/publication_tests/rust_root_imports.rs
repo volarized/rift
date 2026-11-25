@@ -202,3 +202,130 @@ pub fn all() -> u8 { ordinary() + crate::exported!() + local!() }
         }));
     }
 }
+
+const NAMED_MACRO_IMPORT_ROOT: &str = r"
+mod definitions;
+mod opaque;
+mod consumer;
+use crate::root_export as root_import;
+";
+
+const NAMED_MACRO_IMPORT_CONSUMER: &str = r"
+use crate::definitions::{source, source as alias};
+use crate::root_export as exported;
+use crate::definitions::hidden;
+use crate::opaque::uncertain;
+pub fn before_shadow() -> u8 { alias!() }
+macro_rules! alias { () => { 5u8 }; }
+pub fn after_shadow() -> u8 { alias!() }
+";
+
+const NAMED_MACRO_IMPORT_DEFINITIONS: &str = r"
+macro_rules! source { () => { 2u8 }; }
+pub(crate) use source;
+macro_rules! hidden { () => { 3u8 }; }
+use hidden;
+#[macro_export]
+macro_rules! root_export { () => { 4u8 }; }
+";
+
+const NAMED_MACRO_IMPORT_OPAQUE: &str = r"
+macro_rules! uncertain { () => { 6u8 }; }
+macro_rules! introduce { () => { const OTHER: u8 = 7; }; }
+introduce!();
+pub(crate) use uncertain;
+";
+
+#[test]
+fn named_macro_imports_keep_the_written_path_and_defining_module() {
+    let analysis = analyze_rust_root(
+        vec![
+            ("src/lib.rs", NAMED_MACRO_IMPORT_ROOT),
+            ("src/definitions.rs", NAMED_MACRO_IMPORT_DEFINITIONS),
+            ("src/opaque.rs", NAMED_MACRO_IMPORT_OPAQUE),
+            ("src/consumer.rs", NAMED_MACRO_IMPORT_CONSUMER),
+        ],
+        MANIFEST,
+    );
+    let publication = analysis.publication();
+    let path_for = |unit: &rift_protocol::read::SourceUnitId| {
+        publication
+            .units
+            .iter()
+            .find(|source| &source.unit == unit)
+            .expect("source for the occurrence")
+            .path
+            .0
+            .as_str()
+    };
+    let root_prefix = format!("{ROOT}/");
+    let mut imports = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Imports])
+        .filter_map(|edge| {
+            let occurrence = edge.occurrence.as_ref()?;
+            let path = path_for(&occurrence.unit);
+            let source = match path {
+                "src/consumer.rs" => NAMED_MACRO_IMPORT_CONSUMER,
+                "src/definitions.rs" => NAMED_MACRO_IMPORT_DEFINITIONS,
+                _ => return None,
+            };
+            let start = usize::try_from(occurrence.range.start).expect("occurrence start");
+            let end = usize::try_from(occurrence.range.end).expect("occurrence end");
+            let written = &source[start..end];
+            let target = edge
+                .to
+                .as_str()
+                .strip_prefix(root_prefix.as_str())
+                .expect("same crate macro");
+            Some((path, written, target))
+        })
+        .collect::<Vec<_>>();
+    imports.sort_unstable();
+    assert_eq!(
+        imports,
+        [
+            (
+                "src/consumer.rs",
+                "crate::root_export",
+                "definitions/root_export"
+            ),
+            ("src/consumer.rs", "source", "definitions/source"),
+            ("src/consumer.rs", "source", "definitions/source"),
+            ("src/definitions.rs", "hidden", "definitions/hidden"),
+            ("src/definitions.rs", "source", "definitions/source"),
+        ]
+    );
+
+    let root_macro = format!("{ROOT}/definitions/root_export");
+    assert!(analysis.semantics.edges().edges().any(|edge| {
+        edge.from().as_str() == ROOT
+            && edge.to().as_str() == root_macro
+            && edge.kind() == EdgeKind::Imports
+    }));
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.from.as_str() == ROOT
+            && edge.to.as_str() == root_macro
+            && edge.kinds == [EdgeKind::Imports]
+    }));
+    let before = format!("{ROOT}/consumer/before_shadow");
+    let after = format!("{ROOT}/consumer/after_shadow");
+    let target = format!("{ROOT}/consumer/alias");
+    assert!(
+        !publication
+            .edges
+            .iter()
+            .any(|edge| edge.from.as_str() == before && edge.kinds == [EdgeKind::Calls])
+    );
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str() == after && edge.to.as_str() == target && edge.kinds == [EdgeKind::Calls]
+    }));
+    assert_eq!(
+        analysis
+            .semantics
+            .static_targets_omitted()
+            .get(&EdgeKind::Imports),
+        Some(&3)
+    );
+}

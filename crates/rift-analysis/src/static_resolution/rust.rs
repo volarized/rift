@@ -56,6 +56,8 @@ struct Export<'source> {
     module: Vec<String>,
     target: Vec<String>,
     visibility: Option<&'source str>,
+    file: &'source str,
+    written: ByteRange,
 }
 
 struct FileNamespace<'source> {
@@ -400,6 +402,8 @@ impl<'source> Namespaces<'source> {
                         module,
                         target,
                         visibility,
+                        file: file.document.path.as_str(),
+                        written: imported.range,
                     },
                 );
             }
@@ -1462,23 +1466,8 @@ impl<'source> Namespaces<'source> {
         let Some(source) = self.module(file, position, work) else {
             return false;
         };
-        for length in 1..=target_namespace.len() {
-            let module = &target_namespace[..length];
-            if !work.charge() || self.module_unavailable(module) {
-                return false;
-            }
-            if let Some(target) = self.modules.get(module) {
-                let Some(target) = target else {
-                    return false;
-                };
-                if !namespace_visible(
-                    source,
-                    &module[..length - 1],
-                    target.symbol.visibility.as_deref(),
-                ) {
-                    return false;
-                }
-            }
+        if !self.module_path_visible(source, target_namespace, work) {
+            return false;
         }
         let visibility = target.symbol.visibility.as_deref();
         let within_crate = source.first() == target_namespace.first();
@@ -1498,6 +1487,33 @@ impl<'source> Namespaces<'source> {
                 && target_namespace
                     .split_last()
                     .is_some_and(|(_, module)| source == module))
+    }
+
+    fn module_path_visible(
+        &self,
+        source: &[String],
+        target_namespace: &[String],
+        work: &mut Work,
+    ) -> bool {
+        for length in 1..=target_namespace.len() {
+            let module = &target_namespace[..length];
+            if !work.charge() || self.module_unavailable(module) {
+                return false;
+            }
+            if let Some(target) = self.modules.get(module) {
+                let Some(target) = target else {
+                    return false;
+                };
+                if !namespace_visible(
+                    source,
+                    &module[..length - 1],
+                    target.symbol.visibility.as_deref(),
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn resolved_path(
