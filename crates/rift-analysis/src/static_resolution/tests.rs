@@ -2819,6 +2819,73 @@ fn test_rust_generic_impl_self_and_trait_calls_resolve() {
 }
 
 #[test]
+fn test_rust_reference_aliases_probe_their_defining_type() {
+    let manifest = [("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")];
+    for (prefix, alias_file, generic, alias, trait_call) in [
+        (
+            "mod types; use crate::types::Alias;",
+            "pub type Alias = Vec<u8>;",
+            "",
+            "Alias",
+            false,
+        ),
+        ("pub type Alias<T> = Vec<T>;", "", "<T>", "Alias<T>", false),
+        (
+            "mod types; use crate::types::Alias;",
+            "use std::vec::Vec as List; pub type Alias<T> = List<T>;",
+            "<T>",
+            "Alias<T>",
+            false,
+        ),
+        (
+            "mod types; use crate::types::Alias;",
+            "mod inner { pub type List<T> = Vec<T>; } pub type Alias<T> = inner::List<T>;",
+            "<T>",
+            "Alias<T>",
+            false,
+        ),
+        (
+            "mod types; use crate::types::Alias;",
+            "pub struct Vec<T>(pub T); pub type Alias<T> = Vec<T>;",
+            "<T>",
+            "Alias<T>",
+            true,
+        ),
+        ("pub type Alias<Vec> = Vec;", "", "<T>", "Alias<T>", true),
+    ] {
+        let source = format!(
+            "{prefix}\npub trait Q {{ fn len(&self) -> usize; fn probe(self) -> usize; }}\nimpl{generic} Q for &{alias} {{ fn len(&self) -> usize {{ 99 }} fn probe(self) -> usize {{ self.len() }} }}\n"
+        );
+        let mut files = vec![("src/lib.rs", source.as_str())];
+        if !alias_file.is_empty() {
+            files.push(("src/types.rs", alias_file));
+        }
+        let result = resolution("rust", &files, &manifest, WORK_MAX);
+        assert!(!result.exhausted, "{source}");
+        assert_eq!(
+            calls(&result, "src/lib.rs").any(|edge| source_of(edge, &source) == "self.len()"),
+            trait_call,
+            "{source}\n{alias_file}"
+        );
+        assert_eq!(
+            result.occurrences.iter().any(|edge| {
+                edge.role == ReferenceRole::Read && source_of(edge, &source) == "self.len"
+            }),
+            trait_call,
+            "{source}\n{alias_file}"
+        );
+        let site = u64::try_from(source.find("self.len()").expect("call site")).expect("offset");
+        assert_eq!(
+            result.edge_calls.values().any(|coverage| {
+                !coverage.unavailable && coverage.unresolved.iter().any(|range| range.start == site)
+            }),
+            !trait_call,
+            "{source}\n{alias_file}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_nested_use_groups_keep_module_aliases_and_globs() {
     for source in [
         "mod jobs; use crate::jobs::{self as tasks, *}; fn root() { leaf(); tasks::leaf(); }",

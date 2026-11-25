@@ -15,7 +15,7 @@ mod rust;
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use rift_core::{
     ContributionReference, DeclarationBinding, FileDigest, LoopBudget, ProjectPath, ProviderId,
@@ -1152,7 +1152,7 @@ enum Binding<'source> {
 struct Index<'source> {
     graph: &'source NormalizedGraph,
     provider: ProviderId,
-    files: BTreeMap<&'source str, File<'source>>,
+    files: Arc<BTreeMap<&'source str, File<'source>>>,
     rust: rust::Namespaces<'source>,
     javascript: javascript::PackageModes<'source>,
     owners: external::Owners,
@@ -1225,6 +1225,7 @@ impl<'source> Index<'source> {
                 }
             }
         }
+        let files = Arc::new(files);
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let owners = external::Owners::new(namespace, work)?;

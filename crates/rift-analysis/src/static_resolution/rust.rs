@@ -8,6 +8,7 @@ mod references;
 const RECEIVER_DEPTH_MAX: usize = 64;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
@@ -18,6 +19,8 @@ use super::{Binding, File, Target, Work};
 #[derive(Default)]
 pub(super) struct Namespaces<'source> {
     files: BTreeMap<&'source str, FileNamespace<'source>>,
+    /// The file scopes where type aliases declare their right-hand types.
+    source_files: Arc<BTreeMap<&'source str, File<'source>>>,
     values: BTreeMap<Vec<String>, Option<Target<'source>>>,
     types: BTreeMap<Vec<String>, Option<Target<'source>>>,
     structural_types: BTreeMap<(String, String), Option<Target<'source>>>,
@@ -191,10 +194,14 @@ impl<'source> Namespaces<'source> {
     }
 
     pub(super) fn new(
-        files: &BTreeMap<&'source str, File<'source>>,
+        files: &Arc<BTreeMap<&'source str, File<'source>>>,
         work: &mut Work,
     ) -> Option<Self> {
-        let mut namespaces = Self::default();
+        let mut namespaces = Self {
+            source_files: Arc::clone(files),
+            ..Self::default()
+        };
+        let files = files.as_ref();
         let mut alternatives = unadmitted_alternatives(files, work)?;
         alternatives.extend(unadmitted_chain_modules(files, work)?);
         for file in files
