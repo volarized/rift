@@ -17,6 +17,78 @@ fn imports<'source>(
 }
 
 #[test]
+fn test_python_module_qualifiers_keep_their_tokens_and_terminal_targets() {
+    let package = "from .child import Thing, helper\n\
+        from . import child\n\
+        from . import child as alias\n\
+        value = child.Thing()\n\
+        other = alias.Thing()\n\
+        direct = Thing()\n\
+        def by_value(child: Thing):\n    return child.run()\n";
+    let path = "pkg/__init__.py";
+    let result = resolution(
+        "python",
+        &[
+            (path, package),
+            (
+                "pkg/child.py",
+                "class Thing:\n    def run(self): pass\ndef helper(): pass\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let module = "rift://symbol/local/python/pkg/child";
+    let class = "rift://symbol/local/python/pkg/child/Thing";
+    assert_eq!(
+        imports(&result, path, package),
+        [
+            ("Thing", class),
+            ("helper", "rift://symbol/local/python/pkg/child/helper"),
+            ("child", module),
+            ("alias", module),
+            (".child", module),
+        ],
+    );
+    let qualifiers = result
+        .occurrences
+        .iter()
+        .filter(|edge| {
+            edge.role == ReferenceRole::Read
+                && edge.binding.unit().key().as_str() == path
+                && target(edge) == module
+        })
+        .map(|edge| (source_of(edge, package), edge.binding.range().start()))
+        .collect::<Vec<_>>();
+    let site = |written| {
+        u64::try_from(package.find(written).expect("written qualifier"))
+            .expect("qualifier byte offset")
+    };
+    assert_eq!(
+        qualifiers,
+        [
+            ("child", site("child.Thing")),
+            ("alias", site("alias.Thing"))
+        ],
+    );
+    assert_eq!(
+        calls(&result, path)
+            .map(|call| (source_of(call, package), target(call)))
+            .collect::<Vec<_>>(),
+        [
+            ("child.Thing()", class),
+            ("alias.Thing()", class),
+            ("Thing()", class),
+            (
+                "child.run()",
+                "rift://symbol/local/python/pkg/child/Thing/run"
+            ),
+        ],
+    );
+    assert!(!result.ended);
+}
+
+#[test]
 fn test_python_package_self_imports_bind_their_submodules() {
     let package = "from . import leaf, other as other\n";
     let sibling = "from . import leaf\ndef use(): return leaf.target()\n";

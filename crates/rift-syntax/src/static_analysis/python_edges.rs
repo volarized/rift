@@ -202,8 +202,6 @@ impl EdgePythonKinds {
                 names.class(byte_range(syntax_element)?);
             }
             self.edge_definition(visited, facts)?;
-            self.edge_type_parameters(syntax_element, facts)?;
-            self.edge_evaluated_outside(syntax_element, facts)?;
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
@@ -353,13 +351,12 @@ impl EdgePythonKinds {
     fn edge_type_parameters(
         &self,
         definition: Node<'_>,
+        parameters: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(parameters) = definition.child_by_field_name("type_parameters") else {
-            return Ok(());
-        };
         // The type parameter scope holds the function's annotations and body or the class's
-        // arguments and body. A function's default values run in the enclosing scope.
+        // arguments and body or the alias's right side. Function argument defaults run in the
+        // enclosing scope.
         let scope = ByteRange {
             end: byte_range(definition)?.end,
             ..byte_range(parameters)?
@@ -374,7 +371,10 @@ impl EdgePythonKinds {
             }
         }
         let mut cursor = parameters.walk();
-        for parameter in parameters.named_children(&mut cursor) {
+        for parameter in parameters
+            .named_children(&mut cursor)
+            .filter(|parameter| !parameter.is_extra())
+        {
             let mut candidate = if parameter.kind_id() == self.type_parameter_default {
                 parameter.child_by_field_id(self.left)
             } else {
@@ -456,7 +456,10 @@ impl EdgePythonKinds {
                 kind,
             )?);
         }
-        Ok(())
+        if let Some(parameters) = syntax_element.child_by_field_name("type_parameters") {
+            self.edge_type_parameters(syntax_element, parameters, facts)?;
+        }
+        self.edge_evaluated_outside(syntax_element, facts)
     }
 
     fn edge_function_decorator<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {

@@ -31,10 +31,34 @@ fn test_python_established_member_callees_are_calls_alone() {
             "item.n()",
         ]
     );
-    let mut read = result
+    let reads = result
         .occurrences
         .iter()
         .filter(|access| access.role == ReferenceRole::Read && access.edge_kind.is_none())
+        .collect::<Vec<_>>();
+    let module = "rift://symbol/local/python/mod";
+    let mut qualifier_sites = reads
+        .iter()
+        .filter(|access| target(access) == module)
+        .map(|access| {
+            assert_eq!(access.binding.unit().key().as_str(), "main.py");
+            assert_eq!(source_of(access, SOURCE), "mod");
+            let range = access.binding.range();
+            (range.start(), range.end())
+        })
+        .collect::<Vec<_>>();
+    qualifier_sites.sort_unstable();
+    let expected_sites = SOURCE
+        .match_indices("mod.f")
+        .map(|(offset, _)| {
+            let start = u64::try_from(offset).expect("qualifier offset");
+            (start, start + 3)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(qualifier_sites, expected_sites);
+    let mut read = reads
+        .into_iter()
+        .filter(|access| target(access) != module)
         .map(|access| (source_of(access, SOURCE), target(access)))
         .collect::<Vec<_>>();
     read.sort_unstable();

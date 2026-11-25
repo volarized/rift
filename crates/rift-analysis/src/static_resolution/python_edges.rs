@@ -1,5 +1,6 @@
 //! Resolves Python names through captured declarations, imports, and receivers.
 
+mod aliases;
 mod annotations;
 mod classes;
 mod elements;
@@ -10,6 +11,7 @@ mod receiver_guards;
 mod references;
 mod slots;
 
+pub(super) use aliases::{ClassAliases, ModuleAliases};
 pub(super) use classes::{ClassOrders, MemberOwners};
 pub(super) use references::PythonNameSites;
 
@@ -22,6 +24,34 @@ use rift_syntax::{
 
 use super::{Binding, File, Index, StaticOccurrence, Target, Work};
 use crate::analyzer::namespace::python::python_import_target;
+
+/// An established import terminal beside its written from-module token.
+pub(super) struct PythonImportQualifier<'source> {
+    pub(super) module: ByteRange,
+    terminal: Target<'source>,
+    from: rift_core::SymbolId,
+}
+
+impl<'source> PythonImportQualifier<'source> {
+    pub(super) fn from_import(
+        binding: &StaticBinding,
+        terminal: Target<'source>,
+        occurrence: &StaticOccurrence,
+    ) -> Option<Self> {
+        let StaticBindingKind::PythonImport {
+            module,
+            export: Some(_),
+        } = binding.kind
+        else {
+            return None;
+        };
+        Some(Self {
+            module,
+            terminal,
+            from: occurrence.edge_from.as_ref()?.clone(),
+        })
+    }
+}
 
 pub(super) struct EdgePythonModules(BTreeMap<String, Option<String>>);
 
@@ -253,6 +283,9 @@ impl<'source> Index<'source> {
             if !work.charge() || !visited.insert((target.file.path.as_str(), name.start)) {
                 return None;
             }
+            if let Some(class) = self.python_aliases.target(target) {
+                return work.python_lookup(|_| Some(class));
+            }
             let file = self.files.get(target.file.path.as_str())?;
             let StaticBindingKind::PythonAlias { value } = *file.python_values.get(&name.end)?
             else {
@@ -427,6 +460,32 @@ impl<'source> Index<'source> {
         Some(occurrence)
     }
 
+    pub(super) fn python_import_qualifier(
+        &self,
+        file: &File<'source>,
+        site: PythonImportQualifier<'source>,
+    ) -> Option<StaticOccurrence> {
+        let text = file.text(site.module)?;
+        if text.bytes().all(|byte| byte == b'.') {
+            return None;
+        }
+        let name = EdgePythonModules::name(file, text)?;
+        let written = self.files.get(self.edge_python.path(&name)?)?;
+        let target = written.qualified_target(".")?;
+        if site.terminal.symbol.kind == "module" && site.terminal.file.path == target.file.path {
+            return None;
+        }
+        let mut occurrence = self.occurrence(
+            file,
+            site.module,
+            site.module,
+            rift_core::ReferenceRole::Import,
+            target,
+        )?;
+        occurrence.edge_from = Some(site.from);
+        Some(occurrence)
+    }
+
     fn value_target(&self, value: Value<'source>) -> Option<Target<'source>> {
         match value {
             Value::Symbol(target)
@@ -533,8 +592,13 @@ impl<'source> Index<'source> {
     }
 
     /// Follows every import of every Python module once.
-    pub(super) fn python_import_targets(&self, work: &mut Work) -> Option<ImportTargets<'source>> {
+    pub(super) fn python_import_targets(
+        &self,
+        work: &mut Work,
+    ) -> Option<(ImportTargets<'source>, ModuleAliases<'source>)> {
         let mut targets = ImportTargets::default();
+        let mut aliases = Vec::new();
+        let collect_aliases = work.budget.remaining() > super::FILE_WORK_FLOOR;
         for file in self.python_files() {
             for binding in file.facts.bindings() {
                 if !work.charge() {
@@ -549,10 +613,15 @@ impl<'source> Index<'source> {
                 ) {
                     let name = (file.document.path.as_str(), file.text(binding.name)?);
                     self.follow_imports(name, &mut targets, work)?;
+                } else if collect_aliases
+                    && matches!(binding.kind, StaticBindingKind::PythonAlias { .. })
+                    && file.python_module_binding(binding)
+                {
+                    aliases.push((file.document.path.as_str(), binding));
                 }
             }
         }
-        Some(targets)
+        Some((targets, aliases))
     }
 
     /// Follows the imports of `name` up to a name already followed, the end of the chain, or

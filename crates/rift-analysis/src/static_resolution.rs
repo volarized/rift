@@ -195,17 +195,20 @@ fn resolve_by<'source>(
 }
 
 /// What one file's pass adds, held apart until the files join in path order.
-struct FileResolution {
+struct FileResolution<'source> {
     resolution: StaticResolution,
-    deferred_references: Option<DeferredReferences>,
+    deferred_references: Option<DeferredReferences<'source>>,
     /// Budget the pass consumed.
     used: usize,
     /// Whether the pass ended on its budget.
     exhausted: bool,
 }
 
-enum DeferredReferences {
-    PythonNames(python_edges::PythonNameSites),
+enum DeferredReferences<'source> {
+    Python {
+        names: Option<python_edges::PythonNameSites>,
+        imports: Vec<python_edges::PythonImportQualifier<'source>>,
+    },
     Rust,
 }
 
@@ -1186,6 +1189,7 @@ struct Index<'source> {
     edge_python: python_edges::EdgePythonModules,
     edge_python_classes: python_edges::ClassOrders<'source>,
     python_imports: python_edges::ImportTargets<'source>,
+    python_aliases: python_edges::ClassAliases<'source>,
     /// The classes that declare a member, by the member's name.
     python_members: python_edges::MemberOwners<'source>,
     python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
@@ -1268,6 +1272,7 @@ impl<'source> Index<'source> {
             edge_python,
             edge_python_classes: python_edges::ClassOrders::default(),
             python_imports: python_edges::ImportTargets::default(),
+            python_aliases: python_edges::ClassAliases::default(),
             python_members: python_edges::MemberOwners::default(),
             python_writes,
             syntax_publication,
@@ -1275,9 +1280,11 @@ impl<'source> Index<'source> {
             #[cfg(test)]
             performed: std::sync::atomic::AtomicUsize::new(0),
         };
-        index.python_imports = index.python_import_targets(work)?;
+        let (imports, aliases) = index.python_import_targets(work)?;
+        index.python_imports = imports;
         index.python_members = index.python_member_owners(work)?;
         index.edge_python_classes = index.python_class_orders(FileWork::CLASS_ORDERS, work);
+        index.python_aliases = index.python_class_alias_targets(aliases, work);
         Some(index)
     }
 
@@ -1357,7 +1364,7 @@ impl<'source> Index<'source> {
                 if let Some(sites) = apart.deferred_references {
                     let remaining = file_work.max(file).saturating_sub(apart.used);
                     let queue = match sites {
-                        DeferredReferences::PythonNames(_) => &mut deferred_references,
+                        DeferredReferences::Python { .. } => &mut deferred_references,
                         DeferredReferences::Rust => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
@@ -1375,7 +1382,7 @@ impl<'source> Index<'source> {
     /// A cut here affects the static pass, but it cannot make a file's call coverage unavailable.
     fn resolve_deferred_references(
         &self,
-        references: Vec<(&File<'source>, usize, DeferredReferences)>,
+        references: Vec<(&File<'source>, usize, DeferredReferences<'source>)>,
         work: &mut Work,
         resolution: &mut StaticResolution,
     ) {
@@ -1383,20 +1390,40 @@ impl<'source> Index<'source> {
             resolution.supplemental_start =
                 Some((resolution.occurrences.len(), resolution.external.len()));
         }
+        let mut python_qualifiers = Vec::new();
         for (file, remaining, sites) in references {
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
-            match sites {
-                DeferredReferences::PythonNames(sites) => {
-                    self.python_name_references(file, sites, &mut deferred, resolution);
+            let python = match sites {
+                DeferredReferences::Python { names, imports } => {
+                    let names = names.map_or_else(Vec::new, |sites| {
+                        self.python_name_references(file, sites, &mut deferred, resolution)
+                    });
+                    (!names.is_empty() || !imports.is_empty()).then_some((imports, names))
                 }
                 DeferredReferences::Rust => {
                     self.rust_call_qualifiers(file, &mut deferred, resolution);
                     self.rust_value_reads(file, &mut deferred, resolution);
                     self.rust_field_sites(file, &mut deferred, resolution);
+                    None
                 }
+            };
+            let used = budget.saturating_sub(deferred.budget.remaining());
+            #[cfg(test)]
+            self.performed
+                .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+            work.budget = LoopBudget::new(left.saturating_sub(used));
+            resolution.ended |= deferred.exhausted;
+            if let Some((imports, names)) = python {
+                python_qualifiers.push((file, remaining.saturating_sub(used), imports, names));
             }
+        }
+        for (file, remaining, imports, names) in python_qualifiers {
+            let left = work.budget.remaining();
+            let budget = left.min(remaining);
+            let mut deferred = Work::new(budget);
+            self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
             let used = budget.saturating_sub(deferred.budget.remaining());
             #[cfg(test)]
             self.performed
@@ -1412,7 +1439,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         budget: usize,
         edge_calls: &BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
-    ) -> FileResolution {
+    ) -> FileResolution<'source> {
         let mut work = Work::new(budget);
         let mut resolution = StaticResolution::default();
         let unit = file.document.placement.unit();
@@ -1492,7 +1519,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) -> Option<DeferredReferences> {
+    ) -> Option<DeferredReferences<'source>> {
         for range in file.facts.unsupported_bindings() {
             if file.inactive(*range, work) {
                 continue;
@@ -1523,7 +1550,42 @@ impl<'source> Index<'source> {
             }
             result.record_kind(occurrence, edge.kind);
         }
+        let imports = self.resolve_imports(file, work, result)?;
+        if matches!(
+            file.document.facts.language().name.as_str(),
+            "javascript" | "typescript"
+        ) {
+            self.javascript_edges(file, work, result);
+        }
+        let deferred = match file.document.facts.language().name.as_str() {
+            "python" => {
+                let names = self.python_references(file, work, result);
+                (!work.exhausted && (names.is_some() || !imports.is_empty()))
+                    .then_some(DeferredReferences::Python { names, imports })
+            }
+            "rust" => {
+                self.rust_references(file, work, result);
+                (!file.facts.calls().is_empty()
+                    || !file.facts.rust_value_reads().is_empty()
+                    || !file.facts.rust_field_sites().is_empty())
+                .then_some(DeferredReferences::Rust)
+            }
+            _ => None,
+        };
+        if !work.exhausted {
+            result.analyzed_sources += 1;
+        }
+        deferred
+    }
+
+    fn resolve_imports(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) -> Option<Vec<python_edges::PythonImportQualifier<'source>>> {
         let mut written_python_imports = BTreeSet::new();
+        let mut qualifiers = Vec::new();
         for binding in file.facts.bindings() {
             if file.inactive(binding.name, work) {
                 continue;
@@ -1544,6 +1606,16 @@ impl<'source> Index<'source> {
                             Some(self.python_identity(file, range, file.qualified_target(".")?)?);
                         written =
                             self.python_written_import(file, binding, target, &occurrence, work);
+                        if written.is_none()
+                            && let Some(qualifier) =
+                                python_edges::PythonImportQualifier::from_import(
+                                    binding,
+                                    target,
+                                    &occurrence,
+                                )
+                        {
+                            qualifiers.push(qualifier);
+                        }
                     } else if matches!(
                         file.document.facts.language().name.as_str(),
                         "javascript" | "typescript"
@@ -1567,29 +1639,8 @@ impl<'source> Index<'source> {
                 }
             }
         }
-        if matches!(
-            file.document.facts.language().name.as_str(),
-            "javascript" | "typescript"
-        ) {
-            self.javascript_edges(file, work, result);
-        }
-        let deferred = match file.document.facts.language().name.as_str() {
-            "python" => self
-                .python_references(file, work, result)
-                .map(DeferredReferences::PythonNames),
-            "rust" => {
-                self.rust_references(file, work, result);
-                (!file.facts.calls().is_empty()
-                    || !file.facts.rust_value_reads().is_empty()
-                    || !file.facts.rust_field_sites().is_empty())
-                .then_some(DeferredReferences::Rust)
-            }
-            _ => None,
-        };
-        if !work.exhausted {
-            result.analyzed_sources += 1;
-        }
-        deferred
+        qualifiers.retain(|site| !written_python_imports.contains(&site.module));
+        Some(qualifiers)
     }
 
     fn call_occurrence(

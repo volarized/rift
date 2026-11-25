@@ -12,6 +12,58 @@ use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, Publicat
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
 
 #[test]
+fn package_collects_python_generic_aliases_in_their_own_scope() {
+    let source = "class T: pass\nclass Bound: pass\n\
+                  type Plain = T\n\
+                  type Values[T] = T\n\
+                  type WithDefault[T = int] = T\n\
+                  type Bounded[\n    T: Bound,  # bound of the alias\n] = list[T]\n\
+                  def accept(value: Values[int]) -> Values[int]: return value\n";
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let identity = |name| format!("{module}/{name}");
+    for alias in ["Plain", "Values", "WithDefault", "Bounded"] {
+        let name = identity(alias);
+        assert!(
+            result
+                .objects
+                .iter()
+                .any(|object| { object.id.as_ref().is_some_and(|id| id.as_str() == name) }),
+            "{alias}"
+        );
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Contains]
+                    && edge.from.as_str() == module
+                    && edge.to.as_str() == name
+            }),
+            "{alias}"
+        );
+    }
+    let module_type = identity("T");
+    let plain_alias = identity("Plain");
+    let uses = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::HasType] && edge.to.as_str() == module_type)
+        .map(|edge| edge.from.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(uses, [plain_alias.as_str()]);
+    for (source, target) in [("Bounded", "Bound"), ("accept", "Values")] {
+        let from = identity(source);
+        let to = identity(target);
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::HasType]
+                    && edge.from.as_str() == from
+                    && edge.to.as_str() == to
+            }),
+            "{source} -> {target}"
+        );
+    }
+}
+
+#[test]
 fn package_preserves_python_edges_beside_type_parameter_defaults() {
     let prefix = "import math\ndef leaf(): pass\ndef f(): leaf()\n";
     let module = "rift://symbol/pypi/pypi.org/click/python/click";
@@ -444,6 +496,57 @@ fn package_rust_initializer_local_types_do_not_name_the_module_type() {
                 && matches!(&edge.target, NormalizedTarget::Symbol(id) if module_target(id.as_str()))
         });
         assert!(leaked.is_none(), "{label}: {leaked:?}");
+    }
+}
+
+#[test]
+fn package_calls_keep_their_javascript_initializer_owners() {
+    let source = "function load() { return 1; }\n\
+                  export const value = load();\n\
+                  export const items = [load()];\n\
+                  export const object = { property: load() };\n\
+                  export class Owner { field = load(); static shared = load(); }\n\
+                  export function run() { const local = load(); return local; }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.js"}"#,
+        )),
+    )
+    .expect("admitted JavaScript package");
+    let mut calls = analysis
+        .publication()
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/load"))
+        .map(|edge| {
+            let span = edge.occurrence.as_ref().expect("written call");
+            let start = usize::try_from(span.range.start).expect("start");
+            let end = usize::try_from(span.range.end).expect("end");
+            assert_eq!(source.get(start..end), Some("load()"));
+            (start, edge.from.as_str())
+        })
+        .collect::<Vec<_>>();
+    calls.sort_unstable();
+    let owners = [
+        "value",
+        "items",
+        "object/property",
+        "Owner/field",
+        "Owner/shared",
+        "run",
+    ];
+    assert_eq!(calls.len(), owners.len(), "{calls:?}");
+    for ((start, owner), (expected, (position, _))) in calls.into_iter().zip(
+        owners
+            .into_iter()
+            .zip(source.match_indices("load()").skip(1)),
+    ) {
+        assert_eq!(start, position);
+        assert!(owner.ends_with(&format!("/beacon/{expected}")), "{owner}");
     }
 }
 

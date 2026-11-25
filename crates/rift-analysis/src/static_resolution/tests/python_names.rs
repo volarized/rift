@@ -555,13 +555,13 @@ fn test_python_first_names_are_read_where_the_path_is_not_established_further() 
 #[test]
 fn test_python_first_names_of_imported_modules_are_read_once() {
     for (body, expected, refused) in [
-        ("import pkg.leaf as m\nx = m.g\n", "", 0),
+        ("import pkg.leaf as m\nx = m.g\n", "1  reads pkg/leaf", 0),
         (
             "import pkg.leaf as m\nx = m.missing\n",
             "1  reads pkg/leaf",
             0,
         ),
-        ("from pkg import leaf\nleaf.g()\n", "", 0),
+        ("from pkg import leaf\nleaf.g()\n", "1  reads pkg/leaf", 0),
         ("import os\nos.getcwd()\n", "", 0),
         ("import os\nx = os.environ\n", "os", 0),
         ("from pkg.leaf import two\nx = two.y\n", "", 1),

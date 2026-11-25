@@ -1,4 +1,41 @@
 #[test]
+fn workspace_javascript_initializer_calls_keep_their_execution_owners() {
+    let source = concat!(
+        "function load() {}\n",
+        "export const direct = load();\n",
+        "export const object = { property: load() };\n",
+        "load();\n",
+        "export class Holder { field = load(); }\n",
+        "export const later = () => load();\n",
+    );
+    for (language, path) in [("javascript", "main.mjs"), ("typescript", "main.ts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let mut found = calls(&result, path).collect::<Vec<_>>();
+        found.sort_unstable_by_key(|edge| edge.binding.range().start());
+        assert_eq!(found.len(), 5, "{language}: {found:?}");
+        let sites = source.match_indices("load()").skip(1);
+        for ((edge, (start, _)), suffix) in
+            found
+                .into_iter()
+                .zip(sites)
+                .zip(["", "", "", "/Holder/field", "/later"])
+        {
+            assert_eq!(
+                edge.binding.range().start(),
+                u64::try_from(start).expect("offset")
+            );
+            assert_eq!(source_of(edge, source), "load()");
+            assert!(target(edge).ends_with("/load"), "{language}: {edge:?}");
+            let owner = edge.edge_from.as_ref().expect("caller");
+            assert!(
+                owner.as_str().ends_with(&format!(".%2F{path}{suffix}")),
+                "{language}: {owner}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_typescript_export_overloads_keep_one_checked_callable() {
     let source = "function leaf() {} export function run(value: string): void; export function run(value: number): void; export function run(value: unknown) { leaf(); }";
     let document = syntax("jobs.ts", source);
@@ -2883,10 +2920,83 @@ fn test_python_static_imports_keep_submodules_and_captured_external_exports() {
         imported,
         [
             "rift://symbol/local/python/pkg/models",
-            "rift://symbol/local/python/pkg/bridge"
+            "rift://symbol/local/python/pkg/bridge",
+            "rift://symbol/local/python/pkg"
         ],
         "{result:?}"
     );
+}
+
+#[test]
+fn test_python_cross_module_aliases_reuse_the_class_terminal() {
+    use std::cell::Cell;
+
+    let work = [2, 12].map(|links| {
+        let mut modules = vec![
+            ("sample/__init__.py".to_owned(), String::new()),
+            (
+                "sample/stage_00.py".to_owned(),
+                "class Entry:\n    def visit(self): pass\nAlias = Entry\n".to_owned(),
+            ),
+        ];
+        for stage in 1..=links {
+            let previous = stage - 1;
+            modules.push((
+                format!("sample/stage_{stage:02}.py"),
+                format!(
+                    "from .stage_{previous:02} import Alias as Previous\nAlias = Previous\ndef run():\n    value = Previous()\n    value.visit()\n"
+                ),
+            ));
+        }
+        let final_path = &modules.last().expect("last module").0;
+        let sources = modules
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>();
+        let used = Cell::new(0);
+        let result = resolution_by(
+            "python",
+            &sources,
+            &[],
+            1_000_000,
+            &|graph, documents, input, budget| {
+                super::resolve_by(graph, documents, input, budget, |index, work, resolution| {
+                    const LOOKUP_WORK: usize = 4096;
+                    let file = index.files.get(final_path.as_str()).expect("final module");
+                    let call = file
+                        .facts
+                        .calls()
+                        .iter()
+                        .find(|call| file.text(call.callee_range) == Some("Previous"))
+                        .expect("constructor call");
+                    let mut probe = super::Work::new(LOOKUP_WORK);
+                    let target = index
+                        .edge_python_call(file, call, &mut probe)
+                        .expect("constructor target");
+                    assert_eq!(target.symbol.name, "Entry");
+                    used.set(LOOKUP_WORK - probe.budget.remaining());
+                    index.resolve_files(super::FileWork::CAPTURED, work, resolution);
+                })
+            },
+        );
+        assert!(!result.exhausted);
+        if links == 2 {
+            let fallback = resolution("python", &sources, &[], WORK_MAX);
+            assert!(!fallback.exhausted);
+            assert_eq!(labelled(&result), labelled(&fallback));
+        }
+        assert_eq!(
+            calls(&result, final_path).map(target).collect::<Vec<_>>(),
+            [
+                "rift://symbol/local/python/sample/stage_00/Entry",
+                "rift://symbol/local/python/sample/stage_00/Entry/visit",
+            ],
+            "{result:?}"
+        );
+        used.get()
+    });
+    assert!(work[0] > 0);
+    assert!(work[1] <= 2 * work[0], "{work:?}");
 }
 
 #[test]
@@ -2907,7 +3017,7 @@ fn test_python_static_reexports_keep_module_import_owners() {
         .iter()
         .filter(|edge| edge.role == ReferenceRole::Import)
         .collect::<Vec<_>>();
-    assert_eq!(imports.len(), 3, "{result:?}");
+    assert_eq!(imports.len(), 4, "{result:?}");
     let written = imports
         .iter()
         .find(|edge| {

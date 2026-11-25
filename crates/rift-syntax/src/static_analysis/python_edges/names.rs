@@ -277,17 +277,14 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let mut name = visited.syntax_element().child_by_field_id(self.left);
-        // The name stands under `type`, and one with parameters under `generic_type` as well.
-        for _ in 0..2 {
-            name = name
-                .filter(|element| element.kind_id() != self.identifier)
-                .and_then(|element| element.named_child(0))
-                .or(name);
+        let alias = visited.syntax_element();
+        let Some((name, parameters)) = crate::python::type_alias_parts(alias) else {
+            return Ok(());
+        };
+        if let Some(parameters) = parameters {
+            self.edge_type_parameters(alias, parameters, facts)?;
         }
-        if let Some(name) = name.filter(|element| element.kind_id() == self.identifier)
-            && let Some(scope) = edge_enclosing(visited, &self.scopes)
-        {
+        if let Some(scope) = edge_enclosing(visited, &self.scopes) {
             let end = byte_range(name)?.end;
             let binding = self.scoped_binding(name, scope, end, StaticBindingKind::Shadow)?;
             facts.bindings.push(binding);

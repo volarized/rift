@@ -203,6 +203,8 @@ struct PythonKinds {
     attribute: u16,
     type_alias_statement: u16,
     type_expression: u16,
+    generic_type: u16,
+    type_parameter: u16,
     decorator: u16,
     call: u16,
     typed_parameter: u16,
@@ -255,6 +257,8 @@ impl PythonKinds {
             attribute: kind_id(language, ATTRIBUTE_KIND),
             type_alias_statement: kind_id(language, TYPE_ALIAS_STATEMENT_KIND),
             type_expression: kind_id(language, TYPE_KIND),
+            generic_type: kind_id(language, "generic_type"),
+            type_parameter: kind_id(language, "type_parameter"),
             decorator: kind_id(language, DECORATOR_KIND),
             call: kind_id(language, CALL_KIND),
             typed_parameter: kind_id(language, TYPED_PARAMETER_KIND),
@@ -728,7 +732,7 @@ impl PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let Some(name) = self.type_alias_name(visited.syntax_element()) else {
+        let Some((name, _)) = type_alias_parts(visited.syntax_element()) else {
             return Ok(None);
         };
         if self.statement_scope(visited).is_none() {
@@ -752,21 +756,33 @@ impl PythonRules {
             documentation_ranges: Vec::new(),
         }))
     }
+}
 
-    /// The identifier a `type` statement names, `Pair` in
-    /// `type Pair = tuple[int, int]`; `None` for a generic left side.
-    fn type_alias_name<'tree>(&self, statement: Node<'tree>) -> Option<Node<'tree>> {
-        if statement.kind_id() != self.kinds.type_alias_statement {
-            return None;
-        }
-        let left = statement.child_by_field_id(self.kinds.left.get())?;
-        let name = if left.kind_id() == self.kinds.type_expression {
-            left.named_child(0)?
-        } else {
-            left
-        };
-        (name.kind_id() == self.kinds.identifier).then_some(name)
+/// The identifier and optional parameter list a `type` statement declares.
+pub(crate) fn type_alias_parts(statement: Node<'_>) -> Option<(Node<'_>, Option<Node<'_>>)> {
+    let kinds = python_kinds();
+    if statement.kind_id() != kinds.type_alias_statement {
+        return None;
     }
+    let left = statement.child_by_field_id(kinds.left.get())?;
+    let head = if left.kind_id() == kinds.type_expression {
+        left.named_children(&mut left.walk())
+            .find(|child| !child.is_extra())?
+    } else {
+        left
+    };
+    let (name, parameters) = if head.kind_id() == kinds.generic_type {
+        let mut cursor = head.walk();
+        let mut children = head
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra());
+        let name = children.next()?;
+        let parameters = children.find(|child| child.kind_id() == kinds.type_parameter)?;
+        (name, Some(parameters))
+    } else {
+        (head, None)
+    };
+    (name.kind_id() == kinds.identifier).then_some((name, parameters))
 }
 
 /// Literal documentation each module-level `name.__doc__ = "..."` assigns,
@@ -1044,7 +1060,7 @@ impl GrammarRules for PythonRules {
         } else if syntax_element.kind_id() == self.kinds.attribute {
             syntax_element.child_by_field_id(self.kinds.attribute_name.get())
         } else if syntax_element.kind_id() == self.kinds.type_alias_statement {
-            self.type_alias_name(syntax_element)
+            type_alias_parts(syntax_element).map(|(name, _)| name)
         } else if syntax_element.kind_id() == self.kinds.assignment {
             syntax_element
                 .child_by_field_id(self.kinds.left.get())
