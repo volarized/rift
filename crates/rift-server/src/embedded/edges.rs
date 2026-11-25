@@ -3,6 +3,7 @@
 use ruff_db::{files::File, source::source_text};
 use ruff_text_size::TextSize;
 use serde_json::{Value, json};
+use ty_ide::NavigationTarget;
 use ty_project::{ProjectDatabase, SemanticDb as _};
 
 use super::{
@@ -34,7 +35,7 @@ pub(super) fn definitions(
 ) -> Result<Value, AnswerRefusal> {
     let (file, offset) = document_position(database, exchange, params)?;
     let targets = ty_ide::goto_definition(database, database.program_file(file), offset);
-    navigation_locations(database, exchange, targets)
+    navigation_locations(database, exchange, targets.into_iter().flatten())
 }
 
 pub(super) fn type_definitions(
@@ -44,52 +45,34 @@ pub(super) fn type_definitions(
 ) -> Result<Value, AnswerRefusal> {
     let (file, offset) = document_position(database, exchange, params)?;
     let targets = ty_ide::goto_type_definition(database, database.program_file(file), offset);
-    let Value::Array(mut locations) = navigation_locations(database, exchange, targets)? else {
-        return Ok(Value::Array(Vec::new()));
-    };
-    locations.retain(|location| !names_divergent_marker(database, location));
-    Ok(Value::Array(locations))
+    let targets = targets
+        .into_iter()
+        .flatten()
+        .filter(|target| !names_inference_marker(database, target));
+    navigation_locations(database, exchange, targets)
 }
 
-/// The stub ty declares its own dynamic markers in.
-const MARKER_STUB_URI: &str = "vendored://stdlib/ty_extensions/_internal.pyi";
-/// The name of the marker ty puts where type inference did not converge.
-const DIVERGENT_MARKER: &str = "Divergent";
+/// The vendored stub where ty declares its dynamic markers.
+const MARKER_STUB: [&str; 3] = ["stdlib", "ty_extensions", "_internal.pyi"];
 
-/// Whether `location` is the declaration of ty's `Divergent` marker.
-///
-/// The marker stands for a part of a type that inference gave up on, such as the recursive
-/// positions of an alias cycle the vendored `ty_python_semantic` cuts. It is no type of the
-/// program, so a type definition answer leaves it out instead of naming it.
-fn names_divergent_marker(database: &ProjectDatabase, location: &Value) -> bool {
-    if location["uri"] != MARKER_STUB_URI {
+/// Whether the target names a marker for incomplete type inference.
+fn names_inference_marker(database: &ProjectDatabase, target: &NavigationTarget) -> bool {
+    let file = target.file();
+    let path = file.path(database);
+    if path.as_vendored_path().is_none_or(|path| {
+        !path
+            .components()
+            .map(|component| component.as_str())
+            .eq(MARKER_STUB)
+    }) {
         return false;
     }
-    let Ok(file) =
-        ruff_db::files::vendored_path_to_file(database, "stdlib/ty_extensions/_internal.pyi")
-    else {
-        return false;
-    };
     let text = source_text(database, file);
-    let start = &location["range"]["start"];
-    let (Some(line), Some(character)) = (
-        start["line"]
-            .as_u64()
-            .and_then(|line| usize::try_from(line).ok()),
-        start["character"]
-            .as_u64()
-            .and_then(|character| usize::try_from(character).ok()),
-    ) else {
-        return false;
-    };
-    text.as_str()
-        .lines()
-        .nth(line)
-        .and_then(|content| content.get(character..))
-        .is_some_and(|rest| {
-            rest.strip_prefix(DIVERGENT_MARKER)
-                .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
-        })
+    let range = target.focus_range();
+    let name = text
+        .as_str()
+        .get(usize::from(range.start())..usize::from(range.end()));
+    matches!(name, Some("Divergent" | "Unknown" | "Todo"))
 }
 
 pub(super) fn implementations(
@@ -99,16 +82,16 @@ pub(super) fn implementations(
 ) -> Result<Value, AnswerRefusal> {
     let (file, offset) = document_position(database, exchange, params)?;
     let targets = ty_ide::goto_implementation(database, database.program_file(file), offset);
-    navigation_locations(database, exchange, targets)
+    navigation_locations(database, exchange, targets.into_iter().flatten())
 }
 
 fn navigation_locations(
     database: &ProjectDatabase,
     exchange: &Exchange<'_>,
-    targets: Option<ty_ide::RangedValue<ty_ide::NavigationTargets>>,
+    targets: impl IntoIterator<Item = NavigationTarget>,
 ) -> Result<Value, AnswerRefusal> {
     let mut locations = Vec::new();
-    for target in targets.into_iter().flat_map(|targets| targets.value) {
+    for target in targets {
         if let Some((uri, range)) =
             target_location(database, exchange, target.file(), target.focus_range())?
         {
@@ -226,6 +209,39 @@ mod tests {
             answer[0]["range"]["start"],
             json!({"line":3,"character":6}),
             "{answer}"
+        );
+    }
+
+    #[test]
+    fn type_definition_omits_tys_unknown_marker() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let file = root.join("app.py");
+        std::fs::write(
+            &file,
+            "x: \"foobar\"\nclass Unknown:\n    pass\nvalue = Unknown()\n",
+        )
+        .expect("source");
+        let uri = super::super::path_to_uri(&file).expect("URI");
+        let at = |line, character| json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}});
+        let (marker, local) = super::super::with_database(root, |database, canonical_root| {
+            let exchange = Exchange {
+                spelled_root: root,
+                canonical_root,
+                sent_text: None,
+            };
+            Ok((
+                type_definitions(database, &exchange, &at(0, 6))?,
+                type_definitions(database, &exchange, &at(3, 0))?,
+            ))
+        })
+        .expect("type definitions");
+        assert_eq!(marker, json!([]), "{marker}");
+        assert_eq!(local[0]["uri"], uri, "{local}");
+        assert_eq!(
+            local[0]["range"]["start"],
+            json!({"line": 1, "character": 6}),
+            "{local}"
         );
     }
 
