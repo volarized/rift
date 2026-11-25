@@ -324,13 +324,16 @@ async fn python_embedded_engine_adds_facts_to_the_static_answer() -> TestResult 
         counts,
         [
             ("calls", 9, 14),
-            ("references", 21, 29),
+            ("references", 22, 30),
             ("hasType", 10, 10),
             ("extends", 2, 2),
             ("implements", 0, 0),
         ]
     );
     assert_more(&counts, &["calls", "references"]);
+    let module_import = ("main".to_owned(), "shapes".to_owned());
+    assert!(static_facts.structural["imports"].contains(&module_import));
+    assert!(static_facts.pairs("references").contains(&module_import));
     for (from, to) in [
         ("main/each", "shapes/Square/area"),
         ("main/chained", "shapes/Circle/area"),

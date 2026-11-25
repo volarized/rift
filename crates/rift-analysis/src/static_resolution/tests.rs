@@ -1,4 +1,41 @@
 #[test]
+fn workspace_javascript_initializer_calls_keep_their_execution_owners() {
+    let source = concat!(
+        "function load() {}\n",
+        "export const direct = load();\n",
+        "export const object = { property: load() };\n",
+        "load();\n",
+        "export class Holder { field = load(); }\n",
+        "export const later = () => load();\n",
+    );
+    for (language, path) in [("javascript", "main.mjs"), ("typescript", "main.ts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let mut found = calls(&result, path).collect::<Vec<_>>();
+        found.sort_unstable_by_key(|edge| edge.binding.range().start());
+        assert_eq!(found.len(), 5, "{language}: {found:?}");
+        let sites = source.match_indices("load()").skip(1);
+        for ((edge, (start, _)), suffix) in
+            found
+                .into_iter()
+                .zip(sites)
+                .zip(["", "", "", "/Holder/field", "/later"])
+        {
+            assert_eq!(
+                edge.binding.range().start(),
+                u64::try_from(start).expect("offset")
+            );
+            assert_eq!(source_of(edge, source), "load()");
+            assert!(target(edge).ends_with("/load"), "{language}: {edge:?}");
+            let owner = edge.edge_from.as_ref().expect("caller");
+            assert!(
+                owner.as_str().ends_with(&format!(".%2F{path}{suffix}")),
+                "{language}: {owner}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_typescript_export_overloads_keep_one_checked_callable() {
     let source = "function leaf() {} export function run(value: string): void; export function run(value: number): void; export function run(value: unknown) { leaf(); }";
     let document = syntax("jobs.ts", source);

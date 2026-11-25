@@ -28,6 +28,7 @@ fn build(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
 #[test]
 fn test_python_reexports_keep_the_written_module_and_terminal_import() {
     let source = "from __future__ import annotations\nimport typing\n\nif typing.TYPE_CHECKING:\n    from .barrel import Settings as Selected, Other\n\ndef enabled(record: Selected) -> bool:\n    return record.enabled\n";
+    let direct_source = "from .model import Settings\n";
     let refused = "from .shadowed import Settings as Shadowed\nfrom .cycle_a import Settings as Cyclic\nfrom .ambiguous import Settings as Ambiguous\n";
     let (_directory, index) = build(&[
         ("pkg/__init__.py", ""),
@@ -40,7 +41,7 @@ fn test_python_reexports_keep_the_written_module_and_terminal_import() {
             "from .model import Settings as Settings, Other as Other\n",
         ),
         ("pkg/use.py", source),
-        ("pkg/direct.py", "from .model import Settings\n"),
+        ("pkg/direct.py", direct_source),
         (
             "pkg/shadowed.py",
             "from .model import Settings as Settings\nSettings = []\n",
@@ -89,15 +90,33 @@ fn test_python_reexports_keep_the_written_module_and_terminal_import() {
         let end = usize::try_from(binding.range().end()).expect("source end");
         assert_eq!(&source[start..end], spelling);
     }
-    let mut direct = index.edges().edges().filter(|edge| {
-        edge.kind().as_ref() == "imports"
-            && edge.occurrence().unit().key().as_str() == "pkg/direct.py"
-    });
+    let mut direct = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind().as_ref() == "imports"
+                && edge.occurrence().unit().key().as_str() == "pkg/direct.py"
+        })
+        .map(|edge| {
+            assert_eq!(edge.from().as_str(), format!("{prefix}direct"));
+            let range = edge.occurrence().range();
+            let start = usize::try_from(range.start()).expect("source start");
+            let end = usize::try_from(range.end()).expect("source end");
+            (start, end, edge.to().as_str())
+        })
+        .collect::<Vec<_>>();
+    direct.sort_unstable();
     assert_eq!(
-        direct.next().expect("stored direct import").to().as_str(),
-        format!("{prefix}model/Settings")
+        direct,
+        [
+            (5, 11, format!("{prefix}model").as_str()),
+            (19, 27, format!("{prefix}model/Settings").as_str()),
+        ]
     );
-    assert!(direct.next().is_none());
+    assert_eq!(
+        (&direct_source[5..11], &direct_source[19..27]),
+        (".model", "Settings")
+    );
     for edge in index.edges().edges().filter(|edge| {
         edge.kind().as_ref() == "imports"
             && edge.occurrence().unit().key().as_str() == "pkg/refused.py"

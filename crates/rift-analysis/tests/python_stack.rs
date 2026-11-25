@@ -8,7 +8,8 @@ use rift_analysis::{
     PackageImportRootOrigin, PackageSource,
 };
 use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
-use rift_protocol::read::PackageIdentity;
+use rift_protocol::index::StoredEdge;
+use rift_protocol::read::{EdgeKind, PackageIdentity};
 use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
 const STACK_BYTES: usize = 2 << 20;
@@ -17,6 +18,10 @@ const CLASS: &str = "class C:\n    def m(self): pass\n";
 
 /// The edges of one package analyzed on a 2 MiB stack, as `from -> to`.
 fn edges(modules: &[(&str, String)], syntax_depth_max: usize) -> Vec<String> {
+    edge_pairs(&stored_edges(modules, syntax_depth_max))
+}
+
+fn stored_edges(modules: &[(&str, String)], syntax_depth_max: usize) -> Vec<StoredEdge> {
     let modules = modules
         .iter()
         .map(|(name, text)| ((*name).to_owned(), text.clone()))
@@ -29,7 +34,7 @@ fn edges(modules: &[(&str, String)], syntax_depth_max: usize) -> Vec<String> {
         .expect("analysis ends on its stack")
 }
 
-fn analyzed(modules: &[(String, String)], syntax_depth_max: usize) -> Vec<String> {
+fn analyzed(modules: &[(String, String)], syntax_depth_max: usize) -> Vec<StoredEdge> {
     let package = PackageIdentity {
         manager: "pypi".to_owned(),
         registry: "pypi.org".to_owned(),
@@ -71,9 +76,11 @@ fn analyzed(modules: &[(String, String)], syntax_depth_max: usize) -> Vec<String
         .with_import_roots(&roots)
         .expect("fixture import root");
     let analysis = PackageAnalyzer::analyze(input, 1).expect("package analysis");
-    let mut edges = analysis
-        .publication()
-        .edges
+    analysis.into_parts().0.edges
+}
+
+fn edge_pairs(edges: &[StoredEdge]) -> Vec<String> {
+    let mut edges = edges
         .iter()
         .map(|edge| {
             let name = |identity: &str| {
@@ -229,17 +236,38 @@ fn a_chain_of_container_elements_ends() {
 #[test]
 fn a_chain_of_reexports_ends() {
     let exports = chain(|link, before| format!("from module import a{before} as a{link}"));
-    let found = edges(
-        &module(format!(
-            "{CLASS}from module import C as a0\n{exports}class K(a{LAST}): pass\nK().m()\n"
-        )),
-        512,
-    );
+    let source =
+        format!("{CLASS}from module import C as a0\n{exports}class K(a{LAST}): pass\nK().m()\n");
+    let (qualifiers, original): (Vec<_>, Vec<_>) = stored_edges(&module(source.as_str()), 512)
+        .into_iter()
+        .partition(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge.from == edge.to
+                && edge.from.as_str().ends_with("/python/module")
+        });
     assert_edges(
-        &found,
+        &edge_pairs(&original),
         1007,
         &["module/K -> module/C", "module -> module/C/m"],
     );
+    let mut actual = qualifiers
+        .iter()
+        .map(|edge| {
+            let site = edge.occurrence.as_ref().expect("written qualifier");
+            assert_eq!(site.unit.0, "rift://source/pypi/pypi.org/beacon/module.py");
+            site.range.start..site.range.end
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable_by_key(|range| range.start);
+    let expected = source
+        .match_indices("from module import ")
+        .map(|(offset, _)| {
+            let start = u64::try_from(offset).expect("offset") + 5;
+            start..start + 6
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expected.len(), LINKS);
+    assert_eq!(actual, expected);
 }
 
 // Issue #1066.

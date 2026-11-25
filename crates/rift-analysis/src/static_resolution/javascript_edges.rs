@@ -1,6 +1,6 @@
 //! ECMAScript containment, access, type usage, and override facts.
 
-use rift_core::{ReferenceRole, SourceRange, SymbolId};
+use rift_core::{ReferenceRole, SourceLocation, SourceRange, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
@@ -33,16 +33,22 @@ impl<'source> Index<'source> {
             // holding that value is the caller: the callable it defines, or the
             // variable, field or object member whose initializer builds it.
             (Some(value), _) => scopes.definitions.resolve(value.start, value.end).copied(),
-            // Outside every function, the declaration receiving an initializer owns its calls.
+            // Outside every function, fields own their initializer calls. In package
+            // facts, variable and literal property initializers also name their holder.
             (None, None) => scopes
                 .definitions
                 .resolve(range.start, range.end)
                 .copied()
                 .filter(|symbol| match symbol.syntax_element_kind {
                     Some("field_definition" | "public_field_definition") => true,
-                    Some("variable_declarator" | "pair") => symbol
-                        .name_range
-                        .is_some_and(|name| name.end <= range.start),
+                    Some("variable_declarator" | "pair") => {
+                        matches!(
+                            file.document.placement.origin().location(),
+                            Some(SourceLocation::Dependency { .. })
+                        ) && symbol
+                            .name_range
+                            .is_some_and(|name| name.end <= range.start)
+                    }
                     _ => false,
                 }),
             (None, Some(_)) => None,
