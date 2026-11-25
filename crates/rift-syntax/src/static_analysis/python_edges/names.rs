@@ -76,7 +76,12 @@ impl Names {
             let end = usize::try_from(binding.name.end).ok()?;
             source.get(start..end).map(|name| (binding.scope, name))
         };
-        let mut bound = facts.bindings.iter().map(text).collect::<BTreeSet<_>>();
+        let mut bound = facts
+            .bindings
+            .iter()
+            .filter(|binding| !matches!(binding.kind, StaticBindingKind::PythonMemberWrite { .. }))
+            .map(text)
+            .collect::<BTreeSet<_>>();
         let deleted = self.deleted.into_iter();
         let added = deleted.filter(|binding| bound.insert(text(binding)));
         let added = added.collect::<Vec<_>>();
