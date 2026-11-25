@@ -82,7 +82,7 @@ fn records(properties: &Object, definitions: &mut Object) -> Value {
         .remove("default");
 
     let mut unit = definitions["PackageSourceUnit"].clone();
-    omit(&mut unit, "unit");
+    optional(&mut unit, "unit");
     unit["properties"]["base"] = identity(false, false);
     unit["properties"]["origin"] = json!({"$ref": "#/$defs/SymbolOrigin"});
     unit["properties"]["declarations"] = array(

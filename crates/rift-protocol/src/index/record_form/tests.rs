@@ -135,6 +135,40 @@ fn package_records_preserve_explicit_cuts_and_unit_origin() {
 }
 
 #[test]
+fn package_records_preserve_a_foreign_or_custom_unit_identity() {
+    for id in [
+        "rift://source/pypi/pypi.org/companion/demo/__init__.py",
+        "rift://source/external/demo/__init__.py",
+    ] {
+        let mut expected = publication();
+        expected.format_revision = super::PACKAGE_PUBLICATION_FORMAT_REVISION;
+        expected.units[0].unit.0 = id.into();
+        for declaration in &mut expected.declarations {
+            declaration.unit.0 = id.into();
+        }
+        expected.documents[0].identity = id.into();
+        expected.documents[0].unit.0 = id.into();
+        expected.edges[0]
+            .occurrence
+            .as_mut()
+            .expect("source occurrence")
+            .unit
+            .0 = id.into();
+        refresh_digests(&mut expected);
+        let bytes = encode_package_records(&expected).expect("write publication");
+        let compact: Value = serde_json::from_str(&bytes).expect("record form");
+        assert_eq!(compact["records"]["units"][0]["unit"], id);
+        assert_eq!(
+            decode_package_records(bytes.as_bytes()).expect("restore publication"),
+            expected
+        );
+
+        expected.units[0].path.0 = "another.py".into();
+        assert!(encode_package_records(&expected).is_err());
+    }
+}
+
+#[test]
 fn package_records_check_header_counts_before_decoding_rows() {
     let bytes = encode_package_records(&publication()).expect("encode fixture");
     assert!(bytes.starts_with("{\"header\":{"));

@@ -15,7 +15,7 @@ use super::{
 };
 use crate::canonical::{canonical_json, record_digest_without_member};
 use crate::documentation::DocumentationIndex;
-use crate::identity::{SymbolOwner, released_source_identity};
+use crate::identity::{SymbolOwner, parse_source_unit_identity, released_source_identity};
 use crate::read::{
     Digest, PackageIdentity, RuntimeIdentity, SourceKind, SourceLocationKind, Symbol, SymbolId,
     SymbolKind, SymbolOrigin,
@@ -354,10 +354,12 @@ fn encode_units(
     for (index, unit) in units.iter_mut().enumerate() {
         let id = take_text(unit, "unit")?;
         let path = text(unit, "path")?;
-        if released_source_identity(&publication.owner, path)? != id
-            || by_unit.insert(id, index).is_some()
-        {
-            return Err(invalid("source unit path does not establish one identity"));
+        if !released_source_identity(&publication.owner, path).is_ok_and(|default| default == id) {
+            validate_unit_path(&id, path)?;
+            unit.insert("unit".into(), id.clone().into());
+        }
+        if by_unit.insert(id, index).is_some() {
+            return Err(invalid("publication repeats a source unit"));
         }
         source_bytes = count_unit_source_bytes(unit, source_bytes)?;
     }
@@ -479,8 +481,13 @@ fn restore_units(
     for raw in blocks {
         let mut unit = serde_json::from_str(raw.get()).map_err(|error| json_error(&error))?;
         verify_record_digest(&mut unit)?;
-        let path = text(&unit, "path")?;
-        let id = released_source_identity(owner, path)?;
+        let id = if unit.contains_key("unit") {
+            let id = take_text(&mut unit, "unit")?;
+            validate_unit_path(&id, text(&unit, "path")?)?;
+            id
+        } else {
+            released_source_identity(owner, text(&unit, "path")?)?
+        };
         if !units.insert(id.clone()) {
             return Err(invalid("publication repeats a source unit"));
         }
@@ -521,6 +528,15 @@ fn restore_units(
         expanded.units.push(decode_row(unit)?);
     }
     Ok(total_source)
+}
+
+fn validate_unit_path(id: &str, path: &str) -> Result<(), RiftError> {
+    let (_, original) = parse_source_unit_identity(id)?;
+    if path == original {
+        Ok(())
+    } else {
+        Err(invalid("source unit path differs from its identity"))
+    }
 }
 
 struct Context {

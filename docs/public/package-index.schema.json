@@ -2402,6 +2402,10 @@
         "source_complete": {
           "description": "Whether `source` holds the whole file. `false` means the bytes were cut at the\nbound; `content_digest` still covers the whole file.",
           "type": "boolean"
+        },
+        "unit": {
+          "$ref": "#/$defs/SourceUnitId",
+          "description": "The unit this file is filed under."
         }
       },
       "required": [
