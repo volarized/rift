@@ -2061,9 +2061,8 @@ fn plain_tar_members_are_omitted_from_a_stream() -> TestResult {
     let mut tar = Vec::new();
     flate2::read::GzDecoder::new(bytes.as_slice()).read_to_end(&mut tar)?;
     let limits = skipping(&bytes)?;
-    check_tar_headers(tar.as_slice(), limits)?;
     let mut output = ArchiveOutput::new(Some("release"), limits, limits.expanded(tar.len()));
-    read_tar_members(tar.as_slice(), &mut output)?;
+    read_tar_entries(tar.as_slice(), &mut output)??;
     let files = output.into_files(FileDigest::of(&tar));
     assert_eq!(files.files().len(), 1);
     assert_eq!(files.omissions()[0].path().as_str(), "native.so");
@@ -3148,7 +3147,7 @@ fn a_pax_size_that_differs_from_its_header_is_refused_in_both_modes() -> TestRes
 
 // Issue #1064.
 #[test]
-fn a_second_extended_header_of_one_member_is_refused_by_the_header_pass() -> TestResult {
+fn a_second_extended_header_of_one_member_is_refused_by_the_header_check() -> TestResult {
     let size = pax_record("size", "1");
     let path = pax_record("path", "release/a");
     for (flag, first, second) in [
@@ -3163,8 +3162,11 @@ fn a_second_extended_header_of_one_member_is_refused_by_the_header_pass() -> Tes
         ]
         .concat();
         for limits in both_modes(ArchiveLimits::default()) {
+            let mut output =
+                ArchiveOutput::new(Some("release"), limits, limits.expanded(tar.len()));
             assert_eq!(
-                check_tar_headers(tar.as_slice(), limits).expect_err("a second extended header"),
+                read_tar_entries(tar.as_slice(), &mut output)
+                    .expect_err("a second extended header"),
                 ArchiveError::InvalidArchive
             );
             assert_eq!(
@@ -3182,6 +3184,78 @@ fn a_second_extended_header_of_one_member_is_refused_by_the_header_pass() -> Tes
             let bytes = gzip(&tar.map(Vec::as_slice).concat())?;
             assert_eq!(retained(&read(&bytes, limits)?), [("a", b"x".as_slice())]);
         }
+    }
+    Ok(())
+}
+
+// Issue #1118.
+#[test]
+fn an_extended_header_in_a_v7_header_is_refused() -> TestResult {
+    let pax = pax_record("path", "release/other");
+    for (flag, content) in [
+        (b'L', b"release/other\0".as_slice()),
+        (b'x', pax.as_bytes()),
+    ] {
+        let member = raw_member("release/a", b'0', b"x")?;
+        let ustar = [raw_member("release/notes", flag, content)?, member.clone()].concat();
+        let mut header = tar::Header::new_old();
+        header.set_path("release/notes")?;
+        header.set_size(u64::try_from(content.len())?);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::new(flag));
+        header.set_cksum();
+        let mut old = ustar.clone();
+        old[..512].copy_from_slice(header.as_bytes());
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                retained(&read(&gzip(&ustar)?, limits)?),
+                [("other", b"x".as_slice())]
+            );
+            assert_eq!(
+                read(&gzip(&old)?, limits).expect_err("a v7 extended header"),
+                ArchiveError::UnsupportedEntry
+            );
+        }
+    }
+    Ok(())
+}
+
+// The order of refusals that the two tar passes had.
+#[test]
+fn a_header_refusal_is_reported_before_an_earlier_member_refusal() -> TestResult {
+    let unsafe_member = raw_member("release/../a", b'0', b"x")?;
+    let outside = raw_member("other/a", b'0', b"x")?;
+    let device = raw_member("release/dev", b'3', b"")?;
+    let pending = raw_member("././@LongLink", b'L', b"release/a\0")?;
+    let unsafe_path = ArchiveError::unsafe_path("release/../a");
+    let cases = [
+        (
+            vec![&unsafe_member, &device],
+            ArchiveError::UnsupportedEntry,
+        ),
+        (vec![&unsafe_member, &outside], unsafe_path.clone()),
+        (vec![&outside, &unsafe_member], ArchiveError::RootMismatch),
+        (vec![&unsafe_member, &pending], unsafe_path),
+        (vec![&pending], ArchiveError::InvalidArchive),
+    ];
+    for (members, expected) in cases {
+        let tar = members.into_iter().map(Vec::as_slice).collect::<Vec<_>>();
+        for limits in both_modes(ArchiveLimits::default()) {
+            assert_eq!(
+                read(&gzip(&tar.concat())?, limits).expect_err("a refused archive"),
+                expected
+            );
+        }
+    }
+    // The decompressed byte bound is reported before both.
+    let zeros = raw_member("release/zeros", b'0', &vec![0; 64 * 1024])?;
+    let bytes = gzip(&[unsafe_member, device, zeros].concat())?;
+    let limits = ArchiveLimits::new(bytes.len(), 32 * 1024, 32 * 1024, 8, 10_000)?;
+    for limits in both_modes(limits) {
+        assert_eq!(
+            read(&bytes, limits).expect_err("the decompressed byte bound"),
+            ArchiveBound::ExpandedBytes.exceeded(32 * 1024 + 1, 32 * 1024, None)
+        );
     }
     Ok(())
 }

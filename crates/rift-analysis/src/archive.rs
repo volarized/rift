@@ -579,8 +579,8 @@ pub fn read_archive(
 /// dropped as they are decoded, and [`ArchiveFiles::omissions`] lists it as
 /// [`ArchiveOmissionReason::Unselected`].
 ///
-/// The reader is read from its start: once for the digest, and then in two passes for tar and
-/// by member for ZIP. It serves exactly the bytes whose digest was established: each block read
+/// The reader is read from its start: once for the digest, and then once for tar and by member
+/// for ZIP. It serves exactly the bytes whose digest was established: each block read
 /// later is compared with the digest of the first pass before a byte of it is used. The reader
 /// keeps buffers, the digest states of its blocks, the member inventory, and the selected files;
 /// the container is never held whole.
@@ -715,7 +715,7 @@ impl<'a, R: Read + Seek> Source<'a, R> {
         if !verified {
             return Err(ArchiveError::DigestMismatch);
         }
-        // Two passes read every block, and a member costs a few blocks of its own.
+        // One tar pass or every ZIP member reads each block, a ZIP directory is read again, and a member costs a few blocks of its own.
         let reads = (states.len() as u64 + limits.members as u64 + 1024).saturating_mul(4);
         Ok(Self {
             reader,
@@ -815,23 +815,20 @@ impl<R> Seek for Source<'_, R> {
 
 const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_DEFAULT;
 
-/// Decodes the gzip stream once for header validation and once for the members.
+/// Decodes the gzip stream once, checking every header and reading every member.
 fn read_tar<R: Read + Seek>(
     source: &mut Source<'_, R>,
     compressed: usize,
     output: &mut ArchiveOutput<'_>,
 ) -> Result<(), ArchiveError> {
     source.restart();
-    let mut stream = gzip_stream(&mut *source, output.expanded);
-    let checked = check_tar_headers(&mut stream, output.limits);
-    // The rest of the stream decides the byte bound and gzip's own checks before a header
-    // refusal.
+    let mut stream = gzip_stream(source, output.expanded);
+    let entries = read_tar_entries(&mut stream, output);
+    // The rest of the stream decides the byte bound and gzip's own checks before a header or a
+    // member refusal.
     std::io::copy(&mut stream, &mut std::io::sink()).map_err(|_| ArchiveError::InvalidArchive)?;
     check_expansion(&stream, compressed, output)?;
-    checked?;
-    source.restart();
-    let stream = gzip_stream(source, output.expanded);
-    read_tar_members(stream, output)
+    entries?
 }
 
 /// The gzip stream of `source`, up to one byte past the decompressed byte bound.
@@ -935,14 +932,54 @@ struct TarExtension {
 }
 
 impl TarExtension {
-    /// The member path in the order the tar library reads it: GNU long name, PAX, header.
-    fn member_path(&self, header: &[u8]) -> Option<ProjectPath> {
+    /// The member name as a tar reader resolves it: GNU long name, PAX path, header name.
+    fn path_bytes<'a>(&'a self, header: &'a [u8]) -> &'a [u8] {
         let name = self
             .long_name
             .as_deref()
             .map(|name| name.strip_suffix(b"\0").unwrap_or(name));
-        let path = name.or(self.path.as_deref()).unwrap_or(header);
-        member_path(std::str::from_utf8(path).ok()?).filter(|path| !path.as_str().is_empty())
+        name.or(self.path.as_deref()).unwrap_or(header)
+    }
+
+    /// The member path that a refusal names, when it is one.
+    fn member_path(&self, header: &[u8]) -> Option<ProjectPath> {
+        let path = std::str::from_utf8(self.path_bytes(header)).ok()?;
+        member_path(path).filter(|path| !path.as_str().is_empty())
+    }
+
+    /// Reads the records of one extended header, whose bytes the caller bounded.
+    fn read(&mut self, entry: &mut tar::Entry<'_, impl Read>) -> Result<(), ArchiveError> {
+        let kind = entry.header().entry_type();
+        let global = kind.is_pax_global_extensions();
+        if kind.is_gnu_longname() {
+            let mut name = Vec::new();
+            entry
+                .read_to_end(&mut name)
+                .map_err(|_| ArchiveError::InvalidArchive)?;
+            self.long_name = Some(name);
+            return Ok(());
+        }
+        self.local |= !global;
+        let values = entry
+            .pax_extensions()
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        for value in values.into_iter().flatten() {
+            let value = value.map_err(|_| ArchiveError::InvalidArchive)?;
+            let key = value.key_bytes();
+            if is_sparse(key) || (global && changes_members(key)) {
+                return Err(ArchiveError::UnsupportedEntry);
+            }
+            match key {
+                // The first path record counts, as in the tar library.
+                b"path" => {
+                    self.path
+                        .get_or_insert_with(|| value.value_bytes().to_vec());
+                }
+                b"size" => self.record_size(value.value_bytes()),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Whether an extended header of the next member was read.
@@ -978,12 +1015,22 @@ fn is_sparse(key: &[u8]) -> bool {
     key.starts_with(b"GNU.sparse") || key == b"SCHILY.filetype"
 }
 
-/// Checks every raw header before the tar library allocates extended header contents.
-fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), ArchiveError> {
+/// Reads every tar entry in one pass, and checks its header before its contents are read.
+///
+/// The iteration is raw: the tar library exposes GNU and PAX extended headers before it
+/// allocates their contents, and this reader applies them itself.
+///
+/// The outer error is the first header refusal. The inner one is the first member refusal: the
+/// headers after it are still checked, and no member after it is read.
+fn read_tar_entries(
+    reader: impl Read,
+    output: &mut ArchiveOutput<'_>,
+) -> Result<Result<(), ArchiveError>, ArchiveError> {
+    let limits = output.limits;
     let mut raw = tar::Archive::new(reader);
     raw.set_ignore_zeros(true);
     let mut extended = TarExtension::default();
-    // Raw iteration exposes GNU and PAX headers before the library allocates their contents.
+    let mut read = Ok(());
     let mut members = 0_u64;
     let mut extended_headers = 0_u64;
     for entry in raw
@@ -993,8 +1040,7 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
     {
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
-        let global = kind.is_pax_global_extensions();
-        let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions() || global;
+        let extension = is_extended_header(entry.header());
         let (bound, count) = if extension {
             (ArchiveBound::ExtendedHeaders, &mut extended_headers)
         } else {
@@ -1009,13 +1055,13 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
         if !kind.is_file() && !kind.is_dir() && !extension && !link {
             return Err(ArchiveError::UnsupportedEntry);
         }
-        // The tar library gives pending records to a global header instead of their member.
-        if global && extended.pending() {
+        // A global header between another extended header and its member names neither.
+        if kind.is_pax_global_extensions() && extended.pending() {
             return Err(ArchiveError::UnsupportedEntry);
         }
-        // The tar library refuses a second one too, after it read the first.
-        let local = kind.is_pax_local_extensions();
-        if (local && extended.local) || (kind.is_gnu_longname() && extended.long_name.is_some()) {
+        if (kind.is_pax_local_extensions() && extended.local)
+            || (kind.is_gnu_longname() && extended.long_name.is_some())
+        {
             return Err(ArchiveError::InvalidArchive);
         }
         let size = entry.size();
@@ -1023,86 +1069,55 @@ fn check_tar_headers(reader: impl Read, limits: ArchiveLimits) -> Result<(), Arc
             let member = extended.member_path(&entry.path_bytes());
             return Err(limits.member_bytes_exceeded(size, member));
         }
-        if extension && size > limits.extension_bytes as u64 {
-            return Err(ArchiveBound::ExtensionBytes.exceeded(
-                size,
-                limits.extension_bytes as u64,
-                extended.member_path(&entry.path_bytes()),
-            ));
-        }
-        if kind.is_gnu_longname() {
-            let mut name = Vec::new();
-            entry
-                .read_to_end(&mut name)
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            extended.long_name = Some(name);
-        }
-        if let Some(values) = entry
-            .pax_extensions()
-            .map_err(|_| ArchiveError::InvalidArchive)?
-        {
-            for value in values {
-                let value = value.map_err(|_| ArchiveError::InvalidArchive)?;
-                let key = value.key_bytes();
-                if is_sparse(key) || (global && changes_members(key)) {
-                    return Err(ArchiveError::UnsupportedEntry);
-                }
-                match key {
-                    // The tar library reads the first path record.
-                    b"path" => {
-                        extended
-                            .path
-                            .get_or_insert_with(|| value.value_bytes().to_vec());
-                    }
-                    b"size" => extended.record_size(value.value_bytes()),
-                    _ => {}
-                }
-            }
-        }
         if extension {
-            extended.local |= local;
-        } else {
-            // A PAX size over the header's would move the reader past headers checked here.
-            if extended.disagrees(size) {
-                return Err(ArchiveError::InvalidArchive);
+            if size > limits.extension_bytes as u64 {
+                return Err(ArchiveBound::ExtensionBytes.exceeded(
+                    size,
+                    limits.extension_bytes as u64,
+                    extended.member_path(&entry.path_bytes()),
+                ));
             }
-            extended = TarExtension::default();
+            extended.read(&mut entry)?;
+            continue;
         }
+        // A PAX size over the header's would move another reader past headers checked here.
+        if extended.disagrees(size) {
+            return Err(ArchiveError::InvalidArchive);
+        }
+        if read.is_ok() {
+            read = push_tar_member(&extended, &mut entry, output);
+        }
+        extended = TarExtension::default();
     }
-    Ok(())
+    if extended.pending() {
+        read = read.and(Err(ArchiveError::InvalidArchive));
+    }
+    Ok(read)
 }
 
-fn read_tar_members(reader: impl Read, output: &mut ArchiveOutput<'_>) -> Result<(), ArchiveError> {
-    let mut archive = tar::Archive::new(reader);
-    archive.set_ignore_zeros(true);
-    let mut members = 0_u64;
-    for entry in archive
-        .entries()
-        .map_err(|_| ArchiveError::InvalidArchive)?
-    {
-        let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
-        let kind = entry.header().entry_type();
-        // The header pass counted every global header. Its name is the writer's own and names
-        // no member: POSIX defaults it to a path below the writer's temporary directory.
-        if kind.is_pax_global_extensions() {
-            continue;
-        }
-        members += 1;
-        if members > output.limits.members as u64 {
-            return Err(output.limits.members_exceeded(members, None));
-        }
-        let path = String::from_utf8(entry.path_bytes().into_owned()).map_err(|error| {
-            ArchiveError::unsafe_path(&String::from_utf8_lossy(error.as_bytes()))
-        })?;
-        if kind.is_symlink() || kind.is_hard_link() {
-            output.push_skipped_link(&path)?;
-            continue;
-        }
-        let directory = kind.is_dir();
-        let size = entry.size();
-        output.push(&path, directory, size, &mut entry)?;
+/// Whether a header describes the next member or the archive rather than a member of its own.
+///
+/// The tar library reads GNU and PAX local records only of a header in the GNU or ustar form.
+fn is_extended_header(header: &tar::Header) -> bool {
+    let kind = header.entry_type();
+    let recognized = header.as_gnu().is_some() || header.as_ustar().is_some();
+    kind.is_pax_global_extensions()
+        || (recognized && (kind.is_gnu_longname() || kind.is_pax_local_extensions()))
+}
+
+fn push_tar_member(
+    extended: &TarExtension,
+    entry: &mut tar::Entry<'_, impl Read>,
+    output: &mut ArchiveOutput<'_>,
+) -> Result<(), ArchiveError> {
+    let path = extended.path_bytes(&entry.path_bytes()).to_vec();
+    let path = String::from_utf8(path)
+        .map_err(|error| ArchiveError::unsafe_path(&String::from_utf8_lossy(error.as_bytes())))?;
+    let kind = entry.header().entry_type();
+    if kind.is_symlink() || kind.is_hard_link() {
+        return output.push_skipped_link(&path);
     }
-    Ok(())
+    output.push(&path, kind.is_dir(), entry.size(), entry)
 }
 
 fn read_zip<R: Read + Seek>(
