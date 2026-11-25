@@ -67,6 +67,7 @@ pub(super) struct EdgePythonKinds {
     guards: guards::TypeGuards,
     names: names::NameKinds,
     return_type: u16,
+    parameter_list: u16,
     loops: [u16; 2],
     /// Compound statements and clauses a class body may define methods under.
     conditional: [u16; 6],
@@ -141,6 +142,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             guards: guards::TypeGuards::new(&grammar),
             names: names::NameKinds::new(&grammar),
             return_type: field("return_type"),
+            parameter_list: field("parameters"),
             loops: [id("for_statement"), id("while_statement")],
             conditional: [
                 id("if_statement"),
@@ -170,6 +172,7 @@ impl EdgePythonKinds {
         } else if self.scopes[3..].contains(&id) {
             facts.expression_scopes.push(byte_range(syntax_element)?);
             self.edge_first_iterable(syntax_element, facts)?;
+            self.edge_evaluated_outside(syntax_element, facts)?;
         }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
@@ -193,6 +196,7 @@ impl EdgePythonKinds {
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
             self.edge_type_parameters(syntax_element, facts)?;
+            self.edge_evaluated_outside(syntax_element, facts)?;
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
@@ -292,8 +296,28 @@ impl EdgePythonKinds {
             .find(|child| child.kind_id() == self.assignment[3]);
         if let Some(iterable) = clause.and_then(|clause| clause.child_by_field_id(self.right)) {
             facts
-                .first_iterables
+                .evaluated_outside
                 .push((byte_range(comprehension)?, byte_range(iterable)?));
+        }
+        Ok(())
+    }
+
+    /// The parameters and return annotation of a function or lambda, and the arguments of a
+    /// class, which the enclosing scope evaluates.
+    fn edge_evaluated_outside(
+        &self,
+        scope: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let part = |field| scope.child_by_field_id(field).map(byte_range).transpose();
+        if let Some(arguments) = part(self.superclasses)? {
+            facts
+                .evaluated_outside
+                .push((byte_range(scope)?, arguments));
+        } else if let Some(parameters) = part(self.parameter_list)? {
+            let end = part(self.return_type)?.unwrap_or(parameters).end;
+            let outside = ByteRange { end, ..parameters };
+            facts.evaluated_outside.push((byte_range(scope)?, outside));
         }
         Ok(())
     }
@@ -305,6 +329,12 @@ impl EdgePythonKinds {
     ) -> Result<(), RiftError> {
         let Some(parameters) = definition.child_by_field_name("type_parameters") else {
             return Ok(());
+        };
+        // Python reads these names in a scope of their own around the definition's, which
+        // holds its parameters, annotations and arguments too.
+        let scope = ByteRange {
+            end: byte_range(definition)?.end,
+            ..byte_range(parameters)?
         };
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
@@ -322,12 +352,12 @@ impl EdgePythonKinds {
                 candidate = element.named_child(0);
             }
             if let Some(name) = name {
-                facts.bindings.push(self.scoped_binding(
-                    name,
-                    definition,
-                    byte_range(definition)?.start,
-                    StaticBindingKind::Shadow,
-                )?);
+                facts.bindings.push(StaticBinding {
+                    name: byte_range(name)?,
+                    scope,
+                    available_from: scope.start,
+                    kind: StaticBindingKind::Shadow,
+                });
             } else {
                 facts.unsupported_bindings.push(byte_range(definition)?);
             }

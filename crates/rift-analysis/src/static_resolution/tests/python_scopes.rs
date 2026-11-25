@@ -92,3 +92,95 @@ fn test_python_annotated_collected_parameters_hold_no_instance() {
     let body = "class C:\n    def m(self): pass\n    def n(*args: int): args.m()\ndef f(*args: C, **kwargs: C):\n    args.m()\n    kwargs.m()\n";
     assert_eq!(called(body), Vec::<String>::new());
 }
+
+#[test]
+fn test_python_defaults_annotations_and_class_arguments_read_the_enclosing_scope() {
+    for (body, expected) in [
+        ("def f(h=h()): pass\n", vec!["f -> h"]),
+        ("def f(o=1, h=o()): pass\n", vec!["f -> o"]),
+        ("value = lambda h=h(): 0\n", vec![" -> h"]),
+        ("value = lambda h=1: h()\n", vec![]),
+        ("def f():\n    h = 1\n    def g(o=h()): pass\n", vec![]),
+        (
+            "class C:\n    def m(self):\n        def g(h=h()): pass\n    h = 1\n",
+            vec!["C/m/g -> h"],
+        ),
+        (
+            "class C:\n    h = 1\n    def m(self, value=h()): pass\n",
+            vec![],
+        ),
+        ("class C(metaclass=h()):\n    h = 1\n", vec!["C -> h"]),
+        ("def f[h](value=h()): pass\n", vec![]),
+        ("class C[h](metaclass=h()): pass\n", vec![]),
+        ("class C[h]:\n    def m(self): h()\n", vec![]),
+    ] {
+        assert_eq!(called(body), expected, "{body}");
+    }
+}
+
+#[test]
+fn test_python_class_scopes_are_read_in_their_own_code_only() {
+    for (body, expected) in [
+        ("class C:\n    h = 1\n    value = h()\n", vec![]),
+        (
+            "class C:\n    h = 1\n    def m(self): h()\n",
+            vec!["C/m -> h"],
+        ),
+        (
+            "class C:\n    h = 1\n    value = [h() for item in (1,)]\n",
+            vec!["C -> h"],
+        ),
+        (
+            "class C:\n    h = 1\n    value = [item for item in h()]\n",
+            vec![],
+        ),
+        (
+            "class C:\n    h = 1\n    value = lambda self: h()\n",
+            vec!["C -> h"],
+        ),
+        (
+            "class C:\n    h = 1\n    value = lambda self=h(): 0\n",
+            vec![],
+        ),
+        (
+            "def f():\n    class C:\n        h = 1\n        value = h()\n",
+            vec![],
+        ),
+        (
+            "def f():\n    class C:\n        h = 1\n        def m(self, value=h()):\n            def g(value=h()): pass\n            h()\n",
+            vec!["f/C/m/g -> h", "f/C/m -> h"],
+        ),
+        (
+            "class C:\n    h = 1\n    class D:\n        value = h()\n",
+            vec!["C/D -> h"],
+        ),
+    ] {
+        assert_eq!(called(body), expected, "{body}");
+    }
+}
+
+#[test]
+fn test_python_annotations_read_past_the_parameters() {
+    let body = "class C:\n    def m(self): pass\ndef f(C: C, o: C): o.m()\n";
+    assert_eq!(called(body), ["f -> C/m"]);
+}
+
+#[test]
+fn test_python_external_names_follow_the_same_scopes() {
+    let source = "import re\nclass C:\n    re = 1\n    len = 1\n    def m(self, re=re.compile('')): return len('')\n    def n(self): re.escape('')\ndef f(len=len('')): pass\ndef g():\n    with f() as re: re.escape('')\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let called = result
+        .external
+        .iter()
+        .filter(|external| external.role == super::ReferenceRole::Call)
+        .map(|external| external.target.as_str().rsplit("/python/").next())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        called,
+        [
+            Some("builtins/len"),
+            Some("re/escape"),
+            Some("builtins/len")
+        ]
+    );
+}
