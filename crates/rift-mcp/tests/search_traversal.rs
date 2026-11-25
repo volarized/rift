@@ -1384,7 +1384,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
         ),
     )
     .await?;
-    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
+    assert_eq!(symbol_names(&counted), ["LIMIT", "leaf"], "{counted}");
     let warnings = counted["warnings"]
         .as_array()
         .ok_or("a dropped callee warns")?;
@@ -2120,7 +2120,11 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         ),
     )
     .await?;
-    assert_eq!(symbol_names(&counted), ["leaf", "len"], "{counted}");
+    assert_eq!(
+        symbol_names(&counted),
+        ["LIMIT", "leaf", "len"],
+        "{counted}"
+    );
     let len = callee_hit(&counted, "len")?;
     let id = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
     assert_eq!(len["hit"]["symbol"]["id"], json!(id), "{len}");
@@ -2395,7 +2399,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
         ),
     )
     .await?;
-    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
+    assert_eq!(symbol_names(&counted), ["LIMIT", "leaf"], "{counted}");
     let codes: Vec<&Value> = counted["warnings"]
         .as_array()
         .into_iter()
@@ -2514,7 +2518,7 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
         ),
     )
     .await?;
-    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
+    assert_eq!(symbol_names(&counted), ["LIMIT", "leaf"], "{counted}");
     let warnings = &counted["warnings"];
     assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
     assert_eq!(

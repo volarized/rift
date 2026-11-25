@@ -28,6 +28,9 @@ impl<'source> Index<'source> {
                     .text(reference.target)
                     .is_some_and(|text| !text.contains('.'))
             {
+                if reference.role == ReferenceRole::Read {
+                    self.python_name_read(file, reference.target, work, result);
+                }
                 continue;
             }
             let occurrence = self
@@ -38,20 +41,7 @@ impl<'source> Index<'source> {
                         .flatten()
                 })
                 .and_then(|target| {
-                    let mut occurrence = self.occurrence(
-                        file,
-                        reference.target,
-                        reference.target,
-                        reference.role,
-                        target,
-                    )?;
-                    // An annotation belongs to its declaration. Accesses belong to the enclosing callable.
-                    if reference.role != ReferenceRole::Type
-                        && let Some(caller) = file.enclosing_callable(reference.target)
-                    {
-                        occurrence.edge_from = self.python_identity(file, reference.target, caller);
-                    }
-                    Some(occurrence)
+                    self.python_access(file, reference.target, reference.role, target)
                 });
             if !names_callee(&callees, reference, occurrence.as_ref()) {
                 result.record(occurrence);
@@ -87,6 +77,23 @@ impl<'source> Index<'source> {
                 }
             }
         }
+    }
+
+    /// An access belongs to the enclosing callable, an annotation to its declaration.
+    pub(super) fn python_access(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        role: ReferenceRole,
+        target: Target<'source>,
+    ) -> Option<StaticOccurrence> {
+        let mut occurrence = self.occurrence(file, range, range, role, target)?;
+        if role != ReferenceRole::Type
+            && let Some(caller) = file.enclosing_callable(range)
+        {
+            occurrence.edge_from = self.python_identity(file, range, caller);
+        }
+        Some(occurrence)
     }
 
     /// The declaration a write to `module.name` names: the module's own declaration of `name`,

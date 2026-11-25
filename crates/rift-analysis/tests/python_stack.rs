@@ -151,7 +151,7 @@ fn a_chain_of_constructed_values_ends() {
     let found = chained(format!("{CLASS}a0 = C\n{links}a{LAST}.m()\n"));
     assert_edges(
         &found,
-        1003,
+        1004,
         &["module/C -> module/C/m", "module -> module/C"],
     );
 }
@@ -164,7 +164,7 @@ fn a_chain_of_constructed_attributes_ends() {
     ));
     assert_edges(
         &found,
-        3005,
+        3006,
         &["module/A -> module/A/f", "module/A/f -> module/A/a998"],
     );
 }
@@ -177,7 +177,7 @@ fn a_chain_of_aliases_ends() {
     ));
     assert_edges(
         &found,
-        1007,
+        2007,
         &[
             "module -> module/C/m",
             "module/D -> module/C",
@@ -192,7 +192,7 @@ fn a_chain_of_container_aliases_ends() {
     let found = chained(format!(
         "{CLASS}from typing import List\na0: List[C] = []\n{links}for x in a{LAST}:\n    x.m()\n"
     ));
-    assert_edges(&found, 1005, &["module -> module/a998"]);
+    assert_edges(&found, 2005, &["module -> module/a998"]);
 }
 
 #[test]
@@ -428,7 +428,7 @@ fn a_chain_of_arguments_ends() {
     ));
     assert_edges(
         &found,
-        5002,
+        6001,
         &["module -> module/C/m", "module -> module/f999"],
     );
 }

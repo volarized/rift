@@ -1,0 +1,285 @@
+//! Python names read and written as values.
+
+use super::{ReferenceRole, StaticResolution, WORK_MAX, resolution, source_of, target};
+use rift_protocol::read::EdgeKind;
+
+/// The accesses of `main.py` that spell a plain name, as `from role name -> to`.
+fn accesses(sources: &[(&str, &str)]) -> (Vec<String>, StaticResolution) {
+    let result = resolution("python", sources, &[], WORK_MAX);
+    assert!(!result.exhausted);
+    let prefix = "rift://symbol/local/python/";
+    let short = |identity: &str| identity.trim_start_matches(prefix).to_owned();
+    let source = sources[0].1;
+    let mut found = result
+        .occurrences
+        .iter()
+        .filter(|access| {
+            access.edge_kind.is_none()
+                && matches!(access.role, ReferenceRole::Read | ReferenceRole::Write)
+                && access.binding.unit().to_string() == "rift://source/project/main.py"
+                && !source_of(access, source).contains('.')
+        })
+        .map(|access| {
+            let from = access.edge_from.as_ref().map(|from| short(from.as_str()));
+            let role = if access.role == ReferenceRole::Read {
+                "reads"
+            } else {
+                "writes"
+            };
+            let line = source[..usize::try_from(access.binding.range().start()).expect("start")]
+                .matches('\n')
+                .count();
+            let from = from.unwrap_or_default();
+            (
+                access.binding.range().start(),
+                format!("{line} {from} {role} {}", short(target(access))),
+            )
+        })
+        .collect::<Vec<_>>();
+    found.sort();
+    (found.into_iter().map(|(_, text)| text).collect(), result)
+}
+
+/// The accesses of one module and its count of reads left without a target.
+fn module(body: &str) -> (Vec<String>, u64) {
+    let (found, result) = accesses(&[("main.py", body)]);
+    let refused = result.omitted.get(&EdgeKind::Reads).copied();
+    (found, refused.unwrap_or_default())
+}
+
+const NAMES: &str = "def f(): pass\nclass C: pass\nN = 1\n";
+
+/// The accesses of a body below [`NAMES`], without any refused; lines count from its first one.
+fn below(body: &str) -> Vec<String> {
+    let (found, refused) = module(&format!("{NAMES}{body}"));
+    assert_eq!(refused, 0, "{body}");
+    found
+        .iter()
+        .map(|access| {
+            let (line, rest) = access.split_once(' ').expect("line");
+            let line = line.parse::<usize>().expect("line") - NAMES.lines().count();
+            format!("{line} {rest}").replace("main/", "")
+        })
+        .collect()
+}
+
+/// Asserts the reads of each body.
+fn assert_reads(cases: &[(&str, &[&str])]) {
+    for (body, expected) in cases {
+        let mut found = below(body);
+        found.retain(|access| access.contains(" reads "));
+        assert_eq!(found, *expected, "{body}");
+    }
+}
+
+#[test]
+fn test_python_names_read_as_values_name_their_declaration() {
+    assert_reads(&[
+        ("g = f\n", &["0  reads f"]),
+        (
+            "def run(): return f, C, N\n",
+            &["0 run reads f", "0 run reads C", "0 run reads N"],
+        ),
+        ("def run():\n    f(key=f)\n", &["1 run reads f"]),
+        (
+            "def run(x=N, *, y: int = N): pass\n",
+            &["0 run reads N", "0 run reads N"],
+        ),
+        ("@f(N)\ndef run(): pass\n", &["0 run reads N"]),
+        (
+            "def run():\n    try: pass\n    except C: raise N\n",
+            &["2 run reads C", "2 run reads N"],
+        ),
+        (
+            "def run(x): return isinstance(x, C) and N[0]\n",
+            &["0 run reads C", "0 run reads N"],
+        ),
+        (
+            "def run():\n    def inner(): pass\n    return inner\n",
+            &["2 run reads run/inner"],
+        ),
+        (
+            "class D:\n    m = N\n    n = m\n",
+            &["1  reads N", "2  reads D/m"],
+        ),
+        (
+            "def run(): return [N for x in f for y in N]\n",
+            &["0 run reads N", "0 run reads f", "0 run reads N"],
+        ),
+        ("x = lambda y=N: f\n", &["0  reads N", "0  reads f"]),
+        (
+            "def run():\n    global N\n    return N\n",
+            &["2 run reads N"],
+        ),
+        (
+            "def run():\n    global G\n    G = 1\ndef other(): return G\n",
+            &["3 other reads G"],
+        ),
+        (
+            "def run():\n    while N: f(N)\n",
+            &["1 run reads N", "1 run reads N"],
+        ),
+    ]);
+}
+
+#[test]
+fn test_python_callees_and_stated_names_are_no_reads() {
+    assert_reads(&[
+        ("f()\n", &[]),
+        ("C()\n", &[]),
+        ("N()\n", &[]),
+        ("@f\ndef run(): pass\n", &[]),
+        ("def run(N: C) -> C: pass\n", &[]),
+        ("class D(C): pass\n", &[]),
+        ("run(N=1)\n", &[]),
+        ("x.N = x.f\n", &[]),
+    ]);
+}
+
+#[test]
+fn test_python_names_shadowed_in_their_scope_are_no_reads() {
+    assert_reads(&[
+        ("def run(f): return f\n", &[]),
+        ("def run(*f, **N): return f, N\n", &[]),
+        ("def run(*f: int): return f\n", &[]),
+        ("def run():\n    f = 1\n    return f\n", &[]),
+        ("def run():\n    print(f)\n    f = 1\n", &[]),
+        ("def run():\n    for f in (): print(f)\n", &[]),
+        ("def run():\n    with x as f: print(f)\n", &[]),
+        ("def run():\n    with x as (f, [N]): print(f, N)\n", &[]),
+        (
+            "def run():\n    try: pass\n    except x as f: print(f)\n",
+            &[],
+        ),
+        (
+            "def run(x):\n    match x:\n        case [f, *N]: print(f, N)\n",
+            &[],
+        ),
+        ("def run():\n    if (f := 1): print(f)\n", &[]),
+        ("def run():\n    [f := x for x in ()]\n    print(f)\n", &[]),
+        ("def run():\n    f += 1\n", &[]),
+        ("def run():\n    print(f)\n    del f\n", &[]),
+        ("def run(): return [f for f in ()]\n", &[]),
+        ("def run(): return {f: N for f, N in ()}\n", &[]),
+        ("def run(): return lambda f: f\n", &[]),
+        ("def run(f):\n    def inner(): return f\n", &[]),
+        ("def run(f):\n    class D:\n        x = f\n", &[]),
+        (
+            "def run():\n    f = 1\n    def inner():\n        nonlocal f\n        f = 2\n        return f\n",
+            &[],
+        ),
+        ("def run(f=f): return f\n", &["0 run reads f"]),
+        ("x = lambda f=f: f\n", &["0  reads f"]),
+        ("def run(f):\n    def inner(x=f): pass\n", &[]),
+        ("def run(): return [f for f in f]\n", &["0 run reads f"]),
+        (
+            "def run(): return [[f for f in f] for x in N]\n",
+            &["0 run reads f", "0 run reads N"],
+        ),
+        ("def run[f](): return f\n", &[]),
+    ]);
+}
+
+#[test]
+fn test_python_class_names_are_read_in_the_class_body_alone() {
+    assert_reads(&[
+        (
+            "class D:\n    f = 1\n    def m(self): return f\n",
+            &["2 D/m reads f"],
+        ),
+        ("class D:\n    f = [f]\n", &["1  reads f"]),
+        ("class D:\n    f = f\n", &["1  reads f"]),
+        ("class D:\n    x = f\n    f = 1\n", &["1  reads f"]),
+        ("class D:\n    m = 1\n    x = [m for y in ()]\n", &[]),
+        (
+            "class D:\n    m = ()\n    x = [y for y in m]\n",
+            &["2  reads D/m"],
+        ),
+        (
+            "class D:\n    m = 1\n    x = lambda self, y=m: y\n",
+            &["2  reads D/m"],
+        ),
+        (
+            "class D:\n    m = 1\n    def n(self, y=m): return m\n",
+            &["2 D/n reads D/m"],
+        ),
+        ("class D:\n    m = 1\n    class E:\n        x = m\n", &[]),
+        (
+            "class D:\n    f = 1\n    class E:\n        x = f\n",
+            &["3  reads f"],
+        ),
+        ("class D(x=C):\n    C = 1\n", &[]),
+        (
+            "class D:\n    for x in ():\n        y = z\n        z = 1\n",
+            &["2  reads D/z"],
+        ),
+    ]);
+}
+
+#[test]
+fn test_python_names_bound_more_than_once_need_one_declaration() {
+    assert_reads(&[
+        (
+            "if x: M = 1\nelse: M = 2\ndef run(): return M\n",
+            &["2 run reads M"],
+        ),
+        (
+            "if x:\n    def g(): pass\nelse:\n    def g(): pass\ny = g\n",
+            &["4  reads g"],
+        ),
+        (
+            "def g(): pass\ng = f(g)\ny = g\n",
+            &["1  reads g", "2  reads g"],
+        ),
+        (
+            "def run():\n    def g(): pass\n    g = f(g)\n    return g\n",
+            &["2 run reads run/g", "3 run reads run/g"],
+        ),
+        (
+            "def run():\n    g = 1\n    if g:\n        def g(): pass\n    return g\n",
+            &["4 run reads run/g"],
+        ),
+        (
+            "M = None\ndef run():\n    global M\n    M = 1\n    return M\n",
+            &["4 run reads M"],
+        ),
+        ("for M in ():\n    x = M\n", &[]),
+        ("M = 1\nfor M in ():\n    x = M\n", &["2  reads M"]),
+        (
+            "def run():\n    if x:\n        def g(): pass\n    else:\n        def g(): pass\n    return g\n",
+            &["5 run reads run/g"],
+        ),
+    ]);
+}
+
+/// Asserts that a body below [`NAMES`] stores no access and counts `refused` reads.
+fn assert_refused(cases: &[(&str, u64)]) {
+    for (body, refused) in cases {
+        let (found, omitted) = module(&format!("{NAMES}{body}"));
+        assert_eq!(found, Vec::<String>::new(), "{body}");
+        assert_eq!(omitted, *refused, "{body}");
+    }
+}
+
+#[test]
+fn test_python_names_without_one_declaration_are_counted() {
+    assert_refused(&[
+        // The module has not bound the name yet.
+        ("x = M\nM = 1\n", 1),
+        ("M = [M]\n", 1),
+        // A condition the class body states can leave the name of the module.
+        ("class D:\n    if x: f = 1\n    y = f\n", 1),
+        // The parameter and the declaration are two things.
+        (
+            "def run(g):\n    if not g:\n        def g(): pass\n    return g\n",
+            2,
+        ),
+        // A star import can bind any name.
+        ("from x import *\ny = f\n", 1),
+    ]);
+}
+
+#[test]
+fn test_python_locals_below_a_star_import_are_not_counted() {
+    assert_refused(&[("from x import *\ndef run(f): return f\n", 0)]);
+}

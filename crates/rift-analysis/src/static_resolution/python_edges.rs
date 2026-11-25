@@ -3,6 +3,7 @@
 mod annotations;
 mod classes;
 mod elements;
+mod names;
 mod overloads;
 mod rebinding;
 mod receiver_guards;

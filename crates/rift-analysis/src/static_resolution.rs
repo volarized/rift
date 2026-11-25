@@ -456,6 +456,10 @@ struct File<'source> {
     python_evaluated_outside: BTreeMap<ByteRange, ByteRange>,
     /// The Python lambdas, comprehensions and generator expressions around a position.
     python_expressions: EnclosingDefinitions<ByteRange>,
+    /// The Python loop statements around a position.
+    python_loops: EnclosingDefinitions<ByteRange>,
+    /// The bindings of each Python name in the scopes that declare it `global`.
+    python_globals: Bindings<'source>,
     /// Python annotation ranges by start, which can be evaluated after later statements.
     python_annotations: BTreeMap<u64, u64>,
     /// Python names with a non-None check and the branch it admits.
@@ -605,6 +609,8 @@ impl<'source> File<'source> {
             python_whole: python_edges::WholeFile::Module,
             python_evaluated_outside: BTreeMap::new(),
             python_expressions: EnclosingDefinitions::new([]),
+            python_loops: EnclosingDefinitions::new([]),
+            python_globals: BTreeMap::new(),
             python_annotations: BTreeMap::new(),
             python_non_none: BTreeMap::new(),
             python_receivers: BTreeMap::new(),
@@ -651,7 +657,8 @@ impl<'source> File<'source> {
         Some(file)
     }
 
-    fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
+    /// Python guards, scopes, expressions and loops, indexed for lookup by position.
+    fn index_python_flow(&mut self, work: &mut Work) -> Option<()> {
         for &(name, body) in self.facts.non_none_guards() {
             if !work.charge() {
                 return None;
@@ -676,6 +683,19 @@ impl<'source> File<'source> {
             expressions.push((range.start, range.end, range));
         }
         self.python_expressions = EnclosingDefinitions::new(expressions);
+        let mut loops = Vec::new();
+        for &range in self.facts.loops() {
+            if !work.charge() {
+                return None;
+            }
+            loops.push((range.start, range.end, range));
+        }
+        self.python_loops = EnclosingDefinitions::new(loops);
+        Some(())
+    }
+
+    fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
+        self.index_python_flow(work)?;
         for binding in self.facts.bindings() {
             if !work.charge() {
                 return None;
@@ -712,6 +732,7 @@ impl<'source> File<'source> {
                     .insert(annotation.start, annotation.end);
             }
         }
+        self.index_python_globals(work)?;
         for (name, bindings) in &self.by_name {
             if bindings.len() <= SCANNED_BINDINGS_MAX {
                 continue;
@@ -751,6 +772,33 @@ impl<'source> File<'source> {
             }
         }
         self.index_written_types(work)
+    }
+
+    /// The bindings that a `global` statement gives to the module.
+    fn index_python_globals(&mut self, work: &mut Work) -> Option<()> {
+        for (name, bindings) in &self.by_name {
+            let global = bindings
+                .iter()
+                .filter(|binding| binding.kind == StaticBindingKind::PythonGlobal)
+                .map(|binding| binding.scope)
+                .collect::<BTreeSet<_>>();
+            if global.is_empty() {
+                continue;
+            }
+            for &binding in bindings {
+                if !work.charge() {
+                    return None;
+                }
+                let bound = !matches!(
+                    binding.kind,
+                    StaticBindingKind::PythonGlobal | StaticBindingKind::PythonGuard { .. }
+                );
+                if bound && global.contains(&binding.scope) {
+                    self.python_globals.entry(name).or_default().push(binding);
+                }
+            }
+        }
+        Some(())
     }
 
     /// Declared and element types, function writes, spread values, type signatures and
