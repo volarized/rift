@@ -2391,6 +2391,41 @@ fn both_modes(limits: ArchiveLimits) -> [ArchiveLimits; 2] {
 }
 
 #[test]
+fn ustar_directory_capacity_leaves_the_following_file_readable() -> TestResult {
+    let mut directory = tar::Header::new_ustar();
+    directory.set_path("release/docs")?;
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o755);
+    directory.set_size(4096);
+    directory.set_cksum();
+    let member = raw_member("release/docs/readme.txt", b'0', b"hello\n")?;
+    let bytes = gzip(&[directory.as_bytes().as_slice(), &member, &[0; 1024]].concat())?;
+    let files = read(&bytes, ArchiveLimits::default())?;
+    assert_eq!(files.files().len(), 1);
+    assert_eq!(files.files()[&fixture_path("docs/readme.txt")], b"hello\n");
+    assert_eq!(
+        files.members()["release/docs"],
+        ArchiveMemberKind::Directory
+    );
+    Ok(())
+}
+
+#[test]
+fn tar_refuses_a_bad_header_checksum_or_incomplete_member() -> TestResult {
+    let mut member = raw_member("release/readme.txt", b'0', b"hello\n")?;
+    let truncated = member[..513].to_vec();
+    member[0] = b'R';
+    for input in [member, truncated] {
+        let bytes = gzip(&input)?;
+        assert_eq!(
+            read(&bytes, ArchiveLimits::default()).expect_err("invalid tar data"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn pax_multiline_comment_leaves_following_records_readable() -> TestResult {
     let records = [
         pax_record("comment", "first\nsecond café\n"),
