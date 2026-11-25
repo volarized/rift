@@ -3227,6 +3227,38 @@ fn test_rust_near_value_declarations_hide_outer_functions() {
 }
 
 #[test]
+fn test_rust_declarative_macro_bindings_have_statement_scope() {
+    const BIND: &str = "macro_rules! bind { ($name:ident) => { let $name = other; }; }";
+    const INSPECT: &str = "macro_rules! bind { ($name:ident) => { let local = $name; }; }";
+    const CALL: &str = "/* call */ ";
+    for body in [
+        format!("{BIND} bind!(leaf); leaf();"),
+        format!("{CALL}leaf(); {BIND} bind!(leaf); leaf();"),
+        format!("{BIND} {{ bind!(leaf); leaf(); }} {CALL}leaf();"),
+        format!("{BIND} bind!(leaf); {CALL}crate::leaf();"),
+        format!("{BIND} bind!(other); {CALL}leaf();"),
+        format!("{INSPECT} bind!(leaf); {CALL}leaf();"),
+        format!("{BIND} {INSPECT} bind!(leaf); {CALL}leaf();"),
+        format!("{INSPECT} #[cfg(any())] {BIND} bind!(leaf); {CALL}leaf();"),
+    ] {
+        let source = format!("pub fn leaf() {{}}\npub fn other() {{}}\npub fn run() {{ {body} }}");
+        let manifest = [("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")];
+        let result = resolution("rust", &[("src/lib.rs", &source)], &manifest, WORK_MAX);
+        assert!(!result.exhausted, "{body}");
+        let expected = source
+            .find(CALL)
+            .map(|marker| u64::try_from(marker + CALL.len()).expect("offset"));
+        let found = calls(&result, "src/lib.rs")
+            .map(|edge| {
+                assert!(target(edge).ends_with("/fixture/leaf"), "{body}");
+                edge.callee_range.start
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found, expected.into_iter().collect::<Vec<_>>(), "{body}");
+    }
+}
+
+#[test]
 fn test_rust_unknown_import_does_not_establish_a_receiver_type() {
     let source =
         "mod known; #[cfg(unknown)] use crate::known::Item; fn root(item: &Item) { item.read(); }";

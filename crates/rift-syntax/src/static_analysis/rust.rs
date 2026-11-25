@@ -1,5 +1,8 @@
 mod imports;
+mod macros;
 mod references;
+
+pub(super) use macros::Macros;
 
 use std::sync::OnceLock;
 
@@ -60,6 +63,7 @@ pub(super) struct Kinds {
     bounds: u16,
     edge_macro: u16,
     macro_definition: u16,
+    macro_name: u16,
     assignment: [u16; 2],
     scopes: [u16; 3],
     functions: [u16; 3],
@@ -135,6 +139,7 @@ pub(super) fn kinds() -> &'static Kinds {
             bounds: field("bounds"),
             edge_macro: id("macro_invocation"),
             macro_definition: id("macro_definition"),
+            macro_name: field("macro"),
             assignment: [id("assignment_expression"), id("compound_assignment_expr")],
             scopes: [id("source_file"), id("block"), id("declaration_list")],
             functions: [
@@ -169,12 +174,13 @@ pub(super) fn kinds() -> &'static Kinds {
 }
 
 impl Kinds {
-    pub(super) fn record(
+    pub(super) fn record<'source>(
         &self,
         visited: Visited<'_, '_>,
-        source: &str,
+        source: &'source str,
         facts: &mut StaticFactsParts,
         budget: &mut rift_core::LoopBudget,
+        macros: &mut Macros<'source>,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let mut ancestor = Some(visited);
@@ -182,7 +188,7 @@ impl Kinds {
         // parser recovery subtrees cannot establish executable facts.
         while let Some(current) = ancestor {
             let element = current.syntax_element();
-            if element.kind_id() == self.macro_definition
+            if (element.kind_id() == self.macro_definition && element != syntax_element)
                 || element.is_error()
                 || element.is_missing()
             {
@@ -191,6 +197,9 @@ impl Kinds {
             ancestor = current.parent();
         }
         let id = syntax_element.kind_id();
+        if id == self.macro_definition {
+            return self.record_macro_definition(visited, source, macros);
+        }
         self.record_reference(visited, facts)?;
         if id == self.call {
             self.record_call(syntax_element, facts)?;
@@ -233,6 +242,7 @@ impl Kinds {
             self.record_mutation(syntax_element, facts)?;
         } else if id == self.edge_macro {
             facts.unsupported_bindings.push(byte_range(syntax_element)?);
+            self.record_macro_binding(visited, source, macros, facts)?;
         } else if id == self.impl_item {
             self.record_impl(syntax_element, facts)?;
         } else if id == self.type_parameter || id == self.where_predicate {
