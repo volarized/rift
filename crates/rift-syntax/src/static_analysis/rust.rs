@@ -36,6 +36,10 @@ pub(super) struct Kinds {
     generic_function: u16,
     field_expression: u16,
     field_declaration: u16,
+    value_items: [u16; 2],
+    struct_item: u16,
+    tuple_fields: u16,
+    foreign_item: u16,
     function_type: u16,
     struct_expression: u16,
     field_initializers: [u16; 2],
@@ -113,6 +117,10 @@ pub(super) fn kinds() -> &'static Kinds {
             generic_function: id("generic_function"),
             field_expression: id("field_expression"),
             field_declaration: id("field_declaration"),
+            value_items: [id("const_item"), id("static_item")],
+            struct_item: id("struct_item"),
+            tuple_fields: id("ordered_field_declaration_list"),
+            foreign_item: id("foreign_mod_item"),
             function_type: id("function_type"),
             struct_expression: id("struct_expression"),
             field_initializers: [id("field_initializer"), id("shorthand_field_initializer")],
@@ -243,10 +251,13 @@ impl Kinds {
         {
             self.record_closure_argument(visited, facts)?;
         } else if id == self.functions[0] {
-            self.record_function(visited, facts)?;
+            self.record_item_binding(syntax_element, visited, facts)?;
             self.record_return(syntax_element, facts)?;
         } else if id == self.functions[1] {
             self.record_return(syntax_element, facts)?;
+            self.record_named_value_binding(visited, facts)?;
+        } else if self.value_items.contains(&id) || self.value_struct(syntax_element) {
+            self.record_named_value_binding(visited, facts)?;
         } else if id == self.field_declaration {
             self.record_function_field(syntax_element, facts)?;
         } else if self.assignment.contains(&id) {
@@ -894,16 +905,47 @@ impl Kinds {
         Ok(())
     }
 
-    fn record_function(
+    /// Tuple and unit structs declare a value alongside their type.
+    fn value_struct(&self, item: Node<'_>) -> bool {
+        item.kind_id() == self.struct_item
+            && item
+                .child_by_field_id(self.body)
+                .is_none_or(|body| body.kind_id() == self.tuple_fields)
+    }
+
+    /// Finds the block or module where a named value item binds its name.
+    fn record_named_value_binding(
         &self,
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let name = visited
-            .syntax_element()
-            .child_by_field_id(self.name)
-            .and_then(|syntax_element| identifier(syntax_element, self.identifier));
-        let scope = enclosing(visited, &self.scopes).map(Visited::syntax_element);
+        let item = visited.syntax_element();
+        let container = visited.parent().and_then(Visited::parent);
+        let owner = if item.kind_id() == self.functions[1] {
+            container.filter(|parent| parent.syntax_element().kind_id() == self.foreign_item)
+        } else {
+            container
+                .is_none_or(|parent| {
+                    ![self.impl_item, self.trait_item].contains(&parent.syntax_element().kind_id())
+                })
+                .then_some(visited)
+        };
+        if let Some(owner) = owner {
+            self.record_item_binding(item, owner, facts)?;
+        }
+        Ok(())
+    }
+
+    fn record_item_binding(
+        &self,
+        declaration: Node<'_>,
+        item: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let name = declaration.child_by_field_id(self.name).filter(|name| {
+            [self.identifier, self.type_identifier].contains(&name.kind_id()) && !name.is_missing()
+        });
+        let scope = enclosing(item, &self.scopes).map(Visited::syntax_element);
         if let Some((name, scope)) = name.zip(scope) {
             facts.bindings.push(binding(
                 name,
