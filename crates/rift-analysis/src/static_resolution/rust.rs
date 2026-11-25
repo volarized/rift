@@ -1,6 +1,7 @@
 //! Resolves Rust paths admitted by the captured crate and module inventory.
 
 mod deref;
+mod receivers;
 mod references;
 
 // Exhausting initializer lookup depth leaves the authored site unresolved.
@@ -440,115 +441,6 @@ impl<'source> Namespaces<'source> {
         self.referents
             .get(&(owner.file.path.as_str(), owner.symbol.item_range))
             .map(|(_, referent)| *referent)
-    }
-
-    /// Method lookup through a receiver whose owner is `&T` / `&mut T`, following the
-    /// language's receiver probing order over the reference's own implementations (`A`)
-    /// and `T`'s methods (`B`), each classified by its `self` parameter:
-    ///
-    /// 1. receiver type itself: `A` by value, `B` by `&self` (`&mut self` for `&mut T`);
-    /// 2. `&R`: `A` by `&self`; 3. `&mut R`: `A` by `&mut self`;
-    /// 4. `T`: `B` by value; 5. `B` by the other reference kind.
-    ///
-    /// The first step with candidates decides: one candidate, or one inherent method among
-    /// them, is selected; anything else, or a receiver form not listed, stays unresolved.
-    fn receiver_method_of(
-        &self,
-        file: &File<'source>,
-        position: u64,
-        owner: Target<'source>,
-        member: &str,
-        work: &mut Work,
-    ) -> Option<Target<'source>> {
-        let Some(referent) = self.referent(owner) else {
-            return self.inherent_method(file, position, owner, member, work);
-        };
-        let unique = owner.symbol.name.starts_with("&mut");
-        let mut reference = Vec::new();
-        let mut nominal = Vec::new();
-        // Implementations for the same reference kind of `T` may sit in other modules,
-        // each with its own owner identity; all of them are the receiver type's methods.
-        let owners = self
-            .referents
-            .values()
-            .filter(|(other, other_referent)| {
-                other_referent.file.path == referent.file.path
-                    && other_referent.symbol.item_range == referent.symbol.item_range
-                    && other.symbol.name.starts_with("&mut") == unique
-            })
-            .map(|(other, _)| (*other, true))
-            .chain([(referent, false)])
-            .collect::<Vec<_>>();
-        let mut visited = BTreeSet::new();
-        for (candidates, is_reference) in owners {
-            let side = if is_reference {
-                &mut reference
-            } else {
-                &mut nominal
-            };
-            let Some(mut path) = candidates.admitted_path() else {
-                continue;
-            };
-            if !visited.insert(path.clone()) {
-                continue;
-            }
-            path.push(member.to_owned());
-            for method in self.methods.get(&path).into_iter().flatten() {
-                if !work.charge() || !self.available(method.target) {
-                    return None;
-                }
-                let kind = self_kind(method.target)?;
-                if kind != SelfKind::Absent {
-                    side.push((*method, kind, trait_method(method)?));
-                }
-            }
-        }
-        let (first, last) = if unique {
-            (SelfKind::Unique, SelfKind::Shared)
-        } else {
-            (SelfKind::Shared, SelfKind::Unique)
-        };
-        if reference
-            .iter()
-            .chain(&nominal)
-            .any(|(_, kind, _)| *kind == SelfKind::Other)
-        {
-            return None;
-        }
-        let steps = [
-            (Some(SelfKind::Value), Some(first)),
-            (Some(SelfKind::Shared), None),
-            (Some(SelfKind::Unique), None),
-            (None, Some(SelfKind::Value)),
-            (None, Some(last)),
-        ];
-        for (from_reference, from_nominal) in steps {
-            let found = reference
-                .iter()
-                .filter(|(_, kind, _)| Some(*kind) == from_reference)
-                .chain(
-                    nominal
-                        .iter()
-                        .filter(|(_, kind, _)| Some(*kind) == from_nominal),
-                )
-                .collect::<Vec<_>>();
-            if found.is_empty() {
-                continue;
-            }
-            let inherent = found
-                .iter()
-                .filter(|(_, _, implemented)| !implemented)
-                .collect::<Vec<_>>();
-            let target = match (inherent.as_slice(), found.as_slice()) {
-                ([(method, _, _)], _) | ([], [(method, _, _)]) => method.target,
-                _ => return None,
-            };
-            return (target.symbol.visibility.as_deref() == Some("pub")
-                || self.declaration_visible(file, position, target, work)
-                || target.symbol.visibility.is_none())
-            .then_some(target);
-        }
-        None
     }
 
     /// The owner whose fields a receiver of `owner` reads: a reference owner's referent.
@@ -1156,6 +1048,10 @@ impl<'source> Namespaces<'source> {
         if let ["Self", member] = parts.as_slice()
             && let Some(owner) = self.structural_self(file, position, work)
         {
+            // An inherent method of the standard library comes before one of a trait.
+            if self.standard_associated(file, owner, member, work)? {
+                return None;
+            }
             return self.inherent_method(file, position, owner, member, work);
         }
         if let [parameter, member] = parts.as_slice()
@@ -1301,31 +1197,17 @@ impl<'source> Namespaces<'source> {
                 .iter()
                 .any(|edge| edge.from == range);
             if trait_impl {
-                implemented.push(method);
+                implemented.push(*method);
             } else {
-                inherent.push(method);
+                inherent.push(*method);
             }
         }
-        // Inherent methods take precedence. Among trait implementations, the trait of the
-        // implementation enclosing the site is in scope there; compiled code cannot have
-        // another in-scope candidate of the same name, so that implementation is selected.
-        let selected = match (inherent.as_slice(), implemented.as_slice()) {
-            ([method], _) | ([], [method]) => Some(method.target),
-            ([], methods) => {
-                let mut enclosing = methods.iter().filter(|method| {
-                    method.target.file.path == file.document.path
-                        && method.implementation.range.contains(position)
-                });
-                let first = enclosing.next();
-                if enclosing.next().is_some() {
-                    None
-                } else {
-                    first.map(|method| method.target)
-                }
-            }
-            _ => None,
+        // Inherent methods take precedence.
+        let target = match (inherent.as_slice(), implemented.as_slice()) {
+            ([method], _) | ([], [method]) => method.target,
+            ([], methods) => receivers::enclosing_method(file, position, methods)?.target,
+            _ => return None,
         };
-        let target = selected?;
         (target.symbol.visibility.as_deref() == Some("pub")
             || self.declaration_visible(file, position, target, work)
             || target.symbol.visibility.is_none())
@@ -2011,18 +1893,18 @@ fn self_kind(method: Target<'_>) -> Option<SelfKind> {
     let source = method.file.source;
     let facts = method.file.facts.static_facts()?;
     let Some(binding) = facts.bindings().iter().find(|binding| {
-        matches!(
-            binding.kind,
-            rift_syntax::StaticBindingKind::RustReceiver { .. }
-        ) && method.symbol.item_range.encloses(binding.scope)
-            && source.get(
-                usize::try_from(binding.name.start).unwrap_or(usize::MAX)
-                    ..usize::try_from(binding.name.end).unwrap_or(usize::MAX),
-            ) == Some("self")
+        matches!(binding.kind, StaticBindingKind::RustReceiver { .. })
+            && method.symbol.item_range.encloses(binding.scope)
+            && references::source_text(source, binding.name) == Some("self")
     }) else {
         return Some(SelfKind::Absent);
     };
-    let start = usize::try_from(method.symbol.item_range.start).ok()?;
+    receiver_form(source, binding)
+}
+
+/// The form of one `self` parameter.
+fn receiver_form(source: &str, binding: &rift_syntax::StaticBinding) -> Option<SelfKind> {
+    let start = usize::try_from(binding.scope.start).ok()?;
     let name = usize::try_from(binding.name.start).ok()?;
     let end = usize::try_from(binding.name.end).ok()?;
     let before = source.get(start..name)?;
@@ -2031,25 +1913,11 @@ fn self_kind(method: Target<'_>) -> Option<SelfKind> {
     if after.starts_with(':') {
         return Some(SelfKind::Other);
     }
-    let Some(reference) = parameter.strip_prefix('&') else {
-        return Some(if matches!(parameter, "" | "mut") {
-            SelfKind::Value
-        } else {
-            SelfKind::Other
-        });
-    };
-    let reference = reference.trim_start();
-    let reference = reference
-        .strip_prefix('\'')
-        .map_or(reference, |lifetime| {
-            lifetime.trim_start_matches(|character: char| {
-                character.is_alphanumeric() || character == '_'
-            })
-        })
-        .trim();
-    Some(match reference {
-        "" => SelfKind::Shared,
-        "mut" => SelfKind::Unique,
+    let (references, rest) = receivers::split_references(parameter);
+    Some(match (references.as_slice(), rest) {
+        ([], "" | "mut") => SelfKind::Value,
+        ([receivers::Reference::Shared], "") => SelfKind::Shared,
+        ([receivers::Reference::Unique], "") => SelfKind::Unique,
         _ => SelfKind::Other,
     })
 }

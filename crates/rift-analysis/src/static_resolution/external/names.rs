@@ -1,7 +1,8 @@
 //! Standard-library names each shipped language defines.
 
 /// Crates the Rust toolchain supplies without a manifest entry.
-pub(super) const RUST_RUNTIME_CRATES: [&str; 5] = ["std", "core", "alloc", "proc_macro", "test"];
+pub(in crate::static_resolution) const RUST_RUNTIME_CRATES: [&str; 5] =
+    ["std", "core", "alloc", "proc_macro", "test"];
 
 /// Top-level modules of the `CPython` standard library, in byte order.
 pub(super) const PYTHON_STANDARD_MODULES: [&str; 205] = [
@@ -402,7 +403,7 @@ pub(super) const NODE_BUILTIN_MODULES: [&str; 42] = [
 ];
 
 /// Defining path of one name the Rust standard prelude brings into every module.
-pub(super) fn rust_prelude(name: &str) -> Option<&'static str> {
+pub(in crate::static_resolution) fn rust_prelude(name: &str) -> Option<&'static str> {
     Some(match name {
         "AsMut" => "core::convert::AsMut",
         "AsRef" => "core::convert::AsRef",

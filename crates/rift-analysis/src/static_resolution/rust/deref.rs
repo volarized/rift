@@ -207,7 +207,8 @@ impl<'source> Namespaces<'source> {
         {
             return None;
         }
-        let method = self.receiver_method_of(file, receiver.start, target, member, work)?;
+        // The argument's own references are not known.
+        let method = self.receiver_method_of(file, None, receiver.start, (target, member), work)?;
         match self_kind(method)? {
             SelfKind::Shared => Some(method),
             SelfKind::Unique => self

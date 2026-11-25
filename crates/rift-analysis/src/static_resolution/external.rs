@@ -18,6 +18,8 @@ use crate::NamespaceInput;
 
 mod names;
 
+pub(super) use names::{RUST_RUNTIME_CRATES, rust_prelude};
+
 const CARGO_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 const NPM_SECTIONS: [&str; 4] = [
     "dependencies",
