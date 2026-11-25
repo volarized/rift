@@ -1186,6 +1186,7 @@ struct Index<'source> {
     edge_python: python_edges::EdgePythonModules,
     edge_python_classes: python_edges::ClassOrders<'source>,
     python_imports: python_edges::ImportTargets<'source>,
+    python_aliases: python_edges::ClassAliases<'source>,
     /// The classes that declare a member, by the member's name.
     python_members: python_edges::MemberOwners<'source>,
     python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
@@ -1268,6 +1269,7 @@ impl<'source> Index<'source> {
             edge_python,
             edge_python_classes: python_edges::ClassOrders::default(),
             python_imports: python_edges::ImportTargets::default(),
+            python_aliases: python_edges::ClassAliases::default(),
             python_members: python_edges::MemberOwners::default(),
             python_writes,
             syntax_publication,
@@ -1275,9 +1277,11 @@ impl<'source> Index<'source> {
             #[cfg(test)]
             performed: std::sync::atomic::AtomicUsize::new(0),
         };
-        index.python_imports = index.python_import_targets(work)?;
+        let (imports, aliases) = index.python_import_targets(work)?;
+        index.python_imports = imports;
         index.python_members = index.python_member_owners(work)?;
         index.edge_python_classes = index.python_class_orders(FileWork::CLASS_ORDERS, work);
+        index.python_aliases = index.python_class_alias_targets(aliases, work);
         Some(index)
     }
 

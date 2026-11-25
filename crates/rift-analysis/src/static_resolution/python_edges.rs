@@ -1,5 +1,6 @@
 //! Resolves Python names through captured declarations, imports, and receivers.
 
+mod aliases;
 mod annotations;
 mod classes;
 mod elements;
@@ -10,6 +11,7 @@ mod receiver_guards;
 mod references;
 mod slots;
 
+pub(super) use aliases::{ClassAliases, ModuleAliases};
 pub(super) use classes::{ClassOrders, MemberOwners};
 pub(super) use references::PythonNameSites;
 
@@ -252,6 +254,9 @@ impl<'source> Index<'source> {
             let name = target.symbol.name_range?;
             if !work.charge() || !visited.insert((target.file.path.as_str(), name.start)) {
                 return None;
+            }
+            if let Some(class) = self.python_aliases.target(target) {
+                return work.python_lookup(|_| Some(class));
             }
             let file = self.files.get(target.file.path.as_str())?;
             let StaticBindingKind::PythonAlias { value } = *file.python_values.get(&name.end)?
@@ -533,8 +538,13 @@ impl<'source> Index<'source> {
     }
 
     /// Follows every import of every Python module once.
-    pub(super) fn python_import_targets(&self, work: &mut Work) -> Option<ImportTargets<'source>> {
+    pub(super) fn python_import_targets(
+        &self,
+        work: &mut Work,
+    ) -> Option<(ImportTargets<'source>, ModuleAliases<'source>)> {
         let mut targets = ImportTargets::default();
+        let mut aliases = Vec::new();
+        let collect_aliases = work.budget.remaining() > super::FILE_WORK_FLOOR;
         for file in self.python_files() {
             for binding in file.facts.bindings() {
                 if !work.charge() {
@@ -549,10 +559,15 @@ impl<'source> Index<'source> {
                 ) {
                     let name = (file.document.path.as_str(), file.text(binding.name)?);
                     self.follow_imports(name, &mut targets, work)?;
+                } else if collect_aliases
+                    && matches!(binding.kind, StaticBindingKind::PythonAlias { .. })
+                    && file.python_module_binding(binding)
+                {
+                    aliases.push((file.document.path.as_str(), binding));
                 }
             }
         }
-        Some(targets)
+        Some((targets, aliases))
     }
 
     /// Follows the imports of `name` up to a name already followed, the end of the chain, or

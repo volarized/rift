@@ -753,6 +753,11 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return None;
             }
+            if let Value::Symbol(target) = value
+                && let Some(class) = self.python_aliases.target(target)
+            {
+                return work.python_lookup(|_| Some(Value::Symbol(class)));
+            }
             let target = match value {
                 Value::Instance(_) => return Some(value),
                 Value::Member { assigned, .. }
@@ -818,6 +823,9 @@ impl<'source> Index<'source> {
                 return None;
             }
             let file = self.files.get(target.file.path.as_str())?;
+            if let Some(class) = self.python_aliases.target(target) {
+                return work.python_lookup(|_| Some(class));
+            }
             let value = match *file.python_values.get(&target.symbol.name_range?.end)? {
                 StaticBindingKind::PythonAnnotation { annotation } => {
                     return self.python_class_object_annotation(file, annotation, work);
