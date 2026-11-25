@@ -49,6 +49,31 @@ fn module(body: &str) -> (Vec<String>, u64) {
 
 const NAMES: &str = "def f(): pass\nclass C: pass\nN = 1\n";
 
+#[test]
+fn test_python_name_budget_keeps_other_facts_in_every_file() {
+    let mut source = "N = 0\n".repeat(1_800);
+    source.push_str(&"N\n".repeat(4_000));
+    source.push_str("class Tail:\n    def member(self): pass\n");
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", &source),
+            ("other.py", "def leaf(): pass\ndef run(): leaf()\n"),
+        ],
+        &[],
+        200_000,
+    );
+    assert!(result.ended, "plain name lookup spends the pass budget");
+    assert!(!result.exhausted, "the other facts finish on their budget");
+    assert_eq!(result.analyzed_sources, 2);
+    assert!(
+        result
+            .edge_calls
+            .values()
+            .all(|coverage| !coverage.unavailable)
+    );
+}
+
 /// The accesses of a body below [`NAMES`], without any refused; lines count from its first one.
 fn below(body: &str) -> Vec<String> {
     let (found, refused) = module(&format!("{NAMES}{body}"));

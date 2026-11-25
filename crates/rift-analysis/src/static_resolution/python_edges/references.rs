@@ -10,13 +10,19 @@ use rift_syntax::{ByteRange, StaticReference};
 use super::super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 use super::Value;
 
+/// Plain names read after member, annotation, and containment facts have been resolved.
+pub(in crate::static_resolution) struct PythonNameSites {
+    names: Vec<StaticReference>,
+    paths: BTreeSet<u64>,
+}
+
 impl<'source> Index<'source> {
     pub(in crate::static_resolution) fn python_references(
         &self,
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) {
+    ) -> Option<PythonNameSites> {
         let callees = established_callees(result);
         let mut paths = callees
             .keys()
@@ -24,17 +30,17 @@ impl<'source> Index<'source> {
             .collect::<BTreeSet<_>>();
         let mut names = Vec::new();
         for reference in file.facts.references() {
-            if !work.charge() {
-                return;
-            }
             // A member access spells its receiver. A name alone states no member.
             if reference.role != ReferenceRole::Type
                 && file
                     .text(reference.target)
                     .is_some_and(|text| !text.contains('.'))
             {
-                names.push(reference);
+                names.push(*reference);
                 continue;
+            }
+            if !work.charge() {
+                return None;
             }
             let target = if reference.role == ReferenceRole::Type {
                 self.python_type(file, reference.target, work)
@@ -57,20 +63,9 @@ impl<'source> Index<'source> {
                 result.record(occurrence);
             }
         }
-        for reference in names {
-            if !work.charge() {
-                return;
-            }
-            let name = reference.target;
-            if reference.role == ReferenceRole::Write {
-                self.python_name_write(file, name, work, result);
-            } else if !(paths.contains(&name.start) && file.python_path_starts(name)) {
-                self.python_name_read(file, name, work, result);
-            }
-        }
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
-                return;
+                return None;
             }
             if symbol.qualified_name == "." {
                 continue;
@@ -96,6 +91,29 @@ impl<'source> Index<'source> {
                 {
                     result.record(self.python_edge(file, range, EdgeKind::Overrides, target, base));
                 }
+            }
+        }
+        self.named_type_references(file, work, result);
+        (!work.exhausted && !names.is_empty()).then_some(PythonNameSites { names, paths })
+    }
+
+    /// Resolve plain names using the work left by the other facts of every file.
+    pub(in crate::static_resolution) fn python_name_references(
+        &self,
+        file: &File<'source>,
+        sites: PythonNameSites,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for reference in sites.names {
+            if !work.charge() {
+                return;
+            }
+            let name = reference.target;
+            if reference.role == ReferenceRole::Write {
+                self.python_name_write(file, name, work, result);
+            } else if !(sites.paths.contains(&name.start) && file.python_path_starts(name)) {
+                self.python_name_read(file, name, work, result);
             }
         }
     }

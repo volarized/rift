@@ -464,9 +464,8 @@ pub struct StaticFactsParts {
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
     /// after later statements of the enclosing scope.
     pub expression_scopes: Vec<ByteRange>,
-    /// Python scopes and the part of each that the enclosing scope evaluates: the iterable of a
-    /// comprehension's first clause, the parameters and return annotation of a function, the
-    /// parameters of a lambda, the arguments of a class.
+    /// Python scopes and the parts of each that the enclosing scope evaluates. Includes
+    /// function defaults evaluated outside the type parameter scope.
     pub evaluated_outside: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
@@ -753,7 +752,7 @@ impl StaticFacts {
         &self.0.expression_scopes
     }
 
-    /// Python comprehensions and the iterable of their first clause.
+    /// Python scopes and the ranges evaluated in their enclosing scopes.
     #[must_use]
     pub fn evaluated_outside(&self) -> &[(ByteRange, ByteRange)] {
         &self.0.evaluated_outside

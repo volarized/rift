@@ -68,6 +68,7 @@ pub(super) struct EdgePythonKinds {
     names: names::NameKinds,
     return_type: u16,
     parameter_list: u16,
+    default_value: u16,
     loops: [u16; 2],
     /// Compound statements and clauses a class body may define methods under.
     conditional: [u16; 6],
@@ -143,6 +144,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             names: names::NameKinds::new(&grammar),
             return_type: field("return_type"),
             parameter_list: field("parameters"),
+            default_value: field("value"),
             loops: [id("for_statement"), id("while_statement")],
             conditional: [
                 id("if_statement"),
@@ -333,12 +335,21 @@ impl EdgePythonKinds {
         let Some(parameters) = definition.child_by_field_name("type_parameters") else {
             return Ok(());
         };
-        // Python reads these names in a scope of their own around the definition's, which
-        // holds its parameters, annotations and arguments too.
+        // The type parameter scope holds the function's annotations and body or the class's
+        // arguments and body. A function's default values run in the enclosing scope.
         let scope = ByteRange {
             end: byte_range(definition)?.end,
             ..byte_range(parameters)?
         };
+        if let Some(arguments) = definition.child_by_field_id(self.parameter_list) {
+            let mut cursor = arguments.walk();
+            for value in arguments
+                .named_children(&mut cursor)
+                .filter_map(|parameter| parameter.child_by_field_id(self.default_value))
+            {
+                facts.evaluated_outside.push((scope, byte_range(value)?));
+            }
+        }
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
             let mut candidate = Some(parameter);

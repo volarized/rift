@@ -93,6 +93,26 @@ fn module(text: impl Into<String>) -> [(&'static str, String); 1] {
     [("module", text.into())]
 }
 
+#[test]
+fn many_lexical_reads_keep_containment_in_the_package() {
+    let mut source = "N = 0\n".repeat(1_800);
+    source.push_str(&"N\n".repeat(4_000));
+    source.push_str("class Tail:\n    def member(self): pass\n");
+    let found = edges(
+        &[
+            ("module", source),
+            ("other", "def leaf(): pass\ndef run(): leaf()\n".to_owned()),
+        ],
+        512,
+    );
+    assert!(
+        found
+            .iter()
+            .any(|edge| edge == "module/Tail -> module/Tail/member")
+    );
+    assert!(found.iter().any(|edge| edge == "other/run -> other/leaf"));
+}
+
 /// One line for each link of a chain, from the number of the link and the one before it.
 fn chain(line: impl Fn(usize, usize) -> String) -> String {
     chain_of(LINKS, line)
