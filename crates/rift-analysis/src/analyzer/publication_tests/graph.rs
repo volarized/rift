@@ -1441,6 +1441,123 @@ pub fn call() { left::one(); right::one(); }
 }
 
 #[test]
+fn package_rust_inactive_module_alias_leaves_the_selected_source_owner() {
+    const ROOT: &str = r#"
+#[cfg(feature = "primary")]
+mod shared;
+#[cfg(not(feature = "primary"))]
+#[path = "shared/mod.rs"]
+mod fallback;
+#[cfg(feature = "primary")]
+pub fn call_primary() { shared::leaf(); }
+#[cfg(not(feature = "primary"))]
+pub fn call_fallback() { fallback::leaf(); }
+pub fn retained() {}
+"#;
+    for (flags, active, inactive, caller) in [
+        (
+            [r#"feature="primary""#, "unix"].as_slice(),
+            "shared",
+            "fallback",
+            "call_primary",
+        ),
+        (["unix"].as_slice(), "fallback", "shared", "call_fallback"),
+    ] {
+        let publication = package_with_rust_alias_routes(ROOT, flags);
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0.as_str() == "src/shared/mod.rs")
+            .expect("original source unit");
+        let leaf = format!("/beacon/{active}/leaf");
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol.as_str().ends_with(&leaf)
+                && row.unit == unit.unit
+                && row.source == "pub fn leaf() {}"
+        }));
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/beacon/retained") })
+        );
+        assert!(!publication.declarations.iter().any(|row| {
+            row.symbol
+                .as_str()
+                .ends_with(&format!("/beacon/{inactive}/leaf"))
+        }));
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with(&format!("/beacon/{caller}"))
+                && edge.to.as_str().ends_with(&leaf)
+        }));
+    }
+}
+
+#[test]
+fn package_rust_module_alias_keeps_refusal_for_competing_routes() {
+    const CONFLICTS: &str = r#"
+mod shared;
+#[path = "shared/mod.rs"]
+mod fallback;
+pub fn retained() {}
+"#;
+    for (source, flags) in [
+        (CONFLICTS.to_owned(), ["unix"].as_slice()),
+        (
+            CONFLICTS.replace("mod fallback;", "#[cfg(custom_target)]\nmod fallback;"),
+            [].as_slice(),
+        ),
+    ] {
+        let publication = package_with_rust_alias_routes(&source, flags);
+        assert!(publication.declarations.is_empty());
+        assert!(publication.edges.is_empty());
+    }
+}
+
+fn package_with_rust_alias_routes(
+    source: &str,
+    flags: &[&str],
+) -> rift_protocol::index::PackagePublication {
+    let package = fixture::identity();
+    let owner = package.owner().expect("Cargo owner");
+    let language = fixture::language(ShippedLanguage::Rust);
+    let origin = fixture::origin(&package);
+    let root = ProjectPath::new("src/lib.rs").expect("library root");
+    let child = ProjectPath::new("src/shared/mod.rs").expect("shared source");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname='beacon'\nversion='1.0.0'\n[features]\nprimary=[]\n",
+    )];
+    let sources = [
+        PackageSource::new(&root, source),
+        PackageSource::new(&child, "pub fn leaf() {}\n"),
+    ];
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(3, 4096),
+    )
+    .expect("authored source inventory")
+    .with_framework_context(&metadata, &[])
+    .expect("captured manifest");
+    let input = if flags.is_empty() {
+        input
+    } else {
+        input
+            .with_rust_configuration(&manifest, flags)
+            .expect("captured flags")
+    };
+    PackageAnalyzer::analyze(input, 1)
+        .expect("package analysis")
+        .into_parts()
+        .0
+}
+
+#[test]
 fn package_rust_shared_literal_modules_resolve_each_outgoing_scope() {
     const ROOT: &str = r#"
 #[path = "shared.rs"]

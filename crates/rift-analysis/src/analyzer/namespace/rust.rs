@@ -94,8 +94,9 @@ pub(super) fn prepare(
         let mut exports = Vec::new();
         let mut conditioned = Vec::new();
         let configuration = configurations.file(path.as_str());
-        let ordinary =
+        let mut ordinary =
             module_children(file, &directory, &inventory, input.syntax(), &configuration);
+        retain_selected_module_routes(file, &configuration, &mut ordinary);
         routes.record(file, &namespace, &ordinary);
         let children = macros::children(
             file,
@@ -180,6 +181,38 @@ fn record_module_declarations(
             Declaring::Known(configuration.condition(&condition)),
         ));
     }
+}
+
+/// Drops an inactive alias when two ordinary routes compete for the same source file.
+fn retain_selected_module_routes(
+    file: &super::SelectedFile<'_>,
+    configuration: &configuration::Configuration<'_>,
+    children: &mut Vec<ChildModulePath>,
+) {
+    let mut routes = BTreeMap::<_, Vec<_>>::new();
+    for (path, scope, item) in children.iter() {
+        routes
+            .entry(path.as_str())
+            .or_default()
+            .push((scope, *item));
+    }
+    let mut inactive = std::collections::BTreeSet::new();
+    for candidates in routes.values() {
+        let [(left_scope, left), (right_scope, right)] = candidates.as_slice() else {
+            continue;
+        };
+        if left_scope == right_scope {
+            continue;
+        }
+        let left_active = configuration.admitted(file.syntax, file.source, *left);
+        let right_active = configuration.admitted(file.syntax, file.source, *right);
+        match (left_active, right_active) {
+            (Some(true), Some(false)) => inactive.insert(*right),
+            (Some(false), Some(true)) => inactive.insert(*left),
+            _ => continue,
+        };
+    }
+    children.retain(|(_, _, item)| !inactive.contains(item));
 }
 
 fn place_implementations(
