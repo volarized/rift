@@ -45,6 +45,12 @@ pub struct RustLspDeclarationAdmission {
     pub dropped_at_limit: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingProof {
+    SemanticToken,
+    ShorthandDefinition,
+}
+
 impl PackageAnalyzer {
     /// Adds physically authored Rust bindings under their retained callable owners.
     ///
@@ -60,11 +66,49 @@ impl PackageAnalyzer {
         producer: &FactProducer,
         limits: ExactPackageLimits,
     ) -> Result<RustLspDeclarationAdmission, RiftError> {
+        Self::admit_rust_lsp_bindings(
+            publication,
+            observed,
+            producer,
+            limits,
+            BindingProof::SemanticToken,
+        )
+    }
+
+    /// Adds authored Rust shorthand bindings selected by a definition response.
+    ///
+    /// Each observation must be the only local definition at the same physical token on the
+    /// opened source. A response may also name a field; its location confers no binding authority.
+    /// Declaration tokens and retained syntax bindings consume capacity before these observations.
+    /// # Errors
+    /// Returns an error when a new declaration's canonical record cannot be rendered.
+    pub fn admit_rust_lsp_shorthand_declarations(
+        publication: &mut PackagePublication,
+        observed: &[RustLspDeclarationFile<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) -> Result<RustLspDeclarationAdmission, RiftError> {
+        Self::admit_rust_lsp_bindings(
+            publication,
+            observed,
+            producer,
+            limits,
+            BindingProof::ShorthandDefinition,
+        )
+    }
+
+    fn admit_rust_lsp_bindings(
+        publication: &mut PackagePublication,
+        observed: &[RustLspDeclarationFile<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+        proof: BindingProof,
+    ) -> Result<RustLspDeclarationAdmission, RiftError> {
         if observed.is_empty() {
             return Ok(RustLspDeclarationAdmission::default());
         }
 
-        let mut output = Supplement::new(publication, producer, limits);
+        let mut output = Supplement::new(publication, producer, limits, proof);
         let units = publication
             .units
             .iter()
@@ -152,6 +196,7 @@ struct Supplement<'a> {
     bytes: u64,
     record_bytes: u64,
     dropped: usize,
+    proof: BindingProof,
 }
 
 impl<'a> Supplement<'a> {
@@ -159,6 +204,7 @@ impl<'a> Supplement<'a> {
         publication: &PackagePublication,
         producer: &'a FactProducer,
         limits: ExactPackageLimits,
+        proof: BindingProof,
     ) -> Self {
         let symbols = bound(limits.publication().symbols);
         let slots = symbols.saturating_sub(publication.objects.len()).min(
@@ -189,6 +235,7 @@ impl<'a> Supplement<'a> {
             bytes,
             record_bytes,
             dropped: 0,
+            proof,
         }
     }
 
@@ -213,12 +260,7 @@ impl<'a> Supplement<'a> {
             return Ok(());
         };
         let syntax = BindingSyntax::new(syntax.syntax_elements());
-        let owners =
-            EnclosingDefinitions::new(existing.iter().filter_map(|&declaration| {
-                let kind = declaration.syntax_element_kind.as_deref()?;
-                (declaration.origin.source_kind == SourceKind::Authored && callable(kind))
-                    .then_some((declaration.range.start, declaration.range.end, declaration))
-            }));
+        let owners = callable_owners(existing);
         let ranges = existing
             .iter()
             .map(|row| (row.range.start, row.range.end))
@@ -236,11 +278,13 @@ impl<'a> Supplement<'a> {
             let Some(observation) = observation else {
                 continue;
             };
-            let Some((kind, scope)) = syntax.binding(range) else {
+            let Some((kind, scope)) = syntax.binding(range, self.proof) else {
                 continue;
             };
-            let Some(&owner) = owners
+            let Some(owner) = owners
                 .resolve(scope.start, scope.end)
+                .copied()
+                .flatten()
                 .filter(|owner| owner.range.end == scope.end)
             else {
                 continue;
@@ -257,7 +301,11 @@ impl<'a> Supplement<'a> {
                 continue;
             };
             let ordinal = ordinals.entry((&owner.symbol, name)).or_insert(0_usize);
-            let component = format!("{name}#lsp{ordinal}");
+            let category = match self.proof {
+                BindingProof::SemanticToken => "lsp",
+                BindingProof::ShorthandDefinition => "lsp_shorthand",
+            };
+            let component = format!("{name}#{category}{ordinal}");
             *ordinal += 1;
             if ranges.contains(&(range.start(), range.end())) {
                 continue;
@@ -330,10 +378,10 @@ impl<'a> Supplement<'a> {
             digest: Digest(String::new()),
         };
         declaration.digest = digest_of(&declaration, &publication.owner)?;
-        let (kind, portable) = if observation.parameter {
-            ("parameter_binding", SymbolKind::Parameter)
-        } else {
-            ("local_binding", SymbolKind::Value)
+        let (kind, portable) = match (self.proof, observation.parameter) {
+            (BindingProof::ShorthandDefinition, _) => ("shorthand_binding", SymbolKind::Value),
+            (_, true) => ("parameter_binding", SymbolKind::Parameter),
+            (_, false) => ("local_binding", SymbolKind::Value),
         };
         let mut extensions = BTreeMap::new();
         extensions.insert(
@@ -366,6 +414,35 @@ impl<'a> Supplement<'a> {
 
 fn callable(kind: &str) -> bool {
     matches!(kind, "function_item" | "function_signature_item")
+}
+
+fn callable_owners<'a>(
+    declarations: &[&'a PackageSymbol],
+) -> EnclosingDefinitions<Option<&'a PackageSymbol>> {
+    let mut owners = BTreeMap::new();
+    for &declaration in declarations {
+        if declaration.origin.source_kind != SourceKind::Authored
+            || !declaration
+                .syntax_element_kind
+                .as_deref()
+                .is_some_and(callable)
+        {
+            continue;
+        }
+        owners
+            .entry((declaration.range.start, declaration.range.end))
+            .and_modify(|existing: &mut Option<&PackageSymbol>| {
+                if existing.is_some_and(|owner| owner.symbol != declaration.symbol) {
+                    *existing = None;
+                }
+            })
+            .or_insert(Some(declaration));
+    }
+    EnclosingDefinitions::new(
+        owners
+            .into_iter()
+            .map(|((start, end), owner)| (start, end, owner)),
+    )
 }
 
 struct BindingSyntax<'tree> {
@@ -409,13 +486,21 @@ impl<'tree> BindingSyntax<'tree> {
         }
     }
 
-    fn binding(&self, range: SourceRange) -> Option<(&'static str, ByteRange)> {
+    fn binding(
+        &self,
+        range: SourceRange,
+        proof: BindingProof,
+    ) -> Option<(&'static str, ByteRange)> {
         let &index = self.elements.get(&ByteRange {
             start: range.start(),
             end: range.end(),
         })?;
-        let scope = syntax_callable(self.tree, &self.first_child, index)?;
-        Some((self.tree[index].kind, scope))
+        let kind = self.tree[index].kind;
+        if proof == BindingProof::ShorthandDefinition && kind != "shorthand_field_identifier" {
+            return None;
+        }
+        let scope = syntax_callable(self.tree, &self.first_child, index, proof)?;
+        Some((kind, scope))
     }
 }
 
@@ -433,6 +518,7 @@ fn syntax_callable(
     tree: &[SyntaxElement],
     first: &[Option<usize>],
     mut index: usize,
+    proof: BindingProof,
 ) -> Option<ByteRange> {
     let mut current = tree.get(index)?;
     let mut in_binding = false;
@@ -445,11 +531,13 @@ fn syntax_callable(
                 | "attribute_item"
                 | "inner_attribute_item"
                 | "macro_definition" => return None,
+                "closure_expression" if proof == BindingProof::ShorthandDefinition => return None,
                 kind if callable(kind) => return Some(current.range),
                 _ => {}
             }
         } else {
             match current.kind {
+                "or_pattern" if proof == BindingProof::ShorthandDefinition => return None,
                 "tuple_pattern"
                 | "slice_pattern"
                 | "reference_pattern"

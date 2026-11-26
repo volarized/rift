@@ -597,6 +597,91 @@ pub fn parameter(Panel { item }: Panel) -> u8 {
 }
 
 #[test]
+fn exact_rust_definition_shorthand_is_admitted_after_existing_bindings() {
+    use rift_core::{FileDigest, SourceRange};
+    use rift_protocol::producer::{FactProducer, ProducerName, ProducerRevision};
+
+    use crate::{RustLspDeclaration, RustLspDeclarationFile};
+
+    let source = "pub struct Panel { pub item: u8 }
+macro_rules! notice { () => { () } }
+pub fn choose(panel: Panel) -> u8 {
+    notice!();
+    let Panel { item } = panel;
+    item
+}
+";
+    let base = analyze(source);
+    let token = position(source, "item } = panel");
+    let field = position(source, "item: u8");
+    let span = |start| SourceRange::new(start, start + 4).expect("physical token");
+    let producer = FactProducer {
+        name: ProducerName::parse("rust-analyzer").expect("producer"),
+        revision: ProducerRevision::parse("0.0.1").expect("producer revision"),
+    };
+    let path = ProjectPath::new("src/lib.rs").expect("opened Rust source");
+    let declarations = [
+        RustLspDeclaration {
+            range: span(field),
+            parameter: false,
+        },
+        RustLspDeclaration {
+            range: span(token),
+            parameter: false,
+        },
+    ];
+    let observed = [RustLspDeclarationFile {
+        path: &path,
+        digest: FileDigest::of(source.as_bytes()),
+        declarations: &declarations,
+    }];
+    assert!(base.declarations.iter().all(|row| row.range.start != token));
+    let mut admitted = base.clone();
+    let limits = ExactPackageLimits::new(2, 1 << 20);
+    let result = PackageAnalyzer::admit_rust_lsp_shorthand_declarations(
+        &mut admitted,
+        &observed,
+        &producer,
+        limits,
+    )
+    .expect("verified Definition observation");
+    assert_eq!(result.admitted, 1);
+    let added = admitted
+        .declarations
+        .iter()
+        .find(|row| row.range.start == token)
+        .expect("authored shorthand definition");
+    assert_eq!(added.range.end, token + 4);
+    assert!(
+        added
+            .symbol
+            .as_str()
+            .ends_with("/choose/item%23lsp_shorthand0")
+    );
+    assert_eq!(
+        added.syntax_element_kind.as_deref(),
+        Some("shorthand_field_identifier")
+    );
+    assert!(
+        base.declarations
+            .iter()
+            .all(|row| admitted.declarations.contains(row))
+    );
+    assert_eq!(admitted.edges, base.edges);
+
+    let clipped = limits
+        .with_declarations(u32::try_from(base.declarations.len()).expect("cap"))
+        .expect("room for incumbent declarations");
+    let mut held = base.clone();
+    let result = PackageAnalyzer::admit_rust_lsp_shorthand_declarations(
+        &mut held, &observed, &producer, clipped,
+    )
+    .expect("checked capped observation");
+    assert_eq!(result.dropped_at_limit, 1);
+    assert_eq!(held, base);
+}
+
+#[test]
 fn package_rust_shorthand_refuses_an_in_scope_constant() {
     let source = "const item: u8 = 0;
 pub struct Panel { pub item: u8 }
