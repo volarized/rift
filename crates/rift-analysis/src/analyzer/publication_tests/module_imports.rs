@@ -3367,6 +3367,55 @@ fn non_entry_returns_keep_nested_keys_under_their_physical_parent() {
 }
 
 #[test]
+fn non_entry_callbacks_keep_properties_in_distinct_call_arguments() {
+    const SOURCE: &str = concat!(
+        "function inspect(value) { return value.status; }\n",
+        "export function choose(items) {\n",
+        "  return items.map(item => {\n",
+        "    if (item) return inspect({ status: 'first' });\n",
+        "    return inspect({ status: 'second' });\n",
+        "  });\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("callback argument properties");
+    let properties = ["status: 'first'", "status: 'second'"].map(|written| {
+        let start = SOURCE.find(written).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property");
+        assert!(!row.public);
+        row.symbol.clone()
+    });
+    assert_ne!(properties[0], properties[1]);
+    let calls = found
+        .edges
+        .iter()
+        .filter(|row| row.kinds == [EdgeKind::Calls] && row.to.as_str().ends_with("/inspect"))
+        .map(|row| row.occurrence.as_ref().expect("written call").range.start)
+        .collect::<BTreeSet<_>>();
+    let written = SOURCE
+        .match_indices("return inspect(")
+        .map(|(start, _)| u64::try_from(start + "return ".len()).expect("call position"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(calls, written);
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
 fn javascript_file_modules_keep_local_names_without_an_established_method() {
     const SOURCE: &str = concat!(
         "export const codec = flag\n",

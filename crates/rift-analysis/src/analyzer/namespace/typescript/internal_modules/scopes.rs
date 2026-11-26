@@ -7,7 +7,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
-    StaticCallee, StaticFacts, SyntaxFacts, SyntaxSymbol,
+    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::{SelectedFile, binding_name};
@@ -525,8 +525,7 @@ impl<'source> FileScopes<'source> {
         let owner = owners
             .enclosing
             .resolve(symbol.item_range.start, symbol.item_range.end)
-            .copied()
-            .flatten()?;
+            .and_then(|(_, owner)| *owner)?;
         (owner.syntax_element_kind == Some("function_declaration")
             && symbol.container.as_deref() == Some(owner.qualified_name.as_str())
             && owner.body_range?.encloses(scope)
@@ -923,7 +922,8 @@ impl<'source> FileScopes<'source> {
 
 /// The physical callable or module that can own one repeated literal property.
 struct LiteralOwners<'source> {
-    enclosing: EnclosingDefinitions<Option<&'source SyntaxSymbol>>,
+    enclosing: EnclosingDefinitions<(ByteRange, Option<&'source SyntaxSymbol>)>,
+    callbacks: BTreeSet<ByteRange>,
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
@@ -947,7 +947,8 @@ impl<'source> LiteralOwners<'source> {
                         .name_range
                         .and_then(|name| functions.get(&name).copied())
                         .filter(|owner| owner.item_range == symbol.item_range);
-                    (symbol.item_range.start, symbol.item_range.end, function)
+                    let scope = symbol.item_range;
+                    (scope.start, scope.end, (scope, function))
                 })
                 .chain(
                     facts
@@ -956,7 +957,7 @@ impl<'source> LiteralOwners<'source> {
                         .copied()
                         .chain(facts.function_values().iter().map(|&(scope, _)| scope))
                         .chain(facts.static_blocks().iter().copied())
-                        .map(|scope| (scope.start, scope.end, None)),
+                        .map(|scope| (scope.start, scope.end, (scope, None))),
                 ),
         );
         let mut calls = BTreeMap::<u64, Vec<_>>::new();
@@ -965,6 +966,13 @@ impl<'source> LiteralOwners<'source> {
         }
         Self {
             enclosing,
+            callbacks: facts
+                .function_contexts()
+                .iter()
+                .filter_map(|&(function, context)| {
+                    matches!(context, StaticFunctionContext::Argument { .. }).then_some(function)
+                })
+                .collect(),
             calls,
             bound_calls: facts
                 .destructured()
@@ -976,7 +984,10 @@ impl<'source> LiteralOwners<'source> {
     }
 
     fn proves_body(&self, property: &SyntaxSymbol, member: &StaticBodyMember) -> bool {
-        let scope = self.enclosing.resolve(member.body.start, member.body.end);
+        let scope = self
+            .enclosing
+            .resolve(member.body.start, member.body.end)
+            .copied();
         let container = property.container.as_deref();
         if let Some(owner) = container
             && self.returned.get(&member.body) == Some(&Some(owner))
@@ -989,7 +1000,7 @@ impl<'source> LiteralOwners<'source> {
                     && call.range.encloses(member.holder)
                     && match (container, scope) {
                         (None, None) => property.qualified_name == property.name,
-                        (Some(owner), Some(Some(function))) => {
+                        (Some(owner), Some((_, Some(function)))) => {
                             function.qualified_name == owner
                                 && function
                                     .body_range
@@ -1000,10 +1011,30 @@ impl<'source> LiteralOwners<'source> {
                                 )
                                 && !self.bound_calls.contains(&call.range)
                         }
+                        (container, Some((scope, None))) if self.callbacks.contains(&scope) => {
+                            scope.encloses(call.range)
+                                && matches!(
+                                    call.callee,
+                                    StaticCallee::Direct | StaticCallee::Member { .. }
+                                )
+                                && !self.bound_calls.contains(&call.range)
+                                && self.callback_literal_container(scope, container)
+                        }
                         _ => false,
                     }
             })
         })
+    }
+
+    fn callback_literal_container(&self, scope: ByteRange, container: Option<&str>) -> bool {
+        let Some(mut owners) = self.enclosing.containing(scope.start, scope.end) else {
+            return false;
+        };
+        match owners.find(|(body, _)| *body != scope) {
+            Some((_, Some(owner))) => container == Some(owner.qualified_name.as_str()),
+            None => container.is_none(),
+            Some((_, None)) => false,
+        }
     }
 }
 
