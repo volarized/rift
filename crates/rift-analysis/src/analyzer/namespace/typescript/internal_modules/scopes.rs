@@ -282,7 +282,7 @@ impl<'source> FileScopes<'source> {
         else {
             return BTreeMap::new();
         };
-        let owners = LiteralOwners::new(symbols, facts, anchors);
+        let owners = LiteralOwners::new(symbols, facts, anchors, file.source);
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
         let mut scoped = BTreeMap::new();
         for (name, declarations) in candidates {
@@ -1038,6 +1038,7 @@ impl<'source> LiteralOwners<'source> {
         symbols: &'source [SyntaxSymbol],
         facts: &'source StaticFacts,
         anchors: &BTreeMap<String, SymbolId>,
+        source: &str,
     ) -> Self {
         let functions = literal_callable_owners(symbols, facts, anchors);
         let enclosing = EnclosingDefinitions::new(
@@ -1074,7 +1075,12 @@ impl<'source> LiteralOwners<'source> {
                 .function_contexts()
                 .iter()
                 .filter_map(|&(function, context)| {
-                    matches!(context, StaticFunctionContext::Argument { .. }).then_some(function)
+                    let last = usize::try_from(function.end.checked_sub(1)?).ok()?;
+                    // A function range ends at its written body. Keep the existing refusal
+                    // for a concise callback whose call is its expression body.
+                    (matches!(context, StaticFunctionContext::Argument { .. })
+                        && source.as_bytes().get(last) == Some(&b'}'))
+                    .then_some(function)
                 })
                 .collect(),
             calls,
@@ -1136,8 +1142,7 @@ impl<'source> LiteralOwners<'source> {
         };
         match owners.find(|(body, _)| *body != scope) {
             Some((_, Some(owner))) => container == Some(owner.qualified_name.as_str()),
-            None => container.is_none(),
-            Some((_, None)) => false,
+            None | Some((_, None)) => false,
         }
     }
 }
