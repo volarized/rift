@@ -10,8 +10,8 @@ limits, and failures. For an introduction through an agent's workflow, see the
 [MCP guide](/docs/mcp).
 
 The expandable tool properties and examples come from the served [JSON schema](https://volar.sh/rift/mcp.json).
-A recorded example shows the MCP call, compact text, and JSON. Search examples also show
-the SPARQL query on its own.
+The Request tab shows the MCP call and offers a SPARQL view for searches. The Response tab shows
+compact text or JSON.
 [Result content](#result-content) defines the compact text.
 
 ## Map [#resource-map]
@@ -734,36 +734,7 @@ working tree, which a revision does not have.
 
 A workspace with no git repository refuses a revision read and names the remedy:
 
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Execution failure, compact text:**
-
-```text
-1 error
-	capability_unavailable · retry operator_action
-		no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `revision` to read the current tree; adjust the request to a served capability, or configure a provider that serves it
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Execution failure, `ErrorData`:**
-
-```json
-{
-  "code": "capability_unavailable",
-  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `revision` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
-  "retry": "operator_action",
-  "phase": "read"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+<ReadExample name="revision-unavailable" />
 
 An unknown revision refuses with `resource_not_found`, and
 [`[providers.history]`](/docs/developer/configuration#providers) owns the capability: `enabled = false`
@@ -850,73 +821,7 @@ The compact text has these parts:
 
 The tabs below show the page of a workspace with one TypeScript language and one source unit:
 
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Request:** `rift://workspace`
-
-**Response, compact text:**
-
-```text
-workspace
-languages:
-	typescript:tsx · syntax · lsp typescript:tsx ready
-		include src/**/*.tsx
-		exclude src/generated/**
-source:
-	src/view.tsx · typescript:tsx
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Request:** `rift://workspace`
-
-**Response, JSON:**
-
-```json
-{
-  "configuration_revision": "3f9a1c2e",
-  "languages": [
-    {
-      "enabled": true,
-      "exclude": [
-        "src/generated/**"
-      ],
-      "execution": false,
-      "include": [
-        "src/**/*.tsx"
-      ],
-      "language": "typescript:tsx",
-      "lsp": {
-        "process": "typescript:tsx",
-        "state": "ready"
-      },
-      "syntax": true
-    }
-  ],
-  "pagination": {
-    "max_results": 10,
-    "page": 1,
-    "pages": 1,
-    "total": 1
-  },
-  "revision": "rift://revision/tree/9f0c4e2a7b1d3c5e8f6a0b2d4c6e8a1f3b5d7c9e0a2b4d6f8e1c3a5b7d9f0e2c",
-  "source": [
-    {
-      "digest": "8a4d20bc",
-      "language": "typescript:tsx",
-      "path": "src/view.tsx"
-    }
-  ]
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+<ReadExample name="workspace" />
 
 The source page describes one published catalog. The server **MUST** return its configuration
 revision, revision, source digests, and pagination from that publication. During preparation, the server

@@ -20,7 +20,7 @@ export type PingState =
   | { status: "pending" }
   | { status: "done"; ok: boolean; text: string };
 
-const OUTLINE = "bg-transparent font-mono font-normal dark:bg-transparent";
+const OUTLINE = "font-mono font-normal";
 
 function StatusGlyph({ status }: { status: Connection["status"] }) {
   const size = "size-3 shrink-0";

@@ -1,17 +1,13 @@
 import {
-  BracketsCurlyIcon,
-  CircuitryIcon,
   CodeIcon,
   FileTextIcon,
   FoldersIcon,
   MapTrifoldIcon,
   PackageIcon,
   PlayIcon,
-  TextAlignLeftIcon,
 } from "@phosphor-icons/react/ssr";
 import { ServerCodeBlock } from "fumadocs-ui/components/codeblock.rsc";
-import { Tab, Tabs, TabsList, TabsTrigger } from "fumadocs-ui/components/tabs";
-
+import { ExampleTabs } from "@/components/example-tabs";
 import { IconCard } from "@/components/icon-card";
 import { Badge } from "@/components/ui/badge";
 
@@ -68,27 +64,12 @@ export async function WorkspaceMapExample() {
   });
 
   return (
-    <Tabs defaultValue="visualization" className="not-prose my-6 rounded-none">
-      <TabsList aria-label="Example map view">
-        <TabsTrigger value="visualization">
-          <MapTrifoldIcon aria-hidden="true" />
-          Visualization
-        </TabsTrigger>
-        <TabsTrigger value="call">
-          <CircuitryIcon aria-hidden="true" />
-          MCP call
-        </TabsTrigger>
-        <TabsTrigger value="text">
-          <TextAlignLeftIcon aria-hidden="true" />
-          Text
-        </TabsTrigger>
-        <TabsTrigger value="json">
-          <BracketsCurlyIcon aria-hidden="true" />
-          JSON
-        </TabsTrigger>
-      </TabsList>
-      <Tab value="visualization" className="@container rounded-none p-4 [&>figure:only-child]:m-0">
-        <figure aria-label="Map of the example project">
+    <ExampleTabs
+      mcp={call}
+      text={text}
+      json={json}
+      visualization={
+        <figure className="@container m-0 p-4" aria-label="Map of the example project">
           <figcaption className="flex flex-wrap items-center justify-between gap-3 border p-4">
             <span className="flex items-center gap-3">
               <MapTrifoldIcon size={24} weight="light" aria-hidden="true" />
@@ -166,16 +147,7 @@ export async function WorkspaceMapExample() {
             )}
           </div>
         </figure>
-      </Tab>
-      <Tab value="call" className="rounded-none p-0 [&>figure:only-child]:m-0">
-        {call}
-      </Tab>
-      <Tab value="text" className="rounded-none p-0 [&>figure:only-child]:m-0">
-        {text}
-      </Tab>
-      <Tab value="json" className="rounded-none p-0 [&>figure:only-child]:m-0">
-        {json}
-      </Tab>
-    </Tabs>
+      }
+    />
   );
 }

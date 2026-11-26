@@ -954,5 +954,55 @@
         "total": 1
       }
     }
+  },
+  "revision-unavailable": {
+    "arguments": {
+      "id": "rift://symbol/local/rust/example_project/config/load_config",
+      "revision": "rift://revision/git/main"
+    },
+    "text": "1 error\n\tcapability_unavailable · retry operator_action\n\t\tno configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `revision` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
+    "json": {
+      "code": "capability_unavailable",
+      "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `revision` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
+      "retry": "operator_action",
+      "phase": "read"
+    }
+  },
+  "workspace": {
+    "arguments": {
+      "uri": "rift://workspace"
+    },
+    "text": "workspace\nlanguages:\n\ttypescript:tsx · syntax · lsp typescript:tsx ready\n\t\tinclude src/**/*.tsx\n\t\texclude src/generated/**\nsource:\n\tsrc/view.tsx · typescript:tsx",
+    "json": {
+      "configuration_revision": "3f9a1c2e",
+      "languages": [
+        {
+          "enabled": true,
+          "exclude": ["src/generated/**"],
+          "execution": false,
+          "include": ["src/**/*.tsx"],
+          "language": "typescript:tsx",
+          "lsp": {
+            "process": "typescript:tsx",
+            "state": "ready"
+          },
+          "syntax": true
+        }
+      ],
+      "pagination": {
+        "max_results": 10,
+        "page": 1,
+        "pages": 1,
+        "total": 1
+      },
+      "revision": "rift://revision/tree/9f0c4e2a7b1d3c5e8f6a0b2d4c6e8a1f3b5d7c9e0a2b4d6f8e1c3a5b7d9f0e2c",
+      "source": [
+        {
+          "digest": "8a4d20bc",
+          "language": "typescript:tsx",
+          "path": "src/view.tsx"
+        }
+      ]
+    }
   }
 }
