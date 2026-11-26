@@ -28,6 +28,10 @@ fn package_publishes_direct_macro_export_visibility() {
     let source = "#[macro_export]\nmacro_rules! plain_export { () => { 8u8 }; }\n\
                   #[macro_export (/* comment */ local_inner_macros, )]\n\n\
                   // comment\nmacro_rules! qualified_export { () => { 7u8 }; }\n\
+                  #[r#macro_export(local_inner_macros)]\n\
+                  macro_rules! raw_attribute { () => { 5u8 }; }\n\
+                  #[macro_export(r#local_inner_macros)]\n\
+                  macro_rules! raw_argument { () => { 6u8 }; }\n\
                   #[cfg_attr(any(), macro_export(local_inner_macros))]\n\
                   macro_rules! conditional { () => { 9u8 }; }\n\
                   macro_rules! private_macro { () => { 0u8 }; }\n";
@@ -42,10 +46,12 @@ fn package_publishes_direct_macro_export_visibility() {
         .iter()
         .filter(|row| row.syntax_element_kind.as_deref() == Some("macro_definition"))
         .collect::<Vec<_>>();
-    assert_eq!(macros.len(), 4);
+    assert_eq!(macros.len(), 6);
     for (name, public) in [
         ("plain_export", true),
         ("qualified_export", true),
+        ("raw_attribute", true),
+        ("raw_argument", true),
         ("conditional", false),
         ("private_macro", false),
     ] {
