@@ -1,6 +1,7 @@
 //! Resolves Rust paths admitted by the captured crate and module inventory.
 
 mod deref;
+mod extern_crates;
 mod field_sites;
 mod macro_calls;
 mod receivers;
@@ -19,6 +20,11 @@ use rift_syntax::{
 };
 
 use super::{Binding, File, Target, Work};
+
+pub(super) enum ExternCallee<'source> {
+    Local(Target<'source>),
+    Runtime(Vec<String>),
+}
 
 /// Qualified Rust declarations grouped by their admitted crate and module path.
 #[derive(Default)]
@@ -1067,6 +1073,12 @@ impl<'source> Namespaces<'source> {
                     if !work.charge() || imported.glob && imported.scope.contains(position) {
                         return None;
                     }
+                }
+                if value
+                    && !tail.is_empty()
+                    && self.hides_implicit_runtime(file, head, position, work)
+                {
+                    return None;
                 }
                 parts.iter().map(|part| (*part).to_owned()).collect()
             }

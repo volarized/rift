@@ -11,6 +11,35 @@ use crate::static_analysis::{
 };
 
 impl Kinds {
+    pub(super) fn record_extern_crate(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let declaration = visited.syntax_element();
+        let Some(scope) = enclosing(visited, &self.scopes).map(Visited::syntax_element) else {
+            return Ok(());
+        };
+        let Some(crate_name) = declaration.child_by_field_id(self.name) else {
+            return Ok(());
+        };
+        let name = declaration
+            .child_by_field_id(self.alias)
+            .unwrap_or(crate_name);
+        if declaration.has_error() || crate_name.is_missing() || name.is_missing() {
+            return Ok(());
+        }
+        facts.bindings.push(binding(
+            name,
+            scope,
+            byte_range(scope)?.start,
+            StaticBindingKind::RustExternCrate {
+                crate_name: byte_range(crate_name)?,
+            },
+        )?);
+        Ok(())
+    }
+
     pub(super) fn record_import(
         &self,
         visited: Visited<'_, '_>,

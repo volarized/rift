@@ -458,7 +458,13 @@ impl EdgeStore {
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
-        let mut next_start = resolution.occurrences.len();
+        let (alias, alias_external) = resolution
+            .rust_extern_alias_start
+            .take()
+            .unwrap_or((resolution.occurrences.len(), resolution.external.len()));
+        let (incumbent_external, alias_external_rows) =
+            resolution.external.split_at(alias_external);
+        let mut next_start = alias;
         let [
             overload,
             quoted_type,
@@ -482,7 +488,7 @@ impl EdgeStore {
             next_start = start.unwrap_or(next_start);
             next_start
         });
-        let (internal, external) = supplemental_start.unwrap_or((late, resolution.external.len()));
+        let (internal, external) = supplemental_start.unwrap_or((late, alias_external));
         let boundaries = [
             0,
             internal,
@@ -494,13 +500,14 @@ impl EdgeStore {
             initializer,
             quoted_type,
             overload,
+            alias,
             resolution.occurrences.len(),
         ];
-        let (external, supplemental_external) = resolution.external.split_at(external);
+        let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
-        let mut remaining = edges_max.saturating_sub(existing);
-        let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 10] = std::array::from_fn(|index| {
+        let capacity = edges_max.saturating_sub(existing);
+        let mut remaining = capacity;
+        let mut batches: [BTreeMap<_, _>; 11] = std::array::from_fn(|index| {
             let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
             admit_occurrences(rows, spans, &self.edge_modules, &mut edges);
@@ -513,6 +520,12 @@ impl EdgeStore {
             &self.edge_modules,
             &mut batches[1],
         );
+        admit_external(
+            alias_external_rows,
+            spans,
+            &self.edge_modules,
+            &mut batches[10],
+        );
         self.deduplicate_static_batches(&mut batches);
         for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);
@@ -520,7 +533,6 @@ impl EdgeStore {
                 .dropped_edges
                 .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
             remaining -= fits;
-            changed |= fits > 0;
             edges.truncate(fits);
             if edges.is_empty() {
                 continue;
@@ -537,7 +549,7 @@ impl EdgeStore {
                 .or_default()
                 .append(&mut edges);
         }
-        if changed {
+        if remaining < capacity {
             for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
                 edges.sort_by(edge_order);
                 edges.dedup();
