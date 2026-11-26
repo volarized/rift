@@ -54,11 +54,15 @@ impl<'source> PythonImportQualifier<'source> {
     }
 }
 
-pub(super) struct EdgePythonModules(BTreeMap<String, Option<String>>);
+pub(super) struct EdgePythonModules {
+    paths: BTreeMap<String, Option<String>>,
+    stubs: BTreeMap<String, String>,
+}
 
 impl EdgePythonModules {
     pub(super) fn build_edge(files: &BTreeMap<&str, File<'_>>, work: &mut Work) -> Option<Self> {
-        let mut modules = BTreeMap::new();
+        let mut paths = BTreeMap::<_, Option<String>>::new();
+        let mut stubs = BTreeMap::new();
         for file in files
             .values()
             .filter(|file| file.document.facts.language().name == "python")
@@ -73,16 +77,35 @@ impl EdgePythonModules {
                 continue;
             }
             let path = file.document.path.as_str();
-            modules
+            paths
                 .entry(module.join("."))
-                .and_modify(|entry| *entry = None)
+                .and_modify(|entry| {
+                    if let Some(implementation) = entry.as_deref() {
+                        // Physical path order visits a .py file before its adjacent .pyi.
+                        if path
+                            .strip_suffix(".pyi")
+                            .is_some_and(|stem| implementation.strip_suffix(".py") == Some(stem))
+                        {
+                            stubs.insert(implementation.to_owned(), path.to_owned());
+                            return;
+                        }
+                        stubs.remove(implementation);
+                    }
+                    *entry = None;
+                })
                 .or_insert_with(|| Some(path.to_owned()));
         }
-        Some(Self(modules))
+        Some(Self { paths, stubs })
     }
 
     fn path(&self, name: &str) -> Option<&str> {
-        self.0.get(name)?.as_deref()
+        self.paths.get(name)?.as_deref()
+    }
+
+    fn same_module(&self, left: &str, right: &str) -> bool {
+        left == right
+            || self.stubs.get(left).is_some_and(|stub| stub == right)
+            || self.stubs.get(right).is_some_and(|stub| stub == left)
     }
 
     fn name(from: &File<'_>, module: &str) -> Option<String> {
@@ -453,7 +476,11 @@ impl<'source> Index<'source> {
         }
         let name = EdgePythonModules::name(file, file.text(module)?)?;
         let written = self.files.get(self.edge_python.path(&name)?)?;
-        if terminal.file.path == written.document.path || !work.charge() {
+        if self
+            .edge_python
+            .same_module(terminal.file.path.as_str(), written.document.path.as_str())
+            || !work.charge()
+        {
             return None;
         }
         let mut occurrence = self.occurrence(
@@ -684,13 +711,13 @@ impl<'source> Index<'source> {
         };
         file.qualified_target(".")?.admitted_path()?;
         let module = EdgePythonModules::name(file, file.text(module)?)?;
-        let target = self.edge_python.path(&module)?;
         let exported = file.text(export)?;
+        let target = self.edge_python.path(&module)?;
         // A package importing a name from itself binds its submodule.
-        if target == path && exported == name {
+        if self.edge_python.same_module(target, path) && exported == name {
             return None;
         }
-        let target = self.files.get(target)?;
+        let target = self.python_export_file(self.files.get(target)?, exported, work)?;
         Some((target.document.path.as_str(), exported))
     }
 
@@ -699,11 +726,41 @@ impl<'source> Index<'source> {
         (self.edge_python.path(name).is_some()
             || self
                 .edge_python
-                .0
+                .paths
                 .range(prefix.clone()..)
                 .next()
                 .is_some_and(|(module, _)| module.starts_with(&prefix)))
         .then(|| Value::Module(name.to_owned()))
+    }
+
+    /// Selects the physical file declaring a name of a module with an adjacent stub.
+    fn python_export_file<'index>(
+        &'index self,
+        implementation: &'index File<'source>,
+        name: &str,
+        work: &mut Work,
+    ) -> Option<&'index File<'source>> {
+        let path = implementation.document.path.as_str();
+        let Some(stub) = self.edge_python.stubs.get(path) else {
+            return Some(implementation);
+        };
+        if implementation.document.facts.has_errors()
+            || implementation.python_globals.contains_key(name)
+            || implementation.blocked(0, work)
+        {
+            return Some(implementation);
+        }
+        for binding in implementation.by_name.get(name).into_iter().flatten() {
+            if !work.charge() {
+                return None;
+            }
+            if implementation.python_module_binding(binding)
+                && !matches!(binding.kind, StaticBindingKind::PythonGuard { .. })
+            {
+                return Some(implementation);
+            }
+        }
+        self.files.get(stub.as_str())
     }
 
     fn export_value<'index>(
@@ -712,6 +769,7 @@ impl<'source> Index<'source> {
         mut name: &'index str,
         work: &mut Work,
     ) -> Option<Value<'source>> {
+        file = self.python_export_file(file, name, work)?;
         if let Some(target) = self
             .python_imports
             .0
@@ -769,12 +827,16 @@ impl<'source> Index<'source> {
                     let Some(path) = self.edge_python.path(&module) else {
                         return self.module_value(&format!("{module}.{exported}"));
                     };
-                    if path == file.document.path.as_str() && exported == name {
+                    if self
+                        .edge_python
+                        .same_module(path, file.document.path.as_str())
+                        && exported == name
+                    {
                         // A package importing a name from itself binds its submodule.
                         return self.module_value(&format!("{module}.{exported}"));
                     }
                     name = exported;
-                    file = self.files.get(path)?;
+                    file = self.python_export_file(self.files.get(path)?, name, work)?;
                 }
                 StaticBindingKind::PythonModule { module } => {
                     return self.module_value(file.text(module)?.split('.').next()?);

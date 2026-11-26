@@ -229,6 +229,171 @@ fn package_python_parameter_keeps_original_symbols_and_local_reads_under_caps() 
 }
 
 #[test]
+fn package_imports_keep_physical_declarations_in_paired_python_modules() {
+    for (module, source_path, stub_path, paired_importer) in [
+        ("pkg.model", "pkg/model.py", "pkg/model.pyi", false),
+        ("pkg.model", "pkg/model.py", "pkg/model.pyi", true),
+        ("pkg", "pkg/__init__.py", "pkg/__init__.pyi", false),
+    ] {
+        assert_paired_python_module_edges(module, source_path, stub_path, paired_importer);
+    }
+}
+
+fn assert_paired_python_module_edges(
+    module: &str,
+    source_path: &str,
+    stub_path: &str,
+    paired_importer: bool,
+) {
+    use rift_core::ReferenceRole;
+    use rift_provider::NormalizedTarget;
+
+    let implementation = "def build(value): return value\nclass Base: pass\n\
+                          def local():\n    class StubOnly: pass\n    return StubOnly\n";
+    let stub = "def build(value: int) -> int: ...\nclass Base: ...\nclass StubOnly: ...\n";
+    let importer = format!(
+        "from {module} import build, Base, StubOnly\nimport {module} as joined\n\
+         class Child(Base): pass\n\
+         def direct(value: StubOnly): return build(1)\n\
+         def qualified(): return joined.build(2)\n\
+         def read(): return joined.build\n"
+    );
+    let analysis = paired_python_analysis(
+        module,
+        (source_path, implementation),
+        (stub_path, stub),
+        paired_importer,
+        &importer,
+    );
+    let (publication, _, semantics, _) = analysis.into_parts();
+    publication.validate_facts().expect("valid package facts");
+    let module_id = module.replace('.', "/");
+    let importer_unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "pkg/consumer.py")
+        .expect("published importer")
+        .unit;
+    for (role, kind, written, name) in [
+        (ReferenceRole::Import, EdgeKind::Imports, "build", "build"),
+        (
+            ReferenceRole::Import,
+            EdgeKind::Imports,
+            "StubOnly",
+            "StubOnly",
+        ),
+        (ReferenceRole::Type, EdgeKind::Extends, "Base", "Base"),
+        (
+            ReferenceRole::Type,
+            EdgeKind::HasType,
+            "StubOnly",
+            "StubOnly",
+        ),
+        (ReferenceRole::Call, EdgeKind::Calls, "build(1)", "build"),
+        (
+            ReferenceRole::Call,
+            EdgeKind::Calls,
+            "joined.build(2)",
+            "build",
+        ),
+        (
+            ReferenceRole::Read,
+            EdgeKind::Reads,
+            "joined.build",
+            "build",
+        ),
+    ] {
+        let (path, source, declaration) = match name {
+            "Base" => (source_path, implementation, "class Base: pass"),
+            "StubOnly" => (stub_path, stub, "class StubOnly: ..."),
+            _ => (
+                source_path,
+                implementation,
+                "def build(value): return value",
+            ),
+        };
+        let target = format!("/{module_id}/{name}");
+        let mut observed = semantics.static_occurrences().iter().filter(|row| {
+            row.role == role
+                && row.binding.unit().key().as_str() == "pkg/consumer.py"
+                && source_span(&importer, row.binding.range()) == written
+                && matches!(&row.target, NormalizedTarget::Symbol(id) if id.as_str().ends_with(&target))
+        }).peekable();
+        assert!(
+            observed.peek().is_some(),
+            "{module} {paired_importer}: {role:?} {written}"
+        );
+        for row in observed {
+            let binding = row.target_binding.as_ref().expect("physical declaration");
+            assert_eq!(binding.unit().key().as_str(), path);
+            assert_eq!(source_span(source, binding.range()), declaration);
+        }
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [kind]
+                    && edge.to.as_str().ends_with(&target)
+                    && edge.occurrence.as_ref().is_some_and(|span| {
+                        &span.unit == importer_unit
+                            && &importer[usize::try_from(span.range.start).expect("site start")
+                                ..usize::try_from(span.range.end).expect("site end")]
+                                == written
+                    })
+            }),
+            "{module} {paired_importer}: missing published {kind:?} at {written}"
+        );
+    }
+}
+
+fn paired_python_analysis(
+    module: &str,
+    implementation: (&str, &str),
+    stub: (&str, &str),
+    paired_importer: bool,
+    importer: &str,
+) -> PackageAnalysis {
+    let mut sources = vec![implementation, stub, ("pkg/consumer.py", importer)];
+    if module != "pkg" {
+        sources.push(("pkg/__init__.py", ""));
+    }
+    if paired_importer {
+        sources.push((
+            "pkg/consumer.pyi",
+            "class Child: ...\ndef direct(value): ...\n\
+             def qualified(): ...\ndef read(): ...\n",
+        ));
+    }
+    fixture::package_analysis(ShippedLanguage::Python, sources)
+}
+
+#[test]
+fn paired_python_imports_refuse_a_competing_module() {
+    let analysis = fixture::package_analysis(
+        ShippedLanguage::Python,
+        vec![
+            ("pkg/__init__.py", ""),
+            ("pkg/model.py", "def build(): return 1\n"),
+            ("pkg/model.pyi", "def build() -> int: ...\n"),
+            ("pkg/model/__init__.py", "def build(): return 2\n"),
+            (
+                "pkg/consumer.py",
+                "from pkg.model import build\ndef run(): return build()\n",
+            ),
+        ],
+    );
+    assert!(!analysis.publication().edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/consumer/run")
+            && edge.to.as_str().ends_with("/model/build")
+    }));
+}
+
+fn source_span(source: &str, range: SourceRange) -> &str {
+    let start = usize::try_from(range.start()).expect("source start");
+    let end = usize::try_from(range.end()).expect("source end");
+    &source[start..end]
+}
+
+#[test]
 fn package_collects_python_generic_aliases_in_their_own_scope() {
     let source = "class T: pass\nclass Bound: pass\n\
                   type Plain = T\n\

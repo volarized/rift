@@ -77,7 +77,7 @@ impl<'source> Index<'source> {
         if file.blocked(decorator.start, work) {
             return false;
         }
-        if self.edge_python.0.contains_key(module_name) {
+        if self.edge_python.paths.contains_key(module_name) {
             return false;
         }
         let Some(name) = file.text(*binding) else {

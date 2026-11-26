@@ -339,11 +339,18 @@ impl<'source> Index<'source> {
                 match self.edge_python.path(&module) {
                     // A package importing a name from itself binds its submodule.
                     Some(path)
-                        if path != file.document.path.as_str()
+                        if !self
+                            .edge_python
+                            .same_module(path, file.document.path.as_str())
                             || Some(exported) != file.text(binding.name) =>
                     {
-                        let (path, _) = self.files.get_key_value(path)?;
-                        Some(self.python_exported_name((path, exported), followed, work))
+                        let selected =
+                            self.python_export_file(self.files.get(path)?, exported, work)?;
+                        Some(self.python_exported_name(
+                            (selected.document.path.as_str(), exported),
+                            followed,
+                            work,
+                        ))
                     }
                     _ => self.python_module_target(&format!("{module}.{exported}")),
                 }
