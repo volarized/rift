@@ -604,7 +604,7 @@ impl HistoryAnalysis {
             return Ok(ParsedSide::unknown(parsed_bytes));
         };
         let mut shapes: BTreeMap<String, (&'static str, Vec<SymbolShape>)> = BTreeMap::new();
-        for symbol in document.symbols() {
+        for symbol in document.without_package_bindings().symbols() {
             shapes
                 .entry(symbol.qualified_name.clone())
                 .or_insert_with(|| (symbol.kind, Vec::new()))

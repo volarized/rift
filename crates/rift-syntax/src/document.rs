@@ -526,6 +526,22 @@ impl SyntaxDocument {
         }
     }
 
+    /// Keeps project declarations and the complete syntax tree without package-only bindings.
+    #[must_use]
+    pub fn without_package_bindings(mut self) -> Self {
+        if self
+            .facts
+            .symbols
+            .iter()
+            .any(SyntaxSymbol::is_package_binding)
+        {
+            Arc::make_mut(&mut self.facts)
+                .symbols
+                .retain(|symbol| !symbol.is_package_binding());
+        }
+        self
+    }
+
     /// Places these facts at another project path.
     ///
     /// The caller must establish that source bytes, language, dialect, and syntax bounds

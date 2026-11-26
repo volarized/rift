@@ -6999,6 +6999,7 @@ fn analyze_source(
 ) -> Result<rift_syntax::SyntaxDocument, RiftError> {
     provider
         .analyze(SyntaxSource { path, text: source }, limits)
+        .map(SyntaxDocument::without_package_bindings)
         .map_err(|error| {
             errors::index::workspace_syntax()
                 .path(context_path)
@@ -7041,20 +7042,13 @@ pub(crate) fn included_file(
             .fail();
     }
     let source = source_utf8(bytes, context_path)?;
-    let syntax = provider
-        .analyze(
-            SyntaxSource {
-                path: &project_path,
-                text: &source,
-            },
-            limits.syntax(),
-        )
-        .map_err(|error| {
-            errors::index::workspace_syntax()
-                .path(context_path)
-                .cause(error)
-                .error()
-        })?;
+    let syntax = analyze_source(
+        &project_path,
+        &source,
+        context_path,
+        provider,
+        limits.syntax(),
+    )?;
     let digest = FileDigest::of(source.as_bytes());
     Ok(IndexedFile::new(
         project_path,
@@ -13742,6 +13736,71 @@ mod tests {
                 .identity()
                 .map(rift_core::SymbolId::as_str),
             Some("rift://symbol/local/python/fastapi/serve")
+        );
+    }
+
+    #[test]
+    fn workspace_declaration_directory_keeps_only_published_bindings() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let source = "def serve(port: int) -> int:\n    return port\n\n\ndef caller() -> int:\n    return serve(8080)\n";
+        fs::write(directory.path().join("service.py"), source).expect("Python service");
+        fs::write(
+            directory.path().join("pyproject.toml"),
+            "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['service']\n",
+        )
+        .expect("Python module metadata");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("workspace capture");
+        for name in ["serve", "caller"] {
+            let provider = symbol_identity("python", "service.py", name);
+            let declarations = index
+                .symbols_by_provider_identity(&provider, 1)
+                .expect("workspace declaration directory");
+            assert_eq!(declarations.len(), 1);
+            assert!(
+                index
+                    .assembled_symbol(declarations[0])
+                    .expect("published workspace declaration")
+                    .identity()
+                    .is_some()
+            );
+        }
+        let path = ProjectPath::new("service.py").expect("project path");
+        let document = index
+            .syntax(&path)
+            .expect("workspace syntax")
+            .expect("held workspace file");
+        assert_eq!(
+            document.symbols(),
+            index
+                .file(&path)
+                .expect("held workspace file")
+                .syntax()
+                .symbols()
+        );
+        assert!(
+            document
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.name != "port")
+        );
+        let port = source.find("port").expect("parameter token");
+        let range = ByteRange {
+            start: port as u64,
+            end: (port + "port".len()) as u64,
+        };
+        assert_eq!(
+            index
+                .syntax_element_at(&path, range, SyntaxMatch::Exact)
+                .expect("workspace syntax lookup")
+                .expect("parameter syntax element")
+                .range,
+            range
         );
     }
 
