@@ -1,4 +1,7 @@
-use std::sync::OnceLock;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 
 use rift_error::RiftError;
 use tree_sitter::Node;
@@ -55,6 +58,8 @@ pub(super) struct Kinds {
     function: [u16; 2],
     named_expression: [u16; 3],
     class: u16,
+    class_expression: u16,
+    class_body: u16,
     edge_types: Vec<u16>,
     parameters: u16,
     argument_list: u16,
@@ -318,6 +323,8 @@ impl Kinds {
             function,
             named_expression,
             class: id("class_declaration"),
+            class_expression: id("class"),
+            class_body: field("body"),
             edge_types: edge_type_kinds(grammar),
             parameters: id("formal_parameters"),
             argument_list: id("arguments"),
@@ -1965,6 +1972,16 @@ impl Kinds {
     }
 
     fn initializer(&self, value: Node<'_>, source: &str) -> Result<StaticBindingKind, RiftError> {
+        if value.kind_id() == self.class_expression
+            && !value.has_error()
+            && let Some(body) = value
+                .child_by_field_id(self.class_body)
+                .filter(|body| !body.is_missing())
+        {
+            return Ok(StaticBindingKind::JavaScriptClassValue {
+                body: byte_range(body)?,
+            });
+        }
         if value.kind_id() == self.new
             && let Some(constructor) = value
                 .child_by_field_id(self.constructor)
@@ -2437,6 +2454,68 @@ fn same_branches(statement: Node<'_>, source: &str) -> bool {
         .and_then(|clause| clause.named_child(0))
         .and_then(branch);
     consequence.is_some() && consequence == alternative
+}
+
+/// Counts competing declarations at candidate scopes and records writes to those names.
+#[derive(Default)]
+struct ClassValueBindings {
+    scopes: BTreeMap<ByteRange, usize>,
+    writes: BTreeSet<u64>,
+}
+
+/// Keeps class-value evidence for one authored binding whose visible name has no competing
+/// declaration or later write. A write to an inner binding of the same name also withholds evidence.
+pub(super) fn settle_class_values(source: &str, facts: &mut StaticFactsParts) {
+    let written = |range: ByteRange| {
+        source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+    };
+    let mut names = BTreeMap::<&str, ClassValueBindings>::new();
+    for binding in &facts.bindings {
+        if matches!(binding.kind, StaticBindingKind::JavaScriptClassValue { .. })
+            && let Some(name) = written(binding.name)
+        {
+            names
+                .entry(name)
+                .or_default()
+                .scopes
+                .entry(binding.scope)
+                .or_default();
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    for binding in &facts.bindings {
+        if let Some(count) = written(binding.name)
+            .and_then(|name| names.get_mut(name))
+            .and_then(|class| class.scopes.get_mut(&binding.scope))
+        {
+            *count = count.saturating_add(1);
+        }
+    }
+    for &write in &facts.assignments {
+        if let Some(class) = written(write).and_then(|target| names.get_mut(target.trim())) {
+            class.writes.insert(write.start);
+        }
+    }
+    for binding in &mut facts.bindings {
+        if !matches!(binding.kind, StaticBindingKind::JavaScriptClassValue { .. }) {
+            continue;
+        }
+        let stable = written(binding.name)
+            .and_then(|name| names.get(name))
+            .is_some_and(|class| {
+                class.scopes.get(&binding.scope) == Some(&1)
+                    && class
+                        .writes
+                        .range(binding.scope.start..binding.scope.end)
+                        .next()
+                        .is_none()
+            });
+        if !stable {
+            binding.kind = StaticBindingKind::Local;
+        }
+    }
 }
 
 fn text<'a>(syntax_element: Node<'_>, source: &'a str) -> Option<&'a str> {

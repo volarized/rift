@@ -75,7 +75,12 @@ impl<'source> Index<'source> {
                     .and_then(|range| file.text(range))
                     .is_some_and(|value| value.starts_with('{'));
             if !namespace && !object_value {
-                return None;
+                if role == ReferenceRole::Type || !self.javascript_stable_class_value(owner) {
+                    return None;
+                }
+                owner =
+                    self.javascript_class_member(owner, member, MemberMode::Static, role, work)?;
+                continue;
             }
             let target = declared?;
             if object_value && !owner.symbol.body_range?.encloses(target.symbol.item_range) {
@@ -640,7 +645,7 @@ impl<'source> Index<'source> {
             }
             if edge.kind == EdgeKind::Extends
                 && Some(edge.from) == class.symbol.name_range
-                && let Some(base) = self.edge_javascript_target(file, edge.target, work)
+                && let Some(base) = self.javascript_heritage_target(file, edge, work)
             {
                 bases.push(base);
             }
@@ -660,7 +665,11 @@ impl<'source> File<'source> {
         };
         let binding = match self.binding(receiver, member.receiver.start, |_| true, work) {
             super::Binding::Found(binding)
-                if binding.kind == rift_syntax::StaticBindingKind::Local =>
+                if matches!(
+                    binding.kind,
+                    rift_syntax::StaticBindingKind::Local
+                        | rift_syntax::StaticBindingKind::JavaScriptClassValue { .. }
+                ) =>
             {
                 binding
             }

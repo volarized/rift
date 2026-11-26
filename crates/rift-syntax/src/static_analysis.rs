@@ -184,6 +184,11 @@ pub enum StaticBindingKind {
         /// Imported name.
         export: ByteRange,
     },
+    /// An unchanged local variable initialized directly with a class expression.
+    JavaScriptClassValue {
+        /// Exact physical class body, excluding the initializer's heritage header.
+        body: ByteRange,
+    },
     /// A local variable initialized directly by a constructor.
     JavaScriptInstance {
         /// Constructor name.
@@ -1339,6 +1344,9 @@ impl StaticBinding {
             StaticBindingKind::JavaScriptTypeImport { module, export } => {
                 valid(module) && valid(export)
             }
+            StaticBindingKind::JavaScriptClassValue { body } => {
+                valid(body) && self.scope.encloses(body) && self.name.end <= body.start
+            }
             StaticBindingKind::JavaScriptInstance { constructor }
             | StaticBindingKind::JavaScriptConstInstance { constructor }
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
@@ -1490,8 +1498,12 @@ impl<'source> Capture<'source> {
     }
 
     pub(crate) fn finish(mut self) -> StaticFacts {
-        if let Grammar::Rust(_, _, unread, _) = self.grammar {
-            rust::Kinds::close_unread(unread, &mut self.facts.0);
+        match self.grammar {
+            Grammar::Rust(_, _, unread, _) => rust::Kinds::close_unread(unread, &mut self.facts.0),
+            Grammar::JavaScript(_, _) => {
+                javascript::settle_class_values(self.source, &mut self.facts.0);
+            }
+            Grammar::Python(_, _) => {}
         }
         self.facts
     }

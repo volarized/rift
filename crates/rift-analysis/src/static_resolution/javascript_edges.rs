@@ -758,7 +758,7 @@ impl<'source> Index<'source> {
             if Some(edge.from) != class.symbol.name_range || edge.kind != EdgeKind::Extends {
                 continue;
             }
-            let base = self.edge_javascript_target(file, edge.target, work);
+            let base = self.javascript_heritage_target(file, edge, work);
             let target = base.and_then(|base| {
                 self.javascript_class_member(base, &symbol.name, mode, ReferenceRole::Type, work)
             });

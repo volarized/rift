@@ -550,6 +550,316 @@ fn package_calls_keep_their_javascript_initializer_owners() {
     }
 }
 
+#[test]
+fn package_ecmascript_direct_class_values_name_stable_calls() {
+    let source = r"
+export var Named = class Inner { static make() { return 1; } };
+export const Anonymous = class { static make() { return 2; } };
+export class Declared { static make() { return 3; } }
+export var Reassigned = class { static make() { return 4; } };
+Reassigned = class { static make() { return 5; } };
+var Competing = class { static make() { return 6; } };
+var Competing = class { static make() { return 7; } };
+export { Competing };
+export function stable() { Named.make(); Anonymous.make(); new Anonymous(); Declared.make(); }
+export function unsettled() { Reassigned.make(); new Reassigned(); Competing.make(); new Competing(); }
+export function plain() { Anonymous(); }
+export const Patched = class { static make() { return 8; } };
+export function replace(replacement) { Patched.make = replacement; }
+export function changed() { Patched.make(); }
+";
+    for (language, filename, entry) in [
+        (
+            ShippedLanguage::JavaScript,
+            "index.js",
+            r#""main":"index.js""#,
+        ),
+        (
+            ShippedLanguage::TypeScript,
+            "index.ts",
+            r#""types":"index.ts""#,
+        ),
+    ] {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","type":"module",{entry}}}"#);
+        let analysis = fixture::package_result_with_metadata(
+            language,
+            vec![(filename, source)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("admitted ECMAScript package");
+        let mut calls = analysis
+            .publication()
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Calls])
+            .map(|edge| {
+                let span = edge.occurrence.as_ref().expect("written call");
+                let start = usize::try_from(span.range.start).expect("start");
+                let end = usize::try_from(span.range.end).expect("end");
+                let owner = edge.from.as_str().rsplit("/beacon/").next().expect("owner");
+                let target = edge.to.as_str().rsplit("/beacon/").next().expect("target");
+                (start, &source[start..end], owner, target)
+            })
+            .collect::<Vec<_>>();
+        calls.sort_unstable();
+        assert_eq!(
+            calls
+                .into_iter()
+                .map(|(_, label, owner, target)| (label, owner, target))
+                .collect::<Vec<_>>(),
+            [
+                ("Named.make()", "stable", "Named/make"),
+                ("Anonymous.make()", "stable", "Anonymous/make"),
+                ("new Anonymous()", "stable", "Anonymous"),
+                ("Declared.make()", "stable", "Declared/make"),
+            ],
+            "{filename}",
+        );
+    }
+}
+
+#[test]
+fn package_ecmascript_class_heritage_accepts_a_stable_holder() {
+    const COMMON: &str = r"
+export const Held = class { static make() { return 1; } };
+export class Written { static make() { return 2; } }
+export class Derived extends Held {}
+export class WrittenChild extends Written {}
+export const inherited = () => Derived.make();
+export var Replaced = class { static make() { return 3; } };
+Replaced = class { static make() { return 4; } };
+export class Dynamic extends Replaced {}
+export function shadow(Held) { class Local extends Held {} return Local; }
+";
+    const TYPES: &str = r"
+export interface Surface { item: number; }
+export interface Refined extends Surface {}
+export class Implementation implements Surface { item = 1; }
+export type Name = Surface;
+";
+    for (language, filename, entry, typescript) in [
+        (
+            ShippedLanguage::JavaScript,
+            "index.js",
+            r#""main":"index.js""#,
+            false,
+        ),
+        (
+            ShippedLanguage::TypeScript,
+            "index.ts",
+            r#""types":"index.ts""#,
+            true,
+        ),
+    ] {
+        let source = if typescript {
+            format!("{COMMON}{TYPES}")
+        } else {
+            COMMON.to_owned()
+        };
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","type":"module",{entry}}}"#);
+        let analysis = fixture::package_result_with_metadata(
+            language,
+            vec![(filename, &source)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("admitted ECMAScript package");
+        let mut expected = vec![
+            ("Derived", EdgeKind::Extends, "Held", "Held"),
+            ("WrittenChild", EdgeKind::Extends, "Written", "Written"),
+            ("inherited", EdgeKind::Calls, "Held/make", "Derived.make()"),
+        ];
+        if typescript {
+            expected.extend([
+                ("Refined", EdgeKind::Extends, "Surface", "Surface"),
+                ("Refined", EdgeKind::HasType, "Surface", "Surface"),
+                ("Implementation", EdgeKind::Implements, "Surface", "Surface"),
+                ("Implementation", EdgeKind::HasType, "Surface", "Surface"),
+                ("Name", EdgeKind::HasType, "Surface", "Surface"),
+            ]);
+        }
+        let mut resolved = analysis
+            .publication()
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let [kind] = edge.kinds.as_slice() else {
+                    return None;
+                };
+                if !matches!(
+                    kind,
+                    EdgeKind::Extends | EdgeKind::Implements | EdgeKind::HasType | EdgeKind::Calls
+                ) {
+                    return None;
+                }
+                let span = edge.occurrence.as_ref().expect("written relation");
+                let start = usize::try_from(span.range.start).expect("start");
+                let end = usize::try_from(span.range.end).expect("end");
+                let from = edge
+                    .from
+                    .as_str()
+                    .rsplit("/beacon/")
+                    .next()
+                    .expect("from symbol");
+                let to = edge
+                    .to
+                    .as_str()
+                    .rsplit("/beacon/")
+                    .next()
+                    .expect("to symbol");
+                Some((from, *kind, to, &source[start..end]))
+            })
+            .collect::<Vec<_>>();
+        resolved.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(resolved, expected, "{filename}");
+    }
+}
+
+#[test]
+fn package_ecmascript_stable_class_publication_keeps_declared_visibility() {
+    const JS: &str = r"
+export const Stable = class {
+  static make() { return 1; }
+  method() { return 2; }
+  static #secret() { return 3; }
+  #internal() { return 4; }
+};
+export var Mutable = class { static retired() { return 5; } };
+Mutable = class { static replacement() { return 6; } };
+export class Written { static make() { return 7; } static #secret() { return 8; } }
+const Local = class { static make() { return 9; } };
+export const localResult = Local.make();
+";
+    const TS: &str = r"
+export const Stable = class {
+  static make() { return 1; }
+  method() { return 2; }
+  private static secret() { return 3; }
+  protected internal() { return 4; }
+};
+export class Written { static make() { return 7; } private static secret() { return 8; } }
+";
+    for (language, file, source, entry, expected) in [
+        (
+            ShippedLanguage::JavaScript,
+            "index.js",
+            JS,
+            r#""main":"index.js""#,
+            &[
+                ("Stable/make", true),
+                ("Stable/method", true),
+                ("Stable/%23secret", false),
+                ("Stable/%23internal", false),
+                ("Mutable/retired", false),
+                ("Local/make", false),
+                ("Written/make", true),
+                ("Written/%23secret", false),
+            ][..],
+        ),
+        (
+            ShippedLanguage::TypeScript,
+            "index.ts",
+            TS,
+            r#""types":"index.ts""#,
+            &[
+                ("Stable/make", true),
+                ("Stable/method", true),
+                ("Stable/secret", false),
+                ("Stable/internal", false),
+                ("Written/make", true),
+                ("Written/secret", false),
+            ][..],
+        ),
+    ] {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","type":"module",{entry}}}"#);
+        let analysis = fixture::package_result_with_metadata(
+            language,
+            vec![(file, source)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("admitted ECMAScript package");
+        for &(name, public) in expected {
+            let address = format!("/beacon/{name}");
+            let declarations = analysis
+                .publication()
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.symbol.as_str().ends_with(&address))
+                .map(|declaration| declaration.public)
+                .collect::<Vec<_>>();
+            assert_eq!(declarations, [public], "{file}: {name}");
+        }
+    }
+}
+
+#[test]
+fn package_ecmascript_class_initializer_this_preserves_replacement_refusals() {
+    let source = r"
+export const Held = class {
+  static make() { return 1; }
+  static swap(next) { this.make = next; }
+};
+export class Written {
+  static make() { return 2; }
+  static swap(next) { this.make = next; }
+}
+export const Dynamic = class {
+  static make() { return 3; }
+  static swap(next) { function inner() { this.make = next; } return inner; }
+};
+export const Lexical = class {
+  static make() { return 4; }
+  static swap(next) { const bind = () => { this.make = next; }; bind(); }
+};
+export function run(next) { Held.swap(next); return Held.make(); }
+export function control(next) { Written.swap(next); return Written.make(); }
+export function nested(next) { Dynamic.swap(next); return Dynamic.make(); }
+export function captured(next) { Lexical.swap(next); return Lexical.make(); }
+";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.js"}"#,
+        )),
+    )
+    .expect("admitted JavaScript package");
+    let mut calls = analysis
+        .publication()
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls])
+        .filter_map(|edge| {
+            let span = edge.occurrence.as_ref().expect("physical call");
+            let start = usize::try_from(span.range.start).expect("start");
+            let end = usize::try_from(span.range.end).expect("end");
+            let target = edge.to.as_str().rsplit("/beacon/").next().expect("target");
+            let text = &source[start..end];
+            text.contains('.').then_some((start, text, target))
+        })
+        .collect::<Vec<_>>();
+    calls.sort_unstable();
+    let roles = calls
+        .into_iter()
+        .map(|(_, source, target)| (source, target))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        [
+            ("Held.swap(next)", "Held/swap"),
+            ("Written.swap(next)", "Written/swap"),
+            ("Dynamic.swap(next)", "Dynamic/swap"),
+            ("Dynamic.make()", "Dynamic/make"),
+            ("Lexical.swap(next)", "Lexical/swap"),
+        ]
+    );
+}
+
 struct GraphFixture {
     analysis: PackageAnalysis,
     owner: SymbolOwner,
