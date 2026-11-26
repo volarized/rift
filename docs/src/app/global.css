@@ -34,6 +34,7 @@
   --color-muted: var(--muted);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-secondary: var(--secondary);
+  --color-primary-text: var(--primary-text);
   --color-primary-foreground: var(--primary-foreground);
   --color-primary: var(--primary);
   --color-popover-foreground: var(--popover-foreground);
@@ -42,7 +43,8 @@
   --color-card: var(--card);
   --color-foreground: var(--foreground);
   --color-background: var(--background);
-  /* No radii. Separation is by rule, never by fill or corner. */
+  /* Keep control and panel corners square. */
+  --radius-xs: 0px;
   --radius-sm: 0px;
   --radius-md: 0px;
   --radius-lg: 0px;
@@ -52,92 +54,72 @@
   --radius-4xl: 0px;
 }
 
-/*
- * rift design system - wireframe minimalism.
- * Four values, two families, one hairline weight.
- *
- *   void  #08080A  background
- *   rule  #141416  borders, dividers
- *   dim   #7C7C81  labels, prompts
- *   ink   #C9C9C4  text, line objects
- *
- * Dark is canonical. Light is its inversion: the ramp flips end for end, so
- * the void hue (cool, 286deg) carries the text and the ink hue (warm, 106deg)
- * carries the paper.
- */
-
 :root {
   --font-body: "Instrument Sans Variable", Arial, sans-serif;
   --font-code: "JetBrains Mono Variable", "Courier New", monospace;
-  --background: oklch(0.985 0.0022 106.4);
-  --foreground: oklch(0.165 0.0046 285.7);
-  --card: oklch(0.985 0.0022 106.4);
-  --card-foreground: oklch(0.165 0.0046 285.7);
-  --popover: oklch(0.985 0.0022 106.4);
-  --popover-foreground: oklch(0.165 0.0046 285.7);
-  --primary: oklch(0.165 0.0046 285.7);
-  --primary-foreground: oklch(0.985 0.0022 106.4);
-  --secondary: oklch(0.945 0.0025 106.4);
-  --secondary-foreground: oklch(0.165 0.0046 285.7);
-  --muted: oklch(0.945 0.0025 106.4);
-  --muted-foreground: oklch(0.5854 0.0063 286.1);
-  --accent: oklch(0.945 0.0025 106.4);
-  --accent-foreground: oklch(0.165 0.0046 285.7);
+  --background: #f8f8fa;
+  --foreground: #18191f;
+  --card: #ffffff;
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: #bd2418;
+  --primary-foreground: #ffffff;
+  --primary-text: #a51f15;
+  --secondary: #eeeef2;
+  --secondary-foreground: var(--foreground);
+  --muted: var(--secondary);
+  --muted-foreground: #525665;
+  --accent: #fae7e4;
+  --accent-foreground: var(--primary-text);
   --destructive: oklch(0.552 0.166 25.5);
   /* The lamp of a live connection; no surface or text takes it. */
   --positive: oklch(0.6 0.15 150);
-  --border: oklch(0.912 0.0035 286.9);
-  --input: oklch(0.912 0.0035 286.9);
-  --ring: oklch(0.5854 0.0063 286.1);
+  --border: #dedee6;
+  --input: var(--border);
+  --ring: var(--primary-text);
   --chart-1: oklch(0.165 0.0046 285.7);
   --chart-2: oklch(0.2987 0.0072 286.5);
   --chart-3: oklch(0.4421 0.0068 286.3);
   --chart-4: oklch(0.5854 0.0063 286.1);
   --chart-5: oklch(0.7287 0.0049 286.9);
   --radius: 0rem;
-  --sidebar: oklch(0.985 0.0022 106.4);
-  --sidebar-foreground: oklch(0.165 0.0046 285.7);
-  --sidebar-primary: oklch(0.165 0.0046 285.7);
-  --sidebar-primary-foreground: oklch(0.985 0.0022 106.4);
-  --sidebar-accent: oklch(0.945 0.0025 106.4);
-  --sidebar-accent-foreground: oklch(0.165 0.0046 285.7);
-  --sidebar-border: oklch(0.912 0.0035 286.9);
-  --sidebar-ring: oklch(0.5854 0.0063 286.1);
+  --sidebar: var(--background);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--background);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
 }
 
 .dark {
-  --background: oklch(0.1356 0.0046 285.7);
-  --foreground: oklch(0.8345 0.0069 106.4);
-  --card: oklch(0.1356 0.0046 285.7);
-  --card-foreground: oklch(0.8345 0.0069 106.4);
-  --popover: oklch(0.1921 0.0041 286.9);
-  --popover-foreground: oklch(0.8345 0.0069 106.4);
-  --primary: oklch(0.8345 0.0069 106.4);
-  --primary-foreground: oklch(0.1356 0.0046 285.7);
-  --secondary: oklch(0.1921 0.0041 286.9);
-  --secondary-foreground: oklch(0.8345 0.0069 106.4);
-  --muted: oklch(0.1921 0.0041 286.9);
-  --muted-foreground: oklch(0.58 0.0063 286.1);
-  --accent: oklch(0.1921 0.0041 286.9);
-  --accent-foreground: oklch(0.8345 0.0069 106.4);
-  --destructive: oklch(0.637 0.176 25.5);
+  --background: #0c0d10;
+  --foreground: #e3e2e7;
+  --card: #121317;
+  --popover: #18191f;
+  --primary-text: #f04f38;
+  --secondary: #17181e;
+  --muted-foreground: #a5a9b8;
+  --accent: #271517;
+  --destructive: #ffb4ab;
   --positive: oklch(0.74 0.17 150);
-  --border: oklch(0.1921 0.0041 286.9);
-  --input: oklch(0.243 0.005 286.5);
-  --ring: oklch(0.4762 0.0063 286.1);
+  --border: #242529;
+  --input: #343439;
   --chart-1: oklch(0.8345 0.0069 106.4);
   --chart-2: oklch(0.7205 0.0072 106.7);
-  --chart-3: oklch(0.5984 0.0068 286.4);
+  --chart-3: oklch(0.5984 0.0068 106.7);
   --chart-4: oklch(0.4762 0.0063 286.1);
   --chart-5: oklch(0.3342 0.0052 286.5);
-  --sidebar: oklch(0.1356 0.0046 285.7);
-  --sidebar-foreground: oklch(0.8345 0.0069 106.4);
-  --sidebar-primary: oklch(0.8345 0.0069 106.4);
-  --sidebar-primary-foreground: oklch(0.1356 0.0046 285.7);
-  --sidebar-accent: oklch(0.1921 0.0041 286.9);
-  --sidebar-accent-foreground: oklch(0.8345 0.0069 106.4);
-  --sidebar-border: oklch(0.1921 0.0041 286.9);
-  --sidebar-ring: oklch(0.4762 0.0063 286.1);
+  --sidebar: var(--card);
+}
+
+/* Fumadocs uses its primary color for both text and fills. */
+:root,
+.dark {
+  --color-fd-primary: var(--primary-text);
+  --color-fd-primary-foreground: var(--background);
 }
 
 @layer base {
@@ -148,7 +130,7 @@
     @apply bg-background text-foreground font-sans antialiased;
   }
   ::selection {
-    @apply bg-foreground text-background;
+    @apply bg-primary text-primary-foreground;
   }
   pre {
     tab-size: 4;
@@ -189,6 +171,25 @@
     height: 4rem;
     padding-inline-start: 15px;
   }
+}
+
+/* Fumadocs supplies different search sizes for the header and sidebar. */
+[data-search],
+[data-search-full] {
+  @apply h-8 rounded-none border border-border bg-card text-muted-foreground;
+  @apply transition-colors hover:border-primary-text/40 hover:bg-secondary hover:text-foreground;
+}
+
+[data-search] {
+  @apply w-8;
+}
+
+[data-search-full] {
+  @apply gap-2 px-2.5;
+}
+
+[data-search-full] kbd {
+  @apply rounded-none bg-secondary px-1.5 text-xs;
 }
 
 /* RootToggle reserves an icon slot per option; ours have no icons. */

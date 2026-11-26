@@ -52,6 +52,7 @@ export default function Layout({ children }: LayoutProps<"/">) {
           it defaults to a bare "/api/search", which 404s under /rift.
         */}
         <RootProvider
+          theme={{ defaultTheme: "dark" }}
           search={{
             options: {
               type: "static",

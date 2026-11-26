@@ -289,7 +289,7 @@ export function CodebaseLanguages() {
       {LANGUAGES.map((language) => (
         <section
           key={language.name}
-          className={`rounded-xl border border-border bg-muted/30 px-6 py-4 ${language.wide ? "lg:col-span-2" : ""}`}
+          className={`rounded-none border border-border bg-card p-3 sm:p-4 ${language.wide ? "lg:col-span-2" : ""}`}
         >
           <div className="mb-2 flex items-center gap-3">
             {language.logos.length ? (
