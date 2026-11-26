@@ -907,6 +907,10 @@ fn extract_markdown(
     let mut ordinals = BTreeMap::new();
     let mut block_ranges = BTreeMap::new();
     for fact in facts.blocks() {
+        let range = wire_range(fact.range);
+        if slice(input.text(), &range)?.trim().is_empty() {
+            continue;
+        }
         let headings = facts
             .heading_path(fact.heading)
             .into_iter()
@@ -930,7 +934,7 @@ fn extract_markdown(
             MarkdownBlockKind::Code => DocumentationBlockKind::Code,
         };
         let draft = BlockDraft {
-            range: wire_range(fact.range),
+            range,
             line: fact.line,
             kind,
             structure: structure_name(fact.structure),

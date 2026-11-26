@@ -816,6 +816,89 @@ fn rst_references_resolve_local_targets_and_keep_missing_or_ambiguous_names() {
 }
 
 #[test]
+fn rst_embedded_uris_keep_the_destination_and_its_bytes() {
+    let text = concat!(
+        "See `text <https://example.invalid/a>`_, ",
+        "`anonymous <https://example.invalid/end_>`__, ",
+        "and `<docs/other.rst>`__.\n",
+    );
+    let sources = DocumentationSourceSet::new(vec![
+        input("README.rst", text),
+        input("docs/other.rst", "Details.\n"),
+    ])
+    .expect("sources");
+    let collection = collect_documentation(&sources, &[]).expect("collection");
+    let links = &collection.index().links;
+    assert_eq!(links.len(), 3);
+    for target in ["https://example.invalid/a", "https://example.invalid/end_"] {
+        let link = links
+            .iter()
+            .find(|link| link.authored == target)
+            .expect("external link");
+        assert_eq!(exact_text(text, &link.range), target);
+        assert_eq!(
+            link.resolution,
+            DocumentationLinkResolution::Unresolved {
+                reason: DocumentationUnresolvedReason::External,
+            }
+        );
+    }
+    let local = links
+        .iter()
+        .find(|link| link.authored == "docs/other.rst")
+        .expect("local link");
+    assert_eq!(exact_text(text, &local.range), "docs/other.rst");
+    assert!(matches!(
+        local.resolution,
+        DocumentationLinkResolution::Resolved {
+            target: DocumentationTarget::Source { .. }
+        }
+    ));
+}
+
+#[test]
+fn rst_embedded_aliases_follow_the_named_target() {
+    let text = concat!(
+        "See `alias <named_>`_ and `another <named phrase_>`__.\n\n",
+        ".. _named: https://example.invalid/a\n\n",
+        ".. _named phrase: https://example.invalid/b\n",
+    );
+    let collection = collect("README.rst", text);
+    let links = &collection.index().links;
+    assert_eq!(links.len(), 2);
+    for (authored, target) in [
+        ("https://example.invalid/a", "named"),
+        ("https://example.invalid/b", "named phrase"),
+    ] {
+        let link = links
+            .iter()
+            .find(|link| link.authored == authored)
+            .expect("alias link");
+        assert_eq!(exact_text(text, &link.range), target);
+        assert_eq!(
+            link.resolution,
+            DocumentationLinkResolution::Unresolved {
+                reason: DocumentationUnresolvedReason::External,
+            }
+        );
+    }
+}
+
+#[test]
+fn markdown_publication_omits_whitespace_only_blocks() {
+    for path in ["README.md", "guide.mdx"] {
+        let text = "\u{00a0}\u{2003}\n\nKept.\n\n```text\n  payload\n```\n";
+        let collection = collect(path, text);
+        let blocks = &collection.index().blocks;
+        assert_eq!(blocks.len(), 2, "{path}");
+        assert_eq!(exact_text(text, &blocks[0].range), "Kept.\n");
+        assert_eq!(blocks[1].kind, DocumentationBlockKind::Code);
+        assert!(exact_text(text, &blocks[1].range).contains("  payload"));
+        assert!(collect(path, "\u{2003}\n").index().blocks.is_empty());
+    }
+}
+
+#[test]
 fn rst_collection_keeps_code_block_language() {
     let text = ".. code-block:: rust\n\n    fn main() {}\n";
     let collection = collect("guide.rst", text);

@@ -6,6 +6,7 @@ use std::ops::{ControlFlow, Range};
 use rift_core::{ProjectPath, line::line_of, line::line_starts};
 use rift_protocol::read::TextRange;
 use tree_sitter::{Language, Node, ParseOptions, ParseState, Parser, Point, Tree};
+use url::Url;
 
 use rift_error::{RiftError, errors};
 
@@ -855,10 +856,7 @@ fn collect_link(
             RstLinkKind::Destination,
         )
     } else if syntax_element.kind_id() == kinds.reference {
-        (
-            reference_name_range(syntax_element, text)?,
-            RstLinkKind::Reference,
-        )
+        reference_link(syntax_element, text)?
     } else {
         (None, RstLinkKind::Reference)
     };
@@ -875,17 +873,18 @@ fn collect_link(
     Ok(())
 }
 
-fn reference_name_range(
+fn reference_link(
     syntax_element: Node<'_>,
     text: &str,
-) -> Result<Option<TextRange>, RiftError> {
+) -> Result<(Option<TextRange>, RstLinkKind), RiftError> {
     let Range { mut start, mut end } = inline_range(syntax_element, text);
     let Some(raw) = text.get(start..end) else {
         return errors::analysis::documentation_range_invalid()
             .field("rst_range")
             .fail();
     };
-    if raw.starts_with('`') {
+    let quoted = raw.starts_with('`');
+    if quoted {
         start += 1;
     }
     if raw.ends_with("__") {
@@ -896,8 +895,38 @@ fn reference_name_range(
     if text.get(start..end).is_some_and(|name| name.ends_with('`')) {
         end = end.saturating_sub(1);
     }
+    if quoted && let Some((target, kind)) = embedded_reference(text, start..end) {
+        return Ok((Some(text_range(target.start, target.end)?), kind));
+    }
     let range = text_range(start, end)?;
-    Ok((range.start < range.end).then_some(range))
+    Ok((
+        (range.start < range.end).then_some(range),
+        RstLinkKind::Reference,
+    ))
+}
+
+/// An embedded target ends the quoted phrase. A target without a URI scheme and
+/// ending in an underscore can name another reference.
+fn embedded_reference(text: &str, phrase: Range<usize>) -> Option<(Range<usize>, RstLinkKind)> {
+    let (label, destination) = text
+        .get(phrase.clone())?
+        .strip_suffix('>')?
+        .rsplit_once('<')?;
+    if !label.is_empty() && !label.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let target = destination.trim();
+    if target.contains(['<', '>', '\\']) {
+        return None;
+    }
+    let (authored, kind) = match target.strip_suffix('_') {
+        Some(name) if Url::parse(target).is_err() => (name.trim_end(), RstLinkKind::Reference),
+        _ if !target.chars().any(char::is_whitespace) => (target, RstLinkKind::Destination),
+        _ => return None,
+    };
+    let leading = destination.len() - destination.trim_start().len();
+    let start = phrase.start + label.len() + 1 + leading;
+    (!authored.is_empty()).then_some((start..start + authored.len(), kind))
 }
 
 fn collect_errors(syntax_element: Node<'_>, output: &mut Vec<TextRange>) -> Result<(), RiftError> {
