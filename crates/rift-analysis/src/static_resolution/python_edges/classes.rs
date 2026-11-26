@@ -433,7 +433,7 @@ impl<'source> Index<'source> {
                 return false;
             }
             for binding in bindings {
-                match self.python_external_binding(file, binding) {
+                match self.python_external_binding(file, binding, work) {
                     Some(ExternalBinding::Outside) => {}
                     Some(ExternalBinding::Reexport(file, name)) => pending.push((file, name, 0)),
                     None => return false,
@@ -449,6 +449,7 @@ impl<'source> Index<'source> {
         &'index self,
         file: &'index File<'source>,
         binding: &StaticBinding,
+        work: &mut Work,
     ) -> Option<ExternalBinding<'index, 'source>> {
         let outside = |module: &str| {
             let absent = self.module_value(module).is_none();
@@ -468,7 +469,7 @@ impl<'source> Index<'source> {
                     return outside(&format!("{module}.{export}"));
                 };
                 // A module of the selected sources re-exports a binding it holds.
-                let source = self.files.get(path)?;
+                let source = self.python_export_file(self.files.get(path)?, export, work)?;
                 source
                     .by_name
                     .contains_key(export)
@@ -521,7 +522,7 @@ impl<'source> Index<'source> {
         let local = std::iter::successors(Some(module), |module| {
             module.rsplit_once('.').map(|(parent, _)| parent)
         })
-        .any(|module| self.edge_python.0.contains_key(module));
+        .any(|module| self.edge_python.paths.contains_key(module));
         (!local && !qualified.starts_with('.')).then_some(qualified)
     }
 

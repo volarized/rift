@@ -38,7 +38,9 @@ impl<'source> Index<'source> {
                     self.python_written_receiver(path, range, work),
                     Some(Value::Symbol(target))
                         if target.symbol.kinds.contains(&SymbolKind::Module)
-                            && target.file.path == file.document.path
+                            && self.edge_python.same_module(
+                                target.file.path.as_str(), file.document.path.as_str(),
+                            )
                 )
             })
     }
