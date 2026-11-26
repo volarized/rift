@@ -41,4 +41,8 @@ pub use stdlib::{
     STANDARD_LIBRARY_MANAGER, StandardLibrary, StandardLibraryAnswer, StandardLibraryRequest,
     python_environment_runtime, rust_toolchain_channel, standard_library_answer,
 };
-pub use uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages, UvResolver};
+pub use uv::{
+    PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages, UvResolver,
+    dist_info_name as wheel_dist_info_name, normalized_name as normalized_python_distribution_name,
+    wheel_record_paths,
+};

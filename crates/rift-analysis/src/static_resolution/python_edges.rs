@@ -17,6 +17,7 @@ pub(super) use references::PythonNameSites;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rift_protocol::index::python_identifier_is_valid;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol,
@@ -68,6 +69,9 @@ impl EdgePythonModules {
             let Some(module) = file.qualified_target(".").and_then(Target::admitted_path) else {
                 continue;
             };
+            if !module.iter().all(|part| python_identifier_is_valid(part)) {
+                continue;
+            }
             let path = file.document.path.as_str();
             modules
                 .entry(module.join("."))
@@ -83,6 +87,9 @@ impl EdgePythonModules {
 
     fn name(from: &File<'_>, module: &str) -> Option<String> {
         let anchor = from.qualified_target(".")?.admitted_path()?;
+        if module.starts_with('.') && !anchor.iter().all(|part| python_identifier_is_valid(part)) {
+            return None;
+        }
         let package = from
             .document
             .path
