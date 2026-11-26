@@ -7,7 +7,7 @@ use rift_protocol::read::SymbolKind;
 
 use crate::{ByteRange, StaticFacts, SyntaxSymbol};
 
-use super::CALLBACK_PARAMETER_KIND;
+use super::{CALLBACK_PARAMETER_KIND, CALLBACK_PATTERN_PARAMETER_KIND};
 
 pub(super) fn append(
     symbols: &mut Vec<SyntaxSymbol>,
@@ -15,7 +15,9 @@ pub(super) fn append(
     source: &str,
     javascript: bool,
 ) {
-    if !javascript || facts.parameters().is_empty() {
+    if !javascript
+        || (facts.parameters().is_empty() && facts.callback_pattern_parameters().is_empty())
+    {
         return;
     }
     let callbacks = facts
@@ -41,7 +43,17 @@ pub(super) fn append(
         .map(|symbol| symbol.qualified_name.as_str())
         .collect::<BTreeSet<_>>();
     let mut captured = BTreeMap::new();
-    for site in facts.parameters() {
+    let sites = facts
+        .parameters()
+        .iter()
+        .map(|site| (site, CALLBACK_PARAMETER_KIND))
+        .chain(
+            facts
+                .callback_pattern_parameters()
+                .iter()
+                .map(|site| (site, CALLBACK_PATTERN_PARAMETER_KIND)),
+        );
+    for (site, kind) in sites {
         let Some(ordinal) = ordinals.get(&site.function) else {
             continue;
         };
@@ -71,7 +83,7 @@ pub(super) fn append(
         captured
             .entry(qualified.clone())
             .and_modify(|row| *row = None)
-            .or_insert_with(|| Some(parameter(name, qualified, container, site.name)));
+            .or_insert_with(|| Some(parameter(name, qualified, container, site.name, kind)));
     }
     symbols.extend(captured.into_values().flatten());
 }
@@ -85,13 +97,14 @@ fn parameter(
     qualified_name: String,
     container: Option<String>,
     name_range: ByteRange,
+    kind: &'static str,
 ) -> SyntaxSymbol {
     SyntaxSymbol {
         name: name.to_owned(),
         qualified_name,
         declaration_ordinal: 0,
         container,
-        kind: CALLBACK_PARAMETER_KIND,
+        kind,
         syntax_element_kind: Some("identifier"),
         kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
         visibility: None,

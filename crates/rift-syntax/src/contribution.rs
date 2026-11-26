@@ -32,6 +32,7 @@ pub struct PackageBindingSlots {
     python_overload_parameter: usize,
     javascript_parameter: usize,
     javascript_callback_parameter: usize,
+    javascript_callback_pattern: usize,
     typescript_overload_parameter: usize,
     javascript_method_parameter: usize,
     typescript_signature_parameter: usize,
@@ -77,6 +78,7 @@ impl PackageBindingSlots {
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
             javascript_callback_parameter: 0,
+            javascript_callback_pattern: 0,
             typescript_overload_parameter: 0,
             javascript_method_parameter: 0,
             typescript_signature_parameter: 0,
@@ -153,6 +155,13 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_javascript_callback_parameters(mut self, count: usize) -> Self {
         self.javascript_callback_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for written JavaScript callback parameter patterns.
+    #[must_use]
+    pub const fn with_javascript_callback_patterns(mut self, count: usize) -> Self {
+        self.javascript_callback_pattern = count;
         self
     }
 
@@ -320,6 +329,7 @@ impl PackageBindingSlots {
             .saturating_add(self.python_overload_parameter)
             .saturating_add(self.typescript_method_parameter)
             .saturating_add(self.javascript_callback_parameter)
+            .saturating_add(self.javascript_callback_pattern)
             .saturating_add(self.typescript_overload_parameter)
             .saturating_add(self.rust_library_root)
             .saturating_add(self.rust_module_source)
@@ -351,6 +361,8 @@ impl PackageBindingSlots {
         let language = syntax.language().name.as_str();
         let available = if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callback_parameter
+        } else if symbol.is_javascript_callback_pattern_parameter() {
+            &mut self.javascript_callback_pattern
         } else if language == "typescript" && symbol.is_ecmascript_overload_parameter() {
             &mut self.typescript_overload_parameter
         } else if symbol.is_javascript_method_parameter() {

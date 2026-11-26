@@ -3246,6 +3246,70 @@ fn non_entry_conditional_returns_keep_distinct_literal_branch_properties() {
 }
 
 #[test]
+fn package_javascript_callback_patterns_keep_separate_reads() {
+    const SOURCE: &str = concat!(
+        "export function project(records) {\n",
+        "  const fromTuple = ([value]) => value;\n",
+        "  const left = records.map(({value}) => value);\n",
+        "  return [left, fromTuple([4]), records.map(({value}) => value + 1)];\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 24);
+    let publication = analysis.publication();
+    publication
+        .validate_facts()
+        .expect("authored callback patterns");
+    let range = |start| module_runtime_range(start, "value");
+    let mut symbols = BTreeSet::new();
+    for (start, _) in SOURCE
+        .match_indices("value])")
+        .chain(SOURCE.match_indices("value})"))
+    {
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == "value" && row.range == range(start))
+            .expect("physical callback binding");
+        assert!(!binding.public);
+        assert!(symbols.insert(&binding.symbol));
+        let read = SOURCE[start..]
+            .find("=> value")
+            .expect("written callback read")
+            + start
+            + 3;
+        let references = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == binding.symbol)
+            .collect::<Vec<_>>();
+        let [reference] = references.as_slice() else {
+            panic!("one read to each callback binding");
+        };
+        let at = reference
+            .occurrence
+            .as_ref()
+            .expect("written read location");
+        assert_eq!(at.range, range(read));
+        assert_eq!(at.unit, binding.unit);
+    }
+    assert_eq!(symbols.len(), 3);
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/project")
+            && edge.to.as_str().ends_with("/project/fromTuple")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, publication.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| { publication.edges.contains(edge) && !symbols.contains(&edge.to) })
+    );
+}
+
+#[test]
 fn javascript_file_modules_keep_local_names_without_an_established_method() {
     const SOURCE: &str = concat!(
         "export const codec = flag\n",

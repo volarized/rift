@@ -770,6 +770,7 @@ struct EcmaScriptBindingDemand {
     javascript_functions: BindingDemand,
     typescript_methods: BindingDemand,
     javascript_callbacks: BindingDemand,
+    javascript_callback_patterns: BindingDemand,
     typescript_overloads: BindingDemand,
     javascript_methods: BindingDemand,
     typescript_signatures: BindingDemand,
@@ -821,6 +822,8 @@ impl EcmaScriptBindingDemand {
             typed_pattern_slots,
             macro_method_slots,
             disjoint_slots,
+            python_comprehension_slots,
+            callback_pattern_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -842,6 +845,8 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_patterns,
                 rust_macro_methods,
                 rust_disjoint,
+                python_comprehensions,
+                &self.javascript_callback_patterns,
             ],
             &mut slots,
             &mut bytes,
@@ -866,9 +871,8 @@ impl EcmaScriptBindingDemand {
             .with_typescript_destructured_parameters(typed_pattern_slots)
             .with_rust_macro_methods(macro_method_slots)
             .with_disjoint_rust_bindings(disjoint_slots)
-            .with_python_comprehension_bindings(
-                python_comprehensions.reserve(&mut slots, &mut bytes, record),
-            )
+            .with_python_comprehension_bindings(python_comprehension_slots)
+            .with_javascript_callback_patterns(callback_pattern_slots)
     }
 
     fn classify(
@@ -879,6 +883,8 @@ impl EcmaScriptBindingDemand {
     ) -> &mut BindingDemand {
         if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callbacks
+        } else if symbol.is_javascript_callback_pattern_parameter() {
+            &mut self.javascript_callback_patterns
         } else if symbol.is_ecmascript_overload_parameter() {
             &mut self.typescript_overloads
         } else if symbol.is_javascript_method_parameter() {
@@ -923,6 +929,7 @@ impl EcmaScriptBindingDemand {
             + self.javascript_functions.count
             + self.typescript_methods.count
             + self.javascript_callbacks.count
+            + self.javascript_callback_patterns.count
             + self.typescript_overloads.count
             + self.javascript_methods.count
             + self.typescript_signatures.count

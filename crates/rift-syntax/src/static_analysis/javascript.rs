@@ -2350,7 +2350,29 @@ impl Kinds {
             .filter(|syntax_element| !syntax_element.is_extra())
             .enumerate()
         {
+            let earlier = facts.bindings.len();
             self.record_parameter(parameter, scope, facts)?;
+            if self.type_shapes.is_none()
+                && (scope.kind_id() == self.arrow
+                    || self.named_expression[..2].contains(&scope.kind_id()))
+                && matches!(parameter.kind(), "object_pattern" | "array_pattern")
+                && !parameter.has_error()
+                && let Ok(index) = u32::try_from(index)
+            {
+                let function = byte_range(scope)?;
+                facts
+                    .callback_pattern_parameters
+                    .extend(
+                        facts.bindings[earlier..]
+                            .iter()
+                            .map(|binding| StaticParameter {
+                                function,
+                                owner,
+                                index,
+                                name: binding.name,
+                            }),
+                    );
+            }
             let name = if self.parameter_wrappers.contains(&parameter.kind_id()) {
                 self.pattern
                     .and_then(|field| parameter.child_by_field_id(field))

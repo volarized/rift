@@ -483,6 +483,8 @@ pub struct StaticFactsParts {
     pub type_signatures: Vec<(ByteRange, bool)>,
     /// Simple parameters of functions, signatures and function types.
     pub parameters: Vec<StaticParameter>,
+    /// Bindings of written object and array parameters in JavaScript function values.
+    pub callback_pattern_parameters: Vec<StaticParameter>,
     /// Declaration names whose written type is a function type, with that type.
     pub function_types: Vec<(ByteRange, ByteRange)>,
     /// Function-like syntax and the named type its return annotation writes.
@@ -748,6 +750,12 @@ impl StaticFacts {
     #[must_use]
     pub fn parameters(&self) -> &[StaticParameter] {
         &self.0.parameters
+    }
+
+    /// Bindings that belong to a whole function value's parameter pattern.
+    #[must_use]
+    pub fn callback_pattern_parameters(&self) -> &[StaticParameter] {
+        &self.0.callback_pattern_parameters
     }
 
     /// Declaration names whose written type is a function type, with that type.
@@ -1082,6 +1090,7 @@ impl StaticFacts {
             vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.type_signatures),
             vector_capacity(&self.0.parameters),
+            vector_capacity(&self.0.callback_pattern_parameters),
             vector_capacity(&self.0.function_types),
             vector_capacity(&self.0.return_types),
             vector_capacity(&self.0.function_contexts),
@@ -1175,6 +1184,7 @@ impl StaticFacts {
             self.declared_types().len(),
             self.type_signatures().len(),
             self.parameters().len(),
+            self.callback_pattern_parameters().len(),
             self.function_types().len(),
             self.return_types().len(),
             self.function_contexts().len(),
@@ -1342,6 +1352,11 @@ impl StaticFacts {
     fn typed_values_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
         self.parameters().iter().all(|parameter| {
             valid(parameter.function) && valid(parameter.name) && parameter.owner.is_none_or(valid)
+        }) && self.callback_pattern_parameters().iter().all(|parameter| {
+            valid(parameter.function)
+                && valid(parameter.name)
+                && parameter.function.encloses(parameter.name)
+                && parameter.owner.is_none_or(valid)
         }) && self
             .function_types()
             .iter()
