@@ -93,6 +93,8 @@ pub(super) fn package_label(owner: &SymbolOwner) -> String {
 #[derive(Debug)]
 pub struct AnalyzedFile {
     file: IndexedFile,
+    /// A Cargo library declaration belongs to this placement, outside cached syntax.
+    placed_syntax: Option<Box<SyntaxFacts>>,
     placement: DocumentPlacement,
     public_names: BTreeSet<String>,
     /// Whether a consumer can import the file's own module.
@@ -102,18 +104,23 @@ pub struct AnalyzedFile {
 }
 
 impl AnalyzedFile {
+    fn placed_syntax(&self) -> &SyntaxFacts {
+        self.placed_syntax
+            .as_deref()
+            .unwrap_or_else(|| self.file.syntax())
+    }
     fn static_source(&self) -> crate::static_resolution::StaticSource<'_> {
         crate::static_resolution::StaticSource {
             path: self.file.path(),
             source: self.file.source(),
-            facts: self.file.syntax(),
+            facts: self.placed_syntax(),
             placement: &self.placement,
         }
     }
 
     fn placed_facts(&self) -> PlacedFacts<'_> {
         PlacedFacts {
-            facts: self.file.syntax(),
+            facts: self.placed_syntax(),
             path: self.file.path(),
             placement: self.placement.clone(),
         }
@@ -296,6 +303,7 @@ fn analyzed_file(
     let item_kinds = item_kinds(parsed.syntax().symbols());
     Ok(AnalyzedFile {
         file: parsed,
+        placed_syntax: None,
         placement,
         public_names,
         reached: true,
@@ -496,138 +504,177 @@ fn assemble_package_graph(
     Ok((built.semantics, truncated))
 }
 
+#[derive(Default)]
+struct BindingDemands {
+    rust_locals: BindingDemand,
+    rust_parameters: BindingDemand,
+    rust_receivers: BindingDemand,
+    rust_generics: BindingDemand,
+    rust_library: BindingDemand,
+    rust_explicit: BindingDemand,
+    python_parameters: BindingDemand,
+    typescript_parameters: BindingDemand,
+    python_receivers: BindingDemand,
+    python_loop_bindings: BindingDemand,
+    python_variadic_parameters: BindingDemand,
+    python_overload_parameters: BindingDemand,
+    javascript_parameters: BindingDemand,
+    callback_parameters: BindingDemand,
+    overload_parameters: BindingDemand,
+    typescript_method_parameters: BindingDemand,
+    primary: usize,
+    unnamed: usize,
+}
+
+impl BindingDemands {
+    fn collect(documents: &[AnalyzedFile]) -> Self {
+        let mut demands = Self::default();
+        for document in documents {
+            let facts = document.placed_syntax();
+            let receiver_names = facts.python_receiver_names();
+            demands.primary = demands
+                .primary
+                .saturating_add(facts.primary_symbols_len())
+                .saturating_add(document.placement.aliases_count());
+            demands.unnamed = demands
+                .unnamed
+                .saturating_add(facts.left_out_symbols().len());
+            let methods = facts.typescript_method_names();
+            for symbol in facts.symbols().iter().filter(|symbol| {
+                symbol.is_package_binding()
+                    && document
+                        .placement
+                        .logical_identity(&symbol.qualified_name)
+                        .is_some()
+            }) {
+                let demand = if symbol.is_ecmascript_callback_parameter() {
+                    &mut demands.callback_parameters
+                } else if facts.language().name == "typescript"
+                    && symbol.is_ecmascript_overload_parameter()
+                {
+                    &mut demands.overload_parameters
+                } else if symbol.is_ecmascript_parameter() {
+                    if facts.language().name == "javascript" {
+                        &mut demands.javascript_parameters
+                    } else if symbol
+                        .container
+                        .as_deref()
+                        .is_some_and(|owner| methods.contains(owner))
+                    {
+                        &mut demands.typescript_method_parameters
+                    } else {
+                        &mut demands.typescript_parameters
+                    }
+                } else if symbol.is_python_variadic_parameter() {
+                    &mut demands.python_variadic_parameters
+                } else if symbol.is_python_overload_parameter() {
+                    &mut demands.python_overload_parameters
+                } else if symbol.is_python_parameter() {
+                    if symbol
+                        .name_range
+                        .is_some_and(|name| receiver_names.contains(&name))
+                    {
+                        &mut demands.python_receivers
+                    } else {
+                        &mut demands.python_parameters
+                    }
+                } else if symbol.is_rust_receiver_binding() {
+                    &mut demands.rust_receivers
+                } else if symbol.is_rust_explicit_local_binding() {
+                    &mut demands.rust_explicit
+                } else if symbol.is_rust_library_root() {
+                    &mut demands.rust_library
+                } else if symbol.is_rust_generic_parameter() {
+                    &mut demands.rust_generics
+                } else if symbol.is_rust_parameter_binding() {
+                    &mut demands.rust_parameters
+                } else if symbol.is_python_loop_binding() {
+                    &mut demands.python_loop_bindings
+                } else {
+                    &mut demands.rust_locals
+                };
+                demand.count += 1;
+                let range = symbol.item_range;
+                demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
+            }
+        }
+        demands
+    }
+}
+
 fn binding_capacity(
     documents: &[AnalyzedFile],
     limits: ExactPackageLimits,
     synthetic_objects: usize,
 ) -> (usize, rift_syntax::PackageBindingSlots) {
-    let mut rust_locals = BindingDemand::default();
-    let mut rust_parameters = BindingDemand::default();
-    let mut rust_receivers = BindingDemand::default();
-    let mut rust_generics = BindingDemand::default();
-    let mut rust_library = BindingDemand::default();
-    let mut rust_explicit = BindingDemand::default();
-    let mut python_parameters = BindingDemand::default();
-    let mut typescript_parameters = BindingDemand::default();
-    let mut python_receivers = BindingDemand::default();
-    let mut python_loop_bindings = BindingDemand::default();
-    let mut python_variadic_parameters = BindingDemand::default();
-    let mut python_overload_parameters = BindingDemand::default();
-    let mut javascript_parameters = BindingDemand::default();
-    let mut callback_parameters = BindingDemand::default();
-    let mut overload_parameters = BindingDemand::default();
-    let mut typescript_method_parameters = BindingDemand::default();
-    let mut primary = 0_usize;
-    let mut unnamed = 0_usize;
-    for document in documents {
-        let facts = document.file.syntax();
-        let receiver_names = facts.python_receiver_names();
-        primary = primary
-            .saturating_add(facts.primary_symbols_len())
-            .saturating_add(document.placement.aliases_count());
-        unnamed = unnamed.saturating_add(facts.left_out_symbols().len());
-        let methods = facts.typescript_method_names();
-        for symbol in facts.symbols().iter().filter(|symbol| {
-            symbol.is_package_binding()
-                && document
-                    .placement
-                    .logical_identity(&symbol.qualified_name)
-                    .is_some()
-        }) {
-            let demand = if symbol.is_ecmascript_callback_parameter() {
-                &mut callback_parameters
-            } else if facts.language().name == "typescript"
-                && symbol.is_ecmascript_overload_parameter()
-            {
-                &mut overload_parameters
-            } else if symbol.is_ecmascript_parameter() {
-                if facts.language().name == "javascript" {
-                    &mut javascript_parameters
-                } else if symbol
-                    .container
-                    .as_deref()
-                    .is_some_and(|owner| methods.contains(owner))
-                {
-                    &mut typescript_method_parameters
-                } else {
-                    &mut typescript_parameters
-                }
-            } else if symbol.is_python_variadic_parameter() {
-                &mut python_variadic_parameters
-            } else if symbol.is_python_overload_parameter() {
-                &mut python_overload_parameters
-            } else if symbol.is_python_parameter() {
-                if symbol
-                    .name_range
-                    .is_some_and(|name| receiver_names.contains(&name))
-                {
-                    &mut python_receivers
-                } else {
-                    &mut python_parameters
-                }
-            } else if symbol.is_rust_receiver_binding() {
-                &mut rust_receivers
-            } else if symbol.is_rust_explicit_local_binding() {
-                &mut rust_explicit
-            } else if symbol.is_rust_library_root() {
-                &mut rust_library
-            } else if symbol.is_rust_generic_parameter() {
-                &mut rust_generics
-            } else if symbol.is_rust_parameter_binding() {
-                &mut rust_parameters
-            } else if symbol.is_python_loop_binding() {
-                &mut python_loop_bindings
-            } else {
-                &mut rust_locals
-            };
-            demand.count += 1;
-            let range = symbol.item_range;
-            demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
-        }
-    }
-    let provider = limits.declarations_max().saturating_sub(primary);
+    let demands = BindingDemands::collect(documents);
+    let provider = limits.declarations_max().saturating_sub(demands.primary);
     let publication = bound(limits.publication().symbols).saturating_sub(
-        primary
-            .saturating_add(unnamed)
+        demands
+            .primary
+            .saturating_add(demands.unnamed)
             .saturating_add(synthetic_objects),
     );
-    let count = rust_locals.count
-        + rust_parameters.count
-        + python_parameters.count
-        + typescript_parameters.count
-        + python_receivers.count
-        + python_loop_bindings.count
-        + python_variadic_parameters.count
-        + python_overload_parameters.count
-        + javascript_parameters.count
-        + typescript_method_parameters.count
-        + callback_parameters.count
-        + overload_parameters.count
-        + rust_receivers.count
-        + rust_generics.count
-        + rust_library.count
-        + rust_explicit.count;
+    let count = demands.rust_locals.count
+        + demands.rust_parameters.count
+        + demands.python_parameters.count
+        + demands.typescript_parameters.count
+        + demands.python_receivers.count
+        + demands.python_loop_bindings.count
+        + demands.python_variadic_parameters.count
+        + demands.python_overload_parameters.count
+        + demands.javascript_parameters.count
+        + demands.typescript_method_parameters.count
+        + demands.callback_parameters.count
+        + demands.overload_parameters.count
+        + demands.rust_receivers.count
+        + demands.rust_generics.count
+        + demands.rust_library.count
+        + demands.rust_explicit.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
-    let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
-    let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
-    let python_parameter_slots = python_parameters.reserve(&mut slots, &mut bytes, record);
-    let typescript_parameter_slots = typescript_parameters.reserve(&mut slots, &mut bytes, record);
-    let python_receiver_slots = python_receivers.reserve(&mut slots, &mut bytes, record);
-    let python_loop_binding_slots = python_loop_bindings.reserve(&mut slots, &mut bytes, record);
-    let python_variadic_slots = python_variadic_parameters.reserve(&mut slots, &mut bytes, record);
-    let python_overload_slots = python_overload_parameters.reserve(&mut slots, &mut bytes, record);
-    let javascript_parameter_slots = javascript_parameters.reserve(&mut slots, &mut bytes, record);
-    let typescript_method_slots =
-        typescript_method_parameters.reserve(&mut slots, &mut bytes, record);
-    let rust_receiver_slots = rust_receivers.reserve(&mut slots, &mut bytes, record);
-    let rust_generic_slots = rust_generics.reserve(&mut slots, &mut bytes, record);
-    let root_slot = rust_library.reserve(&mut slots, &mut bytes, record);
-    let explicit_slots = rust_explicit.reserve(&mut slots, &mut bytes, record);
+    let local_slots = demands.rust_locals.reserve(&mut slots, &mut bytes, record);
+    let rust_parameter_slots = demands
+        .rust_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let python_parameter_slots = demands
+        .python_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let typescript_parameter_slots = demands
+        .typescript_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let python_receiver_slots = demands
+        .python_receivers
+        .reserve(&mut slots, &mut bytes, record);
+    let python_loop_binding_slots = demands
+        .python_loop_bindings
+        .reserve(&mut slots, &mut bytes, record);
+    let python_variadic_slots = demands
+        .python_variadic_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let python_overload_slots = demands
+        .python_overload_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let javascript_parameter_slots = demands
+        .javascript_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let typescript_method_slots = demands
+        .typescript_method_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let rust_receiver_slots = demands
+        .rust_receivers
+        .reserve(&mut slots, &mut bytes, record);
+    let rust_generic_slots = demands
+        .rust_generics
+        .reserve(&mut slots, &mut bytes, record);
+    let root_slot = demands.rust_library.reserve(&mut slots, &mut bytes, record);
+    let explicit_slots = demands
+        .rust_explicit
+        .reserve(&mut slots, &mut bytes, record);
     let (callback_slots, overload_slots) = reserve_scoped_parameters(
         documents,
-        &callback_parameters,
-        &overload_parameters,
+        &demands.callback_parameters,
+        &demands.overload_parameters,
         slots,
         bytes,
         record,
@@ -914,13 +961,7 @@ fn place_rust_library_root(held: &mut AnalyzedFile, root: &CoreSymbolId) {
     else {
         return;
     };
-    held.file = IndexedFile::new_with_shared_syntax(
-        held.file.path().clone(),
-        std::sync::Arc::clone(held.file.source_content()),
-        held.file.digest(),
-        held.file.executable(),
-        std::sync::Arc::new(syntax),
-    );
+    held.placed_syntax = Some(Box::new(syntax));
 }
 
 /// Renders the canonical publication over the analyzed files.
