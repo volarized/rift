@@ -153,6 +153,103 @@ fn captured_wheel_metadata_establishes_the_original_stub_paths() {
 }
 
 #[test]
+fn a_wheel_script_remains_separate_from_inferred_stub_import_roots() {
+    use rift_core::SourceUnitId;
+    use rift_protocol::identity::SymbolIdentity;
+    use rift_protocol::read::{PackageIdentity, SourceLocation};
+
+    use super::{
+        ContributionOrigin, ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageSource,
+        ProjectPath, ShippedLanguage, SourceKind,
+    };
+
+    const METADATA: &str = "Metadata-Version: 2.4\nName: types-widget\nVersion: 1.0.0\n\n";
+    const RECORD: &str = "widget-stubs/__init__.pyi,,\nwidget,,\n";
+    const STUB: &str = "from widget import invoke\n\ndef run() -> int: ...\n";
+    const SCRIPT: &str = "def local():\n    return 1\n\ndef invoke():\n    return local()\n";
+    const ROOT: &str = "rift://symbol/pypi/pypi.org/types-widget/python/widget/run";
+
+    let package = PackageIdentity {
+        manager: "pypi".to_owned(),
+        registry: "pypi.org".to_owned(),
+        name: "types-widget".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("wheel owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("authored wheel sources");
+    let stub = ProjectPath::new("widget-stubs/__init__.pyi").expect("stub path");
+    let script = ProjectPath::new("widget.py").expect("script analysis path");
+    let physical = SourceUnitId::for_owner(owner.clone(), "widget").expect("script unit");
+    let metadata = ProjectPath::new("types_widget-1.0.0.dist-info/METADATA").expect("METADATA");
+    let record = ProjectPath::new("types_widget-1.0.0.dist-info/RECORD").expect("RECORD");
+    let top_level =
+        ProjectPath::new("types_widget-1.0.0.dist-info/top_level.txt").expect("top-level file");
+    let sources = [
+        PackageSource::new(&stub, STUB),
+        PackageSource::new(&script, SCRIPT)
+            .with_source_unit(&physical, &origin)
+            .expect("physical archive script"),
+    ];
+    let context = [
+        PackageSource::new(&metadata, METADATA),
+        PackageSource::new(&record, RECORD),
+        PackageSource::new(&top_level, "widget-stubs\n"),
+    ];
+    let language = ShippedLanguage::Python.language();
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(8, 8192),
+    )
+    .expect("selected wheel files")
+    .with_framework_context(&context, &[])
+    .expect("captured wheel metadata");
+    let analysis = PackageAnalyzer::analyze(input, 1).expect("package analyzer");
+    let publication = analysis.publication();
+    let root = publication
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str() == ROOT)
+        .expect("inferred wheel root declaration");
+    let physical_identity = physical.to_string();
+    let script = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.unit.as_str() == physical_identity && row.symbol.as_str().ends_with("/invoke")
+        })
+        .expect("authored standalone script declaration");
+    let script_id = SymbolIdentity::parse(script.symbol.as_str()).expect("script identity");
+    assert_eq!(script_id.qualified_path(), ["./widget", "invoke"]);
+    assert!(publication.units.iter().any(|unit| {
+        unit.unit == script.unit && unit.path.0 == "widget" && unit.source == SCRIPT
+    }));
+    assert!(publication.units.iter().any(|unit| {
+        unit.unit == root.unit && unit.path.0 == "widget-stubs/__init__.pyi" && unit.source == STUB
+    }));
+    let called = publication
+        .declarations
+        .iter()
+        .find(|row| row.unit == script.unit && row.symbol.as_str().ends_with("/local"))
+        .expect("local declared function of the script");
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls] && edge.from == script.symbol && edge.to == called.symbol
+    }));
+    assert!(
+        !publication
+            .edges
+            .iter()
+            .any(|edge| { edge.kinds == [EdgeKind::Imports] && edge.to == script.symbol })
+    );
+}
+
+#[test]
 fn a_captured_ordinary_python_root_prevents_stub_directory_projection() {
     const RUNTIME: &str = "def run() -> int:\n    return 7\n";
     const STUB: &str = "def run() -> str: ...\n";

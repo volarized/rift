@@ -440,3 +440,138 @@ fn logical_runtime_object_keeps_released_physical_binding() {
     assert_eq!(publication.units[0].path.0, "src/lib.rs");
     assert_eq!(publication.units[0].source, source);
 }
+
+#[test]
+fn a_selected_python_script_has_file_declarations_and_no_import_module() {
+    use rift_core::SourceUnitId;
+
+    const TEXT: &str = "#!/usr/bin/env python
+from demo.example import sample
+
+def greet():
+    return 'hello'
+
+def invoke():
+    return greet()
+
+def package_call():
+    return sample()
+";
+    let package = rift_protocol::read::PackageIdentity {
+        manager: "pypi".to_owned(),
+        registry: "pypi.org".to_owned(),
+        name: "demo".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("package owner");
+    let origin = ContributionOrigin::new(
+        Some(rift_core::SourceLocation::Dependency { package }),
+        rift_core::SourceKind::Authored,
+    )
+    .expect("authored source");
+    let root = ProjectPath::new("demo/__init__.py").expect("package root");
+    let module = ProjectPath::new("demo/example.py").expect("package module");
+    let script = ProjectPath::new("bin/demo.py").expect("analysis path");
+    let outside = ProjectPath::new("bin/other.py").expect("unselected module");
+    let unit = SourceUnitId::for_owner(owner.clone(), "bin/demo").expect("physical script");
+    let sources = [
+        PackageSource::new(&root, ""),
+        PackageSource::new(
+            &module,
+            "from bin.demo import greet
+
+def sample():
+    return 1
+
+def importer():
+    return greet()
+",
+        ),
+        PackageSource::new(&script, TEXT)
+            .with_source_unit(&unit, &origin)
+            .expect("script placement"),
+        PackageSource::new(
+            &outside,
+            "def other():
+    return 2
+",
+        ),
+    ];
+    let roots = [PackageImportRoot::new(
+        None,
+        vec!["demo".to_owned()],
+        PackageImportRootOrigin::Wheel,
+    )
+    .expect("import root")];
+    let language = ShippedLanguage::Python.language();
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(4, 1 << 20),
+    )
+    .expect("package input")
+    .with_import_roots(&roots)
+    .expect("selected import root");
+    let analysis = PackageAnalyzer::analyze(input, 1).expect("collected package");
+    assert_archive_script_facts(analysis.publication(), TEXT);
+}
+
+fn assert_archive_script_facts(publication: &PackagePublication, text: &str) {
+    let physical = publication
+        .units
+        .iter()
+        .find(|record| record.path.0 == "bin/demo")
+        .expect("original script source");
+    assert_eq!(physical.source, text);
+    assert_eq!(
+        physical.unit.as_str(),
+        "rift://source/pypi/pypi.org/demo/bin/demo"
+    );
+    let declarations = publication
+        .declarations
+        .iter()
+        .filter(|row| row.unit == physical.unit)
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 4);
+    let greet = declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/greet"))
+        .expect("script declaration");
+    let identity = SymbolIdentity::parse(greet.symbol.as_str()).expect("file-based identity");
+    assert_eq!(identity.qualified_path(), ["./bin/demo", "greet"]);
+    assert_eq!(
+        greet.range.start,
+        u64::try_from(text.find("def greet").expect("written declaration")).expect("byte offset")
+    );
+    let local_calls = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls] && edge.to == greet.symbol)
+        .collect::<Vec<_>>();
+    assert_eq!(local_calls.len(), 1);
+    assert!(local_calls[0].from.as_str().ends_with("/invoke"));
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/package_call")
+            && edge.to.as_str().ends_with("/demo/example/sample")
+    }));
+    assert!(
+        !publication
+            .edges
+            .iter()
+            .any(|edge| { edge.kinds == [EdgeKind::Imports] && edge.to == greet.symbol })
+    );
+    let outside_unit = publication
+        .units
+        .iter()
+        .find(|record| record.path.0 == "bin/other.py")
+        .expect("other source retained");
+    assert!(
+        !publication
+            .declarations
+            .iter()
+            .any(|row| row.unit == outside_unit.unit)
+    );
+}

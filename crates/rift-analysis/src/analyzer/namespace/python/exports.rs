@@ -43,12 +43,12 @@ fn established_module(
         return None;
     }
     let identity = prepared.anchors.get(file.path.as_str())?.get(".")?;
-    Some(
-        SymbolIdentity::parse(identity.as_str())
-            .ok()?
-            .qualified_path()
-            .to_vec(),
-    )
+    let identity = SymbolIdentity::parse(identity.as_str()).ok()?;
+    let module = identity.qualified_path();
+    module
+        .iter()
+        .all(|part| python_identifier_is_valid(part))
+        .then(|| module.to_vec())
 }
 
 /// Leading dots climb from the importing package without passing its top level.

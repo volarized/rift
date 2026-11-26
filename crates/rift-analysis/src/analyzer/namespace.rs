@@ -6,7 +6,7 @@ use std::{
 };
 
 use rift_core::SymbolId;
-use rift_protocol::identity::SymbolIdentity;
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
 use rift_syntax::SyntaxFacts;
 
@@ -246,7 +246,10 @@ pub(crate) fn prepare_context(
             .iter()
             .any(|root| root.origin() == PackageImportRootOrigin::Wheel)
     {
-        ordinary_python_paths.extend(captured.keys().filter_map(|path| {
+        ordinary_python_paths.extend(captured.iter().filter_map(|(path, source)| {
+            if python_script_origin(input, *source).is_some() {
+                return None;
+            }
             let (base, extension) = path.rsplit_once('.')?;
             matches!(extension, "py" | "pyi").then_some(base)
         }));
@@ -339,8 +342,10 @@ fn identity_anchors_with_roots(
         return BTreeMap::new();
     }
     let local_fallback = input.owner().is_local() && input.import_roots().is_empty();
-    let Some(module) =
-        python_module_with_inventory(path, roots, ordinary_python_paths).or_else(|| {
+    let Some(module) = python_script_origin(input, source)
+        .map(|original| vec![format!("./{original}")])
+        .or_else(|| python_module_with_inventory(path, roots, ordinary_python_paths))
+        .or_else(|| {
             local_fallback
                 .then(|| python::local_module(input, path))
                 .flatten()
@@ -384,6 +389,25 @@ fn identity_anchors_with_roots(
         syntax,
     };
     retain_valid_declarations(input, &file, anchors)
+}
+
+/// One archive script explicitly selected through a synthetic Python analysis suffix.
+fn python_script_origin<'source>(
+    input: &NamespaceInput<'_>,
+    source: crate::PackageSource<'source>,
+) -> Option<&'source str> {
+    let SymbolOwner::Package { manager, .. } = input.owner() else {
+        return None;
+    };
+    let physical = source.source_unit()?;
+    let original = physical.key().as_str();
+    let extension = original.rsplit_once('.');
+    (manager == "pypi"
+        && physical.source_owner()? == input.owner()
+        && source.origin()?.source_kind() == rift_protocol::read::SourceKind::Authored
+        && !matches!(extension, Some((_, "py" | "pyi")))
+        && source.path().as_str().strip_suffix(".py")? == original)
+        .then_some(original)
 }
 
 fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String> {

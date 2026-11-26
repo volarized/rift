@@ -50,6 +50,9 @@ pub(in crate::analyzer::namespace) fn stub_wheel_root(
     }
     let mut witnessed = BTreeSet::new();
     for captured in input.files() {
+        if super::super::python_script_origin(input, *captured).is_some() {
+            continue;
+        }
         let path = captured.path().as_str();
         let stub_path = path.strip_suffix(".pyi");
         let Some(module_path) = stub_path.or_else(|| path.strip_suffix(".py")) else {
