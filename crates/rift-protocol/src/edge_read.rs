@@ -224,7 +224,8 @@ pub struct EdgeGroup {
     /// consume separate slots even when their payloads or locations are equal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<EdgeOccurrence>,
-    /// Provider exhausted this subject's adjacency under the selected exact domain.
+    /// Provider exhausted this subject's adjacency and established complete coverage.
+    /// A page with `edge_coverage_missing` can carry retained witnesses with `complete: false`.
     pub complete: bool,
 }
 
@@ -257,14 +258,15 @@ pub struct EdgeSearchPage {
     pub view: CapturedView,
 }
 
-/// Complete raw page or the existing typed unavailable outcome.
+/// A raw page or the existing typed unavailable outcome.
 /// An unsupported operation uses the declared `503 application/problem+json` response
 /// with the registered `rift.server.read_unsupported` value in `code`. Missing required
 /// facts use the typed unavailable outcome, including `insufficient_coverage`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum EdgeSearchResult {
-    /// Complete required domain was selected; all requested subjects are answered within the accepted bounds.
+    /// Bounded records from the selected domain. Incomplete coverage is explicit in the
+    /// affected groups and requires a coverage warning and at least one witnessed record.
     Page(EdgeSearchPage),
     /// Required edge facts cannot be established.
     Unavailable(crate::search_read::SearchUnavailable),

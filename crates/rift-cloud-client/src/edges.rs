@@ -134,7 +134,7 @@ impl GlobalClient {
         })
     }
 
-    /// Reads one complete raw adjacency batch without ranking, endpoint deduplication or shortest paths.
+    /// Reads one raw adjacency batch without ranking, endpoint deduplication or shortest paths.
     ///
     /// # Errors
     /// Returns request, capability, transport or strict response validation failure.
@@ -230,10 +230,10 @@ impl GlobalClient {
         Ok(parsed.value)
     }
 
-    /// Acquires the complete batch under the original context and explicit work bounds.
+    /// Acquires a batch under the original context and explicit work bounds.
     ///
     /// # Errors
-    /// Returns unavailable or validation failure without exposing a partial adjacency.
+    /// Returns unavailable or validation failure when the selected facts cannot be established.
     pub async fn edge_pages(
         &self,
         request: &EdgeSearchRequest,
@@ -243,7 +243,7 @@ impl GlobalClient {
             .await
     }
 
-    /// Acquires the complete batch after admission by the request's shared work owner.
+    /// Acquires a batch after admission by the request's shared work owner.
     ///
     /// # Errors
     /// Returns admission, unavailable or strict response validation failure.
@@ -480,11 +480,17 @@ fn validate_page(
         }
         validate_group(group, &request.edges, request.include)?;
     }
+    let incomplete = page.groups.iter().any(|group| !group.complete);
+    let coverage_warning = page
+        .warnings
+        .iter()
+        .any(|warning| matches!(warning, ReadWarning::EdgeCoverageMissing { .. }));
     if i64::try_from(count).map_or(true, |count| count > limit)
-        || page.groups.iter().any(|group| !group.complete)
+        || incomplete != coverage_warning
+        || (incomplete && count == 0)
     {
         return Err(invalid(
-            "edge page did not establish bounded complete adjacency",
+            "edge page did not establish bounded adjacency or retained witnesses",
         ));
     }
     if request

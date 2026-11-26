@@ -500,6 +500,7 @@ impl AcquiredAdjacency {
             .bytes_max
             .checked_sub(u64::try_from(charged).map_err(|_| coverage_failure())?)
             .ok_or_else(coverage_failure)?;
+        self.partial |= page.groups.iter().any(|group| !group.complete);
         for group in &page.groups {
             let records: BTreeSet<_> = group
                 .edges
