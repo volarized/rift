@@ -56,6 +56,8 @@ enum RustSymbolKind {
     Closure,
     /// A value bound by an ordinary let statement.
     LocalBinding,
+    /// A declaration at an authored shorthand field pattern.
+    ShorthandBinding,
     /// A value parameter named in a function's signature.
     ParameterBinding,
     /// A declared generic type.
@@ -87,6 +89,7 @@ impl RustSymbolKind {
             Self::Impl => "impl_item",
             Self::Closure => "let_declaration",
             Self::LocalBinding => local_bindings::KIND,
+            Self::ShorthandBinding => local_bindings::SHORTHAND_KIND,
             Self::ParameterBinding => local_bindings::PARAMETER_KIND,
             Self::TypeParameter => "type_parameter",
             Self::LifetimeParameter => "lifetime_parameter",
@@ -110,7 +113,9 @@ impl RustSymbolKind {
             Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
-            Self::Constant | Self::Static | Self::LocalBinding => vec![SymbolKind::Value],
+            Self::Constant | Self::Static | Self::LocalBinding | Self::ShorthandBinding => {
+                vec![SymbolKind::Value]
+            }
             Self::ParameterBinding | Self::ConstParameter => {
                 vec![SymbolKind::Value, SymbolKind::Parameter]
             }
@@ -140,6 +145,7 @@ impl RustSymbolKind {
             | Self::AssociatedType
             | Self::Closure
             | Self::LocalBinding
+            | Self::ShorthandBinding
             | Self::ParameterBinding
             | Self::TypeParameter
             | Self::LifetimeParameter
@@ -162,6 +168,8 @@ enum RustGrammarSyntaxKind {
     Parameter,
     /// Receiver parameter, including reference and lifetime forms.
     SelfParameter,
+    /// Name the author wrote in a shorthand field of a struct pattern.
+    ShorthandFieldIdentifier,
     /// Generic type parameter.
     TypeParameter,
     /// Generic lifetime parameter.
@@ -221,6 +229,7 @@ impl RustGrammarSyntaxKind {
             Self::LetDeclaration => "let_declaration",
             Self::Parameter => "parameter",
             Self::SelfParameter => "self_parameter",
+            Self::ShorthandFieldIdentifier => "shorthand_field_identifier",
             Self::TypeParameter => "type_parameter",
             Self::LifetimeParameter => "lifetime_parameter",
             Self::ConstParameter => "const_parameter",
@@ -259,6 +268,7 @@ impl RustGrammarSyntaxKind {
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
             Self::LetDeclaration => Some(RustSymbolKind::Closure),
+            Self::ShorthandFieldIdentifier => Some(RustSymbolKind::ShorthandBinding),
             Self::Parameter | Self::SelfParameter => Some(RustSymbolKind::ParameterBinding),
             Self::TypeParameter => Some(RustSymbolKind::TypeParameter),
             Self::LifetimeParameter => Some(RustSymbolKind::LifetimeParameter),
@@ -667,6 +677,9 @@ impl GrammarRules for RustGrammarRules {
             .child_by_field_name(RustGrammarField::Name.as_str())
             .or_else(|| local_bindings::receiver(syntax_element))
             .or_else(|| {
+                (syntax_element.kind() == "shorthand_field_identifier").then_some(syntax_element)
+            })
+            .or_else(|| {
                 matches!(
                     RustGrammarSyntaxKind::from_kind(syntax_element.kind()),
                     Some(RustGrammarSyntaxKind::LetDeclaration | RustGrammarSyntaxKind::Parameter)
@@ -698,6 +711,8 @@ impl GrammarRules for RustGrammarRules {
         };
         let name = if kind == RustSymbolKind::ParameterBinding {
             local_bindings::parameter_name(visited, text).map(str::to_owned)
+        } else if kind == RustSymbolKind::ShorthandBinding {
+            local_bindings::shorthand_name(visited, text).map(str::to_owned)
         } else if matches!(
             kind,
             RustSymbolKind::TypeParameter

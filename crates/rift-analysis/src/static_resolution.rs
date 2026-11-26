@@ -114,6 +114,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_argument_value_start: Option<usize>,
     /// First use-path qualifier resolved to a Rust module or type.
     pub(crate) rust_import_qualifier_start: Option<usize>,
+    /// First occurrence that reads a checked Rust shorthand pattern binding.
+    pub(crate) rust_shorthand_start: Option<usize>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
@@ -277,6 +279,7 @@ fn resolve_by<'source>(
     );
     index.resolve_rust_argument_values(&mut work, &mut resolution);
     index.resolve_rust_import_qualifiers(&mut work, &mut resolution);
+    index.resolve_rust_shorthand(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -645,6 +648,7 @@ struct File<'source> {
     /// The reference prefix and declaration count before additional Rust bindings.
     primary_reference_count: usize,
     rust_local_count: usize,
+    rust_shorthand: bool,
     rust_receivers: Vec<&'source SyntaxSymbol>,
     rust_generics: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     rust_library_root: Option<&'source SyntaxSymbol>,
@@ -818,6 +822,7 @@ impl<'source> File<'source> {
             callables: EnclosingDefinitions::new([]),
             primary_reference_count: facts.references().len(),
             rust_local_count: 0,
+            rust_shorthand: false,
             rust_receivers: Vec::new(),
             rust_generics: BTreeMap::new(),
             rust_library_root: None,
@@ -1123,6 +1128,8 @@ impl<'source> File<'source> {
             if let Some(name) = symbol.name_range.filter(|_| admitted) {
                 self.rust_generics.insert(name, symbol);
             }
+        } else if symbol.is_rust_shorthand_binding() {
+            self.rust_shorthand |= admitted;
         } else if symbol.is_rust_local_binding() {
             self.rust_local_count +=
                 usize::from(admitted && !symbol.is_rust_explicit_local_binding());
@@ -2150,7 +2157,7 @@ impl<'source> Index<'source> {
                 locals
             }
             RustReferencePass::LocalBindings => {
-                self.rust_local_bindings(file, work, resolution);
+                self.rust_local_bindings(file, false, work, resolution);
                 None
             }
         }

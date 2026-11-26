@@ -36,6 +36,7 @@ pub struct PackageBindingSlots {
     rust_library_root: usize,
     rust_module_source: usize,
     rust_explicit: usize,
+    rust_shorthand: usize,
 }
 
 impl PackageBindingSlots {
@@ -65,6 +66,7 @@ impl PackageBindingSlots {
             rust_library_root: 0,
             rust_module_source: 0,
             rust_explicit: 0,
+            rust_shorthand: 0,
         }
     }
 
@@ -159,6 +161,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves slots for checked Rust shorthand pattern bindings.
+    #[must_use]
+    pub const fn with_rust_shorthand(mut self, slots: usize) -> Self {
+        self.rust_shorthand = slots;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -179,6 +188,7 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_library_root)
             .saturating_add(self.rust_module_source)
             .saturating_add(self.rust_explicit)
+            .saturating_add(self.rust_shorthand)
     }
 
     fn admit(
@@ -219,6 +229,8 @@ impl PackageBindingSlots {
             }
         } else if symbol.is_rust_receiver_binding() {
             &mut self.rust_receiver
+        } else if symbol.is_rust_shorthand_binding() {
+            &mut self.rust_shorthand
         } else if symbol.is_rust_explicit_local_binding() {
             &mut self.rust_explicit
         } else if symbol.is_rust_module_source() {

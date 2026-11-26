@@ -550,6 +550,7 @@ struct BindingDemands {
     rust_generics: BindingDemand,
     rust_library: BindingDemand,
     rust_explicit: BindingDemand,
+    rust_shorthand: BindingDemand,
     python_parameters: BindingDemand,
     typescript_parameters: BindingDemand,
     python_receivers: BindingDemand,
@@ -625,6 +626,8 @@ impl BindingDemands {
                     }
                 } else if symbol.is_rust_receiver_binding() {
                     &mut demands.rust_receivers
+                } else if symbol.is_rust_shorthand_binding() {
+                    &mut demands.rust_shorthand
                 } else if symbol.is_rust_explicit_local_binding() {
                     &mut demands.rust_explicit
                 } else if symbol.is_rust_library_root() {
@@ -677,7 +680,8 @@ fn binding_capacity(
         + demands.rust_generics.count
         + demands.rust_library.count
         + demands.rust_explicit.count
-        + rust_module_sources.count;
+        + rust_module_sources.count
+        + demands.rust_shorthand.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = demands.rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -727,6 +731,9 @@ fn binding_capacity(
         record,
     );
     let module_slots = rust_module_sources.reserve(&mut slots, &mut bytes, record);
+    let shorthand_slots = demands
+        .rust_shorthand
+        .reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -747,7 +754,8 @@ fn binding_capacity(
         .with_typescript_method_parameters(typescript_method_slots)
         .with_javascript_callback_parameters(callback_slots)
         .with_typescript_overload_parameters(overload_slots)
-        .with_rust_module_sources(module_slots),
+        .with_rust_module_sources(module_slots)
+        .with_rust_shorthand(shorthand_slots),
     )
 }
 

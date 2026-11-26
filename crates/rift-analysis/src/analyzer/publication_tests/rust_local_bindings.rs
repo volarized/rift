@@ -514,6 +514,113 @@ pub fn keep<U>(value: U) -> U { value }
 }
 
 #[test]
+fn package_rust_shorthand_struct_patterns_keep_binding_and_field_separate() {
+    let source = "pub struct Panel { pub item: u8 }
+pub fn choose(panel: Panel) -> u8 {
+    let Panel { item } = panel;
+    item
+}
+pub fn branch(panel: Panel) -> u8 {
+    match panel {
+        Panel { item } if item > 3 => item,
+        Panel { item } => item + 1,
+    }
+}
+pub fn parameter(Panel { item }: Panel) -> u8 {
+    item
+}
+";
+    let result = analyze(source);
+    let field = result
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/Panel/item"))
+        .expect("separate field declaration");
+    assert!(field.public);
+    for (name, at, range, reads) in [
+        ("choose", "item } = panel", "item\n}", 1),
+        ("branch", "item } if", "item > 3", 2),
+        ("branch", "item } =>", "item + 1", 1),
+        ("parameter", "item }: Panel", "item\n}\n", 1),
+    ] {
+        let declaration = declaration_at(&result, source, at);
+        assert_eq!(declaration.source, "item");
+        assert!(!declaration.public);
+        assert_ne!(declaration.symbol, field.symbol);
+        assert!(
+            declaration
+                .symbol
+                .as_str()
+                .contains(&format!("/{name}/item%23shorthand"))
+        );
+        let occurrences = result
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .filter_map(|edge| edge.occurrence.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(occurrences.len(), reads, "{at}");
+        let start = if name == "parameter" {
+            u64::try_from(source.rfind(range).expect("parameter read")).expect("byte offset")
+        } else {
+            position(source, range)
+        };
+        assert!(
+            occurrences
+                .iter()
+                .any(|site| site.range.start == start && site.range.end == start + 4)
+        );
+    }
+    let established = result
+        .declarations
+        .iter()
+        .filter(|row| !row.symbol.as_str().contains("%23shorthand"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounded = analyze_with_limits(
+        source,
+        ExactPackageLimits::new(2, 1 << 20)
+            .with_declarations(u32::try_from(established.len()).expect("established rows"))
+            .expect("room for previous declarations"),
+    );
+    assert_eq!(bounded.declarations, established);
+    assert!(
+        result
+            .edges
+            .iter()
+            .filter(|edge| {
+                !edge.from.as_str().contains("%23shorthand")
+                    && !edge.to.as_str().contains("%23shorthand")
+            })
+            .all(|edge| bounded.edges.contains(edge))
+    );
+}
+
+#[test]
+fn package_rust_shorthand_refuses_an_in_scope_constant() {
+    let source = "const item: u8 = 0;
+pub struct Panel { pub item: u8 }
+pub fn test(panel: Panel) -> bool {
+    match panel {
+        Panel { item } => true,
+        _ => false,
+    }
+}
+";
+    let result = analyze(source);
+    assert!(
+        result
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/Panel/item"))
+    );
+    assert!(result.declarations.iter().all(|row| {
+        row.range.start != position(source, "item }")
+            && !row.symbol.as_str().contains("%23shorthand")
+    }));
+}
+
+#[test]
 fn package_rust_explicit_lets_keep_declarations_when_macro_output_is_opaque() {
     let source = "mod values { #[allow(non_upper_case_globals)] pub const constant: () = (); }
 use values::*;

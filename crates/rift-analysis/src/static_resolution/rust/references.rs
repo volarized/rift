@@ -29,16 +29,36 @@ struct ImportQualifierSites {
 }
 
 impl<'source> Index<'source> {
+    /// Adds checked Rust shorthand uses after the other Rust occurrence classes.
+    pub(in crate::static_resolution) fn resolve_rust_shorthand(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values().filter(|file| file.rust_shorthand) {
+            if work.exhausted {
+                break;
+            }
+            self.rust_local_bindings(file, true, work, result);
+        }
+        if result.occurrences.len() != start {
+            result.rust_shorthand_start = Some(start);
+        }
+    }
+
     /// Adds authored Rust local definitions and reads on the work left by other references.
     pub(in crate::static_resolution) fn rust_local_bindings(
         &self,
         file: &File<'source>,
+        shorthand: bool,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
         let mut locals = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
-            if symbol.is_rust_receiver_binding()
+            if symbol.is_rust_shorthand_binding() != shorthand
+                || symbol.is_rust_receiver_binding()
                 || symbol.is_rust_generic_parameter()
                 || symbol.is_rust_library_root()
                 || symbol.is_rust_explicit_local_binding()

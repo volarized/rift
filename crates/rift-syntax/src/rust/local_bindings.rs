@@ -12,11 +12,15 @@ use crate::{ByteRange, SyntaxElement, SyntaxSymbol};
 pub(super) const KIND: &str = "local_binding";
 pub(super) const PARAMETER_KIND: &str = "parameter_binding";
 pub(super) const EXPLICIT_LOCAL_KIND: &str = "explicit_local_binding";
+pub(super) const SHORTHAND_KIND: &str = "shorthand_binding";
 
 /// The physical identifier of a supported let statement or value parameter.
 pub(super) fn pattern(item: Node<'_>) -> Option<Node<'_>> {
     if item.has_error() {
         return None;
+    }
+    if item.kind() == "shorthand_field_identifier" {
+        return Some(item);
     }
     if generic_kind(item.kind()) {
         return item.child_by_field_name("name");
@@ -78,6 +82,31 @@ pub(super) fn generic_name<'source>(
     }
     let name = source.get(pattern(visited.syntax_element())?.byte_range())?;
     rift_core::is_portable_name(name).then_some(name)
+}
+
+/// A shorthand field in a checked binding position of a named function.
+pub(super) fn shorthand_name<'source>(
+    visited: Visited<'_, '_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let item = visited.syntax_element();
+    let name = source.get(pattern(item)?.byte_range())?;
+    if !plain_name(name) || visited.parent()?.syntax_element().kind() != "field_pattern" {
+        return None;
+    }
+    let mut ancestor = visited.parent().and_then(Visited::parent);
+    let mut binding = false;
+    while let Some(outer) = ancestor {
+        match outer.syntax_element().kind() {
+            "let_declaration" | "parameter" | "match_arm" => binding = true,
+            "function_item" => return binding.then_some(name),
+            "or_pattern" | "macro_invocation" | "closure_expression" | "async_block"
+            | "const_block" | "const_item" | "static_item" => return None,
+            _ => {}
+        }
+        ancestor = outer.parent();
+    }
+    None
 }
 
 /// A plain authored function parameter or a method's receiver.
@@ -160,8 +189,10 @@ impl SyntaxSymbol {
     /// Whether this is a source-local Rust binding candidate.
     #[must_use]
     pub fn is_rust_local_binding(&self) -> bool {
-        matches!(self.kind, KIND | PARAMETER_KIND | EXPLICIT_LOCAL_KIND)
-            || self.is_rust_generic_parameter()
+        matches!(
+            self.kind,
+            KIND | PARAMETER_KIND | EXPLICIT_LOCAL_KIND | SHORTHAND_KIND
+        ) || self.is_rust_generic_parameter()
     }
 
     /// Whether this source-local Rust binding is a parameter.
@@ -188,6 +219,12 @@ impl SyntaxSymbol {
         self.kind == EXPLICIT_LOCAL_KIND
     }
 
+    /// Whether this declaration is a shorthand struct field binding.
+    #[must_use]
+    pub fn is_rust_shorthand_binding(&self) -> bool {
+        self.kind == SHORTHAND_KIND
+    }
+
     /// The generated last path component of a physical Rust lexical binding.
     #[must_use]
     pub fn rust_local_binding_component(&self) -> Option<&str> {
@@ -198,6 +235,8 @@ impl SyntaxSymbol {
         let (name, ordinal) = component.rsplit_once('#')?;
         let ordinal = if self.is_rust_explicit_local_binding() {
             ordinal.strip_prefix("explicit")?
+        } else if self.is_rust_shorthand_binding() {
+            ordinal.strip_prefix("shorthand")?
         } else if self.is_rust_generic_parameter() {
             ordinal.strip_prefix("generic")?
         } else if self.is_rust_parameter_binding() {
@@ -263,8 +302,19 @@ fn prepare_bindings(
     } else {
         opaque_names(source, symbols, facts)
     };
+    let shorthand_sites = if symbols.iter().any(SyntaxSymbol::is_rust_shorthand_binding) {
+        facts
+            .bindings()
+            .iter()
+            .filter(|binding| binding.kind == StaticBindingKind::Shadow)
+            .map(|binding| binding.name)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let mut same_name = BTreeMap::new();
     let mut retained = BTreeSet::new();
+    let mut retained_shorthand = BTreeSet::new();
     let mut has_receivers = false;
     let mut conditions = facts
         .conditional_items()
@@ -286,6 +336,14 @@ fn prepare_bindings(
         let receiver = symbol.is_rust_receiver_binding();
         let generic = symbol.is_rust_generic_parameter();
         let explicit = symbol.is_rust_explicit_local_binding();
+        let shorthand = symbol.is_rust_shorthand_binding();
+        if shorthand
+            && symbol
+                .name_range
+                .is_none_or(|range| !shorthand_sites.contains(&range))
+        {
+            return false;
+        }
         if !receiver && !generic && symbol.item_range.end <= conditional_end {
             return false;
         }
@@ -304,6 +362,8 @@ fn prepare_bindings(
         // A Rust identifier cannot contain this ordinal separator.
         let category = if explicit {
             "explicit"
+        } else if shorthand {
+            "shorthand"
         } else if generic {
             "generic"
         } else if symbol.kind == PARAMETER_KIND {
@@ -321,11 +381,14 @@ fn prepare_bindings(
             has_receivers = true;
         } else if !generic && !explicit {
             retained.insert(name);
+            if shorthand {
+                retained_shorthand.insert(name);
+            }
         }
         true
     });
     if !retained.is_empty() {
-        prepare_direct_reads(source, elements, facts, &retained);
+        prepare_direct_reads(source, elements, facts, &retained, &retained_shorthand);
     }
     if has_receivers {
         let reads = elements
@@ -340,6 +403,7 @@ fn prepare_direct_reads(
     elements: &[SyntaxElement],
     facts: &mut StaticFacts,
     retained: &BTreeSet<&str>,
+    shorthand: &BTreeSet<&str>,
 ) {
     let direct = facts
         .rust_value_reads()
@@ -351,8 +415,17 @@ fn prepare_direct_reads(
         (element.kind == "identifier" && parent.kind == "binary_expression")
             .then_some(element.range)
     });
+    let match_values = elements.iter().filter_map(|element| {
+        let parent = elements.get(element.parent?)?;
+        (element.kind == "identifier"
+            && parent.kind == "match_arm"
+            && source_name(source, Some(element.range))
+                .is_some_and(|name| shorthand.contains(name)))
+        .then_some(element.range)
+    });
     let reads = direct
         .chain(binary)
+        .chain(match_values)
         .filter(|&range| {
             source_name(source, Some(range)).is_some_and(|name| retained.contains(name))
         })
