@@ -320,8 +320,15 @@ fn test_class_fields_and_parameter_properties_declare_class_properties() {
             ("Shape.#secret", Some("Shape"), "property"),
             ("Shape.constructor", Some("Shape"), "method"),
             ("Shape.name", Some("Shape"), "property"),
+            (
+                "Shape.constructor.plain",
+                Some("Shape.constructor"),
+                "value_parameter",
+            ),
         ]
     );
+    let parameter = symbol(&document, "Shape.constructor.plain");
+    assert_eq!(parameter.kinds, [SymbolKind::Value, SymbolKind::Parameter]);
     let sides = symbol(&document, "Shape.sides");
     assert_eq!(sides.kinds, [SymbolKind::Value, SymbolKind::Member]);
     assert_eq!(

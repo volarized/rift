@@ -207,6 +207,7 @@ mod tests {
                     "method",
                     Some("map<U>(callbackfn: (value: T) => U): U[]")
                 ),
+                ("Array.map.callbackfn", "value_parameter", None),
                 (
                     "Array.reduce",
                     "method",
@@ -219,6 +220,7 @@ mod tests {
                 ),
                 ("Reader", "class", None),
                 ("Reader.read", "method", Some("read(size?: number): string")),
+                ("Reader.read.size", "value_parameter", None),
                 (
                     "readFile",
                     "function",
