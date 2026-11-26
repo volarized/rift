@@ -192,11 +192,13 @@ pub const QUERY_RETAINED_BYTES_MIN: u64 = 1 << 20;
 /// Most retained view material `[search.query] retained_size` accepts: 64 GiB.
 pub const QUERY_RETAINED_BYTES_MAX: u64 = 64 << 30;
 
-/// Bounds on one query result page and on the views retained for later pages.
+/// Local symbol inventory selection and bounds on query results and retained views.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_query_ranges)]
 pub struct QueryConfiguration {
+    /// Whether graph queries can read the captured local symbol inventory. Defaults to true.
+    pub local_symbol_inventory: bool,
     /// Most encoded bytes on one page, from 1 KiB to 4 MiB.
     pub page_limit: crate::configuration::ByteSize,
     /// Most views the server retains for later pages, 1 to 4096. A new view past
@@ -213,6 +215,7 @@ pub struct QueryConfiguration {
 impl Default for QueryConfiguration {
     fn default() -> Self {
         Self {
+            local_symbol_inventory: true,
             page_limit: crate::configuration::ByteSize::from_bytes(4 * 1024 * 1024),
             retained_views: QUERY_RETAINED_VIEWS_DEFAULT,
             retained_size: crate::configuration::ByteSize::from_bytes(QUERY_RETAINED_BYTES_DEFAULT),

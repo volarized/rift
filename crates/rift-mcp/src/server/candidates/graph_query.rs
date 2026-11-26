@@ -224,6 +224,21 @@ impl RiftMcp {
             }
             Err(error) => return Err(read_failure(error)),
         };
+        let configuration = resolved
+            .published
+            .configuration
+            .search_configuration()
+            .query;
+        if !configuration.local_symbol_inventory
+            && selected.is_none()
+            && local_semantics.is_none()
+            && exact.is_none()
+            && query.symbol_selection().is_some()
+        {
+            return Ok(Err(coverage_unavailable(vec![
+                ReadWarning::LocalSymbolInventoryUnavailable,
+            ])));
+        }
         let retrieved = match tokio::time::timeout_at(
             deadline.at(),
             Box::pin(self.prepare_retrievals(&resolved, query, limits, deadline)),
@@ -239,11 +254,6 @@ impl RiftMcp {
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         }
-        let configuration = resolved
-            .published
-            .configuration
-            .search_configuration()
-            .query;
         let reads = Arc::clone(&resolved.published.reads);
         let mut warnings = acquired.take_warnings();
         if local_semantics.is_some() {
@@ -894,11 +904,15 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
 }
 
 fn insufficient_coverage(warnings: Vec<ReadWarning>) -> QueryReadResult {
-    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+    QueryReadResult::Unavailable(coverage_unavailable(warnings))
+}
+
+fn coverage_unavailable(warnings: Vec<ReadWarning>) -> SearchUnavailable {
+    SearchUnavailable::Unavailable {
         reason: SymbolUnavailableReason::InsufficientCoverage,
         view: None,
         warnings,
-    })
+    }
 }
 
 #[cfg(test)]

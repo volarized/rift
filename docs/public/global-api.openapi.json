@@ -6476,6 +6476,20 @@
           },
           {
             "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "const": "local_symbol_inventory_unavailable"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "additionalProperties": false,
+            "description": "The query requires a local symbol inventory that the server does not offer.\nUse `SERVICE :search` to select package facts."
+          },
+          {
+            "type": "object",
             "additionalProperties": false,
             "properties": {
               "code": {

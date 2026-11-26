@@ -1620,8 +1620,13 @@
     },
     "QueryConfiguration": {
       "additionalProperties": false,
-      "description": "Bounds on one query result page and on the views retained for later pages.",
+      "description": "Local symbol inventory selection and bounds on query results and retained views.",
       "properties": {
+        "local_symbol_inventory": {
+          "default": true,
+          "description": "Whether graph queries can read the captured local symbol inventory. Defaults to true.",
+          "type": "boolean"
+        },
         "page_limit": {
           "$ref": "#/$defs/ByteSize",
           "default": "4mb",
@@ -1833,6 +1838,7 @@
         "query": {
           "$ref": "#/$defs/QueryConfiguration",
           "default": {
+            "local_symbol_inventory": true,
             "page_limit": "4mb",
             "retained_size": "8gb",
             "retained_views": 256
@@ -2515,6 +2521,7 @@
         "pattern_verified_size": "128mb",
         "pool_slots": 4,
         "query": {
+          "local_symbol_inventory": true,
           "page_limit": "4mb",
           "retained_size": "8gb",
           "retained_views": 256
