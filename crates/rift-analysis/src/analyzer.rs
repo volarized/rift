@@ -71,11 +71,15 @@ mod publication_tests;
 #[cfg(test)]
 mod retained_tests;
 mod rust_lsp_declarations;
+mod rust_lsp_operators;
 
 use join::ModuleRole;
 pub use join::StubForm;
 pub use rust_lsp_declarations::{
     RustLspDeclaration, RustLspDeclarationAdmission, RustLspDeclarationFile,
+};
+pub use rust_lsp_operators::{
+    RustLspOperatorDefinition, RustLspOperatorEdges, RustLspOperatorSite,
 };
 
 pub(super) fn package_label(owner: &SymbolOwner) -> String {
