@@ -37,13 +37,13 @@ enum Presence {
 
 /// The state of each package path: the captured files, and the path observations whose
 /// absent keys stay unknown. A selection without an observation never proves absence.
-pub(super) struct PackageFiles<'input> {
+pub(crate) struct PackageFiles<'input> {
     captured: BTreeSet<&'input str>,
     observed: Option<&'input BTreeMap<ObservationPath, Option<ArchiveMemberKind>>>,
 }
 
 impl<'input> PackageFiles<'input> {
-    pub(super) fn captured(input: &NamespaceInput<'input>) -> Self {
+    pub(crate) fn captured(input: &NamespaceInput<'input>) -> Self {
         Self {
             captured: input
                 .files()
@@ -106,7 +106,7 @@ impl<'input> PackageFiles<'input> {
     /// names the entry when Node's index is established missing, or when its state is not
     /// captured. The captured `module` file is then the one entry the manifest spells.
     pub(super) fn runtime(&self, main: Option<&str>, module: Option<&str>) -> Entry {
-        let entry = match runtime_candidates(main) {
+        let entry = match runtime_candidates(main, "") {
             Some(candidates) => self.first(candidates),
             None => return Entry::Absent,
         };
@@ -122,6 +122,15 @@ impl<'input> PackageFiles<'input> {
             }
             (entry, _) => entry,
         }
+    }
+
+    /// The written nested main's outer index, when every earlier runtime candidate
+    /// is established absent and the selected source is this folder's JavaScript index.
+    pub(crate) fn observed_folder_index(&self, main: &str, directory: &str) -> Option<ProjectPath> {
+        let Entry::File(path) = self.first(runtime_candidates(Some(main), directory)?) else {
+            return None;
+        };
+        (path.as_str() == format!("{directory}/index.js")).then_some(path)
     }
 
     pub(super) fn types(&self, metadata: &PackageMetadata) -> Entry {
@@ -178,7 +187,7 @@ pub(super) fn resolve(
 
 /// Node's `LOAD_AS_DIRECTORY` order for a written `main`, or the package's index without
 /// one. `None` for a target outside the package.
-fn runtime_candidates(main: Option<&str>) -> Option<Vec<String>> {
+fn runtime_candidates(main: Option<&str>, directory: &str) -> Option<Vec<String>> {
     let mut candidates = Vec::new();
     if let Some(main) = main.filter(|main| !main.is_empty()) {
         let path = normalized(main)?;
@@ -189,7 +198,12 @@ fn runtime_candidates(main: Option<&str>) -> Option<Vec<String>> {
                 .extend(RUNTIME_EXTENSIONS.map(|extension| format!("{path}/index{extension}")));
         }
     }
-    candidates.extend(RUNTIME_EXTENSIONS.map(|extension| format!("index{extension}")));
+    let index = if directory.is_empty() {
+        "index".to_owned()
+    } else {
+        format!("{directory}/index")
+    };
+    candidates.extend(RUNTIME_EXTENSIONS.map(|extension| format!("{index}{extension}")));
     Some(candidates)
 }
 
@@ -252,7 +266,7 @@ pub(in crate::analyzer) fn build_paths(
         Some(types) => types_candidates(types).unwrap_or_default(),
         None => default_types(metadata.main.as_deref()).unwrap_or_default(),
     };
-    let paths = runtime_candidates(metadata.main.as_deref())
+    let paths = runtime_candidates(metadata.main.as_deref(), "")
         .unwrap_or_default()
         .into_iter()
         .chain(declared)

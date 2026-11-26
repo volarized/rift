@@ -267,3 +267,89 @@ module.exports = use";
         }
     }
 }
+
+#[test]
+fn an_extensionless_nested_main_can_use_its_observed_outer_index() {
+    use rift_protocol::read::{ProjectPath as ObservedPath, SourceLocation};
+
+    const CALLER: &str =
+        "const { work } = require(\"./lib\");\nexports.run = function run() { return work(); };\n";
+    const INDEX: &str = "exports.work = function work() { return 42; };\n";
+    const NESTED: &str = r#"{"main":"entry"}"#;
+
+    let package = rift_protocol::read::PackageIdentity {
+        manager: "npm".to_owned(),
+        registry: "registry.npmjs.org".to_owned(),
+        name: "beacon".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("npm owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("authored npm source");
+    let language = ShippedLanguage::JavaScript.language();
+    let entry = ProjectPath::new("index.js").expect("entry path");
+    let index = ProjectPath::new("lib/index.js").expect("fallback path");
+    let manifest = ProjectPath::new("package.json").expect("root manifest path");
+    let nested = ProjectPath::new("lib/package.json").expect("nested manifest path");
+    let selected = [
+        PackageSource::new(&entry, CALLER),
+        PackageSource::new(&index, INDEX),
+    ];
+    let context = [
+        PackageSource::new(&manifest, ROOT_ONLY_MANIFEST),
+        PackageSource::new(&nested, NESTED),
+    ];
+
+    for (observed_json, found) in [
+        (Some(None), true),
+        (None, false),
+        (Some(Some(crate::ArchiveMemberKind::File)), false),
+    ] {
+        let mut observed = BTreeMap::from([
+            (ObservedPath("lib/entry".to_owned()), None),
+            (ObservedPath("lib/entry.js".to_owned()), None),
+            (ObservedPath("lib/entry.node".to_owned()), None),
+        ]);
+        if let Some(kind) = observed_json {
+            observed.insert(ObservedPath("lib/entry.json".to_owned()), kind);
+        }
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &selected,
+            ExactPackageLimits::new(16, 16_384),
+        )
+        .expect("captured byte bounds")
+        .with_framework_context(&context, &[])
+        .expect("both written manifests")
+        .with_build_paths(&observed)
+        .expect("observed paths");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("package analysis");
+        let publication = analysis.publication();
+        publication.validate_facts().expect("valid stored edges");
+        let edges = publication
+            .edges
+            .iter()
+            .filter(|row| {
+                row.to.as_str().ends_with("/beacon%2Flib%2Findex.js/work")
+                    && matches!(row.kinds.as_slice(), [EdgeKind::Imports | EdgeKind::Calls])
+            })
+            .collect::<Vec<_>>();
+        if found {
+            assert_eq!(edges.len(), 2);
+            for (kind, source) in [(EdgeKind::Imports, "work"), (EdgeKind::Calls, "work()")] {
+                let edge = edges
+                    .iter()
+                    .find(|row| row.kinds == [kind])
+                    .expect("authored edge");
+                assert!(occurrence(edge, CALLER, source));
+            }
+        } else {
+            assert!(edges.is_empty(), "{observed_json:?}");
+        }
+    }
+}
