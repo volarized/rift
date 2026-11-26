@@ -26,6 +26,7 @@ pub struct PackageBindingSlots {
     python_receiver: usize,
     python_loop_binding: usize,
     python_variadic_parameter: usize,
+    python_overload_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -45,6 +46,7 @@ impl PackageBindingSlots {
             python_receiver: 0,
             python_loop_binding: 0,
             python_variadic_parameter: 0,
+            python_overload_parameter: 0,
         }
     }
 
@@ -69,6 +71,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves separate slots for parameters in Python overload families.
+    #[must_use]
+    pub const fn with_python_overload_parameter_slots(mut self, slots: usize) -> Self {
+        self.python_overload_parameter = slots;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -79,6 +88,7 @@ impl PackageBindingSlots {
             .saturating_add(self.python_receiver)
             .saturating_add(self.python_loop_binding)
             .saturating_add(self.python_variadic_parameter)
+            .saturating_add(self.python_overload_parameter)
     }
 
     fn admit(
@@ -90,6 +100,8 @@ impl PackageBindingSlots {
             &mut self.typescript_parameter
         } else if symbol.is_python_variadic_parameter() {
             &mut self.python_variadic_parameter
+        } else if symbol.is_python_overload_parameter() {
+            &mut self.python_overload_parameter
         } else if symbol.is_python_parameter() {
             if symbol
                 .name_range

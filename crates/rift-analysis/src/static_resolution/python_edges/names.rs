@@ -66,10 +66,12 @@ impl<'source> Index<'source> {
         let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
             let target = match file.python_parameters.get(&name) {
-                Some(&Some(symbol)) if parameters => Some(Target {
-                    file: file.document,
-                    symbol,
-                }),
+                Some(&Some(symbol)) if parameters && !symbol.is_python_overload_parameter() => {
+                    Some(Target {
+                        file: file.document,
+                        symbol,
+                    })
+                }
                 None if !parameters => file.target_at(name),
                 _ => continue,
             };
@@ -162,6 +164,32 @@ impl<'source> Index<'source> {
             if let Some(target) = file
                 .python_parameter_read_target(read, name, work)
                 .filter(|target| target.symbol.is_python_variadic_parameter())
+            {
+                self.record_python_local_read(file, read, target, result);
+            }
+        }
+    }
+
+    /// Resolves a parameter read of the physical overload implementation.
+    pub(in crate::static_resolution) fn python_overload_parameter_reads(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for &(read, name) in file.facts.python_local_reads() {
+            let Some(&Some(symbol)) = file.python_parameters.get(&name) else {
+                continue;
+            };
+            if !symbol.is_python_overload_parameter() {
+                continue;
+            }
+            if !work.charge() {
+                return;
+            }
+            if file.enclosing_callable(read).is_some_and(|caller| {
+                caller.symbol.python_overload == Some(rift_syntax::PythonOverload::Ordinary)
+            }) && let Some(target) = file.python_parameter_read_target(read, name, work)
             {
                 self.record_python_local_read(file, read, target, result);
             }

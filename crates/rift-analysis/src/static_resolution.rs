@@ -79,6 +79,7 @@ pub(crate) struct StaticResolution {
     pub(crate) python_initializer_start: Option<usize>,
     /// First reference inside a compound Python string annotation.
     pub(crate) python_quoted_type_start: Option<usize>,
+    pub(crate) python_overload_parameter_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -259,6 +260,7 @@ struct PendingPythonReferences<'index, 'source> {
     remaining: usize,
     initializers: Option<python_edges::InitializerCalls>,
     quoted_types: bool,
+    overload_reads: bool,
 }
 
 type PendingPythonFiles<'index, 'source> =
@@ -1070,10 +1072,13 @@ impl<'source> File<'source> {
     }
 
     fn has_python_local_reads(&self) -> bool {
-        self.facts
-            .python_local_reads()
-            .iter()
-            .any(|(_, name)| !matches!(self.python_parameters.get(name), Some(None)))
+        self.facts.python_local_reads().iter().any(|(_, name)| {
+            match self.python_parameters.get(name) {
+                Some(Some(symbol)) => !symbol.is_python_overload_parameter(),
+                Some(None) => false,
+                None => true,
+            }
+        })
     }
 
     fn python_local_pass(&self) -> Option<DeferredReferences<'source>> {
@@ -1561,7 +1566,12 @@ impl<'source> Index<'source> {
                         reference.role == ReferenceRole::Type
                             && python_edges::quoted_type_text(file, reference.target).is_some()
                     });
-                if initializers.is_some() || quoted_types {
+                let overload_reads = file.facts.python_local_reads().iter().any(|(_, name)| {
+                    file.python_parameters.get(name).is_some_and(|symbol| {
+                        symbol.is_some_and(rift_syntax::SyntaxSymbol::is_python_overload_parameter)
+                    })
+                });
+                if initializers.is_some() || quoted_types || overload_reads {
                     pending_python.insert(
                         file.document.path.as_str(),
                         PendingPythonReferences {
@@ -1569,6 +1579,7 @@ impl<'source> Index<'source> {
                             remaining,
                             initializers,
                             quoted_types,
+                            overload_reads,
                         },
                     );
                 }
@@ -1708,6 +1719,17 @@ impl<'source> Index<'source> {
                 resolution,
                 |file, work, resolution| {
                     self.python_quoted_type_references(file, work, resolution);
+                },
+            );
+        }
+        resolution.python_overload_parameter_start = Some(resolution.occurrences.len());
+        for site in pending.values_mut().filter(|site| site.overload_reads) {
+            Self::resolve_python_shared_file_work(
+                site,
+                work,
+                resolution,
+                |file, work, resolution| {
+                    self.python_overload_parameter_reads(file, work, resolution);
                 },
             );
         }

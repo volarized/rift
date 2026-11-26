@@ -455,16 +455,21 @@ impl EdgeStore {
         edges_max: usize,
     ) {
         let supplemental_start = resolution.supplemental_start.take();
+        if resolution.occurrences.is_empty() && resolution.external.is_empty() {
+            return;
+        }
         let mut next_start = resolution.occurrences.len();
         let [
-            quoted_type_start,
-            initializer_start,
-            variadic_start,
-            receiver_start,
-            capture_start,
-            python_reassignment_start,
-            late_start,
+            overload,
+            quoted_type,
+            initializer,
+            variadic,
+            receiver,
+            capture,
+            reassigned,
+            late,
         ] = [
+            resolution.python_overload_parameter_start.take(),
             resolution.python_quoted_type_start.take(),
             resolution.python_initializer_start.take(),
             resolution.python_variadic_start.take(),
@@ -477,35 +482,26 @@ impl EdgeStore {
             next_start = start.unwrap_or(next_start);
             next_start
         });
-        if resolution.occurrences.is_empty() && resolution.external.is_empty() {
-            return;
-        }
-        let (internal, external) =
-            supplemental_start.unwrap_or((late_start, resolution.external.len()));
-        let (earlier, quoted_types) = resolution.occurrences.split_at(quoted_type_start);
-        let (earlier, initializer_keywords) = earlier.split_at(initializer_start);
-        let (earlier, variadic_reads) = earlier.split_at(variadic_start);
-        let (earlier, receiver_reads) = earlier.split_at(receiver_start);
-        let (earlier, captured_reads) = earlier.split_at(capture_start);
-        let (earlier, reassigned_reads) = earlier.split_at(python_reassignment_start);
-        let (earlier, late_supplemental) = earlier.split_at(late_start);
-        let (occurrences, supplemental) = earlier.split_at(internal);
+        let (internal, external) = supplemental_start.unwrap_or((late, resolution.external.len()));
+        let boundaries = [
+            0,
+            internal,
+            late,
+            reassigned,
+            capture,
+            receiver,
+            variadic,
+            initializer,
+            quoted_type,
+            overload,
+            resolution.occurrences.len(),
+        ];
         let (external, supplemental_external) = resolution.external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches = [
-            occurrences,
-            supplemental,
-            late_supplemental,
-            reassigned_reads,
-            captured_reads,
-            receiver_reads,
-            variadic_reads,
-            initializer_keywords,
-            quoted_types,
-        ]
-        .map(|rows| {
+        let mut batches: [BTreeMap<_, _>; 10] = std::array::from_fn(|index| {
+            let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
             admit_occurrences(rows, spans, &self.edge_modules, &mut edges);
             edges

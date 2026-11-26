@@ -4,7 +4,11 @@ use tree_sitter::Node;
 
 use crate::extract::byte_range;
 use crate::failure::RiftError;
-use crate::{ByteRange, PythonOverload, SyntaxLimits};
+use crate::{
+    ByteRange, PythonOverload, StaticBindingKind, StaticFacts, SyntaxLimits, SyntaxSymbol,
+};
+
+use super::PARAMETER_KIND_WORD;
 
 #[derive(Debug, Clone)]
 struct ImportedOverload {
@@ -239,4 +243,111 @@ impl OverloadContext {
         }
         Ok(found.unwrap_or(PythonOverload::Ordinary))
     }
+}
+
+/// Keeps repeated parameter names within distinct physical declarations of
+/// one ordered overload family in the same immediate lexical scope.
+pub(super) fn repeated_parameters(
+    symbols: &[SyntaxSymbol],
+    facts: &StaticFacts,
+    counts: &BTreeMap<&str, usize>,
+    eligible: &BTreeMap<ByteRange, ByteRange>,
+) -> BTreeSet<ByteRange> {
+    let owners = overload_members(symbols, facts, counts);
+    if owners.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut candidates: BTreeMap<&str, BTreeMap<ByteRange, ByteRange>> = BTreeMap::new();
+    for parameter in symbols
+        .iter()
+        .filter(|symbol| symbol.kind == PARAMETER_KIND_WORD)
+    {
+        if let Some((name, owner)) = parameter
+            .name_range
+            .and_then(|name| Some((name, *eligible.get(&name)?)))
+            && owners
+                .get(&owner)
+                .is_some_and(|owner| Some(*owner) == parameter.container.as_deref())
+        {
+            candidates
+                .entry(&parameter.qualified_name)
+                .or_default()
+                .insert(owner, name);
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|(name, family)| family.len() > 1 && counts.get(*name) == Some(&family.len()))
+        .flat_map(|(_, family)| family.into_values())
+        .collect()
+}
+
+fn overload_members<'symbols>(
+    symbols: &'symbols [SyntaxSymbol],
+    facts: &StaticFacts,
+    counts: &BTreeMap<&str, usize>,
+) -> BTreeMap<ByteRange, &'symbols str> {
+    let mut families: BTreeMap<&str, Vec<&SyntaxSymbol>> = BTreeMap::new();
+    for callable in symbols.iter().filter(|symbol| {
+        symbol.python_overload.is_some()
+            && counts
+                .get(symbol.qualified_name.as_str())
+                .is_some_and(|count| *count > 1)
+    }) {
+        families
+            .entry(&callable.qualified_name)
+            .or_default()
+            .push(callable);
+    }
+    if families.is_empty() {
+        return BTreeMap::new();
+    }
+    let bindings = facts
+        .bindings()
+        .iter()
+        .map(|binding| (binding.name, binding))
+        .collect::<BTreeMap<_, _>>();
+    let mut owners = BTreeMap::new();
+    for (name, mut family) in families {
+        if counts.get(name) != Some(&family.len()) {
+            continue;
+        }
+        family.sort_by_key(|callable| callable.item_range);
+        let Some((implementation, signatures)) = family.split_last() else {
+            continue;
+        };
+        let Some(binding) = implementation
+            .name_range
+            .and_then(|name| bindings.get(&name))
+        else {
+            continue;
+        };
+        if implementation.python_overload != Some(PythonOverload::Ordinary)
+            || !signatures.iter().all(|signature| {
+                matches!(
+                    signature.python_overload,
+                    Some(PythonOverload::Overload { .. })
+                ) && signature.item_range.end <= implementation.item_range.start
+                    && signature
+                        .name_range
+                        .and_then(|name| bindings.get(&name))
+                        .is_some_and(|signature_binding| {
+                            signature_binding.scope == binding.scope
+                                && matches!(
+                                    signature_binding.kind,
+                                    StaticBindingKind::Local
+                                        | StaticBindingKind::PythonFunction { .. }
+                                )
+                        })
+            })
+        {
+            continue;
+        }
+        owners.extend(
+            family
+                .into_iter()
+                .map(|callable| (callable.item_range, name)),
+        );
+    }
+    owners
 }

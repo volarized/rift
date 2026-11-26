@@ -176,6 +176,7 @@ const FUNCTION_KIND_WORD: &str = "function";
 /// Provider kind for an ordinary function parameter at its name token.
 pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
 pub(crate) const VARIADIC_PARAMETER_KIND_WORD: &str = "variadic_parameter";
+pub(crate) const OVERLOAD_PARAMETER_KIND_WORD: &str = "overload_parameter";
 /// The kind word a Python class carries on the wire.
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
@@ -1479,8 +1480,8 @@ fn retain_loop_bindings(
     });
 }
 
-/// Keeps the parameter candidates with exact parameter bindings and no other
-/// declaration of the same Python name. An assignment may already own that name.
+/// Keeps parameter declarations with exact bindings, including repeated names
+/// from a proved overload family. An assignment may already own a name.
 fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::StaticFacts) {
     use std::collections::BTreeSet;
 
@@ -1499,30 +1500,39 @@ fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::
                         | crate::StaticBindingKind::PythonReceiver { .. }
                 )
         })
-        .map(|binding| binding.name)
-        .collect::<BTreeSet<_>>();
+        .map(|binding| (binding.name, binding.scope))
+        .collect::<BTreeMap<_, _>>();
     let mut names = BTreeMap::new();
     for symbol in symbols.iter() {
         *names
             .entry(symbol.qualified_name.as_str())
             .or_insert(0_usize) += 1;
     }
-    let mut withheld = BTreeSet::new();
-    for symbol in symbols.iter().filter(|symbol| symbol.is_python_parameter()) {
-        if let Some(range) = symbol.name_range
-            && (names.get(symbol.qualified_name.as_str()) != Some(&1)
-                || !eligible.contains(&range)
-                || !rift_core::is_portable_name(&symbol.name)
-                || !rift_core::is_portable_name(&symbol.qualified_name))
-        {
-            withheld.insert(range);
+    let overload_parameters = overload::repeated_parameters(symbols, facts, &names, &eligible);
+    let withheld = symbols
+        .iter()
+        .filter(|symbol| symbol.is_python_parameter())
+        .filter_map(|symbol| {
+            let range = symbol.name_range?;
+            let admitted = eligible.contains_key(&range)
+                && (names.get(symbol.qualified_name.as_str()) == Some(&1)
+                    || overload_parameters.contains(&range))
+                && rift_core::is_portable_name(&symbol.name)
+                && rift_core::is_portable_name(&symbol.qualified_name);
+            (!admitted).then_some(range)
+        })
+        .collect::<BTreeSet<_>>();
+    symbols.retain_mut(|symbol| {
+        if !symbol.is_python_parameter() {
+            return true;
         }
-    }
-    symbols.retain(|symbol| {
-        !symbol.is_python_parameter()
-            || symbol
-                .name_range
-                .is_some_and(|range| !withheld.contains(&range))
+        let Some(range) = symbol.name_range else {
+            return false;
+        };
+        if overload_parameters.contains(&range) {
+            symbol.kind = OVERLOAD_PARAMETER_KIND_WORD;
+        }
+        !withheld.contains(&range)
     });
     facts.retain_python_local_reads(|name| !withheld.contains(&name));
 }
@@ -1532,6 +1542,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         FUNCTION_KIND_WORD,
         PARAMETER_KIND_WORD,
         VARIADIC_PARAMETER_KIND_WORD,
+        OVERLOAD_PARAMETER_KIND_WORD,
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
         LOOP_BINDING_KIND_WORD,

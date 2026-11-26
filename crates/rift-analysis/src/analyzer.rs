@@ -500,6 +500,7 @@ fn binding_capacity(
     let mut python_receivers = BindingDemand::default();
     let mut python_loop_bindings = BindingDemand::default();
     let mut python_variadic_parameters = BindingDemand::default();
+    let mut python_overload_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
@@ -520,6 +521,8 @@ fn binding_capacity(
                 &mut typescript_parameters
             } else if symbol.is_python_variadic_parameter() {
                 &mut python_variadic_parameters
+            } else if symbol.is_python_overload_parameter() {
+                &mut python_overload_parameters
             } else if symbol.is_python_parameter() {
                 if symbol
                     .name_range
@@ -553,19 +556,9 @@ fn binding_capacity(
         + typescript_parameters.count
         + python_receivers.count
         + python_loop_bindings.count
-        + python_variadic_parameters.count;
-    let (mut bytes, record) = limits
-        .retained_source()
-        .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
-        .map_or((u64::MAX, u64::MAX), |limits| {
-            let existing = documents.iter().fold(0_u64, |total, file| {
-                total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
-            });
-            (
-                limits.total_bytes_max.saturating_sub(existing),
-                u64::from(limits.record_bytes_max),
-            )
-        });
+        + python_variadic_parameters.count
+        + python_overload_parameters.count;
+    let (mut bytes, record) = binding_source_budget(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
     let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
@@ -574,6 +567,7 @@ fn binding_capacity(
     let python_receiver_slots = python_receivers.reserve(&mut slots, &mut bytes, record);
     let python_loop_binding_slots = python_loop_bindings.reserve(&mut slots, &mut bytes, record);
     let python_variadic_slots = python_variadic_parameters.reserve(&mut slots, &mut bytes, record);
+    let python_overload_slots = python_overload_parameters.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -584,8 +578,28 @@ fn binding_capacity(
         )
         .with_python_receiver_slots(python_receiver_slots)
         .with_python_loop_binding_slots(python_loop_binding_slots)
-        .with_python_variadic_parameter_slots(python_variadic_slots),
+        .with_python_variadic_parameter_slots(python_variadic_slots)
+        .with_python_overload_parameter_slots(python_overload_slots),
     )
+}
+
+fn binding_source_budget(
+    documents: &[AnalyzedFile],
+    limits: ExactPackageLimits,
+    binding_count: usize,
+) -> (u64, u64) {
+    limits
+        .retained_source()
+        .filter(|limits| binding_count != 0 && limits.total_bytes_max != u64::MAX)
+        .map_or((u64::MAX, u64::MAX), |limits| {
+            let existing = documents.iter().fold(0_u64, |total, file| {
+                total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
+            });
+            (
+                limits.total_bytes_max.saturating_sub(existing),
+                u64::from(limits.record_bytes_max),
+            )
+        })
 }
 
 /// Candidate count and the longest retained name in one class of source-local binding.
