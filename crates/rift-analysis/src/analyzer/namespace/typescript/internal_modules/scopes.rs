@@ -823,7 +823,10 @@ impl<'source> LiteralOwners<'source> {
                                 && function
                                     .body_range
                                     .is_some_and(|body| body.encloses(call.range))
-                                && call.callee == StaticCallee::Direct
+                                && matches!(
+                                    call.callee,
+                                    StaticCallee::Direct | StaticCallee::Member { .. }
+                                )
                                 && !self.bound_calls.contains(&call.range)
                         }
                         _ => false,

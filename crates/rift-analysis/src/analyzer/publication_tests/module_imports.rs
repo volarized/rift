@@ -3063,3 +3063,51 @@ fn non_entry_javascript_patterns_keep_their_written_lexical_bindings() {
         });
     assert_ne!(bindings[0], bindings[1]);
 }
+
+#[test]
+fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
+    const SOURCE: &str = concat!(
+        "const receiver = { read(options) { return options.status; } };\n",
+        "export function choose() {\n",
+        "  receiver.read({ status: 'first' });\n",
+        "  receiver.read({ status: 'second' });\n",
+        "  const named = { status: 'stable' };\n",
+        "  return receiver.read(named);\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical argument properties");
+    let mut identities = BTreeSet::new();
+    for property in ["status: 'first'", "status: 'second'", "status: 'stable'"] {
+        let start = SOURCE.find(property).expect("written key");
+        let declared = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.range == module_runtime_range(start, property) && row.source == property
+            })
+            .expect("physical member argument property");
+        assert!(identities.insert(&declared.symbol));
+        if property == "status: 'stable'" {
+            assert!(declared.symbol.as_str().ends_with("/choose/named/status"));
+        }
+    }
+    let calls = found
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/choose")
+                && edge.to.as_str().ends_with("/receiver/read")
+                && edge.kinds == [EdgeKind::Calls]
+        })
+        .map(|edge| edge.occurrence.as_ref().expect("written call").range.start)
+        .collect::<BTreeSet<_>>();
+    let written = SOURCE
+        .match_indices("receiver.read(")
+        .map(|(start, _)| u64::try_from(start).expect("physical call position"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(calls, written);
+}
