@@ -143,6 +143,8 @@ enum RustGrammarSyntaxKind {
     LetDeclaration,
     /// `parameter` in a function's parameter list.
     Parameter,
+    /// Receiver parameter, including reference and lifetime forms.
+    SelfParameter,
     /// `closure_expression` value.
     ClosureExpression,
     /// `const_item` declaration.
@@ -195,6 +197,7 @@ impl RustGrammarSyntaxKind {
         match self {
             Self::LetDeclaration => "let_declaration",
             Self::Parameter => "parameter",
+            Self::SelfParameter => "self_parameter",
             Self::ClosureExpression => "closure_expression",
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
@@ -230,7 +233,7 @@ impl RustGrammarSyntaxKind {
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
             Self::LetDeclaration => Some(RustSymbolKind::Closure),
-            Self::Parameter => Some(RustSymbolKind::ParameterBinding),
+            Self::Parameter | Self::SelfParameter => Some(RustSymbolKind::ParameterBinding),
             Self::ImplItem => Some(RustSymbolKind::Impl),
             Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
@@ -630,6 +633,7 @@ impl GrammarRules for RustGrammarRules {
     fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         syntax_element
             .child_by_field_name(RustGrammarField::Name.as_str())
+            .or_else(|| local_bindings::receiver(syntax_element))
             .or_else(|| {
                 matches!(
                     RustGrammarSyntaxKind::from_kind(syntax_element.kind()),
@@ -708,7 +712,8 @@ impl GrammarRules for RustGrammarRules {
             | RustGrammarSyntaxKind::TraitItem
             | RustGrammarSyntaxKind::UnionItem
             | RustGrammarSyntaxKind::EnumVariant
-            | RustGrammarSyntaxKind::FunctionItem => {
+            | RustGrammarSyntaxKind::FunctionItem
+            | RustGrammarSyntaxKind::FunctionSignatureItem => {
                 let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
                 text.get(name.byte_range()).map(Into::into)
             }
@@ -1386,8 +1391,10 @@ mod tests {
                 "Plain",
                 "Holder",
                 "Holder::run",
+                "Holder::run::self#parameter0",
                 "Plain",
-                "Plain::run"
+                "Plain::run",
+                "Plain::run::self#parameter0"
             ]
         );
         let containers = document
@@ -1403,8 +1410,10 @@ mod tests {
                 None,
                 None,
                 Some("Holder"),
+                Some("Holder::run"),
                 None,
-                Some("Plain")
+                Some("Plain"),
+                Some("Plain::run")
             ]
         );
     }
@@ -1566,9 +1575,11 @@ mod tests {
                 "Plain::default",
                 "Plain",
                 "Plain::clone",
+                "Plain::clone::self#parameter0",
                 "Plain",
                 "Measure",
                 "Measure::size",
+                "Measure::size::self#parameter0",
                 "call",
                 "call::f#parameter0",
                 "old",
@@ -1686,6 +1697,7 @@ mod tests {
                 ("A", false),
                 ("T", true),
                 ("t", false),
+                ("self", false),
                 ("m", true),
                 ("inner", true),
                 ("declared", false),

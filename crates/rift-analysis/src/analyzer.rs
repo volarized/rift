@@ -496,6 +496,7 @@ fn binding_capacity(
 ) -> (usize, rift_syntax::PackageBindingSlots) {
     let mut rust_locals = BindingDemand::default();
     let mut rust_parameters = BindingDemand::default();
+    let mut rust_receivers = BindingDemand::default();
     let mut python_parameters = BindingDemand::default();
     let mut typescript_parameters = BindingDemand::default();
     let mut python_receivers = BindingDemand::default();
@@ -554,6 +555,8 @@ fn binding_capacity(
                 } else {
                     &mut python_parameters
                 }
+            } else if symbol.is_rust_receiver_binding() {
+                &mut rust_receivers
             } else if symbol.is_rust_parameter_binding() {
                 &mut rust_parameters
             } else if symbol.is_python_loop_binding() {
@@ -583,7 +586,8 @@ fn binding_capacity(
         + javascript_parameters.count
         + typescript_method_parameters.count
         + callback_parameters.count
-        + overload_parameters.count;
+        + overload_parameters.count
+        + rust_receivers.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -597,6 +601,7 @@ fn binding_capacity(
     let javascript_parameter_slots = javascript_parameters.reserve(&mut slots, &mut bytes, record);
     let typescript_method_slots =
         typescript_method_parameters.reserve(&mut slots, &mut bytes, record);
+    let rust_receiver_slots = rust_receivers.reserve(&mut slots, &mut bytes, record);
     let (callback_slots, overload_slots) = reserve_scoped_parameters(
         documents,
         &callback_parameters,
@@ -613,6 +618,7 @@ fn binding_capacity(
             python_parameter_slots,
             typescript_parameter_slots,
         )
+        .with_rust_receivers(rust_receiver_slots)
         .with_python_receiver_slots(python_receiver_slots)
         .with_python_loop_binding_slots(python_loop_binding_slots)
         .with_python_variadic_parameter_slots(python_variadic_slots)

@@ -100,6 +100,8 @@ pub(crate) struct StaticResolution {
     pub(crate) deferred_overload_parameters: Vec<StaticOccurrence>,
     /// First internal and external occurrence resolved through authored Rust extern crate aliases.
     pub(crate) rust_extern_alias_start: Option<(usize, usize)>,
+    /// First occurrence resolved to a Rust receiver parameter.
+    pub(crate) rust_receiver_start: Option<usize>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
@@ -243,6 +245,7 @@ fn resolve_by<'source>(
     }
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
+    index.resolve_rust_receivers(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -579,6 +582,7 @@ struct File<'source> {
     /// The reference prefix and declaration count before additional Rust bindings.
     primary_reference_count: usize,
     rust_local_count: usize,
+    rust_receivers: Vec<&'source SyntaxSymbol>,
     package_binding_count: usize,
     ecmascript_parameters: EcmaScriptParameters<'source>,
     typescript_method_parameters: EcmaScriptParameters<'source>,
@@ -749,6 +753,7 @@ impl<'source> File<'source> {
             callables: EnclosingDefinitions::new([]),
             primary_reference_count: facts.references().len(),
             rust_local_count: 0,
+            rust_receivers: Vec::new(),
             package_binding_count: 0,
             ecmascript_parameters: BTreeMap::new(),
             typescript_method_parameters: BTreeMap::new(),
@@ -1043,7 +1048,9 @@ impl<'source> File<'source> {
         admitted: bool,
     ) {
         self.package_binding_count += 1;
-        if symbol.is_rust_local_binding() {
+        if symbol.is_rust_receiver_binding() {
+            self.rust_receivers.extend(admitted.then_some(symbol));
+        } else if symbol.is_rust_local_binding() {
             self.rust_local_count += usize::from(admitted);
         } else if let Some(name) = symbol.name_range {
             if self.document.facts.language().name == "python" && symbol.is_python_parameter() {

@@ -30,6 +30,9 @@ impl<'source> Index<'source> {
     ) {
         let mut locals = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
+            if symbol.is_rust_receiver_binding() {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -63,7 +66,11 @@ impl<'source> Index<'source> {
         if locals.is_empty() {
             return;
         }
-        for reference in &file.facts.references()[file.primary_reference_count..] {
+        let references = &file.facts.references()[file.primary_reference_count..];
+        for reference in references
+            .iter()
+            .take_while(|reference| file.text(reference.target) != Some("self"))
+        {
             if !work.charge() {
                 return;
             }
@@ -84,6 +91,75 @@ impl<'source> Index<'source> {
             if file
                 .enclosing_callable(read)
                 .is_none_or(|caller| caller.symbol.item_range != holder)
+            {
+                continue;
+            }
+            if let Some(occurrence) = self.occurrence(file, read, read, ReferenceRole::Read, target)
+            {
+                result.record(Some(occurrence));
+            }
+        }
+    }
+
+    /// Adds receiver occurrences after the earlier declaration and reference classes.
+    pub(in crate::static_resolution) fn resolve_rust_receivers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            if work.exhausted {
+                break;
+            }
+            if !file.rust_receivers.is_empty() {
+                self.rust_receivers(file, work, result);
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_receiver_start = Some(start);
+        }
+    }
+
+    fn rust_receivers(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
+        let mut receivers = BTreeMap::new();
+        for &symbol in &file.rust_receivers {
+            if !work.charge() {
+                return;
+            }
+            let Some((name, method)) = symbol.name_range.zip(file.parent_callable(symbol)) else {
+                continue;
+            };
+            let target = Target {
+                file: file.document,
+                symbol,
+            };
+            if let Some(edge) = self.rust_edge(file, name, EdgeKind::Contains, method, target) {
+                result.record(Some(edge));
+                receivers.insert(method.symbol.item_range, target);
+            }
+        }
+        let references = &file.facts.references()[file.primary_reference_count..];
+        for reference in references
+            .iter()
+            .rev()
+            .take_while(|reference| file.text(reference.target) == Some("self"))
+        {
+            if !work.charge() {
+                return;
+            }
+            let read = reference.target;
+            let Some(method) = file.enclosing_callable(read) else {
+                continue;
+            };
+            let Some(&target) = receivers.get(&method.symbol.item_range) else {
+                continue;
+            };
+            if !method
+                .symbol
+                .body_range
+                .is_some_and(|body| body.encloses(read))
+                || file.conditional(read, work)
             {
                 continue;
             }

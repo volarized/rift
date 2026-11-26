@@ -17,6 +17,9 @@ pub(super) fn pattern(item: Node<'_>) -> Option<Node<'_>> {
     if item.has_error() {
         return None;
     }
+    if let Some(receiver) = receiver(item) {
+        return Some(receiver);
+    }
     let pattern = item.child_by_field_name("pattern")?;
     let eligible = match item.kind() {
         "parameter" => true,
@@ -26,18 +29,46 @@ pub(super) fn pattern(item: Node<'_>) -> Option<Node<'_>> {
     (eligible && pattern.kind() == "identifier").then_some(pattern)
 }
 
-/// A plain authored parameter of a named function with a body.
+/// The written `self` token, including the token in a typed receiver.
+pub(super) fn receiver(item: Node<'_>) -> Option<Node<'_>> {
+    match item.kind() {
+        "self_parameter" => item
+            .named_children(&mut item.walk())
+            .find(|child| child.kind() == "self"),
+        "parameter" => item
+            .child_by_field_name("pattern")
+            .filter(|pattern| pattern.kind() == "self"),
+        _ => None,
+    }
+}
+
+/// A plain authored function parameter or a method's receiver.
 pub(super) fn parameter_name<'source>(
     visited: Visited<'_, '_>,
     source: &'source str,
 ) -> Option<&'source str> {
     let parameters = visited.parent()?;
-    if parameters.syntax_element().kind() != "parameters"
-        || parameters.parent()?.syntax_element().kind() != "function_item"
-    {
+    let function = parameters.parent()?;
+    if parameters.syntax_element().kind() != "parameters" {
         return None;
     }
-    let name = source.get(pattern(visited.syntax_element())?.byte_range())?;
+    let item = visited.syntax_element();
+    let name = source.get(pattern(item)?.byte_range())?;
+    if receiver(item).is_some() {
+        let list = function.parent()?;
+        return (matches!(
+            function.syntax_element().kind(),
+            "function_item" | "function_signature_item"
+        ) && list.syntax_element().kind() == "declaration_list"
+            && matches!(
+                list.parent()?.syntax_element().kind(),
+                "impl_item" | "trait_item"
+            ))
+        .then_some(name);
+    }
+    if function.syntax_element().kind() != "function_item" {
+        return None;
+    }
     plain_name(name).then_some(name)
 }
 
@@ -92,6 +123,12 @@ impl SyntaxSymbol {
         self.kind == PARAMETER_KIND
     }
 
+    /// Whether this is a method's reserved receiver parameter.
+    #[must_use]
+    pub fn is_rust_receiver_binding(&self) -> bool {
+        self.is_rust_parameter_binding() && self.name == "self"
+    }
+
     /// The generated last path component of a physical Rust lexical binding.
     #[must_use]
     pub fn rust_local_binding_component(&self) -> Option<&str> {
@@ -125,18 +162,36 @@ pub(super) fn prepare(
     if !symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
         return;
     }
-    if facts.rust_uses().iter().any(|import| import.glob)
+    let opaque_scope = facts.rust_uses().iter().any(|import| import.glob)
         || !facts.unsupported_bindings().is_empty()
         || !facts.rust_root_macro_calls().is_empty()
         || !facts.rust_textual_macro_calls().is_empty()
-        || !facts.rust_macro_barriers().is_empty()
-    {
-        symbols.retain(|symbol| !symbol.is_rust_local_binding());
-        return;
+        || !facts.rust_macro_barriers().is_empty();
+    if opaque_scope {
+        symbols
+            .retain(|symbol| !symbol.is_rust_local_binding() || symbol.is_rust_receiver_binding());
+        if !symbols.iter().any(SyntaxSymbol::is_rust_receiver_binding) {
+            return;
+        }
     }
-    let opaque = opaque_names(source, symbols, facts);
+    prepare_bindings(source, elements, symbols, facts, opaque_scope);
+}
+
+fn prepare_bindings(
+    source: &str,
+    elements: &[SyntaxElement],
+    symbols: &mut Vec<SyntaxSymbol>,
+    facts: &mut StaticFacts,
+    opaque_scope: bool,
+) {
+    let opaque = if opaque_scope {
+        BTreeSet::new()
+    } else {
+        opaque_names(source, symbols, facts)
+    };
     let mut same_name = BTreeMap::new();
     let mut retained = BTreeSet::new();
+    let mut has_receivers = false;
     let mut conditions = facts
         .conditional_items()
         .iter()
@@ -154,7 +209,8 @@ pub(super) fn prepare(
         {
             conditional_end = conditional_end.max(condition.end);
         }
-        if symbol.item_range.end <= conditional_end {
+        let receiver = symbol.is_rust_receiver_binding();
+        if !receiver && symbol.item_range.end <= conditional_end {
             return false;
         }
         let Some(name) = source_name(source, symbol.name_range) else {
@@ -163,7 +219,7 @@ pub(super) fn prepare(
         let Some(owner) = symbol.container.as_deref() else {
             return false;
         };
-        if opaque.contains(name) {
+        if !receiver && opaque.contains(name) {
             return false;
         }
         let ordinal = same_name
@@ -181,12 +237,30 @@ pub(super) fn prepare(
         }
         symbol.qualified_name = qualified;
         *ordinal += 1;
-        retained.insert(name);
+        if receiver {
+            has_receivers = true;
+        } else {
+            retained.insert(name);
+        }
         true
     });
-    if retained.is_empty() {
-        return;
+    if !retained.is_empty() {
+        prepare_direct_reads(source, elements, facts, &retained);
     }
+    if has_receivers {
+        let reads = elements
+            .iter()
+            .filter_map(|element| receiver_reference(element, elements));
+        facts.add_rust_local_references(reads.collect());
+    }
+}
+
+fn prepare_direct_reads(
+    source: &str,
+    elements: &[SyntaxElement],
+    facts: &mut StaticFacts,
+    retained: &BTreeSet<&str>,
+) {
     let direct = facts
         .rust_value_reads()
         .iter()
@@ -208,6 +282,42 @@ pub(super) fn prepare(
         })
         .collect();
     facts.add_rust_local_references(reads);
+}
+
+fn receiver_reference(
+    element: &SyntaxElement,
+    elements: &[SyntaxElement],
+) -> Option<StaticReference> {
+    if element.kind != "self" {
+        return None;
+    }
+    let parent = elements.get(element.parent?)?;
+    // The same token is also a qualifier in paths and imports. Its immediate expression
+    // parent identifies written receiver uses.
+    matches!(
+        parent.kind,
+        "field_expression"
+            | "arguments"
+            | "binary_expression"
+            | "unary_expression"
+            | "reference_expression"
+            | "parenthesized_expression"
+            | "cast_expression"
+            | "return_expression"
+            | "expression_statement"
+            | "let_declaration"
+            | "block"
+            | "tuple_expression"
+            | "array_expression"
+            | "index_expression"
+            | "try_expression"
+            | "await_expression"
+            | "field_initializer"
+    )
+    .then_some(StaticReference {
+        target: element.range,
+        role: ReferenceRole::Read,
+    })
 }
 
 fn opaque_names<'source>(

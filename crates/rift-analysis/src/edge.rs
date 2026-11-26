@@ -468,10 +468,14 @@ impl EdgeStore {
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
+        let rust_receiver = resolution
+            .rust_receiver_start
+            .take()
+            .unwrap_or(resolution.occurrences.len());
         let (alias, alias_external) = resolution
             .rust_extern_alias_start
             .take()
-            .unwrap_or((resolution.occurrences.len(), resolution.external.len()));
+            .unwrap_or((rust_receiver, resolution.external.len()));
         let (incumbent_external, alias_external_rows) = resolution.external.split_at(alias_external);
         let mut next_start = alias;
         let [
@@ -525,13 +529,14 @@ impl EdgeStore {
             callback,
             typescript_overload,
             alias,
+            rust_receiver,
             resolution.occurrences.len(),
         ];
         let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 16] = std::array::from_fn(|index| {
+        let mut batches: [BTreeMap<_, _>; 17] = std::array::from_fn(|index| {
             let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
             admit_occurrences(

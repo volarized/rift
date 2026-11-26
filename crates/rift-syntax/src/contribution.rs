@@ -21,6 +21,7 @@ pub const SYNTAX_PROVIDER_ID: &str = "syntax";
 pub struct PackageBindingSlots {
     rust_local: usize,
     rust_parameter: usize,
+    rust_receiver: usize,
     python_parameter: usize,
     typescript_parameter: usize,
     python_receiver: usize,
@@ -45,6 +46,7 @@ impl PackageBindingSlots {
         Self {
             rust_local,
             rust_parameter,
+            rust_receiver: 0,
             python_parameter,
             typescript_parameter,
             javascript_parameter: 0,
@@ -114,11 +116,19 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves additional slots for Rust receiver parameters.
+    #[must_use]
+    pub const fn with_rust_receivers(mut self, rust_receiver: usize) -> Self {
+        self.rust_receiver = rust_receiver;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
         self.rust_local
             .saturating_add(self.rust_parameter)
+            .saturating_add(self.rust_receiver)
             .saturating_add(self.python_parameter)
             .saturating_add(self.typescript_parameter)
             .saturating_add(self.javascript_parameter)
@@ -167,6 +177,8 @@ impl PackageBindingSlots {
             } else {
                 &mut self.python_parameter
             }
+        } else if symbol.is_rust_receiver_binding() {
+            &mut self.rust_receiver
         } else if symbol.is_rust_parameter_binding() {
             &mut self.rust_parameter
         } else if symbol.is_python_loop_binding() {

@@ -340,3 +340,114 @@ fn package_rust_parameter_leaves_the_existing_let_slot_available() {
             .any(|row| { row.kinds == [EdgeKind::Reads] && row.to == local.symbol })
     );
 }
+
+#[test]
+fn package_rust_receiver_parameters_keep_their_method_and_physical_reads() {
+    let source = r"
+mod support { pub const ZERO: u8 = 0; }
+use support::*;
+pub trait Observed { fn observe(&self); }
+pub struct Counter { value: u8 }
+impl Counter {
+    pub fn current(&self) -> u8 { self.value }
+    pub fn owned(self) -> u8 { self.current() + ZERO }
+    pub fn boxed(self: Box<Self>) -> u8 { self.current() + self::support::ZERO }
+}
+";
+    let result = analyze(source);
+    for (written, method, expression) in [
+        ("self);", "/observe", None),
+        ("self) -> u8 { self.value", "/current", Some("self.value")),
+        (
+            "self) -> u8 { self.current",
+            "/owned",
+            Some("self.current() + ZERO"),
+        ),
+        ("self: Box<Self>", "/boxed", Some("self.current() + self::")),
+    ] {
+        let receiver = declaration_at(&result, source, written);
+        assert!(!receiver.public);
+        assert_eq!(receiver.range.end, receiver.range.start + 4);
+        assert!(result.objects.iter().any(|symbol| {
+            symbol.id.as_ref() == Some(&receiver.symbol)
+                && symbol.kinds.contains(&SymbolKind::Parameter)
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Contains]
+                && edge.from.as_str().ends_with(method)
+                && edge.to == receiver.symbol
+        }));
+        let reads = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == receiver.symbol)
+            .collect::<Vec<_>>();
+        if let Some(expression) = expression {
+            let [read] = reads.as_slice() else {
+                panic!("one receiver Read");
+            };
+            assert!(read.from.as_str().ends_with(method));
+            let span = read.occurrence.as_ref().expect("receiver Read range");
+            let start = position(source, expression);
+            assert_eq!((span.range.start, span.range.end), (start, start + 4));
+        } else {
+            assert!(reads.is_empty());
+        }
+    }
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from.as_str().ends_with("/current")
+            && edge.to.as_str().ends_with("/value")
+    }));
+    for method in ["/owned", "/boxed"] {
+        assert!(result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with(method)
+                && edge.to.as_str().ends_with("/current")
+        }));
+    }
+}
+
+#[test]
+fn package_rust_receiver_leaves_established_declarations_and_edges_at_the_caps() {
+    let source = &format!(
+        "pub fn leaf() {{}}
+pub struct Counter {{ value: u8 }}
+impl Counter {{
+    pub fn current(&self, parameter: u8) -> u8 {{ {} let local = parameter; self.value + local }}
+}}
+",
+        "leaf(); ".repeat(128),
+    );
+    let full = analyze(source);
+    let receiver = &declaration_at(&full, source, "self, parameter").symbol;
+    let declarations = full
+        .declarations
+        .iter()
+        .filter(|row| &row.symbol != receiver)
+        .cloned()
+        .collect::<Vec<_>>();
+    let edges = full
+        .edges
+        .iter()
+        .filter(|edge| &edge.to != receiver && &edge.from != receiver)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(full.edges.len(), edges.len() + 2);
+    let no_declaration_room = analyze_with_limits(
+        source,
+        ExactPackageLimits::new(2, 1 << 20)
+            .with_declarations(u32::try_from(declarations.len()).expect("declaration count"))
+            .expect("room for established declarations"),
+    );
+    assert_eq!(no_declaration_room.declarations, declarations);
+    assert_eq!(no_declaration_room.edges, edges);
+    let no_edge_room = analyze_with_limits(
+        source,
+        ExactPackageLimits::new(2, 1 << 20)
+            .with_edges(edges.len())
+            .expect("room for established edges"),
+    );
+    assert_eq!(no_edge_room.declarations, full.declarations);
+    assert_eq!(no_edge_room.edges, edges);
+}
