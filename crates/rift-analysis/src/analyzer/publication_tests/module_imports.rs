@@ -1734,3 +1734,119 @@ fn package_keeps_initializer_properties_under_their_physical_lexical_bindings() 
             .ends_with("/initialize/named/code")
     );
 }
+
+#[test]
+fn npm_javascript_callbacks_keep_physical_parameters_and_reads() {
+    const SOURCE: &str = concat!(
+        "export function map(values) {\n",
+        "  const keep = (item) => item;\n",
+        "  return [\n",
+        "    values.map(function (item) { return keep(item); }),\n",
+        "    values.map(item => item),\n",
+        "  ];\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked callback source");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid callback publication");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("callback unit");
+    let mut identities = BTreeSet::new();
+    for (decl, decl_offset, read, read_offset, owner) in [
+        ("keep = (item)", 8, "=> item;", 3, "/map/keep"),
+        ("function (item)", 10, "keep(item)", 5, "/map"),
+        ("item => item)", 0, "item => item)", 8, "/map"),
+    ] {
+        let name_start = SOURCE.find(decl).expect("parameter declaration") + decl_offset;
+        let read_start = SOURCE.find(read).expect("parameter read") + read_offset;
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == unit.unit && row.range == module_runtime_range(name_start, "item")
+            })
+            .expect("physical callback parameter");
+        let identity = &declaration.symbol;
+        assert!(identities.insert(identity));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(identity)
+                && object.kinds.contains(&SymbolKind::Parameter)
+                && object.name == "item"
+        }));
+        assert!(
+            found.edges.iter().any(|edge| {
+                edge.from.as_str().ends_with(owner)
+                    && edge.to == *identity
+                    && edge.kinds == [EdgeKind::Reads]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == unit.unit
+                            && site.range == module_runtime_range(read_start, "item")
+                    })
+            }),
+            "{read}"
+        );
+    }
+}
+
+#[test]
+fn callback_parameters_preserve_earlier_package_declarations() {
+    const SOURCE: &str =
+        "export function map(values) { const keep = (item) => item; return keep(values); }";
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(4);
+    let roomy = collect(8);
+    assert_eq!(bounded.declarations.len(), 4);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.source == "values")
+    );
+    assert!(roomy.declarations.iter().any(|row| row.source == "item"));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    assert!(bounded.declarations.iter().all(|row| row.source != "item"));
+}

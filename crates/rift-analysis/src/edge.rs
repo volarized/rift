@@ -470,6 +470,7 @@ impl EdgeStore {
         }
         let mut next_start = resolution.occurrences.len();
         let [
+            callback,
             literal,
             module_qualifier,
             file_module,
@@ -482,6 +483,7 @@ impl EdgeStore {
             reassigned,
             late,
         ] = [
+            resolution.callback_parameter_start.take(),
             resolution.literal_start.take(),
             resolution.file_module_qualifier_start.take(),
             resolution.file_module_start.take(),
@@ -513,13 +515,14 @@ impl EdgeStore {
             file_module,
             module_qualifier,
             literal,
+            callback,
             resolution.occurrences.len(),
         ];
         let (external, supplemental_external) = resolution.external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 13] = std::array::from_fn(|index| {
+        let mut batches: [BTreeMap<_, _>; 14] = std::array::from_fn(|index| {
             let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
             admit_occurrences(rows, spans, &self.edge_modules, &mut edges, matches!(index, 10 | 11));

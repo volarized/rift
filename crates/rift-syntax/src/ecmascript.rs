@@ -80,6 +80,7 @@ use std::num::NonZeroU16;
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
+mod callback_parameters;
 mod commonjs;
 mod members;
 pub(crate) mod recovery;
@@ -232,6 +233,7 @@ const JSDOC_LINE_MARKER: char = '*';
 
 /// Provider kind of an ordinary ECMAScript value parameter.
 pub(crate) const PARAMETER_KIND: &str = "value_parameter";
+pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -2269,6 +2271,12 @@ pub(crate) fn analyze_included(
         facts.set_member_aliases(aliases);
         if !recovered && !tree.root_node().has_error() {
             append_parameters(&mut symbols, parameters, facts);
+            callback_parameters::append(
+                &mut symbols,
+                facts,
+                source.text,
+                language.name == "javascript",
+            );
         }
     }
     symbols.sort_by_key(|symbol| symbol.range.start);
@@ -2427,6 +2435,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == PARAMETER_KIND {
         return Some(PARAMETER_KIND);
+    }
+    if name == CALLBACK_PARAMETER_KIND {
+        return Some(CALLBACK_PARAMETER_KIND);
     }
     kinds
         .declarations

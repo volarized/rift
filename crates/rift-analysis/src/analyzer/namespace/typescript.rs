@@ -1237,6 +1237,7 @@ fn declaration_anchors_with_public(
             continue;
         }
         let literal = declared_module_name(symbol, source);
+        let callback_scope = anonymous_callback_scope(symbol);
         let Some(mut path) = literal
             .as_ref()
             .map(|name| vec![name.clone()])
@@ -1244,11 +1245,13 @@ fn declaration_anchors_with_public(
         else {
             continue;
         };
+        if let Some(scope) = callback_scope {
+            path.push(scope.to_owned());
+        } else if symbol.qualified_name != defining_name(symbol) {
+            continue;
+        }
         if literal.is_none() {
             path.push(symbol.name.clone());
-        }
-        if symbol.qualified_name != defining_name(symbol) {
-            continue;
         }
         let Ok(identity) = SymbolIdentity::new(
             input.owner().clone(),
@@ -1344,6 +1347,14 @@ fn conflicting_assignment_name(mut name: &str, conflicts: &BTreeSet<&str>) -> bo
         };
         name = parent;
     }
+}
+
+fn anonymous_callback_scope(symbol: &SyntaxSymbol) -> Option<&str> {
+    if !symbol.is_ecmascript_callback_parameter() || symbol.container.is_some() {
+        return None;
+    }
+    let (scope, name) = symbol.qualified_name.split_once('.')?;
+    (name == symbol.name).then_some(scope)
 }
 
 fn defining_name(symbol: &SyntaxSymbol) -> String {

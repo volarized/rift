@@ -90,6 +90,10 @@ pub(crate) struct StaticResolution {
     pub(crate) literal_start: Option<usize>,
     /// Containment awaiting the capacity left by existing references.
     pub(crate) deferred_literal_containment: Vec<StaticOccurrence>,
+    /// First callback parameter reference after the previously admitted edge classes.
+    pub(crate) callback_parameter_start: Option<usize>,
+    /// Callback parameter reads awaiting their place after containment.
+    pub(crate) deferred_callback_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -219,6 +223,11 @@ fn resolve_by<'source>(
         let deferred = std::mem::take(&mut resolution.deferred_literal_containment);
         resolution.occurrences.extend(deferred);
     }
+    if !resolution.deferred_callback_parameters.is_empty() {
+        resolution.callback_parameter_start = Some(resolution.occurrences.len());
+        let deferred = std::mem::take(&mut resolution.deferred_callback_parameters);
+        resolution.occurrences.extend(deferred);
+    }
     external::admit_declared(namespace, &mut resolution.external, work_max);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
@@ -260,6 +269,7 @@ enum DeferredReferences<'source> {
     },
     EcmaScriptModuleSpecifiers,
     EcmaScriptModuleQualifiers,
+    JavaScriptCallbackParameters,
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -553,6 +563,7 @@ struct File<'source> {
     package_binding_count: usize,
     ecmascript_parameters: EcmaScriptParameters<'source>,
     typescript_method_parameters: EcmaScriptParameters<'source>,
+    javascript_callback_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -719,6 +730,7 @@ impl<'source> File<'source> {
             package_binding_count: 0,
             ecmascript_parameters: BTreeMap::new(),
             typescript_method_parameters: BTreeMap::new(),
+            javascript_callback_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -989,6 +1001,43 @@ impl<'source> File<'source> {
         Some(())
     }
 
+    fn index_package_binding(
+        &mut self,
+        symbol: &'source SyntaxSymbol,
+        site: Option<&'source rift_syntax::StaticParameter>,
+        methods: &BTreeSet<&str>,
+        admitted: bool,
+    ) {
+        self.package_binding_count += 1;
+        if symbol.is_rust_local_binding() {
+            self.rust_local_count += usize::from(admitted);
+        } else if let Some(name) = symbol.name_range {
+            if symbol.is_python_parameter() {
+                self.python_parameters
+                    .insert(name, admitted.then_some(symbol));
+            } else if admitted && let Some(site) = site {
+                let parameter = EcmaScriptParameter { symbol, site };
+                if symbol.is_ecmascript_callback_parameter() {
+                    self.javascript_callback_parameters.insert(name, parameter);
+                    return;
+                }
+                let parameters = if symbol
+                    .container
+                    .as_deref()
+                    .is_some_and(|owner| methods.contains(owner))
+                {
+                    &mut self.typescript_method_parameters
+                } else {
+                    &mut self.ecmascript_parameters
+                };
+                parameters
+                    .entry(symbol.name.as_str())
+                    .or_default()
+                    .insert(name, parameter);
+            }
+        }
+    }
+
     fn index_symbols(
         &mut self,
         admitted_binding: &impl Fn(Target<'source>) -> bool,
@@ -1010,33 +1059,14 @@ impl<'source> File<'source> {
         let methods = self.document.facts.typescript_method_names();
         for symbol in self.document.facts.symbols() {
             if symbol.is_package_binding() {
-                self.package_binding_count += 1;
                 let admitted = admitted_binding(Target {
                     file: self.document,
                     symbol,
                 });
-                if symbol.is_rust_local_binding() {
-                    self.rust_local_count += usize::from(admitted);
-                } else if let Some(name) = symbol.name_range {
-                    if symbol.is_python_parameter() {
-                        self.python_parameters
-                            .insert(name, admitted.then_some(symbol));
-                    } else if admitted && let Some(&site) = parameters.get(&name) {
-                        let parameters = if symbol
-                            .container
-                            .as_deref()
-                            .is_some_and(|owner| methods.contains(owner))
-                        {
-                            &mut self.typescript_method_parameters
-                        } else {
-                            &mut self.ecmascript_parameters
-                        };
-                        parameters
-                            .entry(symbol.name.as_str())
-                            .or_default()
-                            .insert(name, EcmaScriptParameter { symbol, site });
-                    }
-                }
+                let site = symbol
+                    .name_range
+                    .and_then(|range| parameters.get(&range).copied());
+                self.index_package_binding(symbol, site, &methods, admitted);
                 continue;
             }
             if self.inactive(symbol.item_range, work) {
@@ -1634,7 +1664,8 @@ impl<'source> Index<'source> {
                         | DeferredReferences::EcmaScriptParameters { .. }
                         | DeferredReferences::TypeScriptMethodParameters { .. }
                         | DeferredReferences::EcmaScriptModuleSpecifiers
-                        | DeferredReferences::EcmaScriptModuleQualifiers => {
+                        | DeferredReferences::EcmaScriptModuleQualifiers
+                        | DeferredReferences::JavaScriptCallbackParameters => {
                             &mut deferred_references
                         }
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
@@ -1689,6 +1720,7 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
+        let mut callback_parameters = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1708,6 +1740,7 @@ impl<'source> Index<'source> {
             })
             .or_else(|| module_specifiers.pop_front())
             .or_else(|| module_qualifiers.pop_front())
+            .or_else(|| callback_parameters.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1744,6 +1777,7 @@ impl<'source> Index<'source> {
                     }
                     DeferredReferences::EcmaScriptModuleSpecifiers => &mut module_specifiers,
                     DeferredReferences::EcmaScriptModuleQualifiers => &mut module_qualifiers,
+                    DeferredReferences::JavaScriptCallbackParameters => &mut callback_parameters,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1904,6 +1938,11 @@ impl<'source> Index<'source> {
                     .file_module_qualifier_start
                     .get_or_insert(resolution.occurrences.len());
                 self.javascript_module_qualifiers(file, work, resolution);
+                (!file.javascript_callback_parameters.is_empty())
+                    .then_some(DeferredReferences::JavaScriptCallbackParameters)
+            }
+            DeferredReferences::JavaScriptCallbackParameters => {
+                self.javascript_callback_parameter_reads(file, work, resolution);
                 None
             }
             DeferredReferences::Rust {

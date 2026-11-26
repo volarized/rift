@@ -165,10 +165,16 @@ impl SyntaxSymbol {
         self.kind == crate::python::LOOP_BINDING_KIND_WORD
     }
 
-    /// Whether this is an ordinary ECMAScript value parameter.
+    /// Whether this is an authored ECMAScript value parameter.
     #[must_use]
     pub fn is_ecmascript_parameter(&self) -> bool {
-        self.kind == crate::ecmascript::PARAMETER_KIND
+        self.kind == crate::ecmascript::PARAMETER_KIND || self.is_ecmascript_callback_parameter()
+    }
+
+    /// Whether this is the physical parameter of a JavaScript function value.
+    #[must_use]
+    pub fn is_ecmascript_callback_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::CALLBACK_PARAMETER_KIND
     }
 
     /// Whether this binding uses a package-only declaration reservation.

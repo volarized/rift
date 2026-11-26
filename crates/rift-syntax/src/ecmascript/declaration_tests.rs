@@ -493,6 +493,7 @@ fn test_function_valued_variables_carry_the_callable_category() {
         let kinds = document
             .symbols()
             .iter()
+            .filter(|symbol| !symbol.is_ecmascript_callback_parameter())
             .map(|symbol| (symbol.name.as_str(), symbol.kinds.clone()))
             .collect::<Vec<_>>();
         assert_eq!(

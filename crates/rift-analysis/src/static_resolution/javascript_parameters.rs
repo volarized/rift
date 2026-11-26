@@ -53,6 +53,55 @@ impl File<'_> {
 }
 
 impl<'source> Index<'source> {
+    pub(super) fn javascript_callback_parameter_reads(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return;
+            }
+            if reference.role == ReferenceRole::Read
+                && !file.members.contains_key(&reference.target)
+                && let Some(occurrence) =
+                    self.javascript_callback_parameter_read(file, reference.target, work)
+            {
+                result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
+                result.deferred_callback_parameters.push(occurrence);
+            }
+        }
+    }
+
+    fn javascript_callback_parameter_read(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let name = file.text(range)?;
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            name,
+            range.start,
+            ReferenceRole::Read,
+            work,
+        )?;
+        let parameter = file.javascript_callback_parameters.get(&binding.name)?;
+        if binding.kind != StaticBindingKind::Shadow || binding.scope != parameter.site.function {
+            return None;
+        }
+        let target = Target {
+            file: file.document,
+            symbol: parameter.symbol,
+        };
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Read, target)?;
+        occurrence.edge_from = Some(self.javascript_call_from(file, range, work)?);
+        Some(occurrence)
+    }
+
     /// Adds reads after previously collected facts have spent their reserved work.
     pub(super) fn ecmascript_parameter_reads(
         &self,

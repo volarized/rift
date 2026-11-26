@@ -503,6 +503,7 @@ fn binding_capacity(
     let mut python_variadic_parameters = BindingDemand::default();
     let mut python_overload_parameters = BindingDemand::default();
     let mut javascript_parameters = BindingDemand::default();
+    let mut callback_parameters = BindingDemand::default();
     let mut typescript_method_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
@@ -521,7 +522,9 @@ fn binding_capacity(
                     .logical_identity(&symbol.qualified_name)
                     .is_some()
         }) {
-            let demand = if symbol.is_ecmascript_parameter() {
+            let demand = if symbol.is_ecmascript_callback_parameter() {
+                &mut callback_parameters
+            } else if symbol.is_ecmascript_parameter() {
                 if facts.language().name == "javascript" {
                     &mut javascript_parameters
                 } else if symbol
@@ -573,7 +576,8 @@ fn binding_capacity(
         + python_variadic_parameters.count
         + python_overload_parameters.count
         + javascript_parameters.count
-        + typescript_method_parameters.count;
+        + typescript_method_parameters.count
+        + callback_parameters.count;
     let (mut bytes, record) = binding_source_budget(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -587,6 +591,7 @@ fn binding_capacity(
     let javascript_parameter_slots = javascript_parameters.reserve(&mut slots, &mut bytes, record);
     let typescript_method_slots =
         typescript_method_parameters.reserve(&mut slots, &mut bytes, record);
+    let callback_slots = reserve_callbacks(documents, &callback_parameters, slots, bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -600,7 +605,8 @@ fn binding_capacity(
         .with_python_variadic_parameter_slots(python_variadic_slots)
         .with_python_overload_parameter_slots(python_overload_slots)
         .with_javascript_parameters(javascript_parameter_slots)
-        .with_typescript_method_parameters(typescript_method_slots),
+        .with_typescript_method_parameters(typescript_method_slots)
+        .with_javascript_callback_parameters(callback_slots),
     )
 }
 
@@ -621,6 +627,26 @@ fn binding_source_budget(
                 u64::from(limits.record_bytes_max),
             )
         })
+}
+
+/// Leaves room for established ECMAScript file declarations before callback parameters.
+fn reserve_callbacks(
+    documents: &[AnalyzedFile],
+    demand: &BindingDemand,
+    mut slots: usize,
+    mut bytes: u64,
+    record: u64,
+) -> usize {
+    if demand.count == 0 {
+        return 0;
+    }
+    for file in documents {
+        if let Some(source) = complete_module_bytes(file, record) {
+            slots = slots.saturating_sub(1);
+            bytes = bytes.saturating_sub(source);
+        }
+    }
+    demand.reserve(&mut slots, &mut bytes, record)
 }
 
 /// Candidate count and the longest retained name in one class of source-local binding.
@@ -805,16 +831,21 @@ fn scoped_anchor_source_max(file: &AnalyzedFile, record_limit: u32) -> u64 {
                 .min(maximum)
         })
         .fold(0, u64::saturating_add);
+    primary
+        .saturating_add(bindings)
+        .saturating_add(complete_module_bytes(file, maximum).unwrap_or(0))
+}
+
+fn complete_module_bytes(file: &AnalyzedFile, maximum: u64) -> Option<u64> {
+    let syntax = file.file.syntax();
     let source = u64::try_from(file.file.source().len()).unwrap_or(u64::MAX);
-    let file_module = matches!(syntax.language().name.as_str(), "javascript" | "typescript")
+    (matches!(syntax.language().name.as_str(), "javascript" | "typescript")
         && file.placement.logical_identity(".").is_some()
         && !syntax.has_errors()
         && syntax.left_out_declaration_count() == 0
         && syntax.primary_symbols_len() > 0
-        && source <= maximum;
-    primary
-        .saturating_add(bindings)
-        .saturating_add(if file_module { source } else { 0 })
+        && source <= maximum)
+        .then_some(source)
 }
 
 /// Renders the canonical publication over the analyzed files.
