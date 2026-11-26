@@ -6,8 +6,8 @@ use rift_core::SymbolId;
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
-    ByteRange, ScopedIdentityAnchors, StaticBodyMember, StaticCall, StaticCallee, StaticFacts,
-    SyntaxFacts, SyntaxSymbol,
+    ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
+    StaticCallee, StaticFacts, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::{SelectedFile, binding_name};
@@ -311,7 +311,145 @@ impl<'source> FileScopes<'source> {
                 scoped.insert(name.to_owned(), overrides);
             }
         }
+        self.scope_initialized_properties(
+            file,
+            facts,
+            anchors,
+            &owners,
+            &mut occupied,
+            &mut scoped,
+        );
         scoped
+    }
+
+    /// The authored variable, initializer and member must share one physical holder.
+    fn scope_initialized_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        facts: &StaticFacts,
+        anchors: &BTreeMap<String, SymbolId>,
+        owners: &LiteralOwners<'source>,
+        occupied: &mut BTreeSet<SymbolId>,
+        scoped: &mut ScopedIdentityAnchors,
+    ) {
+        let captured = facts
+            .bindings()
+            .iter()
+            .filter(|binding| binding.kind == StaticBindingKind::Local)
+            .map(|binding| (binding.name, binding.scope))
+            .collect::<BTreeSet<_>>();
+        let mut declarations = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
+        let mut members = BTreeMap::<ByteRange, Vec<(&SyntaxSymbol, &StaticBodyMember)>>::new();
+        for symbol in file.syntax.symbols() {
+            declarations
+                .entry(&symbol.qualified_name)
+                .or_default()
+                .push(symbol);
+            if let Some(member) = self.body_members.get(&symbol.item_range) {
+                members
+                    .entry(member.holder)
+                    .or_default()
+                    .push((symbol, member));
+            }
+        }
+        for (&name, bindings) in &declarations {
+            if bindings.len() < 2 {
+                continue;
+            }
+            let Some(original) = anchors.get(name) else {
+                continue;
+            };
+            let mut lexical_scopes = BTreeSet::new();
+            let mut proposed = BTreeSet::new();
+            let mut additions = ScopedIdentityAnchors::new();
+            let complete = bindings.iter().all(|symbol| {
+                let Some((scope, body)) = self.scoped_initializer(file, symbol, owners, &captured)
+                else {
+                    return false;
+                };
+                let Some(properties) = members.get(&symbol.item_range) else {
+                    return false;
+                };
+                let Some(identity) = local_group_identity(original, symbol.declaration_ordinal)
+                else {
+                    return false;
+                };
+                if !lexical_scopes.insert(scope)
+                    || occupied.contains(&identity)
+                    || !proposed.insert(identity.clone())
+                {
+                    return false;
+                }
+                let Some(owner) = SymbolIdentity::parse(identity.as_str()).ok() else {
+                    return false;
+                };
+                for &(property, member) in properties {
+                    if member.body != body
+                        || property.container.as_deref() != Some(name)
+                        || !ordinary_private_property(property, file.source)
+                    {
+                        return false;
+                    }
+                    let Some(identity) = literal_property_identity(&owner, &property.name) else {
+                        return false;
+                    };
+                    if occupied.contains(&identity) || !proposed.insert(identity.clone()) {
+                        return false;
+                    }
+                    additions
+                        .entry(property.qualified_name.clone())
+                        .or_default()
+                        .insert(property.declaration_ordinal, identity);
+                }
+                additions
+                    .entry(name.to_owned())
+                    .or_default()
+                    .insert(symbol.declaration_ordinal, identity);
+                true
+            });
+            if complete
+                && additions.iter().all(|(name, group)| {
+                    group.len() >= 2
+                        && !scoped.contains_key(name)
+                        && declarations
+                            .get(name.as_str())
+                            .is_some_and(|rows| rows.len() == group.len())
+                })
+            {
+                occupied.extend(proposed);
+                scoped.extend(additions);
+            }
+        }
+    }
+
+    fn scoped_initializer(
+        &self,
+        file: &SelectedFile<'_>,
+        symbol: &SyntaxSymbol,
+        owners: &LiteralOwners<'_>,
+        captured: &BTreeSet<(ByteRange, ByteRange)>,
+    ) -> Option<(ByteRange, ByteRange)> {
+        if symbol.syntax_element_kind != Some("variable_declarator")
+            || symbol.kind != "variable"
+            || symbol.kinds.contains(&SymbolKind::Public)
+        {
+            return None;
+        }
+        let name = symbol.name_range?;
+        let body = symbol.body_range?;
+        let Scope::Lexical(scope) = self.of(symbol, file) else {
+            return None;
+        };
+        let owner = owners
+            .enclosing
+            .resolve(symbol.item_range.start, symbol.item_range.end)
+            .copied()
+            .flatten()?;
+        (symbol.container.as_deref() == Some(owner.qualified_name.as_str())
+            && owner.body_range?.encloses(scope)
+            && scope.encloses(symbol.item_range)
+            && captured.contains(&(name, scope)))
+        .then_some((scope, body))
     }
 
     fn private_local_groups(
@@ -540,6 +678,14 @@ fn returned_literal_owners<'source>(
             .or_insert(Some(name));
     }
     owners
+}
+
+fn literal_property_identity(owner: &SymbolIdentity, name: &str) -> Option<SymbolId> {
+    let mut path = owner.qualified_path().to_vec();
+    path.push(name.to_owned());
+    let identity =
+        SymbolIdentity::new(owner.owner().clone(), owner.language().clone(), path).ok()?;
+    SymbolId::new(identity.wire_identity()).ok()
 }
 
 fn ordinary_private_property(symbol: &SyntaxSymbol, source: &str) -> bool {

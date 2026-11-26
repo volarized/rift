@@ -1661,3 +1661,76 @@ fn assert_prior_literal_edges(bounded: &PackagePublication, input: &str) {
         );
     }
 }
+
+const SCOPED_INITIALIZER_PROPERTIES: &str = r#"
+import { inspect } from "../index.mjs";
+export function initialize(first) {
+  if (first) {
+    const record = { code: 11 };
+    return inspect(record.code);
+  }
+  const record = { code: 22 };
+  const named = { code: 44 };
+  inspect(named.code);
+  return inspect(record.code);
+}
+"#;
+
+#[test]
+fn package_keeps_initializer_properties_under_their_physical_lexical_bindings() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function inspect(value) { return value; }",
+            ),
+            ("lib/branches.mjs", SCOPED_INITIALIZER_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/branches.mjs")
+        .expect("non-entry unit")
+        .unit;
+    let declaration = |written: &str| {
+        let start = SCOPED_INITIALIZER_PROPERTIES
+            .find(written)
+            .expect("authored declaration");
+        publication
+            .declarations
+            .iter()
+            .find(|row| {
+                &row.unit == unit && offset_in(row.range.start) == start && row.source == written
+            })
+            .expect("retained declaration")
+    };
+    let owners = ["record = { code: 11 }", "record = { code: 22 }"].map(declaration);
+    let properties = ["code: 11", "code: 22"].map(declaration);
+    assert_ne!(owners[0].symbol, owners[1].symbol);
+    assert_ne!(properties[0].symbol, properties[1].symbol);
+    for (owner, property) in owners.into_iter().zip(properties) {
+        assert!(!owner.public && !property.public);
+        assert!(owner.symbol.as_str().contains("/initialize/record%23"));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&owner.symbol)
+                && object.name == "code"
+        }));
+    }
+    let unrelated = declaration("code: 44");
+    assert!(
+        unrelated
+            .symbol
+            .as_str()
+            .ends_with("/initialize/named/code")
+    );
+}
