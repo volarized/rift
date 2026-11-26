@@ -364,12 +364,17 @@ impl<'source> Index<'source> {
                 .or_else(|| self.javascript_merged_alias_property_parent(file, target, work))
                 .or_else(|| module.clone());
             if let Some(from) = from {
-                result.record(self.javascript_declaration_edge(
-                    file,
-                    target,
-                    from,
-                    EdgeKind::Contains,
-                ));
+                let occurrence =
+                    self.javascript_declaration_edge(file, target, from, EdgeKind::Contains);
+                match (
+                    target.is_physical_only_javascript_package_symbol(),
+                    occurrence,
+                ) {
+                    (true, Some(occurrence)) => {
+                        result.deferred_literal_containment.push(occurrence);
+                    }
+                    (_, occurrence) => result.record(occurrence),
+                }
             }
             if matches!(symbol.kind, "method" | "property" | "field") {
                 self.javascript_overrides(file, symbol, work, result);
@@ -912,5 +917,21 @@ impl<'source> Index<'source> {
         }?;
         imported.document.placement.logical_identity(".")?;
         Some(imported)
+    }
+}
+
+impl Target<'_> {
+    /// Package declarations admitted through a physical scope with no shared name anchor.
+    pub(super) fn is_physical_only_javascript_package_symbol(self) -> bool {
+        let placement = self.file.placement;
+        self.file.facts.language().name == "javascript"
+            && matches!(
+                placement.origin().location(),
+                Some(SourceLocation::Dependency { .. })
+            )
+            && placement
+                .logical_identity(&self.symbol.qualified_name)
+                .is_none()
+            && placement.logical_identity_for_symbol(self.symbol).is_some()
     }
 }

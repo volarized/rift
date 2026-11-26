@@ -86,6 +86,10 @@ pub(crate) struct StaticResolution {
     pub(crate) file_module_start: Option<usize>,
     /// First qualifier reference after the file module specifiers.
     pub(crate) file_module_qualifier_start: Option<usize>,
+    /// First containment edge of a physically scoped literal declaration.
+    pub(crate) literal_start: Option<usize>,
+    /// Containment awaiting the capacity left by existing references.
+    pub(crate) deferred_literal_containment: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -210,6 +214,11 @@ fn resolve_by<'source>(
         ..StaticResolution::default()
     };
     files(&index, &mut work, &mut resolution);
+    if !resolution.deferred_literal_containment.is_empty() {
+        resolution.literal_start = Some(resolution.occurrences.len());
+        let deferred = std::mem::take(&mut resolution.deferred_literal_containment);
+        resolution.occurrences.extend(deferred);
+    }
     external::admit_declared(namespace, &mut resolution.external, work_max);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
@@ -2515,6 +2524,8 @@ impl StaticResolution {
     /// coverage for its unit.
     fn join(&mut self, file: &File<'_>, mut apart: Self, over_share: bool) {
         self.occurrences.append(&mut apart.occurrences);
+        self.deferred_literal_containment
+            .append(&mut apart.deferred_literal_containment);
         self.external.append(&mut apart.external);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();

@@ -1423,3 +1423,241 @@ fn npm_constructor_calls_an_imported_stable_class_value() {
         );
     }
 }
+
+const NAMED_ARGUMENT_PROPERTIES: &str = r#"
+import { consume } from "../index.mjs";
+export function choose() {
+  consume({ status: "ready" });
+  consume({ status: "completed" });
+  const first = consume({ status: "assigned first" });
+  const second = consume({ status: "assigned second" });
+  const options = { status: "stable" };
+  return [first, second, consume(options)];
+}
+export function defaults(first = consume({ hidden: 1 }), second = consume({ hidden: 2 })) {
+  return [first, second];
+}
+export function callbacks(run) {
+  run(() => consume({ hidden: 3 }));
+  run(() => consume({ hidden: 4 }));
+}
+"#;
+
+#[test]
+fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function consume(value) { return value.status; }",
+            ),
+            ("lib/choose.mjs", NAMED_ARGUMENT_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let held = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/choose.mjs")
+        .expect("non-entry unit");
+    let property = |value: &str| {
+        let written = format!("status: \"{value}\"");
+        let start = u64::try_from(
+            NAMED_ARGUMENT_PROPERTIES
+                .find(&written)
+                .expect("written key"),
+        )
+        .expect("source position");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == held.unit && row.range.start == start && row.source == written)
+            .expect("physical property");
+        assert!(!row.public);
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.name == "status"
+                && object.kind.0 == "property"
+        }));
+        row.symbol.as_str()
+    };
+    let first = property("ready");
+    let second = property("completed");
+    assert_ne!(first, second);
+    assert!(first.contains("/choose/status%23"));
+    assert!(second.contains("/choose/status%23"));
+    assert!(property("assigned first").ends_with("/choose/first/status"));
+    assert!(property("assigned second").ends_with("/choose/second/status"));
+    assert!(property("stable").ends_with("/choose/options/status"));
+    assert!(publication.declarations.iter().all(|row| {
+        row.unit != held.unit
+            || !row.source.starts_with("hidden:")
+            || !row.symbol.as_str().contains("%23")
+    }));
+    let calls = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/choose")
+                && edge.to.as_str().ends_with("/consume")
+                && edge.kinds.contains(&EdgeKind::Calls)
+        })
+        .map(|edge| {
+            let occurrence = edge.occurrence.as_ref().expect("authored invocation");
+            assert_eq!(occurrence.unit, held.unit);
+            offset_in(occurrence.range.start)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        calls,
+        [
+            "consume({ status: \"ready\" })",
+            "consume({ status: \"completed\" })",
+            "consume({ status: \"assigned first\" })",
+            "consume({ status: \"assigned second\" })",
+            "consume(options)",
+        ]
+        .into_iter()
+        .map(|call| NAMED_ARGUMENT_PROPERTIES
+            .find(call)
+            .expect("written invocation"))
+        .collect(),
+    );
+}
+
+#[test]
+fn non_entry_literal_contains_uses_only_the_capacity_left_by_existing_edges() {
+    const INPUT: &str = r#"
+import { inspect } from "../index.mjs";
+export function choose() {
+  inspect({ code: "first" });
+  inspect({ code: "second" });
+  const options = { code: "named" };
+  return inspect(options);
+}
+"#;
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owner");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let root = ProjectPath::new("index.mjs").expect("entry");
+    let non_entry = ProjectPath::new("lib/choose.mjs").expect("non-entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let files = [
+        PackageSource::new(
+            &root,
+            "export function inspect(value) { return value.code; }",
+        ),
+        PackageSource::new(&non_entry, INPUT),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+    )];
+    let publication = |edge_cap| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_edges(edge_cap)
+            .expect("bounded edges");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+            .expect("bounded archive facts")
+            .with_framework_context(&metadata, &[])
+            .expect("npm manifest");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("publication");
+        analysis.into_parts().0
+    };
+    let bounded = publication(8);
+    assert_prior_literal_edges(&bounded, INPUT);
+    let roomy = publication(64);
+    for prior in &bounded.edges {
+        assert!(roomy.edges.contains(prior));
+    }
+    let optional = roomy
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Contains] && edge.to.as_str().contains("/choose/code%23")
+        })
+        .map(|edge| {
+            offset_in(
+                edge.occurrence
+                    .as_ref()
+                    .expect("literal property")
+                    .range
+                    .start,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(optional, BTreeSet::from([80, 110]));
+}
+
+fn assert_prior_literal_edges(bounded: &PackagePublication, input: &str) {
+    let expected = [
+        (
+            EdgeKind::Contains,
+            "/choose",
+            "/choose/options",
+            "options",
+            137,
+        ),
+        (
+            EdgeKind::Reads,
+            "/choose",
+            "/choose/options",
+            "options",
+            183,
+        ),
+        (
+            EdgeKind::Calls,
+            "/choose",
+            "/inspect",
+            r#"inspect({ code: "first" })"#,
+            70,
+        ),
+        (
+            EdgeKind::Calls,
+            "/choose",
+            "/inspect",
+            r#"inspect({ code: "second" })"#,
+            100,
+        ),
+        (
+            EdgeKind::Calls,
+            "/choose",
+            "/inspect",
+            "inspect(options)",
+            175,
+        ),
+        (
+            EdgeKind::Imports,
+            "%2Fchoose.mjs",
+            "/inspect",
+            "inspect",
+            10,
+        ),
+    ];
+    assert_eq!(bounded.edges.len(), expected.len());
+    for (kind, from, to, text, start) in expected {
+        assert!(
+            bounded.edges.iter().any(|edge| {
+                edge.kinds == [kind]
+                    && edge.from.as_str().ends_with(from)
+                    && edge.to.as_str().ends_with(to)
+                    && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                        occurrence.unit.0.ends_with("/lib/choose.mjs")
+                            && offset_in(occurrence.range.start) == start
+                            && input.get(start..offset_in(occurrence.range.end)) == Some(text)
+                    })
+            }),
+            "{kind:?} {from} {to} {text}"
+        );
+    }
+}
