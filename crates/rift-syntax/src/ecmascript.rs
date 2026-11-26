@@ -230,7 +230,7 @@ const BLOCK_COMMENT_CLOSE: &str = "*/";
 /// Leads each continuation line inside a `JSDoc` block.
 const JSDOC_LINE_MARKER: char = '*';
 
-/// Provider kind of an ordinary TypeScript value parameter.
+/// Provider kind of an ordinary ECMAScript value parameter.
 pub(crate) const PARAMETER_KIND: &str = "value_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
@@ -1004,24 +1004,33 @@ impl EcmaScriptKinds {
         None
     }
 
-    /// A simple parameter of a named TypeScript function with a body.
+    /// A simple parameter of a named ECMAScript function with a body.
     fn ordinary_parameter<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let parameter = visited.syntax_element();
-        if !self.formal_parameter_kinds.contains(&parameter.kind_id()) || parameter.has_error() {
+        let name = if parameter.kind_id() == self.identifier {
+            parameter
+        } else if self.formal_parameter_kinds.contains(&parameter.kind_id()) {
+            parameter.child_by_field_id(self.pattern?.get())?
+        } else {
+            return None;
+        };
+        if parameter.has_error() || name.kind_id() != self.identifier || name.is_missing() {
             return None;
         }
         let list = visited.parent()?;
+        if list.syntax_element().kind() != "formal_parameters" {
+            return None;
+        }
         let function = list.parent()?.syntax_element();
-        if list.syntax_element().kind() != "formal_parameters"
-            || function.kind() != FUNCTION_DECLARATION_KIND
-        {
+        let direct = function.kind() == FUNCTION_DECLARATION_KIND;
+        let generator = self.formal_parameter_kinds.is_empty()
+            && function.kind() == GENERATOR_FUNCTION_DECLARATION_KIND;
+        if !(direct || generator) {
             return None;
         }
         self.child(function, EcmaScriptGrammarField::Name)?;
         self.child(function, EcmaScriptGrammarField::Body)?;
-        parameter
-            .child_by_field_id(self.pattern?.get())
-            .filter(|name| name.kind_id() == self.identifier && !name.is_missing())
+        Some(name)
     }
 
     /// The name a constructor parameter property declares: `name` in
@@ -2234,7 +2243,7 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
-    let parameters = take_parameters(kinds, &mut symbols);
+    let parameters = take_parameters(&mut symbols);
     let mut static_facts = capture.map(crate::static_analysis::Capture::finish);
     if let Some(facts) = &mut static_facts {
         let aliases = members::record(
@@ -2292,15 +2301,9 @@ fn parser_for_ranges(
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
-fn take_parameters(
-    kinds: &EcmaScriptKinds,
-    symbols: &mut Vec<crate::SyntaxSymbol>,
-) -> Vec<crate::SyntaxSymbol> {
-    if kinds.formal_parameter_kinds.is_empty() {
-        return Vec::new();
-    }
+fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> Vec<crate::SyntaxSymbol> {
     symbols
-        .extract_if(.., |symbol| symbol.is_typescript_parameter())
+        .extract_if(.., |symbol| symbol.is_ecmascript_parameter())
         .collect()
 }
 
@@ -2411,7 +2414,7 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     if name == OBJECT_KIND {
         return Some(OBJECT_KIND);
     }
-    if name == PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+    if name == PARAMETER_KIND {
         return Some(PARAMETER_KIND);
     }
     kinds

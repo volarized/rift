@@ -165,9 +165,9 @@ impl SyntaxSymbol {
         self.kind == crate::python::LOOP_BINDING_KIND_WORD
     }
 
-    /// Whether this is an ordinary TypeScript function parameter candidate.
+    /// Whether this is an ordinary ECMAScript value parameter.
     #[must_use]
-    pub fn is_typescript_parameter(&self) -> bool {
+    pub fn is_ecmascript_parameter(&self) -> bool {
         self.kind == crate::ecmascript::PARAMETER_KIND
     }
 
@@ -177,7 +177,7 @@ impl SyntaxSymbol {
         self.is_rust_local_binding()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
-            || self.is_typescript_parameter()
+            || self.is_ecmascript_parameter()
     }
 }
 

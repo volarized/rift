@@ -1208,7 +1208,7 @@ fn declaration_anchors_with_public(
     // Process containing declarations first without changing the document's source order.
     declarations.sort_by_key(|symbol| symbol.qualified_name.len());
     for symbol in declarations {
-        if symbol.is_typescript_parameter()
+        if symbol.is_ecmascript_parameter()
             && (input.release_version().is_none()
                 || !matches!(
                     input.owner(),

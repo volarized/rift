@@ -501,6 +501,7 @@ fn binding_capacity(
     let mut python_loop_bindings = BindingDemand::default();
     let mut python_variadic_parameters = BindingDemand::default();
     let mut python_overload_parameters = BindingDemand::default();
+    let mut javascript_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
@@ -517,8 +518,12 @@ fn binding_capacity(
                     .logical_identity(&symbol.qualified_name)
                     .is_some()
         }) {
-            let demand = if symbol.is_typescript_parameter() {
-                &mut typescript_parameters
+            let demand = if symbol.is_ecmascript_parameter() {
+                if facts.language().name == "javascript" {
+                    &mut javascript_parameters
+                } else {
+                    &mut typescript_parameters
+                }
             } else if symbol.is_python_variadic_parameter() {
                 &mut python_variadic_parameters
             } else if symbol.is_python_overload_parameter() {
@@ -557,7 +562,8 @@ fn binding_capacity(
         + python_receivers.count
         + python_loop_bindings.count
         + python_variadic_parameters.count
-        + python_overload_parameters.count;
+        + python_overload_parameters.count
+        + javascript_parameters.count;
     let (mut bytes, record) = binding_source_budget(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -568,6 +574,7 @@ fn binding_capacity(
     let python_loop_binding_slots = python_loop_bindings.reserve(&mut slots, &mut bytes, record);
     let python_variadic_slots = python_variadic_parameters.reserve(&mut slots, &mut bytes, record);
     let python_overload_slots = python_overload_parameters.reserve(&mut slots, &mut bytes, record);
+    let javascript_parameter_slots = javascript_parameters.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -579,7 +586,8 @@ fn binding_capacity(
         .with_python_receiver_slots(python_receiver_slots)
         .with_python_loop_binding_slots(python_loop_binding_slots)
         .with_python_variadic_parameter_slots(python_variadic_slots)
-        .with_python_overload_parameter_slots(python_overload_slots),
+        .with_python_overload_parameter_slots(python_overload_slots)
+        .with_javascript_parameters(javascript_parameter_slots),
     )
 }
 

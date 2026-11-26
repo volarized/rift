@@ -2994,3 +2994,121 @@ unknown('w', function () {
         Some("leaf()")
     );
 }
+
+#[test]
+fn package_stores_javascript_named_function_parameters_and_reads() {
+    const SOURCE: &str = concat!(
+        "export function choose(value) { return value; }\n",
+        "export function* another(value) { yield value; }\n",
+    );
+    let package = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.mjs"}"#,
+        )),
+    )
+    .expect("admitted JavaScript source");
+    let publication = package.publication();
+    for (function, usage) in [("choose", "return value"), ("another", "yield value")] {
+        let function_start = SOURCE.find(function).expect("written function");
+        let declaration = function_start + function.len() + 1;
+        let read = SOURCE.find(usage).expect("written read") + usage.len() - "value".len();
+        let binding = publication
+            .objects
+            .iter()
+            .find(|object| {
+                object.kinds.contains(&SymbolKind::Parameter)
+                    && object
+                        .id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str().ends_with(&format!("/{function}/value")))
+            })
+            .and_then(|object| object.id.as_ref())
+            .expect("function-owned value parameter");
+        assert!(publication.declarations.iter().any(|site| {
+            site.symbol == *binding
+                && site.source == "value"
+                && usize::try_from(site.range.start) == Ok(declaration)
+                && usize::try_from(site.range.end) == Ok(declaration + "value".len())
+        }));
+        let uses = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == *binding)
+            .map(|edge| {
+                assert!(edge.from.as_str().ends_with(&format!("/{function}")));
+                let site = &edge.occurrence.as_ref().expect("written read").range;
+                assert_eq!(usize::try_from(site.end), Ok(read + "value".len()));
+                usize::try_from(site.start).expect("written start")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uses, [read]);
+    }
+}
+
+#[test]
+fn package_javascript_parameters_follow_typescript_parameters_under_provider_bound() {
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("package identity");
+    let origin = fixture::origin(&package);
+    let language = fixture::language(ShippedLanguage::TypeScript);
+    let javascript = ProjectPath::new("a.mjs").expect("JavaScript path");
+    let typescript = ProjectPath::new("index.ts").expect("TypeScript path");
+    let manifest = ProjectPath::new("package.json").expect("metadata path");
+    let sources = [
+        PackageSource::new(&javascript, "export function first(gift) { return gift; }"),
+        PackageSource::new(
+            &typescript,
+            "export function last(value: number): number { return value; }",
+        ),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","main":"a.mjs","types":"index.ts"}"#,
+    )];
+
+    for (bound, expected) in [
+        (3, &[][..]),
+        (4, &["value"][..]),
+        (5, &["gift", "value"][..]),
+    ] {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("provider declaration bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("package input")
+            .with_framework_context(&metadata, &[])
+            .expect("authored metadata");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("primary declarations accepted");
+        let publication = analysis.publication();
+        let parameters = publication
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Parameter))
+            .map(|object| object.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            parameters,
+            expected.iter().copied().collect(),
+            "bound {bound}, declarations {:?}, warnings {:?}",
+            publication
+                .declarations
+                .iter()
+                .map(|row| &row.symbol)
+                .collect::<Vec<_>>(),
+            publication.warnings
+        );
+        let reads = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads])
+            .filter_map(|edge| edge.to.as_str().rsplit('/').next())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(reads, parameters);
+    }
+}

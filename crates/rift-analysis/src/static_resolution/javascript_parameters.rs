@@ -1,4 +1,4 @@
-//! Physical ownership of ordinary TypeScript value parameters.
+//! Physical ownership of ordinary ECMAScript value parameters.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +16,7 @@ pub(super) fn parameter_sites<'source>(
     if !syntax
         .symbols()
         .iter()
-        .any(rift_syntax::SyntaxSymbol::is_typescript_parameter)
+        .any(rift_syntax::SyntaxSymbol::is_ecmascript_parameter)
     {
         return BTreeMap::new();
     }
@@ -28,18 +28,18 @@ pub(super) fn parameter_sites<'source>(
 }
 
 impl File<'_> {
-    pub(super) fn typescript_parameter_read_candidate(&self, range: ByteRange) -> bool {
-        !self.typescript_parameters.is_empty()
+    pub(super) fn ecmascript_parameter_read_candidate(&self, range: ByteRange) -> bool {
+        !self.ecmascript_parameters.is_empty()
             && !self.members.contains_key(&range)
             && self
                 .text(range)
-                .is_some_and(|name| self.typescript_parameters.contains_key(name))
+                .is_some_and(|name| self.ecmascript_parameters.contains_key(name))
     }
 }
 
 impl<'source> Index<'source> {
     /// Adds reads after previously collected facts have spent their reserved work.
-    pub(super) fn typescript_parameter_reads(
+    pub(super) fn ecmascript_parameter_reads(
         &self,
         file: &File<'source>,
         sites: Vec<ByteRange>,
@@ -50,14 +50,14 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if let Some(occurrence) = self.typescript_parameter_read(file, range, work) {
+            if let Some(occurrence) = self.ecmascript_parameter_read(file, range, work) {
                 result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
                 result.record(Some(occurrence));
             }
         }
     }
 
-    fn typescript_parameter_read(
+    fn ecmascript_parameter_read(
         &self,
         file: &File<'source>,
         range: ByteRange,
@@ -75,7 +75,7 @@ impl<'source> Index<'source> {
         if binding.kind != StaticBindingKind::Shadow {
             return None;
         }
-        let parameter = file.typescript_parameters.get(name)?.get(&binding.name)?;
+        let parameter = file.ecmascript_parameters.get(name)?.get(&binding.name)?;
         let site = parameter.site;
         let owner = file.target_at(site.owner?)?;
         let scopes = self.javascript.scopes.get(file.document.path.as_str())?;

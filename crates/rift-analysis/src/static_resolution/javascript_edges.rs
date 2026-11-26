@@ -186,7 +186,7 @@ impl<'source> Index<'source> {
             }
             if occurrence.is_none()
                 && reference.role == ReferenceRole::Read
-                && file.typescript_parameter_read_candidate(reference.target)
+                && file.ecmascript_parameter_read_candidate(reference.target)
             {
                 parameter_reads.push(reference.target);
             }
@@ -343,7 +343,7 @@ impl<'source> Index<'source> {
         let module = self.javascript_module_identity(file, work);
         self.javascript_alias_edges(file, module.as_ref(), work, result);
         for symbol in file.document.facts.symbols() {
-            if symbol.is_typescript_parameter() {
+            if symbol.is_ecmascript_parameter() {
                 continue;
             }
             if !work.charge() {
@@ -698,7 +698,7 @@ impl<'source> Index<'source> {
             return Some(identity.clone());
         }
         for symbol in file.document.facts.symbols() {
-            if symbol.is_typescript_parameter() {
+            if symbol.is_ecmascript_parameter() {
                 continue;
             }
             if !work.charge() {

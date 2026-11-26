@@ -27,6 +27,7 @@ pub struct PackageBindingSlots {
     python_loop_binding: usize,
     python_variadic_parameter: usize,
     python_overload_parameter: usize,
+    javascript_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -43,6 +44,7 @@ impl PackageBindingSlots {
             rust_parameter,
             python_parameter,
             typescript_parameter,
+            javascript_parameter: 0,
             python_receiver: 0,
             python_loop_binding: 0,
             python_variadic_parameter: 0,
@@ -78,6 +80,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for ordinary JavaScript value parameters.
+    #[must_use]
+    pub const fn with_javascript_parameters(mut self, count: usize) -> Self {
+        self.javascript_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -85,6 +94,7 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_parameter)
             .saturating_add(self.python_parameter)
             .saturating_add(self.typescript_parameter)
+            .saturating_add(self.javascript_parameter)
             .saturating_add(self.python_receiver)
             .saturating_add(self.python_loop_binding)
             .saturating_add(self.python_variadic_parameter)
@@ -94,10 +104,15 @@ impl PackageBindingSlots {
     fn admit(
         &mut self,
         symbol: &crate::SyntaxSymbol,
+        language: &str,
         python_receivers: &BTreeSet<crate::ByteRange>,
     ) -> bool {
-        let available = if symbol.is_typescript_parameter() {
-            &mut self.typescript_parameter
+        let available = if symbol.is_ecmascript_parameter() {
+            if language == "javascript" {
+                &mut self.javascript_parameter
+            } else {
+                &mut self.typescript_parameter
+            }
         } else if symbol.is_python_variadic_parameter() {
             &mut self.python_variadic_parameter
         } else if symbol.is_python_overload_parameter() {
@@ -547,7 +562,7 @@ impl SyntaxPublicationBuilder {
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(symbol, &python_receivers))
+                    || !remaining.admit(symbol, &syntax.language().name, &python_receivers))
             {
                 continue;
             }
