@@ -70,51 +70,11 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
+        parameter_reads: &mut Vec<ByteRange>,
     ) {
-        for reference in file.facts.references() {
-            if !work.charge() {
-                return;
-            }
-            let local = self.javascript_target(file, reference.target, reference.role, work);
-            let target = local
-                .filter(|target| {
-                    reference.role != ReferenceRole::Type
-                        || target.symbol.kinds.contains(&SymbolKind::Type)
-                        || target.symbol.kinds.contains(&SymbolKind::Variant)
-                })
-                .or_else(|| self.javascript_merged_alias_type(file, reference, work));
-            let mut occurrence = target
-                .and_then(|target| {
-                    self.occurrence(
-                        file,
-                        reference.target,
-                        reference.target,
-                        reference.role,
-                        target,
-                    )
-                })
-                .or_else(|| {
-                    self.javascript_module_reference(file, reference.target, reference.role, work)
-                });
-            if let Some(occurrence) = &mut occurrence {
-                occurrence.edge_from = self
-                    .javascript_assignment_reference_from(
-                        file,
-                        reference.target,
-                        reference.role,
-                        work,
-                    )
-                    .or_else(|| self.javascript_module_from(file, reference.target, work));
-            } else if local.is_none()
-                && reference.role == ReferenceRole::Type
-                && file.document.facts.language().name == "typescript"
-                && self
-                    .record_external_typescript_type_use(file, reference.target, work, result)
-                    .is_some()
-            {
-                continue;
-            }
-            result.record(occurrence);
+        self.javascript_references(file, work, result, parameter_reads);
+        if work.exhausted {
+            return;
         }
         for binding in file.facts.bindings() {
             if !work.charge() {
@@ -172,6 +132,66 @@ impl<'source> Index<'source> {
             result.record(occurrence());
         }
         self.javascript_contains(file, work, result);
+    }
+
+    fn javascript_references(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+        parameter_reads: &mut Vec<ByteRange>,
+    ) {
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return;
+            }
+            let local = self.javascript_target(file, reference.target, reference.role, work);
+            let target = local
+                .filter(|target| {
+                    reference.role != ReferenceRole::Type
+                        || target.symbol.kinds.contains(&SymbolKind::Type)
+                        || target.symbol.kinds.contains(&SymbolKind::Variant)
+                })
+                .or_else(|| self.javascript_merged_alias_type(file, reference, work));
+            let mut occurrence = target
+                .and_then(|target| {
+                    self.occurrence(
+                        file,
+                        reference.target,
+                        reference.target,
+                        reference.role,
+                        target,
+                    )
+                })
+                .or_else(|| {
+                    self.javascript_module_reference(file, reference.target, reference.role, work)
+                });
+            if let Some(occurrence) = &mut occurrence {
+                occurrence.edge_from = self
+                    .javascript_assignment_reference_from(
+                        file,
+                        reference.target,
+                        reference.role,
+                        work,
+                    )
+                    .or_else(|| self.javascript_module_from(file, reference.target, work));
+            } else if local.is_none()
+                && reference.role == ReferenceRole::Type
+                && file.document.facts.language().name == "typescript"
+                && self
+                    .record_external_typescript_type_use(file, reference.target, work, result)
+                    .is_some()
+            {
+                continue;
+            }
+            if occurrence.is_none()
+                && reference.role == ReferenceRole::Read
+                && file.typescript_parameter_read_candidate(reference.target)
+            {
+                parameter_reads.push(reference.target);
+            }
+            result.record(occurrence);
+        }
     }
 
     /// Selects the alias facet for a direct TypeScript reference to an established
@@ -323,6 +343,9 @@ impl<'source> Index<'source> {
         let module = self.javascript_module_identity(file, work);
         self.javascript_alias_edges(file, module.as_ref(), work, result);
         for symbol in file.document.facts.symbols() {
+            if symbol.is_typescript_parameter() {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -654,7 +677,7 @@ impl<'source> Index<'source> {
         })
     }
 
-    fn javascript_identity(&self, target: Target<'source>) -> Option<SymbolId> {
+    pub(super) fn javascript_identity(&self, target: Target<'source>) -> Option<SymbolId> {
         let file = self.files.get(target.file.path.as_str())?;
         let range = target.symbol.name_range.unwrap_or(target.symbol.item_range);
         match self
@@ -675,6 +698,9 @@ impl<'source> Index<'source> {
             return Some(identity.clone());
         }
         for symbol in file.document.facts.symbols() {
+            if symbol.is_typescript_parameter() {
+                continue;
+            }
             if !work.charge() {
                 return None;
             }

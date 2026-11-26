@@ -358,6 +358,178 @@ fn package_preserves_python_edges_beside_type_parameter_defaults() {
     }
 }
 
+const TYPESCRIPT_PARAMETER_SOURCE: &str = concat!(
+    "export function choose<Value>(parameter: Value): Value {\n",
+    "  const local = parameter;\n",
+    "  { const local = parameter; void local; }\n",
+    "  return local;\n",
+    "}\n",
+    "export const seed = 3;\n",
+    "export function defaults(parameter: number = seed, fallback: number = parameter): number {\n",
+    "  const seed = 4;\n",
+    "  { const parameter = 5; void parameter; }\n",
+    "  return parameter + fallback + seed;\n",
+    "}\n",
+    "export function defaultsStable(parameter: number = seed, fallback: number = parameter) {\n",
+    "  return parameter + fallback;\n",
+    "}\n",
+    "export function first(name: number): number { return name; }\n",
+    "export function second(name: string): string { return name; }\n",
+    "export class Holder {\n",
+    "  constructor(public readonly name: string) { void name; }\n",
+    "  read(): string { return this.name; }\n",
+    "}\n",
+);
+
+fn typescript_parameter_publication() -> PackagePublication {
+    fixture::package_result_with_metadata(
+        rift_syntax::ShippedLanguage::TypeScript,
+        vec![("index.ts", TYPESCRIPT_PARAMETER_SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#,
+        )),
+    )
+    .expect("admitted TypeScript source")
+    .publication()
+    .clone()
+}
+
+fn typescript_parameter_site(prefix: &str, spelling: &str) -> u64 {
+    u64::try_from(
+        TYPESCRIPT_PARAMETER_SOURCE
+            .find(prefix)
+            .expect("written fixture site")
+            + prefix.rfind(spelling).expect("written name token"),
+    )
+    .expect("source offset")
+}
+
+#[test]
+fn package_stores_typescript_ordinary_parameters_and_their_body_reads() {
+    let publication = typescript_parameter_publication();
+    for (owner, name, source, sites) in [
+        (
+            "choose",
+            "parameter",
+            "choose<Value>(parameter",
+            &["const local = parameter;", "{ const local = parameter;"][..],
+        ),
+        (
+            "first",
+            "name",
+            "first(name",
+            &["first(name: number): number { return name;"][..],
+        ),
+        (
+            "second",
+            "name",
+            "second(name",
+            &["second(name: string): string { return name;"][..],
+        ),
+        (
+            "defaultsStable",
+            "parameter",
+            "defaultsStable(parameter",
+            &["return parameter + fallback;"][..],
+        ),
+    ] {
+        let path = format!("/beacon/{owner}/{name}");
+        let offset = typescript_parameter_site(source, name);
+        let parameter = publication
+            .objects
+            .iter()
+            .find(|object| {
+                object
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str().ends_with(&path))
+            })
+            .expect("physical parameter");
+        assert!(parameter.kinds.contains(&SymbolKind::Parameter));
+        let id = parameter.id.as_ref().expect("established identity");
+        assert!(publication.declarations.iter().any(|declaration| {
+            declaration.symbol == *id
+                && declaration.range.start == offset
+                && declaration.range.end
+                    == offset + u64::try_from(name.len()).expect("physical name")
+                && declaration.source == name
+        }));
+        let uses = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == *id)
+            .map(|edge| {
+                assert!(edge.from.as_str().ends_with(&format!("/beacon/{owner}")));
+                let range = &edge.occurrence.as_ref().expect("written read").range;
+                assert_eq!(
+                    range.end - range.start,
+                    u64::try_from(name.len()).expect("physical name length")
+                );
+                range.start
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = sites
+            .iter()
+            .map(|site| typescript_parameter_site(site, name))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(uses, expected, "{path}");
+    }
+}
+
+#[test]
+fn package_typescript_parameter_keeps_defaults_blocks_and_constructor_properties() {
+    let publication = typescript_parameter_publication();
+    let default_seed = typescript_parameter_site("defaultsStable(parameter: number = seed", "seed");
+    let nested_local = typescript_parameter_site("void parameter;", "parameter");
+    for (offset, target) in [
+        (default_seed, "/beacon/seed"),
+        (nested_local, "/beacon/defaults/parameter"),
+    ] {
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str().ends_with(target)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range.start == offset)
+            }),
+            "{target}"
+        );
+    }
+    let collision = publication
+        .objects
+        .iter()
+        .find(|object| {
+            object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.as_str().ends_with("/beacon/defaults/parameter"))
+        })
+        .expect("prior block-local binding");
+    assert!(!collision.kinds.contains(&SymbolKind::Parameter));
+    let property = publication
+        .objects
+        .iter()
+        .find(|object| {
+            object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.as_str().ends_with("/beacon/Holder/name"))
+        })
+        .expect("prior constructor property");
+    assert!(property.kinds.contains(&SymbolKind::Member));
+    assert!(!property.kinds.contains(&SymbolKind::Parameter));
+    assert!(!publication.declarations.iter().any(|declaration| {
+        declaration
+            .symbol
+            .as_str()
+            .ends_with("/Holder/constructor/name")
+    }));
+}
+
 #[test]
 fn package_stores_typescript_imported_type_uses_at_each_written_site() {
     use rift_protocol::read::EdgeProvider;
@@ -2120,4 +2292,9 @@ fn parameter_provider_bound(shipped: rift_syntax::ShippedLanguage, prior: u32) {
             optional
         );
     }
+}
+
+#[test]
+fn package_typescript_value_parameters_preserve_required_provider_slots() {
+    parameter_provider_bound(rift_syntax::ShippedLanguage::TypeScript, 1);
 }

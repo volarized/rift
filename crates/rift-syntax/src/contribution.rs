@@ -22,16 +22,23 @@ pub struct PackageBindingSlots {
     rust_local: usize,
     rust_parameter: usize,
     python_parameter: usize,
+    typescript_parameter: usize,
 }
 
 impl PackageBindingSlots {
     /// Holds the caller's reserved slots for each supported binding class.
     #[must_use]
-    pub const fn new(rust_local: usize, rust_parameter: usize, python_parameter: usize) -> Self {
+    pub const fn new(
+        rust_local: usize,
+        rust_parameter: usize,
+        python_parameter: usize,
+        typescript_parameter: usize,
+    ) -> Self {
         Self {
             rust_local,
             rust_parameter,
             python_parameter,
+            typescript_parameter,
         }
     }
 
@@ -41,10 +48,13 @@ impl PackageBindingSlots {
         self.rust_local
             .saturating_add(self.rust_parameter)
             .saturating_add(self.python_parameter)
+            .saturating_add(self.typescript_parameter)
     }
 
     fn admit(&mut self, symbol: &crate::SyntaxSymbol) -> bool {
-        let available = if symbol.is_python_parameter() {
+        let available = if symbol.is_typescript_parameter() {
+            &mut self.typescript_parameter
+        } else if symbol.is_python_parameter() {
             &mut self.python_parameter
         } else if symbol.is_rust_parameter_binding() {
             &mut self.rust_parameter

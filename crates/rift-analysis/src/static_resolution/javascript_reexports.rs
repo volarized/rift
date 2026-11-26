@@ -404,7 +404,7 @@ fn files<'source>(
         };
         files.insert(
             document.path.as_str(),
-            File::new(document, facts, None, work)?,
+            File::new(document, facts, None, &|_| false, work)?,
         );
     }
     Some(files)

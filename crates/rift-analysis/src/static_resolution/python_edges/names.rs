@@ -52,22 +52,17 @@ impl<'source> Index<'source> {
         parameters: bool,
     ) {
         for &(read, name) in file.facts.python_local_reads() {
-            let parameter = file.python_parameters.get(&name).copied();
-            if parameters != parameter.is_some() {
-                continue;
-            }
+            let target = match file.python_parameters.get(&name) {
+                Some(&Some(symbol)) if parameters => Some(Target {
+                    file: file.document,
+                    symbol,
+                }),
+                None if !parameters => file.target_at(name),
+                _ => continue,
+            };
             if !work.charge() {
                 return;
             }
-            let target = parameter.map_or_else(
-                || file.target_at(name),
-                |symbol| {
-                    Some(Target {
-                        file: file.document,
-                        symbol,
-                    })
-                },
-            );
             if let Some(occurrence) = target
                 .and_then(|target| file.python_local_target(read, name, target, work))
                 .and_then(|target| self.python_access(file, read, ReferenceRole::Read, target))

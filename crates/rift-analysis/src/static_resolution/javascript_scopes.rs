@@ -33,6 +33,9 @@ impl<'source> Scopes<'source> {
         let mut fields = BTreeSet::new();
         let mut values: BTreeMap<ByteRange, Option<&SyntaxSymbol>> = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
+            if symbol.is_typescript_parameter() {
+                continue;
+            }
             if !work.charge() {
                 return None;
             }
@@ -116,6 +119,9 @@ fn deferred_scopes(
         functions.insert(range);
     }
     for symbol in file.document.facts.symbols() {
+        if symbol.is_typescript_parameter() {
+            continue;
+        }
         if !work.charge() {
             return None;
         }

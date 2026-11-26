@@ -7,6 +7,7 @@ mod javascript_edges;
 mod javascript_exports;
 mod javascript_member_callbacks;
 mod javascript_members;
+mod javascript_parameters;
 mod javascript_reexports;
 mod javascript_scopes;
 mod python_edges;
@@ -25,7 +26,7 @@ use rift_protocol::read::SymbolKind;
 use rift_provider::{NormalizedGraph, NormalizedTarget};
 use rift_syntax::{
     ByteRange, DocumentPlacement, PythonDeletion, SYNTAX_PROVIDER_ID, StaticBinding,
-    StaticBindingKind, StaticCall, StaticFacts, SyntaxFacts, SyntaxSymbol,
+    StaticBindingKind, StaticCall, StaticFacts, StaticParameter, SyntaxFacts, SyntaxSymbol,
 };
 
 pub(crate) use external::ExternalOccurrence;
@@ -217,6 +218,7 @@ enum DeferredReferences<'source> {
     },
     PythonLocals,
     PythonParameters,
+    TypeScriptParameters(Vec<ByteRange>),
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -474,6 +476,11 @@ fn member_facet<'source>(candidates: &[&'source SyntaxSymbol]) -> Option<&'sourc
     }
 }
 
+struct TypeScriptParameter<'source> {
+    symbol: &'source SyntaxSymbol,
+    site: &'source StaticParameter,
+}
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
@@ -488,8 +495,11 @@ struct File<'source> {
     /// The reference prefix and declaration count before additional Rust bindings.
     primary_reference_count: usize,
     rust_local_count: usize,
+    package_binding_count: usize,
+    typescript_parameters:
+        BTreeMap<&'source str, BTreeMap<ByteRange, TypeScriptParameter<'source>>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
-    python_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
@@ -637,6 +647,7 @@ impl<'source> File<'source> {
         document: &'source StaticSource<'source>,
         facts: &'source StaticFacts,
         configuration: Option<&crate::analyzer::namespace::RustConfiguration<'_>>,
+        admitted_binding: &impl Fn(Target<'source>) -> bool,
         work: &mut Work,
     ) -> Option<Self> {
         let mut file = Self {
@@ -650,6 +661,8 @@ impl<'source> File<'source> {
             callables: EnclosingDefinitions::new([]),
             primary_reference_count: facts.references().len(),
             rust_local_count: 0,
+            package_binding_count: 0,
+            typescript_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -703,7 +716,7 @@ impl<'source> File<'source> {
         file.conditions = Conditions::new(conditions);
         file.index_python_deletions(work)?;
         file.index_bindings(work)?;
-        file.index_symbols(work)?;
+        file.index_symbols(admitted_binding, work)?;
         file.index_javascript_members(work)?;
         file.callbacks = javascript_callbacks::Callbacks::index(facts, work)?;
         Some(file)
@@ -920,7 +933,11 @@ impl<'source> File<'source> {
         Some(())
     }
 
-    fn index_symbols(&mut self, work: &mut Work) -> Option<()> {
+    fn index_symbols(
+        &mut self,
+        admitted_binding: &impl Fn(Target<'source>) -> bool,
+        work: &mut Work,
+    ) -> Option<()> {
         let mut callables = Vec::new();
         let mut classes = Vec::new();
         let python = self.document.facts.language().name == "python";
@@ -933,14 +950,26 @@ impl<'source> File<'source> {
         {
             self.python_whole = python_edges::WholeFile::Expression;
         }
+        let parameters = javascript_parameters::parameter_sites(self.document.facts, self.facts);
         for symbol in self.document.facts.symbols() {
-            if symbol.is_rust_local_binding() {
-                self.rust_local_count += 1;
-                continue;
-            }
-            if symbol.is_python_parameter() {
-                if let Some(name) = symbol.name_range {
-                    self.python_parameters.insert(name, symbol);
+            if symbol.is_package_binding() {
+                self.package_binding_count += 1;
+                let admitted = admitted_binding(Target {
+                    file: self.document,
+                    symbol,
+                });
+                if symbol.is_rust_local_binding() {
+                    self.rust_local_count += usize::from(admitted);
+                } else if let Some(name) = symbol.name_range {
+                    if symbol.is_python_parameter() {
+                        self.python_parameters
+                            .insert(name, admitted.then_some(symbol));
+                    } else if admitted && let Some(&site) = parameters.get(&name) {
+                        self.typescript_parameters
+                            .entry(symbol.name.as_str())
+                            .or_default()
+                            .insert(name, TypeScriptParameter { symbol, site });
+                    }
                 }
                 continue;
             }
@@ -1008,12 +1037,17 @@ impl<'source> File<'source> {
             self.facts.bindings().len(),
             self.facts.python_deletions().len(),
             self.facts.heritage_edges().len(),
-            self.document.facts.symbols().len()
-                - self.rust_local_count
-                - self.python_parameters.len(),
+            self.document.facts.symbols().len() - self.package_binding_count,
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
+    }
+
+    fn has_python_local_reads(&self) -> bool {
+        self.facts
+            .python_local_reads()
+            .iter()
+            .any(|(_, name)| !matches!(self.python_parameters.get(name), Some(None)))
     }
 
     fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
@@ -1224,6 +1258,33 @@ impl<'source> File<'source> {
     }
 }
 
+/// The exact source binding of a captured declaration in the admitted syntax publication.
+fn syntax_target<'graph>(
+    graph: &'graph NormalizedGraph,
+    provider: &ProviderId,
+    publication: rift_core::ProviderRevision,
+    target: Target<'_>,
+) -> Option<(ContributionReference, &'graph DeclarationBinding)> {
+    let address = target.symbol.provider_address(
+        &target.file.facts.language().identity_segment(),
+        target.file.placement.identity_path(),
+    );
+    let reference = ContributionReference::new(
+        provider.clone(),
+        ProviderSymbolId::for_symbol(&address).ok()?,
+    );
+    let key =
+        rift_core::ContributionKey::new(provider.clone(), publication, reference.symbol().clone());
+    let target_binding = graph.contribution(&key)?.source()?;
+    if target_binding.unit() != target.file.placement.unit()
+        || target_binding.range().start() != target.symbol.item_range.start
+        || target_binding.range().end() != target.symbol.item_range.end
+    {
+        return None;
+    }
+    Some((reference, target_binding))
+}
+
 enum Binding<'source> {
     Found(&'source StaticBinding),
     Missing,
@@ -1259,6 +1320,25 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut files = BTreeMap::new();
+        let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok();
+        let syntax_publication = provider
+            .as_ref()
+            .and_then(|provider| graph.publications().provider(provider))
+            .map(rift_provider::ProviderPublication::revision);
+        let admitted_binding = |target| {
+            provider
+                .as_ref()
+                .zip(syntax_publication)
+                .is_some_and(|(provider, publication)| {
+                    syntax_target(graph, provider, publication, target).is_some_and(
+                        |(reference, _)| {
+                            graph.record_for(&reference).is_some_and(|record| {
+                                record.resolution() == rift_core::SymbolResolution::Established
+                            })
+                        },
+                    )
+                })
+        };
         let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
         for document in documents {
@@ -1283,6 +1363,7 @@ impl<'source> Index<'source> {
                 document,
                 facts,
                 Some(&configurations.file(document.path.as_str())),
+                &admitted_binding,
                 work,
             )?;
             if files.insert(document.path.as_str(), file).is_some() {
@@ -1311,11 +1392,9 @@ impl<'source> Index<'source> {
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let owners = external::Owners::new(namespace, work)?;
-        let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
-        let syntax_publication = graph.publications().provider(&provider)?.revision();
         let mut index = Self {
             graph,
-            provider,
+            provider: provider?,
             files,
             rust,
             javascript,
@@ -1326,7 +1405,7 @@ impl<'source> Index<'source> {
             python_aliases: python_edges::ClassAliases::default(),
             python_members: python_edges::MemberOwners::default(),
             python_writes,
-            syntax_publication,
+            syntax_publication: syntax_publication?,
             unavailable_sources,
             #[cfg(test)]
             performed: std::sync::atomic::AtomicUsize::new(0),
@@ -1418,7 +1497,8 @@ impl<'source> Index<'source> {
                         DeferredReferences::Python { .. }
                         | DeferredReferences::PythonQualifiers { .. }
                         | DeferredReferences::PythonLocals
-                        | DeferredReferences::PythonParameters => &mut deferred_references,
+                        | DeferredReferences::PythonParameters
+                        | DeferredReferences::TypeScriptParameters(_) => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
@@ -1444,7 +1524,10 @@ impl<'source> Index<'source> {
             resolution.supplemental_start =
                 Some((resolution.occurrences.len(), resolution.external.len()));
         }
-        let mut existing = VecDeque::from(references);
+        let (mut typescript_parameter_sites, mut existing): (VecDeque<_>, VecDeque<_>) =
+            references.into_iter().partition(|(_, _, sites)| {
+                matches!(sites, DeferredReferences::TypeScriptParameters(_))
+            });
         let mut macro_sites = VecDeque::new();
         let mut rust_local_sites = VecDeque::new();
         let mut python_local_sites = VecDeque::new();
@@ -1455,12 +1538,14 @@ impl<'source> Index<'source> {
             .or_else(|| rust_local_sites.pop_front())
             .or_else(|| python_local_sites.pop_front())
             .or_else(|| python_parameter_sites.pop_front())
+            .or_else(|| typescript_parameter_sites.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
-            let locals = (!file.facts.python_local_reads().is_empty())
+            let locals = file
+                .has_python_local_reads()
                 .then_some(DeferredReferences::PythonLocals);
             let next = match sites {
                 DeferredReferences::Python { names, imports } => {
@@ -1477,11 +1562,17 @@ impl<'source> Index<'source> {
                 }
                 DeferredReferences::PythonLocals => {
                     self.python_local_reads(file, &mut deferred, resolution, false);
-                    (!file.python_parameters.is_empty())
+                    file.python_parameters
+                        .values()
+                        .any(Option::is_some)
                         .then_some(DeferredReferences::PythonParameters)
                 }
                 DeferredReferences::PythonParameters => {
                     self.python_local_reads(file, &mut deferred, resolution, true);
+                    None
+                }
+                DeferredReferences::TypeScriptParameters(sites) => {
+                    self.typescript_parameter_reads(file, sites, &mut deferred, resolution);
                     None
                 }
                 DeferredReferences::Rust {
@@ -1504,6 +1595,7 @@ impl<'source> Index<'source> {
                 let queue = match next {
                     DeferredReferences::PythonLocals => &mut python_local_sites,
                     DeferredReferences::PythonParameters => &mut python_parameter_sites,
+                    DeferredReferences::TypeScriptParameters(_) => &mut typescript_parameter_sites,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1682,19 +1774,20 @@ impl<'source> Index<'source> {
             python_qualifiers: imports,
             rust_macros,
         } = self.resolve_imports(file, work, result)?;
+        let mut parameter_reads = Vec::new();
         if matches!(
             file.document.facts.language().name.as_str(),
             "javascript" | "typescript"
         ) {
-            self.javascript_edges(file, work, result);
+            self.javascript_edges(file, work, result, &mut parameter_reads);
         }
         let deferred = match file.document.facts.language().name.as_str() {
+            "typescript" => (!work.exhausted && !parameter_reads.is_empty())
+                .then_some(DeferredReferences::TypeScriptParameters(parameter_reads)),
             "python" => {
                 let names = self.python_references(file, work, result);
                 (!work.exhausted
-                    && (names.is_some()
-                        || !imports.is_empty()
-                        || !file.facts.python_local_reads().is_empty()))
+                    && (names.is_some() || !imports.is_empty() || file.has_python_local_reads()))
                 .then_some(DeferredReferences::Python { names, imports })
             }
             "rust" => {
@@ -2016,26 +2109,8 @@ impl<'source> Index<'source> {
         file.text(range)?;
         file.text(callee_range)?;
         let range = SourceRange::new(range.start, range.end).ok()?;
-        let address = target.symbol.provider_address(
-            &target.file.facts.language().identity_segment(),
-            target.file.placement.identity_path(),
-        );
-        let reference = ContributionReference::new(
-            self.provider.clone(),
-            ProviderSymbolId::for_symbol(&address).ok()?,
-        );
-        let key = rift_core::ContributionKey::new(
-            self.provider.clone(),
-            self.syntax_publication,
-            reference.symbol().clone(),
-        );
-        let target_binding = self.graph.contribution(&key)?.source()?;
-        if target_binding.unit() != target.file.placement.unit()
-            || target_binding.range().start() != target.symbol.item_range.start
-            || target_binding.range().end() != target.symbol.item_range.end
-        {
-            return None;
-        }
+        let (reference, target_binding) =
+            syntax_target(self.graph, &self.provider, self.syntax_publication, target)?;
         let record = self.graph.record_for(&reference)?;
         let normalized = match record.resolution() {
             rift_core::SymbolResolution::Established => {
@@ -2066,6 +2141,7 @@ impl StaticResolution {
                 ..
             } | DeferredReferences::PythonLocals
                 | DeferredReferences::PythonParameters
+                | DeferredReferences::TypeScriptParameters(_)
         ) {
             self.late_supplemental_start
                 .get_or_insert(self.occurrences.len());

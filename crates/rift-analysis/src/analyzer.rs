@@ -496,6 +496,7 @@ fn binding_capacity(
     let mut rust_locals = BindingDemand::default();
     let mut rust_parameters = BindingDemand::default();
     let mut python_parameters = BindingDemand::default();
+    let mut typescript_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
@@ -511,7 +512,9 @@ fn binding_capacity(
                     .logical_identity(&symbol.qualified_name)
                     .is_some()
         }) {
-            let demand = if symbol.is_python_parameter() {
+            let demand = if symbol.is_typescript_parameter() {
+                &mut typescript_parameters
+            } else if symbol.is_python_parameter() {
                 &mut python_parameters
             } else if symbol.is_rust_parameter_binding() {
                 &mut rust_parameters
@@ -529,7 +532,10 @@ fn binding_capacity(
             .saturating_add(unnamed)
             .saturating_add(synthetic_objects),
     );
-    let count = rust_locals.count + rust_parameters.count + python_parameters.count;
+    let count = rust_locals.count
+        + rust_parameters.count
+        + python_parameters.count
+        + typescript_parameters.count;
     let (mut bytes, record) = limits
         .retained_source()
         .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
@@ -546,12 +552,14 @@ fn binding_capacity(
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
     let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
     let python_parameter_slots = python_parameters.reserve(&mut slots, &mut bytes, record);
+    let typescript_parameter_slots = typescript_parameters.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
             local_slots,
             rust_parameter_slots,
             python_parameter_slots,
+            typescript_parameter_slots,
         ),
     )
 }
