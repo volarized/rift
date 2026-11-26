@@ -1337,6 +1337,90 @@ pub fn call() { left::one(); right::one(); }
 }
 
 #[test]
+fn package_rust_shared_literal_modules_resolve_each_outgoing_scope() {
+    const ROOT: &str = r#"
+#[path = "shared.rs"]
+pub mod east;
+#[path = "shared.rs"]
+pub mod west;
+pub fn outer() -> u8 { east::caller() + west::caller() }
+"#;
+    const SHARED: &str = "pub type Number = u8;
+pub fn leaf() -> Number { 7 }
+pub fn caller() -> Number { leaf() }
+pub fn through_self() -> Number { self::leaf() }
+pub fn shadowed() -> Number { let leaf = || 3; leaf() }
+#[cfg(any())]
+pub fn inactive() -> Number { leaf() }
+";
+    let publication = fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![("src/lib.rs", ROOT), ("src/shared.rs", SHARED)],
+        None,
+    )
+    .expect("checked literal modules")
+    .into_parts()
+    .0;
+    assert_eq!(publication.units.len(), 2);
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0.as_str() == "src/shared.rs")
+        .expect("shared physical unit")
+        .unit;
+    for module in ["east", "west"] {
+        for (caller, spelling) in [("caller", "leaf()"), ("through_self", "self::leaf()")] {
+            let declaration = format!("fn {caller}() -> Number");
+            let first = SHARED.find(&declaration).expect("declared function");
+            let start = first + SHARED[first..].find(spelling).expect("authored call");
+            let end = start + spelling.len();
+            let from = format!("/beacon/{module}/{caller}");
+            let to = format!("/beacon/{module}/leaf");
+            assert!(publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with(&from)
+                    && edge.to.as_str().ends_with(&to)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == unit
+                            && site.range.start == start as u64
+                            && site.range.end == end as u64
+                    })
+            }));
+            let ty = format!("/beacon/{module}/Number");
+            assert!(publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::HasType]
+                    && edge.from.as_str().ends_with(&from)
+                    && edge.to.as_str().ends_with(&ty)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| &site.unit == unit)
+            }));
+        }
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with("/beacon/outer")
+                && edge
+                    .to
+                    .as_str()
+                    .ends_with(&format!("/beacon/{module}/caller"))
+        }));
+    }
+    let wrong = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/inactive")
+                || (edge.from.as_str().ends_with("/shadowed")
+                    && ["/beacon/east/leaf", "/beacon/west/leaf"]
+                        .iter()
+                        .any(|suffix| edge.to.as_str().ends_with(suffix)))
+        })
+        .collect::<Vec<_>>();
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+#[test]
 fn package_rust_constructors_and_fields_use_their_block_owner() {
     use rift_core::ReferenceRole;
     use rift_provider::NormalizedTarget;

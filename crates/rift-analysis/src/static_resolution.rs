@@ -116,6 +116,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_import_qualifier_start: Option<usize>,
     /// First occurrence that reads a checked Rust shorthand pattern binding.
     pub(crate) rust_shorthand_start: Option<usize>,
+    /// First occurrence resolved in an explicitly placed shared Rust source.
+    pub(crate) rust_shared_start: Option<usize>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
@@ -280,6 +282,7 @@ fn resolve_by<'source>(
     index.resolve_rust_argument_values(&mut work, &mut resolution);
     index.resolve_rust_import_qualifiers(&mut work, &mut resolution);
     index.resolve_rust_shorthand(&mut work, &mut resolution);
+    index.resolve_rust_shared_sources(documents.1, namespace, &mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

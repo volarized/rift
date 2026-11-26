@@ -14,6 +14,7 @@ const RECEIVER_DEPTH_MAX: usize = 64;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use rift_core::SymbolId;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, StaticBindingKind, StaticCall, StaticCallee, StaticRustUse, SyntaxSymbol,
@@ -30,6 +31,7 @@ pub(super) enum ExternCallee<'source> {
 #[derive(Default)]
 pub(super) struct Namespaces<'source> {
     files: BTreeMap<&'source str, FileNamespace<'source>>,
+    shared_files: BTreeMap<(&'source str, &'source SymbolId), FileNamespace<'source>>,
     /// The file scopes where type aliases declare their right-hand types.
     source_files: Arc<BTreeMap<&'source str, File<'source>>>,
     values: BTreeMap<Vec<String>, Option<Target<'source>>>,
@@ -843,6 +845,15 @@ impl<'source> Namespaces<'source> {
     ) -> Option<()> {
         let base = document.placement.module_path();
         self.bases.insert(base.to_vec());
+        if let Some(module) = document.placement.module() {
+            self.shared_files.insert(
+                (document.path.as_str(), module),
+                FileNamespace {
+                    base: base.to_vec(),
+                    inline: Vec::new(),
+                },
+            );
+        }
         for symbol in document.facts.symbols() {
             if !work.charge() {
                 return None;
@@ -1178,8 +1189,7 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Target<'source>> {
         let name = file.text(call.callee_range)?;
         let position = call.range.start;
-        let (module, inline_scope) =
-            self.module_at_with_scope(file.document.path.as_str(), position, work)?;
+        let (module, inline_scope) = self.module_with_scope(file, position, work)?;
         let binding = match file.binding(name, position, is_value_binding, work) {
             Binding::Found(binding) if self.module(file, binding.name.start, work)? == module => {
                 Some(binding)
@@ -1778,12 +1788,22 @@ impl<'source> Namespaces<'source> {
     }
 
     fn module(&self, file: &File<'source>, position: u64, work: &mut Work) -> Option<&[String]> {
-        self.module_at(file.document.path.as_str(), position, work)
+        self.module_with_scope(file, position, work)
+            .map(|(path, _)| path)
     }
 
     fn module_at(&self, file: &str, position: u64, work: &mut Work) -> Option<&[String]> {
-        self.module_at_with_scope(file, position, work)
-            .map(|(path, _)| path)
+        let scope = self.files.get(file)?;
+        self.module_in(scope, position, work).map(|(path, _)| path)
+    }
+
+    fn file_namespace(&self, document: &StaticSource<'source>) -> Option<&FileNamespace<'source>> {
+        let path = document.path.as_str();
+        document
+            .placement
+            .module()
+            .and_then(|module| self.shared_files.get(&(path, module)))
+            .or_else(|| self.files.get(path))
     }
 
     fn module_scope(
@@ -1792,17 +1812,25 @@ impl<'source> Namespaces<'source> {
         position: u64,
         work: &mut Work,
     ) -> Option<ByteRange> {
-        let (_, inline) = self.module_at_with_scope(file.document.path.as_str(), position, work)?;
+        let (_, inline) = self.module_with_scope(file, position, work)?;
         inline.or_else(|| crate::analyzer::namespace::rust_file_scope(file.document.source))
     }
 
-    fn module_at_with_scope(
+    fn module_with_scope(
         &self,
-        file: &str,
+        file: &File<'source>,
         position: u64,
         work: &mut Work,
     ) -> Option<(&[String], Option<ByteRange>)> {
-        let namespace = self.files.get(file)?;
+        self.module_in(self.file_namespace(file.document)?, position, work)
+    }
+
+    fn module_in<'scope>(
+        &self,
+        namespace: &'scope FileNamespace<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<(&'scope [String], Option<ByteRange>)> {
         let mut path = namespace.base.as_slice();
         let mut scope = None;
         let crate_name = path.first()?;

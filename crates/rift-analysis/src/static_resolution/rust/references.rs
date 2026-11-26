@@ -13,8 +13,11 @@ use super::{
     Namespace, Namespaces, RECEIVER_DEPTH_MAX, inherent_member, is_type_binding, is_value_binding,
     path_segments,
 };
+use crate::NamespaceInput;
+use crate::analyzer::namespace::RustConfigurations;
 use crate::static_resolution::{
-    Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
+    Binding, File, Index, StaticOccurrence, StaticResolution, StaticSource, Target, Work,
+    admitted_facts,
 };
 
 pub(super) enum ReceiverOwner<'source> {
@@ -29,6 +32,104 @@ struct ImportQualifierSites {
 }
 
 impl<'source> Index<'source> {
+    /// Resolves authored calls and type names with each shared source's written module owner.
+    pub(in crate::static_resolution) fn resolve_rust_shared_sources(
+        &self,
+        shared: &'source [StaticSource<'source>],
+        namespace: &NamespaceInput<'_>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        if shared.is_empty() {
+            return;
+        }
+        let configurations = RustConfigurations::new(namespace);
+        let start = resolution.occurrences.len();
+        let admitted = |target| {
+            Self::admitted_binding(
+                self.graph,
+                Some((&self.provider, self.syntax_publication)),
+                target,
+            )
+        };
+        for document in shared {
+            if !work.charge() {
+                break;
+            }
+            let Some(facts) = admitted_facts(document) else {
+                continue;
+            };
+            let configuration = configurations.file(document.path.as_str());
+            let Some(file) = File::new(document, facts, Some(&configuration), &admitted, work)
+            else {
+                break;
+            };
+            self.rust_shared_references(&file, work, resolution);
+        }
+        resolution.rust_shared_start = (resolution.occurrences.len() != start).then_some(start);
+    }
+
+    fn rust_shared_references(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        for call in file.facts.calls() {
+            if !work.charge() {
+                return;
+            }
+            if matches!(call.callee, StaticCallee::Direct | StaticCallee::Qualified)
+                && let Some(mut occurrence) = self.call_occurrence(file, call, work)
+                && self.rust_shared_owner(file, call.range, &mut occurrence)
+            {
+                resolution.record(Some(occurrence));
+            }
+        }
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return;
+            }
+            let range = reference.target;
+            if reference.role == ReferenceRole::Type
+                && let Some(target) = self.rust.edge_type_target(file, range, work)
+                && let Some(mut occurrence) =
+                    self.occurrence(file, range, range, ReferenceRole::Type, target)
+                && self.rust_shared_owner(file, range, &mut occurrence)
+            {
+                resolution.record(Some(occurrence));
+            }
+        }
+    }
+
+    fn rust_shared_owner(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        occurrence: &mut StaticOccurrence,
+    ) -> bool {
+        let Some(owner) = file
+            .enclosing_callable(range)
+            .filter(|owner| owner.symbol.kind == "function" && owner.symbol.container.is_none())
+        else {
+            return false;
+        };
+        let Some(source) = self.occurrence(file, range, range, occurrence.role, owner) else {
+            return false;
+        };
+        let rift_provider::NormalizedTarget::Symbol(owner) = source.target else {
+            return false;
+        };
+        if !matches!(
+            occurrence.target,
+            rift_provider::NormalizedTarget::Symbol(_)
+        ) {
+            return false;
+        }
+        occurrence.edge_from = Some(owner);
+        true
+    }
+
     /// Adds checked Rust shorthand uses after the other Rust occurrence classes.
     pub(in crate::static_resolution) fn resolve_rust_shorthand(
         &self,
