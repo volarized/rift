@@ -531,6 +531,8 @@ pub struct StaticFactsParts {
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
+    /// Named function and literal body for each written object branch of a conditional return.
+    pub returned_branch_objects: Vec<(ByteRange, ByteRange)>,
     /// Declared names whose initializer is an object literal that ends in a spread of a
     /// name, with that spread name: `const o = { a: 1, ...base }` gives `(o, base)`.
     pub spread_values: Vec<(ByteRange, ByteRange)>,
@@ -896,6 +898,12 @@ impl StaticFacts {
         &self.0.returned_objects
     }
 
+    /// Authored conditional branches for declaration placement.
+    #[must_use]
+    pub fn returned_branch_objects(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.returned_branch_objects
+    }
+
     /// Names initialized by an object literal ending in a spread of a name, with that name.
     #[must_use]
     pub fn spread_values(&self) -> &[(ByteRange, ByteRange)] {
@@ -1096,6 +1104,7 @@ impl StaticFacts {
             vector_capacity(&self.0.object_members),
             vector_capacity(&self.0.body_members),
             vector_capacity(&self.0.returned_objects),
+            vector_capacity(&self.0.returned_branch_objects),
             vector_capacity(&self.0.spread_values),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
@@ -1188,6 +1197,7 @@ impl StaticFacts {
             self.object_members().len(),
             self.body_members().len(),
             self.returned_objects().len(),
+            self.returned_branch_objects().len(),
             self.spread_values().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
@@ -1405,6 +1415,10 @@ impl StaticFacts {
                 .returned_objects()
                 .iter()
                 .all(|(owner, object)| valid(*owner) && object.is_none_or(valid))
+            && self
+                .returned_branch_objects()
+                .iter()
+                .all(|(owner, object)| valid(*owner) && valid(*object))
             && self
                 .spread_values()
                 .iter()

@@ -511,17 +511,39 @@ impl Kinds {
         let Some(owner) = owner else {
             return Ok(());
         };
-        let mut value = value;
-        // Each step descends within the admitted syntax depth.
-        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
-            value = inner.named_child(0);
-        }
+        let owner = byte_range(owner)?;
+        let value = self.written_return_value(value);
         let object = value
             .filter(|node| node.kind_id() == self.object_literal[0])
             .map(byte_range)
             .transpose()?;
-        facts.returned_objects.push((byte_range(owner)?, object));
+        facts.returned_objects.push((owner, object));
+        if self.type_shapes.is_none()
+            && self.function.contains(&function_element.kind_id())
+            && let Some(value) =
+                value.filter(|node| node.kind() == "ternary_expression" && !node.has_error())
+        {
+            let branches = ["consequence", "alternative"].map(|field| {
+                self.written_return_value(value.child_by_field_name(field))
+                    .filter(|node| node.kind_id() == self.object_literal[0])
+            });
+            if let [Some(first), Some(second)] = branches {
+                for branch in [first, second] {
+                    facts
+                        .returned_branch_objects
+                        .push((owner, byte_range(branch)?));
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn written_return_value<'tree>(&self, mut value: Option<Node<'tree>>) -> Option<Node<'tree>> {
+        // Each step descends within the admitted syntax depth.
+        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
+            value = inner.named_child(0);
+        }
+        value
     }
 
     /// Records a function written as a member of an object literal: a method, or a

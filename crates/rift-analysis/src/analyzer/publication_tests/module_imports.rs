@@ -183,7 +183,7 @@ export function established() {
   return inspect(options.stable);
 }
 export function unsupported(first) {
-  return first ? { opaque: 5 } : { opaque: 6 };
+  return first ? { opaque: 5 } : [{ opaque: 6 }];
 }
 "#;
 
@@ -3175,6 +3175,65 @@ fn non_entry_class_methods_keep_properties_of_returned_call_arguments() {
     });
     assert_eq!(calls, written.into_iter().collect());
 
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
+fn non_entry_conditional_returns_keep_distinct_literal_branch_properties() {
+    const SOURCE: &str = concat!(
+        "export function build(first) {\n",
+        "  return first ? ({ state: 1, ready: true }) : ({ state: 2, ready: false });\n",
+        "}\n",
+        "export function direct(first) {\n",
+        "  if (first) return { stable: 3 };\n",
+        "  return { stable: 4 };\n",
+        "}\n",
+        "export function caller(first) { const result = build(first); return result.state; }\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("authored conditional branch properties");
+
+    let mut identities = BTreeSet::new();
+    for (owner, written) in [
+        ("build", "state: 1"),
+        ("build", "ready: true"),
+        ("build", "state: 2"),
+        ("build", "ready: false"),
+        ("direct", "stable: 3"),
+        ("direct", "stable: 4"),
+    ] {
+        let start = SOURCE.find(written).expect("written property");
+        let property = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property");
+        assert!(!property.public);
+        assert!(property.symbol.as_str().contains(&format!("/{owner}/")));
+        assert!(identities.insert(&property.symbol));
+    }
+    assert!(found.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/caller")
+            && edge.to.as_str().ends_with("/build")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    assert!(
+        found
+            .edges
+            .iter()
+            .all(|edge| { edge.kinds != [EdgeKind::Reads] || !identities.contains(&edge.to) })
+    );
     let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
     assert_eq!(bounded.publication().declarations, found.declarations);
     assert!(

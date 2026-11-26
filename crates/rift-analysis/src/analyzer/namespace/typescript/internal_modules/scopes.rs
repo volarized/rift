@@ -993,7 +993,13 @@ fn returned_literal_owners<'source>(
     facts: &StaticFacts,
 ) -> BTreeMap<ByteRange, Option<&'source str>> {
     let mut owners = BTreeMap::new();
-    for &(name, object) in facts.returned_objects() {
+    let bodies = facts.returned_objects().iter().copied().chain(
+        facts
+            .returned_branch_objects()
+            .iter()
+            .map(|&(name, object)| (name, Some(object))),
+    );
+    for (name, object) in bodies {
         let Some((owner, body)) = declarations.get(&name).zip(object) else {
             continue;
         };
