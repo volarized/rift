@@ -13,6 +13,9 @@ pub const HEADER_BYTES_MAX: usize = 4 << 10;
 /// Maximum bytes in one message body an engine may announce.
 pub const MESSAGE_BYTES_MAX: usize = 64 << 20;
 
+/// Minimum bytes on the wire for a frame, including an empty body.
+pub(crate) const FRAME_BYTES_MIN: usize = b"Content-Length:0\r\n\r\n".len();
+
 /// The header naming the body size, compared ASCII case-insensitively.
 const CONTENT_LENGTH_HEADER: &str = "content-length";
 
@@ -45,6 +48,11 @@ impl Default for Framing {
 }
 
 impl Framing {
+    /// Bytes still held for an incomplete frame.
+    pub(crate) const fn pending_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// An empty codec awaiting its first bytes.
     #[must_use]
     pub fn new() -> Self {

@@ -87,8 +87,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> ScriptedEngine<T> {
     /// Writes one message, framed.
     pub(crate) async fn send(&mut self, message: &Value) {
         let payload = serde_json::to_vec(message).expect("scripted messages serialize");
+        self.send_bytes(&Framing::frame(&payload)).await;
+    }
+
+    /// Writes test bytes without changing their framing.
+    pub(crate) async fn send_bytes(&mut self, bytes: &[u8]) {
         self.transport
-            .write_all(&Framing::frame(&payload))
+            .write_all(bytes)
             .await
             .expect("the duplex writes");
         self.transport.flush().await.expect("the duplex flushes");

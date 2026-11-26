@@ -56,7 +56,7 @@ mod edges;
 mod rust_declarations;
 mod rust_macro_expansion;
 use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE};
-use crate::framing::Framing;
+use crate::framing::{FRAME_BYTES_MIN, Framing, HEADER_BYTES_MAX, MESSAGE_BYTES_MAX};
 use crate::uri::TreeRoot;
 pub use rust_macro_expansion::RustMacroExpansion;
 
@@ -1124,7 +1124,7 @@ impl EngineSession {
         self.refuse_ended()?;
         loop {
             let now = Instant::now();
-            if settled(self) || now >= until {
+            if now >= until || (self.queue.is_empty() && settled(self)) {
                 return Ok(());
             }
             let wake = self
@@ -1607,7 +1607,9 @@ impl EngineSession {
         }
     }
 
-    /// Frames and writes one payload to the engine's stdin.
+    /// Frames and writes one payload to the engine's stdin, draining bounded
+    /// stdout if the two pipes fill. The next exchange routes those messages
+    /// in order, after the current frame reaches the engine.
     ///
     /// The frame counts as in flight from before its first byte until the flush
     /// returns, so a caller that drops the write partway leaves the session not
@@ -1622,8 +1624,46 @@ impl EngineSession {
         };
         let framed = Framing::frame(&payload);
         self.frame_in_flight = true;
-        self.stdin.write_all(&framed).await.map_err(|_| closed())?;
-        self.stdin.flush().await.map_err(|_| closed())?;
+        let message_overhead = size_of::<Vec<u8>>();
+        let mut remaining = (MESSAGE_BYTES_MAX + HEADER_BYTES_MAX + STREAM_READ_BYTES)
+            .saturating_sub(self.framing.pending_bytes());
+        for message in &self.queue {
+            remaining = remaining.saturating_sub(message.len() + message_overhead);
+        }
+        {
+            let stdin = &mut self.stdin;
+            let writing = async {
+                stdin.write_all(&framed).await?;
+                stdin.flush().await
+            };
+            tokio::pin!(writing);
+            let mut chunk = vec![0_u8; STREAM_READ_BYTES].into_boxed_slice();
+            loop {
+                // Once the existing frame buffer is full, the same write deadline applies.
+                // Reserve a queue entry for an already-started frame and entries for
+                // the maximum number of frames the new bytes could complete.
+                let read_charge = 1 + message_overhead.div_ceil(FRAME_BYTES_MIN);
+                let length =
+                    (remaining.saturating_sub(message_overhead) / read_charge).min(chunk.len());
+                tokio::select! {
+                    biased;
+                    result = &mut writing => {
+                        result.map_err(|_| closed())?;
+                        break;
+                    }
+                    read = self.stdout.read(&mut chunk[..length]), if length != 0 => {
+                        let read = read.map_err(|_| closed())?;
+                        if read == 0 {
+                            return Err(closed());
+                        }
+                        self.progress.output(Instant::now());
+                        let messages = self.framing.feed(&chunk[..read])?;
+                        remaining -= read + messages.len() * message_overhead;
+                        self.queue.extend(messages);
+                    }
+                }
+            }
+        }
         self.frame_in_flight = false;
         Ok(())
     }

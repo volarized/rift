@@ -131,6 +131,105 @@ async fn join(engine_task: tokio::task::JoinHandle<()>) {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
+async fn document_open_reads_engine_output_when_both_directions_fill() {
+    let (_workspace, mut session, task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine
+            .notify(
+                "window/logMessage",
+                json!({"type": 4, "message": "x".repeat(128 << 10)}),
+            )
+            .await;
+        for id in [19, 20] {
+            engine
+                .send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "workspace/configuration",
+                    "params": {"items": [{"section": "rust-analyzer"}]},
+                }))
+                .await;
+        }
+        let open = engine.next_message().await;
+        assert_eq!(open["method"], "textDocument/didOpen");
+        assert_eq!(
+            open["params"]["textDocument"]["text"]
+                .as_str()
+                .expect("source text")
+                .len(),
+            128 << 10
+        );
+        for id in [19, 20] {
+            let reply = engine.next_raw_message().await;
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["result"], json!([null]));
+        }
+        engine
+            .notify(
+                "textDocument/publishDiagnostics",
+                json!({
+                    "uri": open["params"]["textDocument"]["uri"],
+                    "version": open["params"]["textDocument"]["version"],
+                    "diagnostics": [],
+                }),
+            )
+            .await;
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.expect_request("exit").await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    session
+        .open(&document, "rust", "x".repeat(128 << 10))
+        .await
+        .expect("both directions make progress");
+    assert!(session.is_open(&document));
+    session
+        .read_output(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            |session| session.published_diagnostics_version(&document).is_some(),
+        )
+        .await
+        .expect("queued requests keep their order");
+    assert!(session.published_diagnostics_version(&document).is_some());
+    session.shutdown().await;
+    join(task).await;
+}
+
+#[tokio::test]
+async fn invalid_and_partial_frames_refuse_an_open_blocked_on_input() {
+    const MALFORMED: &[u8] = b"Invalid header\r\n\r\n";
+    const PARTIAL: &[u8] = b"Content-Length: 42\r\n\r\n{";
+    for (bytes, slug) in [
+        (MALFORMED, errors::lsp::framing_header_malformed::SLUG),
+        (PARTIAL, errors::lsp::engine_timed_out::SLUG),
+    ] {
+        let launch = EngineLaunch {
+            request_timeout: Duration::from_secs(1),
+            ..transport_launch()
+        };
+        let (_workspace, result, task) = begin(launch, move |mut engine| async move {
+            engine.handshake(full_capabilities()).await;
+            engine.send_bytes(bytes).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let mut session = result.expect("initial handshake");
+        let document = path("src/lib.rs");
+        let error = session
+            .open(&document, "rust", "x".repeat(128 << 10))
+            .await
+            .expect_err("the engine never reads this document");
+        assert_eq!(error.slug(), slug);
+        assert!(!session.is_open(&document));
+        assert!(!session.is_intact());
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
 async fn reference_batch_sends_every_request_before_reading_reversed_answers() {
     let (_workspace, mut session, task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
