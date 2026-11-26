@@ -504,6 +504,7 @@ fn binding_capacity(
     let mut python_overload_parameters = BindingDemand::default();
     let mut javascript_parameters = BindingDemand::default();
     let mut callback_parameters = BindingDemand::default();
+    let mut overload_parameters = BindingDemand::default();
     let mut typescript_method_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
@@ -524,6 +525,10 @@ fn binding_capacity(
         }) {
             let demand = if symbol.is_ecmascript_callback_parameter() {
                 &mut callback_parameters
+            } else if facts.language().name == "typescript"
+                && symbol.is_ecmascript_overload_parameter()
+            {
+                &mut overload_parameters
             } else if symbol.is_ecmascript_parameter() {
                 if facts.language().name == "javascript" {
                     &mut javascript_parameters
@@ -577,8 +582,9 @@ fn binding_capacity(
         + python_overload_parameters.count
         + javascript_parameters.count
         + typescript_method_parameters.count
-        + callback_parameters.count;
-    let (mut bytes, record) = binding_source_budget(documents, limits, count);
+        + callback_parameters.count
+        + overload_parameters.count;
+    let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
     let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
@@ -591,7 +597,14 @@ fn binding_capacity(
     let javascript_parameter_slots = javascript_parameters.reserve(&mut slots, &mut bytes, record);
     let typescript_method_slots =
         typescript_method_parameters.reserve(&mut slots, &mut bytes, record);
-    let callback_slots = reserve_callbacks(documents, &callback_parameters, slots, bytes, record);
+    let (callback_slots, overload_slots) = reserve_scoped_parameters(
+        documents,
+        &callback_parameters,
+        &overload_parameters,
+        slots,
+        bytes,
+        record,
+    );
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -606,18 +619,19 @@ fn binding_capacity(
         .with_python_overload_parameter_slots(python_overload_slots)
         .with_javascript_parameters(javascript_parameter_slots)
         .with_typescript_method_parameters(typescript_method_slots)
-        .with_javascript_callback_parameters(callback_slots),
+        .with_javascript_callback_parameters(callback_slots)
+        .with_typescript_overload_parameters(overload_slots),
     )
 }
 
-fn binding_source_budget(
+fn binding_source_capacity(
     documents: &[AnalyzedFile],
     limits: ExactPackageLimits,
-    binding_count: usize,
+    count: usize,
 ) -> (u64, u64) {
     limits
         .retained_source()
-        .filter(|limits| binding_count != 0 && limits.total_bytes_max != u64::MAX)
+        .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
         .map_or((u64::MAX, u64::MAX), |limits| {
             let existing = documents.iter().fold(0_u64, |total, file| {
                 total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
@@ -629,16 +643,17 @@ fn binding_source_budget(
         })
 }
 
-/// Leaves room for established ECMAScript file declarations before callback parameters.
-fn reserve_callbacks(
+/// Leaves room for established ECMAScript file declarations before scoped parameters.
+fn reserve_scoped_parameters(
     documents: &[AnalyzedFile],
-    demand: &BindingDemand,
+    callbacks: &BindingDemand,
+    overloads: &BindingDemand,
     mut slots: usize,
     mut bytes: u64,
     record: u64,
-) -> usize {
-    if demand.count == 0 {
-        return 0;
+) -> (usize, usize) {
+    if callbacks.count == 0 && overloads.count == 0 {
+        return (0, 0);
     }
     for file in documents {
         if let Some(source) = complete_module_bytes(file, record) {
@@ -646,7 +661,10 @@ fn reserve_callbacks(
             bytes = bytes.saturating_sub(source);
         }
     }
-    demand.reserve(&mut slots, &mut bytes, record)
+    (
+        callbacks.reserve(&mut slots, &mut bytes, record),
+        overloads.reserve(&mut slots, &mut bytes, record),
+    )
 }
 
 /// Candidate count and the longest retained name in one class of source-local binding.

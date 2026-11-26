@@ -94,6 +94,10 @@ pub(crate) struct StaticResolution {
     pub(crate) callback_parameter_start: Option<usize>,
     /// Callback parameter reads awaiting their place after containment.
     pub(crate) deferred_callback_parameters: Vec<StaticOccurrence>,
+    /// First TypeScript overload parameter read after callback parameter reads.
+    pub(crate) overload_parameter_start: Option<usize>,
+    /// Overload parameter reads awaiting capacity after earlier package edges.
+    pub(crate) deferred_overload_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -228,6 +232,11 @@ fn resolve_by<'source>(
         let deferred = std::mem::take(&mut resolution.deferred_callback_parameters);
         resolution.occurrences.extend(deferred);
     }
+    if !resolution.deferred_overload_parameters.is_empty() {
+        resolution.overload_parameter_start = Some(resolution.occurrences.len());
+        let deferred = std::mem::take(&mut resolution.deferred_overload_parameters);
+        resolution.occurrences.extend(deferred);
+    }
     external::admit_declared(namespace, &mut resolution.external, work_max);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
@@ -270,6 +279,7 @@ enum DeferredReferences<'source> {
     EcmaScriptModuleSpecifiers,
     EcmaScriptModuleQualifiers,
     JavaScriptCallbackParameters,
+    TypeScriptOverloadParameters,
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -564,6 +574,7 @@ struct File<'source> {
     ecmascript_parameters: EcmaScriptParameters<'source>,
     typescript_method_parameters: EcmaScriptParameters<'source>,
     javascript_callback_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    typescript_overload_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -731,6 +742,7 @@ impl<'source> File<'source> {
             ecmascript_parameters: BTreeMap::new(),
             typescript_method_parameters: BTreeMap::new(),
             javascript_callback_parameters: BTreeMap::new(),
+            typescript_overload_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -1012,13 +1024,17 @@ impl<'source> File<'source> {
         if symbol.is_rust_local_binding() {
             self.rust_local_count += usize::from(admitted);
         } else if let Some(name) = symbol.name_range {
-            if symbol.is_python_parameter() {
+            if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
                 self.python_parameters
                     .insert(name, admitted.then_some(symbol));
             } else if admitted && let Some(site) = site {
                 let parameter = EcmaScriptParameter { symbol, site };
                 if symbol.is_ecmascript_callback_parameter() {
                     self.javascript_callback_parameters.insert(name, parameter);
+                    return;
+                }
+                if symbol.is_ecmascript_overload_parameter() {
+                    self.typescript_overload_parameters.insert(name, parameter);
                     return;
                 }
                 let parameters = if symbol
@@ -1665,7 +1681,8 @@ impl<'source> Index<'source> {
                         | DeferredReferences::TypeScriptMethodParameters { .. }
                         | DeferredReferences::EcmaScriptModuleSpecifiers
                         | DeferredReferences::EcmaScriptModuleQualifiers
-                        | DeferredReferences::JavaScriptCallbackParameters => {
+                        | DeferredReferences::JavaScriptCallbackParameters
+                        | DeferredReferences::TypeScriptOverloadParameters => {
                             &mut deferred_references
                         }
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
@@ -1721,6 +1738,7 @@ impl<'source> Index<'source> {
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
         let mut callback_parameters = VecDeque::new();
+        let mut overload_parameters = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1741,6 +1759,7 @@ impl<'source> Index<'source> {
             .or_else(|| module_specifiers.pop_front())
             .or_else(|| module_qualifiers.pop_front())
             .or_else(|| callback_parameters.pop_front())
+            .or_else(|| overload_parameters.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1778,6 +1797,7 @@ impl<'source> Index<'source> {
                     DeferredReferences::EcmaScriptModuleSpecifiers => &mut module_specifiers,
                     DeferredReferences::EcmaScriptModuleQualifiers => &mut module_qualifiers,
                     DeferredReferences::JavaScriptCallbackParameters => &mut callback_parameters,
+                    DeferredReferences::TypeScriptOverloadParameters => &mut overload_parameters,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1938,11 +1958,19 @@ impl<'source> Index<'source> {
                     .file_module_qualifier_start
                     .get_or_insert(resolution.occurrences.len());
                 self.javascript_module_qualifiers(file, work, resolution);
-                (!file.javascript_callback_parameters.is_empty())
-                    .then_some(DeferredReferences::JavaScriptCallbackParameters)
+                if file.javascript_callback_parameters.is_empty() {
+                    (!file.typescript_overload_parameters.is_empty())
+                        .then_some(DeferredReferences::TypeScriptOverloadParameters)
+                } else {
+                    Some(DeferredReferences::JavaScriptCallbackParameters)
+                }
             }
             DeferredReferences::JavaScriptCallbackParameters => {
-                self.javascript_callback_parameter_reads(file, work, resolution);
+                self.ecmascript_scoped_parameter_reads(file, false, work, resolution);
+                None
+            }
+            DeferredReferences::TypeScriptOverloadParameters => {
+                self.ecmascript_scoped_parameter_reads(file, true, work, resolution);
                 None
             }
             DeferredReferences::Rust {

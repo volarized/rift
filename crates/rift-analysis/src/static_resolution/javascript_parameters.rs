@@ -6,7 +6,10 @@ use rift_core::ReferenceRole;
 use rift_syntax::{ByteRange, StaticBindingKind, StaticFacts, StaticParameter, SyntaxFacts};
 
 use super::javascript::js_binding;
-use super::{EcmaScriptParameters, File, Index, StaticOccurrence, StaticResolution, Target, Work};
+use super::{
+    EcmaScriptParameter, EcmaScriptParameters, File, Index, StaticOccurrence, StaticResolution,
+    Target, Work,
+};
 
 #[derive(Default)]
 pub(super) struct ParameterReads {
@@ -53,12 +56,24 @@ impl File<'_> {
 }
 
 impl<'source> Index<'source> {
-    pub(super) fn javascript_callback_parameter_reads(
+    pub(super) fn ecmascript_scoped_parameter_reads(
         &self,
         file: &File<'source>,
+        overloads: bool,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
+        let (parameters, pending) = if overloads {
+            (
+                &file.typescript_overload_parameters,
+                &mut result.deferred_overload_parameters,
+            )
+        } else {
+            (
+                &file.javascript_callback_parameters,
+                &mut result.deferred_callback_parameters,
+            )
+        };
         for reference in file.facts.references() {
             if !work.charge() {
                 return;
@@ -66,18 +81,19 @@ impl<'source> Index<'source> {
             if reference.role == ReferenceRole::Read
                 && !file.members.contains_key(&reference.target)
                 && let Some(occurrence) =
-                    self.javascript_callback_parameter_read(file, reference.target, work)
+                    self.ecmascript_scoped_parameter_read(file, reference.target, parameters, work)
             {
                 result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
-                result.deferred_callback_parameters.push(occurrence);
+                pending.push(occurrence);
             }
         }
     }
 
-    fn javascript_callback_parameter_read(
+    fn ecmascript_scoped_parameter_read(
         &self,
         file: &File<'source>,
         range: ByteRange,
+        parameters: &BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let name = file.text(range)?;
@@ -89,9 +105,16 @@ impl<'source> Index<'source> {
             ReferenceRole::Read,
             work,
         )?;
-        let parameter = file.javascript_callback_parameters.get(&binding.name)?;
+        let parameter = parameters.get(&binding.name)?;
         if binding.kind != StaticBindingKind::Shadow || binding.scope != parameter.site.function {
             return None;
+        }
+        if parameter.symbol.is_ecmascript_overload_parameter() {
+            let owner = file.target_at(parameter.site.owner?)?;
+            if owner.symbol.item_range != binding.scope || !owner.symbol.body_range?.encloses(range)
+            {
+                return None;
+            }
         }
         let target = Target {
             file: file.document,

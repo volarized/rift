@@ -29,6 +29,7 @@ pub struct PackageBindingSlots {
     python_overload_parameter: usize,
     javascript_parameter: usize,
     javascript_callback_parameter: usize,
+    typescript_overload_parameter: usize,
     typescript_method_parameter: usize,
 }
 
@@ -52,6 +53,7 @@ impl PackageBindingSlots {
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
             javascript_callback_parameter: 0,
+            typescript_overload_parameter: 0,
             typescript_method_parameter: 0,
         }
     }
@@ -105,6 +107,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for distinct TypeScript overload parameters.
+    #[must_use]
+    pub const fn with_typescript_overload_parameters(mut self, count: usize) -> Self {
+        self.typescript_overload_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -119,6 +128,7 @@ impl PackageBindingSlots {
             .saturating_add(self.python_overload_parameter)
             .saturating_add(self.typescript_method_parameter)
             .saturating_add(self.javascript_callback_parameter)
+            .saturating_add(self.typescript_overload_parameter)
     }
 
     fn admit(
@@ -130,6 +140,8 @@ impl PackageBindingSlots {
     ) -> bool {
         let available = if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callback_parameter
+        } else if language == "typescript" && symbol.is_ecmascript_overload_parameter() {
+            &mut self.typescript_overload_parameter
         } else if symbol.is_ecmascript_parameter() {
             if language == "javascript" {
                 &mut self.javascript_parameter
@@ -592,7 +604,12 @@ impl SyntaxPublicationBuilder {
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(symbol, &syntax.language().name, &python_receivers, &methods))
+                    || !remaining.admit(
+                        symbol,
+                        &syntax.language().name,
+                        &python_receivers,
+                        &methods,
+                    ))
             {
                 continue;
             }

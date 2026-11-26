@@ -83,6 +83,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKi
 mod callback_parameters;
 mod commonjs;
 mod members;
+mod overload_parameters;
 pub(crate) mod recovery;
 mod variance;
 
@@ -234,6 +235,7 @@ const JSDOC_LINE_MARKER: char = '*';
 /// Provider kind of an ordinary ECMAScript value parameter.
 pub(crate) const PARAMETER_KIND: &str = "value_parameter";
 pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
+pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -1032,7 +1034,7 @@ impl EcmaScriptKinds {
             && !self.parameter_property_marked(parameter);
         let signature = matches!(
             function.kind(),
-            METHOD_SIGNATURE_KIND | ABSTRACT_METHOD_SIGNATURE_KIND
+            FUNCTION_SIGNATURE_KIND | METHOD_SIGNATURE_KIND | ABSTRACT_METHOD_SIGNATURE_KIND
         );
         if !(direct || generator || method || signature) {
             return None;
@@ -2270,12 +2272,13 @@ pub(crate) fn analyze_included(
         )?;
         facts.set_member_aliases(aliases);
         if !recovered && !tree.root_node().has_error() {
-            append_parameters(&mut symbols, parameters, facts);
-            callback_parameters::append(
-                &mut symbols,
-                facts,
+            append_value_parameters(
+                language,
+                tree.root_node(),
                 source.text,
-                language.name == "javascript",
+                &mut symbols,
+                parameters,
+                facts,
             );
         }
     }
@@ -2319,6 +2322,21 @@ fn parser_for_ranges(
     Ok(parser)
 }
 
+fn append_value_parameters(
+    language: &Language,
+    root: Node<'_>,
+    source: &str,
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+    parameters: Vec<crate::SyntaxSymbol>,
+    facts: &crate::StaticFacts,
+) {
+    let overloads = (language.name == "typescript")
+        .then(|| overload_parameters::capture(symbols, &parameters, facts, root));
+    append_parameters(symbols, parameters, facts);
+    symbols.extend(overloads.into_iter().flatten());
+    callback_parameters::append(symbols, facts, source, language.name == "javascript");
+}
+
 /// Holds optional parameters aside while existing member facts are resolved.
 fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> Vec<crate::SyntaxSymbol> {
     symbols
@@ -2341,10 +2359,19 @@ fn append_parameters(
             .entry(symbol.qualified_name.as_str())
             .or_insert(0_usize) += 1;
     }
+    let standalone = symbols
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some(FUNCTION_SIGNATURE_KIND))
+        .filter_map(|symbol| symbol.name_range)
+        .collect::<BTreeSet<_>>();
     let anchors = facts
         .parameters()
         .iter()
-        .filter(|parameter| parameter.owner.is_some())
+        .filter(|parameter| {
+            parameter
+                .owner
+                .is_some_and(|owner| !standalone.contains(&owner))
+        })
         .map(|parameter| parameter.name)
         .collect::<BTreeSet<_>>();
     let retained = parameters
@@ -2438,6 +2465,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == CALLBACK_PARAMETER_KIND {
         return Some(CALLBACK_PARAMETER_KIND);
+    }
+    if name == OVERLOAD_PARAMETER_KIND {
+        return Some(OVERLOAD_PARAMETER_KIND);
     }
     kinds
         .declarations

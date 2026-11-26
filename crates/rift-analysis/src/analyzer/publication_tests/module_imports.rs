@@ -1891,3 +1891,139 @@ fn npm_callback_parameter_keeps_a_same_named_module_export() {
             })
     }));
 }
+
+#[test]
+fn npm_typescript_overloads_retain_their_physical_parameters() {
+    const SOURCE: &str = concat!(
+        "export function convert(value: string): string;\n",
+        "export function convert(value: number): number;\n",
+        "export function convert(value: string | number) { return value; }\n",
+        "export interface Store {\n",
+        "  read(key: string): string;\n",
+        "  read(index: number): number;\n",
+        "}\n",
+        "export class Table {\n",
+        "  read(record: string): string;\n",
+        "  read(record: number): number;\n",
+        "  read(record: string | number) { return record; }\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.ts"}}}"#,
+        )),
+    )
+    .expect("checked overload source");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid overloaded declarations");
+    let mut identities = BTreeSet::new();
+    for written in [
+        "value: string)",
+        "value: number)",
+        "value: string | number)",
+        "key: string)",
+        "index: number)",
+        "record: string)",
+        "record: number)",
+        "record: string | number)",
+    ] {
+        let start = SOURCE.find(written).expect("parameter source");
+        let name = written.split(':').next().expect("parameter name");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit.as_str().ends_with("/index.ts")
+                    && offset_in(row.range.start) == start
+                    && SOURCE
+                        .get(start..offset_in(row.range.end))
+                        .is_some_and(|source| source.starts_with(name))
+            })
+            .expect("physical overload parameter");
+        assert!(identities.insert(&declaration.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&declaration.symbol)
+                && object.kinds.contains(&SymbolKind::Parameter)
+                && object.name == name
+        }));
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        if written.contains('|') {
+            let [read] = reads.as_slice() else {
+                panic!("implementation read of {name}")
+            };
+            let source = read.occurrence.as_ref().expect("authored reference");
+            let start = SOURCE
+                .find(&format!("return {name}"))
+                .expect("returned parameter")
+                + 7;
+            assert_eq!(source.unit, declaration.unit);
+            assert_eq!(source.range, module_runtime_range(start, name));
+        } else {
+            assert!(reads.is_empty(), "{written} has no implementation");
+        }
+    }
+}
+
+#[test]
+fn overload_parameters_preserve_regular_parameter_and_module_slots() {
+    const SOURCE: &str = concat!(
+        "export function choose(value: string): string;\n",
+        "export function choose(value: number): number;\n",
+        "export function choose(value: string | number) { return value; }\n",
+        "export function plain(ordinary: number) { return ordinary; }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::TypeScript.language();
+    let file = ProjectPath::new("index.ts").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.ts"}}}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(6);
+    let roomy = collect(10);
+    assert_eq!(bounded.declarations.len(), 6);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/plain/ordinary"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    assert_eq!(roomy.declarations.len() - bounded.declarations.len(), 3);
+}

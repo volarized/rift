@@ -186,6 +186,7 @@ mod tests {
         let symbols = document
             .symbols()
             .iter()
+            .filter(|symbol| !symbol.is_ecmascript_overload_parameter())
             .map(|symbol| {
                 (
                     symbol.qualified_name.as_str(),

@@ -168,13 +168,21 @@ impl SyntaxSymbol {
     /// Whether this is an authored ECMAScript value parameter.
     #[must_use]
     pub fn is_ecmascript_parameter(&self) -> bool {
-        self.kind == crate::ecmascript::PARAMETER_KIND || self.is_ecmascript_callback_parameter()
+        self.kind == crate::ecmascript::PARAMETER_KIND
+            || self.is_ecmascript_callback_parameter()
+            || self.is_ecmascript_overload_parameter()
     }
 
     /// Whether this is the physical parameter of a JavaScript function value.
     #[must_use]
     pub fn is_ecmascript_callback_parameter(&self) -> bool {
         self.kind == crate::ecmascript::CALLBACK_PARAMETER_KIND
+    }
+
+    /// Whether this parameter belongs to one physical TypeScript overload.
+    #[must_use]
+    pub fn is_ecmascript_overload_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::OVERLOAD_PARAMETER_KIND
     }
 
     /// Whether this binding uses a package-only declaration reservation.
