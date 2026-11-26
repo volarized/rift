@@ -502,6 +502,7 @@ fn binding_capacity(
     let mut python_variadic_parameters = BindingDemand::default();
     let mut python_overload_parameters = BindingDemand::default();
     let mut javascript_parameters = BindingDemand::default();
+    let mut typescript_method_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
@@ -511,6 +512,7 @@ fn binding_capacity(
             .saturating_add(facts.primary_symbols_len())
             .saturating_add(document.placement.aliases_count());
         unnamed = unnamed.saturating_add(facts.left_out_symbols().len());
+        let methods = facts.typescript_method_names();
         for symbol in facts.symbols().iter().filter(|symbol| {
             symbol.is_package_binding()
                 && document
@@ -521,6 +523,12 @@ fn binding_capacity(
             let demand = if symbol.is_ecmascript_parameter() {
                 if facts.language().name == "javascript" {
                     &mut javascript_parameters
+                } else if symbol
+                    .container
+                    .as_deref()
+                    .is_some_and(|owner| methods.contains(owner))
+                {
+                    &mut typescript_method_parameters
                 } else {
                     &mut typescript_parameters
                 }
@@ -563,7 +571,8 @@ fn binding_capacity(
         + python_loop_bindings.count
         + python_variadic_parameters.count
         + python_overload_parameters.count
-        + javascript_parameters.count;
+        + javascript_parameters.count
+        + typescript_method_parameters.count;
     let (mut bytes, record) = binding_source_budget(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -575,6 +584,8 @@ fn binding_capacity(
     let python_variadic_slots = python_variadic_parameters.reserve(&mut slots, &mut bytes, record);
     let python_overload_slots = python_overload_parameters.reserve(&mut slots, &mut bytes, record);
     let javascript_parameter_slots = javascript_parameters.reserve(&mut slots, &mut bytes, record);
+    let typescript_method_slots =
+        typescript_method_parameters.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -587,7 +598,8 @@ fn binding_capacity(
         .with_python_loop_binding_slots(python_loop_binding_slots)
         .with_python_variadic_parameter_slots(python_variadic_slots)
         .with_python_overload_parameter_slots(python_overload_slots)
-        .with_javascript_parameters(javascript_parameter_slots),
+        .with_javascript_parameters(javascript_parameter_slots)
+        .with_typescript_method_parameters(typescript_method_slots),
     )
 }
 

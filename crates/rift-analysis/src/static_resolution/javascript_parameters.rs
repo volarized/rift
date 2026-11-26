@@ -6,7 +6,13 @@ use rift_core::ReferenceRole;
 use rift_syntax::{ByteRange, StaticBindingKind, StaticFacts, StaticParameter, SyntaxFacts};
 
 use super::javascript::js_binding;
-use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
+use super::{EcmaScriptParameters, File, Index, StaticOccurrence, StaticResolution, Target, Work};
+
+#[derive(Default)]
+pub(super) struct ParameterReads {
+    pub(super) functions: Vec<ByteRange>,
+    pub(super) methods: Vec<ByteRange>,
+}
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
 pub(super) fn parameter_sites<'source>(
@@ -28,12 +34,21 @@ pub(super) fn parameter_sites<'source>(
 }
 
 impl File<'_> {
-    pub(super) fn ecmascript_parameter_read_candidate(&self, range: ByteRange) -> bool {
-        !self.ecmascript_parameters.is_empty()
-            && !self.members.contains_key(&range)
-            && self
-                .text(range)
-                .is_some_and(|name| self.ecmascript_parameters.contains_key(name))
+    pub(super) fn record_parameter_read(&self, range: ByteRange, reads: &mut ParameterReads) {
+        if (self.ecmascript_parameters.is_empty() && self.typescript_method_parameters.is_empty())
+            || self.members.contains_key(&range)
+        {
+            return;
+        }
+        let Some(name) = self.text(range) else {
+            return;
+        };
+        if self.ecmascript_parameters.contains_key(name) {
+            reads.functions.push(range);
+        }
+        if self.typescript_method_parameters.contains_key(name) {
+            reads.methods.push(range);
+        }
     }
 }
 
@@ -43,6 +58,7 @@ impl<'source> Index<'source> {
         &self,
         file: &File<'source>,
         sites: Vec<ByteRange>,
+        parameters: &EcmaScriptParameters<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
@@ -50,7 +66,8 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if let Some(occurrence) = self.ecmascript_parameter_read(file, range, work) {
+            if let Some(occurrence) = self.ecmascript_parameter_read(file, range, parameters, work)
+            {
                 result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
                 result.record(Some(occurrence));
             }
@@ -61,6 +78,7 @@ impl<'source> Index<'source> {
         &self,
         file: &File<'source>,
         range: ByteRange,
+        parameters: &EcmaScriptParameters<'source>,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let name = file.text(range)?;
@@ -75,7 +93,7 @@ impl<'source> Index<'source> {
         if binding.kind != StaticBindingKind::Shadow {
             return None;
         }
-        let parameter = file.ecmascript_parameters.get(name)?.get(&binding.name)?;
+        let parameter = parameters.get(name)?.get(&binding.name)?;
         let site = parameter.site;
         let owner = file.target_at(site.owner?)?;
         let scopes = self.javascript.scopes.get(file.document.path.as_str())?;

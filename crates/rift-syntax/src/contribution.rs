@@ -28,6 +28,7 @@ pub struct PackageBindingSlots {
     python_variadic_parameter: usize,
     python_overload_parameter: usize,
     javascript_parameter: usize,
+    typescript_method_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -49,6 +50,7 @@ impl PackageBindingSlots {
             python_loop_binding: 0,
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
+            typescript_method_parameter: 0,
         }
     }
 
@@ -87,6 +89,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for TypeScript method parameters.
+    #[must_use]
+    pub const fn with_typescript_method_parameters(mut self, count: usize) -> Self {
+        self.typescript_method_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -99,6 +108,7 @@ impl PackageBindingSlots {
             .saturating_add(self.python_loop_binding)
             .saturating_add(self.python_variadic_parameter)
             .saturating_add(self.python_overload_parameter)
+            .saturating_add(self.typescript_method_parameter)
     }
 
     fn admit(
@@ -106,10 +116,17 @@ impl PackageBindingSlots {
         symbol: &crate::SyntaxSymbol,
         language: &str,
         python_receivers: &BTreeSet<crate::ByteRange>,
+        methods: &std::collections::BTreeSet<&str>,
     ) -> bool {
         let available = if symbol.is_ecmascript_parameter() {
             if language == "javascript" {
                 &mut self.javascript_parameter
+            } else if symbol
+                .container
+                .as_deref()
+                .is_some_and(|owner| methods.contains(owner))
+            {
+                &mut self.typescript_method_parameter
             } else {
                 &mut self.typescript_parameter
             }
@@ -558,11 +575,12 @@ impl SyntaxPublicationBuilder {
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
         let mut remaining = *binding_slots;
+        let methods = syntax.typescript_method_names();
         let python_receivers = syntax.python_receiver_names();
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(symbol, &syntax.language().name, &python_receivers))
+                    || !remaining.admit(symbol, &syntax.language().name, &python_receivers, &methods))
             {
                 continue;
             }

@@ -10,6 +10,7 @@ use rift_syntax::{
 };
 
 use super::javascript::MemberMode;
+use super::javascript_parameters::ParameterReads;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
 impl<'source> Index<'source> {
@@ -70,7 +71,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-        parameter_reads: &mut Vec<ByteRange>,
+        parameter_reads: &mut ParameterReads,
     ) {
         self.javascript_references(file, work, result, parameter_reads);
         if work.exhausted {
@@ -139,7 +140,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
-        parameter_reads: &mut Vec<ByteRange>,
+        parameter_reads: &mut ParameterReads,
     ) {
         for reference in file.facts.references() {
             if !work.charge() {
@@ -184,11 +185,8 @@ impl<'source> Index<'source> {
             {
                 continue;
             }
-            if occurrence.is_none()
-                && reference.role == ReferenceRole::Read
-                && file.ecmascript_parameter_read_candidate(reference.target)
-            {
-                parameter_reads.push(reference.target);
+            if occurrence.is_none() && reference.role == ReferenceRole::Read {
+                file.record_parameter_read(reference.target, parameter_reads);
             }
             result.record(occurrence);
         }

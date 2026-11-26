@@ -15,6 +15,7 @@ mod rust;
 #[cfg(test)]
 mod tests;
 
+use javascript_parameters::ParameterReads;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
@@ -235,7 +236,8 @@ enum DeferredReferences<'source> {
     PythonCaptures,
     PythonReceivers,
     PythonVariadics,
-    EcmaScriptParameters(Vec<ByteRange>),
+    EcmaScriptParameters(ParameterReads),
+    TypeScriptMethodParameters(Vec<ByteRange>),
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -509,6 +511,9 @@ struct EcmaScriptParameter<'source> {
     site: &'source StaticParameter,
 }
 
+type EcmaScriptParameters<'source> =
+    BTreeMap<&'source str, BTreeMap<ByteRange, EcmaScriptParameter<'source>>>;
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
@@ -524,8 +529,8 @@ struct File<'source> {
     primary_reference_count: usize,
     rust_local_count: usize,
     package_binding_count: usize,
-    ecmascript_parameters:
-        BTreeMap<&'source str, BTreeMap<ByteRange, EcmaScriptParameter<'source>>>,
+    ecmascript_parameters: EcmaScriptParameters<'source>,
+    typescript_method_parameters: EcmaScriptParameters<'source>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -691,6 +696,7 @@ impl<'source> File<'source> {
             rust_local_count: 0,
             package_binding_count: 0,
             ecmascript_parameters: BTreeMap::new(),
+            typescript_method_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -979,6 +985,7 @@ impl<'source> File<'source> {
             self.python_whole = python_edges::WholeFile::Expression;
         }
         let parameters = javascript_parameters::parameter_sites(self.document.facts, self.facts);
+        let methods = self.document.facts.typescript_method_names();
         for symbol in self.document.facts.symbols() {
             if symbol.is_package_binding() {
                 self.package_binding_count += 1;
@@ -993,7 +1000,16 @@ impl<'source> File<'source> {
                         self.python_parameters
                             .insert(name, admitted.then_some(symbol));
                     } else if admitted && let Some(&site) = parameters.get(&name) {
-                        self.ecmascript_parameters
+                        let parameters = if symbol
+                            .container
+                            .as_deref()
+                            .is_some_and(|owner| methods.contains(owner))
+                        {
+                            &mut self.typescript_method_parameters
+                        } else {
+                            &mut self.ecmascript_parameters
+                        };
+                        parameters
                             .entry(symbol.name.as_str())
                             .or_default()
                             .insert(name, EcmaScriptParameter { symbol, site });
@@ -1593,7 +1609,10 @@ impl<'source> Index<'source> {
                         | DeferredReferences::PythonCaptures
                         | DeferredReferences::PythonReceivers
                         | DeferredReferences::PythonVariadics
-                        | DeferredReferences::EcmaScriptParameters(_) => &mut deferred_references,
+                        | DeferredReferences::EcmaScriptParameters(_)
+                        | DeferredReferences::TypeScriptMethodParameters(_) => {
+                            &mut deferred_references
+                        }
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
@@ -1640,6 +1659,7 @@ impl<'source> Index<'source> {
         let mut rust_local_sites = VecDeque::new();
         let mut python_local_sites = VecDeque::new();
         let mut python_parameter_sites = VecDeque::new();
+        let mut typescript_method_sites = VecDeque::new();
         let mut python_reassigned_sites = VecDeque::new();
         let mut python_captured_sites = VecDeque::new();
         let mut python_receiver_sites = VecDeque::new();
@@ -1652,6 +1672,7 @@ impl<'source> Index<'source> {
             .or_else(|| python_parameter_sites.pop_front())
             .or_else(|| typescript_parameter_sites.pop_front())
             .or_else(|| javascript_parameter_sites.pop_front())
+            .or_else(|| typescript_method_sites.pop_front())
             .or_else(|| python_reassigned_sites.pop_front())
             .or_else(|| python_captured_sites.pop_front())
             .or_else(|| python_receiver_sites.pop_front())
@@ -1685,6 +1706,9 @@ impl<'source> Index<'source> {
                         &mut javascript_parameter_sites
                     }
                     DeferredReferences::EcmaScriptParameters(_) => &mut typescript_parameter_sites,
+                    DeferredReferences::TypeScriptMethodParameters(_) => {
+                        &mut typescript_method_sites
+                    }
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1807,7 +1831,25 @@ impl<'source> Index<'source> {
                 None
             }
             DeferredReferences::EcmaScriptParameters(sites) => {
-                self.ecmascript_parameter_reads(file, sites, work, resolution);
+                self.ecmascript_parameter_reads(
+                    file,
+                    sites.functions,
+                    &file.ecmascript_parameters,
+                    work,
+                    resolution,
+                );
+                (!sites.methods.is_empty()).then_some(
+                    DeferredReferences::TypeScriptMethodParameters(sites.methods),
+                )
+            }
+            DeferredReferences::TypeScriptMethodParameters(sites) => {
+                self.ecmascript_parameter_reads(
+                    file,
+                    sites,
+                    &file.typescript_method_parameters,
+                    work,
+                    resolution,
+                );
                 None
             }
             DeferredReferences::Rust {
@@ -2019,7 +2061,7 @@ impl<'source> Index<'source> {
             python_qualifiers: imports,
             rust_macros,
         } = self.resolve_imports(file, work, result)?;
-        let mut parameter_reads = Vec::new();
+        let mut parameter_reads = ParameterReads::default();
         if matches!(
             file.document.facts.language().name.as_str(),
             "javascript" | "typescript"
@@ -2027,8 +2069,9 @@ impl<'source> Index<'source> {
             self.javascript_edges(file, work, result, &mut parameter_reads);
         }
         let deferred = match file.document.facts.language().name.as_str() {
-            "javascript" | "typescript" => (!work.exhausted && !parameter_reads.is_empty())
-                .then_some(DeferredReferences::EcmaScriptParameters(parameter_reads)),
+            "javascript" | "typescript" => (!work.exhausted
+                && (!parameter_reads.functions.is_empty() || !parameter_reads.methods.is_empty()))
+            .then_some(DeferredReferences::EcmaScriptParameters(parameter_reads)),
             "python" => {
                 let names = self.python_references(file, work, result);
                 (!work.exhausted
@@ -2406,6 +2449,7 @@ impl StaticResolution {
             } | DeferredReferences::PythonLocals
                 | DeferredReferences::PythonParameters(_)
                 | DeferredReferences::EcmaScriptParameters(_)
+                | DeferredReferences::TypeScriptMethodParameters(_)
         ) {
             self.late_supplemental_start
                 .get_or_insert(self.occurrences.len());

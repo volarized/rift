@@ -1004,7 +1004,7 @@ impl EcmaScriptKinds {
         None
     }
 
-    /// A simple parameter of a named ECMAScript function with a body.
+    /// A simple parameter of a named function or TypeScript method.
     fn ordinary_parameter<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let parameter = visited.syntax_element();
         let name = if parameter.kind_id() == self.identifier {
@@ -1025,11 +1025,20 @@ impl EcmaScriptKinds {
         let direct = function.kind() == FUNCTION_DECLARATION_KIND;
         let generator = self.formal_parameter_kinds.is_empty()
             && function.kind() == GENERATOR_FUNCTION_DECLARATION_KIND;
-        if !(direct || generator) {
+        let method = self.pattern.is_some()
+            && function.kind_id() == self.method_definition
+            && !self.parameter_property_marked(parameter);
+        let signature = matches!(
+            function.kind(),
+            METHOD_SIGNATURE_KIND | ABSTRACT_METHOD_SIGNATURE_KIND
+        );
+        if !(direct || generator || method || signature) {
             return None;
         }
         self.child(function, EcmaScriptGrammarField::Name)?;
-        self.child(function, EcmaScriptGrammarField::Body)?;
+        if !signature {
+            self.child(function, EcmaScriptGrammarField::Body)?;
+        }
         Some(name)
     }
 
@@ -1048,12 +1057,7 @@ impl EcmaScriptKinds {
         {
             return None;
         }
-        let marked = named_children(syntax_element)
-            .any(|child| Some(child.kind_id()) == self.accessibility_modifier)
-            || self
-                .readonly_token
-                .is_some_and(|token| EcmaScriptRules::has_token(syntax_element, &[token]));
-        if !marked {
+        if !self.parameter_property_marked(syntax_element) {
             return None;
         }
         let method = visited.parent()?.parent()?.syntax_element();
@@ -1067,6 +1071,13 @@ impl EcmaScriptKinds {
         }
         let name = syntax_element.child_by_field_id(self.pattern?.get())?;
         (name.kind_id() == self.identifier).then_some(name)
+    }
+
+    fn parameter_property_marked(&self, parameter: Node<'_>) -> bool {
+        named_children(parameter).any(|child| Some(child.kind_id()) == self.accessibility_modifier)
+            || self
+                .readonly_token
+                .is_some_and(|token| EcmaScriptRules::has_token(parameter, &[token]))
     }
 
     /// Whether `syntax_element` is an enum member written without a value, `B` in

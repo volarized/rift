@@ -794,6 +794,24 @@ impl SyntaxFacts {
         &self.symbols
     }
 
+    /// Qualified names of TypeScript methods that can own a value parameter.
+    #[must_use]
+    pub fn typescript_method_names(&self) -> BTreeSet<&str> {
+        if self.language.name != "typescript"
+            || !self
+                .symbols
+                .iter()
+                .any(SyntaxSymbol::is_ecmascript_parameter)
+        {
+            return BTreeSet::new();
+        }
+        self.symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "method")
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect()
+    }
+
     /// Number of established declaration candidates before optional package bindings.
     #[must_use]
     pub fn primary_symbols_len(&self) -> usize {

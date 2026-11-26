@@ -3112,3 +3112,91 @@ fn package_javascript_parameters_follow_typescript_parameters_under_provider_bou
         assert_eq!(reads, parameters);
     }
 }
+
+#[test]
+fn package_retains_typescript_method_parameters_and_body_reads() {
+    const SOURCE: &str = concat!(
+        "export class Holder { method(value: number) { return value; } }\n",
+        "export interface Reader { method(value: number): number; }\n",
+        "export function choose(name: number) { return name; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#,
+        )),
+    )
+    .expect("authored class and interface");
+    let publication = analysis.publication();
+    let holder = SOURCE.find("method(value").expect("class parameter") + "method(".len();
+    let reader = SOURCE.rfind("method(value").expect("interface parameter") + "method(".len();
+    let usage = SOURCE.find("return value").expect("class method read") + "return ".len();
+    for (container, start, read) in [("Holder", holder, Some(usage)), ("Reader", reader, None)] {
+        let identity = format!("/{container}/method/value");
+        let binding = publication
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Parameter))
+            .filter_map(|object| object.id.as_ref())
+            .find(|id| id.as_str().ends_with(&identity))
+            .expect("method-owned value parameter");
+        assert!(publication.declarations.iter().any(|site| {
+            site.symbol == *binding
+                && site.source == "value"
+                && usize::try_from(site.range.start) == Ok(start)
+                && usize::try_from(site.range.end) == Ok(start + "value".len())
+        }));
+        let uses = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == *binding)
+            .map(|edge| {
+                assert!(
+                    edge.from
+                        .as_str()
+                        .ends_with(&format!("/{container}/method"))
+                );
+                let site = &edge.occurrence.as_ref().expect("written read").range;
+                assert_eq!(site.end - site.start, 5);
+                usize::try_from(site.start).expect("physical byte offset")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uses, read.into_iter().collect::<Vec<_>>());
+    }
+
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("package identity");
+    let origin = fixture::origin(&package);
+    let language = fixture::language(ShippedLanguage::TypeScript);
+    let path = ProjectPath::new("index.ts").expect("source path");
+    let manifest = ProjectPath::new("package.json").expect("metadata path");
+    let sources = [PackageSource::new(&path, SOURCE)];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#,
+    )];
+    let limits = ExactPackageLimits::new(2, 4096)
+        .with_declarations(6)
+        .expect("five ordinary declarations and one parameter");
+    let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+        .expect("package input")
+        .with_framework_context(&metadata, &[])
+        .expect("authored metadata");
+    let bounded = PackageAnalyzer::analyze(input, 1).expect("primary declarations accepted");
+    let parameters = bounded
+        .publication()
+        .objects
+        .iter()
+        .filter(|object| object.kinds.contains(&SymbolKind::Parameter))
+        .map(|object| object.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(parameters, ["name"]);
+    assert!(bounded.publication().edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/choose/name")
+    }));
+}
