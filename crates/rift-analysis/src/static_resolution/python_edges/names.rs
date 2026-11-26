@@ -43,6 +43,27 @@ impl Name<'_> {
 type ImportedNames<'source> = BTreeMap<ModuleName<'source>, Name<'source>>;
 
 impl<'source> Index<'source> {
+    /// Records direct function-local reads after all earlier reference work.
+    pub(in crate::static_resolution) fn python_local_reads(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for &(read, assignment) in file.facts.python_local_reads() {
+            if !work.charge() {
+                return;
+            }
+            if let Some(occurrence) = file
+                .python_local_target(read, assignment, work)
+                .and_then(|target| self.python_access(file, read, ReferenceRole::Read, target))
+                .filter(|site| site.edge_from.is_some())
+            {
+                result.record(Some(occurrence));
+            }
+        }
+    }
+
     /// Records one read of a plain name.
     pub(super) fn python_name_read(
         &self,
@@ -423,6 +444,70 @@ fn shares(kind: StaticBindingKind) -> bool {
 }
 
 impl<'source> File<'source> {
+    /// The one authored local declaration available to this read in its own function.
+    fn python_local_target(
+        &self,
+        read: ByteRange,
+        assignment: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let target = self.target_at(assignment)?;
+        let caller = self.enclosing_callable(read)?;
+        let body = caller.symbol.body_range?;
+        if target.symbol.kind != "variable"
+            || target.symbol.container.as_deref() != Some(caller.symbol.qualified_name.as_str())
+            || !body.encloses(target.symbol.item_range)
+            || !body.encloses(read)
+            || target.symbol.item_range.end > read.start
+            || self.in_python_annotation(read.start)
+            || self
+                .python_expressions
+                .resolve(read.start, read.end)
+                .is_some()
+            || self.blocked(read.start, work)
+        {
+            return None;
+        }
+        let name = self.text(read)?;
+        let bindings = self
+            .bindings_around(name, read)
+            .filter(|binding| {
+                !matches!(
+                    binding.kind,
+                    StaticBindingKind::PythonGuard { .. }
+                        | StaticBindingKind::PythonMemberWrite { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        let ScopeLookup::Found(selected) = self.python_scope(&bindings, read.start, work) else {
+            return None;
+        };
+        let scope = selected.scope;
+        if scope.module || scope.range != caller.symbol.item_range || selected.redirected.is_some()
+        {
+            return None;
+        }
+        let mut local = bindings
+            .into_iter()
+            .filter(|binding| Scope::of(self, binding) == scope);
+        let binding = local.next()?;
+        if binding.name != assignment
+            || binding.available_from > read.start
+            || local.next().is_some()
+        {
+            return None;
+        }
+        let mut deletions = self
+            .python_deletions
+            .get(&(name, scope.range))
+            .into_iter()
+            .flatten();
+        if deletions.any(|deletion| !work.charge() || deletion.name.end <= read.start) {
+            return None;
+        }
+        Some(target)
+    }
+
     /// The bindings of a name in module statements.
     fn python_module_bindings(&self, name: &str) -> Vec<&'source StaticBinding> {
         let bindings = self.by_name.get(name).into_iter().flatten().copied();

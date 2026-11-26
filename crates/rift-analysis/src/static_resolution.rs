@@ -215,6 +215,7 @@ enum DeferredReferences<'source> {
         imports: Vec<python_edges::PythonImportQualifier<'source>>,
         names: Vec<ByteRange>,
     },
+    PythonLocals,
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -1403,7 +1404,8 @@ impl<'source> Index<'source> {
                     let remaining = file_work.max(file).saturating_sub(apart.used);
                     let queue = match sites {
                         DeferredReferences::Python { .. }
-                        | DeferredReferences::PythonQualifiers { .. } => &mut deferred_references,
+                        | DeferredReferences::PythonQualifiers { .. }
+                        | DeferredReferences::PythonLocals => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
@@ -1431,16 +1433,20 @@ impl<'source> Index<'source> {
         }
         let mut existing = VecDeque::from(references);
         let mut macro_sites = VecDeque::new();
-        let mut local_sites = VecDeque::new();
+        let mut rust_local_sites = VecDeque::new();
+        let mut python_local_sites = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
-            .or_else(|| local_sites.pop_front())
+            .or_else(|| rust_local_sites.pop_front())
+            .or_else(|| python_local_sites.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
+            let locals = (!file.facts.python_local_reads().is_empty())
+                .then_some(DeferredReferences::PythonLocals);
             let next = match sites {
                 DeferredReferences::Python { names, imports } => {
                     let names = names.map_or_else(Vec::new, |sites| {
@@ -1448,60 +1454,25 @@ impl<'source> Index<'source> {
                     });
                     (!names.is_empty() || !imports.is_empty())
                         .then_some(DeferredReferences::PythonQualifiers { imports, names })
+                        .or(locals)
                 }
                 DeferredReferences::PythonQualifiers { imports, names } => {
                     self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
+                    locals
+                }
+                DeferredReferences::PythonLocals => {
+                    self.python_local_reads(file, &mut deferred, resolution);
                     None
                 }
                 DeferredReferences::Rust {
                     pass,
                     macro_imports,
-                } => {
-                    let locals =
-                        (file.rust_local_count != 0).then_some(RustReferencePass::LocalBindings);
-                    let next = match pass {
-                        RustReferencePass::Paths => {
-                            self.rust_call_qualifiers(file, &mut deferred, resolution);
-                            self.rust_value_reads(file, &mut deferred, resolution);
-                            self.rust_field_sites(file, &mut deferred, resolution);
-                            (!file.facts.rust_root_macro_calls().is_empty()
-                                || !file.facts.rust_textual_macro_calls().is_empty()
-                                || !macro_imports.is_empty())
-                            .then_some(RustReferencePass::RootMacros)
-                            .or(locals)
-                        }
-                        RustReferencePass::RootMacros => {
-                            self.rust_root_macro_calls(file, &mut deferred, resolution);
-                            (!file.facts.rust_textual_macro_calls().is_empty()
-                                || !macro_imports.is_empty())
-                            .then_some(RustReferencePass::TextualMacros)
-                            .or(locals)
-                        }
-                        RustReferencePass::TextualMacros => {
-                            self.rust_textual_macro_calls(file, &mut deferred, resolution);
-                            (!macro_imports.is_empty())
-                                .then_some(RustReferencePass::MacroImports)
-                                .or(locals)
-                        }
-                        RustReferencePass::MacroImports => {
-                            self.rust_macro_imports(
-                                file,
-                                &macro_imports,
-                                &mut deferred,
-                                resolution,
-                            );
-                            locals
-                        }
-                        RustReferencePass::LocalBindings => {
-                            self.rust_local_bindings(file, &mut deferred, resolution);
-                            None
-                        }
-                    };
-                    next.map(|pass| DeferredReferences::Rust {
+                } => self
+                    .resolve_deferred_rust(file, &pass, &macro_imports, &mut deferred, resolution)
+                    .map(|pass| DeferredReferences::Rust {
                         pass,
                         macro_imports,
-                    })
-                }
+                    }),
             };
             let used = budget.saturating_sub(deferred.budget.remaining());
             #[cfg(test)]
@@ -1511,15 +1482,60 @@ impl<'source> Index<'source> {
             resolution.ended |= deferred.exhausted;
             if let Some(next) = next {
                 let queue = match next {
+                    DeferredReferences::PythonLocals => &mut python_local_sites,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
                         pass: RustReferencePass::LocalBindings,
                         ..
-                    } => &mut local_sites,
+                    } => &mut rust_local_sites,
                     DeferredReferences::Rust { .. } => &mut macro_sites,
                 };
                 queue.push_back((file, remaining.saturating_sub(used), next));
+            }
+        }
+    }
+
+    /// Records one Rust reference class and returns the next class that has source evidence.
+    fn resolve_deferred_rust(
+        &self,
+        file: &File<'source>,
+        pass: &RustReferencePass,
+        macro_imports: &[ByteRange],
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) -> Option<RustReferencePass> {
+        let locals = (file.rust_local_count != 0).then_some(RustReferencePass::LocalBindings);
+        match pass {
+            RustReferencePass::Paths => {
+                self.rust_call_qualifiers(file, work, resolution);
+                self.rust_value_reads(file, work, resolution);
+                self.rust_field_sites(file, work, resolution);
+                (!file.facts.rust_root_macro_calls().is_empty()
+                    || !file.facts.rust_textual_macro_calls().is_empty()
+                    || !macro_imports.is_empty())
+                .then_some(RustReferencePass::RootMacros)
+                .or(locals)
+            }
+            RustReferencePass::RootMacros => {
+                self.rust_root_macro_calls(file, work, resolution);
+                (!file.facts.rust_textual_macro_calls().is_empty() || !macro_imports.is_empty())
+                    .then_some(RustReferencePass::TextualMacros)
+                    .or(locals)
+            }
+            RustReferencePass::TextualMacros => {
+                self.rust_textual_macro_calls(file, work, resolution);
+                (!macro_imports.is_empty())
+                    .then_some(RustReferencePass::MacroImports)
+                    .or(locals)
+            }
+            RustReferencePass::MacroImports => {
+                self.rust_macro_imports(file, macro_imports, work, resolution);
+                locals
+            }
+            RustReferencePass::LocalBindings => {
+                self.rust_local_bindings(file, work, resolution);
+                None
             }
         }
     }
@@ -1654,8 +1670,11 @@ impl<'source> Index<'source> {
         let deferred = match file.document.facts.language().name.as_str() {
             "python" => {
                 let names = self.python_references(file, work, result);
-                (!work.exhausted && (names.is_some() || !imports.is_empty()))
-                    .then_some(DeferredReferences::Python { names, imports })
+                (!work.exhausted
+                    && (names.is_some()
+                        || !imports.is_empty()
+                        || !file.facts.python_local_reads().is_empty()))
+                .then_some(DeferredReferences::Python { names, imports })
             }
             "rust" => {
                 self.rust_references(file, work, result);
@@ -2024,7 +2043,7 @@ impl StaticResolution {
             DeferredReferences::Rust {
                 pass: RustReferencePass::LocalBindings,
                 ..
-            }
+            } | DeferredReferences::PythonLocals
         ) {
             self.late_supplemental_start
                 .get_or_insert(self.occurrences.len());

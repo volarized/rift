@@ -162,12 +162,12 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
 }
 
 impl EdgePythonKinds {
-    pub(super) fn record_edge(
+    pub(super) fn record_edge<'source>(
         &self,
         visited: Visited<'_, '_>,
-        source: &str,
+        source: &'source str,
         facts: &mut StaticFactsParts,
-        names: &mut Names,
+        names: &mut Names<'source>,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let id = syntax_element.kind_id();
@@ -209,6 +209,7 @@ impl EdgePythonKinds {
         } else if self.assignment.contains(&id) {
             if let Some(target) = syntax_element.child_by_field_id(self.left) {
                 self.edge_shadow(target, visited, facts)?;
+                self.edge_direct_local(visited, target, source, names)?;
             }
         } else if id == self.named {
             if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
@@ -270,7 +271,7 @@ impl EdgePythonKinds {
         parameter: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
-        names: &mut Names,
+        names: &mut Names<'_>,
     ) -> Result<(), RiftError> {
         if let Some(value) = parameter.child_by_field_id(self.default_value) {
             // Type parameter defaults are evaluated lazily in an annotation scope.
@@ -621,7 +622,7 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         source: &str,
         facts: &mut StaticFactsParts,
-        names: &mut Names,
+        names: &mut Names<'_>,
     ) -> Result<(), RiftError> {
         let element = visited.syntax_element();
         let id = element.kind_id();
@@ -692,7 +693,7 @@ impl EdgePythonKinds {
                 });
             }
         } else if id == self.identifier {
-            self.edge_name(visited, facts, names)?;
+            self.edge_name(visited, source, facts, names)?;
         } else if id == self.attribute {
             self.edge_member_access(visited, facts)?;
         }

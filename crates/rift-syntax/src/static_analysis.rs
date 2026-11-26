@@ -532,6 +532,8 @@ pub struct StaticFactsParts {
     pub evaluated_outside: Vec<(ByteRange, ByteRange)>,
     /// Python names deleted in a function, with the function and the block that deletes them.
     pub python_deletions: Vec<PythonDeletion>,
+    /// Plain Python reads paired with an earlier assignment name in the same function body.
+    pub python_local_reads: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -909,6 +911,12 @@ impl StaticFacts {
         &self.0.python_deletions
     }
 
+    /// Plain Python reads and the direct local assignments their names could select.
+    #[must_use]
+    pub fn python_local_reads(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_local_reads
+    }
+
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     #[must_use]
     pub fn non_none_guards(&self) -> &[(ByteRange, ByteRange)] {
@@ -965,6 +973,7 @@ impl StaticFacts {
             vector_capacity(&self.0.expression_scopes),
             vector_capacity(&self.0.evaluated_outside),
             vector_capacity(&self.0.python_deletions),
+            vector_capacity(&self.0.python_local_reads),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_writes),
             vector_capacity(&self.0.skippable),
@@ -1038,6 +1047,7 @@ impl StaticFacts {
             self.expression_scopes().len(),
             self.evaluated_outside().len(),
             self.python_deletions().len(),
+            self.python_local_reads().len(),
             self.non_none_guards().len(),
             self.commonjs_writes().len(),
             self.skippable().len(),
@@ -1280,7 +1290,7 @@ impl StaticFacts {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
         let rust = self.rust_rows_valid(&valid, limits);
-        let flow = self.python_flow_valid(valid);
+        let flow = self.python_flow_valid(valid) && self.python_local_reads_valid(source, valid);
         if !(edges
             && references
             && declared_types
@@ -1305,6 +1315,21 @@ impl StaticFacts {
             return errors::syntax::facts_range_invalid().fail();
         }
         Ok(())
+    }
+
+    fn python_local_reads_valid(&self, source: &str, valid: impl Fn(ByteRange) -> bool) -> bool {
+        let spelling = |range: ByteRange| {
+            source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+        };
+        self.python_local_reads()
+            .windows(2)
+            .all(|pair| pair[0].0.end <= pair[1].0.start)
+            && self.python_local_reads().iter().all(|&(read, assignment)| {
+                valid(read)
+                    && valid(assignment)
+                    && assignment.end <= read.start
+                    && spelling(read) == spelling(assignment)
+            })
     }
 
     fn python_flow_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
@@ -1416,7 +1441,10 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar<'source> {
-    Python(&'static python_edges::EdgePythonKinds, python_edges::Names),
+    Python(
+        &'static python_edges::EdgePythonKinds,
+        python_edges::Names<'source>,
+    ),
     JavaScript(&'static javascript::Kinds, javascript::Documentation),
     /// With the places the parser could not read.
     Rust(
@@ -1661,6 +1689,89 @@ mod rust_local_read_tests {
         assert_eq!(
             earlier.rust_local_reference_start(source),
             earlier.references().len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_local_read_tests {
+    use super::{StaticFacts, StaticFactsParts};
+    use crate::python::PythonSyntaxProvider;
+    use crate::{ByteRange, SyntaxLimits, SyntaxProvider, SyntaxSource};
+
+    #[test]
+    fn test_python_local_read_restore_checks_anchor_and_order() {
+        let source = "def run():\n    pièce = 1\n    return pièce + pièce\n";
+        let ranges = source
+            .match_indices("pièce")
+            .map(|(start, name)| ByteRange {
+                start: u64::try_from(start).expect("start"),
+                end: u64::try_from(start + name.len()).expect("end"),
+            })
+            .collect::<Vec<_>>();
+        let [first, read, later] = ranges[..] else {
+            panic!("three sites");
+        };
+        let restore = |rows| {
+            StaticFacts::from_parts(
+                source,
+                SyntaxLimits::default(),
+                StaticFactsParts {
+                    python_local_reads: rows,
+                    ..StaticFactsParts::default()
+                },
+            )
+        };
+        let pairs = vec![(read, first), (later, first)];
+        let captured = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &rift_core::ProjectPath::new("run.py").expect("path"),
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("authored Python source");
+        let original = captured.facts().static_facts().expect("captured facts");
+        assert_eq!(original.python_local_reads(), pairs);
+        assert_eq!(
+            &StaticFacts::from_parts(source, SyntaxLimits::default(), original.0.clone())
+                .expect("restore exact captured facts"),
+            original
+        );
+        let restored = restore(pairs.clone()).expect("retained local reads");
+        assert_eq!(restored.python_local_reads(), pairs);
+        assert!(restored.references().is_empty());
+        assert!(
+            restore(Vec::new())
+                .expect("older facts")
+                .python_local_reads()
+                .is_empty()
+        );
+        let split = ByteRange {
+            start: first.start + 3,
+            end: first.end,
+        };
+        for rows in [
+            vec![(read, later)],
+            vec![(read, split)],
+            vec![(read, ByteRange { start: 0, end: 3 })],
+            vec![(later, first), (read, first)],
+            vec![(read, first), (read, first)],
+        ] {
+            assert!(restore(rows).is_err());
+        }
+        let limits = SyntaxLimits::new(100, 1, 10).expect("limits");
+        assert!(
+            StaticFacts::from_parts(
+                source,
+                limits,
+                StaticFactsParts {
+                    python_local_reads: pairs,
+                    ..StaticFactsParts::default()
+                },
+            )
+            .is_err()
         );
     }
 }

@@ -12,6 +12,38 @@ use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, Publicat
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
 
 #[test]
+fn package_stores_python_direct_function_local_reads() {
+    let source = "def choose(parameter: int) -> int:\n    local = parameter\n    def nested() -> int:\n        local = 7\n        return local\n    return local + nested()\n";
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let rows = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    for (scope, text) in [("choose/nested", "local\n"), ("choose", "local +")] {
+        let owner = format!("{module}/{scope}");
+        let target = format!("{owner}/local");
+        let row = rows
+            .iter()
+            .find(|row| row.to.as_str() == target)
+            .expect("local target");
+        assert_eq!(row.from.as_str(), owner);
+        let site = row.occurrence.as_ref().expect("source use");
+        let start = u64::try_from(source.find(text).expect("written read")).expect("offset");
+        assert_eq!(site.range.start, start);
+        assert_eq!(site.range.end, start + 5);
+        assert!(
+            result
+                .declarations
+                .iter()
+                .any(|entry| entry.symbol.as_str() == target)
+        );
+    }
+}
+
+#[test]
 fn package_collects_python_generic_aliases_in_their_own_scope() {
     let source = "class T: pass\nclass Bound: pass\n\
                   type Plain = T\n\
@@ -1733,5 +1765,81 @@ fn four_byte_names_keep_full_artifact_facts_and_neighbor_publication() {
         let restored: PackagePublication =
             serde_json::from_value(wire).expect("full artifact restore");
         assert_eq!(&restored, publication);
+    }
+}
+#[test]
+fn package_python_local_reads_keep_earlier_supplemental_reads_at_the_cap() {
+    let package = rift_protocol::read::PackageIdentity {
+        manager: "pypi".to_owned(),
+        registry: "pypi.org".to_owned(),
+        name: "click".to_owned(),
+        version: "8.3.3".to_owned(),
+    };
+    let owner = package.owner().expect("package owner");
+    let origin = ContributionOrigin::new(
+        Some(rift_core::SourceLocation::Dependency { package }),
+        rift_core::SourceKind::Authored,
+    )
+    .expect("authored source");
+    let language = Language {
+        name: "python".to_owned(),
+        dialect: None,
+    };
+    let path = ProjectPath::new("click.py").expect("source path");
+    let text = concat!(
+        "sentinel = 1\n",
+        "def a_local():\n",
+        "    local_value = 2\n",
+        "    return local_value\n",
+        "def z_prior():\n",
+        "    return sentinel\n",
+    );
+    let source = [PackageSource::new(&path, text)];
+    let roots = [PackageImportRoot::new(
+        None,
+        vec!["click".to_owned()],
+        PackageImportRootOrigin::PyModules,
+    )
+    .expect("declared module root")];
+    for (cap, expected) in [
+        (5, &[("/z_prior", "/sentinel", 97_u64, 105_u64)][..]),
+        (
+            6,
+            &[
+                ("/a_local", "/a_local/local_value", 59, 70),
+                ("/z_prior", "/sentinel", 97, 105),
+            ][..],
+        ),
+    ] {
+        let limits = ExactPackageLimits::new(1, 4096)
+            .with_edges(cap)
+            .expect("bounded edges");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &source, limits)
+            .expect("valid source")
+            .with_import_roots(&roots)
+            .expect("stable module scope");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("analyzed package");
+        let edges = &analysis.publication().edges;
+        assert_eq!(edges.len(), cap);
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.kinds == [EdgeKind::Contains])
+                .count(),
+            4
+        );
+        for (from, to, start, end) in expected {
+            assert!(
+                edges.iter().any(|edge| {
+                    edge.kinds == [EdgeKind::Reads]
+                        && edge.from.as_str().ends_with(from)
+                        && edge.to.as_str().ends_with(to)
+                        && edge.occurrence.as_ref().is_some_and(|site| {
+                            site.range.start == *start && site.range.end == *end
+                        })
+                }),
+                "{from} {to} capacity {cap}"
+            );
+        }
     }
 }
