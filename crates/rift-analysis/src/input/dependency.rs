@@ -486,6 +486,14 @@ mod tests {
             .symbol
     }
 
+    fn declaration_index(publication: &PackagePublication, target: &SymbolId) -> usize {
+        publication
+            .declarations
+            .iter()
+            .position(|row| &row.symbol == target)
+            .expect("observed declaration")
+    }
+
     #[test]
     fn dependency_witness_keeps_defining_owner_and_original_declaration() {
         fixture(|dependency, input| {
@@ -496,7 +504,8 @@ mod tests {
                 .expect("admitted target");
             assert!(std::ptr::eq(
                 declaration,
-                &raw const dependency.publication.declarations[0]
+                &raw const dependency.publication.declarations
+                    [declaration_index(dependency.publication, identity(dependency))]
             ));
             assert_eq!(declaration.source, TARGET);
             assert_eq!(unit.source, TARGET);
@@ -554,9 +563,9 @@ mod tests {
             for duplicate in [false, true] {
                 let mut publication = dependency.publication.clone();
                 if duplicate {
-                    publication
-                        .declarations
-                        .push(publication.declarations[0].clone());
+                    publication.declarations.push(
+                        publication.declarations[declaration_index(&publication, &target)].clone(),
+                    );
                 } else {
                     publication.declarations.clear();
                 }
@@ -580,9 +589,10 @@ mod tests {
             let target = identity(dependency).clone();
             for change in 0..4 {
                 let mut publication = dependency.publication.clone();
+                let index = declaration_index(&publication, &target);
                 match change {
-                    0 => publication.declarations[0].range.end += 1,
-                    1 => publication.declarations[0].source.push(' '),
+                    0 => publication.declarations[index].range.end += 1,
+                    1 => publication.declarations[index].source.push(' '),
                     2 => publication.units[0].source_complete = false,
                     _ => publication.units[0].source.push(' '),
                 }
@@ -601,9 +611,18 @@ mod tests {
             let target = identity(dependency).clone();
             for change in 0..3 {
                 let mut publication = dependency.publication.clone();
+                let index = declaration_index(&publication, &target);
                 match change {
-                    0 => publication.declarations[0].public = false,
-                    1 => publication.objects.push(publication.objects[0].clone()),
+                    0 => publication.declarations[index].public = false,
+                    1 => {
+                        let object = publication
+                            .objects
+                            .iter()
+                            .find(|row| row.id.as_ref() == Some(&target))
+                            .expect("observed object");
+                        publication.objects.push(object.clone());
+                    }
+
                     _ => publication.units.push(publication.units[0].clone()),
                 }
                 let changed = PackageDependency {

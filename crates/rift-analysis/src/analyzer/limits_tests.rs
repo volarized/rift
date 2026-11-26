@@ -593,9 +593,16 @@ fn supplemental_rust_macro_import_keeps_prior_edges_at_the_cap() {
     let edges = full.semantics.edges();
     let mut primary = Vec::new();
     let mut supplemental = 0;
+    let mut root_additions = 0;
     for edge in edges.edges() {
         if edge.kind() == EdgeKind::Imports && edge.to().as_str().ends_with("/chosen") {
             supplemental += 1;
+        } else if (edge.kind() == EdgeKind::Contains
+            && edge.from().as_str() == "rift://symbol/cargo/crates.io/beacon/rust/beacon")
+            || (edge.kind() == EdgeKind::Reads
+                && edge.to().as_str() == "rift://symbol/cargo/crates.io/beacon/rust/beacon")
+        {
+            root_additions += 1;
         } else {
             primary.push(edge);
         }
@@ -617,7 +624,10 @@ fn supplemental_rust_macro_import_keeps_prior_edges_at_the_cap() {
         limited.semantics.edges().edges().collect::<Vec<_>>(),
         primary
     );
-    assert_eq!(limited.semantics.edges().dropped_edges(), 1);
+    assert_eq!(
+        limited.semantics.edges().dropped_edges(),
+        1 + root_additions
+    );
 }
 
 #[test]
@@ -634,7 +644,13 @@ fn supplemental_rust_extern_crate_aliases_keep_prior_edges_at_the_cap() {
     );
     let (baseline, candidate) = rust_extern_capacity_sources(&body);
     let before = collect_rust_extern_capacity(&baseline, None);
-    let incumbents = before.semantics.edges().edges().collect::<Vec<_>>();
+    let incumbents = before
+        .semantics
+        .edges()
+        .edges()
+        .filter(|edge| edge.from().as_str() != ROOT || edge.kind() != EdgeKind::Contains)
+        .collect::<Vec<_>>();
+    let root_contains = before.semantics.edges().edges().count() - incumbents.len();
     assert_eq!(
         incumbents
             .iter()
@@ -654,12 +670,15 @@ fn supplemental_rust_extern_crate_aliases_keep_prior_edges_at_the_cap() {
         bounded_after.semantics.edges().edges().collect::<Vec<_>>(),
         incumbents
     );
-    assert_eq!(bounded_after.semantics.edges().dropped_edges(), 3);
+    assert_eq!(
+        bounded_after.semantics.edges().dropped_edges(),
+        3 + root_contains as u64
+    );
 
-    let surplus = collect_rust_extern_capacity(&candidate, Some(capacity + 3));
+    let surplus = collect_rust_extern_capacity(&candidate, Some(capacity + 3 + root_contains));
     let edges = surplus.semantics.edges();
     assert_eq!(edges.dropped_edges(), 0);
-    assert_eq!(edges.edges().count(), capacity + 3);
+    assert_eq!(edges.edges().count(), capacity + 3 + root_contains);
     assert!(
         incumbents
             .iter()

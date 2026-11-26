@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::documentation::{
     DocumentationDeclaration, DocumentationInput, DocumentationSourceSet, collect_documentation,
@@ -55,6 +56,7 @@ use rift_ranking::split_identifier_words;
 
 #[cfg(test)]
 mod coverage_tests;
+mod file_modules;
 #[cfg(test)]
 mod fixture;
 mod join;
@@ -68,9 +70,22 @@ mod publication_tests;
 
 #[cfg(test)]
 mod retained_tests;
+mod rust_lsp_declarations;
+mod rust_lsp_macro_items;
+pub use rust_lsp_macro_items::{
+    RustLspMacroAdmission, RustLspMacroDefinition, RustLspMacroFile, RustLspMacroItems,
+    RustLspMacroSite,
+};
+mod rust_lsp_operators;
 
 use join::ModuleRole;
 pub use join::StubForm;
+pub use rust_lsp_declarations::{
+    RustLspDeclaration, RustLspDeclarationAdmission, RustLspDeclarationFile,
+};
+pub use rust_lsp_operators::{
+    RustLspOperatorDefinition, RustLspOperatorEdges, RustLspOperatorSite,
+};
 
 pub(super) fn package_label(owner: &SymbolOwner) -> String {
     match owner {
@@ -88,7 +103,11 @@ pub(super) fn package_label(owner: &SymbolOwner) -> String {
 #[derive(Debug)]
 pub struct AnalyzedFile {
     file: IndexedFile,
+    /// A Cargo library declaration belongs to this placement, outside cached syntax.
+    placed_syntax: Option<Box<SyntaxFacts>>,
+    rust_module_source: Option<Arc<SyntaxFacts>>,
     placement: DocumentPlacement,
+    shared_rust_placements: Vec<DocumentPlacement>,
     public_names: BTreeSet<String>,
     /// Whether a consumer can import the file's own module.
     reached: bool,
@@ -97,18 +116,30 @@ pub struct AnalyzedFile {
 }
 
 impl AnalyzedFile {
+    fn placed_syntax(&self) -> &SyntaxFacts {
+        self.placed_syntax
+            .as_deref()
+            .unwrap_or_else(|| self.file.syntax())
+    }
+    fn primary_declaration_count(&self) -> usize {
+        self.placed_syntax()
+            .primary_symbols_len()
+            .saturating_mul(self.shared_rust_placements.len().max(1))
+            .saturating_add(self.placement.aliases_count())
+    }
+
     fn static_source(&self) -> crate::static_resolution::StaticSource<'_> {
         crate::static_resolution::StaticSource {
             path: self.file.path(),
             source: self.file.source(),
-            facts: self.file.syntax(),
+            facts: self.placed_syntax(),
             placement: &self.placement,
         }
     }
 
     fn placed_facts(&self) -> PlacedFacts<'_> {
         PlacedFacts {
-            facts: self.file.syntax(),
+            facts: self.placed_syntax(),
             path: self.file.path(),
             placement: self.placement.clone(),
         }
@@ -122,7 +153,10 @@ impl AnalyzedFile {
 
     /// The grammar kind of the item syntax element of the declaration bound at `range`; absent when
     /// the syntax provider names none.
-    fn item_kind(&self, range: rift_core::SourceRange) -> Option<String> {
+    fn item_kind(&self, range: rift_core::SourceRange, qualified_name: &str) -> Option<String> {
+        if matches!(qualified_name, "." | "..") && self.file.syntax().language().name == "rust" {
+            return Some("source_file".to_owned());
+        }
         let key = (range.start(), range.end());
         self.item_kinds.get(&key).map(|kind| (*kind).to_owned())
     }
@@ -288,7 +322,10 @@ fn analyzed_file(
     let item_kinds = item_kinds(parsed.syntax().symbols());
     Ok(AnalyzedFile {
         file: parsed,
+        placed_syntax: None,
+        rust_module_source: None,
         placement,
+        shared_rust_placements: Vec::new(),
         public_names,
         reached: true,
         item_kinds,
@@ -426,10 +463,43 @@ fn assemble_package_graph(
     namespace: &namespace::PreparedNamespace,
     revision: u64,
 ) -> Result<(WorkspaceSemantics, Option<usize>), RiftError> {
-    let placed = analyzed
+    let mut placed = analyzed
         .iter()
+        .filter(|held| held.shared_rust_placements.is_empty())
         .map(AnalyzedFile::placed_facts)
         .collect::<Vec<_>>();
+    placed.extend(analyzed.iter().filter_map(|held| {
+        let facts = held.rust_module_source.as_deref()?;
+        let facet = facts.symbols().first()?;
+        let module = held.placement.module()?.clone();
+        Some(PlacedFacts {
+            facts,
+            path: held.file.path(),
+            placement: DocumentPlacement::new(
+                held.placement.origin().clone(),
+                held.placement.unit().clone(),
+                held.placement.identity_path(),
+            )
+            .with_identity_anchors(BTreeMap::from([(facet.qualified_name.clone(), module)])),
+        })
+    }));
+    let shared = analyzed
+        .iter()
+        .flat_map(|held| {
+            held.shared_rust_placements.iter().map(|placement| {
+                crate::static_resolution::StaticSource {
+                    placement,
+                    ..held.static_source()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    placed.extend(shared.iter().map(|source| PlacedFacts {
+        facts: source.facts,
+        path: source.path,
+        // The source unit has no single module owner; only its declarations do.
+        placement: source.placement.clone().with_module(None),
+    }));
     let (bindings, mut binding_slots) = binding_capacity(
         analyzed,
         input.limits(),
@@ -469,7 +539,7 @@ fn assemble_package_graph(
                 (reference.symbol() == &target).then(|| export.target.clone())
             })
         },
-        (&static_sources, &input.namespace_input()),
+        (&static_sources, &shared, &input.namespace_input()),
         &mut binding_slots,
     )
     .map_err(|error| {
@@ -488,109 +558,386 @@ fn assemble_package_graph(
     Ok((built.semantics, truncated))
 }
 
+#[derive(Default)]
+struct BindingDemands {
+    rust_locals: BindingDemand,
+    rust_parameters: BindingDemand,
+    rust_receivers: BindingDemand,
+    rust_generics: BindingDemand,
+    rust_library: BindingDemand,
+    rust_explicit: BindingDemand,
+    rust_shorthand: BindingDemand,
+    rust_macro_methods: BindingDemand,
+    rust_disjoint: BindingDemand,
+    python_parameters: BindingDemand,
+    python_receivers: BindingDemand,
+    python_loop_bindings: BindingDemand,
+    python_variadic_parameters: BindingDemand,
+    python_overload_parameters: BindingDemand,
+    ecmascript: EcmaScriptBindingDemand,
+    primary: usize,
+    unnamed: usize,
+}
+
+impl BindingDemands {
+    fn collect(documents: &[AnalyzedFile]) -> Self {
+        let mut demands = Self::default();
+        for document in documents {
+            let facts = document.placed_syntax();
+            demands.primary = demands
+                .primary
+                .saturating_add(document.primary_declaration_count());
+            demands.unnamed = demands
+                .unnamed
+                .saturating_add(facts.left_out_symbols().len());
+            if !document.shared_rust_placements.is_empty() {
+                continue;
+            }
+            let receiver_names = facts.python_receiver_names();
+            let methods = facts.typescript_method_names();
+            for symbol in facts.symbols().iter().filter(|symbol| {
+                symbol.is_package_binding()
+                    && document
+                        .placement
+                        .logical_identity(&symbol.qualified_name)
+                        .is_some()
+            }) {
+                let language = facts.language().name.as_str();
+                let demand = if matches!(language, "javascript" | "typescript")
+                    && symbol.is_ecmascript_package_binding()
+                {
+                    demands
+                        .ecmascript
+                        .classify(symbol, language == "javascript", &methods)
+                } else if symbol.is_python_variadic_parameter() {
+                    &mut demands.python_variadic_parameters
+                } else if symbol.is_python_overload_parameter() {
+                    &mut demands.python_overload_parameters
+                } else if symbol.is_python_parameter() {
+                    if symbol
+                        .name_range
+                        .is_some_and(|name| receiver_names.contains(&name))
+                    {
+                        &mut demands.python_receivers
+                    } else {
+                        &mut demands.python_parameters
+                    }
+                } else if symbol.is_rust_receiver_binding() {
+                    &mut demands.rust_receivers
+                } else if facts.is_disjoint_rust_binding(symbol) {
+                    &mut demands.rust_disjoint
+                } else if symbol.is_rust_shorthand_binding() {
+                    &mut demands.rust_shorthand
+                } else if language == "rust" && symbol.is_rust_macro_method() {
+                    &mut demands.rust_macro_methods
+                } else if symbol.is_rust_explicit_local_binding() {
+                    &mut demands.rust_explicit
+                } else if symbol.is_rust_library_root() {
+                    &mut demands.rust_library
+                } else if symbol.is_rust_generic_parameter() {
+                    &mut demands.rust_generics
+                } else if symbol.is_rust_parameter_binding() {
+                    &mut demands.rust_parameters
+                } else if symbol.is_python_loop_binding() {
+                    &mut demands.python_loop_bindings
+                } else {
+                    &mut demands.rust_locals
+                };
+                demand.observe(symbol.item_range);
+            }
+        }
+        demands
+    }
+
+    fn count(&self) -> usize {
+        self.rust_locals.count
+            + self.rust_parameters.count
+            + self.python_parameters.count
+            + self.python_receivers.count
+            + self.python_loop_bindings.count
+            + self.python_variadic_parameters.count
+            + self.python_overload_parameters.count
+            + self.rust_receivers.count
+            + self.rust_generics.count
+            + self.rust_library.count
+            + self.rust_explicit.count
+            + self.rust_shorthand.count
+            + self.rust_macro_methods.count
+            + self.rust_disjoint.count
+            + self.ecmascript.count()
+    }
+}
+
 fn binding_capacity(
     documents: &[AnalyzedFile],
     limits: ExactPackageLimits,
     synthetic_objects: usize,
 ) -> (usize, rift_syntax::PackageBindingSlots) {
-    let mut rust_locals = BindingDemand::default();
-    let mut rust_parameters = BindingDemand::default();
-    let mut python_parameters = BindingDemand::default();
-    let mut typescript_parameters = BindingDemand::default();
-    let mut python_receivers = BindingDemand::default();
-    let mut python_loop_bindings = BindingDemand::default();
-    let mut python_variadic_parameters = BindingDemand::default();
-    let mut python_overload_parameters = BindingDemand::default();
-    let mut primary = 0_usize;
-    let mut unnamed = 0_usize;
-    for document in documents {
-        let facts = document.file.syntax();
-        let receiver_names = facts.python_receiver_names();
-        primary = primary
-            .saturating_add(facts.primary_symbols_len())
-            .saturating_add(document.placement.aliases_count());
-        unnamed = unnamed.saturating_add(facts.left_out_symbols().len());
-        for symbol in facts.symbols().iter().filter(|symbol| {
-            symbol.is_package_binding()
-                && document
-                    .placement
-                    .logical_identity(&symbol.qualified_name)
-                    .is_some()
-        }) {
-            let demand = if symbol.is_typescript_parameter() {
-                &mut typescript_parameters
-            } else if symbol.is_python_variadic_parameter() {
-                &mut python_variadic_parameters
-            } else if symbol.is_python_overload_parameter() {
-                &mut python_overload_parameters
-            } else if symbol.is_python_parameter() {
-                if symbol
-                    .name_range
-                    .is_some_and(|name| receiver_names.contains(&name))
-                {
-                    &mut python_receivers
-                } else {
-                    &mut python_parameters
-                }
-            } else if symbol.is_rust_parameter_binding() {
-                &mut rust_parameters
-            } else if symbol.is_python_loop_binding() {
-                &mut python_loop_bindings
-            } else {
-                &mut rust_locals
-            };
-            demand.count += 1;
-            let range = symbol.item_range;
-            demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
-        }
-    }
-    let provider = limits.declarations_max().saturating_sub(primary);
+    let demands = BindingDemands::collect(documents);
+    let rust_module_sources = BindingDemand::module_sources(documents);
+    let provider = limits.declarations_max().saturating_sub(demands.primary);
     let publication = bound(limits.publication().symbols).saturating_sub(
-        primary
-            .saturating_add(unnamed)
+        demands
+            .primary
+            .saturating_add(demands.unnamed)
             .saturating_add(synthetic_objects),
     );
-    let count = rust_locals.count
-        + rust_parameters.count
-        + python_parameters.count
-        + typescript_parameters.count
-        + python_receivers.count
-        + python_loop_bindings.count
-        + python_variadic_parameters.count
-        + python_overload_parameters.count;
-    let (mut bytes, record) = binding_source_budget(documents, limits, count);
+    let count = demands.count() + rust_module_sources.count;
+    let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
-    let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
-    let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
-    let python_parameter_slots = python_parameters.reserve(&mut slots, &mut bytes, record);
-    let typescript_parameter_slots = typescript_parameters.reserve(&mut slots, &mut bytes, record);
-    let python_receiver_slots = python_receivers.reserve(&mut slots, &mut bytes, record);
-    let python_loop_binding_slots = python_loop_bindings.reserve(&mut slots, &mut bytes, record);
-    let python_variadic_slots = python_variadic_parameters.reserve(&mut slots, &mut bytes, record);
-    let python_overload_slots = python_overload_parameters.reserve(&mut slots, &mut bytes, record);
+    let local_slots = demands.rust_locals.reserve(&mut slots, &mut bytes, record);
+    let rust_parameter_slots = demands
+        .rust_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let python_parameter_slots = demands
+        .python_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let typescript_parameter_slots = demands
+        .ecmascript
+        .typescript_functions
+        .reserve(&mut slots, &mut bytes, record);
+    let python_receiver_slots = demands
+        .python_receivers
+        .reserve(&mut slots, &mut bytes, record);
+    let python_loop_binding_slots = demands
+        .python_loop_bindings
+        .reserve(&mut slots, &mut bytes, record);
+    let python_variadic_slots = demands
+        .python_variadic_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let python_overload_slots = demands
+        .python_overload_parameters
+        .reserve(&mut slots, &mut bytes, record);
+    let javascript_parameter_slots = demands
+        .ecmascript
+        .javascript_functions
+        .reserve(&mut slots, &mut bytes, record);
+    let typescript_method_slots = demands
+        .ecmascript
+        .typescript_methods
+        .reserve(&mut slots, &mut bytes, record);
+    let rust_receiver_slots = demands
+        .rust_receivers
+        .reserve(&mut slots, &mut bytes, record);
+    let rust_generic_slots = demands
+        .rust_generics
+        .reserve(&mut slots, &mut bytes, record);
+    let root_slot = demands.rust_library.reserve(&mut slots, &mut bytes, record);
+    let explicit_slots = demands
+        .rust_explicit
+        .reserve(&mut slots, &mut bytes, record);
+    let established = rift_syntax::PackageBindingSlots::new(
+        local_slots,
+        rust_parameter_slots,
+        python_parameter_slots,
+        typescript_parameter_slots,
+    )
+    .with_rust_receivers(rust_receiver_slots)
+    .with_rust_generics(rust_generic_slots)
+    .with_rust_library_root(root_slot)
+    .with_rust_explicit_locals(explicit_slots)
+    .with_python_receiver_slots(python_receiver_slots)
+    .with_python_loop_binding_slots(python_loop_binding_slots)
+    .with_python_variadic_parameter_slots(python_variadic_slots)
+    .with_python_overload_parameter_slots(python_overload_slots)
+    .with_javascript_parameters(javascript_parameter_slots)
+    .with_typescript_method_parameters(typescript_method_slots);
     (
         count,
-        rift_syntax::PackageBindingSlots::new(
-            local_slots,
-            rust_parameter_slots,
-            python_parameter_slots,
-            typescript_parameter_slots,
-        )
-        .with_python_receiver_slots(python_receiver_slots)
-        .with_python_loop_binding_slots(python_loop_binding_slots)
-        .with_python_variadic_parameter_slots(python_variadic_slots)
-        .with_python_overload_parameter_slots(python_overload_slots),
+        demands.ecmascript.reserve_late_bindings(
+            documents,
+            [
+                &rust_module_sources,
+                &demands.rust_shorthand,
+                &demands.rust_macro_methods,
+                &demands.rust_disjoint,
+            ],
+            (slots, bytes),
+            record,
+            established,
+        ),
     )
 }
 
-fn binding_source_budget(
+#[derive(Default)]
+struct EcmaScriptBindingDemand {
+    typescript_functions: BindingDemand,
+    javascript_functions: BindingDemand,
+    typescript_methods: BindingDemand,
+    javascript_callbacks: BindingDemand,
+    typescript_overloads: BindingDemand,
+    javascript_methods: BindingDemand,
+    typescript_signatures: BindingDemand,
+    javascript_scoped_functions: BindingDemand,
+    typescript_types: BindingDemand,
+    javascript_shorthand: BindingDemand,
+    typescript_callable_types: BindingDemand,
+    typescript_index_signatures: BindingDemand,
+    javascript_wrapped: BindingDemand,
+    javascript_destructured: BindingDemand,
+    typescript_function_types: BindingDemand,
+    typescript_patterns: BindingDemand,
+    typescript_method_types: BindingDemand,
+}
+
+impl EcmaScriptBindingDemand {
+    fn reserve_late_bindings(
+        &self,
+        documents: &[AnalyzedFile],
+        rust: [&BindingDemand; 4],
+        capacity: (usize, u64),
+        record: u64,
+        established: rift_syntax::PackageBindingSlots,
+    ) -> rift_syntax::PackageBindingSlots {
+        let [
+            rust_modules,
+            rust_shorthand,
+            rust_macro_methods,
+            rust_disjoint,
+        ] = rust;
+        let (mut slots, mut bytes) = capacity;
+        let [
+            callback_slots,
+            overload_slots,
+            rust_module_slots,
+            rust_shorthand_slots,
+            method_slots,
+            signature_slots,
+            scoped_slots,
+            type_slots,
+            shorthand_slots,
+            callable_type_slots,
+            index_signature_slots,
+            wrapped_slots,
+            destructured_slots,
+            method_type_slots,
+            function_type_slots,
+            typed_pattern_slots,
+            macro_method_slots,
+            disjoint_slots,
+        ] = reserve_scoped_parameters(
+            documents,
+            [
+                &self.javascript_callbacks,
+                &self.typescript_overloads,
+                rust_modules,
+                rust_shorthand,
+                &self.javascript_methods,
+                &self.typescript_signatures,
+                &self.javascript_scoped_functions,
+                &self.typescript_types,
+                &self.javascript_shorthand,
+                &self.typescript_callable_types,
+                &self.typescript_index_signatures,
+                &self.javascript_wrapped,
+                &self.javascript_destructured,
+                &self.typescript_method_types,
+                &self.typescript_function_types,
+                &self.typescript_patterns,
+                rust_macro_methods,
+                rust_disjoint,
+            ],
+            &mut slots,
+            &mut bytes,
+            record,
+        );
+        established
+            .with_javascript_callback_parameters(callback_slots)
+            .with_typescript_overload_parameters(overload_slots)
+            .with_rust_module_sources(rust_module_slots)
+            .with_rust_shorthand(rust_shorthand_slots)
+            .with_javascript_method_parameters(method_slots)
+            .with_typescript_signature_parameters(signature_slots)
+            .with_javascript_scoped_function_parameters(scoped_slots)
+            .with_typescript_type_parameters(type_slots)
+            .with_javascript_shorthand_parameters(shorthand_slots)
+            .with_typescript_callable_type_parameters(callable_type_slots)
+            .with_typescript_index_signature_parameters(index_signature_slots)
+            .with_javascript_wrapped_parameters(wrapped_slots)
+            .with_javascript_destructured_parameters(destructured_slots)
+            .with_typescript_method_type_parameters(method_type_slots)
+            .with_typescript_function_type_parameters(function_type_slots)
+            .with_typescript_destructured_parameters(typed_pattern_slots)
+            .with_rust_macro_methods(macro_method_slots)
+            .with_disjoint_rust_bindings(disjoint_slots)
+    }
+
+    fn classify(
+        &mut self,
+        symbol: &SyntaxSymbol,
+        javascript: bool,
+        methods: &BTreeSet<&str>,
+    ) -> &mut BindingDemand {
+        if symbol.is_ecmascript_callback_parameter() {
+            &mut self.javascript_callbacks
+        } else if symbol.is_ecmascript_overload_parameter() {
+            &mut self.typescript_overloads
+        } else if symbol.is_javascript_method_parameter() {
+            &mut self.javascript_methods
+        } else if symbol.is_typescript_signature_parameter() {
+            &mut self.typescript_signatures
+        } else if symbol.is_javascript_scoped_function_parameter() {
+            &mut self.javascript_scoped_functions
+        } else if symbol.is_typescript_type_parameter() {
+            &mut self.typescript_types
+        } else if symbol.is_javascript_shorthand_parameter() {
+            &mut self.javascript_shorthand
+        } else if symbol.is_typescript_callable_type_parameter() {
+            &mut self.typescript_callable_types
+        } else if symbol.is_typescript_index_signature_parameter() {
+            &mut self.typescript_index_signatures
+        } else if symbol.is_javascript_wrapped_parameter() {
+            &mut self.javascript_wrapped
+        } else if symbol.is_javascript_destructured_parameter() {
+            &mut self.javascript_destructured
+        } else if symbol.is_typescript_method_type_parameter() {
+            &mut self.typescript_method_types
+        } else if symbol.is_typescript_function_type_parameter() {
+            &mut self.typescript_function_types
+        } else if symbol.is_typescript_destructured_parameter() {
+            &mut self.typescript_patterns
+        } else if javascript {
+            &mut self.javascript_functions
+        } else if symbol
+            .container
+            .as_deref()
+            .is_some_and(|owner| methods.contains(owner))
+        {
+            &mut self.typescript_methods
+        } else {
+            &mut self.typescript_functions
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.typescript_functions.count
+            + self.javascript_functions.count
+            + self.typescript_methods.count
+            + self.javascript_callbacks.count
+            + self.typescript_overloads.count
+            + self.javascript_methods.count
+            + self.typescript_signatures.count
+            + self.javascript_scoped_functions.count
+            + self.typescript_types.count
+            + self.javascript_shorthand.count
+            + self.typescript_callable_types.count
+            + self.typescript_index_signatures.count
+            + self.javascript_wrapped.count
+            + self.javascript_destructured.count
+            + self.typescript_method_types.count
+            + self.typescript_function_types.count
+            + self.typescript_patterns.count
+    }
+}
+
+fn binding_source_capacity(
     documents: &[AnalyzedFile],
     limits: ExactPackageLimits,
-    binding_count: usize,
+    count: usize,
 ) -> (u64, u64) {
     limits
         .retained_source()
-        .filter(|limits| binding_count != 0 && limits.total_bytes_max != u64::MAX)
+        .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
         .map_or((u64::MAX, u64::MAX), |limits| {
             let existing = documents.iter().fold(0_u64, |total, file| {
                 total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
@@ -602,6 +949,26 @@ fn binding_source_budget(
         })
 }
 
+/// Leaves room for established ECMAScript file declarations before scoped parameters.
+fn reserve_scoped_parameters<const N: usize>(
+    documents: &[AnalyzedFile],
+    demands: [&BindingDemand; N],
+    slots: &mut usize,
+    bytes: &mut u64,
+    record: u64,
+) -> [usize; N] {
+    if demands.iter().all(|demand| demand.count == 0) {
+        return [0; N];
+    }
+    for file in documents {
+        if let Some(source) = complete_module_bytes(file, record) {
+            *slots = slots.saturating_sub(1);
+            *bytes = bytes.saturating_sub(source);
+        }
+    }
+    demands.map(|demand| demand.reserve(slots, bytes, record))
+}
+
 /// Candidate count and the longest retained name in one class of source-local binding.
 #[derive(Default)]
 struct BindingDemand {
@@ -610,6 +977,23 @@ struct BindingDemand {
 }
 
 impl BindingDemand {
+    fn observe(&mut self, range: ByteRange) {
+        self.count += 1;
+        self.largest = self.largest.max(range.end.saturating_sub(range.start));
+    }
+
+    fn module_sources(documents: &[AnalyzedFile]) -> Self {
+        let mut demand = Self::default();
+        for facet in documents
+            .iter()
+            .filter_map(|file| file.rust_module_source.as_ref()?.symbols().first())
+        {
+            demand.count += 1;
+            demand.largest = demand.largest.max(facet.item_range.end);
+        }
+        demand
+    }
+
     fn reserve(&self, slots: &mut usize, bytes: &mut u64, record: u64) -> usize {
         let each = self.largest.min(record).max(1);
         let fits = usize::try_from(*bytes / each).unwrap_or(usize::MAX);
@@ -687,7 +1071,7 @@ fn place_namespace(
         },
     )?;
     let exposed = namespace.exposed_names();
-    for held in analyzed {
+    for held in analyzed.iter_mut() {
         held.public_names.extend(
             namespace
                 .public_names
@@ -706,7 +1090,28 @@ fn place_namespace(
             && path == held.file.path().as_str()
         {
             assigned.insert(".".to_owned(), root.clone());
+            place_rust_library_root(held, root);
         }
+        if namespace.rust_module_sources.remove(path.as_str())
+            && let Some(module) = namespace.rust_modules.get(path.as_str())
+        {
+            place_rust_module_source(held, module);
+        }
+        if let Some(methods) = namespace.rust_macro_methods.remove(path.as_str()) {
+            held.item_kinds.extend(item_kinds(&methods));
+            let facts = held
+                .placed_syntax
+                .take()
+                .map_or_else(|| held.file.syntax().clone(), |facts| *facts);
+            held.placed_syntax = Some(Box::new(facts.with_rust_macro_methods(methods)));
+        }
+        held.shared_rust_placements = namespace
+            .shared_rust_modules
+            .remove(held.file.path().as_str())
+            .into_iter()
+            .flatten()
+            .map(|scope| scope.placement(&held.placement))
+            .collect();
         held.placement = held
             .placement
             .clone()
@@ -725,7 +1130,112 @@ fn place_namespace(
             );
     }
 
+    place_scoped_anchors(analyzed, &mut namespace, input.limits());
     Ok(namespace)
+}
+
+/// Optional physical anchors reuse captured source, but each new declaration retains a
+/// bounded copy. Leave the earlier unresolved rows when the existing sources may need
+/// the caller's full budget.
+fn place_scoped_anchors(
+    analyzed: &mut [AnalyzedFile],
+    namespace: &mut namespace::PreparedNamespace,
+    limits: ExactPackageLimits,
+) {
+    if namespace.scoped_anchors.is_empty() {
+        return;
+    }
+    let reserve_fits = limits.retained_source().is_none_or(|limit| {
+        limit.total_bytes_max == u64::MAX
+            || !analyzed.iter().any(|held| {
+                namespace
+                    .scoped_anchors
+                    .get(held.file.path().as_str())
+                    .is_some_and(|anchors| {
+                        anchors
+                            .keys()
+                            .any(|name| held.placement.logical_identity(name).is_none())
+                    })
+            })
+            || analyzed.iter().fold(0_u64, |total, held| {
+                total.saturating_add(scoped_anchor_source_max(held, limit.record_bytes_max))
+            }) <= limit.total_bytes_max
+    });
+    for held in analyzed {
+        let Some(mut anchors) = namespace.scoped_anchors.remove(held.file.path().as_str()) else {
+            continue;
+        };
+        if !reserve_fits {
+            anchors.retain(|name, _| held.placement.logical_identity(name).is_some());
+        }
+        held.placement = held.placement.clone().with_scoped_identity_anchors(anchors);
+    }
+}
+
+/// Existing package bindings and complete file modules can also retain source.
+fn scoped_anchor_source_max(file: &AnalyzedFile, record_limit: u32) -> u64 {
+    let primary = primary_retained_source_max(file, record_limit);
+    let syntax = file.file.syntax();
+    let maximum = u64::from(record_limit);
+    let bindings = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.is_package_binding())
+        .map(|symbol| {
+            symbol
+                .item_range
+                .end
+                .saturating_sub(symbol.item_range.start)
+                .min(maximum)
+        })
+        .fold(0, u64::saturating_add);
+    primary
+        .saturating_add(bindings)
+        .saturating_add(complete_module_bytes(file, maximum).unwrap_or(0))
+}
+
+fn complete_module_bytes(file: &AnalyzedFile, maximum: u64) -> Option<u64> {
+    let syntax = file.file.syntax();
+    let source = u64::try_from(file.file.source().len()).unwrap_or(u64::MAX);
+    (matches!(syntax.language().name.as_str(), "javascript" | "typescript")
+        && file.placement.logical_identity(".").is_some()
+        && !syntax.has_errors()
+        && syntax.left_out_declaration_count() == 0
+        && syntax.primary_symbols_len() > 0
+        && source <= maximum)
+        .then_some(source)
+}
+
+fn place_rust_library_root(held: &mut AnalyzedFile, root: &CoreSymbolId) {
+    let Ok(identity) = SymbolIdentity::parse(root.as_str()) else {
+        return;
+    };
+    let [name] = identity.qualified_path() else {
+        return;
+    };
+    let source = held.file.source();
+    let Some(syntax) = held
+        .file
+        .syntax()
+        .clone()
+        .with_rust_library_root(name, source)
+    else {
+        return;
+    };
+    held.placed_syntax = Some(Box::new(syntax));
+}
+
+fn place_rust_module_source(held: &mut AnalyzedFile, module: &CoreSymbolId) {
+    let Ok(identity) = SymbolIdentity::parse(module.as_str()) else {
+        return;
+    };
+    let Some(name) = identity.qualified_path().last() else {
+        return;
+    };
+    held.rust_module_source =
+        held.file
+            .syntax()
+            .rust_module_source(name, held.file.path(), held.file.source());
 }
 
 /// Renders the canonical publication over the analyzed files.
@@ -776,6 +1286,7 @@ fn publish(
         semantics,
         &mut records,
     )?;
+    records.retain_ecmascript_modules(package, analyzed, semantics, limits)?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));
@@ -1489,6 +2000,9 @@ fn package_declarations<'declaration>(
 ) -> Result<Vec<DocumentationDeclaration<'declaration>>, RiftError> {
     let mut bindings = BTreeMap::new();
     for record in semantics.graph().records() {
+        let Some(id) = record.identity() else {
+            continue;
+        };
         for key in record.contributions() {
             let Some(contribution) = semantics.graph().contribution(key) else {
                 continue;
@@ -1498,6 +2012,7 @@ fn package_declarations<'declaration>(
             };
             bindings.insert(
                 (
+                    id.as_str(),
                     binding.unit().to_string(),
                     binding.range().start(),
                     binding.range().end(),
@@ -1510,6 +2025,7 @@ fn package_declarations<'declaration>(
     for declaration in &records.declarations {
         let facts = bindings
             .get(&(
+                declaration.symbol.as_str(),
                 declaration.unit.0.clone(),
                 declaration.range.start,
                 declaration.range.end,
@@ -1842,7 +2358,11 @@ impl Records {
                     && matches!(language, "javascript" | "typescript" | "rust")
                     && let Some(module) = held.placement.logical_identity(".")
                     && !objects.contains(module.as_str())
-                    && !semantics.edges().outgoing(module).is_empty()
+                    && semantics
+                        .edges()
+                        .outgoing(module)
+                        .iter()
+                        .any(|edge| !edge.is_file_module_reference())
                 {
                     let proven = (language != "javascript"
                         || javascript_module_source(owner, held))
@@ -1873,7 +2393,7 @@ impl Records {
                 .edges()
                 .outgoing(id)
                 .iter()
-                .filter(|edge| !edge.is_graph_edge())
+                .filter(|edge| !edge.is_graph_edge() && !edge.is_file_module_reference())
             {
                 if self.edges.len() >= limit {
                     self.warn(truncation(
@@ -1980,6 +2500,7 @@ impl Records {
                         .as_ref()
                         .is_some_and(|scopes| scopes.resolve(range.start(), range.end()).is_none());
                 if edge.is_graph_edge()
+                    || edge.is_file_module_reference()
                     || !(import || direct)
                     || occurrence.unit() != held.placement.unit()
                     || held
@@ -2048,7 +2569,13 @@ impl Records {
             let Some(module) = held.placement.logical_identity(".") else {
                 continue;
             };
-            if objects.contains(module.as_str()) || !semantics.edges().outgoing(module).is_empty() {
+            if objects.contains(module.as_str())
+                || semantics
+                    .edges()
+                    .outgoing(module)
+                    .iter()
+                    .any(|edge| !edge.is_file_module_reference())
+            {
                 continue;
             }
             let syntax = held.file.syntax();
@@ -2484,7 +3011,7 @@ impl Records {
                 start: binding.range().start(),
                 end: binding.range().end(),
             },
-            syntax_element_kind: held.item_kind(binding.range()),
+            syntax_element_kind: held.item_kind(binding.range(), facts.qualified_name()),
             line: line_of(starts, binding.range().start()),
             signature_indices: fact_indices(owner, &object.signatures, facts.signatures_slice())?,
             type_indices: fact_indices(owner, &object.types, facts.type_bindings())?,
@@ -3525,7 +4052,7 @@ mod tests {
             .iter()
             .map(|symbol| symbol.name.as_str())
             .collect();
-        assert_eq!(named, ["hidden", "spawn"]);
+        assert_eq!(named, ["beacon", "hidden", "spawn"]);
         let public: Vec<&str> = publication
             .objects
             .iter()
@@ -3554,7 +4081,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            [Some("function_item"), Some("function_item")],
+            [
+                Some("source_file"),
+                Some("function_item"),
+                Some("function_item")
+            ],
             "each declaration names its item syntax element's grammar kind"
         );
     }
@@ -4092,7 +4623,10 @@ class _Private:
             .collect();
         assert_eq!(
             changed_symbols,
-            ["rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"]
+            [
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha",
+            ]
         );
         let added = after
             .declarations
@@ -4191,6 +4725,7 @@ class _Private:
             added,
             [
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/b",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/b",
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/b/beta"
             ]
         );
@@ -4203,9 +4738,10 @@ class _Private:
             unchanged,
             [
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"
             ],
-            "an untouched declaration keeps its digest"
+            "an untouched declaration and source facet keep their digests"
         );
     }
 
@@ -4238,7 +4774,7 @@ class _Private:
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file().path().as_str(), "src/lib.rs");
         assert!(files[0].is_public("spawn"));
-        assert_eq!(analysis.publication().objects.len(), 1);
+        assert_eq!(analysis.publication().objects.len(), 2);
     }
 
     #[test]

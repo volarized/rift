@@ -333,8 +333,7 @@ impl<'source> Namespaces<'source> {
             if file.inactive(crate_name, work) {
                 continue;
             }
-            let Some((origin, inline)) =
-                self.module_at_with_scope(file.document.path.as_str(), crate_name.start, work)
+            let Some((origin, inline)) = self.module_with_scope(file, crate_name.start, work)
             else {
                 continue;
             };

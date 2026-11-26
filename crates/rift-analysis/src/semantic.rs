@@ -129,7 +129,7 @@ impl PreparedSemantics {
         };
         let syntax_provider = ProviderId::new(SYNTAX_PROVIDER_ID)?;
         let (edges, static_resolution) = match static_inputs {
-            Some((sources, input))
+            Some((sources, shared, input))
                 if self.beyond_declaration_bound.is_empty()
                     && self.refused_contributions.is_empty() =>
             {
@@ -137,6 +137,7 @@ impl PreparedSemantics {
                     crate::static_resolution::resolve(
                         &graph,
                         sources,
+                        shared,
                         input,
                         edges_max.saturating_mul(16),
                     )
@@ -168,6 +169,7 @@ impl PreparedSemantics {
 type ExternalTarget<'input> =
     dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
 type StaticInputs<'call, 'source> = (
+    &'call [StaticSource<'source>],
     &'call [StaticSource<'source>],
     &'call crate::NamespaceInput<'source>,
 );
@@ -430,12 +432,16 @@ impl WorkspaceSemantics {
         static_inputs: StaticInputs<'_, '_>,
         binding_slots: &mut rift_syntax::PackageBindingSlots,
     ) -> Result<BuiltSemantics, RiftError> {
+        let ordinary = documents.len().saturating_sub(static_inputs.1.len());
         Self::prepare_facts_with(
             documents,
             declarations_max,
             revision,
             false,
-            |_, placed, builder| {
+            |index, placed, builder| {
+                if index >= ordinary {
+                    return builder.add_facts_placed(placed.facts, &placed.placement);
+                }
                 builder.add_facts_placed_with_bindings(
                     placed.facts,
                     &placed.placement,

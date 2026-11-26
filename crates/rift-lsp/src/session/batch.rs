@@ -261,7 +261,7 @@ impl EngineSession {
             .collect())
     }
 
-    async fn request_batch<R: Request>(
+    pub(super) async fn request_batch<R: Request>(
         &mut self,
         params: Vec<R::Params>,
     ) -> Result<Vec<R::Result>, RiftError> {

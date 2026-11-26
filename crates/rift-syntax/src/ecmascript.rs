@@ -80,10 +80,19 @@ use std::num::NonZeroU16;
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
+
+mod callback_parameters;
+mod checked_parameters;
 mod commonjs;
 mod members;
+mod overload_parameters;
 pub(crate) mod recovery;
+mod scoped_function_parameters;
+mod shorthand_parameters;
+mod type_parameters;
+mod type_signature_parameters;
 mod variance;
+mod wrapped_parameters;
 
 use tree_sitter::{Node, Parser};
 
@@ -230,8 +239,22 @@ const BLOCK_COMMENT_CLOSE: &str = "*/";
 /// Leads each continuation line inside a `JSDoc` block.
 const JSDOC_LINE_MARKER: char = '*';
 
-/// Provider kind of an ordinary TypeScript value parameter.
+/// Provider kind of an ordinary ECMAScript value parameter.
 pub(crate) const PARAMETER_KIND: &str = "value_parameter";
+pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
+pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
+pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
+pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
+pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
+pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const FUNCTION_TYPE_PARAMETER_KIND: &str = "typescript_function_type_parameter";
+pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_parameter";
+pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
+pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
+pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
+pub(crate) const DESTRUCTURED_PARAMETER_KIND: &str = "javascript_destructured_parameter";
+pub(crate) const TYPED_DESTRUCTURED_PARAMETER_KIND: &str = "typescript_destructured_parameter";
+pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -1004,24 +1027,44 @@ impl EcmaScriptKinds {
         None
     }
 
-    /// A simple parameter of a named TypeScript function with a body.
-    fn ordinary_parameter<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+    /// A simple parameter of a named function or method, with its JavaScript method class.
+    fn ordinary_parameter<'tree>(
+        &self,
+        visited: Visited<'_, 'tree>,
+    ) -> Option<(Node<'tree>, bool)> {
         let parameter = visited.syntax_element();
-        if !self.formal_parameter_kinds.contains(&parameter.kind_id()) || parameter.has_error() {
+        let name = if parameter.kind_id() == self.identifier {
+            parameter
+        } else if self.formal_parameter_kinds.contains(&parameter.kind_id()) {
+            parameter.child_by_field_id(self.pattern?.get())?
+        } else {
+            return None;
+        };
+        if parameter.has_error() || name.kind_id() != self.identifier || name.is_missing() {
             return None;
         }
         let list = visited.parent()?;
+        if list.syntax_element().kind() != "formal_parameters" {
+            return None;
+        }
         let function = list.parent()?.syntax_element();
-        if list.syntax_element().kind() != "formal_parameters"
-            || function.kind() != FUNCTION_DECLARATION_KIND
-        {
+        let direct = function.kind() == FUNCTION_DECLARATION_KIND;
+        let generator = self.formal_parameter_kinds.is_empty()
+            && function.kind() == GENERATOR_FUNCTION_DECLARATION_KIND;
+        let method = function.kind_id() == self.method_definition
+            && !self.parameter_property_marked(parameter);
+        let signature = matches!(
+            function.kind(),
+            FUNCTION_SIGNATURE_KIND | METHOD_SIGNATURE_KIND | ABSTRACT_METHOD_SIGNATURE_KIND
+        );
+        if !(direct || generator || method || signature) {
             return None;
         }
         self.child(function, EcmaScriptGrammarField::Name)?;
-        self.child(function, EcmaScriptGrammarField::Body)?;
-        parameter
-            .child_by_field_id(self.pattern?.get())
-            .filter(|name| name.kind_id() == self.identifier && !name.is_missing())
+        if !signature {
+            self.child(function, EcmaScriptGrammarField::Body)?;
+        }
+        Some((name, method && self.formal_parameter_kinds.is_empty()))
     }
 
     /// The name a constructor parameter property declares: `name` in
@@ -1039,12 +1082,7 @@ impl EcmaScriptKinds {
         {
             return None;
         }
-        let marked = named_children(syntax_element)
-            .any(|child| Some(child.kind_id()) == self.accessibility_modifier)
-            || self
-                .readonly_token
-                .is_some_and(|token| EcmaScriptRules::has_token(syntax_element, &[token]));
-        if !marked {
+        if !self.parameter_property_marked(syntax_element) {
             return None;
         }
         let method = visited.parent()?.parent()?.syntax_element();
@@ -1058,6 +1096,13 @@ impl EcmaScriptKinds {
         }
         let name = syntax_element.child_by_field_id(self.pattern?.get())?;
         (name.kind_id() == self.identifier).then_some(name)
+    }
+
+    fn parameter_property_marked(&self, parameter: Node<'_>) -> bool {
+        named_children(parameter).any(|child| Some(child.kind_id()) == self.accessibility_modifier)
+            || self
+                .readonly_token
+                .is_some_and(|token| EcmaScriptRules::has_token(parameter, &[token]))
     }
 
     /// Whether `syntax_element` is an enum member written without a value, `B` in
@@ -1589,6 +1634,82 @@ impl EcmaScriptRules<'_> {
         text.get(name.byte_range()).map(Into::into)
     }
 
+    fn parameter_syntax<'tree>(
+        &self,
+        visited: Visited<'_, 'tree>,
+    ) -> Option<(Node<'tree>, &'static str)> {
+        type_parameters::declared_name(visited)
+            .map(|name| (name, TYPE_PARAMETER_KIND))
+            .or_else(|| {
+                type_parameters::named_owner(visited, type_parameters::function)
+                    .map(|name| (name, FUNCTION_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
+                type_parameters::named_owner(visited, type_parameters::method)
+                    .map(|name| (name, METHOD_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
+                type_signature_parameters::callable_parameter_name(visited)
+                    .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
+                type_signature_parameters::index_parameter_name(visited)
+                    .map(|name| (name, INDEX_SIGNATURE_PARAMETER_KIND))
+            })
+            .or_else(|| {
+                if self.kinds.formal_parameter_kinds.is_empty() {
+                    let written = visited.syntax_element();
+                    wrapped_parameters::declared_name(written)
+                        .map(|name| (name, WRAPPED_PARAMETER_KIND))
+                        .or_else(|| {
+                            wrapped_parameters::destructured_name(written, false)
+                                .map(|name| (name, DESTRUCTURED_PARAMETER_KIND))
+                        })
+                } else {
+                    wrapped_parameters::destructured_name(visited.syntax_element(), true)
+                        .map(|name| (name, TYPED_DESTRUCTURED_PARAMETER_KIND))
+                }
+            })
+            .or_else(|| {
+                self.kinds
+                    .ordinary_parameter(visited)
+                    .map(|(name, method)| {
+                        let kind = if method {
+                            METHOD_PARAMETER_KIND
+                        } else {
+                            PARAMETER_KIND
+                        };
+                        (name, kind)
+                    })
+            })
+    }
+
+    fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let (name, kind) = self.parameter_syntax(visited)?;
+        let name = text.get(name.byte_range())?;
+        let type_parameter = matches!(
+            kind,
+            TYPE_PARAMETER_KIND | METHOD_TYPE_PARAMETER_KIND | FUNCTION_TYPE_PARAMETER_KIND
+        );
+        if !name.is_ascii() || name.contains('\\') || (!type_parameter && name == "this") {
+            return None;
+        }
+        let kinds = if type_parameter {
+            vec![SymbolKind::Type, SymbolKind::TypeParameter]
+        } else {
+            vec![SymbolKind::Value, SymbolKind::Parameter]
+        };
+        Some(Declaration {
+            name: name.to_owned(),
+            kind,
+            kinds,
+            visibility: None,
+            body_range: None,
+            documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
+        })
+    }
+
     /// One declaration the walk reaches through a syntax element outside the kind
     /// table: a name a destructuring pattern binds, a constructor parameter
     /// property, an enum member without a value, or the anonymous class a
@@ -1599,21 +1720,8 @@ impl EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
-        if let Some(name) = self
-            .kinds
-            .ordinary_parameter(visited)
-            .and_then(|name| text.get(name.byte_range()))
-            .filter(|name| *name != "this" && name.is_ascii() && !name.contains('\\'))
-        {
-            return Ok(Some(Declaration {
-                name: name.to_owned(),
-                kind: PARAMETER_KIND,
-                kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
-                visibility: None,
-                body_range: None,
-                documentation: Vec::new(),
-                documentation_ranges: Vec::new(),
-            }));
+        if let Some(parameter) = self.parameter_declaration(visited, text) {
+            return Ok(Some(parameter));
         }
         let parent = visited.parent().map(Visited::syntax_element);
         let (name, kind, kinds) = if let Some(declarator) = self.kinds.pattern_declarator(visited) {
@@ -1882,10 +1990,17 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .then_some(self.kinds.pattern)
             .flatten()
             .and_then(|pattern| syntax_element.child_by_field_id(pattern.get()));
+        let wrapped_parameter = self
+            .kinds
+            .formal_parameter_kinds
+            .is_empty()
+            .then(|| wrapped_parameters::declared_name(syntax_element))
+            .flatten();
         let name = self
             .kinds
             .name_syntax_element(syntax_element)
             .or(parameter_name)
+            .or(wrapped_parameter)
             .or_else(|| {
                 (syntax_element.kind_id() == self.kinds.assignment_expression)
                     .then(|| {
@@ -2059,15 +2174,14 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
-        self.kinds
-            .ordinary_parameter(visited)
-            .unwrap_or_else(|| visited.syntax_element())
+        self.parameter_syntax(visited)
+            .map_or_else(|| visited.syntax_element(), |(name, _)| name)
     }
 
     /// Starts the declaration at the statement carrying it, extended over the
     /// `JSDoc` comments attached before that statement.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
-        if let Some(name) = self.kinds.ordinary_parameter(visited) {
+        if let Some((name, _)) = self.parameter_syntax(visited) {
             return name.start_byte();
         }
         let statement = self.statement(visited);
@@ -2234,7 +2348,7 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
-    let parameters = take_parameters(kinds, &mut symbols);
+    let parameters = take_parameters(&mut symbols);
     let mut static_facts = capture.map(crate::static_analysis::Capture::finish);
     if let Some(facts) = &mut static_facts {
         let aliases = members::record(
@@ -2248,7 +2362,14 @@ pub(crate) fn analyze_included(
         )?;
         facts.set_member_aliases(aliases);
         if !recovered && !tree.root_node().has_error() {
-            append_parameters(&mut symbols, parameters, facts);
+            append_package_parameters(
+                language,
+                tree.root_node(),
+                source.text,
+                &mut symbols,
+                parameters,
+                facts,
+            );
         }
     }
     symbols.sort_by_key(|symbol| symbol.range.start);
@@ -2291,17 +2412,118 @@ fn parser_for_ranges(
     Ok(parser)
 }
 
-/// Holds optional parameters aside while existing member facts are resolved.
-fn take_parameters(
-    kinds: &EcmaScriptKinds,
+fn append_package_parameters(
+    language: &Language,
+    root: Node<'_>,
+    source: &str,
     symbols: &mut Vec<crate::SyntaxSymbol>,
-) -> Vec<crate::SyntaxSymbol> {
-    if kinds.formal_parameter_kinds.is_empty() {
-        return Vec::new();
+    candidates: ParameterDeclarations,
+    facts: &crate::StaticFacts,
+) {
+    let ParameterDeclarations {
+        values: parameters,
+        types: type_parameters,
+        callable_types,
+        index_signatures,
+        wrapped,
+        destructured,
+        method_types,
+        function_types,
+        typed_patterns,
+    } = candidates;
+    let scoped = if language.name == "typescript" {
+        overload_parameters::capture(symbols, &parameters, facts, root)
+    } else {
+        scoped_function_parameters::capture(symbols, &parameters, facts)
+    };
+    let shorthand = if language.name == "javascript" {
+        shorthand_parameters::capture(symbols, &parameters, facts)
+    } else {
+        Vec::new()
+    };
+    append_parameters(symbols, parameters, facts);
+    symbols.extend(scoped);
+    symbols.extend(shorthand);
+    callback_parameters::append(symbols, facts, source, language.name == "javascript");
+    checked_parameters::append_under_named_owner(
+        symbols,
+        type_parameters,
+        facts,
+        type_parameters::structured,
+    );
+    type_signature_parameters::append_callable_types(root, symbols, callable_types, facts);
+    type_signature_parameters::append_indexes(root, symbols, index_signatures);
+    checked_parameters::append_under_named_owner(
+        symbols,
+        wrapped,
+        facts,
+        wrapped_parameters::accepted_owner,
+    );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        destructured,
+        facts,
+        wrapped_parameters::accepted_owner,
+    );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        method_types,
+        facts,
+        type_parameters::method,
+    );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        function_types,
+        facts,
+        type_parameters::function,
+    );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        typed_patterns,
+        facts,
+        wrapped_parameters::accepted_owner,
+    );
+}
+
+#[derive(Default)]
+struct ParameterDeclarations {
+    values: Vec<crate::SyntaxSymbol>,
+    types: Vec<crate::SyntaxSymbol>,
+    callable_types: Vec<crate::SyntaxSymbol>,
+    index_signatures: Vec<crate::SyntaxSymbol>,
+    wrapped: Vec<crate::SyntaxSymbol>,
+    destructured: Vec<crate::SyntaxSymbol>,
+    function_types: Vec<crate::SyntaxSymbol>,
+    typed_patterns: Vec<crate::SyntaxSymbol>,
+    method_types: Vec<crate::SyntaxSymbol>,
+}
+
+/// Holds optional parameters aside while existing member facts are resolved.
+fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarations {
+    let mut candidates = ParameterDeclarations::default();
+    for symbol in symbols.extract_if(.., |symbol| symbol.is_ecmascript_package_binding()) {
+        let class = if symbol.is_typescript_type_parameter() {
+            &mut candidates.types
+        } else if symbol.is_typescript_callable_type_parameter() {
+            &mut candidates.callable_types
+        } else if symbol.is_typescript_index_signature_parameter() {
+            &mut candidates.index_signatures
+        } else if symbol.is_javascript_wrapped_parameter() {
+            &mut candidates.wrapped
+        } else if symbol.is_javascript_destructured_parameter() {
+            &mut candidates.destructured
+        } else if symbol.is_typescript_method_type_parameter() {
+            &mut candidates.method_types
+        } else if symbol.is_typescript_function_type_parameter() {
+            &mut candidates.function_types
+        } else if symbol.is_typescript_destructured_parameter() {
+            &mut candidates.typed_patterns
+        } else {
+            &mut candidates.values
+        };
+        class.push(symbol);
     }
-    symbols
-        .extract_if(.., |symbol| symbol.is_typescript_parameter())
-        .collect()
+    candidates
 }
 
 /// An ordinary parameter adds no competing facet of an existing lexical declaration.
@@ -2319,12 +2541,16 @@ fn append_parameters(
             .entry(symbol.qualified_name.as_str())
             .or_insert(0_usize) += 1;
     }
+    let signatures = symbols
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some(FUNCTION_SIGNATURE_KIND))
+        .filter_map(|symbol| symbol.name_range)
+        .collect::<BTreeSet<_>>();
     let anchors = facts
         .parameters()
         .iter()
-        .filter(|parameter| parameter.owner.is_some())
-        .map(|parameter| parameter.name)
-        .collect::<BTreeSet<_>>();
+        .filter_map(|parameter| Some((parameter.name, parameter.owner?)))
+        .collect::<BTreeMap<_, _>>();
     let retained = parameters
         .iter()
         .filter(|symbol| {
@@ -2339,16 +2565,20 @@ fn append_parameters(
         .filter(|symbol| {
             symbol
                 .name_range
-                .is_some_and(|name| anchors.contains(&name))
+                .is_some_and(|name| anchors.contains_key(&name))
         })
         .filter(|symbol| rift_core::is_portable_name(&symbol.name))
         .map(|symbol| symbol.name_range)
         .collect::<BTreeSet<_>>();
-    symbols.extend(
-        parameters
-            .into_iter()
-            .filter(|symbol| retained.contains(&symbol.name_range)),
-    );
+    symbols.extend(parameters.into_iter().filter_map(|mut symbol| {
+        if !retained.contains(&symbol.name_range) {
+            return None;
+        }
+        if signatures.contains(anchors.get(&symbol.name_range?)?) {
+            symbol.kind = SIGNATURE_PARAMETER_KIND;
+        }
+        Some(symbol)
+    }));
 }
 
 /// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
@@ -2411,8 +2641,50 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     if name == OBJECT_KIND {
         return Some(OBJECT_KIND);
     }
-    if name == PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+    if name == PARAMETER_KIND {
         return Some(PARAMETER_KIND);
+    }
+    if name == CALLBACK_PARAMETER_KIND {
+        return Some(CALLBACK_PARAMETER_KIND);
+    }
+    if name == OVERLOAD_PARAMETER_KIND {
+        return Some(OVERLOAD_PARAMETER_KIND);
+    }
+    if name == METHOD_PARAMETER_KIND {
+        return Some(METHOD_PARAMETER_KIND);
+    }
+    if name == SIGNATURE_PARAMETER_KIND {
+        return Some(SIGNATURE_PARAMETER_KIND);
+    }
+    if name == SCOPED_FUNCTION_PARAMETER_KIND {
+        return Some(SCOPED_FUNCTION_PARAMETER_KIND);
+    }
+    if name == SHORTHAND_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(SHORTHAND_PARAMETER_KIND);
+    }
+    if name == CALLABLE_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(CALLABLE_TYPE_PARAMETER_KIND);
+    }
+    if name == INDEX_SIGNATURE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(INDEX_SIGNATURE_PARAMETER_KIND);
+    }
+    if name == WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(WRAPPED_PARAMETER_KIND);
+    }
+    if name == DESTRUCTURED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(DESTRUCTURED_PARAMETER_KIND);
+    }
+    if name == METHOD_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(METHOD_TYPE_PARAMETER_KIND);
+    }
+    if name == FUNCTION_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(FUNCTION_TYPE_PARAMETER_KIND);
+    }
+    if name == TYPED_DESTRUCTURED_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(TYPED_DESTRUCTURED_PARAMETER_KIND);
+    }
+    if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(TYPE_PARAMETER_KIND);
     }
     kinds
         .declarations

@@ -8,7 +8,7 @@ use std::{
 use rift_core::SymbolId;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
-use rift_syntax::SyntaxFacts;
+use rift_syntax::{ScopedIdentityAnchors, SyntaxFacts};
 
 use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportRootOrigin};
 
@@ -50,10 +50,17 @@ pub(crate) struct ExportBinding {
 #[derive(Default)]
 pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
+    pub(crate) scoped_anchors: BTreeMap<String, ScopedIdentityAnchors>,
     /// The source path and accepted crate namespace of a Cargo library root.
     pub(crate) rust_package_root: Option<(String, SymbolId)>,
     /// The module of each Rust file a captured library's module tree reaches.
     pub(crate) rust_modules: BTreeMap<String, SymbolId>,
+    /// Rust units with an authored module declaration and a unique checked source.
+    pub(crate) rust_module_sources: BTreeSet<String>,
+    /// Written names that a selected local Rust macro emits as inherent methods.
+    pub(crate) rust_macro_methods: BTreeMap<String, Vec<rift_syntax::SyntaxSymbol>>,
+    /// Separate logical Rust owners of the same checked physical source.
+    pub(crate) shared_rust_modules: BTreeMap<String, Vec<rust::SharedRustModule>>,
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     /// Observed `CommonJS` files with a checked synchronized export object.
     pub(crate) commonjs_modules: BTreeSet<String>,
@@ -208,6 +215,9 @@ pub(crate) fn prepare_context(
     prepared.anchors.extend(rust.anchors);
     prepared.rust_package_root = rust.rust_package_root;
     prepared.rust_modules = rust.rust_modules;
+    prepared.rust_module_sources = rust.rust_module_sources;
+    prepared.rust_macro_methods = rust.rust_macro_methods;
+    prepared.shared_rust_modules = rust.shared_rust_modules;
     prepared.exports.extend(rust.exports);
     prepared.alias_visibilities.extend(rust.alias_visibilities);
     prepared.unresolved_exports |= rust.unresolved_exports;

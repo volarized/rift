@@ -7,6 +7,7 @@ mod javascript_edges;
 mod javascript_exports;
 mod javascript_member_callbacks;
 mod javascript_members;
+mod javascript_modules;
 mod javascript_parameters;
 mod javascript_reexports;
 mod javascript_scopes;
@@ -15,6 +16,7 @@ mod rust;
 #[cfg(test)]
 mod tests;
 
+use javascript_parameters::{ParameterReads, ScopedParameterReads};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
@@ -80,10 +82,92 @@ pub(crate) struct StaticResolution {
     /// First reference inside a compound Python string annotation.
     pub(crate) python_quoted_type_start: Option<usize>,
     pub(crate) python_overload_parameter_start: Option<usize>,
+    /// First reference to an authored file module from an ECMAScript module pass.
+    pub(crate) file_module_start: Option<usize>,
+    /// First qualifier reference after the file module specifiers.
+    pub(crate) file_module_qualifier_start: Option<usize>,
+    /// First containment edge of a physically scoped literal declaration.
+    pub(crate) literal_start: Option<usize>,
+    /// Containment awaiting the capacity left by existing references.
+    pub(crate) deferred_literal_containment: Vec<StaticOccurrence>,
+    /// First callback parameter reference after the previously admitted edge classes.
+    pub(crate) callback_parameter_start: Option<usize>,
+    /// Callback parameter reads awaiting their place after containment.
+    pub(crate) deferred_callback_parameters: Vec<StaticOccurrence>,
+    /// First TypeScript overload parameter read after callback parameter reads.
+    pub(crate) overload_parameter_start: Option<usize>,
+    /// Overload parameter reads awaiting capacity after earlier package edges.
+    pub(crate) deferred_overload_parameters: Vec<StaticOccurrence>,
     /// First internal and external occurrence resolved through authored Rust extern crate aliases.
     pub(crate) rust_extern_alias_start: Option<(usize, usize)>,
+    /// First occurrence resolved to a Rust receiver parameter.
+    pub(crate) rust_receiver_start: Option<usize>,
+    /// First occurrence resolved to an authored Rust generic parameter.
+    pub(crate) rust_generic_start: Option<usize>,
+    /// First occurrence derived from the physical Cargo library root.
+    pub(crate) rust_library_root_start: Option<usize>,
+    /// First path occurrence resolved to the physical Cargo library root.
+    pub(crate) rust_crate_paths_start: Option<usize>,
+    /// First restricted visibility occurrence resolved to the Cargo library root.
+    pub(crate) rust_crate_visibility_start: Option<usize>,
+    /// First occurrence resolved from a Rust argument value.
+    pub(crate) rust_argument_value_start: Option<usize>,
+    /// First use-path qualifier resolved to a Rust module or type.
+    pub(crate) rust_import_qualifier_start: Option<usize>,
+    /// First occurrence that reads a checked Rust shorthand pattern binding.
+    pub(crate) rust_shorthand_start: Option<usize>,
+    /// First occurrence resolved in an explicitly placed shared Rust source.
+    pub(crate) rust_shared_start: Option<usize>,
+    /// First reference to an authored parent module after existing Rust references.
+    pub(crate) rust_parent_module_start: Option<usize>,
+    /// Authored parent-module sites already resolved by the qualified-call pass.
+    pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
+    /// First JavaScript method parameter read after earlier parameter reads.
+    pub(crate) javascript_method_parameter_start: Option<usize>,
+    /// JavaScript method parameter reads awaiting capacity after earlier facts.
+    pub(crate) deferred_javascript_method_parameters: Vec<StaticOccurrence>,
+    /// First parameter read from a separately anchored JavaScript function.
+    pub(crate) scoped_javascript_function_start: Option<usize>,
+    /// Reads of scoped JavaScript parameters awaiting capacity after earlier facts.
+    pub(crate) deferred_scoped_javascript_parameters: Vec<StaticOccurrence>,
+    /// First occurrence of a private binding with only a physical scope anchor.
+    pub(crate) scoped_javascript_lexical_start: Option<usize>,
+    /// Occurrences of separately anchored private bindings after earlier facts.
+    pub(crate) deferred_scoped_javascript_lexical: Vec<StaticOccurrence>,
+    /// First occurrence of a written TypeScript type parameter after earlier facts.
+    pub(crate) typescript_type_parameter_start: Option<usize>,
+    /// Type uses awaiting the capacity left by earlier package edges.
+    pub(crate) deferred_typescript_type_parameters: Vec<StaticOccurrence>,
+    /// First Read of a JavaScript parameter that shares a name with a shorthand property.
+    pub(crate) javascript_shorthand_parameter_start: Option<usize>,
+    /// Shorthand parameter Reads awaiting capacity after earlier package edges.
+    pub(crate) deferred_javascript_shorthand_parameters: Vec<StaticOccurrence>,
+    /// First Read of a named JavaScript defaulted or rest parameter.
+    pub(crate) javascript_wrapped_parameter_start: Option<usize>,
+    /// Defaulted and rest parameter Reads behind earlier package edges.
+    pub(crate) deferred_javascript_wrapped_parameters: Vec<StaticOccurrence>,
+    /// First Read of a named JavaScript object or array parameter binding.
+    pub(crate) javascript_destructured_parameter_start: Option<usize>,
+    /// Pattern binding Reads after earlier package edges.
+    pub(crate) deferred_javascript_destructured_parameters: Vec<StaticOccurrence>,
+    /// First containment edge of a property in a physical TypeScript union branch.
+    pub(crate) typescript_union_property_start: Option<usize>,
+    /// Union properties awaiting the capacity left by earlier package facts.
+    pub(crate) deferred_typescript_union_properties: Vec<StaticOccurrence>,
+    /// First use of a TypeScript method type parameter after earlier edges.
+    pub(crate) typescript_method_type_parameter_start: Option<usize>,
+    /// Type parameter uses awaiting capacity after earlier package facts.
+    pub(crate) deferred_typescript_method_type_parameters: Vec<StaticOccurrence>,
+    /// First use of a TypeScript function type parameter after earlier edges.
+    pub(crate) typescript_function_type_parameter_start: Option<usize>,
+    /// Type parameter uses awaiting capacity after earlier package facts.
+    pub(crate) deferred_typescript_function_type_parameters: Vec<StaticOccurrence>,
+    /// First Read of a TypeScript parameter pattern binding after earlier edges.
+    pub(crate) typescript_destructured_parameter_start: Option<usize>,
+    /// Pattern binding Reads awaiting capacity after earlier package facts.
+    pub(crate) deferred_typescript_destructured_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -160,12 +244,13 @@ pub(crate) fn deferred(documents: &[StaticSource<'_>]) -> StaticResolution {
 pub(crate) fn resolve(
     graph: &NormalizedGraph,
     documents: &[StaticSource<'_>],
+    shared: &[StaticSource<'_>],
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
     resolve_by(
         graph,
-        documents,
+        (documents, shared),
         namespace,
         work_max,
         |index, work, resolution| index.resolve_files(FileWork::CAPTURED, work, resolution),
@@ -175,12 +260,16 @@ pub(crate) fn resolve(
 /// Runs one static pass whose files `files` resolves against the built index.
 fn resolve_by<'source>(
     graph: &'source NormalizedGraph,
-    documents: &'source [StaticSource<'source>],
+    documents: (
+        &'source [StaticSource<'source>],
+        &'source [StaticSource<'source>],
+    ),
     namespace: &NamespaceInput<'_>,
     work_max: usize,
     files: impl FnOnce(&Index<'source>, &mut Work, &mut StaticResolution),
 ) -> StaticResolution {
     let mut edge_calls: BTreeMap<_, _> = documents
+        .0
         .iter()
         .filter(|document| supported_language(document.facts))
         .map(|document| {
@@ -208,11 +297,101 @@ fn resolve_by<'source>(
         ..StaticResolution::default()
     };
     files(&index, &mut work, &mut resolution);
+    append_deferred_ecmascript(&mut resolution);
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
+    index.resolve_rust_receivers(&mut work, &mut resolution);
+    index.resolve_rust_generics(&mut work, &mut resolution);
+    index.resolve_rust_library_root(&mut work, &mut resolution);
+    resolution.rust_crate_paths_start = index.resolve_rust_crate_references(
+        &mut work,
+        &mut resolution,
+        StaticFacts::rust_crate_paths,
+    );
+    resolution.rust_crate_visibility_start = index.resolve_rust_crate_references(
+        &mut work,
+        &mut resolution,
+        StaticFacts::rust_crate_visibility,
+    );
+    index.resolve_rust_argument_values(&mut work, &mut resolution);
+    index.resolve_rust_import_qualifiers(&mut work, &mut resolution);
+    index.resolve_rust_shorthand(&mut work, &mut resolution);
+    index.resolve_rust_shared_sources(documents.1, namespace, &mut work, &mut resolution);
+    index.resolve_rust_parent_modules(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
+}
+
+fn append_deferred_ecmascript(resolution: &mut StaticResolution) {
+    resolution.literal_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_literal_containment,
+    );
+    resolution.callback_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_callback_parameters,
+    );
+    resolution.overload_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_overload_parameters,
+    );
+    resolution.javascript_method_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_method_parameters,
+    );
+    resolution.scoped_javascript_function_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_scoped_javascript_parameters,
+    );
+    resolution.scoped_javascript_lexical_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_scoped_javascript_lexical,
+    );
+    resolution.typescript_type_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_type_parameters,
+    );
+    resolution.javascript_shorthand_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_shorthand_parameters,
+    );
+    resolution.javascript_wrapped_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_wrapped_parameters,
+    );
+    resolution.javascript_destructured_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_destructured_parameters,
+    );
+    resolution.typescript_union_property_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_union_properties,
+    );
+    resolution.typescript_method_type_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_method_type_parameters,
+    );
+    resolution.typescript_function_type_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_function_type_parameters,
+    );
+    resolution.typescript_destructured_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_destructured_parameters,
+    );
+}
+
+fn append_late_occurrences(
+    occurrences: &mut Vec<StaticOccurrence>,
+    pending: &mut Vec<StaticOccurrence>,
+) -> Option<usize> {
+    if pending.is_empty() {
+        return None;
+    }
+    let start = occurrences.len();
+    occurrences.extend(std::mem::take(pending));
+    Some(start)
 }
 
 /// What one file's pass adds, held apart until the files join in path order.
@@ -240,7 +419,17 @@ enum DeferredReferences<'source> {
     PythonCaptures,
     PythonReceivers,
     PythonVariadics,
-    TypeScriptParameters(Vec<ByteRange>),
+    EcmaScriptParameters {
+        reads: ParameterReads,
+        file_module: bool,
+    },
+    TypeScriptMethodParameters {
+        sites: Vec<ByteRange>,
+        file_module: bool,
+    },
+    EcmaScriptModuleSpecifiers,
+    EcmaScriptModuleQualifiers,
+    ScopedParameters(ScopedParameterReads),
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -266,6 +455,38 @@ struct PendingPythonReferences<'index, 'source> {
     initializers: Option<python_edges::InitializerCalls>,
     quoted_types: bool,
     overload_reads: bool,
+}
+
+impl<'index, 'source> PendingPythonReferences<'index, 'source> {
+    fn capture(
+        file: &'index File<'source>,
+        remaining: usize,
+        resolution: &StaticResolution,
+        has_initializers: bool,
+    ) -> Option<Self> {
+        let initializers = if has_initializers {
+            python_edges::InitializerCalls::capture(file, resolution)
+        } else {
+            None
+        };
+        let quoted_types = file.document.facts.language().name == "python"
+            && file.facts.references().iter().any(|reference| {
+                reference.role == ReferenceRole::Type
+                    && python_edges::quoted_type_text(file, reference.target).is_some()
+            });
+        let overload_reads = file.facts.python_local_reads().iter().any(|(_, name)| {
+            file.python_parameters.get(name).is_some_and(|symbol| {
+                symbol.is_some_and(rift_syntax::SyntaxSymbol::is_python_overload_parameter)
+            })
+        });
+        (initializers.is_some() || quoted_types || overload_reads).then_some(Self {
+            file,
+            remaining,
+            initializers,
+            quoted_types,
+            overload_reads,
+        })
+    }
 }
 
 type PendingPythonFiles<'index, 'source> =
@@ -438,7 +659,7 @@ impl Target<'_> {
         let anchor = self
             .file
             .placement
-            .logical_identity(&self.symbol.qualified_name)?;
+            .logical_identity_for_symbol(self.symbol)?;
         let identity = rift_protocol::identity::SymbolIdentity::parse(anchor.as_str()).ok()?;
         Some(identity.qualified_path().to_vec())
     }
@@ -509,10 +730,13 @@ fn member_facet<'source>(candidates: &[&'source SyntaxSymbol]) -> Option<&'sourc
     }
 }
 
-struct TypeScriptParameter<'source> {
+struct EcmaScriptParameter<'source> {
     symbol: &'source SyntaxSymbol,
     site: &'source StaticParameter,
 }
+
+type EcmaScriptParameters<'source> =
+    BTreeMap<&'source str, BTreeMap<ByteRange, EcmaScriptParameter<'source>>>;
 
 struct File<'source> {
     document: &'source StaticSource<'source>,
@@ -532,9 +756,24 @@ struct File<'source> {
     /// The reference prefix and declaration count before additional Rust bindings.
     primary_reference_count: usize,
     rust_local_count: usize,
+    rust_shorthand: bool,
+    rust_receivers: Vec<&'source SyntaxSymbol>,
+    rust_generics: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    rust_library_root: Option<&'source SyntaxSymbol>,
     package_binding_count: usize,
-    typescript_parameters:
-        BTreeMap<&'source str, BTreeMap<ByteRange, TypeScriptParameter<'source>>>,
+    ecmascript_parameters: EcmaScriptParameters<'source>,
+    typescript_method_parameters: EcmaScriptParameters<'source>,
+    javascript_callback_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    typescript_overload_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    javascript_method_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    typescript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    typescript_function_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    typescript_method_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -700,8 +939,24 @@ impl<'source> File<'source> {
             callables: EnclosingDefinitions::new([]),
             primary_reference_count: facts.references().len(),
             rust_local_count: 0,
+            rust_shorthand: false,
+            rust_receivers: Vec::new(),
+            rust_generics: BTreeMap::new(),
+            rust_library_root: None,
             package_binding_count: 0,
-            typescript_parameters: BTreeMap::new(),
+            ecmascript_parameters: BTreeMap::new(),
+            typescript_method_parameters: BTreeMap::new(),
+            javascript_callback_parameters: BTreeMap::new(),
+            typescript_overload_parameters: BTreeMap::new(),
+            javascript_method_parameters: BTreeMap::new(),
+            scoped_javascript_parameters: BTreeMap::new(),
+            typescript_type_parameters: BTreeMap::new(),
+            javascript_wrapped_parameters: BTreeMap::new(),
+            javascript_destructured_parameters: BTreeMap::new(),
+            typescript_destructured_parameters: BTreeMap::new(),
+            typescript_function_type_parameters: BTreeMap::new(),
+            typescript_method_type_parameters: BTreeMap::new(),
+            javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -983,6 +1238,89 @@ impl<'source> File<'source> {
         Some(())
     }
 
+    fn index_package_binding(
+        &mut self,
+        symbol: &'source SyntaxSymbol,
+        site: Option<&'source rift_syntax::StaticParameter>,
+        methods: &BTreeSet<&str>,
+        admitted: bool,
+    ) {
+        self.package_binding_count += 1;
+        if symbol.is_rust_library_root() {
+            self.rust_library_root = admitted.then_some(symbol);
+        } else if symbol.is_rust_receiver_binding() {
+            self.rust_receivers.extend(admitted.then_some(symbol));
+        } else if symbol.is_rust_generic_parameter() {
+            if let Some(name) = symbol.name_range.filter(|_| admitted) {
+                self.rust_generics.insert(name, symbol);
+            }
+        } else if symbol.is_rust_shorthand_binding() {
+            self.rust_shorthand |= admitted;
+        } else if symbol.is_rust_local_binding() {
+            self.rust_local_count +=
+                usize::from(admitted && !symbol.is_rust_explicit_local_binding());
+        } else if let Some(name) = symbol.name_range {
+            if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
+                self.python_parameters
+                    .insert(name, admitted.then_some(symbol));
+            } else if admitted && symbol.is_typescript_type_parameter() {
+                self.typescript_type_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_javascript_wrapped_parameter() {
+                self.javascript_wrapped_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_javascript_destructured_parameter() {
+                self.javascript_destructured_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_typescript_method_type_parameter() {
+                self.typescript_method_type_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_typescript_function_type_parameter() {
+                self.typescript_function_type_parameters
+                    .insert(name, symbol);
+            } else if admitted && symbol.is_typescript_destructured_parameter() {
+                self.typescript_destructured_parameters.insert(name, symbol);
+            } else if admitted && let Some(site) = site {
+                if symbol.is_typescript_signature_parameter()
+                    || symbol.is_typescript_callable_type_parameter()
+                    || symbol.is_typescript_index_signature_parameter()
+                {
+                    return;
+                }
+                let parameter = EcmaScriptParameter { symbol, site };
+                if symbol.is_ecmascript_callback_parameter() {
+                    self.javascript_callback_parameters.insert(name, parameter);
+                    return;
+                }
+                if symbol.is_ecmascript_overload_parameter() {
+                    self.typescript_overload_parameters.insert(name, parameter);
+                    return;
+                }
+                if symbol.is_javascript_method_parameter() {
+                    self.javascript_method_parameters.insert(name, parameter);
+                    return;
+                }
+                if symbol.is_javascript_scoped_function_parameter() {
+                    self.scoped_javascript_parameters.insert(name, parameter);
+                    return;
+                }
+                if symbol.is_javascript_shorthand_parameter() {
+                    self.javascript_shorthand_parameters.insert(name, parameter);
+                    return;
+                }
+                let parameters = if symbol
+                    .container
+                    .as_deref()
+                    .is_some_and(|owner| methods.contains(owner))
+                {
+                    &mut self.typescript_method_parameters
+                } else {
+                    &mut self.ecmascript_parameters
+                };
+                parameters
+                    .entry(symbol.name.as_str())
+                    .or_default()
+                    .insert(name, parameter);
+            }
+        }
+    }
+
     fn index_symbols(
         &mut self,
         admitted_binding: &impl Fn(Target<'source>) -> bool,
@@ -1001,26 +1339,17 @@ impl<'source> File<'source> {
             self.python_whole = python_edges::WholeFile::Expression;
         }
         let parameters = javascript_parameters::parameter_sites(self.document.facts, self.facts);
+        let methods = self.document.facts.typescript_method_names();
         for symbol in self.document.facts.symbols() {
             if symbol.is_package_binding() {
-                self.package_binding_count += 1;
                 let admitted = admitted_binding(Target {
                     file: self.document,
                     symbol,
                 });
-                if symbol.is_rust_local_binding() {
-                    self.rust_local_count += usize::from(admitted);
-                } else if let Some(name) = symbol.name_range {
-                    if symbol.is_python_parameter() {
-                        self.python_parameters
-                            .insert(name, admitted.then_some(symbol));
-                    } else if admitted && let Some(&site) = parameters.get(&name) {
-                        self.typescript_parameters
-                            .entry(symbol.name.as_str())
-                            .or_default()
-                            .insert(name, TypeScriptParameter { symbol, site });
-                    }
-                }
+                let site = symbol
+                    .name_range
+                    .and_then(|range| parameters.get(&range).copied());
+                self.index_package_binding(symbol, site, &methods, admitted);
                 continue;
             }
             if self.inactive(symbol.item_range, work) {
@@ -1091,6 +1420,92 @@ impl<'source> File<'source> {
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
+    }
+
+    fn scoped_parameter_pass(
+        &self,
+        earlier: Option<ScopedParameterReads>,
+    ) -> Option<ScopedParameterReads> {
+        [
+            (
+                ScopedParameterReads::Callback,
+                !self.javascript_callback_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::Overload,
+                !self.typescript_overload_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptMethod,
+                !self.javascript_method_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptScopedFunction,
+                !self.scoped_javascript_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptType,
+                !self.typescript_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptShorthand,
+                !self.javascript_shorthand_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptWrapped,
+                !self.javascript_wrapped_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptDestructured,
+                !self.javascript_destructured_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptMethodType,
+                !self.typescript_method_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptFunctionType,
+                !self.typescript_function_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptDestructured,
+                !self.typescript_destructured_parameters.is_empty(),
+            ),
+        ]
+        .into_iter()
+        .skip(earlier.map_or(0, |class| class as usize + 1))
+        .find_map(|(class, present)| present.then_some(class))
+    }
+
+    fn retained_parameter_pass_without_file_module(&self) -> Option<DeferredReferences<'source>> {
+        [
+            (
+                ScopedParameterReads::TypeScriptType,
+                !self.typescript_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptWrapped,
+                !self.javascript_wrapped_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptDestructured,
+                !self.javascript_destructured_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptMethodType,
+                !self.typescript_method_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptFunctionType,
+                !self.typescript_function_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptDestructured,
+                !self.typescript_destructured_parameters.is_empty(),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(class, present)| present.then_some(DeferredReferences::ScopedParameters(class)))
     }
 
     fn has_python_local_reads(&self) -> bool {
@@ -1398,7 +1813,10 @@ struct Index<'source> {
 impl<'source> Index<'source> {
     fn new(
         graph: &'source NormalizedGraph,
-        documents: &'source [StaticSource<'source>],
+        documents: (
+            &'source [StaticSource<'source>],
+            &'source [StaticSource<'source>],
+        ),
         namespace: &NamespaceInput<'_>,
         work: &mut Work,
     ) -> Option<Self> {
@@ -1414,7 +1832,7 @@ impl<'source> Index<'source> {
         let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
         let mut rust_extern_files = Vec::new();
-        for document in documents {
+        for document in documents.0 {
             if !work.charge() {
                 return None;
             }
@@ -1467,7 +1885,7 @@ impl<'source> Index<'source> {
         }
         rust_extern_files.sort_unstable();
         let files = Arc::new(files);
-        let rust = rust::Namespaces::new(&files, work)?;
+        let rust = rust::Namespaces::new(&files, documents.1, &admitted_binding, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let owners = external::Owners::new(namespace, work)?;
         let mut index = Self {
@@ -1586,32 +2004,13 @@ impl<'source> Index<'source> {
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
                 let remaining = file_work.max(file).saturating_sub(apart.used);
-                let initializers = if has_initializers {
-                    python_edges::InitializerCalls::capture(file, &apart.resolution)
-                } else {
-                    None
-                };
-                let quoted_types = file.document.facts.language().name == "python"
-                    && file.facts.references().iter().any(|reference| {
-                        reference.role == ReferenceRole::Type
-                            && python_edges::quoted_type_text(file, reference.target).is_some()
-                    });
-                let overload_reads = file.facts.python_local_reads().iter().any(|(_, name)| {
-                    file.python_parameters.get(name).is_some_and(|symbol| {
-                        symbol.is_some_and(rift_syntax::SyntaxSymbol::is_python_overload_parameter)
-                    })
-                });
-                if initializers.is_some() || quoted_types || overload_reads {
-                    pending_python.insert(
-                        file.document.path.as_str(),
-                        PendingPythonReferences {
-                            file,
-                            remaining,
-                            initializers,
-                            quoted_types,
-                            overload_reads,
-                        },
-                    );
+                if let Some(pending) = PendingPythonReferences::capture(
+                    file,
+                    remaining,
+                    &apart.resolution,
+                    has_initializers,
+                ) {
+                    pending_python.insert(file.document.path.as_str(), pending);
                 }
                 if let Some(sites) = apart.deferred_references {
                     let queue = match sites {
@@ -1623,7 +2022,11 @@ impl<'source> Index<'source> {
                         | DeferredReferences::PythonCaptures
                         | DeferredReferences::PythonReceivers
                         | DeferredReferences::PythonVariadics
-                        | DeferredReferences::TypeScriptParameters(_) => &mut deferred_references,
+                        | DeferredReferences::EcmaScriptParameters { .. }
+                        | DeferredReferences::TypeScriptMethodParameters { .. }
+                        | DeferredReferences::EcmaScriptModuleSpecifiers
+                        | DeferredReferences::EcmaScriptModuleQualifiers
+                        | DeferredReferences::ScopedParameters(_) => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
@@ -1639,7 +2042,6 @@ impl<'source> Index<'source> {
                 resolution,
                 &mut pending_python,
             );
-            self.resolve_python_tail(pending_python, work, resolution);
         }
     }
 
@@ -1656,18 +2058,28 @@ impl<'source> Index<'source> {
             resolution.supplemental_start =
                 Some((resolution.occurrences.len(), resolution.external.len()));
         }
-        let (mut typescript_parameter_sites, mut existing): (VecDeque<_>, VecDeque<_>) =
+        let (ecmascript_parameter_sites, mut existing): (VecDeque<_>, VecDeque<_>) =
             references.into_iter().partition(|(_, _, sites)| {
-                matches!(sites, DeferredReferences::TypeScriptParameters(_))
+                matches!(sites, DeferredReferences::EcmaScriptParameters { .. })
             });
+        let (mut javascript_parameter_sites, mut typescript_parameter_sites): (
+            VecDeque<_>,
+            VecDeque<_>,
+        ) = ecmascript_parameter_sites
+            .into_iter()
+            .partition(|(file, _, _)| file.document.facts.language().name == "javascript");
         let mut macro_sites = VecDeque::new();
         let mut rust_local_sites = VecDeque::new();
         let mut python_local_sites = VecDeque::new();
         let mut python_parameter_sites = VecDeque::new();
+        let mut typescript_method_sites = VecDeque::new();
         let mut python_reassigned_sites = VecDeque::new();
         let mut python_captured_sites = VecDeque::new();
         let mut python_receiver_sites = VecDeque::new();
         let mut python_variadic_sites = VecDeque::new();
+        let mut module_specifiers = VecDeque::new();
+        let mut module_qualifiers = VecDeque::new();
+        let mut scoped_parameters = std::array::from_fn::<_, 11, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1675,10 +2087,19 @@ impl<'source> Index<'source> {
             .or_else(|| python_local_sites.pop_front())
             .or_else(|| python_parameter_sites.pop_front())
             .or_else(|| typescript_parameter_sites.pop_front())
+            .or_else(|| javascript_parameter_sites.pop_front())
+            .or_else(|| typescript_method_sites.pop_front())
             .or_else(|| python_reassigned_sites.pop_front())
             .or_else(|| python_captured_sites.pop_front())
             .or_else(|| python_receiver_sites.pop_front())
             .or_else(|| python_variadic_sites.pop_front())
+            .or_else(|| {
+                self.resolve_python_tail(std::mem::take(pending_python), work, resolution);
+                None
+            })
+            .or_else(|| module_specifiers.pop_front())
+            .or_else(|| module_qualifiers.pop_front())
+            .or_else(|| scoped_parameters.iter_mut().find_map(VecDeque::pop_front))
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1702,7 +2123,22 @@ impl<'source> Index<'source> {
                     DeferredReferences::PythonCaptures => &mut python_captured_sites,
                     DeferredReferences::PythonReceivers => &mut python_receiver_sites,
                     DeferredReferences::PythonVariadics => &mut python_variadic_sites,
-                    DeferredReferences::TypeScriptParameters(_) => &mut typescript_parameter_sites,
+                    DeferredReferences::EcmaScriptParameters { .. }
+                        if file.document.facts.language().name == "javascript" =>
+                    {
+                        &mut javascript_parameter_sites
+                    }
+                    DeferredReferences::EcmaScriptParameters { .. } => {
+                        &mut typescript_parameter_sites
+                    }
+                    DeferredReferences::TypeScriptMethodParameters { .. } => {
+                        &mut typescript_method_sites
+                    }
+                    DeferredReferences::EcmaScriptModuleSpecifiers => &mut module_specifiers,
+                    DeferredReferences::EcmaScriptModuleQualifiers => &mut module_qualifiers,
+                    DeferredReferences::ScopedParameters(class) => {
+                        &mut scoped_parameters[class as usize]
+                    }
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1824,9 +2260,56 @@ impl<'source> Index<'source> {
                 self.python_variadic_reads(file, work, resolution);
                 None
             }
-            DeferredReferences::TypeScriptParameters(sites) => {
-                self.typescript_parameter_reads(file, sites, work, resolution);
-                None
+            DeferredReferences::EcmaScriptParameters { reads, file_module } => {
+                self.ecmascript_parameter_reads(
+                    file,
+                    reads.functions,
+                    &file.ecmascript_parameters,
+                    work,
+                    resolution,
+                );
+                if reads.methods.is_empty() {
+                    file_module
+                        .then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                        .or_else(|| file.retained_parameter_pass_without_file_module())
+                } else {
+                    Some(DeferredReferences::TypeScriptMethodParameters {
+                        sites: reads.methods,
+                        file_module,
+                    })
+                }
+            }
+            DeferredReferences::TypeScriptMethodParameters { sites, file_module } => {
+                self.ecmascript_parameter_reads(
+                    file,
+                    sites,
+                    &file.typescript_method_parameters,
+                    work,
+                    resolution,
+                );
+                file_module
+                    .then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                    .or_else(|| file.retained_parameter_pass_without_file_module())
+            }
+            DeferredReferences::EcmaScriptModuleSpecifiers => {
+                resolution
+                    .file_module_start
+                    .get_or_insert(resolution.occurrences.len());
+                self.javascript_module_specifiers(file, work, resolution);
+                Some(DeferredReferences::EcmaScriptModuleQualifiers)
+            }
+            DeferredReferences::EcmaScriptModuleQualifiers => {
+                resolution
+                    .file_module_qualifier_start
+                    .get_or_insert(resolution.occurrences.len());
+                self.javascript_module_qualifiers(file, work, resolution);
+                file.scoped_parameter_pass(None)
+                    .map(DeferredReferences::ScopedParameters)
+            }
+            DeferredReferences::ScopedParameters(class) => {
+                self.ecmascript_scoped_parameter_reads(file, class, work, resolution);
+                file.scoped_parameter_pass(Some(class))
+                    .map(DeferredReferences::ScopedParameters)
             }
             DeferredReferences::Rust {
                 pass,
@@ -1910,7 +2393,7 @@ impl<'source> Index<'source> {
                 locals
             }
             RustReferencePass::LocalBindings => {
-                self.rust_local_bindings(file, work, resolution);
+                self.rust_local_bindings(file, false, work, resolution);
                 None
             }
         }
@@ -2047,7 +2530,7 @@ impl<'source> Index<'source> {
             python_qualifiers: imports,
             rust_macros,
         } = self.resolve_imports(file, work, result)?;
-        let mut parameter_reads = Vec::new();
+        let mut parameter_reads = ParameterReads::default();
         if matches!(
             file.document.facts.language().name.as_str(),
             "javascript" | "typescript"
@@ -2055,8 +2538,23 @@ impl<'source> Index<'source> {
             self.javascript_edges(file, work, result, &mut parameter_reads);
         }
         let deferred = match file.document.facts.language().name.as_str() {
-            "typescript" => (!work.exhausted && !parameter_reads.is_empty())
-                .then_some(DeferredReferences::TypeScriptParameters(parameter_reads)),
+            "javascript" | "typescript" => {
+                let file_module = self.javascript_has_file_module(file);
+                (!work.exhausted
+                    && (file_module
+                        || !parameter_reads.functions.is_empty()
+                        || !parameter_reads.methods.is_empty()
+                        || !file.typescript_type_parameters.is_empty()
+                        || !file.javascript_wrapped_parameters.is_empty()
+                        || !file.javascript_destructured_parameters.is_empty()
+                        || !file.typescript_method_type_parameters.is_empty()
+                        || !file.typescript_function_type_parameters.is_empty()
+                        || !file.typescript_destructured_parameters.is_empty()))
+                .then_some(DeferredReferences::EcmaScriptParameters {
+                    reads: parameter_reads,
+                    file_module,
+                })
+            }
             "python" => {
                 let names = self.python_references(file, work, result);
                 (!work.exhausted
@@ -2436,7 +2934,9 @@ impl StaticResolution {
                 ..
             } | DeferredReferences::PythonLocals
                 | DeferredReferences::PythonParameters(_)
-                | DeferredReferences::TypeScriptParameters(_)
+                | DeferredReferences::EcmaScriptParameters { .. }
+                | DeferredReferences::TypeScriptMethodParameters { .. }
+                | DeferredReferences::EcmaScriptModuleSpecifiers
         ) {
             self.late_supplemental_start
                 .get_or_insert(self.occurrences.len());
@@ -2448,6 +2948,14 @@ impl StaticResolution {
     /// coverage for its unit.
     fn join(&mut self, file: &File<'_>, mut apart: Self, over_share: bool) {
         self.occurrences.append(&mut apart.occurrences);
+        self.deferred_literal_containment
+            .append(&mut apart.deferred_literal_containment);
+        self.deferred_scoped_javascript_lexical
+            .append(&mut apart.deferred_scoped_javascript_lexical);
+        self.deferred_typescript_union_properties
+            .append(&mut apart.deferred_typescript_union_properties);
+        self.rust_call_parent_sites
+            .append(&mut apart.rust_call_parent_sites);
         self.external.append(&mut apart.external);
         self.rust_extern_candidates
             .append(&mut apart.rust_extern_candidates);

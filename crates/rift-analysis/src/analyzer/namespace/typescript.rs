@@ -129,7 +129,62 @@ pub(super) fn prepare(
             }
         }
     }
+    retain_unique_scoped_identities(&mut prepared);
     prepared
+}
+
+fn retain_unique_scoped_identities(prepared: &mut PreparedNamespace) {
+    if prepared.scoped_anchors.is_empty() {
+        return;
+    }
+    let mut owners = BTreeMap::<&SymbolId, Option<&str>>::new();
+    for (path, anchors) in &prepared.anchors {
+        for identity in anchors.values() {
+            owners
+                .entry(identity)
+                .and_modify(|owner| {
+                    if *owner != Some(path.as_str()) {
+                        *owner = None;
+                    }
+                })
+                .or_insert(Some(path.as_str()));
+        }
+    }
+    let aliases = prepared
+        .exports
+        .iter()
+        .map(|binding| &binding.identity)
+        .collect::<BTreeSet<_>>();
+    let mut physical_groups = BTreeMap::<SymbolId, usize>::new();
+    for groups in prepared.scoped_anchors.values() {
+        for group in groups.values() {
+            for identity in group.values().collect::<BTreeSet<_>>() {
+                *physical_groups.entry(identity.clone()).or_default() += 1;
+            }
+        }
+    }
+    let anchors = &prepared.anchors;
+    prepared.scoped_anchors.retain(|path, scoped| {
+        scoped.retain(|name, overrides| {
+            let Some(anchors) = anchors.get(path) else {
+                return false;
+            };
+            let unique = if let Some(original) = anchors.get(name) {
+                owners.get(original).copied().flatten() == Some(path.as_str())
+            } else {
+                // A private literal key has a physical identity in each body and no
+                // common name that a bare use could resolve.
+                overrides
+                    .values()
+                    .all(|identity| physical_groups.get(identity) == Some(&1))
+            };
+            unique
+                && overrides
+                    .values()
+                    .all(|identity| !owners.contains_key(identity) && !aliases.contains(identity))
+        });
+        !scoped.is_empty()
+    });
 }
 
 /// Names what the files of a package declare in ambient modules.
@@ -169,20 +224,102 @@ fn prepare_anchors(
     input: &NamespaceInput<'_>,
     file: &SelectedFile<'_>,
     module: &str,
-    anchors: BTreeMap<String, SymbolId>,
+    mut anchors: BTreeMap<String, SymbolId>,
     prepared: &mut PreparedNamespace,
 ) -> bool {
+    let scoped = internal_modules::private_local_identities(file, &anchors);
+    if input.release_version().is_some()
+        && matches!(
+            input.owner(),
+            rift_protocol::identity::SymbolOwner::Package { .. }
+        )
+    {
+        place_scoped_function_parameters(file, &mut anchors, &scoped);
+    }
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;
     }
     let (exports, unresolved) = export_bindings(input, file, module, &anchors);
+    if !scoped.is_empty() {
+        prepared
+            .scoped_anchors
+            .insert(file.path.as_str().to_owned(), scoped);
+    }
     prepared.unresolved_exports |= unresolved;
     prepared.exports.extend(exports);
     prepared
         .anchors
         .insert(file.path.as_str().to_owned(), anchors);
     true
+}
+
+fn place_scoped_function_parameters(
+    file: &SelectedFile<'_>,
+    anchors: &mut BTreeMap<String, SymbolId>,
+    scopes: &rift_syntax::ScopedIdentityAnchors,
+) {
+    if scopes.is_empty() || file.syntax.language().name != "javascript" {
+        return;
+    }
+    let Some(facts) = file.syntax.static_facts() else {
+        return;
+    };
+    let owners = file
+        .syntax
+        .symbols()
+        .iter()
+        .filter_map(|symbol| {
+            let placements = scopes.get(&symbol.qualified_name)?;
+            let name = symbol.name_range?;
+            let identity = placements
+                .get(&symbol.declaration_ordinal)
+                .or_else(|| anchors.get(&symbol.qualified_name))?;
+            Some((name, (symbol.item_range, identity.clone())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut owner_count = BTreeMap::<&SymbolId, usize>::new();
+    for (_, identity) in owners.values() {
+        *owner_count.entry(identity).or_default() += 1;
+    }
+    let sites = facts
+        .parameters()
+        .iter()
+        .map(|site| (site.name, site))
+        .collect::<BTreeMap<_, _>>();
+    let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+    for parameter in file
+        .syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.is_javascript_scoped_function_parameter())
+    {
+        let Some(site) = parameter.name_range.and_then(|name| sites.get(&name)) else {
+            continue;
+        };
+        let Some((function, identity)) = site.owner.and_then(|name| owners.get(&name)) else {
+            continue;
+        };
+        if *function != site.function || owner_count.get(identity) != Some(&1) {
+            continue;
+        }
+        let Ok(owner) = SymbolIdentity::parse(identity.as_str()) else {
+            continue;
+        };
+        let mut path = owner.qualified_path().to_vec();
+        path.push(parameter.name.clone());
+        let Ok(identity) =
+            SymbolIdentity::new(owner.owner().clone(), owner.language().clone(), path)
+        else {
+            continue;
+        };
+        let Ok(identity) = SymbolId::new(identity.wire_identity()) else {
+            continue;
+        };
+        if occupied.insert(identity.clone()) {
+            anchors.insert(parameter.qualified_name.clone(), identity);
+        }
+    }
 }
 
 /// Resolves same-module aliases through recorded declaration and export facts.
@@ -349,6 +486,9 @@ fn declaration_targets<'facts>(
 ) -> BTreeMap<(Option<String>, String), Option<DeclarationTarget<'facts>>> {
     let mut targets = BTreeMap::new();
     for symbol in syntax.symbols() {
+        if symbol.is_ecmascript_package_binding() {
+            continue;
+        }
         let Some(identity) = anchors.get(&symbol.qualified_name) else {
             continue;
         };
@@ -1163,7 +1303,7 @@ fn declaration_anchors_with_public(
     // Process containing declarations first without changing the document's source order.
     declarations.sort_by_key(|symbol| symbol.qualified_name.len());
     for symbol in declarations {
-        if symbol.is_typescript_parameter()
+        if symbol.is_ecmascript_package_binding()
             && (input.release_version().is_none()
                 || !matches!(
                     input.owner(),
@@ -1176,6 +1316,7 @@ fn declaration_anchors_with_public(
             continue;
         }
         let literal = declared_module_name(symbol, source);
+        let parameter_scope = supplemental_parameter_scope(symbol);
         let Some(mut path) = literal
             .as_ref()
             .map(|name| vec![name.clone()])
@@ -1183,11 +1324,13 @@ fn declaration_anchors_with_public(
         else {
             continue;
         };
+        if let Some(scope) = parameter_scope {
+            path.push(scope.to_owned());
+        } else if symbol.qualified_name != defining_name(symbol) {
+            continue;
+        }
         if literal.is_none() {
             path.push(symbol.name.clone());
-        }
-        if symbol.qualified_name != defining_name(symbol) {
-            continue;
         }
         let Ok(identity) = SymbolIdentity::new(
             input.owner().clone(),
@@ -1283,6 +1426,25 @@ fn conflicting_assignment_name(mut name: &str, conflicts: &BTreeSet<&str>) -> bo
         };
         name = parent;
     }
+}
+
+fn supplemental_parameter_scope(symbol: &SyntaxSymbol) -> Option<&str> {
+    let name = if symbol.is_ecmascript_callback_parameter() && symbol.container.is_none() {
+        symbol.qualified_name.as_str()
+    } else if symbol.is_ecmascript_overload_parameter()
+        || symbol.is_javascript_shorthand_parameter()
+        || symbol.is_typescript_callable_type_parameter()
+        || symbol.is_typescript_index_signature_parameter()
+    {
+        symbol
+            .qualified_name
+            .strip_prefix(symbol.container.as_deref()?)?
+            .strip_prefix('.')?
+    } else {
+        return None;
+    };
+    let (scope, name) = name.split_once('.')?;
+    (name == symbol.name).then_some(scope)
 }
 
 fn defining_name(symbol: &SyntaxSymbol) -> String {

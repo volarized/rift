@@ -165,19 +165,151 @@ impl SyntaxSymbol {
         self.kind == crate::python::LOOP_BINDING_KIND_WORD
     }
 
-    /// Whether this is an ordinary TypeScript function parameter candidate.
+    /// Whether this is an authored ECMAScript value parameter.
     #[must_use]
-    pub fn is_typescript_parameter(&self) -> bool {
+    pub fn is_ecmascript_parameter(&self) -> bool {
         self.kind == crate::ecmascript::PARAMETER_KIND
+            || self.is_ecmascript_callback_parameter()
+            || self.is_ecmascript_overload_parameter()
+            || self.is_javascript_method_parameter()
+            || self.is_typescript_signature_parameter()
+            || self.is_javascript_scoped_function_parameter()
+            || self.is_javascript_shorthand_parameter()
+            || self.is_typescript_callable_type_parameter()
+            || self.is_typescript_index_signature_parameter()
+            || self.is_javascript_wrapped_parameter()
+            || self.is_javascript_destructured_parameter()
+            || self.is_typescript_destructured_parameter()
+    }
+
+    /// Whether this is the physical parameter of a JavaScript function value.
+    #[must_use]
+    pub fn is_ecmascript_callback_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::CALLBACK_PARAMETER_KIND
+    }
+
+    /// Whether this parameter belongs to one physical TypeScript overload.
+    #[must_use]
+    pub fn is_ecmascript_overload_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::OVERLOAD_PARAMETER_KIND
+    }
+
+    /// Whether this is a selected Cargo library's physical source root.
+    #[must_use]
+    pub fn is_rust_library_root(&self) -> bool {
+        self.kind == "module"
+            && self.qualified_name == "."
+            && self.syntax_element_kind == Some("source_file")
+    }
+
+    /// Whether this is the checked source file of an out-of-line Rust module.
+    #[must_use]
+    pub fn is_rust_module_source(&self) -> bool {
+        self.kind == "module"
+            && self.qualified_name == ".."
+            && self.syntax_element_kind == Some("source_file")
+    }
+
+    /// Whether this parameter belongs to an authored JavaScript method.
+    #[must_use]
+    pub fn is_javascript_method_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::METHOD_PARAMETER_KIND
+    }
+
+    /// Whether this is the physical parameter of a TypeScript function signature.
+    #[must_use]
+    pub fn is_typescript_signature_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::SIGNATURE_PARAMETER_KIND
+    }
+
+    /// Whether this parameter belongs to a separately anchored JavaScript function.
+    #[must_use]
+    pub fn is_javascript_scoped_function_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::SCOPED_FUNCTION_PARAMETER_KIND
+    }
+
+    /// Whether this JavaScript parameter shares its name with a shorthand property.
+    #[must_use]
+    pub fn is_javascript_shorthand_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::SHORTHAND_PARAMETER_KIND
+    }
+
+    /// Whether this value parameter is written in a TypeScript callable type.
+    #[must_use]
+    pub fn is_typescript_callable_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::CALLABLE_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this value parameter is written in a TypeScript index signature.
+    #[must_use]
+    pub fn is_typescript_index_signature_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::INDEX_SIGNATURE_PARAMETER_KIND
+    }
+
+    /// Whether this is a named JavaScript defaulted or rest parameter.
+    #[must_use]
+    pub fn is_javascript_wrapped_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::WRAPPED_PARAMETER_KIND
+    }
+
+    /// Whether this is a named JavaScript object or array parameter binding.
+    #[must_use]
+    pub fn is_javascript_destructured_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::DESTRUCTURED_PARAMETER_KIND
+    }
+
+    /// Whether this is a binding written in a TypeScript parameter pattern.
+    #[must_use]
+    pub fn is_typescript_destructured_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::TYPED_DESTRUCTURED_PARAMETER_KIND
+    }
+
+    /// Whether this is the written type parameter of a TypeScript declaration.
+    #[must_use]
+    pub fn is_typescript_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this ECMAScript binding uses a package declaration reservation.
+    #[must_use]
+    pub fn is_ecmascript_package_binding(&self) -> bool {
+        self.is_ecmascript_parameter()
+            || self.is_typescript_type_parameter()
+            || self.is_typescript_method_type_parameter()
+            || self.is_typescript_function_type_parameter()
+    }
+
+    /// Whether this is the written type parameter of a TypeScript method.
+    #[must_use]
+    pub fn is_typescript_method_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::METHOD_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this is the written type parameter of a TypeScript function.
+    #[must_use]
+    pub fn is_typescript_function_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::FUNCTION_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether a checked local macro emits a method at this written name.
+    #[must_use]
+    pub fn is_rust_macro_method(&self) -> bool {
+        self.kind == "function"
+            && self.syntax_element_kind == Some("identifier")
+            && self.container.is_some()
+            && self.name_range == Some(self.item_range)
     }
 
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
         self.is_rust_local_binding()
+            || self.is_rust_library_root()
+            || self.is_rust_module_source()
+            || self.is_rust_macro_method()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
-            || self.is_typescript_parameter()
+            || self.is_ecmascript_package_binding()
     }
 }
 
@@ -224,6 +356,11 @@ pub enum RustModulePath {
         path: rift_core::ProjectPath,
         /// Original literal content, before the module item.
         range: ByteRange,
+    },
+    /// Exact outer path attributes whose Cargo predicates decide the selected path.
+    Conditional {
+        /// Authored attribute ranges in source order.
+        attributes: Vec<ByteRange>,
     },
     /// Unsupported or conflicting attributes prevent an established module path.
     Unknown,
@@ -722,6 +859,81 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Adds the source-file declaration of a library established by its Cargo manifest.
+    ///
+    /// The caller supplies the selected crate name. The retained Rust facts must match
+    /// the complete source bytes and hold no parse error or omitted declaration.
+    #[must_use]
+    pub fn with_rust_library_root(mut self, name: &str, source: &str) -> Option<Self> {
+        let root = self.rust_source_module(name, source, ".")?;
+        self.symbols.insert(0, root);
+        Some(self)
+    }
+
+    /// Adds checked authored Rust macro method names after other syntax declarations.
+    ///
+    /// The caller establishes the selected macro arm and the admitted inherent owner.
+    #[must_use]
+    pub fn with_rust_macro_methods(mut self, methods: Vec<SyntaxSymbol>) -> Self {
+        self.symbols.extend(methods);
+        self.symbols.sort_by_key(|symbol| symbol.item_range.start);
+        self
+    }
+
+    /// Captures a separate whole-file declaration for an out-of-line Rust module.
+    /// The caller establishes the authored module path and package owner.
+    #[must_use]
+    pub fn rust_module_source(
+        &self,
+        name: &str,
+        path: &ProjectPath,
+        source: &str,
+    ) -> Option<Arc<Self>> {
+        let symbol = self.rust_source_module(name, source, "..")?;
+        let mut facts = SyntaxDocument::empty(self.language.clone(), path.clone()).into_facts();
+        Arc::get_mut(&mut facts)?.symbols.push(symbol);
+        Some(facts)
+    }
+
+    fn rust_source_module(
+        &self,
+        name: &str,
+        source: &str,
+        qualified: &str,
+    ) -> Option<SyntaxSymbol> {
+        if self.language.name != "rust"
+            || self.has_errors
+            || self.left_out_declaration_count() != 0
+            || self.source_digest != Some(FileDigest::of(source.as_bytes()))
+            || !is_portable_name(name)
+        {
+            return None;
+        }
+        let range = ByteRange {
+            start: 0,
+            end: u64::try_from(source.len()).ok()?,
+        };
+        Some(SyntaxSymbol {
+            declaration_ordinal: 0,
+            qualified_name: qualified.to_owned(),
+            container: None,
+            name: name.to_owned(),
+            kind: "module",
+            syntax_element_kind: Some("source_file"),
+            kinds: vec![SymbolKind::Module],
+            visibility: None,
+            range,
+            item_range: range,
+            name_range: None,
+            body_range: Some(range),
+            signatures: Arc::from([]),
+            documentation: Arc::from([]),
+            documentation_ranges: Vec::new(),
+            module_path: None,
+            python_overload: None,
+        })
+    }
+
     /// Returns captured source-based name-resolution evidence, when recorded.
     #[must_use]
     pub const fn static_facts(&self) -> Option<&crate::StaticFacts> {
@@ -745,6 +957,22 @@ impl SyntaxFacts {
                 .then_some(binding.name)
             })
             .collect()
+    }
+
+    /// Whether the Rust binding was recovered in a function disjoint from macro effects.
+    ///
+    /// Those bindings use their ordinary identities and have a later package admission
+    /// reservation, so they cannot consume slots for previously retained declarations.
+    #[must_use]
+    pub fn is_disjoint_rust_binding(&self, symbol: &SyntaxSymbol) -> bool {
+        symbol.is_rust_local_binding()
+            && !symbol.is_rust_receiver_binding()
+            && !symbol.is_rust_generic_parameter()
+            && !symbol.is_rust_explicit_local_binding()
+            && self.static_facts().is_some_and(|facts| {
+                !facts.rust_textual_macro_calls().is_empty()
+                    || !facts.rust_macro_barriers().is_empty()
+            })
     }
 
     /// Returns the complete named tree in pre-order, or `None` when these facts hold none.
@@ -794,12 +1022,30 @@ impl SyntaxFacts {
         &self.symbols
     }
 
+    /// Qualified names of TypeScript methods that can own a value parameter.
+    #[must_use]
+    pub fn typescript_method_names(&self) -> BTreeSet<&str> {
+        if self.language.name != "typescript"
+            || !self
+                .symbols
+                .iter()
+                .any(SyntaxSymbol::is_ecmascript_parameter)
+        {
+            return BTreeSet::new();
+        }
+        self.symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "method")
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect()
+    }
+
     /// Number of established declaration candidates before optional package bindings.
     #[must_use]
     pub fn primary_symbols_len(&self) -> usize {
         if matches!(
             self.language.name.as_str(),
-            "rust" | "python" | "typescript"
+            "rust" | "python" | "javascript" | "typescript"
         ) {
             self.symbols
                 .iter()

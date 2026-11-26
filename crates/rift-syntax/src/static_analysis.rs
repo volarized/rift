@@ -6,6 +6,7 @@ mod python_edges;
 mod rust;
 pub use heritage_edges::HeritageEdge;
 
+use rift_core::ReferenceRole;
 use rift_error::{RiftError, errors};
 use tree_sitter::{Language, Node};
 
@@ -443,6 +444,17 @@ pub struct StaticCommonJsExport {
     pub literal: Option<ByteRange>,
 }
 
+/// A direct type annotation use with its written generic binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticRustGenericReference {
+    /// Original use token.
+    pub range: ByteRange,
+    /// Original generic declaration token.
+    pub binding: ByteRange,
+    /// The role the token has in the type annotation.
+    pub role: ReferenceRole,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
@@ -528,6 +540,16 @@ pub struct StaticFactsParts {
     pub rust_uses: Vec<StaticRustUse>,
     /// Rust value paths and named pattern terminals.
     pub rust_value_reads: Vec<StaticRustValueRead>,
+    /// Rust value paths written directly as call arguments.
+    pub rust_argument_value_reads: Vec<ByteRange>,
+    /// Direct uses of generic parameters in type annotations.
+    pub rust_generic_references: Vec<StaticRustGenericReference>,
+    /// Written crate-root tokens in paths.
+    pub rust_crate_paths: Vec<ByteRange>,
+    /// Written crate-root tokens in restricted visibility.
+    pub rust_crate_visibility: Vec<ByteRange>,
+    /// Written relative paths and visibility qualifiers naming the immediate parent.
+    pub rust_parent_module_references: Vec<ByteRange>,
     /// Hoisted block-local value names with their scopes.
     pub rust_local_values: Vec<(ByteRange, ByteRange)>,
     /// Block-local type and module items with their lexical blocks.
@@ -647,6 +669,44 @@ impl StaticFacts {
                     .and_then(|(start, end)| source.get(start..end))
                     .is_some_and(crate::rust::local_bindings::plain_name)
         })
+    }
+
+    /// Rust value paths written directly as call arguments.
+    #[must_use]
+    pub fn rust_argument_value_reads(&self) -> &[ByteRange] {
+        &self.0.rust_argument_value_reads
+    }
+
+    /// Direct uses of generic parameters in type annotations.
+    #[must_use]
+    pub fn rust_generic_references(&self) -> &[StaticRustGenericReference] {
+        &self.0.rust_generic_references
+    }
+
+    /// Written crate-root tokens in paths.
+    #[must_use]
+    pub fn rust_crate_paths(&self) -> &[ByteRange] {
+        &self.0.rust_crate_paths
+    }
+
+    /// Written crate-root tokens in restricted visibility.
+    #[must_use]
+    pub fn rust_crate_visibility(&self) -> &[ByteRange] {
+        &self.0.rust_crate_visibility
+    }
+
+    /// Written relative paths and visibility qualifiers naming the immediate parent.
+    #[must_use]
+    pub fn rust_parent_module_references(&self) -> &[ByteRange] {
+        &self.0.rust_parent_module_references
+    }
+
+    pub(crate) fn set_rust_generic_references(
+        &mut self,
+        mut references: Vec<StaticRustGenericReference>,
+    ) {
+        references.sort_by_key(|reference| reference.range);
+        self.0.rust_generic_references = references;
     }
 
     pub(crate) fn add_rust_local_references(&mut self, references: Vec<StaticReference>) {
@@ -1033,6 +1093,11 @@ impl StaticFacts {
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.rust_value_reads),
+            vector_capacity(&self.0.rust_argument_value_reads),
+            vector_capacity(&self.0.rust_generic_references),
+            vector_capacity(&self.0.rust_crate_paths),
+            vector_capacity(&self.0.rust_crate_visibility),
+            vector_capacity(&self.0.rust_parent_module_references),
             vector_capacity(&self.0.rust_local_values),
             vector_capacity(&self.0.rust_local_types),
             vector_capacity(&self.0.rust_field_sites),
@@ -1119,6 +1184,11 @@ impl StaticFacts {
             self.inherent_impls().len(),
             self.rust_uses().len(),
             self.rust_value_reads().len(),
+            self.rust_argument_value_reads().len(),
+            self.rust_generic_references().len(),
+            self.rust_crate_paths().len(),
+            self.rust_crate_visibility().len(),
+            self.rust_parent_module_references().len(),
             self.rust_local_values().len(),
             self.rust_local_types().len(),
             self.rust_field_sites().len(),
@@ -1191,6 +1261,16 @@ impl StaticFacts {
         imports
             && conditional
             && self.rust_value_reads().iter().all(|read| valid(read.range))
+            && self.rust_argument_value_reads().iter().copied().all(valid)
+            && self
+                .rust_generic_references()
+                .windows(2)
+                .all(|pair| pair[0].range < pair[1].range)
+            && self.rust_generic_references().iter().all(|reference| {
+                valid(reference.range)
+                    && valid(reference.binding)
+                    && matches!(reference.role, ReferenceRole::Read | ReferenceRole::Type)
+            })
             && self
                 .rust_local_values()
                 .iter()
@@ -1199,6 +1279,13 @@ impl StaticFacts {
                 .rust_local_types()
                 .iter()
                 .all(|(item, scope)| valid(*item) && valid(*scope) && scope.encloses(*item))
+            && self.rust_crate_paths().iter().copied().all(valid)
+            && self.rust_crate_visibility().iter().copied().all(valid)
+            && self
+                .rust_parent_module_references()
+                .iter()
+                .copied()
+                .all(valid)
             && self.rust_macro_ranges_valid(valid)
             && self.rust_field_sites().iter().all(|site| {
                 valid(site.owner)

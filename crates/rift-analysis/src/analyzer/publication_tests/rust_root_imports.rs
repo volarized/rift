@@ -594,10 +594,40 @@ pub fn run() -> (u8, u8, u8, u16) {
     }
     assert!(publication.declarations.iter().all(|declaration| {
         let name = declaration.symbol.as_str();
-        !name.ends_with("/OpaqueName")
-            && !name.ends_with("/ElsewhereName")
-            && !name.ends_with("/DecoyName")
+        !name.ends_with("/OpaqueName") && !name.ends_with("/DecoyName")
     }));
+    assert!(publication.declarations.iter().any(|declaration| {
+        declaration
+            .symbol
+            .as_str()
+            .ends_with("/conditional/ElsewhereName")
+            && declaration.unit.as_str().ends_with("src/elsewhere.rs")
+    }));
+}
+
+fn assert_root_declaration(
+    publication: &rift_protocol::index::PackagePublication,
+    unit: &rift_core::SourceUnitId,
+    source: &str,
+) {
+    let declaration = publication
+        .declarations
+        .iter()
+        .find(|declaration| declaration.symbol.as_str() == ROOT)
+        .expect("physical library root");
+    assert_eq!(declaration.unit.0, unit.to_string());
+    assert_eq!(
+        declaration.range,
+        TextRange {
+            start: 0,
+            end: source.len() as u64
+        }
+    );
+    assert_eq!(declaration.source, source);
+    assert_eq!(
+        declaration.syntax_element_kind.as_deref(),
+        Some("source_file")
+    );
 }
 
 #[test]
@@ -622,18 +652,17 @@ fn library_root_publishes_stored_external_import_and_preserves_authored_rows() {
     let object = objects.next().expect("published library root");
     assert!(objects.next().is_none());
     assert_eq!(object.kinds, [SymbolKind::Module]);
-    assert_eq!(object.origin.source_kind, SourceKind::Synthetic);
-    assert!(object.origin.location.is_none());
-    assert!(
-        publication
-            .declarations
-            .iter()
-            .all(|declaration| declaration.symbol.as_str() != ROOT)
-    );
+    assert_eq!(object.origin.source_kind, SourceKind::Authored);
+    assert!(object.origin.location.is_some());
+    assert_root_declaration(&publication, unit, SOURCE);
     let root_imports = publication
         .edges
         .iter()
-        .filter(|edge| edge.from.as_str() == ROOT && edge.kinds == [EdgeKind::Imports])
+        .filter(|edge| {
+            edge.from.as_str() == ROOT
+                && edge.kinds == [EdgeKind::Imports]
+                && edge.to.as_str().starts_with("rift://symbol/stdlib/")
+        })
         .collect::<Vec<_>>();
     assert_eq!(root_imports.len(), 1);
     let external = root_imports[0];
@@ -693,7 +722,7 @@ fn library_root_publishes_stored_external_import_and_preserves_authored_rows() {
 }
 
 #[test]
-fn library_root_does_not_materialize_from_unchecked_scope_or_non_external_import() {
+fn library_root_requires_a_checked_source_even_when_edges_are_available() {
     let cycle = "mod lib;\nuse std::fmt::Debug;\npub fn run() {}";
     let malformed = "use std::fmt::Debug;\npub fn run() {}\npub fn broken( {";
     let missing = format!("{MANIFEST}\n[lib]\npath='src/absent.rs'\n");
@@ -720,17 +749,25 @@ fn library_root_does_not_materialize_from_unchecked_scope_or_non_external_import
             anchored,
             "{path}: {source}"
         );
-        assert!(
+        assert_eq!(
             publication
                 .objects
                 .iter()
-                .all(|object| object.id.as_ref().is_none_or(|id| id.as_str() != ROOT))
+                .any(|object| object.id.as_ref().is_some_and(|id| id.as_str() == ROOT)),
+            anchored
         );
-        assert!(
+        assert_eq!(
             publication
                 .edges
                 .iter()
-                .all(|edge| edge.from.as_str() != ROOT)
+                .any(|edge| edge.from.as_str() == ROOT && edge.kinds == [EdgeKind::Contains]),
+            anchored
+        );
+        assert!(
+            !publication
+                .edges
+                .iter()
+                .any(|edge| edge.to.as_str().contains("untracked"))
         );
     }
 }
@@ -889,7 +926,7 @@ fn named_macro_imports_keep_the_written_path_and_defining_module() {
             && edge.to().as_str() == root_macro
             && edge.kind() == EdgeKind::Imports
     }));
-    assert!(!publication.edges.iter().any(|edge| {
+    assert!(publication.edges.iter().any(|edge| {
         edge.from.as_str() == ROOT
             && edge.to.as_str() == root_macro
             && edge.kinds == [EdgeKind::Imports]
@@ -913,4 +950,403 @@ fn named_macro_imports_keep_the_written_path_and_defining_module() {
             .get(&EdgeKind::Imports),
         Some(&3)
     );
+}
+
+#[test]
+fn authored_library_root_contains_items_without_an_external_import() {
+    let source = "pub fn top() {}
+pub struct Thing { value: u8 }
+pub mod nested { pub fn child() {} }
+";
+    let manifest = format!(
+        "{MANIFEST}
+[lib]
+path='sources/library.rs'
+"
+    );
+    let (publication, files, _, _) = analyze_rust_root(
+        vec![
+            ("sources/library.rs", source),
+            ("src/main.rs", "fn main() {}"),
+        ],
+        &manifest,
+    )
+    .into_parts();
+    let root = files
+        .iter()
+        .find(|file| file.file().path().as_str() == "sources/library.rs")
+        .expect("selected library");
+    assert!(publication.declarations.iter().any(|row| {
+        row.symbol.as_str() == ROOT
+            && row.unit.0 == root.placement().unit().to_string()
+            && row.range
+                == (TextRange {
+                    start: 0,
+                    end: source.len() as u64,
+                })
+    }));
+    for (name, written) in [("top", "top"), ("Thing", "Thing"), ("nested", "nested")] {
+        let target = format!("{ROOT}/{name}");
+        let start = source.find(written).expect("top-level written name") as u64;
+        let end = start + written.len() as u64;
+        assert!(publication.edges.iter().any(|edge| {
+            edge.from.as_str() == ROOT
+                && edge.to.as_str() == target
+                && edge.kinds == [EdgeKind::Contains]
+                && edge.occurrence.as_ref().is_some_and(|span| {
+                    span.unit.0 == root.placement().unit().to_string()
+                        && span.range == TextRange { start, end }
+                })
+        }));
+    }
+    assert!(
+        publication
+            .edges
+            .iter()
+            .all(|edge| { edge.from.as_str() != ROOT || !edge.to.as_str().ends_with("/main") })
+    );
+    publication.validate_facts().expect("covered publication");
+}
+
+#[test]
+fn authored_crate_path_tokens_reference_the_selected_library_root() {
+    const LIBRARY: &str = "
+pub mod child;
+pub fn leaf() {}
+pub fn call() { crate::leaf(); }
+#[cfg(any())]
+pub fn inactive() { crate::leaf(); }
+pub fn private() {}
+";
+    const CHILD: &str = "
+use crate::leaf as imported;
+pub fn run() { crate::leaf(); imported(); }
+";
+    let (publication, files, _, _) = analyze_rust_root(
+        vec![
+            ("src/lib.rs", LIBRARY),
+            ("src/child.rs", CHILD),
+            ("src/main.rs", "fn main() { crate::missing(); }"),
+        ],
+        MANIFEST,
+    )
+    .into_parts();
+    for (path, source, expected) in [
+        (
+            "src/lib.rs",
+            LIBRARY,
+            vec![LIBRARY.find("crate::").expect("written qualifier")],
+        ),
+        (
+            "src/child.rs",
+            CHILD,
+            CHILD
+                .match_indices("crate::")
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let unit = files
+            .iter()
+            .find(|file| file.file().path().as_str() == path)
+            .expect("selected source")
+            .placement()
+            .unit()
+            .to_string();
+        let mut actual = publication
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let occurrence = edge.occurrence.as_ref()?;
+                (edge.to.as_str() == ROOT
+                    && edge.kinds == [EdgeKind::Reads]
+                    && occurrence.unit.0 == unit)
+                    .then_some(occurrence.range.clone())
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|range| range.start);
+        let expected = expected
+            .into_iter()
+            .map(|start| TextRange {
+                start: start as u64,
+                end: (start + 5) as u64,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{source}");
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/call")
+            && edge.to.as_str().ends_with("/leaf")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    assert!(publication.edges.iter().all(|edge| {
+        edge.to.as_str() != ROOT
+            || edge
+                .occurrence
+                .as_ref()
+                .is_none_or(|span| !span.unit.0.ends_with("/src/main.rs"))
+    }));
+}
+
+#[test]
+fn authored_crate_visibility_references_the_selected_library_root() {
+    let source = "pub(crate) fn leaf() {}
+pub(in crate) fn other() {}
+pub fn caller() { leaf(); other(); }
+";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    let mut ranges = publication
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let span = edge.occurrence.as_ref()?;
+            (edge.to.as_str() == ROOT && edge.kinds == [EdgeKind::Reads])
+                .then_some(span.range.clone())
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start);
+    assert_eq!(
+        ranges,
+        source
+            .match_indices("crate")
+            .map(|(start, _)| TextRange {
+                start: start as u64,
+                end: (start + 5) as u64
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Calls])
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn package_rust_places_selected_local_macro_method_names_at_authored_tokens() {
+    let source = r"
+pub struct Clock;
+macro_rules! methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(pub fn $name(&self) -> u8 { $value })*
+    };
+}
+impl Clock {
+    methods! { hour => 7; minute => 13; }
+}
+macro_rules! setters {
+    ($($(#[$attr:meta])* fn $method:ident($field:ident: $ty:ty);)+) => {
+        $($(#[$attr])* #[inline] pub fn $method(self, $field: $ty) -> Self { self })+
+    };
+}
+impl Clock {
+    setters! { /// Sets the second.
+        fn with_second(second: u8);
+    }
+}
+trait Others { fn denied(&self) -> u8; }
+macro_rules! trait_methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(fn $name(&self) -> u8 { $value })*
+    };
+}
+impl Others for Clock {
+    trait_methods! { denied => 9; }
+}
+macro_rules! methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(pub fn unrelated(&self) -> u8 { $value })*
+    };
+}
+impl Clock { methods! { absent => 0; } }
+pub fn read(clock: &Clock) -> u8 { clock.hour() }
+";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    for name in ["hour", "minute", "with_second"] {
+        let key = format!("/Clock/{name}");
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(&key))
+            .unwrap_or_else(|| panic!("expected authored method {name}"));
+        let start =
+            usize::try_from(declaration.range.start).expect("fixture source offset fits usize");
+        let end = usize::try_from(declaration.range.end).expect("fixture source offset fits usize");
+        assert_eq!(&source[start..end], name);
+        assert_eq!(
+            declaration.syntax_element_kind.as_deref(),
+            Some("identifier")
+        );
+        assert!(declaration.signature_indices.is_empty());
+    }
+    for name in ["denied", "absent", "unrelated"] {
+        let key = format!("/Clock/{name}");
+        assert!(
+            !publication
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with(&key))
+        );
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/read")
+            && edge.to.as_str().ends_with("/Clock/hour")
+    }));
+}
+
+#[test]
+fn package_rust_feature_guarded_documentation_preserves_its_authored_module() {
+    let root = "#[cfg_attr(feature = \"extra\", doc(cfg(feature = \"extra\")))]
+pub mod child;
+pub fn call() -> u8 { child::answer() }";
+    let child = "pub fn answer() -> u8 { 7 }";
+    for enabled in ["", "\"extra\""] {
+        let manifest = format!("{MANIFEST}\n[features]\ndefault = [{enabled}]\nextra = []\n");
+        let analysis = analyze_rust_root(
+            vec![("src/lib.rs", root), ("src/child.rs", child)],
+            &manifest,
+        );
+        let publication = analysis.publication();
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/child/answer")
+                    && row.unit.as_str().ends_with("/src/child.rs")
+            })
+            .expect("checked documentation attribute keeps the module path");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with("/call")
+                && edge.to == declaration.symbol
+        }));
+    }
+}
+
+#[test]
+fn package_rust_cfg_attr_path_keeps_only_the_selected_file_owner() {
+    let native = "#[cfg_attr(feature = \"native\", path = \"platform.rs\")] pub mod selected;
+pub fn call() { selected::entry(); }";
+    let manifest =
+        |enabled| format!("{MANIFEST}\n[features]\ndefault = [{enabled}]\nnative = []\n");
+    let sources = |source| {
+        vec![
+            ("src/lib.rs", source),
+            ("src/platform.rs", "pub fn entry() {}"),
+            ("src/selected.rs", "pub fn entry() {}"),
+        ]
+    };
+    for (feature, physical) in [("\"native\"", "src/platform.rs"), ("", "src/selected.rs")] {
+        let selected = analyze_rust_root(sources(native), &manifest(feature));
+        let declaration = selected
+            .publication()
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/selected/entry"))
+            .expect("selected child declaration");
+        assert!(declaration.unit.as_str().ends_with(physical));
+        assert!(
+            selected
+                .publication()
+                .edges
+                .iter()
+                .any(|row| row.kinds == [EdgeKind::Calls]
+                    && row.from.as_str().ends_with("/call")
+                    && row.to == declaration.symbol)
+        );
+    }
+    for refused in [
+        "#[cfg_attr(unknown, path = \"platform.rs\")] pub mod selected;",
+        "#[cfg_attr(feature = \"native\", path = \"platform.rs\", path = \"selected.rs\")] pub mod selected;",
+        "#[cfg_attr(feature = \"native\", path = \"platform.rs\", transform)] pub mod selected;",
+    ] {
+        let result = analyze_rust_root(sources(refused), &manifest("\"native\""));
+        assert!(
+            result
+                .publication()
+                .declarations
+                .iter()
+                .all(|row| !row.symbol.as_str().ends_with("/selected/entry")),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn authored_super_tokens_resolve_only_to_the_checked_parent_module() {
+    const LIBRARY: &str = r"
+pub struct RootType;
+pub fn check() {}
+pub mod child;
+pub mod outer {
+    pub struct OuterType;
+    pub mod inner {
+        pub(super) fn identity(value: super::OuterType) -> super::OuterType { value }
+    }
+}
+pub fn outside(_: super::RootType) {}
+";
+    const CHILD: &str = r"
+pub(super) fn touch(_: super::RootType) { super::check(); }
+pub struct Holder;
+impl Holder { pub fn keep(&self) -> &Self { self } }
+";
+    let (publication, files, _, _) = analyze_rust_root(
+        vec![("src/lib.rs", LIBRARY), ("src/child.rs", CHILD)],
+        MANIFEST,
+    )
+    .into_parts();
+    for (path, source, module, expected_count) in [
+        ("src/lib.rs", LIBRARY, format!("{ROOT}/outer"), 3),
+        ("src/child.rs", CHILD, ROOT.to_owned(), 3),
+    ] {
+        let unit = files
+            .iter()
+            .find(|file| file.file().path().as_str() == path)
+            .expect("selected module source")
+            .placement()
+            .unit()
+            .to_string();
+        let mut actual = publication
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let span = edge.occurrence.as_ref()?;
+                (edge.to.as_str() == module
+                    && edge.kinds.as_slice() == [EdgeKind::Reads]
+                    && span.unit.0 == unit)
+                    .then_some(span.range.clone())
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|range| range.start);
+        let expected = source
+            .match_indices("super")
+            .take(expected_count)
+            .map(|(start, name)| TextRange {
+                start: start as u64,
+                end: (start + name.len()) as u64,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{path}");
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str() == format!("{ROOT}/child/touch")
+            && edge.to.as_str() == format!("{ROOT}/check")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    let outside = LIBRARY
+        .rfind("super")
+        .expect("parent qualifier outside a module") as u64;
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.occurrence.as_ref().is_some_and(|span| {
+                span.unit.0.ends_with("/src/lib.rs") && span.range.start == outside
+            })
+    }));
 }

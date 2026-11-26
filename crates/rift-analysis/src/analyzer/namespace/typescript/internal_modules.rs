@@ -3,13 +3,14 @@
 use super::entry::{Entry, PackageFiles};
 use super::{
     BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_anchors,
+    SelectedFile, SymbolIdentity, SymbolOwner, binding_name, declaration_anchors, prepare_anchors,
     selected_source_is_valid,
 };
 use crate::static_resolution::is_declaration_file;
 use serde::Deserialize;
 
 mod scopes;
+pub(super) use scopes::private_local_identities;
 
 /// Names every remaining selected source by its package-relative path.
 ///
@@ -80,11 +81,26 @@ pub(super) fn prepare(
         }
         prepared.anchors.remove(path);
         let mut anchors = declaration_anchors(input, file, Some(&module));
-        let withheld = scopes::repeated_names(file);
+        let scopes = scopes::FileScopes::new(file.syntax, file.source);
+        let withheld = scopes.repeated_names(file);
+        let mut physical = scopes.literal_properties(file, &withheld, &anchors);
+        physical.extend(scopes.withheld_lexical_bindings(file, &withheld, &anchors));
+        physical.extend(scopes.withheld_union_properties(file, &withheld, &anchors));
         anchors.retain(|name, _| {
             ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
         });
+        if input.release_version().is_some() {
+            let bindings = scopes.unplaced_lexical_bindings(file, &anchors, &physical);
+            physical.extend(bindings);
+        }
         if prepare_anchors(input, file, &module, anchors, prepared) {
+            if !physical.is_empty() {
+                prepared
+                    .scoped_anchors
+                    .entry(path.to_owned())
+                    .or_default()
+                    .extend(physical);
+            }
             modules.insert((language.name.clone(), module), Some(path.to_owned()));
             if metadata.exports.is_some() || script {
                 prepared

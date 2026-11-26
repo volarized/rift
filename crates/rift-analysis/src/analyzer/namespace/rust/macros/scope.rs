@@ -235,6 +235,10 @@ impl<'a> Tokens<'a> {
                 }
                 true
             }
+            // The built-in doc attribute only takes the included text as its value.
+            ["doc", "=", "include_str", "!", "(", path, ")"] => {
+                path.starts_with('"') && path.ends_with('"')
+            }
             ["doc", rest @ ..] => !rest.contains(&"!"),
             [
                 "allow" | "warn" | "deny" | "forbid" | "expect" | "inline" | "deprecated"

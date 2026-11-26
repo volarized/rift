@@ -29,7 +29,10 @@ mod traversal;
 
 #[cfg(feature = "collector")]
 pub use analyzer::{
-    AnalyzedFile, PackageAnalysis, PackageAnalyzer, PackageLanguage, StubForm,
+    AnalyzedFile, PackageAnalysis, PackageAnalyzer, PackageLanguage, RustLspDeclaration,
+    RustLspDeclarationAdmission, RustLspDeclarationFile, RustLspMacroAdmission,
+    RustLspMacroDefinition, RustLspMacroFile, RustLspMacroItems, RustLspMacroSite,
+    RustLspOperatorDefinition, RustLspOperatorEdges, RustLspOperatorSite, StubForm,
     public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};

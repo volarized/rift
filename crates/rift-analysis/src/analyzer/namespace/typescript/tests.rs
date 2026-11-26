@@ -340,9 +340,24 @@ fn lexical_collision_and_unestablished_reexports_keep_incomplete_export_coverage
 fn typescript_overload_signatures_bind_one_function() {
     let source = "export function format(value: string): string;\nexport function format(value: number): string;";
     let found = one(TYPES, "index.d.ts", source);
-    assert_eq!(found.len(), 1);
-    assert!(found.values().all(|identity| identity.as_str()
-        == "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"));
+    assert_eq!(found.len(), 3);
+    assert_eq!(
+        found["format"].as_str(),
+        "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"
+    );
+    for ordinal in 0..2 {
+        let key = format!("format.$overload#{ordinal}.value");
+        let parameter = SymbolIdentity::parse(found[&key].as_str()).expect("scoped parameter");
+        assert_eq!(
+            parameter.qualified_path(),
+            [
+                "prettier",
+                "format",
+                &format!("$overload#{ordinal}"),
+                "value"
+            ]
+        );
+    }
 }
 
 #[test]
@@ -1159,13 +1174,23 @@ fn package_ambient_overloads_and_repeated_bodies_share_one_identity() {
     let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), overloads);
     let identities = found.anchors["buffer.d.ts"]
         .iter()
-        .filter(|(name, _)| name.contains(".read"))
+        .filter(|(name, _)| {
+            name.rsplit_once('.')
+                .is_some_and(|(_, item)| item == "read")
+        })
         .map(|(_, identity)| identity)
         .collect::<Vec<_>>();
     assert_eq!(
         identities.len(),
         1,
         "every declaration spells one qualified name"
+    );
+    assert_eq!(
+        found.anchors["buffer.d.ts"]
+            .keys()
+            .filter(|name| name.contains(".read.$overload#"))
+            .count(),
+        2
     );
     let repeated =
         "declare module \"node:buffer\" { export function read() {} export function read() {} }";

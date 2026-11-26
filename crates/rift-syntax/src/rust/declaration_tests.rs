@@ -114,11 +114,21 @@ fn test_trait_associated_items_declare_under_the_trait() {
             ("Shape::Unit", Some("Shape"), "associated_type"),
             ("Shape::SIDES", Some("Shape"), "constant"),
             ("Shape::area", Some("Shape"), "function"),
+            (
+                "Shape::area::self#parameter0",
+                Some("Shape::area"),
+                "parameter_binding"
+            ),
             ("Point", None, "struct"),
             ("Point", None, "impl_item"),
             ("Point::Unit", Some("Point"), "type_alias"),
             ("Point::SIDES", Some("Point"), "constant"),
             ("Point::area", Some("Point"), "function"),
+            (
+                "Point::area::self#parameter0",
+                Some("Point::area"),
+                "parameter_binding"
+            ),
         ]
     );
     assert_eq!(

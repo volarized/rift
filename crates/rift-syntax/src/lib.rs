@@ -30,7 +30,7 @@ mod yaml;
 pub use angular::{AngularComponent, AngularTemplate, angular_components};
 pub use contribution::{
     DocumentPlacement, LogicalDeclaration, PackageBindingSlots, PlacedAlias, SYNTAX_PROVIDER_ID,
-    SyntaxPublicationBuilder, source_unit, source_unit_for_path,
+    ScopedIdentityAnchors, SyntaxPublicationBuilder, source_unit, source_unit_for_path,
 };
 pub use css::CssSyntaxProvider;
 pub use document::{
@@ -56,8 +56,8 @@ pub use static_analysis::{
     StaticDeclaredReturn, StaticFacts, StaticFactsParts, StaticFunctionContext, StaticInherentImpl,
     StaticMember, StaticMemberAlias, StaticMemberCallback, StaticMemberCopy, StaticParameter,
     StaticPythonInitializer, StaticPythonInitializerField, StaticReexport, StaticReference,
-    StaticRustFieldSite, StaticRustMacroCall, StaticRustMacroDefinition, StaticRustUse,
-    StaticRustValueRead,
+    StaticRustFieldSite, StaticRustGenericReference, StaticRustMacroCall,
+    StaticRustMacroDefinition, StaticRustUse, StaticRustValueRead,
 };
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};

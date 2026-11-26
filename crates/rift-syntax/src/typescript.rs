@@ -183,9 +183,14 @@ mod tests {
                     function open(options: { flags: string; mode(): number }): void {}\n";
         let document = analyze(text);
         assert!(!document.has_errors());
+        assert_callable_type_parameter_rows(document.symbols());
         let symbols = document
             .symbols()
             .iter()
+            .filter(|symbol| {
+                !symbol.is_ecmascript_overload_parameter()
+                    && !symbol.is_typescript_callable_type_parameter()
+            })
             .map(|symbol| {
                 (
                     symbol.qualified_name.as_str(),
@@ -201,12 +206,15 @@ mod tests {
             symbols,
             [
                 ("Array", "interface", None),
+                ("Array.T", "typescript_type_parameter", None),
                 ("Array.length", "property", None),
                 (
                     "Array.map",
                     "method",
                     Some("map<U>(callbackfn: (value: T) => U): U[]")
                 ),
+                ("Array.map.U", "typescript_method_type_parameter", None),
+                ("Array.map.callbackfn", "value_parameter", None),
                 (
                     "Array.reduce",
                     "method",
@@ -219,6 +227,7 @@ mod tests {
                 ),
                 ("Reader", "class", None),
                 ("Reader.read", "method", Some("read(size?: number): string")),
+                ("Reader.read.size", "value_parameter", None),
                 (
                     "readFile",
                     "function",
@@ -255,6 +264,27 @@ mod tests {
             }
         );
         assert_eq!(options.name_range, Some(options.item_range));
+    }
+
+    fn assert_callable_type_parameter_rows(symbols: &[crate::SyntaxSymbol]) {
+        let names = symbols
+            .iter()
+            .filter(|symbol| symbol.is_typescript_callable_type_parameter())
+            .map(|symbol| {
+                assert!(symbol.signatures.is_empty());
+                symbol.qualified_name.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Array.map.$signature#0.value",
+                "Array.reduce.$signature#0.a",
+                "Array.reduce.$signature#0.b",
+                "Array.reduce.$signature#1.a",
+                "Array.reduce.$signature#1.b",
+            ]
+        );
     }
 
     #[test]

@@ -21,12 +21,36 @@ pub const SYNTAX_PROVIDER_ID: &str = "syntax";
 pub struct PackageBindingSlots {
     rust_local: usize,
     rust_parameter: usize,
+    rust_receiver: usize,
+    rust_generic: usize,
     python_parameter: usize,
     typescript_parameter: usize,
     python_receiver: usize,
     python_loop_binding: usize,
     python_variadic_parameter: usize,
     python_overload_parameter: usize,
+    javascript_parameter: usize,
+    javascript_callback_parameter: usize,
+    typescript_overload_parameter: usize,
+    javascript_method_parameter: usize,
+    typescript_signature_parameter: usize,
+    javascript_scoped_function_parameter: usize,
+    typescript_method_parameter: usize,
+    rust_library_root: usize,
+    rust_module_source: usize,
+    rust_explicit: usize,
+    rust_shorthand: usize,
+    typescript_type_parameter: usize,
+    javascript_shorthand_parameter: usize,
+    typescript_callable_type_parameter: usize,
+    typescript_index_signature_parameter: usize,
+    javascript_wrapped_parameter: usize,
+    javascript_destructured_parameter: usize,
+    typescript_function_type_parameter: usize,
+    typescript_destructured_parameter: usize,
+    typescript_method_type_parameter: usize,
+    rust_macro_method: usize,
+    rust_disjoint: usize,
 }
 
 impl PackageBindingSlots {
@@ -41,12 +65,36 @@ impl PackageBindingSlots {
         Self {
             rust_local,
             rust_parameter,
+            rust_receiver: 0,
+            rust_generic: 0,
             python_parameter,
             typescript_parameter,
+            javascript_parameter: 0,
             python_receiver: 0,
             python_loop_binding: 0,
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
+            javascript_callback_parameter: 0,
+            typescript_overload_parameter: 0,
+            javascript_method_parameter: 0,
+            typescript_signature_parameter: 0,
+            javascript_scoped_function_parameter: 0,
+            typescript_method_parameter: 0,
+            rust_library_root: 0,
+            rust_module_source: 0,
+            rust_explicit: 0,
+            rust_shorthand: 0,
+            typescript_type_parameter: 0,
+            javascript_shorthand_parameter: 0,
+            typescript_callable_type_parameter: 0,
+            typescript_index_signature_parameter: 0,
+            javascript_wrapped_parameter: 0,
+            javascript_destructured_parameter: 0,
+            typescript_function_type_parameter: 0,
+            typescript_destructured_parameter: 0,
+            typescript_method_type_parameter: 0,
+            rust_macro_method: 0,
+            rust_disjoint: 0,
         }
     }
 
@@ -78,26 +126,261 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for ordinary JavaScript value parameters.
+    #[must_use]
+    pub const fn with_javascript_parameters(mut self, count: usize) -> Self {
+        self.javascript_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for TypeScript method parameters.
+    #[must_use]
+    pub const fn with_typescript_method_parameters(mut self, count: usize) -> Self {
+        self.typescript_method_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for the parameters of JavaScript function values.
+    #[must_use]
+    pub const fn with_javascript_callback_parameters(mut self, count: usize) -> Self {
+        self.javascript_callback_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for distinct TypeScript overload parameters.
+    #[must_use]
+    pub const fn with_typescript_overload_parameters(mut self, count: usize) -> Self {
+        self.typescript_overload_parameter = count;
+        self
+    }
+
+    /// Reserves additional slots for Rust receiver parameters.
+    #[must_use]
+    pub const fn with_rust_receivers(mut self, rust_receiver: usize) -> Self {
+        self.rust_receiver = rust_receiver;
+        self
+    }
+
+    /// Reserves additional slots for Rust generic parameters.
+    #[must_use]
+    pub const fn with_rust_generics(mut self, rust_generic: usize) -> Self {
+        self.rust_generic = rust_generic;
+        self
+    }
+
+    /// Reserves an additional slot for the authored Cargo library root.
+    #[must_use]
+    pub const fn with_rust_library_root(mut self, rust_library_root: usize) -> Self {
+        self.rust_library_root = rust_library_root;
+        self
+    }
+
+    /// Reserves slots for checked Rust module source declarations.
+    #[must_use]
+    pub const fn with_rust_module_sources(mut self, slots: usize) -> Self {
+        self.rust_module_source = slots;
+        self
+    }
+
+    /// Reserves slots for explicitly written local bindings in opaque Rust scopes.
+    #[must_use]
+    pub const fn with_rust_explicit_locals(mut self, rust_explicit: usize) -> Self {
+        self.rust_explicit = rust_explicit;
+        self
+    }
+
+    /// Reserves slots for checked Rust shorthand pattern bindings.
+    #[must_use]
+    pub const fn with_rust_shorthand(mut self, slots: usize) -> Self {
+        self.rust_shorthand = slots;
+        self
+    }
+
+    /// Holds the slots left for authored JavaScript method parameters.
+    #[must_use]
+    pub const fn with_javascript_method_parameters(mut self, count: usize) -> Self {
+        self.javascript_method_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for authored TypeScript function signature parameters.
+    #[must_use]
+    pub const fn with_typescript_signature_parameters(mut self, count: usize) -> Self {
+        self.typescript_signature_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for parameters of separately anchored JavaScript functions.
+    #[must_use]
+    pub const fn with_javascript_scoped_function_parameters(mut self, count: usize) -> Self {
+        self.javascript_scoped_function_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for authored TypeScript type parameters.
+    #[must_use]
+    pub const fn with_typescript_type_parameters(mut self, count: usize) -> Self {
+        self.typescript_type_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for JavaScript parameters with a same-name shorthand property.
+    #[must_use]
+    pub const fn with_javascript_shorthand_parameters(mut self, count: usize) -> Self {
+        self.javascript_shorthand_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for declared parameters of TypeScript callable types.
+    #[must_use]
+    pub const fn with_typescript_callable_type_parameters(mut self, count: usize) -> Self {
+        self.typescript_callable_type_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for TypeScript index signature parameter declarations.
+    #[must_use]
+    pub const fn with_typescript_index_signature_parameters(mut self, count: usize) -> Self {
+        self.typescript_index_signature_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for JavaScript defaulted and rest parameter declarations.
+    #[must_use]
+    pub const fn with_javascript_wrapped_parameters(mut self, count: usize) -> Self {
+        self.javascript_wrapped_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for authored JavaScript object and array parameter bindings.
+    #[must_use]
+    pub const fn with_javascript_destructured_parameters(mut self, count: usize) -> Self {
+        self.javascript_destructured_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for authored TypeScript method type parameters.
+    #[must_use]
+    pub const fn with_typescript_method_type_parameters(mut self, count: usize) -> Self {
+        self.typescript_method_type_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for authored TypeScript function type parameters.
+    #[must_use]
+    pub const fn with_typescript_function_type_parameters(mut self, count: usize) -> Self {
+        self.typescript_function_type_parameter = count;
+        self
+    }
+
+    /// Holds slots left for written TypeScript parameter pattern bindings.
+    #[must_use]
+    pub const fn with_typescript_destructured_parameters(mut self, count: usize) -> Self {
+        self.typescript_destructured_parameter = count;
+        self
+    }
+
+    /// Reserves slots for names emitted by checked Rust macro method matchers.
+    #[must_use]
+    pub const fn with_rust_macro_methods(mut self, slots: usize) -> Self {
+        self.rust_macro_method = slots;
+        self
+    }
+
+    /// Reserves slots for Rust bindings outside the effects of a disjoint macro call.
+    #[must_use]
+    pub const fn with_disjoint_rust_bindings(mut self, slots: usize) -> Self {
+        self.rust_disjoint = slots;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
         self.rust_local
             .saturating_add(self.rust_parameter)
+            .saturating_add(self.rust_receiver)
+            .saturating_add(self.rust_generic)
             .saturating_add(self.python_parameter)
             .saturating_add(self.typescript_parameter)
+            .saturating_add(self.javascript_parameter)
             .saturating_add(self.python_receiver)
             .saturating_add(self.python_loop_binding)
             .saturating_add(self.python_variadic_parameter)
             .saturating_add(self.python_overload_parameter)
+            .saturating_add(self.typescript_method_parameter)
+            .saturating_add(self.javascript_callback_parameter)
+            .saturating_add(self.typescript_overload_parameter)
+            .saturating_add(self.rust_library_root)
+            .saturating_add(self.rust_module_source)
+            .saturating_add(self.rust_explicit)
+            .saturating_add(self.rust_shorthand)
+            .saturating_add(self.javascript_method_parameter)
+            .saturating_add(self.typescript_signature_parameter)
+            .saturating_add(self.javascript_scoped_function_parameter)
+            .saturating_add(self.typescript_type_parameter)
+            .saturating_add(self.javascript_shorthand_parameter)
+            .saturating_add(self.typescript_callable_type_parameter)
+            .saturating_add(self.typescript_index_signature_parameter)
+            .saturating_add(self.javascript_wrapped_parameter)
+            .saturating_add(self.javascript_destructured_parameter)
+            .saturating_add(self.typescript_function_type_parameter)
+            .saturating_add(self.typescript_destructured_parameter)
+            .saturating_add(self.typescript_method_type_parameter)
+            .saturating_add(self.rust_macro_method)
+            .saturating_add(self.rust_disjoint)
     }
 
     fn admit(
         &mut self,
         symbol: &crate::SyntaxSymbol,
+        syntax: &SyntaxFacts,
         python_receivers: &BTreeSet<crate::ByteRange>,
+        methods: &std::collections::BTreeSet<&str>,
     ) -> bool {
-        let available = if symbol.is_typescript_parameter() {
-            &mut self.typescript_parameter
+        let language = syntax.language().name.as_str();
+        let available = if symbol.is_ecmascript_callback_parameter() {
+            &mut self.javascript_callback_parameter
+        } else if language == "typescript" && symbol.is_ecmascript_overload_parameter() {
+            &mut self.typescript_overload_parameter
+        } else if symbol.is_javascript_method_parameter() {
+            &mut self.javascript_method_parameter
+        } else if symbol.is_typescript_signature_parameter() {
+            &mut self.typescript_signature_parameter
+        } else if symbol.is_javascript_scoped_function_parameter() {
+            &mut self.javascript_scoped_function_parameter
+        } else if symbol.is_typescript_type_parameter() {
+            &mut self.typescript_type_parameter
+        } else if symbol.is_javascript_shorthand_parameter() {
+            &mut self.javascript_shorthand_parameter
+        } else if symbol.is_typescript_callable_type_parameter() {
+            &mut self.typescript_callable_type_parameter
+        } else if symbol.is_typescript_index_signature_parameter() {
+            &mut self.typescript_index_signature_parameter
+        } else if symbol.is_javascript_wrapped_parameter() {
+            &mut self.javascript_wrapped_parameter
+        } else if symbol.is_javascript_destructured_parameter() {
+            &mut self.javascript_destructured_parameter
+        } else if symbol.is_typescript_method_type_parameter() {
+            &mut self.typescript_method_type_parameter
+        } else if symbol.is_typescript_function_type_parameter() {
+            &mut self.typescript_function_type_parameter
+        } else if symbol.is_typescript_destructured_parameter() {
+            &mut self.typescript_destructured_parameter
+        } else if matches!(language, "javascript" | "typescript")
+            && symbol.is_ecmascript_parameter()
+        {
+            if language == "javascript" {
+                &mut self.javascript_parameter
+            } else if symbol
+                .container
+                .as_deref()
+                .is_some_and(|owner| methods.contains(owner))
+            {
+                &mut self.typescript_method_parameter
+            } else {
+                &mut self.typescript_parameter
+            }
         } else if symbol.is_python_variadic_parameter() {
             &mut self.python_variadic_parameter
         } else if symbol.is_python_overload_parameter() {
@@ -111,6 +394,22 @@ impl PackageBindingSlots {
             } else {
                 &mut self.python_parameter
             }
+        } else if symbol.is_rust_receiver_binding() {
+            &mut self.rust_receiver
+        } else if syntax.is_disjoint_rust_binding(symbol) {
+            &mut self.rust_disjoint
+        } else if symbol.is_rust_shorthand_binding() {
+            &mut self.rust_shorthand
+        } else if language == "rust" && symbol.is_rust_macro_method() {
+            &mut self.rust_macro_method
+        } else if symbol.is_rust_explicit_local_binding() {
+            &mut self.rust_explicit
+        } else if symbol.is_rust_module_source() {
+            &mut self.rust_module_source
+        } else if symbol.is_rust_library_root() {
+            &mut self.rust_library_root
+        } else if symbol.is_rust_generic_parameter() {
+            &mut self.rust_generic
         } else if symbol.is_rust_parameter_binding() {
             &mut self.rust_parameter
         } else if symbol.is_python_loop_binding() {
@@ -152,6 +451,9 @@ pub struct LogicalDeclaration {
     pub language: rift_protocol::read::Language,
 }
 
+/// Logical identities of physical declarations keyed by qualified name and ordinal.
+pub type ScopedIdentityAnchors = BTreeMap<String, BTreeMap<usize, SymbolId>>;
+
 /// Where one document's declarations are filed: origin, source unit, and identity path.
 ///
 /// `unit` is the [`SourceUnitId`] every declaration's binding names, and
@@ -166,6 +468,7 @@ pub struct DocumentPlacement {
     unit: SourceUnitId,
     identity_path: String,
     identity_anchors: BTreeMap<String, SymbolId>,
+    scoped_identity_anchors: ScopedIdentityAnchors,
     module: Option<SymbolId>,
     module_path: Vec<String>,
     aliases: Vec<PlacedAlias>,
@@ -185,6 +488,7 @@ impl DocumentPlacement {
             unit,
             identity_path: identity_path.into(),
             identity_anchors: BTreeMap::new(),
+            scoped_identity_anchors: BTreeMap::new(),
             module: None,
             module_path: Vec::new(),
             aliases: Vec::new(),
@@ -230,6 +534,9 @@ impl DocumentPlacement {
             tracker,
             GetSize::get_heap_size_with_tracker,
         );
+        let (scoped_anchors, tracker) = self
+            .scoped_identity_anchors
+            .get_heap_size_with_tracker(tracker);
         let (mappings, mut tracker) = rift_protocol::retained_map_material(
             &self.logical_declarations,
             tracker,
@@ -249,6 +556,7 @@ impl DocumentPlacement {
                 .saturating_mul(std::mem::size_of::<String>()),
             self.module_path.iter().map(String::capacity).sum(),
             anchors,
+            scoped_anchors,
             mappings,
             self.aliases
                 .capacity()
@@ -297,6 +605,14 @@ impl DocumentPlacement {
     #[must_use]
     pub fn with_identity_anchors(mut self, anchors: BTreeMap<String, SymbolId>) -> Self {
         self.identity_anchors = anchors;
+        self.scoped_identity_anchors.clear();
+        self
+    }
+
+    /// Supplies distinct identities for declarations of one name in separate scopes.
+    #[must_use]
+    pub fn with_scoped_identity_anchors(mut self, anchors: ScopedIdentityAnchors) -> Self {
+        self.scoped_identity_anchors = anchors;
         self
     }
 
@@ -332,6 +648,22 @@ impl DocumentPlacement {
             .get(qualified_name)
             .map(|declaration| &declaration.identity)
             .or_else(|| self.identity_anchors.get(qualified_name))
+    }
+
+    /// Returns the identity of this physical declaration, including any scoped override.
+    #[must_use]
+    pub fn logical_identity_for_symbol(&self, symbol: &crate::SyntaxSymbol) -> Option<&SymbolId> {
+        self.logical_declarations
+            .get(&symbol.qualified_name)
+            .map(|declaration| &declaration.identity)
+            .or_else(|| self.syntax_identity_anchor(symbol))
+    }
+
+    fn syntax_identity_anchor(&self, symbol: &crate::SyntaxSymbol) -> Option<&SymbolId> {
+        self.scoped_identity_anchors
+            .get(&symbol.qualified_name)
+            .and_then(|anchors| anchors.get(&symbol.declaration_ordinal))
+            .or_else(|| self.identity_anchors.get(&symbol.qualified_name))
     }
 
     /// Supplies source-backed export aliases beside existing declarations.
@@ -510,26 +842,24 @@ impl SyntaxPublicationBuilder {
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
         let mut remaining = *binding_slots;
+        let methods = syntax.typescript_method_names();
         let python_receivers = syntax.python_receiver_names();
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(symbol, &python_receivers))
+                    || !remaining.admit(symbol, syntax, &python_receivers, &methods))
             {
                 continue;
             }
             let logical = placement.logical_declarations.get(&symbol.qualified_name);
             let address = symbol.provider_address(&language_segment, placement.identity_path());
             let provider_symbol = ProviderSymbolId::for_symbol(&address)?;
-            let anchor = logical.map_or_else(
-                || {
-                    placement
-                        .identity_anchors
-                        .get(&symbol.qualified_name)
-                        .cloned()
-                },
-                |logical| Some(logical.identity.clone()),
-            );
+            let anchor = logical
+                .map_or_else(
+                    || placement.syntax_identity_anchor(symbol),
+                    |logical| Some(&logical.identity),
+                )
+                .cloned();
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
             let mut facts = symbol.placed_facts(language, anchor.as_ref());
             if let Some(container) = &symbol.container {

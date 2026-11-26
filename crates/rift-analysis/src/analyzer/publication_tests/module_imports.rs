@@ -4,6 +4,254 @@ use super::*;
 use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
+const NON_ENTRY_ARGUMENT_PROPERTIES: &str = r#"
+import { receive } from "../index.mjs";
+receive({ action: "first" });
+receive({ action: "second" });
+const options = { action: "named" };
+receive(options);
+"#;
+const NESTED_ARGUMENT_PROPERTIES: &str = r#"
+import { receive } from "../index.mjs";
+run(() => receive({ action: "first" }));
+run(() => receive({ action: "second" }));
+"#;
+
+#[test]
+fn package_retains_distinct_top_level_argument_properties_in_non_entry_files() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function receive(value) { return value.action; }",
+            ),
+            ("bin/options.mjs", NON_ENTRY_ARGUMENT_PROPERTIES),
+            ("bin/nested.mjs", NESTED_ARGUMENT_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let path = "bin/options.mjs";
+    let analyzed = analysis
+        .files()
+        .iter()
+        .find(|file| file.file().path().as_str() == path)
+        .expect("retained file");
+    assert!(analyzed.placement().logical_identity("action").is_none());
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == path)
+        .expect("source unit");
+    let declarations = ["first", "second", "named"].map(|value| {
+        let written = format!("action: \"{value}\"");
+        let start = u64::try_from(
+            NON_ENTRY_ARGUMENT_PROPERTIES
+                .find(&written)
+                .expect("property"),
+        )
+        .expect("source offset");
+        let matching = publication
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.unit == unit.unit
+                    && declaration.range.start == start
+                    && declaration.source == written
+            })
+            .collect::<Vec<_>>();
+        let [declaration] = matching.as_slice() else {
+            panic!("authored declaration for {value}");
+        };
+        assert!(!declaration.public);
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&declaration.symbol)
+                && object.name == "action"
+                && object.kind.0 == "property"
+        }));
+        declaration.symbol.clone()
+    });
+    let [first, second, named] = declarations;
+    assert_ne!(first, second);
+    assert_ne!(first, named);
+    assert_ne!(second, named);
+    assert!(named.as_str().ends_with("/options/action"));
+    assert!(publication.declarations.iter().all(|declaration| {
+        !declaration.unit.0.ends_with("/bin/nested.mjs")
+            || !declaration.source.starts_with("action:")
+    }));
+}
+
+/// An authored package with two private non-entry argument keys and older established facts.
+fn argument_property_publication(retained_bytes: u64) -> Result<PackagePublication, RiftError> {
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owner");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let root = ProjectPath::new("index.mjs").expect("entry");
+    let non_entry = ProjectPath::new("bin/options.mjs").expect("non-entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let files = [
+        PackageSource::new(
+            &root,
+            "export function receive(value) { return value.action; }",
+        ),
+        PackageSource::new(&non_entry, NON_ENTRY_ARGUMENT_PROPERTIES),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+    )];
+    let limits = ExactPackageLimits::new(3, 4096)
+        .with_retained_source_bytes(192, retained_bytes)
+        .expect("bounded retained records");
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+        .expect("bounded archive facts")
+        .with_framework_context(&metadata, &[])
+        .expect("npm manifest");
+    PackageAnalyzer::analyze(input, 1).map(|analysis| analysis.into_parts().0)
+}
+
+#[test]
+fn non_entry_argument_properties_keep_the_prior_retained_byte_budget() {
+    let room = argument_property_publication(u64::MAX).expect("publication with room");
+    let primary = room
+        .declarations
+        .iter()
+        .filter(|row| {
+            !matches!(
+                row.source.as_str(),
+                "action: \"first\"" | "action: \"second\""
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(primary.len(), 6);
+    let bytes = room
+        .units
+        .iter()
+        .map(|unit| unit.source.as_str())
+        .chain(primary.iter().map(|row| row.source.as_str()))
+        .chain(room.documents.iter().flat_map(|doc| {
+            [
+                doc.file_content.as_deref(),
+                doc.declaration_source.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+        }))
+        .map(|source| u64::try_from(source.len()).expect("captured source bytes"))
+        .sum();
+    let exact = argument_property_publication(bytes).unwrap_or_else(|error| {
+        panic!("old publication fits exactly at {bytes} source bytes: {error:?}")
+    });
+    assert_eq!(exact.declarations, primary);
+    assert_eq!(exact.units, room.units);
+    assert_eq!(exact.documents, room.documents);
+    assert_eq!(exact.edges, room.edges);
+    assert_eq!(exact.objects.len(), room.objects.len());
+    assert_eq!(
+        exact.objects.iter().filter(|row| row.id.is_none()).count(),
+        2
+    );
+    let generous = argument_property_publication(bytes + 192).expect("bounded surplus");
+    assert_eq!(generous.declarations, room.declarations);
+    assert_eq!(generous.objects, room.objects);
+    assert_eq!(generous.edges, room.edges);
+    assert_eq!(generous.declarations.len(), primary.len() + 2);
+}
+
+const RETURNED_LITERAL_PROPERTIES: &str = r#"
+import { inspect } from "../index.mjs";
+export function returned(first) {
+  if (first) return { result: 31 };
+  return ({ result: 42 });
+}
+export function read(first) {
+  return returned(first).result;
+}
+export function established() {
+  const options = { stable: 8 };
+  return inspect(options.stable);
+}
+export function unsupported(first) {
+  return first ? { opaque: 5 } : { opaque: 6 };
+}
+"#;
+
+#[test]
+fn package_retains_private_properties_of_distinct_returned_literals() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function inspect(value) { return value; }",
+            ),
+            ("lib/branches.mjs", RETURNED_LITERAL_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/branches.mjs")
+        .expect("non-entry unit")
+        .unit;
+    let property = |written: &str| {
+        publication.declarations.iter().find(|row| {
+            &row.unit == unit
+                && row.source == written
+                && u64::try_from(
+                    RETURNED_LITERAL_PROPERTIES
+                        .find(written)
+                        .expect("source key"),
+                ) == Ok(row.range.start)
+        })
+    };
+    let first = property("result: 31").expect("first returned property");
+    let second = property("result: 42").expect("second returned property");
+    assert_ne!(first.symbol, second.symbol);
+    for row in [first, second] {
+        assert!(!row.public);
+        assert!(row.symbol.as_str().contains("/returned/result%23"));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.name == "result"
+                && object.kind.0 == "property"
+        }));
+        assert!(
+            !publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds.contains(&EdgeKind::Reads) && edge.to == row.symbol)
+        );
+    }
+    let stable = property("stable: 8").expect("named control");
+    assert!(
+        stable
+            .symbol
+            .as_str()
+            .ends_with("/established/options/stable")
+    );
+    assert!(property("opaque: 5").is_none());
+    assert!(property("opaque: 6").is_none());
+}
+
 const MODULE: &str = "rift://symbol/npm/npmjs.org/app/typescript/app";
 const SIBLING: &str = "rift://symbol/npm/npmjs.org/app/typescript/app%2Fnear";
 const DEPENDENCY: &str = "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType";
@@ -60,26 +308,29 @@ fn analyze_module(
 fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
     let analysis = analyze_module(SOURCE, MANIFEST, PackageConfiguration::default());
     let (publication, _, semantics, _) = analysis.into_parts();
-    let mut modules = publication
+    let modules = publication
         .objects
         .iter()
-        .filter(|object| object.kinds.contains(&SymbolKind::Module));
-    let module = modules.next().expect("checked importing module");
-    assert!(modules.next().is_none());
+        .filter(|object| object.kinds.contains(&SymbolKind::Module))
+        .collect::<Vec<_>>();
+    assert_eq!(modules.len(), 2);
+    let module = modules
+        .iter()
+        .find(|object| object.id.as_ref().map(SymbolId::as_str) == Some(MODULE))
+        .expect("checked importing module");
     assert_eq!(module.id.as_ref().map(SymbolId::as_str), Some(MODULE));
     assert_eq!(module.name, "app");
-    assert_eq!(module.origin.source_kind, SourceKind::Synthetic);
-    assert!(module.origin.location.is_none());
-    assert!(module.origin.package.is_none());
+    assert_eq!(module.origin.source_kind, SourceKind::Authored);
+    assert!(module.origin.location.is_some());
+    assert!(module.origin.package.is_some());
     assert!(module.origin.runtime.is_none());
     publication
         .validate_facts()
         .expect("covered published edges");
     assert!(
-        publication
-            .declarations
-            .iter()
-            .all(|declaration| declaration.symbol.as_str() != MODULE)
+        publication.declarations.iter().any(
+            |declaration| declaration.symbol.as_str() == MODULE && declaration.source == SOURCE
+        )
     );
 
     let unit = publication
@@ -93,7 +344,21 @@ fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
         .iter()
         .filter(|edge| edge.from.as_str() == MODULE)
         .collect::<Vec<_>>();
-    assert_eq!(imports.len(), 2);
+    assert_eq!(imports.len(), 4);
+    let written = "\"./near\"";
+    for (start, _) in SOURCE.match_indices(written) {
+        let start = u64::try_from(start).expect("module specifier position");
+        let end = start + u64::try_from(written.len()).expect("module specifier length");
+        assert!(imports.iter().any(|edge| {
+            edge.to.as_str() == SIBLING
+                && edge.kinds == [EdgeKind::Imports]
+                && edge.provider == EdgeProvider::Static
+                && edge.derivation == EdgeDerivation::Resolution
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == unit.unit && occurrence.range == TextRange { start, end }
+                })
+        }));
+    }
     let sibling_item = format!("{SIBLING}/Local");
     for (target, name, derivation) in [
         (DEPENDENCY, "Imported", EdgeDerivation::Syntax),
@@ -416,13 +681,12 @@ fn assert_javascript_module_declaration(
         .find(|object| object.id.as_ref().is_some_and(|id| id.as_str() == module))
         .expect("checked JavaScript module");
     assert_eq!(object.kinds, [SymbolKind::Module]);
-    assert_eq!(object.origin.source_kind, SourceKind::Synthetic);
+    assert_eq!(object.origin.source_kind, SourceKind::Authored);
     assert!(
         found
             .declarations
             .iter()
-            .all(|row| row.symbol.as_str() != module),
-        "a synthetic module does not claim an authored declaration"
+            .any(|row| { row.symbol.as_str() == module && row.unit != target_source.unit })
     );
 }
 
@@ -440,12 +704,12 @@ fn assert_javascript_module_imports(
         .filter(|row| row.from.as_str() == module && row.kinds == [EdgeKind::Imports])
         .collect::<Vec<_>>();
     if import {
-        assert_eq!(written_imports.len(), 1, "{written_imports:?}");
-        assert_eq!(written_imports[0].to.as_str(), target);
-        let binding = written_imports[0]
-            .occurrence
-            .as_ref()
-            .expect("written import");
+        let named_import = written_imports
+            .iter()
+            .filter(|row| row.to.as_str() == target)
+            .collect::<Vec<_>>();
+        assert_eq!(named_import.len(), 1, "{written_imports:?}");
+        let binding = named_import[0].occurrence.as_ref().expect("written import");
         let start =
             u64::try_from(source.find("alpha").expect("imported name")).expect("byte offset");
         assert_eq!(&binding.unit, unit);
@@ -457,7 +721,19 @@ fn assert_javascript_module_imports(
             }
         );
     } else {
-        assert!(written_imports.is_empty());
+        assert_eq!(written_imports.len(), 1, "{written_imports:?}");
+        let module_target = target.strip_suffix("/alpha").expect("required module");
+        assert_eq!(written_imports[0].to.as_str(), module_target);
+        let binding = written_imports[0]
+            .occurrence
+            .as_ref()
+            .expect("written module");
+        let specifier = "'./left.cjs'";
+        assert_eq!(&binding.unit, unit);
+        assert_eq!(
+            binding.range,
+            module_runtime_range(source.find(specifier).expect("module specifier"), specifier)
+        );
         assert!(found.edges.iter().any(|row| {
             row.from.as_str() == format!("{module}/alpha")
                 && row.to.as_str() == target
@@ -706,9 +982,16 @@ fn assert_new_runtime_roles_follow_prior_package_edges(
     module: &str,
     language: &str,
 ) {
+    let module_references = semantics
+        .edges()
+        .edges()
+        .filter(|edge| edge.is_file_module_reference())
+        .map(crate::Edge::to_protocol)
+        .collect::<Vec<_>>();
     let available_before = publication
         .edges
         .iter()
+        .filter(|edge| !module_references.contains(edge))
         .filter(|edge| {
             edge.from.as_str() != module
                 || match edge.kinds.as_slice() {
@@ -781,14 +1064,6 @@ fn npm_complete_file_modules_can_publish_without_outgoing_edges() {
             "export const = ;\n",
             false,
         ),
-        (
-            ShippedLanguage::JavaScript,
-            "javascript",
-            "index.mjs",
-            "module",
-            "export function leaf() {}\n",
-            false,
-        ),
     ] {
         let selector = if shipped == ShippedLanguage::TypeScript {
             "types"
@@ -834,6 +1109,76 @@ fn npm_complete_file_modules_can_publish_without_outgoing_edges() {
             assert_empty_module_respects_the_symbol_bound(publication, &files, &semantics);
         }
     }
+}
+
+#[test]
+fn npm_written_file_modules_publish_their_own_source() {
+    const MAIN: &str = "import { leaf } from './leaf.mjs';\nexport function run() { leaf(); }\n";
+    const LEAF: &str = "export function leaf() {}\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", MAIN), ("leaf.mjs", LEAF)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("authored package modules");
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid package modules");
+    for (path, suffix, source) in [
+        ("index.mjs", "/beacon", MAIN),
+        ("leaf.mjs", "/beacon%2Fleaf.mjs", LEAF),
+    ] {
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("source unit");
+        let object = publication
+            .objects
+            .iter()
+            .find(|object| {
+                object.kinds.contains(&SymbolKind::Module)
+                    && object
+                        .id
+                        .as_ref()
+                        .is_some_and(|identity| identity.as_str().ends_with(suffix))
+            })
+            .expect("file module");
+        assert_eq!(object.origin.source_kind, SourceKind::Authored);
+        let module = object.id.as_ref().expect("module identity");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol == *module)
+            .expect("physical module");
+        assert_eq!(row.unit, unit.unit);
+        assert_eq!(row.range.start, 0);
+        assert_eq!(
+            row.range.end,
+            u64::try_from(source.len()).expect("source length")
+        );
+        assert_eq!(row.source, source);
+        assert!(row.source_complete);
+    }
+    let specifier = "'./leaf.mjs'";
+    let start = u64::try_from(MAIN.find(specifier).expect("written module")).expect("byte offset");
+    let end = start + u64::try_from(specifier.len()).expect("specifier bytes");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("module unit");
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/beacon")
+            && edge.to.as_str().ends_with("/beacon%2Fleaf.mjs")
+            && edge.kinds == [EdgeKind::Imports]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == unit.unit && site.range == TextRange { start, end }
+            })
+    }));
 }
 
 fn assert_empty_module_respects_the_symbol_bound(
@@ -960,4 +1305,1941 @@ fn empty_file_module_objects_follow_existing_module_edge_owners_at_the_cap() {
             .all(|object| { object.id.as_ref().is_none_or(|id| id.as_str() != ENTRY) })
     );
     assert!(capped.symbols_truncated);
+}
+
+#[test]
+fn npm_commonjs_module_reads_follow_the_written_binding() {
+    const SOURCE: &str = concat!(
+        "const neighbor = require('./neighbor.js');\n",
+        "const replaced = require('./neighbor.js');\n",
+        "replaced = { value: 5 };\n",
+        "exports.result = function result() { return exports.answer + neighbor.value; };\n",
+        "exports.answer = 3;\n",
+        "function shadow(exports, neighbor) { return exports.answer + neighbor.value; }\n",
+        "replaced.value;\n",
+    );
+    let analysis = analyze_javascript_module(
+        "commonjs",
+        "index.js",
+        SOURCE,
+        "neighbor.js",
+        "exports.value = 4;\n",
+    );
+    let found = analysis.publication();
+    found.validate_facts().expect("valid module publication");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.js")
+        .expect("checked CommonJS unit");
+    let module = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon";
+    let neighbor = format!("{module}%2Fneighbor.js");
+    for target in [module, neighbor.as_str()] {
+        assert!(found.declarations.iter().any(|row| {
+            row.symbol.as_str() == target && row.range.start == 0 && row.source_complete
+        }));
+    }
+    let reads_module = |start: usize, spelling: &str, target: &str| {
+        found.edges.iter().any(|edge| {
+            edge.to.as_str() == target
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == unit.unit
+                        && occurrence.range == module_runtime_range(start, spelling)
+                })
+        })
+    };
+    let top = SOURCE
+        .find("exports.result")
+        .expect("written module receiver");
+    let read = SOURCE.find("exports.answer").expect("written own export");
+    let sibling = SOURCE
+        .find("neighbor.value")
+        .expect("written imported module");
+    assert!(reads_module(top, "exports", module));
+    assert!(reads_module(read, "exports", module));
+    assert!(reads_module(sibling, "neighbor", &neighbor));
+    let shadow = SOURCE.rfind("exports.answer").expect("shadowed exports");
+    let shadow_neighbor = SOURCE.rfind("neighbor.value").expect("shadowed namespace");
+    let replaced = SOURCE.find("replaced.value").expect("reassigned namespace");
+    assert!(!reads_module(shadow, "exports", module));
+    assert!(!reads_module(shadow_neighbor, "neighbor", &neighbor));
+    assert!(!reads_module(replaced, "replaced", &neighbor));
+}
+
+#[test]
+fn npm_constructor_calls_an_imported_stable_class_value() {
+    const SOURCE: &str = concat!(
+        "import { Target, Variable } from './target.mjs';\n",
+        "var Holder = class {\n",
+        "  constructor() {\n",
+        "    this.target = new Target();\n",
+        "    this.variable = new Variable();\n",
+        "  }\n",
+        "};\n",
+        "export { Holder };\n",
+    );
+    const TARGET: &str = concat!(
+        "var Target = class { constructor() { this.name = 'target'; } };\n",
+        "var Variable = class {};\n",
+        "Variable = function () {};\n",
+        "export { Target, Variable };\n",
+    );
+    let analysis = analyze_javascript_module("module", "index.mjs", SOURCE, "target.mjs", TARGET);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid constructor references");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("checked constructor unit");
+    let module = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon";
+    let from = format!("{module}/Holder/constructor");
+    for (written, suffix, expected) in [
+        ("new Target()", "Target", true),
+        ("new Variable()", "Variable", false),
+    ] {
+        let target = format!("{module}%2Ftarget.mjs/{suffix}");
+        assert!(
+            found
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str() == target)
+        );
+        let start = SOURCE.find(written).expect("written construction");
+        assert_eq!(
+            found.edges.iter().any(|edge| {
+                edge.from.as_str() == from
+                    && edge.to.as_str() == target
+                    && edge.kinds == [EdgeKind::Calls]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == unit.unit && site.range == module_runtime_range(start, written)
+                    })
+            }),
+            expected,
+            "{written}"
+        );
+    }
+}
+
+const NAMED_ARGUMENT_PROPERTIES: &str = r#"
+import { consume } from "../index.mjs";
+export function choose() {
+  consume({ status: "ready" });
+  consume({ status: "completed" });
+  const first = consume({ status: "assigned first" });
+  const second = consume({ status: "assigned second" });
+  const options = { status: "stable" };
+  return [first, second, consume(options)];
+}
+export function defaults(first = consume({ hidden: 1 }), second = consume({ hidden: 2 })) {
+  return [first, second];
+}
+export function callbacks(run) {
+  run(() => consume({ hidden: 3 }));
+  run(() => consume({ hidden: 4 }));
+}
+"#;
+
+#[test]
+fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function consume(value) { return value.status; }",
+            ),
+            ("lib/choose.mjs", NAMED_ARGUMENT_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let held = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/choose.mjs")
+        .expect("non-entry unit");
+    let property = |value: &str| {
+        let written = format!("status: \"{value}\"");
+        let start = u64::try_from(
+            NAMED_ARGUMENT_PROPERTIES
+                .find(&written)
+                .expect("written key"),
+        )
+        .expect("source position");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == held.unit && row.range.start == start && row.source == written)
+            .expect("physical property");
+        assert!(!row.public);
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.name == "status"
+                && object.kind.0 == "property"
+        }));
+        row.symbol.as_str()
+    };
+    let first = property("ready");
+    let second = property("completed");
+    assert_ne!(first, second);
+    assert!(first.contains("/choose/status%23"));
+    assert!(second.contains("/choose/status%23"));
+    assert!(property("assigned first").ends_with("/choose/first/status"));
+    assert!(property("assigned second").ends_with("/choose/second/status"));
+    assert!(property("stable").ends_with("/choose/options/status"));
+    assert!(publication.declarations.iter().all(|row| {
+        row.unit != held.unit
+            || !row.source.starts_with("hidden:")
+            || !row.symbol.as_str().contains("%23")
+    }));
+    let calls = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/choose")
+                && edge.to.as_str().ends_with("/consume")
+                && edge.kinds.contains(&EdgeKind::Calls)
+        })
+        .map(|edge| {
+            let occurrence = edge.occurrence.as_ref().expect("authored invocation");
+            assert_eq!(occurrence.unit, held.unit);
+            offset_in(occurrence.range.start)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        calls,
+        [
+            "consume({ status: \"ready\" })",
+            "consume({ status: \"completed\" })",
+            "consume({ status: \"assigned first\" })",
+            "consume({ status: \"assigned second\" })",
+            "consume(options)",
+        ]
+        .into_iter()
+        .map(|call| NAMED_ARGUMENT_PROPERTIES
+            .find(call)
+            .expect("written invocation"))
+        .collect(),
+    );
+}
+
+#[test]
+fn non_entry_literal_contains_uses_only_the_capacity_left_by_existing_edges() {
+    const INPUT: &str = r#"
+import { inspect } from "../index.mjs";
+export function choose() {
+  inspect({ code: "first" });
+  inspect({ code: "second" });
+  const options = { code: "named" };
+  return inspect(options);
+}
+"#;
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owner");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let root = ProjectPath::new("index.mjs").expect("entry");
+    let non_entry = ProjectPath::new("lib/choose.mjs").expect("non-entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let files = [
+        PackageSource::new(
+            &root,
+            "export function inspect(value) { return value.code; }",
+        ),
+        PackageSource::new(&non_entry, INPUT),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+    )];
+    let publication = |edge_cap| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_edges(edge_cap)
+            .expect("bounded edges");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+            .expect("bounded archive facts")
+            .with_framework_context(&metadata, &[])
+            .expect("npm manifest");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("publication");
+        analysis.into_parts().0
+    };
+    let bounded = publication(8);
+    assert_prior_literal_edges(&bounded, INPUT);
+    let roomy = publication(64);
+    for prior in &bounded.edges {
+        assert!(roomy.edges.contains(prior));
+    }
+    let optional = roomy
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Contains] && edge.to.as_str().contains("/choose/code%23")
+        })
+        .map(|edge| {
+            offset_in(
+                edge.occurrence
+                    .as_ref()
+                    .expect("literal property")
+                    .range
+                    .start,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(optional, BTreeSet::from([80, 110]));
+}
+
+fn assert_prior_literal_edges(bounded: &PackagePublication, input: &str) {
+    let expected = [
+        (
+            EdgeKind::Contains,
+            "/choose",
+            "/choose/options",
+            "options",
+            137,
+        ),
+        (
+            EdgeKind::Reads,
+            "/choose",
+            "/choose/options",
+            "options",
+            183,
+        ),
+        (
+            EdgeKind::Calls,
+            "/choose",
+            "/inspect",
+            r#"inspect({ code: "first" })"#,
+            70,
+        ),
+        (
+            EdgeKind::Calls,
+            "/choose",
+            "/inspect",
+            r#"inspect({ code: "second" })"#,
+            100,
+        ),
+        (
+            EdgeKind::Calls,
+            "/choose",
+            "/inspect",
+            "inspect(options)",
+            175,
+        ),
+        (
+            EdgeKind::Imports,
+            "%2Fchoose.mjs",
+            "/inspect",
+            "inspect",
+            10,
+        ),
+    ];
+    assert_eq!(bounded.edges.len(), expected.len());
+    for (kind, from, to, text, start) in expected {
+        assert!(
+            bounded.edges.iter().any(|edge| {
+                edge.kinds == [kind]
+                    && edge.from.as_str().ends_with(from)
+                    && edge.to.as_str().ends_with(to)
+                    && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                        occurrence.unit.0.ends_with("/lib/choose.mjs")
+                            && offset_in(occurrence.range.start) == start
+                            && input.get(start..offset_in(occurrence.range.end)) == Some(text)
+                    })
+            }),
+            "{kind:?} {from} {to} {text}"
+        );
+    }
+}
+
+const SCOPED_INITIALIZER_PROPERTIES: &str = r#"
+import { inspect } from "../index.mjs";
+export function initialize(first) {
+  if (first) {
+    const record = { code: 11 };
+    return inspect(record.code);
+  }
+  const record = { code: 22 };
+  const named = { code: 44 };
+  inspect(named.code);
+  return inspect(record.code);
+}
+"#;
+
+#[test]
+fn package_keeps_initializer_properties_under_their_physical_lexical_bindings() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function inspect(value) { return value; }",
+            ),
+            ("lib/branches.mjs", SCOPED_INITIALIZER_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/branches.mjs")
+        .expect("non-entry unit")
+        .unit;
+    let declaration = |written: &str| {
+        let start = SCOPED_INITIALIZER_PROPERTIES
+            .find(written)
+            .expect("authored declaration");
+        publication
+            .declarations
+            .iter()
+            .find(|row| {
+                &row.unit == unit && offset_in(row.range.start) == start && row.source == written
+            })
+            .expect("retained declaration")
+    };
+    let owners = ["record = { code: 11 }", "record = { code: 22 }"].map(declaration);
+    let properties = ["code: 11", "code: 22"].map(declaration);
+    assert_ne!(owners[0].symbol, owners[1].symbol);
+    assert_ne!(properties[0].symbol, properties[1].symbol);
+    for (owner, property) in owners.into_iter().zip(properties) {
+        assert!(!owner.public && !property.public);
+        assert!(owner.symbol.as_str().contains("/initialize/record%23"));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&owner.symbol)
+                && object.name == "code"
+        }));
+    }
+    let unrelated = declaration("code: 44");
+    assert!(
+        unrelated
+            .symbol
+            .as_str()
+            .ends_with("/initialize/named/code")
+    );
+}
+
+#[test]
+fn npm_javascript_callbacks_keep_physical_parameters_and_reads() {
+    const SOURCE: &str = concat!(
+        "export function map(values) {\n",
+        "  const keep = (item) => item;\n",
+        "  return [\n",
+        "    values.map(function (item) { return keep(item); }),\n",
+        "    values.map(item => item),\n",
+        "  ];\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked callback source");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid callback publication");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("callback unit");
+    let mut identities = BTreeSet::new();
+    for (decl, decl_offset, read, read_offset, owner) in [
+        ("keep = (item)", 8, "=> item;", 3, "/map/keep"),
+        ("function (item)", 10, "keep(item)", 5, "/map"),
+        ("item => item)", 0, "item => item)", 8, "/map"),
+    ] {
+        let name_start = SOURCE.find(decl).expect("parameter declaration") + decl_offset;
+        let read_start = SOURCE.find(read).expect("parameter read") + read_offset;
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == unit.unit && row.range == module_runtime_range(name_start, "item")
+            })
+            .expect("physical callback parameter");
+        let identity = &declaration.symbol;
+        assert!(identities.insert(identity));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(identity)
+                && object.kinds.contains(&SymbolKind::Parameter)
+                && object.name == "item"
+        }));
+        assert!(
+            found.edges.iter().any(|edge| {
+                edge.from.as_str().ends_with(owner)
+                    && edge.to == *identity
+                    && edge.kinds == [EdgeKind::Reads]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == unit.unit
+                            && site.range == module_runtime_range(read_start, "item")
+                    })
+            }),
+            "{read}"
+        );
+    }
+}
+
+#[test]
+fn callback_parameters_preserve_earlier_package_declarations() {
+    const SOURCE: &str =
+        "export function map(values) { const keep = (item) => item; return keep(values); }";
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(4);
+    let roomy = collect(8);
+    assert_eq!(bounded.declarations.len(), 4);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.source == "values")
+    );
+    assert!(roomy.declarations.iter().any(|row| row.source == "item"));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    assert!(bounded.declarations.iter().all(|row| row.source != "item"));
+}
+
+#[test]
+fn npm_callback_parameter_keeps_a_same_named_module_export() {
+    let source = concat!(
+        "export function run(values) { return values.map(item => item); }\n",
+        "const item = 7;\n",
+        "export { item as stable };\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked alias beside a callback");
+    let found = analysis.publication();
+    assert!(
+        found.objects.iter().any(|object| {
+            object.name == "item" && object.kinds.contains(&SymbolKind::Parameter)
+        })
+    );
+    let module = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon";
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("module");
+    let export = "export { item as stable };";
+    let start = source.find(export).expect("written export");
+    assert!(found.edges.iter().any(|edge| {
+        edge.from.as_str() == format!("{module}/stable")
+            && edge.to.as_str() == format!("{module}/item")
+            && edge.kinds == [EdgeKind::Aliases]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == unit.unit && site.range == module_runtime_range(start, export)
+            })
+    }));
+}
+
+#[test]
+fn npm_typescript_overloads_retain_their_physical_parameters() {
+    const SOURCE: &str = concat!(
+        "export function convert(value: string): string;\n",
+        "export function convert(value: number): number;\n",
+        "export function convert(value: string | number) { return value; }\n",
+        "export interface Store {\n",
+        "  read(key: string): string;\n",
+        "  read(index: number): number;\n",
+        "}\n",
+        "export class Table {\n",
+        "  read(record: string): string;\n",
+        "  read(record: number): number;\n",
+        "  read(record: string | number) { return record; }\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.ts"}}}"#,
+        )),
+    )
+    .expect("checked overload source");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid overloaded declarations");
+    let mut identities = BTreeSet::new();
+    for written in [
+        "value: string)",
+        "value: number)",
+        "value: string | number)",
+        "key: string)",
+        "index: number)",
+        "record: string)",
+        "record: number)",
+        "record: string | number)",
+    ] {
+        let start = SOURCE.find(written).expect("parameter source");
+        let name = written.split(':').next().expect("parameter name");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit.as_str().ends_with("/index.ts")
+                    && offset_in(row.range.start) == start
+                    && SOURCE
+                        .get(start..offset_in(row.range.end))
+                        .is_some_and(|source| source.starts_with(name))
+            })
+            .expect("physical overload parameter");
+        assert!(identities.insert(&declaration.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&declaration.symbol)
+                && object.kinds.contains(&SymbolKind::Parameter)
+                && object.name == name
+        }));
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        if written.contains('|') {
+            let [read] = reads.as_slice() else {
+                panic!("implementation read of {name}")
+            };
+            let source = read.occurrence.as_ref().expect("authored reference");
+            let start = SOURCE
+                .find(&format!("return {name}"))
+                .expect("returned parameter")
+                + 7;
+            assert_eq!(source.unit, declaration.unit);
+            assert_eq!(source.range, module_runtime_range(start, name));
+        } else {
+            assert!(reads.is_empty(), "{written} has no implementation");
+        }
+    }
+}
+
+#[test]
+fn overload_parameters_preserve_regular_parameter_and_module_slots() {
+    const SOURCE: &str = concat!(
+        "export function choose(value: string): string;\n",
+        "export function choose(value: number): number;\n",
+        "export function choose(value: string | number) { return value; }\n",
+        "export function plain(ordinary: number) { return ordinary; }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::TypeScript.language();
+    let file = ProjectPath::new("index.ts").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.ts"}}}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(6);
+    let roomy = collect(10);
+    assert_eq!(bounded.declarations.len(), 6);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/plain/ordinary"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    assert_eq!(roomy.declarations.len() - bounded.declarations.len(), 3);
+}
+
+#[test]
+fn npm_javascript_methods_retain_their_value_parameters_and_reads() {
+    const SOURCE: &str = concat!(
+        "export const table = {\n",
+        "  read(key) { return key; },\n",
+        "};\n",
+        "export class Reader {\n",
+        "  read(key) { const reroute = (key) => key; return reroute(key); }\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked method source");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid package facts");
+    for (holder, declaration_start, reading, offset) in [
+        (
+            "table",
+            SOURCE.find("read(key)").expect("object method") + 5,
+            "return key",
+            7,
+        ),
+        (
+            "Reader",
+            SOURCE.rfind("read(key)").expect("class method") + 5,
+            "reroute(key);",
+            8,
+        ),
+    ] {
+        let suffix = format!("/{holder}/read/key");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(declaration_start, "key")
+            })
+            .expect("physical method parameter");
+        let owner = format!("/{holder}/read");
+        let read_start = SOURCE.find(reading).expect("authored use") + offset;
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of the {holder} method parameter")
+        };
+        assert!(read.from.as_str().ends_with(&owner));
+        let occurrence = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(occurrence.unit, declaration.unit);
+        assert_eq!(occurrence.range, module_runtime_range(read_start, "key"));
+    }
+}
+
+#[test]
+fn javascript_method_parameters_preserve_existing_parameter_slots() {
+    const SOURCE: &str = concat!(
+        "export const table = { read(key) { return key; } };\n",
+        "export function plain(initial) { const keep = (item) => item; return keep(initial); }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(7);
+    let roomy = collect(9);
+    assert_eq!(bounded.declarations.len(), 7);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/plain/initial"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/keep/item"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    let added = roomy
+        .declarations
+        .iter()
+        .filter(|row| !bounded.declarations.contains(row))
+        .collect::<Vec<_>>();
+    assert_eq!(added.len(), 1);
+    assert!(added[0].symbol.as_str().ends_with("/table/read/key"));
+}
+
+#[test]
+fn standalone_typescript_signatures_keep_their_written_value_parameters() {
+    const SOURCE: &str = concat!(
+        "export declare function display(value: string, radix?: number): string;\n",
+        "export function plain(input: string) { return input; }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::TypeScript.language();
+    let file = ProjectPath::new("index.ts").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.ts"}}}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(4);
+    let roomy = collect(8);
+    roomy
+        .validate_facts()
+        .expect("valid signature declarations");
+    assert_eq!(bounded.declarations.len(), 4);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/plain/input"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    assert_eq!(roomy.declarations.len() - bounded.declarations.len(), 2);
+    for name in ["value", "radix"] {
+        let suffix = format!("/display/{name}");
+        let declaration = roomy
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(&suffix))
+            .expect("authored signature parameter");
+        let start = SOURCE.find(name).expect("parameter declaration");
+        assert_eq!(declaration.range, module_runtime_range(start, name));
+        assert!(
+            !roomy
+                .edges
+                .iter()
+                .any(|edge| { edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads] })
+        );
+    }
+}
+
+#[test]
+fn javascript_scoped_function_parameters_use_their_established_owner() {
+    const SOURCE: &str = concat!(
+        "const values = [];\n",
+        "{ function visit(key) { return key; } values.push(visit(1)); }\n",
+        "{ function visit(key) { return key; } values.push(visit(2)); }\n",
+        "export { values };\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(4);
+    let found = collect(8);
+    assert_eq!(bounded.declarations.len(), 4);
+    assert_eq!(found.declarations.len() - bounded.declarations.len(), 2);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| found.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
+    found.validate_facts().expect("physical scoped parameters");
+    let names = SOURCE
+        .match_indices("visit(key)")
+        .map(|(start, _)| start + 6);
+    let reads = SOURCE
+        .match_indices("return key")
+        .map(|(start, _)| start + 7);
+    for ((declaration_start, read_start), owner) in names.zip(reads).zip(["visit", "visit%231"]) {
+        let suffix = format!("/{owner}/key");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(declaration_start, "key")
+            })
+            .expect("written scoped parameter");
+        let parameter_reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = parameter_reads.as_slice() else {
+            panic!("one read in {owner}")
+        };
+        assert!(read.from.as_str().ends_with(&format!("/{owner}")));
+        let site = read.occurrence.as_ref().expect("written read");
+        assert_eq!(site.unit, declaration.unit);
+        assert_eq!(site.range, module_runtime_range(read_start, "key"));
+    }
+}
+
+#[test]
+fn non_entry_javascript_lexical_bindings_keep_their_physical_scope() {
+    const SOURCE: &str = concat!(
+        "export function choose(flag) {\n",
+        "  if (flag) { const result = 1; return result; }\n",
+        "  { const result = 2; return result; }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid physical declarations and reads");
+    let held = analysis
+        .files()
+        .iter()
+        .find(|file| file.file().path().as_str() == "reader.mjs")
+        .expect("retained module");
+    assert!(held.placement().logical_identity("choose.result").is_none());
+    let unit = &found
+        .units
+        .iter()
+        .find(|row| row.path.0 == "reader.mjs")
+        .expect("physical unit")
+        .unit;
+    let bindings = ["result = 1", "result = 2"].map(|spelling| {
+        let start = SOURCE.find(spelling).expect("variable declaration");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                &row.unit == unit
+                    && row.range == module_runtime_range(start, spelling)
+                    && row.source == spelling
+            })
+            .expect("physical lexical declaration");
+        assert!(!declaration.public);
+        let read_start = SOURCE[start..]
+            .find("return result")
+            .expect("authored read")
+            + start
+            + 7;
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read for {spelling}");
+        };
+        let site = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(site.unit, declaration.unit);
+        assert_eq!(site.range, module_runtime_range(read_start, "result"));
+        declaration.symbol.clone()
+    });
+    assert_ne!(bindings[0], bindings[1]);
+
+    let primary = found
+        .edges
+        .iter()
+        .filter(|edge| !bindings.contains(&edge.to))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!primary.is_empty());
+    // A module-level name cannot be treated as a second private lexical scope.
+    let module_scope = concat!(
+        "const external = 8;\n",
+        "run(() => { const external = 1; return external; });\n",
+    );
+    let without_override = non_entry_lexical_binding_analysis(module_scope, 64);
+    let rows = &without_override.publication().declarations;
+    assert!(rows.iter().all(|row| row.source != "external = 1"));
+
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    let bounded = bounded.publication();
+    assert!(bounded.edges.iter().all(|edge| primary.contains(edge)));
+    assert_eq!(bounded.declarations, found.declarations);
+}
+
+fn non_entry_lexical_binding_analysis(source: &str, edge_cap: usize) -> PackageAnalysis {
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let entry = ProjectPath::new("index.mjs").expect("entry");
+    let reader = ProjectPath::new("reader.mjs").expect("non-entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let files = [
+        PackageSource::new(&entry, "export const ready = true;"),
+        PackageSource::new(&reader, source),
+    ];
+    let context = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let limits = ExactPackageLimits::new(3, 4096)
+        .with_edges(edge_cap)
+        .expect("edge cap");
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+        .expect("checked source files")
+        .with_framework_context(&context, &[])
+        .expect("npm manifest");
+    PackageAnalyzer::analyze(input, 1).expect("validated publication")
+}
+
+#[test]
+fn typescript_structured_declarations_own_their_written_type_parameters() {
+    const SOURCE: &str = concat!(
+        "export interface Reader<Value> { get(): Value; }\n",
+        "export type Identity<Value> = (value: Value) => Value;\n",
+        "export class Box<Value> { read(value: Value): Value { return value; } }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked generic declarations");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid authored type bindings");
+    for (owner, expected) in [("Reader", 1), ("Identity", 2), ("Box", 2)] {
+        let suffix = format!("/{owner}/Value");
+        let start = SOURCE
+            .find(&format!("{owner}<Value>"))
+            .expect("generic owner")
+            + owner.len()
+            + 1;
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, "Value")
+                    && row.source == "Value"
+            })
+            .expect("written type parameter");
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&declaration.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::TypeParameter)
+        }));
+        let end = SOURCE[start..].find('\n').expect("generic declaration end") + start;
+        let ranges = SOURCE[start + 5..end]
+            .match_indices("Value")
+            .map(|(offset, _)| {
+                let range = module_runtime_range(start + 5 + offset, "Value");
+                (range.start, range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ranges.len(), expected);
+        let uses = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::HasType])
+            .map(|edge| {
+                let site = edge.occurrence.as_ref().expect("written type use");
+                assert_eq!(site.unit, declaration.unit);
+                (site.range.start, site.range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(uses, ranges);
+    }
+}
+
+#[test]
+fn javascript_shorthand_property_preserves_both_the_key_and_parameter() {
+    const SOURCE: &str = concat!(
+        "export function choose(value) { return { value }; }\n",
+        "export function control(input) { return { output: input }; }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("validated source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("validated publication")
+            .into_parts()
+            .0
+    };
+    let found = collect(10);
+    found
+        .validate_facts()
+        .expect("valid property and parameter declarations");
+    let written = SOURCE.find("choose(value)").expect("signature") + "choose(".len();
+    let shorthand = SOURCE.find("{ value }").expect("property") + "{ ".len();
+    let property = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.symbol.as_str().ends_with("/choose/value")
+                && row.range == module_runtime_range(shorthand, "value")
+        })
+        .expect("existing shorthand property identity");
+    let parameter = found
+        .declarations
+        .iter()
+        .find(|row| row.range == module_runtime_range(written, "value") && row.source == "value")
+        .expect("authored value parameter");
+    assert_ne!(parameter.symbol, property.symbol);
+    assert_eq!(parameter.unit, property.unit);
+    assert!(found.objects.iter().any(|row| {
+        row.id.as_ref() == Some(&parameter.symbol)
+            && row
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Parameter)
+    }));
+    let reads = found
+        .edges
+        .iter()
+        .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+        .collect::<Vec<_>>();
+    let [read] = reads.as_slice() else {
+        panic!("one authored shorthand Read");
+    };
+    assert_eq!(
+        read.occurrence.as_ref().expect("physical Read").range,
+        property.range
+    );
+    let bounded = collect(6);
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/control/input"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol == property.symbol)
+    );
+    assert!(
+        !bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol == parameter.symbol)
+    );
+    assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
+}
+
+#[test]
+fn typescript_callable_type_signatures_keep_distinct_parameter_ranges() {
+    const SOURCE: &str = concat!(
+        "export type Reader = (value: string) => number;\n",
+        "export interface Service { (value: string): Reader; new (value: number): Service; }\n",
+        "export function run(initial: string) { return initial; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked callable type scopes");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical callable type parameters");
+    let mut identities = BTreeSet::new();
+    for (position, _) in SOURCE.match_indices("value:") {
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.range == module_runtime_range(position, "value") && row.source == "value"
+            })
+            .expect("written callable type parameter");
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&declaration.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::Parameter)
+        }));
+        assert!(identities.insert(&declaration.symbol));
+        assert!(
+            !found
+                .edges
+                .iter()
+                .any(|edge| { edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads] })
+        );
+    }
+    assert_eq!(identities.len(), 3);
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/run/initial") && edge.kinds == [EdgeKind::Reads]
+    }));
+}
+
+#[test]
+fn typescript_index_signature_parameters_keep_separate_non_runtime_scopes() {
+    const SOURCE: &str = concat!(
+        "export interface Inventory { readonly [key: string]: number; [key: number]: number; }\n",
+        "export type Table = { readonly [name: string]: Inventory };\n",
+        "export function read(key: string) { return key; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked signature scopes");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical index signature parameters");
+    let mut identities = BTreeSet::new();
+    for (signature, name, owner) in [
+        ("[key: string]", "key", "Inventory"),
+        ("[key: number]", "key", "Inventory"),
+        ("[name: string]", "name", "Table"),
+    ] {
+        let position = SOURCE.find(signature).expect("written signature") + 1;
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| row.range == module_runtime_range(position, name) && row.source == name)
+            .expect("written index signature parameter");
+        assert!(parameter.symbol.as_str().contains(&format!("/{owner}/")));
+        assert!(identities.insert(&parameter.symbol));
+        assert!(
+            !found
+                .edges
+                .iter()
+                .any(|edge| { edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads] })
+        );
+    }
+    assert_eq!(identities.len(), 3);
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/read/key") && edge.kinds == [EdgeKind::Reads]
+    }));
+}
+
+#[test]
+fn javascript_defaulted_and_rest_parameters_use_their_written_body_scope() {
+    const SOURCE: &str = concat!(
+        "const seed = 1;\n",
+        "export function withDefault(value = seed) { return value; }\n",
+        "export function withRest(...items) { return items; }\n",
+        "export function control(input) { return input; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked wrapped parameters");
+    let found = analysis.publication();
+    found.validate_facts().expect("physical parameter bindings");
+    for (owner, name, header) in [
+        ("withDefault", "value", "value = seed"),
+        ("withRest", "items", "items)"),
+        ("control", "input", "input)"),
+    ] {
+        let suffix = format!("/{owner}/{name}");
+        let start = SOURCE.find(header).expect("physical parameter");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, name)
+                    && row.source == name
+            })
+            .expect("written parameter");
+        let reading = format!("return {name}");
+        let at = SOURCE.find(&reading).expect("body reference") + "return ".len();
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read for {owner}");
+        };
+        assert!(read.from.as_str().ends_with(&format!("/{owner}")));
+        let written = read.occurrence.as_ref().expect("physical parameter read");
+        assert_eq!(written.range, module_runtime_range(at, name));
+        assert_eq!(written.unit, parameter.unit);
+    }
+    let seed = SOURCE.find("= seed").expect("written initializer") + "= ".len();
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/seed")
+            && edge.kinds == [EdgeKind::Reads]
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.range == module_runtime_range(seed, "seed"))
+    }));
+}
+
+#[test]
+fn javascript_object_and_array_parameters_keep_their_written_lexical_bindings() {
+    const SOURCE: &str = concat!(
+        "const key = 1;\n",
+        "export function select({ key }, [{ label: item }]) { return [key, item]; }\n",
+        "export function outside() { return key; }\n",
+        "export function ordinary(input) { return input; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked destructured parameters");
+    let found = analysis.publication();
+    found.validate_facts().expect("physical parameter facts");
+    for (name, header, marker) in [
+        ("key", "{ key }", "[key, item]"),
+        ("item", "item }", "item];"),
+    ] {
+        let start = SOURCE.find(header).expect("written binding") + usize::from(name == "key") * 2;
+        let suffix = format!("/select/{name}");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, name)
+                    && row.source == name
+            })
+            .expect("authored pattern binding");
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&parameter.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::Parameter)
+        }));
+        let read_start = SOURCE.find(marker).expect("written read") + usize::from(name == "key");
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of {name}");
+        };
+        assert!(read.from.as_str().ends_with("/select"));
+        let written = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(written.unit, parameter.unit);
+        assert_eq!(written.range, module_runtime_range(read_start, name));
+    }
+    assert!(found.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/outside")
+            && edge.to.as_str().ends_with("/beacon/key")
+            && edge.kinds == [EdgeKind::Reads]
+    }));
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/ordinary/input") && edge.kinds == [EdgeKind::Reads]
+    }));
+}
+
+#[test]
+fn non_entry_typescript_union_properties_keep_their_written_branches() {
+    const SOURCE: &str = concat!(
+        "export type Result = { kind: 'ready'; value: number } | { kind: 'waiting'; value: string };\n",
+        "export function read(result: Result) { return result.kind; }\n",
+    );
+    let analyze = |entry| {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","types":"./{entry}"}}"#);
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.ts", "export const ready = true;"),
+                ("result.ts", SOURCE),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked union sources")
+    };
+    let non_entry = analyze("index.ts");
+    let entry = analyze("result.ts");
+    let found = non_entry.publication();
+    found.validate_facts().expect("physical union members");
+    let entry_facts = entry.publication();
+    let branch = |publication: &PackagePublication, property: &str| {
+        let start = SOURCE.find(property).expect("written property");
+        publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.range == module_runtime_range(start, property) && row.source == property
+            })
+            .expect("physical union branch property")
+            .symbol
+            .clone()
+    };
+    for pair in [
+        ["kind: 'ready'", "kind: 'waiting'"],
+        ["value: number", "value: string"],
+    ] {
+        let separate = pair.map(|property| branch(found, property));
+        assert_ne!(separate[0], separate[1]);
+        assert_eq!(branch(entry_facts, pair[0]), branch(entry_facts, pair[1]));
+        assert!(
+            found
+                .edges
+                .iter()
+                .all(|edge| !separate.contains(&edge.to) || edge.kinds != [EdgeKind::Reads])
+        );
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/Result"))
+    );
+}
+
+#[test]
+fn typescript_method_type_parameters_keep_their_own_annotation_targets() {
+    const SOURCE: &str = concat!(
+        "export interface Reader { read<Value>(value: Value): Value; }\n",
+        "export class Box { read<Value>(value: Value): Value { return value; } }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked methods");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical method type parameters");
+    for owner in ["Reader", "Box"] {
+        let holder = SOURCE.find(owner).expect("written owner");
+        let method = SOURCE[holder..]
+            .find("read<Value>")
+            .expect("written method")
+            + holder;
+        let start = method + "read<".len();
+        let suffix = format!("/{owner}/read/Value");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, "Value")
+                    && row.source == "Value"
+            })
+            .expect("physical method type parameter");
+        let signature = "read<Value>(value: Value): Value";
+        let expected = signature
+            .match_indices("Value")
+            .skip(1)
+            .map(|(offset, _)| {
+                let range = module_runtime_range(method + offset, "Value");
+                (range.start, range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        let actual = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::HasType])
+            .map(|edge| {
+                let occurrence = edge.occurrence.as_ref().expect("physical type use");
+                assert_eq!(occurrence.unit, parameter.unit);
+                (occurrence.range.start, occurrence.range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/Box/read/value") && edge.kinds == [EdgeKind::Reads]
+    }));
+}
+
+#[test]
+fn non_entry_typescript_union_properties_keep_scopes_across_written_alternatives() {
+    const SOURCE: &str = concat!(
+        "export type Result =\n",
+        "  | { tag: 'first'; value: number }\n",
+        "  | { tag: 'waiting'; message: string }\n",
+        "  | { tag: 'last'; value: string };\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.ts", "export const ready = true;"),
+            ("result.ts", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked alias");
+    let found = analysis.publication();
+    found.validate_facts().expect("physical union members");
+    for properties in [
+        &["tag: 'first'", "tag: 'waiting'", "tag: 'last'"][..],
+        &["value: number", "value: string"][..],
+    ] {
+        let mut identities = BTreeSet::new();
+        for property in properties {
+            let start = SOURCE.find(property).expect("written branch property");
+            let declared = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.range == module_runtime_range(start, property) && row.source == *property
+                })
+                .expect("physical branch declaration");
+            assert!(identities.insert(&declared.symbol));
+        }
+    }
+}
+
+#[test]
+fn typescript_named_function_type_parameters_link_only_their_own_types() {
+    const SOURCE: &str = concat!(
+        "export function choose<Value>(parameter: Value): Value { return parameter; }\n",
+        "export function echo<Value>(parameter: Value): Value { return parameter; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked generic functions");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical function type parameters");
+    for owner in ["choose", "echo"] {
+        let signature = format!("{owner}<Value>(parameter: Value): Value");
+        let method = SOURCE.find(&signature).expect("written function");
+        let start = method + owner.len() + 1;
+        let suffix = format!("/{owner}/Value");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, "Value")
+                    && row.source == "Value"
+            })
+            .expect("physical function type parameter");
+        let expected = signature
+            .match_indices("Value")
+            .skip(1)
+            .map(|(offset, _)| {
+                let range = module_runtime_range(method + offset, "Value");
+                (range.start, range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        let actual = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::HasType])
+            .map(|edge| {
+                let occurrence = edge.occurrence.as_ref().expect("physical type use");
+                assert_eq!(occurrence.unit, parameter.unit);
+                (occurrence.range.start, occurrence.range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn non_entry_javascript_patterns_keep_their_written_lexical_bindings() {
+    const SOURCE: &str = concat!(
+        "export function choose(flag, source) {\n",
+        "  if (flag) { const { value } = source; return value; }\n",
+        "  { const [value] = source; return value; }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical local pattern facts");
+    let bindings =
+        [("{ value }", 2), ("[value]", 1)].map(|(header, offset)| {
+            let position = SOURCE.find(header).expect("written pattern") + offset;
+            let binding = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.range == module_runtime_range(position, "value") && row.source == "value"
+                })
+                .expect("written local pattern binding");
+            assert!(!binding.public);
+            assert!(found.objects.iter().any(|row| {
+                row.id.as_ref() == Some(&binding.symbol) && row.kind.0 == "variable"
+            }));
+            let read_position = SOURCE[position..]
+                .find("return value")
+                .expect("written read")
+                + position
+                + "return ".len();
+            let reads = found
+                .edges
+                .iter()
+                .filter(|edge| edge.to == binding.symbol && edge.kinds == [EdgeKind::Reads])
+                .collect::<Vec<_>>();
+            let [read] = reads.as_slice() else {
+                panic!("one read for each locally bound name");
+            };
+            let occurrence = read.occurrence.as_ref().expect("physical read");
+            assert_eq!(occurrence.unit, binding.unit);
+            assert_eq!(
+                occurrence.range,
+                module_runtime_range(read_position, "value")
+            );
+            binding.symbol.clone()
+        });
+    assert_ne!(bindings[0], bindings[1]);
+}
+
+#[test]
+fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
+    const SOURCE: &str = concat!(
+        "const receiver = { read(options) { return options.status; } };\n",
+        "export function choose() {\n",
+        "  receiver.read({ status: 'first' });\n",
+        "  receiver.read({ status: 'second' });\n",
+        "  const named = { status: 'stable' };\n",
+        "  return receiver.read(named);\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical argument properties");
+    let mut identities = BTreeSet::new();
+    for property in ["status: 'first'", "status: 'second'", "status: 'stable'"] {
+        let start = SOURCE.find(property).expect("written key");
+        let declared = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.range == module_runtime_range(start, property) && row.source == property
+            })
+            .expect("physical member argument property");
+        assert!(identities.insert(&declared.symbol));
+        if property == "status: 'stable'" {
+            assert!(declared.symbol.as_str().ends_with("/choose/named/status"));
+        }
+    }
+    let calls = found
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/choose")
+                && edge.to.as_str().ends_with("/receiver/read")
+                && edge.kinds == [EdgeKind::Calls]
+        })
+        .map(|edge| edge.occurrence.as_ref().expect("written call").range.start)
+        .collect::<BTreeSet<_>>();
+    let written = SOURCE
+        .match_indices("receiver.read(")
+        .map(|(start, _)| u64::try_from(start).expect("physical call position"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(calls, written);
+}
+
+#[test]
+fn javascript_file_modules_keep_local_names_without_an_established_method() {
+    const SOURCE: &str = concat!(
+        "export const codec = flag\n",
+        "  ? { decode(text) { const result = text; return result; } }\n",
+        "  : { decode(text) { const result = String(text); return result; } };\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found.validate_facts().expect("physical private bindings");
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/codec"))
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.symbol.as_str().ends_with("/codec/decode"))
+    );
+    let mut names = BTreeSet::new();
+    for written in ["result = text", "result = String(text)"] {
+        let start = SOURCE.find(written).expect("written binding");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical local under a checked file module");
+        assert!(!row.public);
+        let identity = rift_protocol::identity::SymbolIdentity::parse(row.symbol.as_str())
+            .expect("checked identity");
+        assert_eq!(
+            identity.qualified_path().first().map(String::as_str),
+            Some("beacon/reader.mjs")
+        );
+        assert!(
+            identity
+                .qualified_path()
+                .get(1)
+                .is_some_and(|scope| scope.starts_with("$scope#"))
+        );
+        assert_eq!(
+            identity.qualified_path().last().map(String::as_str),
+            Some("result")
+        );
+        assert!(names.insert(row.symbol.clone()));
+        let position = SOURCE[start..].find("return result").expect("written read") + start + 7;
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == row.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of the written variable");
+        };
+        let site = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(site.unit, row.unit);
+        assert_eq!(site.range, module_runtime_range(position, "result"));
+    }
+    assert_eq!(names.len(), 2);
+    let repeated = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let repeated_names = repeated
+        .publication()
+        .declarations
+        .iter()
+        .filter(|row| row.source.starts_with("result = "))
+        .map(|row| row.symbol.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(repeated_names, names);
+}
+
+#[test]
+fn typescript_typed_patterns_keep_bindings_apart_from_the_written_type() {
+    const SOURCE: &str = "export function pick({ key: label }: { key: string }, [item]: [number]) { return [label, item]; }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked typed bindings");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical typed binding facts");
+    let property = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/pick/key") && row.source == "key: string")
+        .expect("existing annotation declaration");
+    for name in ["label", "item"] {
+        let start = SOURCE.find(name).expect("written pattern token");
+        let suffix = format!("/pick/{name}");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, name)
+                    && row.source == name
+            })
+            .expect("written typed parameter binding");
+        assert_ne!(parameter.symbol, property.symbol);
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&parameter.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::Parameter)
+        }));
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of {name}");
+        };
+        assert!(read.from.as_str().ends_with("/pick"));
+        let written = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(written.unit, parameter.unit);
+        assert_eq!(
+            written.range,
+            module_runtime_range(SOURCE.rfind(name).expect("body reference"), name)
+        );
+    }
 }

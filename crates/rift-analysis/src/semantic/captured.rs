@@ -146,7 +146,7 @@ impl PreparedProjectSemantics<'_> {
         } else {
             Vec::new()
         };
-        let static_inputs = resolve_static.then_some((sources.as_slice(), &self.input));
+        let static_inputs = resolve_static.then_some((sources.as_slice(), &[][..], &self.input));
         let mut built =
             self.prepared
                 .build_with_external(edges_max, previous, None, static_inputs)?;
@@ -290,6 +290,9 @@ impl WorkspaceSemantics {
                 .placement
                 .clone()
                 .with_identity_anchors(namespace.anchors.remove(path).unwrap_or_default())
+                .with_scoped_identity_anchors(
+                    namespace.scoped_anchors.remove(path).unwrap_or_default(),
+                )
                 .with_module(namespace.rust_modules.remove(path))
                 .with_logical_declarations(namespace.mappings.remove(path).unwrap_or_default())
                 .with_aliases(aliases.remove(path).unwrap_or_default());

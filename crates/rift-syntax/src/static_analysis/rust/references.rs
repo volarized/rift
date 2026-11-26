@@ -17,6 +17,27 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let element = visited.syntax_element();
         let id = element.kind_id();
+        if element.kind() == "crate"
+            && let Some(parent) = visited.parent().map(Visited::syntax_element)
+        {
+            if parent.kind() == "visibility_modifier" {
+                facts.rust_crate_visibility.push(byte_range(element)?);
+            } else if parent.child_by_field_id(self.path) == Some(element)
+                || parent.kind() == "use_wildcard"
+            {
+                facts.rust_crate_paths.push(byte_range(element)?);
+            }
+        }
+        if element.kind() == "super"
+            && let Some(parent) = visited.parent().map(Visited::syntax_element)
+            && (parent.kind() == "visibility_modifier"
+                || parent.child_by_field_id(self.path) == Some(element))
+            && enclosing(visited, &[self.use_declaration]).is_none()
+        {
+            facts
+                .rust_parent_module_references
+                .push(byte_range(element)?);
+        }
         let constructor = id == self.local_value_struct
             && element
                 .child_by_field_id(self.body)
@@ -113,6 +134,8 @@ impl Kinds {
                 range: byte_range(element)?,
                 pattern: terminal_pattern,
             });
+        } else if parent.kind() == "arguments" && element.kind_id() != self.scoped_type_identifier {
+            facts.rust_argument_value_reads.push(byte_range(element)?);
         }
         Ok(())
     }

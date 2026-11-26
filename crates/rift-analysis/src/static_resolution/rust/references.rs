@@ -1,18 +1,23 @@
 //! Rust containment, field accesses, overrides, and type uses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::ReferenceRole;
+use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::read::{EdgeKind, SymbolKind};
-use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, StaticBindingKind, StaticCall, StaticCallee, StaticRustUse, SyntaxSymbol,
+};
 
 use super::receivers::split_references;
 use super::{
     Namespace, Namespaces, RECEIVER_DEPTH_MAX, inherent_member, is_type_binding, is_value_binding,
     path_segments,
 };
+use crate::NamespaceInput;
+use crate::analyzer::namespace::RustConfigurations;
 use crate::static_resolution::{
-    Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
+    Binding, File, Index, StaticOccurrence, StaticResolution, StaticSource, Target, Work,
+    admitted_facts,
 };
 
 pub(super) enum ReceiverOwner<'source> {
@@ -20,16 +25,147 @@ pub(super) enum ReceiverOwner<'source> {
     TypePath(ByteRange),
 }
 
+#[derive(Default)]
+struct ImportQualifierSites {
+    seen: BTreeSet<ByteRange>,
+    sources: BTreeMap<ByteRange, Option<SymbolId>>,
+}
+
 impl<'source> Index<'source> {
+    /// Resolves authored calls and type names with each shared source's written module owner.
+    pub(in crate::static_resolution) fn resolve_rust_shared_sources(
+        &self,
+        shared: &'source [StaticSource<'source>],
+        namespace: &NamespaceInput<'_>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        if shared.is_empty() {
+            return;
+        }
+        let configurations = RustConfigurations::new(namespace);
+        let start = resolution.occurrences.len();
+        let admitted = |target| {
+            Self::admitted_binding(
+                self.graph,
+                Some((&self.provider, self.syntax_publication)),
+                target,
+            )
+        };
+        for document in shared {
+            if !work.charge() {
+                break;
+            }
+            let Some(facts) = admitted_facts(document) else {
+                continue;
+            };
+            let configuration = configurations.file(document.path.as_str());
+            let Some(file) = File::new(document, facts, Some(&configuration), &admitted, work)
+            else {
+                break;
+            };
+            self.rust_shared_references(&file, work, resolution);
+        }
+        resolution.rust_shared_start = (resolution.occurrences.len() != start).then_some(start);
+    }
+
+    fn rust_shared_references(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        for call in file.facts.calls() {
+            if !work.charge() {
+                return;
+            }
+            if matches!(call.callee, StaticCallee::Direct | StaticCallee::Qualified)
+                && let Some(mut occurrence) = self.call_occurrence(file, call, work)
+                && self.rust_shared_owner(file, call.range, &mut occurrence)
+            {
+                resolution.record(Some(occurrence));
+            }
+        }
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return;
+            }
+            let range = reference.target;
+            if reference.role == ReferenceRole::Type
+                && let Some(target) = self.rust.edge_type_target(file, range, work)
+                && let Some(mut occurrence) =
+                    self.occurrence(file, range, range, ReferenceRole::Type, target)
+                && self.rust_shared_owner(file, range, &mut occurrence)
+            {
+                resolution.record(Some(occurrence));
+            }
+        }
+    }
+
+    fn rust_shared_owner(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        occurrence: &mut StaticOccurrence,
+    ) -> bool {
+        let Some(owner) = file
+            .enclosing_callable(range)
+            .filter(|owner| owner.symbol.kind == "function" && owner.symbol.container.is_none())
+        else {
+            return false;
+        };
+        let Some(source) = self.occurrence(file, range, range, occurrence.role, owner) else {
+            return false;
+        };
+        let rift_provider::NormalizedTarget::Symbol(owner) = source.target else {
+            return false;
+        };
+        if !matches!(
+            occurrence.target,
+            rift_provider::NormalizedTarget::Symbol(_)
+        ) {
+            return false;
+        }
+        occurrence.edge_from = Some(owner);
+        true
+    }
+
+    /// Adds checked Rust shorthand uses after the other Rust occurrence classes.
+    pub(in crate::static_resolution) fn resolve_rust_shorthand(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values().filter(|file| file.rust_shorthand) {
+            if work.exhausted {
+                break;
+            }
+            self.rust_local_bindings(file, true, work, result);
+        }
+        if result.occurrences.len() != start {
+            result.rust_shorthand_start = Some(start);
+        }
+    }
+
     /// Adds authored Rust local definitions and reads on the work left by other references.
     pub(in crate::static_resolution) fn rust_local_bindings(
         &self,
         file: &File<'source>,
+        shorthand: bool,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
         let mut locals = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
+            if symbol.is_rust_shorthand_binding() != shorthand
+                || symbol.is_rust_receiver_binding()
+                || symbol.is_rust_generic_parameter()
+                || symbol.is_rust_library_root()
+                || symbol.is_rust_explicit_local_binding()
+            {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -63,7 +199,11 @@ impl<'source> Index<'source> {
         if locals.is_empty() {
             return;
         }
-        for reference in &file.facts.references()[file.primary_reference_count..] {
+        let references = &file.facts.references()[file.primary_reference_count..];
+        for reference in references
+            .iter()
+            .take_while(|reference| file.text(reference.target) != Some("self"))
+        {
             if !work.charge() {
                 return;
             }
@@ -91,6 +231,349 @@ impl<'source> Index<'source> {
             {
                 result.record(Some(occurrence));
             }
+        }
+    }
+
+    /// Adds receiver occurrences after the earlier declaration and reference classes.
+    pub(in crate::static_resolution) fn resolve_rust_receivers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            if work.exhausted {
+                break;
+            }
+            if !file.rust_receivers.is_empty() {
+                self.rust_receivers(file, work, result);
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_receiver_start = Some(start);
+        }
+    }
+
+    fn rust_receivers(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
+        let mut receivers = BTreeMap::new();
+        for &symbol in &file.rust_receivers {
+            if !work.charge() {
+                return;
+            }
+            let Some((name, method)) = symbol.name_range.zip(file.parent_callable(symbol)) else {
+                continue;
+            };
+            let target = Target {
+                file: file.document,
+                symbol,
+            };
+            if let Some(edge) = self.rust_edge(file, name, EdgeKind::Contains, method, target) {
+                result.record(Some(edge));
+                receivers.insert(method.symbol.item_range, target);
+            }
+        }
+        let references = &file.facts.references()[file.primary_reference_count..];
+        for reference in references
+            .iter()
+            .rev()
+            .take_while(|reference| file.text(reference.target) == Some("self"))
+        {
+            if !work.charge() {
+                return;
+            }
+            let read = reference.target;
+            let Some(method) = file.enclosing_callable(read) else {
+                continue;
+            };
+            let Some(&target) = receivers.get(&method.symbol.item_range) else {
+                continue;
+            };
+            if !method
+                .symbol
+                .body_range
+                .is_some_and(|body| body.encloses(read))
+                || file.conditional(read, work)
+            {
+                continue;
+            }
+            if let Some(occurrence) = self.occurrence(file, read, read, ReferenceRole::Read, target)
+            {
+                result.record(Some(occurrence));
+            }
+        }
+    }
+
+    /// Adds direct type annotation uses after the earlier occurrence classes.
+    pub(in crate::static_resolution) fn resolve_rust_generics(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            if file.rust_generics.is_empty() {
+                continue;
+            }
+            for reference in file.facts.rust_generic_references() {
+                if !work.charge() {
+                    break;
+                }
+                let Some(&symbol) = file.rust_generics.get(&reference.binding) else {
+                    continue;
+                };
+                if file.text(reference.range) != Some(symbol.name.as_str())
+                    || file.conditional(reference.range, work)
+                {
+                    continue;
+                }
+                let target = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if let Some(occurrence) = self.occurrence(
+                    file,
+                    reference.range,
+                    reference.range,
+                    reference.role,
+                    target,
+                ) {
+                    result.record(Some(occurrence));
+                }
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_generic_start = Some(start);
+        }
+    }
+
+    /// Retains containment from the selected Cargo file to its authored items.
+    pub(in crate::static_resolution) fn resolve_rust_library_root(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            let Some(root) = file.rust_library_root else {
+                continue;
+            };
+            let from = Target {
+                file: file.document,
+                symbol: root,
+            };
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    break;
+                }
+                if symbol.container.is_some()
+                    || symbol.is_package_binding()
+                    || symbol.kind == "impl_item"
+                {
+                    continue;
+                }
+                let Some(name) = symbol.name_range else {
+                    continue;
+                };
+                let to = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if let Some(edge) = self.rust_edge(file, name, EdgeKind::Contains, from, to) {
+                    result.record(Some(edge));
+                }
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_library_root_start = Some(start);
+        }
+    }
+
+    /// Resolves written crate tokens to the selected library declaration.
+    pub(in crate::static_resolution) fn resolve_rust_crate_references(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+        select: impl Fn(&rift_syntax::StaticFacts) -> &[ByteRange],
+    ) -> Option<usize> {
+        let root = self.rust_library_root_target()?;
+        let crate_name = root.file.placement.module_path().first()?;
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            if file.document.placement.module().is_none() {
+                continue;
+            }
+            for &range in select(file.facts) {
+                if !work.charge() {
+                    break;
+                }
+                if file.text(range) != Some("crate")
+                    || file.conditional(range, work)
+                    || file.blocked(range.start, work)
+                    || self
+                        .rust
+                        .module(file, range.start, work)
+                        .and_then(|module| module.first())
+                        != Some(crate_name)
+                {
+                    continue;
+                }
+                if let Some(occurrence) =
+                    self.occurrence(file, range, range, ReferenceRole::Read, root)
+                {
+                    result.record(Some(occurrence));
+                }
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        (result.occurrences.len() != start).then_some(start)
+    }
+
+    fn rust_library_root_target(&self) -> Option<Target<'source>> {
+        self.files.values().find_map(|file| {
+            Some(Target {
+                file: file.document,
+                symbol: file.rust_library_root?,
+            })
+        })
+    }
+
+    /// Reads the parent module named by each checked, written relative qualifier.
+    pub(in crate::static_resolution) fn resolve_rust_parent_modules(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let root = self.rust_library_root_target();
+        let start = result.occurrences.len();
+        'files: for file in self.files.values() {
+            for &range in file.facts.rust_parent_module_references() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if result
+                    .rust_call_parent_sites
+                    .get(file.document.placement.unit())
+                    .is_some_and(|sites| sites.contains(&range))
+                    || file.text(range) != Some("super")
+                    || file.conditional(range, work)
+                    || file.blocked(range.start, work)
+                {
+                    continue;
+                }
+                let Some(path) = self.rust.absolute_path(file, range.start, &["super"], work)
+                else {
+                    continue;
+                };
+                let target = root
+                    .filter(|target| target.file.placement.module_path() == path)
+                    .or_else(|| {
+                        self.rust
+                            .lookup(file, range.start, &path, Namespace::Type, work)
+                            .filter(|target| {
+                                target.symbol.kind == "module"
+                                    && target.admitted_path().as_deref() == Some(path.as_slice())
+                            })
+                    });
+                if let Some(target) = target {
+                    result.record(self.occurrence(file, range, range, ReferenceRole::Read, target));
+                }
+            }
+        }
+        result.rust_parent_module_start = (result.occurrences.len() != start).then_some(start);
+    }
+
+    /// Reads the established qualifiers of authored Rust imports after prior references.
+    pub(in crate::static_resolution) fn resolve_rust_import_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let root = self.rust_library_root_target();
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            let mut sites = ImportQualifierSites::default();
+            for imported in file.facts.rust_uses() {
+                if !work.charge() {
+                    break;
+                }
+                if file.conditional(imported.range, work)
+                    || file.blocked(imported.range.start, work)
+                {
+                    continue;
+                }
+                self.rust_import_qualifiers(file, imported, root, &mut sites, work, result);
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        result.rust_import_qualifier_start = (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn rust_import_qualifiers(
+        &self,
+        file: &File<'source>,
+        imported: &StaticRustUse,
+        root: Option<Target<'source>>,
+        sites: &mut ImportQualifierSites,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let Some(segments) = import_segments(file, imported, work) else {
+            return;
+        };
+        let names = segments.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let qualifier_count = segments.len().saturating_sub(usize::from(!imported.glob));
+        let position = imported.range.start;
+        for (index, &(_, token)) in segments.iter().take(qualifier_count).enumerate() {
+            // Grouped leaves share the same physical prefix and lexical scope.
+            if !sites.seen.insert(token) {
+                continue;
+            }
+            let prefix = &names[..=index];
+            if !prefix.iter().all(|_| work.charge()) {
+                return;
+            }
+            let Some(path) = self.rust.absolute_path(file, position, prefix, work) else {
+                continue;
+            };
+            let Some(target) = self
+                .rust
+                .lookup(file, position, &path, Namespace::Type, work)
+                .filter(|target| qualifier_kind(*target))
+                .or_else(|| {
+                    if work.exhausted
+                        || !matches!(prefix.first().copied(), Some("crate" | "self" | "super"))
+                    {
+                        return None;
+                    }
+                    root.filter(|target| target.file.placement.module_path() == path)
+                })
+            else {
+                continue;
+            };
+            let Some(mut occurrence) =
+                self.occurrence(file, token, token, ReferenceRole::Read, target)
+            else {
+                continue;
+            };
+            if !matches!(
+                occurrence.target,
+                rift_provider::NormalizedTarget::Symbol(_)
+            ) {
+                continue;
+            }
+            let source = sites
+                .sources
+                .entry(imported.scope)
+                .or_insert_with(|| self.rust_module_from(file, imported.range, work));
+            occurrence.edge_from.clone_from(source);
+            result.record(Some(occurrence));
         }
     }
 
@@ -172,6 +655,13 @@ impl<'source> Index<'source> {
                     rift_provider::NormalizedTarget::Symbol(_)
                 )
             {
+                if *part == "super" {
+                    result
+                        .rust_call_parent_sites
+                        .entry(file.document.placement.unit().clone())
+                        .or_default()
+                        .insert(range);
+                }
                 result.occurrences.push(occurrence);
             }
         }
@@ -231,7 +721,13 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if file.conditional(reference.target, work)
+            if (reference.role == ReferenceRole::Type
+                && file
+                    .facts
+                    .rust_generic_references()
+                    .binary_search_by_key(&reference.target, |generic| generic.range)
+                    .is_ok())
+                || file.conditional(reference.target, work)
                 || self
                     .rust
                     .module(file, reference.target.start, work)
@@ -260,7 +756,7 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for symbol in file.document.facts.symbols() {
-            if symbol.is_rust_local_binding() {
+            if symbol.is_rust_local_binding() || symbol.is_rust_library_root() {
                 continue;
             }
             if !work.charge() {
@@ -357,6 +853,32 @@ impl<'source> Index<'source> {
         occurrence.edge_from = Some(from);
         Some(occurrence)
     }
+}
+
+/// The token spans of an import, including the prefixes inherited from enclosing groups.
+fn import_segments<'source>(
+    file: &File<'source>,
+    imported: &StaticRustUse,
+    work: &mut Work,
+) -> Option<Vec<(&'source str, ByteRange)>> {
+    let mut segments = Vec::new();
+    for &range in &imported.path {
+        if !work.charge() {
+            return None;
+        }
+        let text = file.text(range)?;
+        for name in path_segments(text, work)? {
+            let token = text.as_bytes().subslice_range(name.as_bytes())?;
+            segments.push((
+                name,
+                ByteRange {
+                    start: range.start.checked_add(u64::try_from(token.start).ok()?)?,
+                    end: range.start.checked_add(u64::try_from(token.end).ok()?)?,
+                },
+            ));
+        }
+    }
+    Some(segments)
 }
 
 fn qualifier_kind(target: Target<'_>) -> bool {

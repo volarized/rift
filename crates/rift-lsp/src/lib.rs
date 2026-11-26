@@ -12,6 +12,7 @@ pub mod contribution;
 pub mod correlation;
 pub mod framing;
 pub mod position;
+mod rust_declarations;
 pub mod session;
 pub mod uri;
 
@@ -19,5 +20,6 @@ pub use capabilities::{Capabilities, PositionEncoding};
 pub use correlation::{Correlation, RequestId};
 pub use framing::Framing;
 pub use position::LineIndex;
-pub use session::{EngineLaunch, EngineSession};
+pub use rust_declarations::{RustDeclarationKind, RustDeclarationToken, RustDeclarationTokens};
+pub use session::{EngineLaunch, EngineSession, RustMacroExpansion};
 pub use uri::{EngineAddress, EngineRoots, PackageFile, PackageRoot, TreeRoot};

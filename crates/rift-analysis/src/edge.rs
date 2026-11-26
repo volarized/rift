@@ -50,12 +50,18 @@ pub struct Edge {
     static_callee: Option<rift_syntax::ByteRange>,
     derivation: rift_protocol::read::EdgeDerivation,
     from_graph: bool,
+    file_module_reference: bool,
 }
 
 impl Edge {
     /// Whether the normalized graph already carries this edge.
     pub(crate) const fn is_graph_edge(&self) -> bool {
         self.from_graph
+    }
+
+    /// Whether this reference needs two admitted ECMAScript file modules.
+    pub(crate) const fn is_file_module_reference(&self) -> bool {
+        self.file_module_reference
     }
 
     /// Projects this resolved reference with its physical occurrence.
@@ -272,6 +278,7 @@ fn reference_edges<'graph>(
             static_callee: None,
             derivation: rift_protocol::read::EdgeDerivation::Resolution,
             from_graph: false,
+            file_module_reference: false,
         })
     })
 }
@@ -397,6 +404,7 @@ fn admit_external<'a>(
             static_callee: (occurrence.role == ReferenceRole::Call)
                 .then_some(occurrence.callee_range),
             from_graph: false,
+            file_module_reference: false,
             derivation: if occurrence.declared {
                 rift_protocol::read::EdgeDerivation::Resolution
             } else {
@@ -412,6 +420,7 @@ fn admit_occurrences<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     admitted: &mut BTreeMap<&'a SymbolId, Vec<Edge>>,
+    file_module_reference: bool,
 ) {
     for occurrence in occurrences {
         if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
@@ -437,6 +446,7 @@ fn admit_occurrences<'a>(
             static_callee: (occurrence.role == ReferenceRole::Call)
                 .then_some(occurrence.callee_range),
             from_graph: false,
+            file_module_reference,
             derivation: if occurrence.edge_kind.is_some() {
                 rift_protocol::read::EdgeDerivation::Syntax
             } else {
@@ -447,6 +457,88 @@ fn admit_occurrences<'a>(
     }
 }
 
+fn static_admission_batches<'a>(
+    spans: &'a DefinitionSpans,
+    edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
+    resolution: &'a mut StaticResolution,
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 37] {
+    let supplemental_start = resolution.supplemental_start.take();
+    let (alias, alias_external) = resolution
+        .rust_extern_alias_start
+        .take()
+        .map_or((None, resolution.external.len()), |(internal, external)| {
+            (Some(internal), external)
+        });
+    let tail_starts = [
+        resolution.late_supplemental_start.take(),
+        resolution.python_reassignment_start.take(),
+        resolution.python_capture_start.take(),
+        resolution.python_receiver_start.take(),
+        resolution.python_variadic_start.take(),
+        resolution.python_initializer_start.take(),
+        resolution.python_quoted_type_start.take(),
+        resolution.python_overload_parameter_start.take(),
+        resolution.file_module_start.take(),
+        resolution.file_module_qualifier_start.take(),
+        resolution.literal_start.take(),
+        resolution.callback_parameter_start.take(),
+        resolution.overload_parameter_start.take(),
+        resolution.javascript_method_parameter_start.take(),
+        resolution.scoped_javascript_function_start.take(),
+        resolution.scoped_javascript_lexical_start.take(),
+        resolution.typescript_type_parameter_start.take(),
+        resolution.javascript_shorthand_parameter_start.take(),
+        resolution.javascript_wrapped_parameter_start.take(),
+        resolution.javascript_destructured_parameter_start.take(),
+        resolution.typescript_union_property_start.take(),
+        resolution.typescript_method_type_parameter_start.take(),
+        resolution.typescript_function_type_parameter_start.take(),
+        resolution.typescript_destructured_parameter_start.take(),
+        alias,
+        resolution.rust_receiver_start.take(),
+        resolution.rust_generic_start.take(),
+        resolution.rust_library_root_start.take(),
+        resolution.rust_crate_paths_start.take(),
+        resolution.rust_crate_visibility_start.take(),
+        resolution.rust_argument_value_start.take(),
+        resolution.rust_import_qualifier_start.take(),
+        resolution.rust_shorthand_start.take(),
+        resolution.rust_shared_start.take(),
+        resolution.rust_parent_module_start.take(),
+    ];
+    let mut boundaries = [0; 38];
+    let mut next = resolution.occurrences.len();
+    boundaries[37] = next;
+    for (boundary, start) in boundaries[2..37].iter_mut().zip(tail_starts).rev() {
+        next = start.unwrap_or(next);
+        *boundary = next;
+    }
+    let (internal, external) = supplemental_start.unwrap_or((boundaries[2], alias_external));
+    boundaries[1] = internal;
+    let (incumbent_external, alias_external_rows) = resolution.external.split_at(alias_external);
+    let (primary_external, supplemental_external) = incumbent_external.split_at(external);
+    let mut batches = std::array::from_fn(|index| {
+        let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
+        let mut edges = BTreeMap::new();
+        admit_occurrences(
+            rows,
+            spans,
+            edge_modules,
+            &mut edges,
+            matches!(index, 10 | 11),
+        );
+        edges
+    });
+    admit_external(primary_external, spans, edge_modules, &mut batches[0]);
+    admit_external(supplemental_external, spans, edge_modules, &mut batches[1]);
+    admit_external(alias_external_rows, spans, edge_modules, &mut batches[26]);
+    // New ECMAScript references use the capacity left by the earlier stages.
+    batches[15..36].rotate_left(11);
+    // Preserve the established Rust and ECMAScript order ahead of newer Rust sites.
+    batches[10..22].rotate_left(5);
+    batches
+}
+
 impl EdgeStore {
     fn add_static(
         &mut self,
@@ -454,78 +546,13 @@ impl EdgeStore {
         resolution: &mut StaticResolution,
         edges_max: usize,
     ) {
-        let supplemental_start = resolution.supplemental_start.take();
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
-        let (alias, alias_external) = resolution
-            .rust_extern_alias_start
-            .take()
-            .unwrap_or((resolution.occurrences.len(), resolution.external.len()));
-        let (incumbent_external, alias_external_rows) =
-            resolution.external.split_at(alias_external);
-        let mut next_start = alias;
-        let [
-            overload,
-            quoted_type,
-            initializer,
-            variadic,
-            receiver,
-            capture,
-            reassigned,
-            late,
-        ] = [
-            resolution.python_overload_parameter_start.take(),
-            resolution.python_quoted_type_start.take(),
-            resolution.python_initializer_start.take(),
-            resolution.python_variadic_start.take(),
-            resolution.python_receiver_start.take(),
-            resolution.python_capture_start.take(),
-            resolution.python_reassignment_start.take(),
-            resolution.late_supplemental_start.take(),
-        ]
-        .map(|start| {
-            next_start = start.unwrap_or(next_start);
-            next_start
-        });
-        let (internal, external) = supplemental_start.unwrap_or((late, alias_external));
-        let boundaries = [
-            0,
-            internal,
-            late,
-            reassigned,
-            capture,
-            receiver,
-            variadic,
-            initializer,
-            quoted_type,
-            overload,
-            alias,
-            resolution.occurrences.len(),
-        ];
-        let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
-        let capacity = edges_max.saturating_sub(existing);
-        let mut remaining = capacity;
-        let mut batches: [BTreeMap<_, _>; 11] = std::array::from_fn(|index| {
-            let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
-            let mut edges = BTreeMap::new();
-            admit_occurrences(rows, spans, &self.edge_modules, &mut edges);
-            edges
-        });
-        admit_external(external, spans, &self.edge_modules, &mut batches[0]);
-        admit_external(
-            supplemental_external,
-            spans,
-            &self.edge_modules,
-            &mut batches[1],
-        );
-        admit_external(
-            alias_external_rows,
-            spans,
-            &self.edge_modules,
-            &mut batches[10],
-        );
+        let mut remaining = edges_max.saturating_sub(existing);
+        let mut changed = false;
+        let mut batches = static_admission_batches(spans, &self.edge_modules, resolution);
         self.deduplicate_static_batches(&mut batches);
         for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);
@@ -533,6 +560,7 @@ impl EdgeStore {
                 .dropped_edges
                 .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
             remaining -= fits;
+            changed |= fits > 0;
             edges.truncate(fits);
             if edges.is_empty() {
                 continue;
@@ -549,7 +577,7 @@ impl EdgeStore {
                 .or_default()
                 .append(&mut edges);
         }
-        if remaining < capacity {
+        if changed {
             for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
                 edges.sort_by(edge_order);
                 edges.dedup();
@@ -680,6 +708,7 @@ impl EdgeStore {
                         static_callee: None,
                         derivation,
                         from_graph: true,
+                        file_module_reference: false,
                     };
                     outgoing.entry(from.clone()).or_default().push(edge.clone());
                     incoming.entry(to.clone()).or_default().push(edge);
@@ -1204,12 +1233,18 @@ mod tests {
                 occurrences.push(occurrence(&alpha, 0, ReferenceRole::Read));
                 occurrences.push(occurrence(&alpha, 1, ReferenceRole::Read));
             }
+            let rust_import_qualifier_start = (batch_count >= 6).then_some(occurrences.len());
+            if rust_import_qualifier_start.is_some() {
+                occurrences.push(occurrence(&alpha, 0, ReferenceRole::Read));
+                occurrences.push(occurrence(&alpha, 9, ReferenceRole::Read));
+            }
             StaticResolution {
                 occurrences,
                 supplemental_start: (batch_count >= 2).then_some((2, 0)),
                 late_supplemental_start: late_start,
                 python_reassignment_start,
                 python_capture_start,
+                rust_import_qualifier_start,
                 ..StaticResolution::default()
             }
         };
@@ -1237,24 +1272,16 @@ mod tests {
         assert_eq!(room.outgoing(&alpha).len(), 2);
         assert_eq!(room.outgoing(&zeta), baseline.outgoing(&zeta));
 
-        let late = build(3, 3);
-        assert_eq!(late.dropped_edges(), 1);
-        assert_eq!(late.outgoing(&alpha), room.outgoing(&alpha));
-        assert_eq!(late.outgoing(&zeta), room.outgoing(&zeta));
-        let all = build(4, 3);
-        assert!(all.is_complete());
-        assert_eq!(all.edges().count(), 4);
-        let reassigned = build(4, 4);
-        assert_eq!(reassigned.dropped_edges(), 1);
-        assert_eq!(reassigned.outgoing(&alpha), all.outgoing(&alpha));
-        assert_eq!(reassigned.outgoing(&zeta), all.outgoing(&zeta));
-        let all = build(5, 4);
-        assert!(all.is_complete());
-        let captured = build(5, 5);
-        assert_eq!(captured.dropped_edges(), 1);
-        assert_eq!(captured.outgoing(&alpha), all.outgoing(&alpha));
-        assert_eq!(captured.outgoing(&zeta), all.outgoing(&zeta));
-        assert!(build(6, 5).is_complete());
+        for batch in 3..=6 {
+            let earlier = build(batch, batch - 1);
+            assert!(earlier.is_complete());
+            let capped = build(batch, batch);
+            assert_eq!(capped.dropped_edges(), 1);
+            assert!(capped.edges().eq(earlier.edges()));
+            let expanded = build(batch + 1, batch);
+            assert!(expanded.is_complete());
+            assert_eq!(expanded.edges().count(), batch + 1);
+        }
     }
 
     #[test]

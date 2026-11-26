@@ -16,6 +16,7 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{RiftError, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+mod generics;
 pub(crate) mod local_bindings;
 
 /// Rust declaration kind emitted by the Tree-sitter provider.
@@ -55,8 +56,16 @@ enum RustSymbolKind {
     Closure,
     /// A value bound by an ordinary let statement.
     LocalBinding,
+    /// A declaration at an authored shorthand field pattern.
+    ShorthandBinding,
     /// A value parameter named in a function's signature.
     ParameterBinding,
+    /// A declared generic type.
+    TypeParameter,
+    /// A declared generic lifetime.
+    LifetimeParameter,
+    /// A declared generic constant.
+    ConstParameter,
 }
 
 impl RustSymbolKind {
@@ -80,7 +89,11 @@ impl RustSymbolKind {
             Self::Impl => "impl_item",
             Self::Closure => "let_declaration",
             Self::LocalBinding => local_bindings::KIND,
+            Self::ShorthandBinding => local_bindings::SHORTHAND_KIND,
             Self::ParameterBinding => local_bindings::PARAMETER_KIND,
+            Self::TypeParameter => "type_parameter",
+            Self::LifetimeParameter => "lifetime_parameter",
+            Self::ConstParameter => "const_parameter",
         }
     }
 
@@ -100,8 +113,14 @@ impl RustSymbolKind {
             Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
-            Self::Constant | Self::Static | Self::LocalBinding => vec![SymbolKind::Value],
-            Self::ParameterBinding => vec![SymbolKind::Value, SymbolKind::Parameter],
+            Self::Constant | Self::Static | Self::LocalBinding | Self::ShorthandBinding => {
+                vec![SymbolKind::Value]
+            }
+            Self::ParameterBinding | Self::ConstParameter => {
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            }
+            Self::TypeParameter => vec![SymbolKind::Type, SymbolKind::TypeParameter],
+            Self::LifetimeParameter => vec![SymbolKind::TypeParameter],
             Self::Variant => vec![SymbolKind::Variant],
         }
     }
@@ -126,7 +145,11 @@ impl RustSymbolKind {
             | Self::AssociatedType
             | Self::Closure
             | Self::LocalBinding
-            | Self::ParameterBinding => None,
+            | Self::ShorthandBinding
+            | Self::ParameterBinding
+            | Self::TypeParameter
+            | Self::LifetimeParameter
+            | Self::ConstParameter => None,
         }
     }
 }
@@ -143,6 +166,16 @@ enum RustGrammarSyntaxKind {
     LetDeclaration,
     /// `parameter` in a function's parameter list.
     Parameter,
+    /// Receiver parameter, including reference and lifetime forms.
+    SelfParameter,
+    /// Name the author wrote in a shorthand field of a struct pattern.
+    ShorthandFieldIdentifier,
+    /// Generic type parameter.
+    TypeParameter,
+    /// Generic lifetime parameter.
+    LifetimeParameter,
+    /// Generic const parameter.
+    ConstParameter,
     /// `closure_expression` value.
     ClosureExpression,
     /// `const_item` declaration.
@@ -195,6 +228,11 @@ impl RustGrammarSyntaxKind {
         match self {
             Self::LetDeclaration => "let_declaration",
             Self::Parameter => "parameter",
+            Self::SelfParameter => "self_parameter",
+            Self::ShorthandFieldIdentifier => "shorthand_field_identifier",
+            Self::TypeParameter => "type_parameter",
+            Self::LifetimeParameter => "lifetime_parameter",
+            Self::ConstParameter => "const_parameter",
             Self::ClosureExpression => "closure_expression",
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
@@ -230,7 +268,11 @@ impl RustGrammarSyntaxKind {
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
             Self::LetDeclaration => Some(RustSymbolKind::Closure),
-            Self::Parameter => Some(RustSymbolKind::ParameterBinding),
+            Self::ShorthandFieldIdentifier => Some(RustSymbolKind::ShorthandBinding),
+            Self::Parameter | Self::SelfParameter => Some(RustSymbolKind::ParameterBinding),
+            Self::TypeParameter => Some(RustSymbolKind::TypeParameter),
+            Self::LifetimeParameter => Some(RustSymbolKind::LifetimeParameter),
+            Self::ConstParameter => Some(RustSymbolKind::ConstParameter),
             Self::ImplItem => Some(RustSymbolKind::Impl),
             Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
@@ -396,9 +438,7 @@ impl RustQuery {
                 .fail();
         }
         let mut parser = rust_parser()?;
-        let parsed = blanking::blank_const_trait_keywords(source);
-        let tree = parser
-            .parse(parsed.as_ref(), None)
+        let tree = parse_tree(&mut parser, source, SyntaxLimits::DEFAULT)
             .ok_or_else(|| errors::syntax::parse_cancelled().error())?;
         let mut cursor = QueryCursor::new();
         let mut query_captures = cursor.captures(&self.inner, tree.root_node(), source.as_bytes());
@@ -425,6 +465,23 @@ pub struct RustSyntaxProvider {
     language: Language,
 }
 
+impl RustSyntaxProvider {
+    /// Finds requested Rust declaration items with errors anywhere inside them.
+    ///
+    /// The caller supplies ranges matched by the parser. Errors in a disjoint sibling
+    /// do not invalidate an admitted item.
+    /// # Errors
+    /// Returns the syntax refusal when the source or range walk exceeds its bounds.
+    pub fn incomplete_items(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        declarations: &[crate::ByteRange],
+    ) -> Result<std::collections::BTreeSet<crate::ByteRange>, RiftError> {
+        crate::parse_errors::incomplete_declarations(&self.language, source, limits, declarations)
+    }
+}
+
 impl Default for RustSyntaxProvider {
     fn default() -> Self {
         Self {
@@ -448,9 +505,7 @@ impl SyntaxProvider for RustSyntaxProvider {
     ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let mut parser = rust_parser()?;
-        let parsed = blanking::blank_const_trait_keywords(source.text);
-        let tree = parser
-            .parse(parsed.as_ref(), None)
+        let tree = parse_tree(&mut parser, source.text, limits)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let mut capture = crate::static_analysis::Capture::for_rust(source.text, limits);
         let rules = RustGrammarRules {
@@ -465,7 +520,16 @@ impl SyntaxProvider for RustSyntaxProvider {
             Some(&mut capture),
         )?;
         let mut facts = capture.finish();
-        local_bindings::prepare(source.text, &syntax_elements, &mut symbols, &mut facts);
+        local_bindings::prepare(
+            source.text,
+            &syntax_elements,
+            &mut symbols,
+            &mut facts,
+            tree.root_node().has_error(),
+        );
+        let generic_references =
+            generics::references(source.text, &syntax_elements, &symbols, &facts);
+        facts.set_rust_generic_references(generic_references);
         Ok(SyntaxDocument::new_rust(
             self.language.clone(),
             source,
@@ -630,6 +694,10 @@ impl GrammarRules for RustGrammarRules {
     fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         syntax_element
             .child_by_field_name(RustGrammarField::Name.as_str())
+            .or_else(|| local_bindings::receiver(syntax_element))
+            .or_else(|| {
+                (syntax_element.kind() == "shorthand_field_identifier").then_some(syntax_element)
+            })
             .or_else(|| {
                 matches!(
                     RustGrammarSyntaxKind::from_kind(syntax_element.kind()),
@@ -662,6 +730,15 @@ impl GrammarRules for RustGrammarRules {
         };
         let name = if kind == RustSymbolKind::ParameterBinding {
             local_bindings::parameter_name(visited, text).map(str::to_owned)
+        } else if kind == RustSymbolKind::ShorthandBinding {
+            local_bindings::shorthand_name(visited, text).map(str::to_owned)
+        } else if matches!(
+            kind,
+            RustSymbolKind::TypeParameter
+                | RustSymbolKind::LifetimeParameter
+                | RustSymbolKind::ConstParameter
+        ) {
+            local_bindings::generic_name(visited, text).map(str::to_owned)
         } else {
             declaration_name(syntax_element, text).or_else(|| {
                 if kind != RustSymbolKind::Closure {
@@ -691,7 +768,13 @@ impl GrammarRules for RustGrammarRules {
             attachment::attached_documentation(visited, text)?;
         Ok(Some(Declaration {
             name,
-            kind: kind.word(),
+            kind: if kind == RustSymbolKind::LocalBinding
+                && local_bindings::explicit_mut(syntax_element)
+            {
+                local_bindings::EXPLICIT_LOCAL_KIND
+            } else {
+                kind.word()
+            },
             kinds,
             visibility: visibility.as_ref().map(RustVisibility::authored),
             body_range: body_range(syntax_element, kind)?,
@@ -706,9 +789,12 @@ impl GrammarRules for RustGrammarRules {
             | RustGrammarSyntaxKind::StructItem
             | RustGrammarSyntaxKind::EnumItem
             | RustGrammarSyntaxKind::TraitItem
+            | RustGrammarSyntaxKind::TypeItem
+            | RustGrammarSyntaxKind::AssociatedType
             | RustGrammarSyntaxKind::UnionItem
             | RustGrammarSyntaxKind::EnumVariant
-            | RustGrammarSyntaxKind::FunctionItem => {
+            | RustGrammarSyntaxKind::FunctionItem
+            | RustGrammarSyntaxKind::FunctionSignatureItem => {
                 let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
                 text.get(name.byte_range()).map(Into::into)
             }
@@ -754,6 +840,23 @@ impl GrammarRules for RustGrammarRules {
 
 pub(crate) fn rust_grammar() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+pub(crate) fn parse_tree(
+    parser: &mut Parser,
+    text: &str,
+    limits: SyntaxLimits,
+) -> Option<tree_sitter::Tree> {
+    let prepared = blanking::blank_const_trait_keywords(text);
+    let tree = parser.parse(prepared.as_ref(), None)?;
+    let Some(repaired) = blanking::blank_empty_trait_bounds(
+        prepared.as_ref(),
+        tree.root_node(),
+        limits.syntax_elements_max(),
+    ) else {
+        return Some(tree);
+    };
+    parser.parse(repaired, None).or(Some(tree))
 }
 
 fn rust_parser() -> Result<Parser, RiftError> {
@@ -1165,6 +1268,69 @@ mod tests {
     }
 
     #[test]
+    fn empty_supertrait_bound_preserves_original_rust_source() {
+        let path = rift_core::ProjectPath::new("src/payload.rs").expect("Rust source path");
+        let source = "pub trait Café: where for<'a> &'a Self: IntoIterator { fn open(&self); }";
+        let provider = RustSyntaxProvider::default();
+        let parsed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: source,
+                },
+                SyntaxLimits::DEFAULT,
+            )
+            .expect("complete authored trait");
+        assert!(!parsed.has_errors());
+        assert_eq!(
+            parsed.facts().source_digest(),
+            Some(&rift_core::FileDigest::of(source.as_bytes()))
+        );
+        let trait_symbol = parsed
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "Café")
+            .expect("authored trait");
+        assert_eq!(trait_symbol.item_range.start, 0);
+        assert_eq!(
+            trait_symbol.item_range.end,
+            u64::try_from(source.len()).expect("source bytes")
+        );
+        assert!(
+            parsed
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.qualified_name == "Café::open")
+        );
+        let query =
+            RustQuery::new("(trait_item name: (type_identifier) @name)").expect("trait query");
+        let captures = query.captures(source, 2).expect("one trait name capture");
+        assert_eq!(captures.len(), 1);
+        let name = source.find("Café").expect("written name");
+        let from = u64::try_from(name).expect("name offset");
+        let to = u64::try_from(name + "Café".len()).expect("name end");
+        assert_eq!(
+            captures[0].range,
+            crate::ByteRange {
+                start: from,
+                end: to
+            }
+        );
+
+        let malformed = "pub trait Broken: where for<'a> &'a Self: { fn open(&self); }";
+        let parsed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: malformed,
+                },
+                SyntaxLimits::DEFAULT,
+            )
+            .expect("retains a typed parse error");
+        assert!(parsed.has_errors());
+    }
+
+    #[test]
     fn test_provider_extracts_nested_rust_declarations_and_byte_syntax_elements() {
         let text = "pub mod café {\r\npub(crate) struct Item;\r\nimpl Item { fn load() {} }\r\n}";
         let document = analyze(text);
@@ -1275,7 +1441,6 @@ mod tests {
             "#[path = \"\"]",
             "#[path = \"/shared.rs\"]",
             "#[path = \"mapped\\u{2e}rs\"]",
-            "#[cfg_attr(feature = \"alternate\", path = \"other.rs\")]",
             "#[path = \"one.rs\"]\n#[path = \"two.rs\"]",
             "#[path = \"same.rs\"]\n#[path = \"same.rs\"]",
             "#[custom_module]",
@@ -1382,12 +1547,16 @@ mod tests {
             names,
             [
                 "Holder",
+                "Holder::Store#generic0",
                 "Holder::store",
                 "Plain",
                 "Holder",
+                "Holder::Store#generic1",
                 "Holder::run",
+                "Holder::run::self#parameter0",
                 "Plain",
-                "Plain::run"
+                "Plain::run",
+                "Plain::run::self#parameter0"
             ]
         );
         let containers = document
@@ -1400,11 +1569,15 @@ mod tests {
             [
                 None,
                 Some("Holder"),
+                Some("Holder"),
                 None,
                 None,
                 Some("Holder"),
+                Some("Holder"),
+                Some("Holder::run"),
                 None,
-                Some("Plain")
+                Some("Plain"),
+                Some("Plain::run")
             ]
         );
     }
@@ -1566,12 +1739,16 @@ mod tests {
                 "Plain::default",
                 "Plain",
                 "Plain::clone",
+                "Plain::clone::self#parameter0",
                 "Plain",
                 "Measure",
                 "Measure::size",
+                "Measure::size::self#parameter0",
                 "call",
+                "call::F#generic0",
                 "call::f#parameter0",
                 "old",
+                "old::F#generic0",
                 "old::f#parameter0",
                 "closure",
                 "closure::f",
@@ -1686,6 +1863,7 @@ mod tests {
                 ("A", false),
                 ("T", true),
                 ("t", false),
+                ("self", false),
                 ("m", true),
                 ("inner", true),
                 ("declared", false),
@@ -2150,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_documentation_cfg_attributes_refuse_unknown_or_mixed_effects() {
+    fn test_documentation_cfg_attributes_keep_conditional_path_evidence_separate() {
         for attribute in [
             "cfg_attr(docsrs, doc(hidden), path = \"other.rs\")",
             "cfg_attr(docsrs, doc(hidden), macro_use)",
@@ -2167,11 +2345,16 @@ mod tests {
                 format!("mod inline {{ #![{attribute}] mod child; }}"),
             ] {
                 let document = analyze(&text);
-                assert_eq!(
-                    document.symbols()[0].module_path,
-                    Some(crate::RustModulePath::Unknown),
-                    "{text}"
-                );
+                let state = &document.symbols()[0].module_path;
+                if text.starts_with("#[") && attribute.contains("path =") {
+                    let Some(crate::RustModulePath::Conditional { attributes }) = state else {
+                        panic!("expected conditional path metadata: {text}");
+                    };
+                    assert_eq!(attributes.len(), 1, "{text}");
+                    assert_eq!(text_at(&text, attributes[0]), format!("#[{attribute}]"));
+                } else {
+                    assert_eq!(state, &Some(crate::RustModulePath::Unknown), "{text}");
+                }
             }
         }
         let attribute = format!(

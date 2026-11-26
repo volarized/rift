@@ -1204,6 +1204,223 @@ fn package_stores_typescript_imported_type_uses_at_each_written_site() {
 }
 
 #[test]
+fn package_rust_module_source_facet_keeps_written_declaration_and_existing_caps() {
+    let root = "pub mod child; pub fn call() { child::run(); }";
+    let child = "// é\npub fn run() {}\n";
+    let path = ProjectPath::new("src/lib.rs").expect("library root");
+    let child_path = ProjectPath::new("src/child.rs").expect("authored module file");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let package = fixture::identity();
+    let owner = package.owner().expect("cargo owner");
+    let language = fixture::language(ShippedLanguage::Rust);
+    let origin = fixture::origin(&package);
+    let sources = [
+        PackageSource::new(&path, root),
+        PackageSource::new(&child_path, child),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+    )];
+    let analyze = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("package declaration cap");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("exact source inventory")
+            .with_framework_context(&metadata, &[])
+            .expect("checked Cargo manifest");
+        PackageAnalyzer::analyze(input, 1).expect("package analysis")
+    };
+    let baseline = analyze(4);
+    let admitted = analyze(5);
+    let baseline = baseline.publication();
+    let admitted = admitted.publication();
+    let facet = admitted
+        .declarations
+        .iter()
+        .find(|row| {
+            row.symbol.as_str().ends_with("/beacon/child")
+                && row.unit.as_str().ends_with("/src/child.rs")
+        })
+        .expect("whole-file facet of the accepted module");
+    assert_eq!(facet.syntax_element_kind.as_deref(), Some("source_file"));
+    assert_eq!(facet.range.start, 0);
+    assert_eq!(
+        facet.range.end,
+        u64::try_from(child.len()).expect("file byte length")
+    );
+    assert_eq!(facet.source, child);
+    assert!(facet.source_complete);
+    assert!(admitted.declarations.iter().any(|row| {
+        row.symbol == facet.symbol
+            && row.unit.as_str().ends_with("/src/lib.rs")
+            && row.source == "pub mod child;"
+    }));
+    assert_eq!(baseline.declarations.len() + 1, admitted.declarations.len());
+    assert!(
+        baseline
+            .declarations
+            .iter()
+            .all(|row| admitted.declarations.contains(row))
+    );
+    assert_eq!(baseline.units, admitted.units);
+    assert_eq!(baseline.edges, admitted.edges);
+    assert!(admitted.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/beacon/child/run")
+    }));
+}
+
+#[test]
+fn package_rust_shared_literal_modules_keep_distinct_owners_and_one_source() {
+    let root = r#"
+#[path = "shared.rs"]
+pub mod left;
+#[path = "shared.rs"]
+pub mod right;
+pub fn call() { left::one(); right::one(); }
+"#;
+    let shared = "#[cfg(test)] mod tests; pub trait Borrowed: where for<'a> &'a Self: IntoIterator {} pub fn one() {}";
+    let analysis = fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![("src/lib.rs", root), ("src/shared.rs", shared)],
+        None,
+    )
+    .expect("checked literal modules");
+    let (publication, _, _, _) = analysis.into_parts();
+    assert_eq!(publication.units.len(), 2);
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0.as_str() == "src/shared.rs")
+        .expect("one physical unit")
+        .unit;
+    let call_site = |needle: &str| {
+        u64::try_from(root.find(needle).expect("written call")).expect("call offset")
+    };
+    let one = u64::try_from(shared.find("one").expect("authored name")).expect("name offset");
+    for module in ["left", "right"] {
+        let suffix = format!("/beacon/{module}/one");
+        assert_eq!(
+            publication
+                .declarations
+                .iter()
+                .filter(|entry| {
+                    entry.symbol.as_str().ends_with(&suffix)
+                        && &entry.unit == unit
+                        && entry.range.start <= one
+                        && entry.range.end >= one + 3
+                        && entry.source == "pub fn one() {}"
+                })
+                .count(),
+            1,
+            "{module}: {:?}",
+            publication.declarations,
+        );
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with("/beacon/call")
+                    && edge.to.as_str().ends_with(&suffix)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        let call = format!("{module}::one()");
+                        let start = call_site(call.as_str());
+                        site.range.start == start
+                            && site.range.end
+                                == start + u64::try_from(call.len()).expect("call length")
+                    })
+            }),
+            "{module}: {:?}",
+            publication.edges
+        );
+    }
+}
+
+#[test]
+fn package_rust_shared_literal_modules_resolve_each_outgoing_scope() {
+    const ROOT: &str = r#"
+#[path = "shared.rs"]
+pub mod east;
+#[path = "shared.rs"]
+pub mod west;
+pub fn outer() -> u8 { east::caller() + west::caller() }
+"#;
+    const SHARED: &str = "pub type Number = u8;
+pub fn leaf() -> Number { 7 }
+pub fn caller() -> Number { leaf() }
+pub fn through_self() -> Number { self::leaf() }
+pub fn shadowed() -> Number { let leaf = || 3; leaf() }
+#[cfg(any())]
+pub fn inactive() -> Number { leaf() }
+";
+    let publication = fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![("src/lib.rs", ROOT), ("src/shared.rs", SHARED)],
+        None,
+    )
+    .expect("checked literal modules")
+    .into_parts()
+    .0;
+    assert_eq!(publication.units.len(), 2);
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0.as_str() == "src/shared.rs")
+        .expect("shared physical unit")
+        .unit;
+    for module in ["east", "west"] {
+        for (caller, spelling) in [("caller", "leaf()"), ("through_self", "self::leaf()")] {
+            let declaration = format!("fn {caller}() -> Number");
+            let first = SHARED.find(&declaration).expect("declared function");
+            let start = first + SHARED[first..].find(spelling).expect("authored call");
+            let end = start + spelling.len();
+            let from = format!("/beacon/{module}/{caller}");
+            let to = format!("/beacon/{module}/leaf");
+            assert!(publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with(&from)
+                    && edge.to.as_str().ends_with(&to)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == unit
+                            && site.range.start == start as u64
+                            && site.range.end == end as u64
+                    })
+            }));
+            let ty = format!("/beacon/{module}/Number");
+            assert!(publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::HasType]
+                    && edge.from.as_str().ends_with(&from)
+                    && edge.to.as_str().ends_with(&ty)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| &site.unit == unit)
+            }));
+        }
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with("/beacon/outer")
+                && edge
+                    .to
+                    .as_str()
+                    .ends_with(&format!("/beacon/{module}/caller"))
+        }));
+    }
+    let wrong = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/inactive")
+                || (edge.from.as_str().ends_with("/shadowed")
+                    && ["/beacon/east/leaf", "/beacon/west/leaf"]
+                        .iter()
+                        .any(|suffix| edge.to.as_str().ends_with(suffix)))
+        })
+        .collect::<Vec<_>>();
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+#[test]
 fn package_rust_constructors_and_fields_use_their_block_owner() {
     use rift_core::ReferenceRole;
     use rift_provider::NormalizedTarget;
@@ -2901,4 +3118,302 @@ fn parameter_provider_bound(shipped: rift_syntax::ShippedLanguage, prior: u32) {
 #[test]
 fn package_typescript_value_parameters_preserve_required_provider_slots() {
     parameter_provider_bound(rift_syntax::ShippedLanguage::TypeScript, 1);
+}
+
+#[test]
+fn private_ecmascript_lexical_groups_keep_exact_declarations_and_callers() {
+    const SOURCE: &str = r"function leaf() {}
+function exposed() {}
+exports.exposed = exposed;
+unknown('f', function () {
+    function helper() { leaf(); }
+    helper();
+});
+unknown('v', function () {
+    var helper = 'first';
+    var helper = 'same';
+    consume(helper);
+});
+unknown('w', function () {
+    var helper = 'other';
+    consume(helper);
+});
+";
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"index.js"}"#;
+    const PREFIX: &str = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon/";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("captured scoped JavaScript package");
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("valid physical records");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.js")
+        .expect("original source unit");
+    let declaration = |text: &str| {
+        let start = SOURCE.find(text).expect("written declaration");
+        let range = TextRange {
+            start: u64::try_from(start).expect("declaration start"),
+            end: u64::try_from(start + text.len()).expect("declaration end"),
+        };
+        let mut declarations = publication
+            .declarations
+            .iter()
+            .filter(|row| row.unit == unit.unit && row.range == range);
+        let found = declarations.next().expect("physical declaration");
+        assert!(declarations.next().is_none(), "{text}");
+        assert!(!found.public);
+        found
+    };
+    let first = declaration("function helper() { leaf(); }");
+    let second = declaration("helper = 'first'");
+    let same = declaration("helper = 'same'");
+    let other = declaration("helper = 'other'");
+    assert_eq!(first.symbol.as_str(), format!("{PREFIX}helper"));
+    assert_eq!(second.symbol, same.symbol);
+    assert_ne!(first.symbol, second.symbol);
+    assert_ne!(first.symbol, other.symbol);
+    assert_ne!(second.symbol, other.symbol);
+    for (row, scopes) in [(second, "helper#1"), (other, "helper#3")] {
+        let identity = SymbolIdentity::parse(row.symbol.as_str()).expect("scoped identity");
+        assert_eq!(identity.qualified_path(), ["beacon", scopes]);
+    }
+    for (row, callable) in [(first, true), (second, false), (other, false)] {
+        let symbol = publication
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&row.symbol))
+            .expect("object for scope");
+        assert_eq!(symbol.name, "helper");
+        assert_eq!(symbol.kinds.contains(&SymbolKind::Callable), callable);
+    }
+    let calls = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Calls] && edge.to.as_str() == format!("{PREFIX}leaf")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].from, first.symbol);
+    let authored = calls[0].occurrence.as_ref().expect("physical call");
+    assert_eq!(authored.unit, unit.unit);
+    assert_eq!(
+        SOURCE.get(offset_in(authored.range.start)..offset_in(authored.range.end)),
+        Some("leaf()")
+    );
+}
+
+#[test]
+fn package_stores_javascript_named_function_parameters_and_reads() {
+    const SOURCE: &str = concat!(
+        "export function choose(value) { return value; }\n",
+        "export function* another(value) { yield value; }\n",
+    );
+    let package = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.mjs"}"#,
+        )),
+    )
+    .expect("admitted JavaScript source");
+    let publication = package.publication();
+    for (function, usage) in [("choose", "return value"), ("another", "yield value")] {
+        let function_start = SOURCE.find(function).expect("written function");
+        let declaration = function_start + function.len() + 1;
+        let read = SOURCE.find(usage).expect("written read") + usage.len() - "value".len();
+        let binding = publication
+            .objects
+            .iter()
+            .find(|object| {
+                object.kinds.contains(&SymbolKind::Parameter)
+                    && object
+                        .id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str().ends_with(&format!("/{function}/value")))
+            })
+            .and_then(|object| object.id.as_ref())
+            .expect("function-owned value parameter");
+        assert!(publication.declarations.iter().any(|site| {
+            site.symbol == *binding
+                && site.source == "value"
+                && usize::try_from(site.range.start) == Ok(declaration)
+                && usize::try_from(site.range.end) == Ok(declaration + "value".len())
+        }));
+        let uses = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == *binding)
+            .map(|edge| {
+                assert!(edge.from.as_str().ends_with(&format!("/{function}")));
+                let site = &edge.occurrence.as_ref().expect("written read").range;
+                assert_eq!(usize::try_from(site.end), Ok(read + "value".len()));
+                usize::try_from(site.start).expect("written start")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uses, [read]);
+    }
+}
+
+#[test]
+fn package_javascript_parameters_follow_typescript_parameters_under_provider_bound() {
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("package identity");
+    let origin = fixture::origin(&package);
+    let language = fixture::language(ShippedLanguage::TypeScript);
+    let javascript = ProjectPath::new("a.mjs").expect("JavaScript path");
+    let typescript = ProjectPath::new("index.ts").expect("TypeScript path");
+    let manifest = ProjectPath::new("package.json").expect("metadata path");
+    let sources = [
+        PackageSource::new(&javascript, "export function first(gift) { return gift; }"),
+        PackageSource::new(
+            &typescript,
+            "export function last(value: number): number { return value; }",
+        ),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","main":"a.mjs","types":"index.ts"}"#,
+    )];
+
+    for (bound, expected) in [
+        (2, &[][..]),
+        (3, &["value"][..]),
+        (4, &["gift", "value"][..]),
+    ] {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("provider declaration bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("package input")
+            .with_framework_context(&metadata, &[])
+            .expect("authored metadata");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("primary declarations accepted");
+        let publication = analysis.publication();
+        let parameters = publication
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Parameter))
+            .map(|object| object.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            parameters,
+            expected.iter().copied().collect(),
+            "bound {bound}, declarations {:?}, warnings {:?}",
+            publication
+                .declarations
+                .iter()
+                .map(|row| &row.symbol)
+                .collect::<Vec<_>>(),
+            publication.warnings
+        );
+        let reads = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads])
+            .filter_map(|edge| edge.to.as_str().rsplit('/').next())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(reads, parameters);
+    }
+}
+
+#[test]
+fn package_retains_typescript_method_parameters_and_body_reads() {
+    const SOURCE: &str = concat!(
+        "export class Holder { method(value: number) { return value; } }\n",
+        "export interface Reader { method(value: number): number; }\n",
+        "export function choose(name: number) { return name; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#,
+        )),
+    )
+    .expect("authored class and interface");
+    let publication = analysis.publication();
+    let holder = SOURCE.find("method(value").expect("class parameter") + "method(".len();
+    let reader = SOURCE.rfind("method(value").expect("interface parameter") + "method(".len();
+    let usage = SOURCE.find("return value").expect("class method read") + "return ".len();
+    for (container, start, read) in [("Holder", holder, Some(usage)), ("Reader", reader, None)] {
+        let identity = format!("/{container}/method/value");
+        let binding = publication
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Parameter))
+            .filter_map(|object| object.id.as_ref())
+            .find(|id| id.as_str().ends_with(&identity))
+            .expect("method-owned value parameter");
+        assert!(publication.declarations.iter().any(|site| {
+            site.symbol == *binding
+                && site.source == "value"
+                && usize::try_from(site.range.start) == Ok(start)
+                && usize::try_from(site.range.end) == Ok(start + "value".len())
+        }));
+        let uses = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == *binding)
+            .map(|edge| {
+                assert!(
+                    edge.from
+                        .as_str()
+                        .ends_with(&format!("/{container}/method"))
+                );
+                let site = &edge.occurrence.as_ref().expect("written read").range;
+                assert_eq!(site.end - site.start, 5);
+                usize::try_from(site.start).expect("physical byte offset")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uses, read.into_iter().collect::<Vec<_>>());
+    }
+
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("package identity");
+    let origin = fixture::origin(&package);
+    let language = fixture::language(ShippedLanguage::TypeScript);
+    let path = ProjectPath::new("index.ts").expect("source path");
+    let manifest = ProjectPath::new("package.json").expect("metadata path");
+    let sources = [PackageSource::new(&path, SOURCE)];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#,
+    )];
+    let limits = ExactPackageLimits::new(2, 4096)
+        .with_declarations(6)
+        .expect("five ordinary declarations and one parameter");
+    let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+        .expect("package input")
+        .with_framework_context(&metadata, &[])
+        .expect("authored metadata");
+    let bounded = PackageAnalyzer::analyze(input, 1).expect("primary declarations accepted");
+    let parameters = bounded
+        .publication()
+        .objects
+        .iter()
+        .filter(|object| object.kinds.contains(&SymbolKind::Parameter))
+        .map(|object| object.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(parameters, ["name"]);
+    assert!(bounded.publication().edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/choose/name")
+    }));
 }
