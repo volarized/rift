@@ -2851,3 +2851,66 @@ fn non_entry_typescript_union_properties_keep_their_written_branches() {
             .any(|row| row.symbol.as_str().ends_with("/Result"))
     );
 }
+
+#[test]
+fn typescript_method_type_parameters_keep_their_own_annotation_targets() {
+    const SOURCE: &str = concat!(
+        "export interface Reader { read<Value>(value: Value): Value; }\n",
+        "export class Box { read<Value>(value: Value): Value { return value; } }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked methods");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical method type parameters");
+    for owner in ["Reader", "Box"] {
+        let holder = SOURCE.find(owner).expect("written owner");
+        let method = SOURCE[holder..]
+            .find("read<Value>")
+            .expect("written method")
+            + holder;
+        let start = method + "read<".len();
+        let suffix = format!("/{owner}/read/Value");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, "Value")
+                    && row.source == "Value"
+            })
+            .expect("physical method type parameter");
+        let signature = "read<Value>(value: Value): Value";
+        let expected = signature
+            .match_indices("Value")
+            .skip(1)
+            .map(|(offset, _)| {
+                let range = module_runtime_range(method + offset, "Value");
+                (range.start, range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        let actual = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::HasType])
+            .map(|edge| {
+                let occurrence = edge.occurrence.as_ref().expect("physical type use");
+                assert_eq!(occurrence.unit, parameter.unit);
+                (occurrence.range.start, occurrence.range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/Box/read/value") && edge.kinds == [EdgeKind::Reads]
+    }));
+}

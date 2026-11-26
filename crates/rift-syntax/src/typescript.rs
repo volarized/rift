@@ -213,6 +213,7 @@ mod tests {
                     "method",
                     Some("map<U>(callbackfn: (value: T) => U): U[]")
                 ),
+                ("Array.map.U", "typescript_method_type_parameter", None),
                 ("Array.map.callbackfn", "value_parameter", None),
                 (
                     "Array.reduce",

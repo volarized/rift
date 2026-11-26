@@ -266,7 +266,15 @@ impl SyntaxSymbol {
     /// Whether this ECMAScript binding uses a package declaration reservation.
     #[must_use]
     pub fn is_ecmascript_package_binding(&self) -> bool {
-        self.is_ecmascript_parameter() || self.is_typescript_type_parameter()
+        self.is_ecmascript_parameter()
+            || self.is_typescript_type_parameter()
+            || self.is_typescript_method_type_parameter()
+    }
+
+    /// Whether this is the written type parameter of a TypeScript method.
+    #[must_use]
+    pub fn is_typescript_method_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::METHOD_TYPE_PARAMETER_KIND
     }
 
     /// Whether this binding uses a package-only declaration reservation.

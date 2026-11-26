@@ -247,6 +247,7 @@ pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
@@ -1638,6 +1639,10 @@ impl EcmaScriptRules<'_> {
         type_parameters::declared_name(visited)
             .map(|name| (name, TYPE_PARAMETER_KIND))
             .or_else(|| {
+                type_parameters::named_owner(visited, type_parameters::method)
+                    .map(|name| (name, METHOD_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
                 type_signature_parameters::callable_parameter_name(visited)
                     .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
             })
@@ -1675,13 +1680,11 @@ impl EcmaScriptRules<'_> {
     fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
         let (name, kind) = self.parameter_syntax(visited)?;
         let name = text.get(name.byte_range())?;
-        if !name.is_ascii()
-            || name.contains('\\')
-            || (kind != TYPE_PARAMETER_KIND && name == "this")
-        {
+        let type_parameter = matches!(kind, TYPE_PARAMETER_KIND | METHOD_TYPE_PARAMETER_KIND);
+        if !name.is_ascii() || name.contains('\\') || (!type_parameter && name == "this") {
             return None;
         }
-        let kinds = if kind == TYPE_PARAMETER_KIND {
+        let kinds = if type_parameter {
             vec![SymbolKind::Type, SymbolKind::TypeParameter]
         } else {
             vec![SymbolKind::Value, SymbolKind::Parameter]
@@ -2414,6 +2417,7 @@ fn append_package_parameters(
         index_signatures,
         wrapped,
         destructured,
+        method_types,
     } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
@@ -2449,6 +2453,12 @@ fn append_package_parameters(
         facts,
         wrapped_parameters::accepted_owner,
     );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        method_types,
+        facts,
+        type_parameters::method,
+    );
 }
 
 #[derive(Default)]
@@ -2459,6 +2469,7 @@ struct ParameterDeclarations {
     index_signatures: Vec<crate::SyntaxSymbol>,
     wrapped: Vec<crate::SyntaxSymbol>,
     destructured: Vec<crate::SyntaxSymbol>,
+    method_types: Vec<crate::SyntaxSymbol>,
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
@@ -2475,6 +2486,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.wrapped
         } else if symbol.is_javascript_destructured_parameter() {
             &mut candidates.destructured
+        } else if symbol.is_typescript_method_type_parameter() {
+            &mut candidates.method_types
         } else {
             &mut candidates.values
         };
@@ -2630,6 +2643,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == DESTRUCTURED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(DESTRUCTURED_PARAMETER_KIND);
+    }
+    if name == METHOD_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(METHOD_TYPE_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

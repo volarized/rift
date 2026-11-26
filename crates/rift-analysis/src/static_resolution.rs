@@ -152,6 +152,10 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_union_property_start: Option<usize>,
     /// Union properties awaiting the capacity left by earlier package facts.
     pub(crate) deferred_typescript_union_properties: Vec<StaticOccurrence>,
+    /// First use of a TypeScript method type parameter after earlier edges.
+    pub(crate) typescript_method_type_parameter_start: Option<usize>,
+    /// Type parameter uses awaiting capacity after earlier package facts.
+    pub(crate) deferred_typescript_method_type_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -324,6 +328,10 @@ fn resolve_by<'source>(
     resolution.typescript_union_property_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_typescript_union_properties,
+    );
+    resolution.typescript_method_type_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_method_type_parameters,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -737,6 +745,7 @@ struct File<'source> {
     typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    typescript_method_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
@@ -917,6 +926,7 @@ impl<'source> File<'source> {
             typescript_type_parameters: BTreeMap::new(),
             javascript_wrapped_parameters: BTreeMap::new(),
             javascript_destructured_parameters: BTreeMap::new(),
+            typescript_method_type_parameters: BTreeMap::new(),
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
@@ -1230,6 +1240,8 @@ impl<'source> File<'source> {
                 self.javascript_wrapped_parameters.insert(name, symbol);
             } else if admitted && symbol.is_javascript_destructured_parameter() {
                 self.javascript_destructured_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_typescript_method_type_parameter() {
+                self.typescript_method_type_parameters.insert(name, symbol);
             } else if admitted && let Some(site) = site {
                 if symbol.is_typescript_signature_parameter()
                     || symbol.is_typescript_callable_type_parameter()
@@ -1413,6 +1425,10 @@ impl<'source> File<'source> {
                 ScopedParameterReads::JavaScriptDestructured,
                 !self.javascript_destructured_parameters.is_empty(),
             ),
+            (
+                ScopedParameterReads::TypeScriptMethodType,
+                !self.typescript_method_type_parameters.is_empty(),
+            ),
         ]
         .into_iter()
         .skip(earlier.map_or(0, |class| class as usize + 1))
@@ -1432,6 +1448,10 @@ impl<'source> File<'source> {
             (
                 ScopedParameterReads::JavaScriptDestructured,
                 !self.javascript_destructured_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptMethodType,
+                !self.typescript_method_type_parameters.is_empty(),
             ),
         ]
         .into_iter()
@@ -2009,7 +2029,7 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
-        let mut scoped_parameters = std::array::from_fn::<_, 8, _>(|_| VecDeque::new());
+        let mut scoped_parameters = std::array::from_fn::<_, 9, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -2476,7 +2496,8 @@ impl<'source> Index<'source> {
                         || !parameter_reads.methods.is_empty()
                         || !file.typescript_type_parameters.is_empty()
                         || !file.javascript_wrapped_parameters.is_empty()
-                        || !file.javascript_destructured_parameters.is_empty()))
+                        || !file.javascript_destructured_parameters.is_empty()
+                        || !file.typescript_method_type_parameters.is_empty()))
                 .then_some(DeferredReferences::EcmaScriptParameters {
                     reads: parameter_reads,
                     file_module,

@@ -757,6 +757,7 @@ struct EcmaScriptBindingDemand {
     typescript_index_signatures: BindingDemand,
     javascript_wrapped: BindingDemand,
     javascript_destructured: BindingDemand,
+    typescript_method_types: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -783,6 +784,7 @@ impl EcmaScriptBindingDemand {
             index_signature_slots,
             wrapped_slots,
             destructured_slots,
+            method_type_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -799,6 +801,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_index_signatures,
                 &self.javascript_wrapped,
                 &self.javascript_destructured,
+                &self.typescript_method_types,
             ],
             &mut slots,
             &mut bytes,
@@ -818,6 +821,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_index_signature_parameters(index_signature_slots)
             .with_javascript_wrapped_parameters(wrapped_slots)
             .with_javascript_destructured_parameters(destructured_slots)
+            .with_typescript_method_type_parameters(method_type_slots)
     }
 
     fn classify(
@@ -848,6 +852,8 @@ impl EcmaScriptBindingDemand {
             &mut self.javascript_wrapped
         } else if symbol.is_javascript_destructured_parameter() {
             &mut self.javascript_destructured
+        } else if symbol.is_typescript_method_type_parameter() {
+            &mut self.typescript_method_types
         } else if javascript {
             &mut self.javascript_functions
         } else if symbol
@@ -876,6 +882,7 @@ impl EcmaScriptBindingDemand {
             + self.typescript_index_signatures.count
             + self.javascript_wrapped.count
             + self.javascript_destructured.count
+            + self.typescript_method_types.count
     }
 }
 
