@@ -885,6 +885,20 @@ fn rst_embedded_aliases_follow_the_named_target() {
 }
 
 #[test]
+fn markdown_publication_omits_whitespace_only_blocks() {
+    for path in ["README.md", "guide.mdx"] {
+        let text = "\u{00a0}\u{2003}\n\nKept.\n\n```text\n  payload\n```\n";
+        let collection = collect(path, text);
+        let blocks = &collection.index().blocks;
+        assert_eq!(blocks.len(), 2, "{path}");
+        assert_eq!(exact_text(text, &blocks[0].range), "Kept.\n");
+        assert_eq!(blocks[1].kind, DocumentationBlockKind::Code);
+        assert!(exact_text(text, &blocks[1].range).contains("  payload"));
+        assert!(collect(path, "\u{2003}\n").index().blocks.is_empty());
+    }
+}
+
+#[test]
 fn rst_collection_keeps_code_block_language() {
     let text = ".. code-block:: rust\n\n    fn main() {}\n";
     let collection = collect("guide.rst", text);
