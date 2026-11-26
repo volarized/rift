@@ -803,10 +803,7 @@ fn publish(
         semantics,
         &mut records,
     )?;
-    records.retain_ecmascript_file_modules(package, analyzed, limits.declarations_max())?;
-    if matches!(package, SymbolOwner::Package { manager, .. } if manager == "npm") {
-        records.retain_ecmascript_file_module_edges(semantics, limits.edges_max());
-    }
+    records.retain_ecmascript_modules(package, analyzed, semantics, limits)?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));

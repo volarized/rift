@@ -2,25 +2,44 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::{SourceKind, SymbolId as CoreSymbolId};
+use rift_core::{SourceKind, SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId};
 
 use crate::WorkspaceSemantics;
 use rift_error::RiftError;
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
     index::{PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageSourceUnit, PackageSymbol},
-    read::{Digest, SymbolId, SymbolKind, TextRange},
+    read::{Digest, EdgeKind, SymbolId, SymbolKind, TextRange},
 };
 use rift_provider::AssembledSymbol;
 
 use super::{
-    AnalyzedFile, Records, bound, digest_of, javascript_module_source, truncation, wire_path,
-    wire_unit,
+    AnalyzedFile, ExactPackageLimits, Records, bound, digest_of, javascript_module_source,
+    truncation, wire_path, wire_unit,
 };
 
 impl Records {
-    /// Adds authored module references once both ends have retained declarations.
-    pub(super) fn retain_ecmascript_file_module_edges(
+    pub(super) fn retain_ecmascript_modules(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+    ) -> Result<(), RiftError> {
+        if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
+            self.retain_ecmascript_file_modules(
+                owner,
+                analyzed,
+                semantics,
+                limits.declarations_max(),
+            )?;
+            self.retain_ecmascript_file_module_edges(semantics, limits.edges_max());
+        }
+        Ok(())
+    }
+
+    /// Adds references to authored modules after their source units and targets have been retained.
+    fn retain_ecmascript_file_module_edges(
         &mut self,
         semantics: &WorkspaceSemantics,
         edge_limit: usize,
@@ -37,14 +56,25 @@ impl Records {
             .filter(|declaration| modules.contains(&declaration.symbol))
             .map(|declaration| (declaration.symbol.as_str(), declaration.unit.as_str()))
             .collect::<BTreeMap<_, _>>();
-        for (module, unit) in &declared {
-            let Ok(module) = CoreSymbolId::new((*module).to_owned()) else {
-                continue;
-            };
-            for edge in semantics.edges().outgoing(&module) {
-                if !edge.is_file_module_reference()
+        if declared.is_empty() {
+            return;
+        }
+        let source_units = declared.values().copied().collect::<BTreeSet<_>>();
+        let objects = self
+            .objects
+            .iter()
+            .filter_map(|object| object.id.as_ref())
+            .map(SymbolId::as_str)
+            .collect::<BTreeSet<_>>();
+        for kind in [EdgeKind::Imports, EdgeKind::Reads] {
+            let references = semantics
+                .edges()
+                .edges()
+                .filter(|edge| edge.is_file_module_reference() && edge.kind() == kind);
+            for edge in references {
+                if !objects.contains(edge.from().as_str())
                     || !declared.contains_key(edge.to().as_str())
-                    || edge.occurrence().unit().to_string() != *unit
+                    || !source_units.contains(edge.occurrence().unit().to_string().as_str())
                 {
                     continue;
                 }
@@ -61,18 +91,17 @@ impl Records {
     }
 
     /// Admits whole-file declarations after the earlier publication rows.
-    pub(super) fn retain_ecmascript_file_modules(
+    fn retain_ecmascript_file_modules(
         &mut self,
         owner: &SymbolOwner,
         analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
         declaration_limit: usize,
     ) -> Result<(), RiftError> {
-        if self.symbols_truncated
-            || !matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm")
-        {
+        if self.symbols_truncated {
             return Ok(());
         }
-        let modules = file_module_candidates(owner, analyzed, &self.units);
+        let modules = file_module_candidates(owner, analyzed, &self.units, semantics);
         let declared = self
             .declarations
             .iter()
@@ -85,8 +114,15 @@ impl Records {
             .filter_map(|(position, row)| Some((row.id.as_ref()?.0.clone(), position)))
             .collect::<BTreeMap<_, _>>();
         let declaration_limit = declaration_limit.min(bound(self.publication.symbols));
-        for (module, file) in modules {
-            let (Some(file), Ok(identity)) = (file, SymbolIdentity::parse(module.as_str())) else {
+        let checked = modules
+            .iter()
+            .filter_map(|(&module, &file)| Some((module, file?)));
+        let modules = checked
+            .clone()
+            .filter(|(_, (_, existing))| *existing)
+            .chain(checked.filter(|(_, (_, existing))| !*existing));
+        for (module, (file, _)) in modules {
+            let Ok(identity) = SymbolIdentity::parse(module.as_str()) else {
                 continue;
             };
             let [name] = identity.qualified_path() else {
@@ -178,13 +214,15 @@ fn file_module_candidates<'file>(
     owner: &SymbolOwner,
     analyzed: &'file [AnalyzedFile],
     units: &[PackageSourceUnit],
-) -> BTreeMap<&'file CoreSymbolId, Option<&'file AnalyzedFile>> {
+    semantics: &WorkspaceSemantics,
+) -> BTreeMap<&'file CoreSymbolId, Option<(&'file AnalyzedFile, bool)>> {
+    let proven_receivers = commonjs_module_source_units(semantics);
     let complete = units
         .iter()
         .filter(|unit| unit.source_complete)
         .map(|unit| unit.unit.as_str())
         .collect::<BTreeSet<_>>();
-    let mut modules = BTreeMap::<_, Option<&AnalyzedFile>>::new();
+    let mut modules = BTreeMap::<_, Option<(&AnalyzedFile, bool)>>::new();
     for file in analyzed {
         let syntax = file.file.syntax();
         let language = syntax.language().name.as_str();
@@ -196,8 +234,9 @@ fn file_module_candidates<'file>(
             (language, path.rsplit_once('.')),
             ("javascript", Some((_, "mjs" | "cjs"))) | ("typescript", Some((_, "mts" | "cts")))
         );
+        let previous = explicit || javascript_module_source(owner, file);
         let proven = matches!(language, "javascript" | "typescript")
-            && (explicit || javascript_module_source(owner, file))
+            && (previous || proven_receivers.contains(file.placement.unit()))
             && !syntax.has_errors()
             && syntax.left_out_declaration_count() == 0
             && syntax.primary_symbols_len() > 0
@@ -205,7 +244,20 @@ fn file_module_candidates<'file>(
         modules
             .entry(module)
             .and_modify(|file| *file = None)
-            .or_insert(proven.then_some(file));
+            .or_insert(proven.then_some((file, previous)));
     }
     modules
+}
+
+fn commonjs_module_source_units(semantics: &WorkspaceSemantics) -> BTreeSet<&CoreSourceUnitId> {
+    let edges = semantics.edges();
+    edges
+        .edges()
+        .filter(|edge| {
+            edge.is_file_module_reference()
+                && edge.kind() == EdgeKind::Reads
+                && edges.edge_module(edge.occurrence().unit()) == Some(edge.to())
+        })
+        .map(|edge| edge.occurrence().unit())
+        .collect()
 }

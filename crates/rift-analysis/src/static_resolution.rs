@@ -7,6 +7,7 @@ mod javascript_edges;
 mod javascript_exports;
 mod javascript_member_callbacks;
 mod javascript_members;
+mod javascript_modules;
 mod javascript_parameters;
 mod javascript_reexports;
 mod javascript_scopes;
@@ -83,6 +84,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_overload_parameter_start: Option<usize>,
     /// First reference to an authored file module from an ECMAScript module pass.
     pub(crate) file_module_start: Option<usize>,
+    /// First qualifier reference after the file module specifiers.
+    pub(crate) file_module_qualifier_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -247,6 +250,7 @@ enum DeferredReferences<'source> {
         file_module: bool,
     },
     EcmaScriptModuleSpecifiers,
+    EcmaScriptModuleQualifiers,
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -1620,7 +1624,8 @@ impl<'source> Index<'source> {
                         | DeferredReferences::PythonVariadics
                         | DeferredReferences::EcmaScriptParameters { .. }
                         | DeferredReferences::TypeScriptMethodParameters { .. }
-                        | DeferredReferences::EcmaScriptModuleSpecifiers => {
+                        | DeferredReferences::EcmaScriptModuleSpecifiers
+                        | DeferredReferences::EcmaScriptModuleQualifiers => {
                             &mut deferred_references
                         }
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
@@ -1674,6 +1679,7 @@ impl<'source> Index<'source> {
         let mut python_receiver_sites = VecDeque::new();
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
+        let mut module_qualifiers = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1692,6 +1698,7 @@ impl<'source> Index<'source> {
                 None
             })
             .or_else(|| module_specifiers.pop_front())
+            .or_else(|| module_qualifiers.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1727,6 +1734,7 @@ impl<'source> Index<'source> {
                         &mut typescript_method_sites
                     }
                     DeferredReferences::EcmaScriptModuleSpecifiers => &mut module_specifiers,
+                    DeferredReferences::EcmaScriptModuleQualifiers => &mut module_qualifiers,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1880,6 +1888,13 @@ impl<'source> Index<'source> {
                     .file_module_start
                     .get_or_insert(resolution.occurrences.len());
                 self.javascript_module_specifiers(file, work, resolution);
+                Some(DeferredReferences::EcmaScriptModuleQualifiers)
+            }
+            DeferredReferences::EcmaScriptModuleQualifiers => {
+                resolution
+                    .file_module_qualifier_start
+                    .get_or_insert(resolution.occurrences.len());
+                self.javascript_module_qualifiers(file, work, resolution);
                 None
             }
             DeferredReferences::Rust {

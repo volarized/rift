@@ -1058,3 +1058,63 @@ fn empty_file_module_objects_follow_existing_module_edge_owners_at_the_cap() {
     );
     assert!(capped.symbols_truncated);
 }
+
+#[test]
+fn npm_commonjs_module_reads_follow_the_written_binding() {
+    const SOURCE: &str = concat!(
+        "const neighbor = require('./neighbor.js');\n",
+        "const replaced = require('./neighbor.js');\n",
+        "replaced = { value: 5 };\n",
+        "exports.result = function result() { return exports.answer + neighbor.value; };\n",
+        "exports.answer = 3;\n",
+        "function shadow(exports, neighbor) { return exports.answer + neighbor.value; }\n",
+        "replaced.value;\n",
+    );
+    let analysis = analyze_javascript_module(
+        "commonjs",
+        "index.js",
+        SOURCE,
+        "neighbor.js",
+        "exports.value = 4;\n",
+    );
+    let found = analysis.publication();
+    found.validate_facts().expect("valid module publication");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.js")
+        .expect("checked CommonJS unit");
+    let module = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon";
+    let neighbor = format!("{module}%2Fneighbor.js");
+    for target in [module, neighbor.as_str()] {
+        assert!(found.declarations.iter().any(|row| {
+            row.symbol.as_str() == target && row.range.start == 0 && row.source_complete
+        }));
+    }
+    let reads_module = |start: usize, spelling: &str, target: &str| {
+        found.edges.iter().any(|edge| {
+            edge.to.as_str() == target
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == unit.unit
+                        && occurrence.range == module_runtime_range(start, spelling)
+                })
+        })
+    };
+    let top = SOURCE
+        .find("exports.result")
+        .expect("written module receiver");
+    let read = SOURCE.find("exports.answer").expect("written own export");
+    let sibling = SOURCE
+        .find("neighbor.value")
+        .expect("written imported module");
+    assert!(reads_module(top, "exports", module));
+    assert!(reads_module(read, "exports", module));
+    assert!(reads_module(sibling, "neighbor", &neighbor));
+    let shadow = SOURCE.rfind("exports.answer").expect("shadowed exports");
+    let shadow_neighbor = SOURCE.rfind("neighbor.value").expect("shadowed namespace");
+    let replaced = SOURCE.find("replaced.value").expect("reassigned namespace");
+    assert!(!reads_module(shadow, "exports", module));
+    assert!(!reads_module(shadow_neighbor, "neighbor", &neighbor));
+    assert!(!reads_module(replaced, "replaced", &neighbor));
+}

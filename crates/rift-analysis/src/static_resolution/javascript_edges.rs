@@ -651,7 +651,7 @@ impl<'source> Index<'source> {
         self.javascript_import_module_occurrence(file, binding.name, written, work)
     }
 
-    fn javascript_module_occurrence(
+    pub(super) fn javascript_module_occurrence(
         &self,
         file: &File<'source>,
         range: ByteRange,
@@ -882,6 +882,17 @@ impl<'source> Index<'source> {
         {
             return None;
         }
+        let imported = self.javascript_specifier_file(file, module, require, work)?;
+        self.javascript_import_module_occurrence(file, range, imported, work)
+    }
+
+    pub(super) fn javascript_specifier_file(
+        &self,
+        file: &File<'source>,
+        module: ByteRange,
+        require: bool,
+        work: &mut Work,
+    ) -> Option<&File<'source>> {
         let current = file.document.path.as_str();
         let path = javascript_exports::relative_path(current, file.text(module)?, work)?;
         let declaration_only = javascript_exports::is_declaration_file(current);
@@ -900,6 +911,6 @@ impl<'source> Index<'source> {
             )
         }?;
         imported.document.placement.logical_identity(".")?;
-        self.javascript_import_module_occurrence(file, range, imported, work)
+        Some(imported)
     }
 }
