@@ -1399,14 +1399,18 @@ impl IndexContents {
         );
         // The entry paths of a package manifest come last: they fit the remaining bounds or
         // stay unobserved, which leaves the entry unresolved and never refuses the build.
-        let (entries, builds): (Vec<_>, Vec<_>) =
-            manifests.partition(|file| file.path().as_str() == PACKAGE_MANIFEST);
+        let npm_manifest =
+            |path: &ProjectPath| path.as_str().rsplit('/').next() == Some(PACKAGE_MANIFEST);
+        let (mut entries, builds): (Vec<_>, Vec<_>) =
+            manifests.partition(|file| npm_manifest(file.path()));
+        // A nested entry must never consume the observations of the package root.
+        entries.sort_by_key(|entry| entry.path().as_str() != PACKAGE_MANIFEST);
         for file in builds.into_iter().chain(entries) {
             check_cancelled(cancelled)?;
             if let Some(requested) = rift_analysis::build_paths(file, &files, limits.syntax()) {
                 let count = files.len() + metadata.len() + paths.len() + requested.len();
                 let length = requested.iter().map(|path| path.0.len()).sum::<usize>();
-                if file.path().as_str() == PACKAGE_MANIFEST
+                if npm_manifest(file.path())
                     && (count > limits.files_max()
                         || bytes.saturating_add(length) > limits.workspace_bytes_max())
                 {
@@ -13802,6 +13806,256 @@ mod tests {
                 .range,
             range
         );
+    }
+
+    type CommonJsFolderCase = (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        bool,
+        Option<&'static str>,
+    );
+
+    const COMMONJS_FOLDER_INDEX: &str = "rift://symbol/local/javascript/.%2Fsub%2Findex.js/open";
+
+    #[test]
+    fn captured_commonjs_folder_observes_earlier_runtime_paths() {
+        const MISSING: &str = r#"{"main":"missing"}"#;
+        check_commonjs_folder_paths(&[
+            ("", MISSING, None, true, Some(COMMONJS_FOLDER_INDEX)),
+            ("/", MISSING, None, true, Some(COMMONJS_FOLDER_INDEX)),
+            ("", MISSING, Some("sub.json"), true, None),
+            ("", MISSING, Some("sub.node"), true, None),
+            (
+                "/",
+                MISSING,
+                Some("sub.json"),
+                true,
+                Some(COMMONJS_FOLDER_INDEX),
+            ),
+            (
+                "/",
+                MISSING,
+                Some("sub.node"),
+                true,
+                Some(COMMONJS_FOLDER_INDEX),
+            ),
+            ("", MISSING, Some("sub/missing.json"), true, None),
+            (
+                "",
+                MISSING,
+                Some("sub/missing.ts"),
+                true,
+                Some(COMMONJS_FOLDER_INDEX),
+            ),
+            ("", MISSING, None, false, None),
+            ("", r#"{"main":"#, None, true, None),
+            ("", r#"{"main":"../../outside"}"#, None, true, None),
+            (
+                "",
+                r#"{"main":"data.json"}"#,
+                Some("sub/data.json"),
+                true,
+                None,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn captured_commonjs_folder_observes_explicit_script_candidates() {
+        const WRITTEN_SCRIPT: &str = r#"{"main":"entry.js"}"#;
+        check_commonjs_folder_paths(&[
+            ("", WRITTEN_SCRIPT, None, true, Some(COMMONJS_FOLDER_INDEX)),
+            ("", WRITTEN_SCRIPT, None, false, None),
+            ("", WRITTEN_SCRIPT, Some("sub.json"), true, None),
+            (
+                "/",
+                WRITTEN_SCRIPT,
+                Some("sub.json"),
+                true,
+                Some(COMMONJS_FOLDER_INDEX),
+            ),
+            ("", WRITTEN_SCRIPT, Some("sub/entry.js.json"), true, None),
+            ("", WRITTEN_SCRIPT, Some("sub/entry.js.node"), true, None),
+            (
+                "",
+                WRITTEN_SCRIPT,
+                Some("sub/entry.js"),
+                true,
+                Some("rift://symbol/local/javascript/.%2Fsub%2Fentry.js/open"),
+            ),
+            (
+                "",
+                WRITTEN_SCRIPT,
+                Some("sub/entry.js"),
+                false,
+                Some("rift://symbol/local/javascript/.%2Fsub%2Fentry.js/open"),
+            ),
+            (
+                "",
+                WRITTEN_SCRIPT,
+                Some("sub/entry.js.js"),
+                true,
+                Some("rift://symbol/local/javascript/.%2Fsub%2Fentry.js.js/open"),
+            ),
+            (
+                "",
+                WRITTEN_SCRIPT,
+                Some("sub/entry.js/index.js"),
+                true,
+                Some("rift://symbol/local/javascript/.%2Fsub%2Fentry.js%2Findex.js/open"),
+            ),
+        ]);
+    }
+
+    fn check_commonjs_folder_paths(cases: &[CommonJsFolderCase]) {
+        use rift_protocol::read::EdgeKind;
+
+        const CALLER: &str = "var i = require('./index');\nfunction use() { i.open(); }\nmodule.exports.use = use;\n";
+        for &(suffix, manifest, earlier_file, index, expected) in cases {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            fs::create_dir(root.join("sub")).expect("nested folder");
+            fs::write(root.join("sub/package.json"), manifest).expect("nested manifest");
+            fs::write(
+                root.join("package.json"),
+                r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#,
+            )
+            .expect("package manifest");
+            fs::write(
+                root.join("index.js"),
+                format!("module.exports = require('./sub{suffix}');\n"),
+            )
+            .expect("package entry");
+            fs::write(root.join("user.js"), CALLER).expect("caller");
+            if index {
+                fs::write(
+                    root.join("sub/index.js"),
+                    "exports.open = function open() {};\n",
+                )
+                .expect("nested index");
+            }
+            if let Some(earlier_file) = earlier_file {
+                let earlier_file = root.join(earlier_file);
+                fs::create_dir_all(earlier_file.parent().expect("runtime parent"))
+                    .expect("runtime directory");
+                let source = if earlier_file
+                    .extension()
+                    .is_some_and(|extension| extension == "js")
+                {
+                    "exports.open = function open() {};\n"
+                } else {
+                    "{}"
+                };
+                fs::write(earlier_file, source).expect("earlier runtime file");
+            }
+            let workspace = WorkspaceIndex::build(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("full workspace capture");
+            for (kind, source) in [
+                (
+                    EdgeKind::Aliases,
+                    "rift://symbol/local/javascript/beacon/open",
+                ),
+                (
+                    EdgeKind::Calls,
+                    "rift://symbol/local/javascript/.%2Fuser.js/use",
+                ),
+            ] {
+                let source = rift_core::SymbolId::new(source).expect("source identity");
+                let edges = workspace
+                    .edges()
+                    .outgoing(&source)
+                    .iter()
+                    .filter(|edge| edge.kind() == kind)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    edges
+                        .iter()
+                        .map(|edge| edge.to().as_str())
+                        .collect::<Vec<_>>(),
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "{suffix} {manifest} {earlier_file:?} {kind:?}",
+                );
+                if kind == EdgeKind::Calls {
+                    for edge in edges {
+                        let range = edge.occurrence().range();
+                        let start = usize::try_from(range.start()).expect("fixture call start");
+                        let end = usize::try_from(range.end()).expect("fixture call end");
+                        assert_eq!(CALLER.get(start..end), Some("i.open()"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_folder_paths_leave_declaration_and_esm_forwards_unchanged() {
+        use rift_protocol::read::EdgeKind;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir(root.join("sub")).expect("nested folder");
+        for (path, source) in [
+            (
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+            ),
+            ("index.js", "export { open } from './sub';\n"),
+            ("index.d.ts", "export { open } from './sub';\n"),
+            (
+                "sub/package.json",
+                r#"{"main":"missing","types":"types.d.ts"}"#,
+            ),
+            ("sub/index.js", "export function open() {}\n"),
+            (
+                "sub/types.d.ts",
+                "export declare function open(): number;\n",
+            ),
+        ] {
+            fs::write(root.join(path), source).expect("captured source");
+        }
+        let workspace = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("full workspace capture");
+        assert_eq!(
+            workspace
+                .build_paths()
+                .get(&rift_protocol::read::ProjectPath(
+                    "sub/missing.json".to_owned()
+                )),
+            Some(&None),
+        );
+        for (language, expected) in [
+            ("javascript", None),
+            (
+                "typescript",
+                Some("rift://symbol/local/typescript/.%2Fsub%2Ftypes.d.ts/open"),
+            ),
+        ] {
+            let source =
+                rift_core::SymbolId::new(format!("rift://symbol/local/{language}/beacon/open"))
+                    .expect("entry identity");
+            assert_eq!(
+                workspace
+                    .edges()
+                    .outgoing(&source)
+                    .iter()
+                    .filter(|edge| edge.kind() == EdgeKind::Aliases)
+                    .map(|edge| edge.to().as_str())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{language}",
+            );
+        }
     }
 
     #[test]
