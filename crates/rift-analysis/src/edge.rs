@@ -457,6 +457,71 @@ fn admit_occurrences<'a>(
     }
 }
 
+fn static_admission_batches<'a>(
+    spans: &'a DefinitionSpans,
+    edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
+    resolution: &'a mut StaticResolution,
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 22] {
+    let supplemental_start = resolution.supplemental_start.take();
+    let (alias, alias_external) = resolution
+        .rust_extern_alias_start
+        .take()
+        .map_or((None, resolution.external.len()), |(internal, external)| {
+            (Some(internal), external)
+        });
+    let tail_starts = [
+        resolution.late_supplemental_start.take(),
+        resolution.python_reassignment_start.take(),
+        resolution.python_capture_start.take(),
+        resolution.python_receiver_start.take(),
+        resolution.python_variadic_start.take(),
+        resolution.python_initializer_start.take(),
+        resolution.python_quoted_type_start.take(),
+        resolution.python_overload_parameter_start.take(),
+        resolution.file_module_start.take(),
+        resolution.file_module_qualifier_start.take(),
+        resolution.literal_start.take(),
+        resolution.callback_parameter_start.take(),
+        resolution.overload_parameter_start.take(),
+        alias,
+        resolution.rust_receiver_start.take(),
+        resolution.rust_generic_start.take(),
+        resolution.rust_library_root_start.take(),
+        resolution.rust_crate_paths_start.take(),
+        resolution.rust_crate_visibility_start.take(),
+        resolution.rust_argument_value_start.take(),
+    ];
+    let mut boundaries = [0; 23];
+    let mut next = resolution.occurrences.len();
+    boundaries[22] = next;
+    for (boundary, start) in boundaries[2..22].iter_mut().zip(tail_starts).rev() {
+        next = start.unwrap_or(next);
+        *boundary = next;
+    }
+    let (internal, external) = supplemental_start.unwrap_or((boundaries[2], alias_external));
+    boundaries[1] = internal;
+    let (incumbent_external, alias_external_rows) = resolution.external.split_at(alias_external);
+    let (primary_external, supplemental_external) = incumbent_external.split_at(external);
+    let mut batches = std::array::from_fn(|index| {
+        let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
+        let mut edges = BTreeMap::new();
+        admit_occurrences(
+            rows,
+            spans,
+            edge_modules,
+            &mut edges,
+            matches!(index, 10 | 11),
+        );
+        edges
+    });
+    admit_external(primary_external, spans, edge_modules, &mut batches[0]);
+    admit_external(supplemental_external, spans, edge_modules, &mut batches[1]);
+    admit_external(alias_external_rows, spans, edge_modules, &mut batches[15]);
+    // Rust's later resolution precedes the additional ECMAScript rows at admission.
+    batches[10..].rotate_left(5);
+    batches
+}
+
 impl EdgeStore {
     fn add_static(
         &mut self,
@@ -464,125 +529,19 @@ impl EdgeStore {
         resolution: &mut StaticResolution,
         edges_max: usize,
     ) {
-        let supplemental_start = resolution.supplemental_start.take();
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
-        let rust_crate_visibility = resolution
-            .rust_crate_visibility_start
-            .take()
-            .unwrap_or(resolution.occurrences.len());
-        let rust_crate_paths = resolution
-            .rust_crate_paths_start
-            .take()
-            .unwrap_or(rust_crate_visibility);
-        let rust_library_root = resolution
-            .rust_library_root_start
-            .take()
-            .unwrap_or(rust_crate_paths);
-        let rust_generic = resolution
-            .rust_generic_start
-            .take()
-            .unwrap_or(rust_library_root);
-        let rust_receiver = resolution
-            .rust_receiver_start
-            .take()
-            .unwrap_or(rust_generic);
-        let (alias, alias_external) = resolution
-            .rust_extern_alias_start
-            .take()
-            .unwrap_or((rust_receiver, resolution.external.len()));
-        let (incumbent_external, alias_external_rows) = resolution.external.split_at(alias_external);
-        let mut next_start = alias;
-        let [
-            typescript_overload,
-            callback,
-            literal,
-            module_qualifier,
-            file_module,
-            overload,
-            quoted_type,
-            initializer,
-            variadic,
-            receiver,
-            capture,
-            reassigned,
-            late,
-        ] = [
-            resolution.overload_parameter_start.take(),
-            resolution.callback_parameter_start.take(),
-            resolution.literal_start.take(),
-            resolution.file_module_qualifier_start.take(),
-            resolution.file_module_start.take(),
-            resolution.python_overload_parameter_start.take(),
-            resolution.python_quoted_type_start.take(),
-            resolution.python_initializer_start.take(),
-            resolution.python_variadic_start.take(),
-            resolution.python_receiver_start.take(),
-            resolution.python_capture_start.take(),
-            resolution.python_reassignment_start.take(),
-            resolution.late_supplemental_start.take(),
-        ]
-        .map(|start| {
-            next_start = start.unwrap_or(next_start);
-            next_start
-        });
-        let (internal, external) = supplemental_start.unwrap_or((late, alias_external));
-        let boundaries = [
-            0,
-            internal,
-            late,
-            reassigned,
-            capture,
-            receiver,
-            variadic,
-            initializer,
-            quoted_type,
-            overload,
-            file_module,
-            module_qualifier,
-            literal,
-            callback,
-            typescript_overload,
-            alias,
-            rust_receiver,
-            rust_generic,
-            rust_library_root,
-            rust_crate_paths,
-            rust_crate_visibility,
-            resolution.occurrences.len(),
-        ];
-        let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 21] = std::array::from_fn(|index| {
-            let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
-            let mut edges = BTreeMap::new();
-            admit_occurrences(
-                rows,
-                spans,
-                &self.edge_modules,
-                &mut edges,
-                matches!(index, 10 | 11),
-            );
-            edges
-        });
-        admit_external(external, spans, &self.edge_modules, &mut batches[0]);
-        admit_external(
-            supplemental_external,
-            spans,
-            &self.edge_modules,
-            &mut batches[1],
-        );
-        admit_external(alias_external_rows, spans, &self.edge_modules, &mut batches[15]);
-        // Rust's later resolution still precedes the additional ECMAScript rows at admission.
-        batches[10..].rotate_left(5);
+        let mut batches = static_admission_batches(spans, &self.edge_modules, resolution);
         self.deduplicate_static_batches(&mut batches);
         for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);
-            *dropped_edges =
-                dropped_edges.saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
+            self.dropped_edges = self
+                .dropped_edges
+                .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
             remaining -= fits;
             changed |= fits > 0;
             edges.truncate(fits);
@@ -591,15 +550,18 @@ impl EdgeStore {
             }
             // The admitted list becomes the outgoing list's tail: one copy per direction.
             for edge in &edges {
-                incoming
+                self.incoming
                     .entry(edge.to.clone())
                     .or_default()
                     .push(edge.clone());
             }
-            outgoing.entry(from.clone()).or_default().append(&mut edges);
+            self.outgoing
+                .entry(from.clone())
+                .or_default()
+                .append(&mut edges);
         }
         if changed {
-            for edges in outgoing.values_mut().chain(incoming.values_mut()) {
+            for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
                 edges.sort_by(edge_order);
                 edges.dedup();
             }

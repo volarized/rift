@@ -16,7 +16,54 @@ impl<'source> Index<'source> {
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
-        if file.facts.rust_value_reads().is_empty() {
+        self.rust_value_candidates(
+            file,
+            file.facts.rust_value_reads().iter().copied(),
+            work,
+            result,
+        );
+    }
+
+    /// Resolves authored argument value paths after the established edge passes.
+    pub(in crate::static_resolution) fn resolve_rust_argument_values(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self
+            .files
+            .values()
+            .filter(|file| !file.facts.rust_argument_value_reads().is_empty())
+        {
+            if !work.charge() {
+                break;
+            }
+            let candidates =
+                file.facts
+                    .rust_argument_value_reads()
+                    .iter()
+                    .map(|&range| StaticRustValueRead {
+                        range,
+                        pattern: false,
+                    });
+            self.rust_value_candidates(file, candidates, work, result);
+            if work.exhausted {
+                break;
+            }
+        }
+        result.rust_argument_value_start = (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn rust_value_candidates(
+        &self,
+        file: &File<'source>,
+        reads: impl Iterator<Item = StaticRustValueRead>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let mut reads = reads.peekable();
+        if reads.peek().is_none() {
             return;
         }
         let mut local_values: BTreeMap<&str, Vec<ByteRange>> = BTreeMap::new();
@@ -30,7 +77,7 @@ impl<'source> Index<'source> {
                 local_values.entry(name).or_default().push(scope);
             }
         }
-        for read in file.facts.rust_value_reads() {
+        for read in reads {
             if !work.charge() {
                 return;
             }
@@ -98,7 +145,7 @@ impl<'source> Index<'source> {
                 {
                     continue;
                 }
-                _ => self.rust.value_read_target(file, *read, &parts, bare, work),
+                _ => self.rust.value_read_target(file, read, &parts, bare, work),
             };
             let occurrence = target.and_then(|target| {
                 let terminal = text.as_bytes().subslice_range(parts.last()?.as_bytes())?;

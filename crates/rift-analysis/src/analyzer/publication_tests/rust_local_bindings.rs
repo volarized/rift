@@ -667,3 +667,62 @@ pub fn choose(pair: (u8, u8)) -> u8 {
     assert_eq!(admit(&mut capped, digest, cap).dropped_at_limit, 3);
     assert_eq!(capped, existing);
 }
+
+#[test]
+fn package_rust_value_paths_read_direct_arguments_without_replacing_calls() {
+    let source = "pub mod limits { pub const MAXIMUM: u8 = 2; }
+pub fn leaf() -> u8 { 1 }
+pub fn consume(number: u8, pending: fn() -> u8) -> u8 { number + pending() }
+pub fn run() -> u8 { consume(limits::MAXIMUM, leaf) }
+pub fn shadow(leaf: fn() -> u8) -> u8 { consume(0, leaf) }
+#[cfg(any())]
+pub fn inactive() -> u8 { consume(limits::MAXIMUM, leaf) }
+";
+    let source = &format!("{source}\npub fn bulk() {{ {} }}", "leaf(); ".repeat(128));
+    let full = analyze(source);
+    let argument_reads = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from.as_str().ends_with("/run")
+            && (edge.to.as_str().ends_with("/limits/MAXIMUM")
+                || edge.to.as_str().ends_with("/leaf"))
+    };
+    for (written, target, span) in [
+        ("MAXIMUM, leaf", "/limits/MAXIMUM", 7),
+        ("leaf) }", "/leaf", 4),
+    ] {
+        assert!(full.edges.iter().any(|edge| {
+            let start = position(source, written);
+            argument_reads(edge)
+                && edge.to.as_str().ends_with(target)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range.start == start && site.range.end == start + span)
+        }));
+    }
+    assert!(full.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/run")
+            && edge.to.as_str().ends_with("/consume")
+    }));
+    assert!(full.edges.iter().all(|edge| {
+        edge.kinds != [EdgeKind::Reads]
+            || !(edge.from.as_str().ends_with("/inactive")
+                || (edge.from.as_str().ends_with("/shadow")
+                    && edge.to.as_str().ends_with("/leaf")
+                    && !edge.to.as_str().contains("/shadow/")))
+    }));
+    let established = full
+        .edges
+        .iter()
+        .filter(|edge| !argument_reads(edge))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounded = analyze_with_limits(
+        source,
+        ExactPackageLimits::new(2, 1 << 20)
+            .with_edges(established.len())
+            .expect("existing edge capacity"),
+    );
+    assert_eq!(bounded.edges, established);
+}

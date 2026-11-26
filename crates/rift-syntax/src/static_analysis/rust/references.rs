@@ -124,6 +124,8 @@ impl Kinds {
                 range: byte_range(element)?,
                 pattern: terminal_pattern,
             });
+        } else if parent.kind() == "arguments" && element.kind_id() != self.scoped_type_identifier {
+            facts.rust_argument_value_reads.push(byte_range(element)?);
         }
         Ok(())
     }

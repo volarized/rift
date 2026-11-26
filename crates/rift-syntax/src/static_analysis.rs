@@ -540,6 +540,8 @@ pub struct StaticFactsParts {
     pub rust_uses: Vec<StaticRustUse>,
     /// Rust value paths and named pattern terminals.
     pub rust_value_reads: Vec<StaticRustValueRead>,
+    /// Rust value paths written directly as call arguments.
+    pub rust_argument_value_reads: Vec<ByteRange>,
     /// Direct uses of generic parameters in type annotations.
     pub rust_generic_references: Vec<StaticRustGenericReference>,
     /// Written crate-root tokens in paths.
@@ -665,6 +667,12 @@ impl StaticFacts {
                     .and_then(|(start, end)| source.get(start..end))
                     .is_some_and(crate::rust::local_bindings::plain_name)
         })
+    }
+
+    /// Rust value paths written directly as call arguments.
+    #[must_use]
+    pub fn rust_argument_value_reads(&self) -> &[ByteRange] {
+        &self.0.rust_argument_value_reads
     }
 
     /// Direct uses of generic parameters in type annotations.
@@ -1077,6 +1085,7 @@ impl StaticFacts {
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.rust_value_reads),
+            vector_capacity(&self.0.rust_argument_value_reads),
             vector_capacity(&self.0.rust_generic_references),
             vector_capacity(&self.0.rust_crate_paths),
             vector_capacity(&self.0.rust_crate_visibility),
@@ -1166,6 +1175,7 @@ impl StaticFacts {
             self.inherent_impls().len(),
             self.rust_uses().len(),
             self.rust_value_reads().len(),
+            self.rust_argument_value_reads().len(),
             self.rust_generic_references().len(),
             self.rust_crate_paths().len(),
             self.rust_crate_visibility().len(),
@@ -1241,6 +1251,7 @@ impl StaticFacts {
         imports
             && conditional
             && self.rust_value_reads().iter().all(|read| valid(read.range))
+            && self.rust_argument_value_reads().iter().copied().all(valid)
             && self
                 .rust_generic_references()
                 .windows(2)
