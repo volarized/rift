@@ -1283,3 +1283,60 @@ fn npm_commonjs_module_reads_follow_the_written_binding() {
     assert!(!reads_module(shadow_neighbor, "neighbor", &neighbor));
     assert!(!reads_module(replaced, "replaced", &neighbor));
 }
+
+#[test]
+fn npm_constructor_calls_an_imported_stable_class_value() {
+    const SOURCE: &str = concat!(
+        "import { Target, Variable } from './target.mjs';\n",
+        "var Holder = class {\n",
+        "  constructor() {\n",
+        "    this.target = new Target();\n",
+        "    this.variable = new Variable();\n",
+        "  }\n",
+        "};\n",
+        "export { Holder };\n",
+    );
+    const TARGET: &str = concat!(
+        "var Target = class { constructor() { this.name = 'target'; } };\n",
+        "var Variable = class {};\n",
+        "Variable = function () {};\n",
+        "export { Target, Variable };\n",
+    );
+    let analysis = analyze_javascript_module("module", "index.mjs", SOURCE, "target.mjs", TARGET);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid constructor references");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("checked constructor unit");
+    let module = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon";
+    let from = format!("{module}/Holder/constructor");
+    for (written, suffix, expected) in [
+        ("new Target()", "Target", true),
+        ("new Variable()", "Variable", false),
+    ] {
+        let target = format!("{module}%2Ftarget.mjs/{suffix}");
+        assert!(
+            found
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str() == target)
+        );
+        let start = SOURCE.find(written).expect("written construction");
+        assert_eq!(
+            found.edges.iter().any(|edge| {
+                edge.from.as_str() == from
+                    && edge.to.as_str() == target
+                    && edge.kinds == [EdgeKind::Calls]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == unit.unit && site.range == module_runtime_range(start, written)
+                    })
+            }),
+            expected,
+            "{written}"
+        );
+    }
+}

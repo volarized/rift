@@ -349,7 +349,9 @@ impl<'source> Exports<'_, 'source> {
             return self.required_member(file, binding, member, work);
         }
         match binding.kind {
-            StaticBindingKind::Local => Some(Export::Declaration(binding.name)),
+            StaticBindingKind::Local | StaticBindingKind::JavaScriptClassValue { .. } => {
+                Some(Export::Declaration(binding.name))
+            }
             StaticBindingKind::JavaScriptImport { module, export } => Some(Export::Reexport {
                 module: file.text(module)?,
                 name: export
