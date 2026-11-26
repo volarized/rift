@@ -1,9 +1,9 @@
 import "@/app/global.css";
-import "@fontsource/geist-mono/400.css";
-import "@fontsource/geist-mono/500.css";
-import "@fontsource/inter/300.css";
-import "@fontsource/inter/400.css";
-import "@fontsource/inter/500.css";
+
+// Next emits the Fontsource WOFF2 files as same-origin build assets.
+import "@fontsource-variable/instrument-sans";
+import "@fontsource-variable/instrument-sans/wght-italic.css";
+import "@fontsource-variable/jetbrains-mono";
 import { RootProvider } from "fumadocs-ui/provider/next";
 import type { Metadata } from "next";
 
