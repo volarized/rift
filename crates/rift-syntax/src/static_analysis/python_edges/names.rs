@@ -106,13 +106,18 @@ impl<'source> Names<'source> {
         name: ByteRange,
         scope: ByteRange,
         end: u64,
+        capturable: bool,
     ) {
         if let Some(spelling) = text(source, name) {
             self.direct_locals
                 .entry(spelling)
                 .or_default()
                 .entry(scope)
-                .or_insert(DirectLocal { name, end });
+                .or_insert(DirectLocal {
+                    name,
+                    end,
+                    capturable,
+                });
         }
     }
 }
@@ -121,6 +126,7 @@ impl<'source> Names<'source> {
 struct DirectLocal {
     name: ByteRange,
     end: u64,
+    capturable: bool,
 }
 
 /// What one name does where it is written.
@@ -264,6 +270,7 @@ impl EdgePythonKinds {
                 byte_range(target)?,
                 self.scope_range(owner.syntax_element())?,
                 byte_range(assignment)?.end,
+                true,
             );
         }
         Ok(())
@@ -294,6 +301,47 @@ impl EdgePythonKinds {
         .then_some(scope)
     }
 
+    /// A named function declared directly in another function's authored body.
+    fn enclosing_local_function<'tree>(&self, scope: Node<'tree>) -> Option<Node<'tree>> {
+        let block = scope
+            .parent()
+            .filter(|parent| parent.kind_id() == self.block)?;
+        let outer = block.parent()?;
+        (outer.kind_id() == self.definitions[0]
+            && outer.child_by_field_id(self.body) == Some(block))
+        .then_some(outer)
+    }
+
+    fn edge_local_read(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        range: ByteRange,
+        facts: &mut StaticFactsParts,
+        names: &Names<'_>,
+    ) -> Result<(), RiftError> {
+        let Some(assignments) = text(source, range).and_then(|name| names.direct_locals.get(name))
+        else {
+            return Ok(());
+        };
+        let Some(scope) = self.direct_local_read_scope(visited) else {
+            return Ok(());
+        };
+        let inner = byte_range(scope)?;
+        if let Some(local) = assignments.get(&inner) {
+            if local.end <= range.start {
+                facts.python_local_reads.push((range, local.name));
+            }
+        } else if let Some(outer) = self.enclosing_local_function(scope)
+            && let Some(local) = assignments.get(&byte_range(outer)?)
+            && local.capturable
+            && local.end <= inner.start
+        {
+            facts.python_captured_local_reads.push((range, local.name));
+        }
+        Ok(())
+    }
+
     /// Records what a name outside annotations does.
     pub(super) fn edge_name(
         &self,
@@ -309,15 +357,7 @@ impl EdgePythonKinds {
             NameUse::Stated => return Ok(()),
             NameUse::Read => {
                 names.reads.push(range);
-                if let Some(assignments) =
-                    text(source, range).and_then(|name| names.direct_locals.get(name))
-                    && let Some(scope) = self.direct_local_read_scope(visited)
-                    && let Some(local) = assignments.get(&byte_range(scope)?)
-                    && local.end <= range.start
-                {
-                    facts.python_local_reads.push((range, local.name));
-                }
-                return Ok(());
+                return self.edge_local_read(visited, source, range, facts, names);
             }
             NameUse::Assigned | NameUse::Bound | NameUse::Augmented | NameUse::Deleted => {}
         }

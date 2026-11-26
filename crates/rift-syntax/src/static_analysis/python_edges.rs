@@ -569,7 +569,13 @@ impl EdgePythonKinds {
                     && crate::python::parameter_name(parameter) == Some(name)
                 {
                     let scope_range = self.scope_range(scope)?;
-                    names.direct_binding(source, byte_range(name)?, scope_range, scope_range.start);
+                    names.direct_binding(
+                        source,
+                        byte_range(name)?,
+                        scope_range,
+                        scope_range.start,
+                        false,
+                    );
                 }
                 facts.bindings.push(self.scoped_binding(
                     name,

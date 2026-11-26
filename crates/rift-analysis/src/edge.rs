@@ -455,10 +455,14 @@ impl EdgeStore {
         edges_max: usize,
     ) {
         let supplemental_start = resolution.supplemental_start.take();
+        let capture_start = resolution
+            .python_capture_start
+            .take()
+            .unwrap_or(resolution.occurrences.len());
         let python_reassignment_start = resolution
             .python_reassignment_start
             .take()
-            .unwrap_or(resolution.occurrences.len());
+            .unwrap_or(capture_start);
         let late_start = resolution
             .late_supplemental_start
             .take()
@@ -468,8 +472,8 @@ impl EdgeStore {
         }
         let (internal, external) =
             supplemental_start.unwrap_or((late_start, resolution.external.len()));
-        let (earlier, reassigned_reads) =
-            resolution.occurrences.split_at(python_reassignment_start);
+        let (earlier, captured_reads) = resolution.occurrences.split_at(capture_start);
+        let (earlier, reassigned_reads) = earlier.split_at(python_reassignment_start);
         let (earlier, late_supplemental) = earlier.split_at(late_start);
         let (occurrences, supplemental) = earlier.split_at(internal);
         let (external, supplemental_external) = resolution.external.split_at(external);
@@ -480,6 +484,7 @@ impl EdgeStore {
         let mut additional = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         let mut late = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         let mut reassigned = BTreeMap::<&SymbolId, Vec<Edge>>::new();
+        let mut captured = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         admit_occurrences(occurrences, spans, &self.edge_modules, &mut primary);
         admit_external(external, spans, &self.edge_modules, &mut primary);
         admit_occurrences(supplemental, spans, &self.edge_modules, &mut additional);
@@ -491,7 +496,8 @@ impl EdgeStore {
         );
         admit_occurrences(late_supplemental, spans, &self.edge_modules, &mut late);
         admit_occurrences(reassigned_reads, spans, &self.edge_modules, &mut reassigned);
-        let mut batches = [primary, additional, late, reassigned];
+        admit_occurrences(captured_reads, spans, &self.edge_modules, &mut captured);
+        let mut batches = [primary, additional, late, reassigned, captured];
         for position in 0..batches.len() {
             let (prior, next) = batches.split_at_mut(position);
             for (from, edges) in &mut next[0] {
@@ -1162,11 +1168,17 @@ mod tests {
                 occurrences.push(occurrence(&alpha, 1, ReferenceRole::Read));
                 occurrences.push(occurrence(&alpha, 2, ReferenceRole::Read));
             }
+            let python_capture_start = (batch_count >= 5).then_some(occurrences.len());
+            if python_capture_start.is_some() {
+                occurrences.push(occurrence(&alpha, 0, ReferenceRole::Read));
+                occurrences.push(occurrence(&alpha, 1, ReferenceRole::Read));
+            }
             StaticResolution {
                 occurrences,
                 supplemental_start: (batch_count >= 2).then_some((2, 0)),
                 late_supplemental_start: late_start,
                 python_reassignment_start,
+                python_capture_start,
                 ..StaticResolution::default()
             }
         };
@@ -1205,7 +1217,13 @@ mod tests {
         assert_eq!(reassigned.dropped_edges(), 1);
         assert_eq!(reassigned.outgoing(&alpha), all.outgoing(&alpha));
         assert_eq!(reassigned.outgoing(&zeta), all.outgoing(&zeta));
-        assert!(build(5, 4).is_complete());
+        let all = build(5, 4);
+        assert!(all.is_complete());
+        let captured = build(5, 5);
+        assert_eq!(captured.dropped_edges(), 1);
+        assert_eq!(captured.outgoing(&alpha), all.outgoing(&alpha));
+        assert_eq!(captured.outgoing(&zeta), all.outgoing(&zeta));
+        assert!(build(6, 5).is_complete());
     }
 
     #[test]

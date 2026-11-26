@@ -88,12 +88,13 @@ fn test_python_direct_local_reads_keep_their_physical_binding() {
 }
 
 #[test]
-fn test_python_direct_local_reads_refuse_other_scopes_and_unavailable_values() {
+fn test_python_local_reads_follow_captures_and_refuse_unavailable_values() {
     let source = "def run(flag, values):\n    local = 1\n    def capture(): return local\n    def unbound():\n        return local\n        local = 2\n    def deleted():\n        local = 3\n        if flag: del local\n        return local\n    def reassigned():\n        local = 4\n        local += 1\n        return local\n    def annotated():\n        local: int\n        return local\n    def conditional():\n        if flag: local = 5\n        return local\n    def separate():\n        local: int = 6\n        return local\n    return local, [local for local in values], (local for value in values)\n";
     let (found, _) = accesses(&[("main.py", source)]);
     assert_eq!(
         found,
         [
+            "2 main/run/capture reads main/run/local",
             "22 main/run/separate reads main/run/separate/local",
             "23 main/run reads main/run/local",
         ]

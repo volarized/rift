@@ -97,23 +97,32 @@ fn package_stores_python_reassigned_local_reads_in_their_own_scope() {
         .iter()
         .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local"))
         .collect();
-    assert_eq!(reads.len(), 3);
-    for (scope, context) in [
-        ("reassigned", "local = 2\n    return local"),
-        ("nested_scope", "return local +"),
-        ("nested_scope/read", "local = 5\n        return local"),
+    assert_eq!(reads.len(), 4);
+    for (from, to, context) in [
+        ("reassigned", "reassigned", "local = 2\n    return local"),
+        (
+            "outer/read",
+            "outer",
+            "def read() -> int:\n        return local",
+        ),
+        ("nested_scope", "nested_scope", "return local +"),
+        (
+            "nested_scope/read",
+            "nested_scope/read",
+            "local = 5\n        return local",
+        ),
     ] {
         let offset = start(context)
             + u64::try_from(context.rfind("local").expect("written name")).expect("local offset");
         assert!(
             reads.iter().any(|edge| {
-                edge.from.as_str() == id(scope)
-                    && edge.to.as_str() == format!("{}/local", id(scope))
+                edge.from.as_str() == id(from)
+                    && edge.to.as_str() == format!("{}/local", id(to))
                     && edge.occurrence.as_ref().is_some_and(|site| {
                         site.range.start == offset && site.range.end == offset + 5
                     })
             }),
-            "{scope} at {offset}"
+            "{from} to {to} at {offset}"
         );
     }
     assert!(result.edges.iter().any(|edge| {
@@ -121,6 +130,64 @@ fn package_stores_python_reassigned_local_reads_in_their_own_scope() {
             && edge.from.as_str() == id("outer")
             && edge.to.as_str() == id("outer/read")
     }));
+}
+
+const PYTHON_CAPTURE_REFUSALS: &str = concat!(
+    "def shadowed():\n",
+    "    local = 1\n",
+    "    def pick():\n",
+    "        return local\n",
+    "        local = 2\n",
+    "    return pick()\n",
+    "def redirected():\n",
+    "    local = 1\n",
+    "    def rewrite():\n",
+    "        nonlocal local\n",
+    "        local = 3\n",
+    "        return local\n",
+    "    def pick():\n",
+    "        return local\n",
+    "    return rewrite() + pick()\n",
+    "def removed_nonlocal():\n",
+    "    local = 1\n",
+    "    local = 2\n",
+    "    def erase():\n",
+    "        nonlocal local\n",
+    "        del local\n",
+    "    erase()\n",
+    "    return local\n",
+    "def removed_outer():\n",
+    "    local = 1\n",
+    "    def pick():\n",
+    "        return local\n",
+    "    del local\n",
+    "    return pick()\n",
+);
+
+#[test]
+fn package_refuses_shadowed_redirected_or_deleted_python_captures() {
+    let result = publication(&[("click.py", PYTHON_CAPTURE_REFUSALS)], None, &["click"]);
+    assert!(
+        !result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local")
+        })
+    );
+    for (from, to) in [
+        ("/shadowed", "/shadowed/pick"),
+        ("/redirected", "/redirected/rewrite"),
+        ("/redirected", "/redirected/pick"),
+        ("/removed_nonlocal", "/removed_nonlocal/erase"),
+        ("/removed_outer", "/removed_outer/pick"),
+    ] {
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with(from)
+                    && edge.to.as_str().ends_with(to)
+            }),
+            "{from} to {to}"
+        );
+    }
 }
 
 const PYTHON_PARAMETER_SOURCE: &str = concat!(

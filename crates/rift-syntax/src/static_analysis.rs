@@ -534,6 +534,8 @@ pub struct StaticFactsParts {
     pub python_deletions: Vec<PythonDeletion>,
     /// Plain Python reads paired with their earlier binding name in the same function.
     pub python_local_reads: Vec<(ByteRange, ByteRange)>,
+    /// Plain reads in a nested Python function paired with an earlier outer local name.
+    pub python_captured_local_reads: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -917,6 +919,12 @@ impl StaticFacts {
         &self.0.python_local_reads
     }
 
+    /// Plain Python reads and their candidate binding in the enclosing function.
+    #[must_use]
+    pub fn python_captured_local_reads(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_captured_local_reads
+    }
+
     pub(crate) fn retain_python_local_reads(&mut self, keep: impl Fn(ByteRange) -> bool) {
         self.0.python_local_reads.retain(|&(_, name)| keep(name));
     }
@@ -978,6 +986,7 @@ impl StaticFacts {
             vector_capacity(&self.0.evaluated_outside),
             vector_capacity(&self.0.python_deletions),
             vector_capacity(&self.0.python_local_reads),
+            vector_capacity(&self.0.python_captured_local_reads),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_writes),
             vector_capacity(&self.0.skippable),
@@ -1052,6 +1061,7 @@ impl StaticFacts {
             self.evaluated_outside().len(),
             self.python_deletions().len(),
             self.python_local_reads().len(),
+            self.python_captured_local_reads().len(),
             self.non_none_guards().len(),
             self.commonjs_writes().len(),
             self.skippable().len(),
@@ -1325,15 +1335,22 @@ impl StaticFacts {
         let spelling = |range: ByteRange| {
             source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
         };
-        self.python_local_reads()
-            .windows(2)
-            .all(|pair| pair[0].0.end <= pair[1].0.start)
-            && self.python_local_reads().iter().all(|&(read, name)| {
-                valid(read)
-                    && valid(name)
-                    && name.end <= read.start
-                    && spelling(read) == spelling(name)
-            })
+        [
+            self.python_local_reads(),
+            self.python_captured_local_reads(),
+        ]
+        .into_iter()
+        .all(|reads| {
+            reads
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start)
+                && reads.iter().all(|&(read, name)| {
+                    valid(read)
+                        && valid(name)
+                        && name.end <= read.start
+                        && spelling(read) == spelling(name)
+                })
+        })
     }
 
     fn python_flow_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
@@ -1737,6 +1754,42 @@ mod python_local_read_tests {
         let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), original.0.clone())
             .expect("restored read/name pair");
         assert_eq!(&restored, original);
+    }
+
+    #[test]
+    fn test_python_captured_local_read_restores_separately_from_direct_reads() {
+        let source = "def outer(parameter):\n    local = 1\n    def nested():\n        return local + parameter\n    return local\n";
+        let local: Vec<_> = source
+            .match_indices("local")
+            .map(|(start, _)| {
+                let start = u64::try_from(start).expect("source offset");
+                ByteRange {
+                    start,
+                    end: start + 5,
+                }
+            })
+            .collect();
+        let captured = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &rift_core::ProjectPath::new("pick.py").expect("path"),
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("authored Python source");
+        let original = captured.facts().static_facts().expect("captured facts");
+        assert_eq!(original.python_local_reads(), [(local[2], local[0])]);
+        assert_eq!(
+            original.python_captured_local_reads(),
+            [(local[1], local[0])]
+        );
+        let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), original.0.clone())
+            .expect("restored captured and direct read/name pairs");
+        assert_eq!(&restored, original);
+        let mut inverted = original.0.clone();
+        inverted.python_captured_local_reads[0] = (local[0], local[1]);
+        assert!(StaticFacts::from_parts(source, SyntaxLimits::default(), inverted).is_err());
     }
 
     #[test]
