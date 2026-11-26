@@ -493,6 +493,10 @@ fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Resul
 /// name what is missing from it. Every other warning is logged and left out of the answer.
 fn query_warning_text(warning: &ReadWarning) -> Option<String> {
     match warning {
+        ReadWarning::LocalSymbolInventoryUnavailable => Some(
+            "The local symbol inventory is unavailable. Use `SERVICE :search` to select package facts."
+                .to_owned(),
+        ),
         ReadWarning::EdgeCoverageMissing { detail, .. }
         | ReadWarning::TraversalTruncated { detail, .. }
         | ReadWarning::EngineAnalysisUnavailable { detail, .. }

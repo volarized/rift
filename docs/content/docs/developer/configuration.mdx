@@ -1147,6 +1147,10 @@ lives in the index database at `.rift/index`, and the vector ranking's rows in t
 database at `.rift/vectors`. `pool_slots`, `busy_timeout`, and `journal_size_limit` bound each
 of the two on its own, and writes to one wait for that database's turn alone.
 
+`[search.query] local_symbol_inventory` defaults to `true`. Set it to `false` when the server
+offers package facts and does not serve a local symbol inventory. A graph query that needs the
+local inventory returns `insufficient_coverage`. Use `SERVICE :search` to select package facts.
+
 <VersionBadge version="v0.0.73" />
 
 `[search.query] page_limit` accepts 1 KiB to 4 MiB of encoded response and defaults to

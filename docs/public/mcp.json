@@ -1193,6 +1193,20 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The query requires a local symbol inventory that the server does not offer.\nUse `SERVICE :search` to select package facts.",
+                "properties": {
+                  "code": {
+                    "const": "local_symbol_inventory_unavailable",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
@@ -4513,6 +4527,20 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The query requires a local symbol inventory that the server does not offer.\nUse `SERVICE :search` to select package facts.",
+                "properties": {
+                  "code": {
+                    "const": "local_symbol_inventory_unavailable",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
@@ -7668,6 +7696,20 @@
                   "code",
                   "prepared",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The query requires a local symbol inventory that the server does not offer.\nUse `SERVICE :search` to select package facts.",
+                "properties": {
+                  "code": {
+                    "const": "local_symbol_inventory_unavailable",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
                 ],
                 "type": "object"
               },

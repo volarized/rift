@@ -194,6 +194,19 @@ impl RiftMcp {
         if local_semantics.is_some() {
             selected = None;
         }
+        let configuration = resolved
+            .published
+            .configuration
+            .search_configuration()
+            .query;
+        if !configuration.local_symbol_inventory
+            && selected.is_none()
+            && needs_local_symbol_inventory(query, local_semantics)
+        {
+            return Ok(Err(coverage_unavailable(vec![
+                ReadWarning::LocalSymbolInventoryUnavailable,
+            ])));
+        }
         let mut acquired = match self
             .prepare_edges(
                 &resolved,
@@ -239,11 +252,6 @@ impl RiftMcp {
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         }
-        let configuration = resolved
-            .published
-            .configuration
-            .search_configuration()
-            .query;
         let reads = Arc::clone(&resolved.published.reads);
         let mut warnings = acquired.take_warnings();
         if local_semantics.is_some() {
@@ -482,6 +490,22 @@ const fn reads_inventory(selection: rift_search::sparql::SymbolSelection<'_>) ->
         selection,
         rift_search::sparql::SymbolSelection::Identified(_)
     )
+}
+
+/// Whether the selected projection needs the inventory of local symbol identities.
+fn needs_local_symbol_inventory(query: &GraphQuery, semantics: Option<SemanticInventory>) -> bool {
+    if let Some(required) = semantics {
+        return required.symbols;
+    }
+    query
+        .history_selection()
+        .or_else(|| {
+            query
+                .syntax_element_selection()
+                .map(|selection| selection.symbols)
+        })
+        .or_else(|| query.symbol_selection())
+        .is_some_and(reads_inventory)
 }
 
 /// What a projection that reads the captured inventory, or one exact selection, reads from.
@@ -894,11 +918,15 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
 }
 
 fn insufficient_coverage(warnings: Vec<ReadWarning>) -> QueryReadResult {
-    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+    QueryReadResult::Unavailable(coverage_unavailable(warnings))
+}
+
+fn coverage_unavailable(warnings: Vec<ReadWarning>) -> SearchUnavailable {
+    SearchUnavailable::Unavailable {
         reason: SymbolUnavailableReason::InsufficientCoverage,
         view: None,
         warnings,
-    })
+    }
 }
 
 #[cfg(test)]

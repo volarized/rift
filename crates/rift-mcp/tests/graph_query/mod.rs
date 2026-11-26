@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use crate::global_api::{FixtureOptions, GlobalFixture};
 use crate::workspace_client::{TestResult, query, query_after_population, served_workspace};
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use serde_json::{Value, json};
@@ -774,6 +775,115 @@ async fn captured_calls_answer_an_inventory_when_the_engine_is_unavailable() -> 
         "{count}"
     );
     client.cancel().await?;
+    Ok(())
+}
+
+const SYMBOL_COUNT: &str = "SELECT (COUNT(*) AS ?n) { ?s a :Symbol }";
+const SYMBOL_PAGE: &str = "SELECT ?s ?name { ?s a :Symbol; :name ?name } LIMIT 5";
+const SYMBOL_EXISTS: &str = "ASK { ?s a :Symbol }";
+
+#[tokio::test]
+async fn disabled_local_symbol_inventory_refuses_absence_and_keeps_package_reads() -> TestResult {
+    let global = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = '{}'\nattempts = 1\n\n\
+         [search]\ndefault_scope = 'global'\n\n\
+         [search.query]\nlocal_symbol_inventory = false\n",
+        global.endpoint
+    );
+    let (_directory, client, _server_task) = served_workspace(&[], Some(configuration)).await?;
+    let requests_before = global.requests().await.len();
+    for text in [
+        SYMBOL_COUNT,
+        SYMBOL_PAGE,
+        SYMBOL_EXISTS,
+        "SELECT ?s { ?s a :Symbol; :name 'beacon' }",
+        "SELECT ?name { ?s a :Symbol; :name ?name; :contains ?child }",
+        "SELECT ?element { ?element a :SyntaxElement; :of ?s . ?s :name 'beacon' }",
+        "SELECT ?revision { ?s :introducedIn ?revision . ?revision a :Commit }",
+    ] {
+        let answer = statement(&client, text).await?;
+        assert_eq!(answer["outcome"], "unavailable", "{text}: {answer}");
+        assert_eq!(
+            answer["reason"], "insufficient_coverage",
+            "{text}: {answer}"
+        );
+        assert!(
+            warning_codes(&answer).contains("local_symbol_inventory_unavailable"),
+            "{text}: {answer}"
+        );
+        assert!(answer.get("answer").is_none(), "{text}: {answer}");
+        assert!(answer.get("pagination").is_none(), "{text}: {answer}");
+        assert!(answer.get("view").is_none(), "{text}: {answer}");
+    }
+    assert_eq!(global.requests().await.len(), requests_before);
+    let package = statement(
+        &client,
+        "SELECT ?name { SERVICE :search { ?hit :scope 'global'; :query 'beacon'; :target 'symbol'; \
+         :packages '[{\"manager\":\"cargo\",\"registry\":\"crates.io\",\"name\":\"demo\",\"version\":\"1.0.0\"}]'^^rdf:JSON; \
+         :symbol ?symbol . ?symbol :name ?name } }",
+    )
+    .await?;
+    assert!(
+        query::rows(&package)?
+            .iter()
+            .any(|row| query::literal(row, "name").is_ok_and(|name| name == "beacon")),
+        "{package}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_local_symbol_inventory_keeps_an_exact_local_symbol() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", METADATA),
+            ("graph.py", "def beacon() -> int:\n    return 1\n"),
+        ],
+        Some("[search.query]\nlocal_symbol_inventory = false\n".to_owned()),
+    )
+    .await?;
+    let answer = statement(
+        &client,
+        "SELECT ?name { <rift://symbol/local/python/graph/beacon> :name ?name }",
+    )
+    .await?;
+    let [row] = query::rows(&answer)? else {
+        return Err(format!("expected the identified local symbol: {answer}").into());
+    };
+    assert_eq!(query::literal(row, "name")?, "beacon");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_local_symbol_inventory_answers_complete_empty_and_populated_captures() -> TestResult
+{
+    let configuration = "[source]\ninclude = ['**/*.rs']\n\n[search]\ndefault_scope = 'global'\n";
+    let cases: &[(&[(&str, &str)], u64)] = &[
+        (&[], 0),
+        (&[("lib.rs", "// This file declares no symbols.\n")], 0),
+        (&[("lib.rs", "pub fn beacon() {}\n")], 1),
+    ];
+    for &(files, expected) in cases {
+        let (_directory, client, _server_task) =
+            served_workspace(files, Some(configuration.to_owned())).await?;
+        let count = statement(&client, SYMBOL_COUNT).await?;
+        let [row] = query::rows(&count)? else {
+            return Err(format!("expected a count: {count}").into());
+        };
+        assert_eq!(query::literal(row, "n")?.parse::<u64>()?, expected);
+        let page = statement(&client, SYMBOL_PAGE).await?;
+        assert_eq!(page["pagination"]["total"], expected, "{page}");
+        let answer = statement(&client, SYMBOL_EXISTS).await?;
+        assert_eq!(answer["answer"]["value"], expected > 0, "{answer}");
+        client.cancel().await?;
+    }
     Ok(())
 }
 

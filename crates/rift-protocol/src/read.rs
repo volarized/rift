@@ -1476,6 +1476,9 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The query requires a local symbol inventory that the server does not offer.
+    /// Use `SERVICE :search` to select package facts.
+    LocalSymbolInventoryUnavailable,
     /// The vector ranking will not answer for the life of this server, so every answer
     /// is ranked lexically alone. No retry is coming: fix the `[search.vector]`
     /// configuration and start the server again.
