@@ -49,13 +49,27 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         work: &mut Work,
         result: &mut StaticResolution,
+        parameters: bool,
     ) {
-        for &(read, assignment) in file.facts.python_local_reads() {
+        for &(read, name) in file.facts.python_local_reads() {
+            let parameter = file.python_parameters.get(&name).copied();
+            if parameters != parameter.is_some() {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
-            if let Some(occurrence) = file
-                .python_local_target(read, assignment, work)
+            let target = parameter.map_or_else(
+                || file.target_at(name),
+                |symbol| {
+                    Some(Target {
+                        file: file.document,
+                        symbol,
+                    })
+                },
+            );
+            if let Some(occurrence) = target
+                .and_then(|target| file.python_local_target(read, name, target, work))
                 .and_then(|target| self.python_access(file, read, ReferenceRole::Read, target))
                 .filter(|site| site.edge_from.is_some())
             {
@@ -448,17 +462,22 @@ impl<'source> File<'source> {
     fn python_local_target(
         &self,
         read: ByteRange,
-        assignment: ByteRange,
+        name: ByteRange,
+        target: Target<'source>,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let target = self.target_at(assignment)?;
         let caller = self.enclosing_callable(read)?;
         let body = caller.symbol.body_range?;
-        if target.symbol.kind != "variable"
+        let item = target.symbol.item_range;
+        let in_scope = if target.symbol.is_python_parameter() {
+            caller.symbol.item_range.encloses(item) && item.end <= body.start
+        } else {
+            target.symbol.kind == "variable" && body.encloses(item)
+        };
+        if !in_scope
             || target.symbol.container.as_deref() != Some(caller.symbol.qualified_name.as_str())
-            || !body.encloses(target.symbol.item_range)
             || !body.encloses(read)
-            || target.symbol.item_range.end > read.start
+            || item.end > read.start
             || self.in_python_annotation(read.start)
             || self
                 .python_expressions
@@ -468,9 +487,9 @@ impl<'source> File<'source> {
         {
             return None;
         }
-        let name = self.text(read)?;
+        let spelling = self.text(read)?;
         let bindings = self
-            .bindings_around(name, read)
+            .bindings_around(spelling, read)
             .filter(|binding| {
                 !matches!(
                     binding.kind,
@@ -491,15 +510,12 @@ impl<'source> File<'source> {
             .into_iter()
             .filter(|binding| Scope::of(self, binding) == scope);
         let binding = local.next()?;
-        if binding.name != assignment
-            || binding.available_from > read.start
-            || local.next().is_some()
-        {
+        if binding.name != name || binding.available_from > read.start || local.next().is_some() {
             return None;
         }
         let mut deletions = self
             .python_deletions
-            .get(&(name, scope.range))
+            .get(&(spelling, scope.range))
             .into_iter()
             .flatten();
         if deletions.any(|deletion| !work.charge() || deletion.name.end <= read.start) {

@@ -430,12 +430,12 @@ fn assemble_package_graph(
         .iter()
         .map(AnalyzedFile::placed_facts)
         .collect::<Vec<_>>();
-    let (rust_locals, mut rust_locals_remaining) = rust_local_capacity(
+    let (bindings, mut binding_slots) = binding_capacity(
         analyzed,
         input.limits(),
         usize::from(namespace.rust_package_root.is_some()),
     );
-    let rust_local_limit = rust_locals_remaining.remaining();
+    let binding_limit = binding_slots.remaining();
     let (external_work, external_work_max) = external_work_limits(input);
     let static_sources = analyzed
         .iter()
@@ -470,7 +470,7 @@ fn assemble_package_graph(
             })
         },
         (&static_sources, &input.namespace_input()),
-        &mut rust_locals_remaining,
+        &mut binding_slots,
     )
     .map_err(|error| {
         errors::analysis::package_provider_failed()
@@ -484,18 +484,18 @@ fn assemble_package_graph(
             .path(path.as_str())
             .fail();
     }
-    let truncated = (rust_locals > rust_local_limit - rust_locals_remaining.remaining())
-        .then_some(rust_local_limit);
+    let truncated = (bindings > binding_limit - binding_slots.remaining()).then_some(binding_limit);
     Ok((built.semantics, truncated))
 }
 
-fn rust_local_capacity(
+fn binding_capacity(
     documents: &[AnalyzedFile],
     limits: ExactPackageLimits,
     synthetic_objects: usize,
-) -> (usize, rift_syntax::RustBindingSlots) {
-    let mut locals = BindingDemand::default();
-    let mut parameters = BindingDemand::default();
+) -> (usize, rift_syntax::PackageBindingSlots) {
+    let mut rust_locals = BindingDemand::default();
+    let mut rust_parameters = BindingDemand::default();
+    let mut python_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
@@ -504,23 +504,23 @@ fn rust_local_capacity(
             .saturating_add(facts.primary_symbols_len())
             .saturating_add(document.placement.aliases_count());
         unnamed = unnamed.saturating_add(facts.left_out_symbols().len());
-        if facts.language().name == "rust" {
-            for symbol in facts.symbols().iter().filter(|symbol| {
-                symbol.is_rust_local_binding()
-                    && document
-                        .placement
-                        .logical_identity(&symbol.qualified_name)
-                        .is_some()
-            }) {
-                let demand = if symbol.is_rust_parameter_binding() {
-                    &mut parameters
-                } else {
-                    &mut locals
-                };
-                demand.count += 1;
-                let range = symbol.item_range;
-                demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
-            }
+        for symbol in facts.symbols().iter().filter(|symbol| {
+            symbol.is_package_binding()
+                && document
+                    .placement
+                    .logical_identity(&symbol.qualified_name)
+                    .is_some()
+        }) {
+            let demand = if symbol.is_python_parameter() {
+                &mut python_parameters
+            } else if symbol.is_rust_parameter_binding() {
+                &mut rust_parameters
+            } else {
+                &mut rust_locals
+            };
+            demand.count += 1;
+            let range = symbol.item_range;
+            demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
         }
     }
     let provider = limits.declarations_max().saturating_sub(primary);
@@ -529,7 +529,7 @@ fn rust_local_capacity(
             .saturating_add(unnamed)
             .saturating_add(synthetic_objects),
     );
-    let count = locals.count + parameters.count;
+    let count = rust_locals.count + rust_parameters.count + python_parameters.count;
     let (mut bytes, record) = limits
         .retained_source()
         .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
@@ -543,15 +543,20 @@ fn rust_local_capacity(
             )
         });
     let mut slots = provider.min(publication);
-    let local_slots = locals.reserve(&mut slots, &mut bytes, record);
-    let parameter_slots = parameters.reserve(&mut slots, &mut bytes, record);
+    let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
+    let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
+    let python_parameter_slots = python_parameters.reserve(&mut slots, &mut bytes, record);
     (
         count,
-        rift_syntax::RustBindingSlots::new(local_slots, parameter_slots),
+        rift_syntax::PackageBindingSlots::new(
+            local_slots,
+            rust_parameter_slots,
+            python_parameter_slots,
+        ),
     )
 }
 
-/// Candidate count and the longest retained name in one class of Rust binding.
+/// Candidate count and the longest retained name in one class of source-local binding.
 #[derive(Default)]
 struct BindingDemand {
     count: usize,
@@ -585,7 +590,7 @@ fn primary_retained_source_max(file: &AnalyzedFile, record_limit: u32) -> u64 {
         .syntax()
         .symbols()
         .iter()
-        .filter(|symbol| !symbol.is_rust_local_binding())
+        .filter(|symbol| !symbol.is_package_binding())
         .map(|symbol| symbol.item_range)
         .chain(file.placement.aliases().iter().map(|alias| alias.range))
     {

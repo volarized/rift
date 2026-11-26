@@ -532,7 +532,7 @@ pub struct StaticFactsParts {
     pub evaluated_outside: Vec<(ByteRange, ByteRange)>,
     /// Python names deleted in a function, with the function and the block that deletes them.
     pub python_deletions: Vec<PythonDeletion>,
-    /// Plain Python reads paired with an earlier assignment name in the same function body.
+    /// Plain Python reads paired with their earlier binding name in the same function.
     pub python_local_reads: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
@@ -911,10 +911,14 @@ impl StaticFacts {
         &self.0.python_deletions
     }
 
-    /// Plain Python reads and the direct local assignments their names could select.
+    /// Plain Python reads and the direct local names their bindings could select.
     #[must_use]
     pub fn python_local_reads(&self) -> &[(ByteRange, ByteRange)] {
         &self.0.python_local_reads
+    }
+
+    pub(crate) fn retain_python_local_reads(&mut self, keep: impl Fn(ByteRange) -> bool) {
+        self.0.python_local_reads.retain(|&(_, name)| keep(name));
     }
 
     /// Python names checked for a non-`None` value and the bodies the checks admit.
@@ -1324,11 +1328,11 @@ impl StaticFacts {
         self.python_local_reads()
             .windows(2)
             .all(|pair| pair[0].0.end <= pair[1].0.start)
-            && self.python_local_reads().iter().all(|&(read, assignment)| {
+            && self.python_local_reads().iter().all(|&(read, name)| {
                 valid(read)
-                    && valid(assignment)
-                    && assignment.end <= read.start
-                    && spelling(read) == spelling(assignment)
+                    && valid(name)
+                    && name.end <= read.start
+                    && spelling(read) == spelling(name)
             })
     }
 
@@ -1698,6 +1702,42 @@ mod python_local_read_tests {
     use super::{StaticFacts, StaticFactsParts};
     use crate::python::PythonSyntaxProvider;
     use crate::{ByteRange, SyntaxLimits, SyntaxProvider, SyntaxSource};
+
+    #[test]
+    fn test_python_parameter_capture_restores_body_reads_only() {
+        let source = "name = 1\ndef pick(name: int = name):\n    return name\n";
+        let occurrences = source.match_indices("name").collect::<Vec<_>>();
+        assert_eq!(occurrences.len(), 4);
+        let range = |index: usize| {
+            let start = u64::try_from(occurrences[index].0).expect("source offset");
+            ByteRange {
+                start,
+                end: start + 4,
+            }
+        };
+        let captured = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &rift_core::ProjectPath::new("pick.py").expect("path"),
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("authored Python source");
+        let parameter = captured
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.is_python_parameter())
+            .expect("parameter syntax token");
+        assert_eq!(parameter.qualified_name, "pick.name");
+        assert_eq!(parameter.name_range, Some(range(1)));
+        assert_eq!(parameter.item_range, range(1));
+        let original = captured.facts().static_facts().expect("captured facts");
+        assert_eq!(original.python_local_reads(), [(range(3), range(1))]);
+        let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), original.0.clone())
+            .expect("restored read/name pair");
+        assert_eq!(&restored, original);
+    }
 
     #[test]
     fn test_python_local_read_restore_checks_anchor_and_order() {

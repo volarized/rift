@@ -428,7 +428,7 @@ impl WorkspaceSemantics {
         revision: u64,
         external: &ExternalTarget<'_>,
         static_inputs: StaticInputs<'_, '_>,
-        rust_locals_remaining: &mut rift_syntax::RustBindingSlots,
+        binding_slots: &mut rift_syntax::PackageBindingSlots,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::prepare_facts_with(
             documents,
@@ -436,10 +436,10 @@ impl WorkspaceSemantics {
             revision,
             false,
             |_, placed, builder| {
-                builder.add_facts_placed_with_rust_locals(
+                builder.add_facts_placed_with_bindings(
                     placed.facts,
                     &placed.placement,
-                    rust_locals_remaining,
+                    binding_slots,
                 )
             },
         )?

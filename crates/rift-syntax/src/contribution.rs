@@ -16,31 +16,40 @@ use crate::{SyntaxDocument, SyntaxFacts};
 /// Stable identity of built-in syntax Contribution provider.
 pub const SYNTAX_PROVIDER_ID: &str = "syntax";
 
-/// Remaining source-local declaration slots in one Rust package publication.
+/// Remaining source-local declaration slots in one package publication.
 #[derive(Clone, Copy, Default)]
-pub struct RustBindingSlots {
-    local: usize,
-    parameter: usize,
+pub struct PackageBindingSlots {
+    rust_local: usize,
+    rust_parameter: usize,
+    python_parameter: usize,
 }
 
-impl RustBindingSlots {
-    /// Holds the caller's independently reserved let and parameter slots.
+impl PackageBindingSlots {
+    /// Holds the caller's reserved slots for each supported binding class.
     #[must_use]
-    pub const fn new(local: usize, parameter: usize) -> Self {
-        Self { local, parameter }
+    pub const fn new(rust_local: usize, rust_parameter: usize, python_parameter: usize) -> Self {
+        Self {
+            rust_local,
+            rust_parameter,
+            python_parameter,
+        }
     }
 
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
-        self.local.saturating_add(self.parameter)
+        self.rust_local
+            .saturating_add(self.rust_parameter)
+            .saturating_add(self.python_parameter)
     }
 
     fn admit(&mut self, symbol: &crate::SyntaxSymbol) -> bool {
-        let available = if symbol.is_rust_parameter_binding() {
-            &mut self.parameter
+        let available = if symbol.is_python_parameter() {
+            &mut self.python_parameter
+        } else if symbol.is_rust_parameter_binding() {
+            &mut self.rust_parameter
         } else {
-            &mut self.local
+            &mut self.rust_local
         };
         if *available == 0 {
             return false;
@@ -415,27 +424,27 @@ impl SyntaxPublicationBuilder {
         syntax: &SyntaxFacts,
         placement: &DocumentPlacement,
     ) -> Result<(), RiftError> {
-        self.add_facts_placed_with_rust_locals(syntax, placement, &mut RustBindingSlots::default())
+        self.add_facts_placed_with_bindings(syntax, placement, &mut PackageBindingSlots::default())
     }
 
-    /// Adds the primary declarations and any Rust package bindings allowed by the caller.
+    /// Adds the primary declarations and any source-local package bindings allowed by the caller.
     /// Only a binding with a canonical package anchor can use a supplemental slot.
     ///
     /// # Errors
     ///
     /// Returns `RiftError` when one symbol identity or Contribution is invalid.
-    pub fn add_facts_placed_with_rust_locals(
+    pub fn add_facts_placed_with_bindings(
         &mut self,
         syntax: &SyntaxFacts,
         placement: &DocumentPlacement,
-        rust_locals_remaining: &mut RustBindingSlots,
+        binding_slots: &mut PackageBindingSlots,
     ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
-        let mut remaining = *rust_locals_remaining;
+        let mut remaining = *binding_slots;
         for symbol in syntax.symbols() {
-            if symbol.is_rust_local_binding()
+            if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
                     || !remaining.admit(symbol))
             {
@@ -496,7 +505,7 @@ impl SyntaxPublicationBuilder {
         }
         self.add_alias_contributions(syntax, placement, &mut additions)?;
         self.contributions.extend(additions);
-        *rust_locals_remaining = remaining;
+        *binding_slots = remaining;
         Ok(())
     }
 

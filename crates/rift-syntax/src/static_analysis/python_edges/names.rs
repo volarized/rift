@@ -99,7 +99,25 @@ pub(in crate::static_analysis) struct Names<'source> {
     pub(in crate::static_analysis) invalid_type_parameter_default: bool,
 }
 
-/// One initialized name in an assignment immediately inside a function body.
+impl<'source> Names<'source> {
+    pub(super) fn direct_binding(
+        &mut self,
+        source: &'source str,
+        name: ByteRange,
+        scope: ByteRange,
+        end: u64,
+    ) {
+        if let Some(spelling) = text(source, name) {
+            self.direct_locals
+                .entry(spelling)
+                .or_default()
+                .entry(scope)
+                .or_insert(DirectLocal { name, end });
+        }
+    }
+}
+
+/// One parameter or initialized name directly inside a function body.
 struct DirectLocal {
     name: ByteRange,
     end: u64,
@@ -241,18 +259,12 @@ impl EdgePythonKinds {
             .and_then(Visited::parent)
             .filter(|parent| parent.syntax_element().kind_id() == self.definitions[0])
         {
-            let name = byte_range(target)?;
-            if let Some(spelling) = text(source, name) {
-                names
-                    .direct_locals
-                    .entry(spelling)
-                    .or_default()
-                    .entry(self.scope_range(owner.syntax_element())?)
-                    .or_insert(DirectLocal {
-                        name,
-                        end: byte_range(assignment)?.end,
-                    });
-            }
+            names.direct_binding(
+                source,
+                byte_range(target)?,
+                self.scope_range(owner.syntax_element())?,
+                byte_range(assignment)?.end,
+            );
         }
         Ok(())
     }
@@ -273,7 +285,13 @@ impl EdgePythonKinds {
             }
             break;
         }
-        edge_enclosing(visited, &self.scopes).filter(|scope| scope.kind_id() == self.definitions[0])
+        let scope = edge_enclosing(visited, &self.scopes)?;
+        let body = scope.child_by_field_id(self.body)?;
+        (scope.kind_id() == self.definitions[0]
+            && byte_range(body)
+                .ok()?
+                .encloses(byte_range(visited.syntax_element()).ok()?))
+        .then_some(scope)
     }
 
     /// Records what a name outside annotations does.

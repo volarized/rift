@@ -59,6 +59,7 @@ pub(super) struct EdgePythonKinds {
     alias: u16,
     module: u16,
     function: u16,
+    body: u16,
     object: u16,
     member: u16,
     type_field: u16,
@@ -136,6 +137,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             alias: field("alias"),
             module: field("module_name"),
             function: field("function"),
+            body: field("body"),
             object: field("object"),
             member: field("attribute"),
             type_field: field("type"),
@@ -205,7 +207,7 @@ impl EdgePythonKinds {
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
-            self.edge_parameters(visited, source, facts)?;
+            self.edge_parameters(visited, source, facts, names)?;
         } else if self.assignment.contains(&id) {
             if let Some(target) = syntax_element.child_by_field_id(self.left) {
                 self.edge_shadow(target, visited, facts)?;
@@ -525,11 +527,12 @@ impl EdgePythonKinds {
         Ok(())
     }
 
-    fn edge_parameters(
+    fn edge_parameters<'source>(
         &self,
         visited: Visited<'_, '_>,
-        source: &str,
+        source: &'source str,
         facts: &mut StaticFactsParts,
+        names: &mut Names<'source>,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let Some(scope) = visited.parent().map(Visited::syntax_element) else {
@@ -560,11 +563,19 @@ impl EdgePythonKinds {
                     .filter(|_| !collects)
                     .map(byte_range)
                     .transpose()?;
+                let receiver = class_name.filter(|_| first && !collects);
+                if scope.kind_id() == self.definitions[0]
+                    && receiver.is_none()
+                    && crate::python::parameter_name(parameter) == Some(name)
+                {
+                    let scope_range = self.scope_range(scope)?;
+                    names.direct_binding(source, byte_range(name)?, scope_range, scope_range.start);
+                }
                 facts.bindings.push(self.scoped_binding(
                     name,
                     scope,
                     self.scope_range(scope)?.start,
-                    match class_name.filter(|_| first && !collects) {
+                    match receiver {
                         Some(class_name) => StaticBindingKind::PythonReceiver {
                             class_name: byte_range(class_name)?,
                         },

@@ -173,6 +173,8 @@ const FORMATTED_PREFIXES: [char; 2] = ['f', 'F'];
 
 /// The kind word a Python function carries on the wire.
 const FUNCTION_KIND_WORD: &str = "function";
+/// Provider kind for an ordinary function parameter at its name token.
+pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
 /// The kind word a Python class carries on the wire.
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
@@ -208,6 +210,7 @@ struct PythonKinds {
     decorator: u16,
     call: u16,
     typed_parameter: u16,
+    default_parameter: [u16; 2],
     string_start: u16,
     import_from: u16,
     aliased_import: u16,
@@ -262,6 +265,10 @@ impl PythonKinds {
             decorator: kind_id(language, DECORATOR_KIND),
             call: kind_id(language, CALL_KIND),
             typed_parameter: kind_id(language, TYPED_PARAMETER_KIND),
+            default_parameter: [
+                kind_id(language, "default_parameter"),
+                kind_id(language, "typed_default_parameter"),
+            ],
             string_start: kind_id(language, STRING_START_KIND),
             import_from: kind_id(language, IMPORT_FROM_KIND),
             aliased_import: kind_id(language, ALIASED_IMPORT_KIND),
@@ -293,6 +300,27 @@ impl PythonKinds {
             alias: field_id(language, ALIAS_FIELD),
         }
     }
+}
+
+/// The written identifier of an ordinary non-variadic function parameter.
+pub(crate) fn parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
+    let kinds = python_kinds();
+    if parameter.has_error() {
+        return None;
+    }
+    let kind = parameter.kind_id();
+    let name = if kind == kinds.identifier {
+        Some(parameter)
+    } else if kind == kinds.typed_parameter {
+        parameter
+            .named_children(&mut parameter.walk())
+            .find(|child| !child.is_extra())
+    } else if kinds.default_parameter.contains(&kind) {
+        parameter.child_by_field_id(kinds.name.get())
+    } else {
+        None
+    };
+    name.filter(|name| name.kind_id() == kinds.identifier)
 }
 
 /// Resolves one syntax element kind id, proving the pinned grammar defines it.
@@ -665,6 +693,32 @@ impl PythonRules {
         }
         let scope = self.statement_scope(self.assignment_statement(visited)?)?;
         Some(Self::variable(text.get(target.byte_range())?, scope))
+    }
+
+    fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let name = visited.syntax_element();
+        let parent = visited.parent()?;
+        let kind = parent.syntax_element().kind_id();
+        let parameter =
+            if kind == self.kinds.typed_parameter || self.kinds.default_parameter.contains(&kind) {
+                parent
+            } else {
+                visited
+            };
+        let parameters = parameter.parent()?;
+        let owner = parameters.parent()?.syntax_element();
+        if owner.kind_id() != self.kinds.function
+            || owner.child_by_field_id(self.kinds.parameters.get())
+                != Some(parameters.syntax_element())
+            || parameter_name(parameter.syntax_element()) != Some(name)
+        {
+            return None;
+        }
+        Some(Declaration {
+            kind: PARAMETER_KIND_WORD,
+            kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
+            ..Self::variable(text.get(name.byte_range())?, DeclarationScope::Local)
+        })
     }
 
     /// The declared variable behind one name a tuple or list target binds.
@@ -1110,7 +1164,9 @@ impl GrammarRules for PythonRules {
             return Ok(self.assignment_declaration(visited, text));
         }
         if id == self.kinds.identifier {
-            return Ok(self.pattern_declaration(visited, text));
+            return Ok(self
+                .parameter_declaration(visited, text)
+                .or_else(|| self.pattern_declaration(visited, text)));
         }
         if id == self.kinds.attribute {
             let Some(_) = self.attribute_method(visited, text) else {
@@ -1275,8 +1331,9 @@ impl SyntaxProvider for PythonSyntaxProvider {
             source.text,
         )?);
         export_bindings.sort_by_key(|binding| binding.range.start);
-        let (static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
+        let (mut static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
+        retain_parameters(&mut symbols, &mut static_facts);
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -1311,9 +1368,57 @@ impl SyntaxProvider for PythonSyntaxProvider {
     }
 }
 
+/// Keeps the parameter candidates with exact non-receiver bindings and no other
+/// declaration of the same Python name. An assignment may already own that name.
+fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::StaticFacts) {
+    use std::collections::BTreeSet;
+
+    if !symbols.iter().any(crate::SyntaxSymbol::is_python_parameter) {
+        return;
+    }
+    let eligible = facts
+        .bindings()
+        .iter()
+        .filter(|binding| {
+            binding.available_from == binding.scope.start
+                && matches!(
+                    binding.kind,
+                    crate::StaticBindingKind::Shadow
+                        | crate::StaticBindingKind::PythonAnnotation { .. }
+                )
+        })
+        .map(|binding| binding.name)
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeMap::new();
+    for symbol in symbols.iter() {
+        *names
+            .entry(symbol.qualified_name.as_str())
+            .or_insert(0_usize) += 1;
+    }
+    let mut withheld = BTreeSet::new();
+    for symbol in symbols.iter().filter(|symbol| symbol.is_python_parameter()) {
+        if let Some(range) = symbol.name_range
+            && (names.get(symbol.qualified_name.as_str()) != Some(&1)
+                || !eligible.contains(&range)
+                || !rift_core::is_portable_name(&symbol.name)
+                || !rift_core::is_portable_name(&symbol.qualified_name))
+        {
+            withheld.insert(range);
+        }
+    }
+    symbols.retain(|symbol| {
+        !symbol.is_python_parameter()
+            || symbol
+                .name_range
+                .is_some_and(|range| !withheld.contains(&range))
+    });
+    facts.retain_python_local_reads(|name| !withheld.contains(&name));
+}
+
 pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
     [
         FUNCTION_KIND_WORD,
+        PARAMETER_KIND_WORD,
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
         METHOD_KIND_WORD,

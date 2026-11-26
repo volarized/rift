@@ -216,6 +216,7 @@ enum DeferredReferences<'source> {
         names: Vec<ByteRange>,
     },
     PythonLocals,
+    PythonParameters,
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -487,6 +488,8 @@ struct File<'source> {
     /// The reference prefix and declaration count before additional Rust bindings.
     primary_reference_count: usize,
     rust_local_count: usize,
+    /// Supplemental parameter witnesses do not participate in primary binding lookup.
+    python_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
@@ -647,6 +650,7 @@ impl<'source> File<'source> {
             callables: EnclosingDefinitions::new([]),
             primary_reference_count: facts.references().len(),
             rust_local_count: 0,
+            python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
@@ -934,6 +938,12 @@ impl<'source> File<'source> {
                 self.rust_local_count += 1;
                 continue;
             }
+            if symbol.is_python_parameter() {
+                if let Some(name) = symbol.name_range {
+                    self.python_parameters.insert(name, symbol);
+                }
+                continue;
+            }
             if self.inactive(symbol.item_range, work) {
                 continue;
             }
@@ -998,7 +1008,9 @@ impl<'source> File<'source> {
             self.facts.bindings().len(),
             self.facts.python_deletions().len(),
             self.facts.heritage_edges().len(),
-            self.document.facts.symbols().len() - self.rust_local_count,
+            self.document.facts.symbols().len()
+                - self.rust_local_count
+                - self.python_parameters.len(),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -1405,7 +1417,8 @@ impl<'source> Index<'source> {
                     let queue = match sites {
                         DeferredReferences::Python { .. }
                         | DeferredReferences::PythonQualifiers { .. }
-                        | DeferredReferences::PythonLocals => &mut deferred_references,
+                        | DeferredReferences::PythonLocals
+                        | DeferredReferences::PythonParameters => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
                     queue.push((*file, remaining, sites));
@@ -1435,11 +1448,13 @@ impl<'source> Index<'source> {
         let mut macro_sites = VecDeque::new();
         let mut rust_local_sites = VecDeque::new();
         let mut python_local_sites = VecDeque::new();
+        let mut python_parameter_sites = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
             .or_else(|| rust_local_sites.pop_front())
             .or_else(|| python_local_sites.pop_front())
+            .or_else(|| python_parameter_sites.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1461,7 +1476,12 @@ impl<'source> Index<'source> {
                     locals
                 }
                 DeferredReferences::PythonLocals => {
-                    self.python_local_reads(file, &mut deferred, resolution);
+                    self.python_local_reads(file, &mut deferred, resolution, false);
+                    (!file.python_parameters.is_empty())
+                        .then_some(DeferredReferences::PythonParameters)
+                }
+                DeferredReferences::PythonParameters => {
+                    self.python_local_reads(file, &mut deferred, resolution, true);
                     None
                 }
                 DeferredReferences::Rust {
@@ -1483,6 +1503,7 @@ impl<'source> Index<'source> {
             if let Some(next) = next {
                 let queue = match next {
                     DeferredReferences::PythonLocals => &mut python_local_sites,
+                    DeferredReferences::PythonParameters => &mut python_parameter_sites,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -2044,6 +2065,7 @@ impl StaticResolution {
                 pass: RustReferencePass::LocalBindings,
                 ..
             } | DeferredReferences::PythonLocals
+                | DeferredReferences::PythonParameters
         ) {
             self.late_supplemental_start
                 .get_or_insert(self.occurrences.len());

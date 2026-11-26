@@ -43,6 +43,191 @@ fn package_stores_python_direct_function_local_reads() {
     }
 }
 
+const PYTHON_PARAMETER_SOURCE: &str = concat!(
+    "parameter = 9\n",
+    "def choose(parameter: int) -> int:\n",
+    "    local = parameter\n",
+    "    def nested() -> int:\n",
+    "        local = 7\n",
+    "        return local\n",
+    "    return local + nested()\n",
+    "def other(parameter=parameter):\n",
+    "    return parameter\n",
+    "def owner(parameter):\n",
+    "    def nested(parameter):\n",
+    "        return parameter\n",
+    "    return parameter\n",
+    "def rebind(parameter):\n",
+    "    parameter = 3\n",
+    "    return parameter\n",
+    "class Receiver:\n",
+    "    def run(self, *args, **kwargs):\n",
+    "        return self, args, kwargs\n",
+);
+
+#[test]
+fn package_stores_python_function_parameter_names_and_reads() {
+    let source = PYTHON_PARAMETER_SOURCE;
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let id = |relative: &str| format!("{module}/{relative}");
+    let offset = |prefix: &str, spelling: &str| {
+        u64::try_from(
+            source.find(prefix).expect("written site")
+                + prefix.rfind(spelling).expect("token within site"),
+        )
+        .expect("offset")
+    };
+    let read_at = |from: &str, to: &str, at| {
+        result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.from.as_str() == id(from)
+                && edge.to.as_str() == id(to)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range.start == at && site.range.end == at + 9)
+        })
+    };
+    for (owner, signature, use_site) in [
+        ("choose", "choose(parameter", "local = parameter"),
+        (
+            "other",
+            "other(parameter",
+            "other(parameter=parameter):\n    return parameter",
+        ),
+        (
+            "owner",
+            "owner(parameter",
+            "        return parameter\n    return parameter",
+        ),
+        (
+            "owner/nested",
+            "nested(parameter",
+            "        return parameter",
+        ),
+    ] {
+        let target = format!("{owner}/parameter");
+        assert!(
+            result.objects.iter().any(|object| {
+                object
+                    .id
+                    .as_ref()
+                    .is_some_and(|symbol| symbol.as_str() == id(&target))
+                    && object.kinds.contains(&SymbolKind::Parameter)
+            }),
+            "{target}"
+        );
+        let name = offset(signature, "parameter");
+        assert!(
+            result.declarations.iter().any(|declaration| {
+                declaration.symbol.as_str() == id(&target)
+                    && declaration.range.start == name
+                    && declaration.range.end == name + 9
+                    && declaration.source == "parameter"
+            }),
+            "{target}"
+        );
+        assert!(
+            read_at(owner, &target, offset(use_site, "parameter")),
+            "{target}"
+        );
+    }
+    let default = offset("other(parameter=parameter", "parameter");
+    assert!(read_at("other", "parameter", default));
+    assert!(!read_at("other", "other/parameter", default));
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str() == id("choose")
+            && edge.to.as_str() == id("choose/nested")
+    }));
+
+    let rebind = id("rebind/parameter");
+    let declarations = result
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.symbol.as_str() == rebind)
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].source, "parameter = 3");
+    assert!(!result.objects.iter().any(|object| {
+        object.kinds.contains(&SymbolKind::Parameter)
+            && object.id.as_ref().is_some_and(|id| id.as_str() == rebind)
+    }));
+    for name in ["self", "args", "kwargs"] {
+        let target = id(&format!("Receiver/run/{name}"));
+        assert!(
+            !result
+                .declarations
+                .iter()
+                .any(|declaration| declaration.symbol.as_str() == target)
+        );
+    }
+}
+
+#[test]
+fn package_python_parameter_keeps_original_symbols_and_local_reads_under_caps() {
+    const SOURCE: &str = concat!(
+        "def helper(): return 1\n",
+        "def choose(parameter):\n",
+        "    local = parameter\n",
+        "    local + helper()\n",
+        "    return local\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let original = publication(&files, None, &["click"]);
+    let parameter = |id: &str| id.ends_with("/choose/parameter");
+    let symbol_limited = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 4,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    assert_eq!(
+        symbol_limited.declarations,
+        original
+            .declarations
+            .iter()
+            .filter(|entry| !parameter(entry.symbol.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        symbol_limited.edges,
+        original
+            .edges
+            .iter()
+            .filter(|edge| !parameter(edge.to.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        symbol_limited
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Calls])
+    );
+    assert_eq!(
+        symbol_limited
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/choose/local")
+            })
+            .count(),
+        2
+    );
+    assert!(
+        original
+            .edges
+            .iter()
+            .any(|edge| { edge.kinds == [EdgeKind::Reads] && parameter(edge.to.as_str()) })
+    );
+}
+
 #[test]
 fn package_collects_python_generic_aliases_in_their_own_scope() {
     let source = "class T: pass\nclass Bound: pass\n\
@@ -1841,5 +2026,98 @@ fn package_python_local_reads_keep_earlier_supplemental_reads_at_the_cap() {
                 "{from} {to} capacity {cap}"
             );
         }
+    }
+}
+
+#[test]
+fn package_python_value_parameters_preserve_required_provider_slots() {
+    parameter_provider_bound(rift_syntax::ShippedLanguage::Python, 2);
+}
+
+fn parameter_provider_bound(shipped: rift_syntax::ShippedLanguage, prior: u32) {
+    let mut package = fixture::identity();
+    let (file, text, manifest, roots) = if shipped == rift_syntax::ShippedLanguage::TypeScript {
+        package.manager = "npm".to_owned();
+        package.registry = "registry.npmjs.org".to_owned();
+        (
+            "index.ts",
+            "export function choose(value: number): number { return value; }",
+            Some(r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#),
+            Vec::new(),
+        )
+    } else {
+        package.manager = "pypi".to_owned();
+        package.registry = "pypi.org".to_owned();
+        package.name = "click".to_owned();
+        package.version = "8.3.3".to_owned();
+        let root = PackageImportRoot::new(
+            None,
+            vec!["click".to_owned()],
+            PackageImportRootOrigin::PyModules,
+        )
+        .expect("physical module root");
+        (
+            "click.py",
+            "def choose(value: int) -> int:\n    return value\n",
+            None,
+            vec![root],
+        )
+    };
+    let language = fixture::language(shipped);
+    let owner = package.owner().expect("package identity");
+    let origin = fixture::origin(&package);
+    let path = ProjectPath::new(file).expect("source path");
+    let metadata = ProjectPath::new("package.json").expect("metadata path");
+    let sources = [PackageSource::new(&path, text)];
+    let manifest = manifest
+        .map(|text| PackageSource::new(&metadata, text))
+        .into_iter()
+        .collect::<Vec<_>>();
+    for (bound, optional) in [(prior, false), (prior + 1, true)] {
+        let limits = ExactPackageLimits::new(2, 4096)
+            .with_declarations(bound)
+            .expect("provider declaration bound");
+        let exact = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("valid source")
+            .with_framework_context(&manifest, &[])
+            .expect("authored metadata")
+            .with_import_roots(&roots)
+            .expect("authored route");
+        let analysis = PackageAnalyzer::analyze(exact, 1).expect("primary declaration accepted");
+        let publication = analysis.publication();
+        assert_eq!(
+            publication.declarations.len(),
+            usize::try_from(bound).expect("small bound")
+        );
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with("/choose"))
+        );
+        if shipped == rift_syntax::ShippedLanguage::Python {
+            assert!(
+                publication
+                    .declarations
+                    .iter()
+                    .any(|row| row.symbol.as_str().ends_with("/click"))
+            );
+        }
+        assert_eq!(
+            publication.declarations.iter().any(|row| row
+                .symbol
+                .as_str()
+                .ends_with("/choose/value")
+                && row.source == "value"),
+            optional
+        );
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str().ends_with("/choose/value")),
+            optional
+        );
     }
 }

@@ -138,6 +138,20 @@ pub struct SyntaxSymbol {
     pub python_overload: Option<PythonOverload>,
 }
 
+impl SyntaxSymbol {
+    /// Whether this is the physical name of an ordinary Python parameter.
+    #[must_use]
+    pub fn is_python_parameter(&self) -> bool {
+        self.kind == crate::python::PARAMETER_KIND_WORD
+    }
+
+    /// Whether this binding uses a package-only declaration reservation.
+    #[must_use]
+    pub fn is_package_binding(&self) -> bool {
+        self.is_rust_local_binding() || self.is_python_parameter()
+    }
+}
+
 /// Form of one captured export binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxExportKind {
@@ -716,13 +730,16 @@ impl SyntaxFacts {
         &self.symbols
     }
 
-    /// Number of established declaration candidates before optional Rust package bindings.
+    /// Number of established declaration candidates before optional package bindings.
     #[must_use]
     pub fn primary_symbols_len(&self) -> usize {
-        if self.language.name == "rust" {
+        if matches!(
+            self.language.name.as_str(),
+            "rust" | "python" | "typescript"
+        ) {
             self.symbols
                 .iter()
-                .filter(|symbol| !symbol.is_rust_local_binding())
+                .filter(|symbol| !symbol.is_package_binding())
                 .count()
         } else {
             self.symbols.len()

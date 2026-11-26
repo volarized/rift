@@ -49,7 +49,7 @@ impl IndexedFile {
                 .symbols()
                 .iter()
                 .enumerate()
-                .filter(|(_, symbol)| !symbol.is_rust_local_binding())
+                .filter(|(_, symbol)| !symbol.is_package_binding())
                 .map(|(position, symbol)| (symbol.range.start, symbol.range.end, position)),
         );
         Self {
