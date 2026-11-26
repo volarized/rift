@@ -186,11 +186,32 @@ fn a_chain_of_constructed_values_ends() {
 #[test]
 fn a_chain_of_constructed_attributes_ends() {
     let links = chain(|link, before| format!("        self.a{link} = self.a{before}()"));
-    let found = chained(format!(
+    let source = format!(
         "{CLASS}class A:\n    def f(self):\n        self.a0 = C\n{links}        self.a{LAST}.m()\n"
-    ));
+    );
+    let (receiver_reads, earlier): (Vec<_>, Vec<_>) = stored_edges(&module(source.clone()), 65_536)
+        .into_iter()
+        .partition(|edge| {
+            edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/module/A/f/self")
+        });
+    let ranges = receiver_reads
+        .iter()
+        .map(|edge| {
+            let range = &edge
+                .occurrence
+                .as_ref()
+                .expect("written receiver read")
+                .range;
+            let start = usize::try_from(range.start).expect("range start");
+            let end = usize::try_from(range.end).expect("range end");
+            assert_eq!(source.get(start..end), Some("self"));
+            (start, end)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(receiver_reads.len(), 2 * LINKS);
+    assert_eq!(ranges.len(), receiver_reads.len());
     assert_edges(
-        &found,
+        &edge_pairs(&earlier),
         3006,
         &["module/A -> module/A/f", "module/A/f -> module/A/a998"],
     );
