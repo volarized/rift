@@ -2914,3 +2914,45 @@ fn typescript_method_type_parameters_keep_their_own_annotation_targets() {
         edge.to.as_str().ends_with("/Box/read/value") && edge.kinds == [EdgeKind::Reads]
     }));
 }
+
+#[test]
+fn non_entry_typescript_union_properties_keep_scopes_across_written_alternatives() {
+    const SOURCE: &str = concat!(
+        "export type Result =\n",
+        "  | { tag: 'first'; value: number }\n",
+        "  | { tag: 'waiting'; message: string }\n",
+        "  | { tag: 'last'; value: string };\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.ts", "export const ready = true;"),
+            ("result.ts", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked alias");
+    let found = analysis.publication();
+    found.validate_facts().expect("physical union members");
+    for properties in [
+        &["tag: 'first'", "tag: 'waiting'", "tag: 'last'"][..],
+        &["value: number", "value: string"][..],
+    ] {
+        let mut identities = BTreeSet::new();
+        for property in properties {
+            let start = SOURCE.find(property).expect("written branch property");
+            let declared = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.range == module_runtime_range(start, property) && row.source == *property
+                })
+                .expect("physical branch declaration");
+            assert!(identities.insert(&declared.symbol));
+        }
+    }
+}

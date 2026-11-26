@@ -540,6 +540,7 @@ impl<'source> FileScopes<'source> {
                 }
             }
         }
+        let mut checked = BTreeMap::new();
         groups
             .into_iter()
             .filter_map(|(name, members)| {
@@ -551,8 +552,12 @@ impl<'source> FileScopes<'source> {
                     return None;
                 }
                 let original = anchors.get(name)?;
+                let branches = checked
+                    .entry(container)
+                    .or_insert_with(|| self.checked_union_bodies(file, owner))
+                    .as_ref()?;
                 let identities = self
-                    .checked_union_branches(file, owner, &members)?
+                    .checked_union_branches(file, owner, &members, branches)?
                     .into_values()
                     .map(|ordinals| {
                         let identity = local_group_identity(original, *ordinals.first()?)?;
@@ -571,13 +576,60 @@ impl<'source> FileScopes<'source> {
             .collect()
     }
 
+    fn checked_union_bodies(
+        &self,
+        file: &SelectedFile<'_>,
+        owner: &SyntaxSymbol,
+    ) -> Option<BTreeSet<ByteRange>> {
+        let written = owner.body_range?;
+        let at = |start| ByteRange { start, end: start };
+        let captured = self
+            .body_members
+            .range(at(written.start)..at(written.end))
+            .filter_map(|(_, member)| {
+                (written.encloses(member.body) && written.encloses(member.holder))
+                    .then_some(member.body)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut bodies: Vec<ByteRange> = Vec::new();
+        for body in captured {
+            if let Some(outer) = bodies.last() {
+                if outer.encloses(body) {
+                    continue;
+                }
+                if outer.end > body.start {
+                    return None;
+                }
+            }
+            bodies.push(body);
+        }
+        let source_between = |start: u64, end: u64| {
+            let start = usize::try_from(start).ok()?;
+            let end = usize::try_from(end).ok()?;
+            file.source.get(start..end).map(str::trim)
+        };
+        if bodies.len() < 2
+            || !matches!(
+                source_between(written.start, bodies.first()?.start)?,
+                "" | "|"
+            )
+            || !source_between(bodies.last()?.end, written.end)?.is_empty()
+            || !bodies
+                .windows(2)
+                .all(|pair| source_between(pair[0].end, pair[1].start) == Some("|"))
+        {
+            return None;
+        }
+        Some(bodies.into_iter().collect())
+    }
+
     fn checked_union_branches(
         &self,
         file: &SelectedFile<'_>,
         owner: &SyntaxSymbol,
         members: &[&SyntaxSymbol],
+        bodies: &BTreeSet<ByteRange>,
     ) -> Option<BTreeMap<ByteRange, Vec<usize>>> {
-        let first = self.body_members.get(&members.first()?.item_range)?;
         let mut branches = BTreeMap::<ByteRange, Vec<usize>>::new();
         for member in members {
             let body = self.body_members.get(&member.item_range)?;
@@ -585,10 +637,8 @@ impl<'source> FileScopes<'source> {
                 || member.syntax_element_kind != Some("property_signature")
                 || member.container.as_deref() != Some(owner.qualified_name.as_str())
                 || self.of(member, file) != Scope::Body(body.body, false)
-                || !body.holder.encloses(body.body)
+                || !bodies.contains(&body.body)
                 || !body.body.encloses(member.item_range)
-                || !owner.item_range.encloses(body.holder)
-                || first.holder != body.holder
             {
                 return None;
             }
@@ -597,21 +647,7 @@ impl<'source> FileScopes<'source> {
                 .or_default()
                 .push(member.declaration_ordinal);
         }
-        if branches.len() < 2 {
-            return None;
-        }
-        let separate = branches
-            .keys()
-            .zip(branches.keys().skip(1))
-            .all(|(left, right)| {
-                let start = usize::try_from(left.end).ok();
-                let end = usize::try_from(right.start).ok();
-                start
-                    .zip(end)
-                    .and_then(|(start, end)| file.source.get(start..end))
-                    .is_some_and(|separator| separator.trim() == "|")
-            });
-        separate.then_some(branches)
+        (branches.len() > 1).then_some(branches)
     }
 
     fn lexical_groups(
