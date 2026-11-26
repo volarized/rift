@@ -16,6 +16,40 @@ use crate::{SyntaxDocument, SyntaxFacts};
 /// Stable identity of built-in syntax Contribution provider.
 pub const SYNTAX_PROVIDER_ID: &str = "syntax";
 
+/// Remaining source-local declaration slots in one Rust package publication.
+#[derive(Clone, Copy, Default)]
+pub struct RustBindingSlots {
+    local: usize,
+    parameter: usize,
+}
+
+impl RustBindingSlots {
+    /// Holds the caller's independently reserved let and parameter slots.
+    #[must_use]
+    pub const fn new(local: usize, parameter: usize) -> Self {
+        Self { local, parameter }
+    }
+
+    /// The total number of reserved slots.
+    #[must_use]
+    pub const fn remaining(self) -> usize {
+        self.local.saturating_add(self.parameter)
+    }
+
+    fn admit(&mut self, symbol: &crate::SyntaxSymbol) -> bool {
+        let available = if symbol.is_rust_parameter_binding() {
+            &mut self.parameter
+        } else {
+            &mut self.local
+        };
+        if *available == 0 {
+            return false;
+        }
+        *available -= 1;
+        true
+    }
+}
+
 /// One established export alias and its defining provider identity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacedAlias {
@@ -381,7 +415,7 @@ impl SyntaxPublicationBuilder {
         syntax: &SyntaxFacts,
         placement: &DocumentPlacement,
     ) -> Result<(), RiftError> {
-        self.add_facts_placed_with_rust_locals(syntax, placement, &mut 0)
+        self.add_facts_placed_with_rust_locals(syntax, placement, &mut RustBindingSlots::default())
     }
 
     /// Adds the primary declarations and any Rust package bindings allowed by the caller.
@@ -394,18 +428,18 @@ impl SyntaxPublicationBuilder {
         &mut self,
         syntax: &SyntaxFacts,
         placement: &DocumentPlacement,
-        rust_locals_remaining: &mut usize,
+        rust_locals_remaining: &mut RustBindingSlots,
     ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
         let mut remaining = *rust_locals_remaining;
         for symbol in syntax.symbols() {
-            if symbol.is_rust_local_binding() {
-                if remaining == 0 || placement.logical_identity(&symbol.qualified_name).is_none() {
-                    continue;
-                }
-                remaining -= 1;
+            if symbol.is_rust_local_binding()
+                && (placement.logical_identity(&symbol.qualified_name).is_none()
+                    || !remaining.admit(symbol))
+            {
+                continue;
             }
             let logical = placement.logical_declarations.get(&symbol.qualified_name);
             let address = symbol.provider_address(&language_segment, placement.identity_path());

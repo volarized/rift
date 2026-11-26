@@ -55,6 +55,8 @@ enum RustSymbolKind {
     Closure,
     /// A value bound by an ordinary let statement.
     LocalBinding,
+    /// A value parameter named in a function's signature.
+    ParameterBinding,
 }
 
 impl RustSymbolKind {
@@ -78,6 +80,7 @@ impl RustSymbolKind {
             Self::Impl => "impl_item",
             Self::Closure => "let_declaration",
             Self::LocalBinding => local_bindings::KIND,
+            Self::ParameterBinding => local_bindings::PARAMETER_KIND,
         }
     }
 
@@ -98,6 +101,7 @@ impl RustSymbolKind {
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
             Self::Constant | Self::Static | Self::LocalBinding => vec![SymbolKind::Value],
+            Self::ParameterBinding => vec![SymbolKind::Value, SymbolKind::Parameter],
             Self::Variant => vec![SymbolKind::Variant],
         }
     }
@@ -121,7 +125,8 @@ impl RustSymbolKind {
             | Self::Field
             | Self::AssociatedType
             | Self::Closure
-            | Self::LocalBinding => None,
+            | Self::LocalBinding
+            | Self::ParameterBinding => None,
         }
     }
 }
@@ -136,6 +141,8 @@ impl RustSymbolKind {
 enum RustGrammarSyntaxKind {
     /// `let_declaration` binding.
     LetDeclaration,
+    /// `parameter` in a function's parameter list.
+    Parameter,
     /// `closure_expression` value.
     ClosureExpression,
     /// `const_item` declaration.
@@ -187,6 +194,7 @@ impl RustGrammarSyntaxKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::LetDeclaration => "let_declaration",
+            Self::Parameter => "parameter",
             Self::ClosureExpression => "closure_expression",
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
@@ -222,6 +230,7 @@ impl RustGrammarSyntaxKind {
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
             Self::LetDeclaration => Some(RustSymbolKind::Closure),
+            Self::Parameter => Some(RustSymbolKind::ParameterBinding),
             Self::ImplItem => Some(RustSymbolKind::Impl),
             Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
@@ -622,8 +631,10 @@ impl GrammarRules for RustGrammarRules {
         syntax_element
             .child_by_field_name(RustGrammarField::Name.as_str())
             .or_else(|| {
-                (RustGrammarSyntaxKind::from_kind(syntax_element.kind())
-                    == Some(RustGrammarSyntaxKind::LetDeclaration))
+                matches!(
+                    RustGrammarSyntaxKind::from_kind(syntax_element.kind()),
+                    Some(RustGrammarSyntaxKind::LetDeclaration | RustGrammarSyntaxKind::Parameter)
+                )
                 .then(|| syntax_element.child_by_field_name(RustGrammarField::Pattern.as_str()))
                 .flatten()
             })
@@ -649,14 +660,18 @@ impl GrammarRules for RustGrammarRules {
         else {
             return Ok(None);
         };
-        let name = declaration_name(syntax_element, text).or_else(|| {
-            if kind != RustSymbolKind::Closure {
-                return None;
-            }
-            let name = local_bindings::name(visited, text)?;
-            kind = RustSymbolKind::LocalBinding;
-            Some(name.to_owned())
-        });
+        let name = if kind == RustSymbolKind::ParameterBinding {
+            local_bindings::parameter_name(visited, text).map(str::to_owned)
+        } else {
+            declaration_name(syntax_element, text).or_else(|| {
+                if kind != RustSymbolKind::Closure {
+                    return None;
+                }
+                let name = local_bindings::name(visited, text)?;
+                kind = RustSymbolKind::LocalBinding;
+                Some(name.to_owned())
+            })
+        };
         let Some(name) = name else {
             return Ok(None);
         };
@@ -1451,6 +1466,7 @@ mod tests {
         let signatures: Vec<&str> = document
             .symbols()
             .iter()
+            .filter(|symbol| symbol.kinds.contains(&SymbolKind::Callable))
             .map(|symbol| symbol.signatures[0].display.as_str())
             .collect();
         assert_eq!(signatures, ["pub fn one()", "pub fn two(x: u8) -> u8"]);
@@ -1554,7 +1570,9 @@ mod tests {
                 "Measure",
                 "Measure::size",
                 "call",
+                "call::f#parameter0",
                 "old",
+                "old::f#parameter0",
                 "closure",
                 "closure::f",
             ]

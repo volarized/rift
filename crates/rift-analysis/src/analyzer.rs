@@ -430,12 +430,12 @@ fn assemble_package_graph(
         .iter()
         .map(AnalyzedFile::placed_facts)
         .collect::<Vec<_>>();
-    let (rust_locals, rust_local_limit) = rust_local_capacity(
+    let (rust_locals, mut rust_locals_remaining) = rust_local_capacity(
         analyzed,
         input.limits(),
         usize::from(namespace.rust_package_root.is_some()),
     );
-    let mut rust_locals_remaining = rust_local_limit;
+    let rust_local_limit = rust_locals_remaining.remaining();
     let (external_work, external_work_max) = external_work_limits(input);
     let static_sources = analyzed
         .iter()
@@ -484,8 +484,8 @@ fn assemble_package_graph(
             .path(path.as_str())
             .fail();
     }
-    let truncated =
-        (rust_locals > rust_local_limit - rust_locals_remaining).then_some(rust_local_limit);
+    let truncated = (rust_locals > rust_local_limit - rust_locals_remaining.remaining())
+        .then_some(rust_local_limit);
     Ok((built.semantics, truncated))
 }
 
@@ -493,11 +493,11 @@ fn rust_local_capacity(
     documents: &[AnalyzedFile],
     limits: ExactPackageLimits,
     synthetic_objects: usize,
-) -> (usize, usize) {
-    let mut locals = 0;
+) -> (usize, rift_syntax::RustBindingSlots) {
+    let mut locals = BindingDemand::default();
+    let mut parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
-    let mut largest_local = 0_u64;
     for document in documents {
         let facts = document.file.syntax();
         primary = primary
@@ -512,13 +512,14 @@ fn rust_local_capacity(
                         .logical_identity(&symbol.qualified_name)
                         .is_some()
             }) {
-                locals += 1;
-                largest_local = largest_local.max(
-                    symbol
-                        .item_range
-                        .end
-                        .saturating_sub(symbol.item_range.start),
-                );
+                let demand = if symbol.is_rust_parameter_binding() {
+                    &mut parameters
+                } else {
+                    &mut locals
+                };
+                demand.count += 1;
+                let range = symbol.item_range;
+                demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
             }
         }
     }
@@ -528,18 +529,46 @@ fn rust_local_capacity(
             .saturating_add(unnamed)
             .saturating_add(synthetic_objects),
     );
-    let retained = limits
+    let count = locals.count + parameters.count;
+    let (mut bytes, record) = limits
         .retained_source()
-        .filter(|limits| largest_local != 0 && limits.total_bytes_max != u64::MAX)
-        .map_or(usize::MAX, |limits| {
+        .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
+        .map_or((u64::MAX, u64::MAX), |limits| {
             let existing = documents.iter().fold(0_u64, |total, file| {
                 total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
             });
-            let each = largest_local.min(u64::from(limits.record_bytes_max));
-            usize::try_from(limits.total_bytes_max.saturating_sub(existing) / each)
-                .unwrap_or(usize::MAX)
+            (
+                limits.total_bytes_max.saturating_sub(existing),
+                u64::from(limits.record_bytes_max),
+            )
         });
-    (locals, locals.min(provider).min(publication).min(retained))
+    let mut slots = provider.min(publication);
+    let local_slots = locals.reserve(&mut slots, &mut bytes, record);
+    let parameter_slots = parameters.reserve(&mut slots, &mut bytes, record);
+    (
+        count,
+        rift_syntax::RustBindingSlots::new(local_slots, parameter_slots),
+    )
+}
+
+/// Candidate count and the longest retained name in one class of Rust binding.
+#[derive(Default)]
+struct BindingDemand {
+    count: usize,
+    largest: u64,
+}
+
+impl BindingDemand {
+    fn reserve(&self, slots: &mut usize, bytes: &mut u64, record: u64) -> usize {
+        let each = self.largest.min(record).max(1);
+        let fits = usize::try_from(*bytes / each).unwrap_or(usize::MAX);
+        let count = self.count.min(*slots).min(fits);
+        *slots -= count;
+        *bytes -= u64::try_from(count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(each);
+        count
+    }
 }
 
 /// Upper bound on the original units, declarations and their search documents.
@@ -3850,20 +3879,57 @@ class _Private:
         let changed_symbols: Vec<&str> = before
             .declarations
             .iter()
-            .zip(&after.declarations)
-            .filter(|(before, after)| before.digest != after.digest)
-            .map(|(before, _)| before.symbol.as_str())
+            .filter(|original| {
+                after
+                    .declarations
+                    .iter()
+                    .find(|record| original.symbol == record.symbol && original.unit == record.unit)
+                    .expect("retained original declaration")
+                    .digest
+                    != original.digest
+            })
+            .map(|original| original.symbol.as_str())
             .collect();
         assert_eq!(
             changed_symbols,
             ["rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"]
         );
+        let added = after
+            .declarations
+            .iter()
+            .filter(|record| {
+                !before
+                    .declarations
+                    .iter()
+                    .any(|original| original.symbol == record.symbol)
+            })
+            .collect::<Vec<_>>();
+        let [parameter] = added.as_slice() else {
+            panic!("the new formal parameter is the sole addition: {added:?}");
+        };
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(parameter.symbol.as_str())
+            .expect("parameter identity");
+        assert_eq!(
+            parsed.qualified_path(),
+            ["beacon", "a", "alpha", "count#parameter0"]
+        );
+        assert_eq!(parameter.source, "count");
+
         let changed_documents: Vec<&str> = before
             .documents
             .iter()
-            .zip(&after.documents)
-            .filter(|(before, after)| before.digest != after.digest)
-            .map(|(before, _)| before.identity.as_str())
+            .filter(|original| {
+                after
+                    .documents
+                    .iter()
+                    .find(|record| {
+                        original.identity == record.identity && original.kind == record.kind
+                    })
+                    .expect("retained original search document")
+                    .digest
+                    != original.digest
+            })
+            .map(|original| original.identity.as_str())
             .collect();
         assert_eq!(
             changed_documents,
@@ -3873,6 +3939,15 @@ class _Private:
             ],
             "the changed declaration's own document and its file's document move"
         );
+        for document in &after.documents {
+            if before
+                .documents
+                .iter()
+                .all(|original| original.identity != document.identity)
+            {
+                assert_eq!(document.identity.as_str(), parameter.symbol.as_str());
+            }
+        }
         assert_ne!(before.source_digest, after.source_digest);
     }
 

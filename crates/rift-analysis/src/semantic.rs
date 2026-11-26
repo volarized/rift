@@ -428,7 +428,7 @@ impl WorkspaceSemantics {
         revision: u64,
         external: &ExternalTarget<'_>,
         static_inputs: StaticInputs<'_, '_>,
-        rust_locals_remaining: &mut usize,
+        rust_locals_remaining: &mut rift_syntax::RustBindingSlots,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::prepare_facts_with(
             documents,

@@ -1,4 +1,4 @@
-//! Simple initialized names that an authored Rust function binds.
+//! Simple initialized names and parameters that an authored Rust function binds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,15 +10,35 @@ use crate::static_analysis::{StaticBindingKind, StaticFacts, StaticReference};
 use crate::{ByteRange, SyntaxElement, SyntaxSymbol};
 
 pub(super) const KIND: &str = "local_binding";
+pub(super) const PARAMETER_KIND: &str = "parameter_binding";
 
-/// The physical identifier of a supported let statement's plain pattern.
+/// The physical identifier of a supported let statement or value parameter.
 pub(super) fn pattern(item: Node<'_>) -> Option<Node<'_>> {
-    if item.kind() != "let_declaration" || item.has_error() {
+    if item.has_error() {
         return None;
     }
     let pattern = item.child_by_field_name("pattern")?;
-    let value = item.child_by_field_name("value")?;
-    (pattern.kind() == "identifier" && value.kind() != "closure_expression").then_some(pattern)
+    let eligible = match item.kind() {
+        "parameter" => true,
+        "let_declaration" => item.child_by_field_name("value")?.kind() != "closure_expression",
+        _ => false,
+    };
+    (eligible && pattern.kind() == "identifier").then_some(pattern)
+}
+
+/// A plain authored parameter of a named function with a body.
+pub(super) fn parameter_name<'source>(
+    visited: Visited<'_, '_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let parameters = visited.parent()?;
+    if parameters.syntax_element().kind() != "parameters"
+        || parameters.parent()?.syntax_element().kind() != "function_item"
+    {
+        return None;
+    }
+    let name = source.get(pattern(visited.syntax_element())?.byte_range())?;
+    plain_name(name).then_some(name)
 }
 
 /// An initialized, plain binding in a named function, outside other bodies.
@@ -63,10 +83,16 @@ impl SyntaxSymbol {
     /// Whether this is a source-local Rust binding candidate.
     #[must_use]
     pub fn is_rust_local_binding(&self) -> bool {
-        self.kind == KIND
+        matches!(self.kind, KIND | PARAMETER_KIND)
     }
 
-    /// The generated last path component of a physical ordinary Rust let binding.
+    /// Whether this source-local Rust binding is a parameter.
+    #[must_use]
+    pub fn is_rust_parameter_binding(&self) -> bool {
+        self.kind == PARAMETER_KIND
+    }
+
+    /// The generated last path component of a physical Rust lexical binding.
     #[must_use]
     pub fn rust_local_binding_component(&self) -> Option<&str> {
         if !self.is_rust_local_binding() {
@@ -74,6 +100,11 @@ impl SyntaxSymbol {
         }
         let (owner, component) = self.qualified_name.rsplit_once("::")?;
         let (name, ordinal) = component.rsplit_once('#')?;
+        let ordinal = if self.is_rust_parameter_binding() {
+            ordinal.strip_prefix("parameter")?
+        } else {
+            ordinal
+        };
         (self.container.as_deref() == Some(owner)
             && name == self.name
             && plain_name(name)
@@ -91,7 +122,7 @@ pub(super) fn prepare(
     symbols: &mut Vec<SyntaxSymbol>,
     facts: &mut StaticFacts,
 ) {
-    if !symbols.iter().any(|symbol| symbol.kind == KIND) {
+    if !symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
         return;
     }
     if facts.rust_uses().iter().any(|import| import.glob)
@@ -100,27 +131,10 @@ pub(super) fn prepare(
         || !facts.rust_textual_macro_calls().is_empty()
         || !facts.rust_macro_barriers().is_empty()
     {
-        symbols.retain(|symbol| symbol.kind != KIND);
+        symbols.retain(|symbol| !symbol.is_rust_local_binding());
         return;
     }
-    let mut opaque = BTreeSet::new();
-    for symbol in symbols
-        .iter()
-        .filter(|symbol| matches!(symbol.kind, "constant" | "static" | "struct" | "variant"))
-    {
-        if let Some(name) = source_name(source, symbol.name_range) {
-            opaque.insert(name.strip_prefix("r#").unwrap_or(name));
-        }
-    }
-    for binding in facts.bindings() {
-        if let Some(name) = source_name(source, Some(binding.name)) {
-            if let Some(raw) = name.strip_prefix("r#") {
-                opaque.insert(raw);
-            } else if matches!(binding.kind, StaticBindingKind::RustUse { .. }) {
-                opaque.insert(name);
-            }
-        }
-    }
+    let opaque = opaque_names(source, symbols, facts);
     let mut same_name = BTreeMap::new();
     let mut retained = BTreeSet::new();
     let mut conditions = facts
@@ -132,7 +146,7 @@ pub(super) fn prepare(
     let mut conditions = conditions.into_iter().peekable();
     let mut conditional_end = 0;
     symbols.retain_mut(|symbol| {
-        if symbol.kind != KIND {
+        if !symbol.is_rust_local_binding() {
             return true;
         }
         while let Some(condition) =
@@ -152,9 +166,16 @@ pub(super) fn prepare(
         if opaque.contains(name) {
             return false;
         }
-        let ordinal = same_name.entry((owner.to_owned(), name)).or_insert(0_usize);
+        let ordinal = same_name
+            .entry((owner.to_owned(), name, symbol.kind))
+            .or_insert(0_usize);
         // A Rust identifier cannot contain this ordinal separator.
-        let qualified = format!("{owner}::{name}#{ordinal}");
+        let category = if symbol.kind == PARAMETER_KIND {
+            "parameter"
+        } else {
+            ""
+        };
+        let qualified = format!("{owner}::{name}#{category}{ordinal}");
         if !rift_core::is_portable_name(name) || !rift_core::is_portable_name(&qualified) {
             return false;
         }
@@ -187,6 +208,32 @@ pub(super) fn prepare(
         })
         .collect();
     facts.add_rust_local_references(reads);
+}
+
+fn opaque_names<'source>(
+    source: &'source str,
+    symbols: &[SyntaxSymbol],
+    facts: &StaticFacts,
+) -> BTreeSet<&'source str> {
+    let mut opaque = BTreeSet::new();
+    for symbol in symbols
+        .iter()
+        .filter(|symbol| matches!(symbol.kind, "constant" | "static" | "struct" | "variant"))
+    {
+        if let Some(name) = source_name(source, symbol.name_range) {
+            opaque.insert(name.strip_prefix("r#").unwrap_or(name));
+        }
+    }
+    for binding in facts.bindings() {
+        if let Some(name) = source_name(source, Some(binding.name)) {
+            if let Some(raw) = name.strip_prefix("r#") {
+                opaque.insert(raw);
+            } else if matches!(binding.kind, StaticBindingKind::RustUse { .. }) {
+                opaque.insert(name);
+            }
+        }
+    }
+    opaque
 }
 
 fn source_name(source: &str, range: Option<ByteRange>) -> Option<&str> {

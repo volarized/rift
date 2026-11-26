@@ -3,7 +3,7 @@
 use rift_core::ProjectPath;
 use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::index::{PackageAnalysisWarning, PackagePublication, PackageSymbol};
-use rift_protocol::read::EdgeKind;
+use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_syntax::ShippedLanguage;
 
 use super::fixture;
@@ -251,4 +251,92 @@ fn package_rust_let_keeps_exact_primary_retained_source_budget() {
     assert_eq!(exact.declarations, primary.declarations);
     assert_eq!(exact.edges, primary.edges);
     assert_eq!(exact.units, primary.units);
+}
+
+#[test]
+fn package_rust_parameter_names_keep_their_callable_and_physical_read() {
+    let source = "pub fn choose(parameter: u16) -> u16 {\n    let local = parameter;\n    let nested = { let local = 7u16; local };\n    local + nested\n}\npub fn alternate(parameter: u8) -> u8 { parameter }\n";
+    let result = analyze(source);
+    let first = declaration_at(&result, source, "parameter: u16");
+    let second = declaration_at(&result, source, "parameter: u8");
+    assert_ne!(first.symbol, second.symbol);
+    assert!(!first.public && !second.public);
+    for (parameter, function, read) in [
+        (first, "/choose", "parameter;"),
+        (second, "/alternate", "parameter }"),
+    ] {
+        assert!(result.objects.iter().any(|symbol| {
+            symbol.id.as_ref() == Some(&parameter.symbol)
+                && symbol.kinds.contains(&SymbolKind::Parameter)
+        }));
+        let site = position(source, read);
+        assert!(result.edges.iter().any(|row| {
+            row.kinds == [EdgeKind::Reads]
+                && row.from.as_str().ends_with(function)
+                && row.to == parameter.symbol
+                && row.occurrence.as_ref().is_some_and(|site_span| {
+                    site_span.range.start == site && site_span.range.end == site + 9
+                })
+        }));
+    }
+}
+
+#[test]
+fn package_rust_parameter_shadowing_keeps_the_initializer_and_call_owner() {
+    let source = "pub fn leaf() {}\npub fn choose(parameter: u16) -> u16 {\n    let previous = parameter;\n    let parameter = parameter + 1;\n    leaf();\n    previous + parameter\n}\n";
+    let result = analyze(source);
+    let parameter = declaration_at(&result, source, "parameter: u16");
+    let shadow = declaration_at(&result, source, "parameter = parameter");
+    assert_ne!(parameter.symbol, shadow.symbol);
+    assert!(
+        parameter
+            .symbol
+            .as_str()
+            .ends_with("/parameter%23parameter0")
+    );
+    assert!(shadow.symbol.as_str().ends_with("/parameter%230"));
+    for (written, target) in [
+        ("parameter;", parameter),
+        ("parameter + 1", parameter),
+        ("parameter\n", shadow),
+    ] {
+        let site = position(source, written);
+        assert!(result.edges.iter().any(|row| {
+            row.kinds == [EdgeKind::Reads]
+                && row.from.as_str().ends_with("/choose")
+                && row.to == target.symbol
+                && row
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|span| span.range.start == site)
+        }));
+    }
+    assert!(result.edges.iter().any(|row| {
+        row.kinds == [EdgeKind::Calls]
+            && row.from.as_str().ends_with("/choose")
+            && row.to.as_str().ends_with("/leaf")
+    }));
+}
+
+#[test]
+fn package_rust_parameter_leaves_the_existing_let_slot_available() {
+    let source = "pub fn choose(parameter: u16) -> u16 { let local = parameter; local }";
+    let limits = ExactPackageLimits::new(2, 1 << 20)
+        .with_declarations(2)
+        .expect("room for the function and its earlier local");
+    let result = analyze_with_limits(source, limits);
+    let local = declaration_at(&result, source, "local = parameter;");
+    let parameter = position(source, "parameter: u16");
+    assert!(
+        result
+            .declarations
+            .iter()
+            .all(|row| row.range.start != parameter)
+    );
+    assert!(
+        result
+            .edges
+            .iter()
+            .any(|row| { row.kinds == [EdgeKind::Reads] && row.to == local.symbol })
+    );
 }

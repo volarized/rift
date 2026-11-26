@@ -29,7 +29,7 @@ mod yaml;
 
 pub use angular::{AngularComponent, AngularTemplate, angular_components};
 pub use contribution::{
-    DocumentPlacement, LogicalDeclaration, PlacedAlias, SYNTAX_PROVIDER_ID,
+    DocumentPlacement, LogicalDeclaration, PlacedAlias, RustBindingSlots, SYNTAX_PROVIDER_ID,
     SyntaxPublicationBuilder, source_unit, source_unit_for_path,
 };
 pub use css::CssSyntaxProvider;
