@@ -49,3 +49,7 @@ pub(super) fn method(kind: &str) -> bool {
             | super::ABSTRACT_METHOD_SIGNATURE_KIND
     )
 }
+
+pub(super) fn function(kind: &str) -> bool {
+    kind == super::FUNCTION_DECLARATION_KIND
+}

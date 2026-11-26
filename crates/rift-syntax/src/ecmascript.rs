@@ -247,6 +247,7 @@ pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const FUNCTION_TYPE_PARAMETER_KIND: &str = "typescript_function_type_parameter";
 pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
@@ -1639,6 +1640,10 @@ impl EcmaScriptRules<'_> {
         type_parameters::declared_name(visited)
             .map(|name| (name, TYPE_PARAMETER_KIND))
             .or_else(|| {
+                type_parameters::named_owner(visited, type_parameters::function)
+                    .map(|name| (name, FUNCTION_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
                 type_parameters::named_owner(visited, type_parameters::method)
                     .map(|name| (name, METHOD_TYPE_PARAMETER_KIND))
             })
@@ -1680,7 +1685,10 @@ impl EcmaScriptRules<'_> {
     fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
         let (name, kind) = self.parameter_syntax(visited)?;
         let name = text.get(name.byte_range())?;
-        let type_parameter = matches!(kind, TYPE_PARAMETER_KIND | METHOD_TYPE_PARAMETER_KIND);
+        let type_parameter = matches!(
+            kind,
+            TYPE_PARAMETER_KIND | METHOD_TYPE_PARAMETER_KIND | FUNCTION_TYPE_PARAMETER_KIND
+        );
         if !name.is_ascii() || name.contains('\\') || (!type_parameter && name == "this") {
             return None;
         }
@@ -2418,6 +2426,7 @@ fn append_package_parameters(
         wrapped,
         destructured,
         method_types,
+        function_types,
     } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
@@ -2459,6 +2468,12 @@ fn append_package_parameters(
         facts,
         type_parameters::method,
     );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        function_types,
+        facts,
+        type_parameters::function,
+    );
 }
 
 #[derive(Default)]
@@ -2469,6 +2484,7 @@ struct ParameterDeclarations {
     index_signatures: Vec<crate::SyntaxSymbol>,
     wrapped: Vec<crate::SyntaxSymbol>,
     destructured: Vec<crate::SyntaxSymbol>,
+    function_types: Vec<crate::SyntaxSymbol>,
     method_types: Vec<crate::SyntaxSymbol>,
 }
 
@@ -2488,6 +2504,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.destructured
         } else if symbol.is_typescript_method_type_parameter() {
             &mut candidates.method_types
+        } else if symbol.is_typescript_function_type_parameter() {
+            &mut candidates.function_types
         } else {
             &mut candidates.values
         };
@@ -2646,6 +2664,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == METHOD_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(METHOD_TYPE_PARAMETER_KIND);
+    }
+    if name == FUNCTION_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(FUNCTION_TYPE_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

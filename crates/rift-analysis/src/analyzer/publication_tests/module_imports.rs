@@ -2956,3 +2956,59 @@ fn non_entry_typescript_union_properties_keep_scopes_across_written_alternatives
         }
     }
 }
+
+#[test]
+fn typescript_named_function_type_parameters_link_only_their_own_types() {
+    const SOURCE: &str = concat!(
+        "export function choose<Value>(parameter: Value): Value { return parameter; }\n",
+        "export function echo<Value>(parameter: Value): Value { return parameter; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked generic functions");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical function type parameters");
+    for owner in ["choose", "echo"] {
+        let signature = format!("{owner}<Value>(parameter: Value): Value");
+        let method = SOURCE.find(&signature).expect("written function");
+        let start = method + owner.len() + 1;
+        let suffix = format!("/{owner}/Value");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, "Value")
+                    && row.source == "Value"
+            })
+            .expect("physical function type parameter");
+        let expected = signature
+            .match_indices("Value")
+            .skip(1)
+            .map(|(offset, _)| {
+                let range = module_runtime_range(method + offset, "Value");
+                (range.start, range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        let actual = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::HasType])
+            .map(|edge| {
+                let occurrence = edge.occurrence.as_ref().expect("physical type use");
+                assert_eq!(occurrence.unit, parameter.unit);
+                (occurrence.range.start, occurrence.range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+}
