@@ -1011,7 +1011,7 @@ pub fn leaf() {}
 pub fn call() { crate::leaf(); }
 #[cfg(any())]
 pub fn inactive() { crate::leaf(); }
-pub(crate) fn private() {}
+pub fn private() {}
 ";
     const CHILD: &str = "
 use crate::leaf as imported;
@@ -1081,4 +1081,42 @@ pub fn run() { crate::leaf(); imported(); }
                 .as_ref()
                 .is_none_or(|span| !span.unit.0.ends_with("/src/main.rs"))
     }));
+}
+
+#[test]
+fn authored_crate_visibility_references_the_selected_library_root() {
+    let source = "pub(crate) fn leaf() {}
+pub(in crate) fn other() {}
+pub fn caller() { leaf(); other(); }
+";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    let mut ranges = publication
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let span = edge.occurrence.as_ref()?;
+            (edge.to.as_str() == ROOT && edge.kinds == [EdgeKind::Reads])
+                .then_some(span.range.clone())
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start);
+    assert_eq!(
+        ranges,
+        source
+            .match_indices("crate")
+            .map(|(start, _)| TextRange {
+                start: start as u64,
+                end: (start + 5) as u64
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Calls])
+            .count(),
+        2
+    );
 }

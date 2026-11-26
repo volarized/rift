@@ -261,29 +261,26 @@ impl<'source> Index<'source> {
         }
     }
 
-    /// Resolves explicit crate qualifiers to the selected library's physical declaration.
-    pub(in crate::static_resolution) fn resolve_rust_crate_paths(
+    /// Resolves written crate tokens to the selected library declaration.
+    pub(in crate::static_resolution) fn resolve_rust_crate_references(
         &self,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) {
-        let Some(root) = self.files.values().find_map(|file| {
+        select: impl Fn(&rift_syntax::StaticFacts) -> &[ByteRange],
+    ) -> Option<usize> {
+        let root = self.files.values().find_map(|file| {
             Some(Target {
                 file: file.document,
                 symbol: file.rust_library_root?,
             })
-        }) else {
-            return;
-        };
-        let Some(crate_name) = root.file.placement.module_path().first() else {
-            return;
-        };
+        })?;
+        let crate_name = root.file.placement.module_path().first()?;
         let start = result.occurrences.len();
         for file in self.files.values() {
             if file.document.placement.module().is_none() {
                 continue;
             }
-            for &range in file.facts.rust_crate_paths() {
+            for &range in select(file.facts) {
                 if !work.charge() {
                     break;
                 }
@@ -308,9 +305,7 @@ impl<'source> Index<'source> {
                 break;
             }
         }
-        if result.occurrences.len() != start {
-            result.rust_crate_paths_start = Some(start);
-        }
+        (result.occurrences.len() != start).then_some(start)
     }
 
     /// Reads the module and type tokens written before a qualified callee's final name.

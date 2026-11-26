@@ -593,14 +593,16 @@ fn supplemental_rust_macro_import_keeps_prior_edges_at_the_cap() {
     let edges = full.semantics.edges();
     let mut primary = Vec::new();
     let mut supplemental = 0;
-    let mut root_contains = 0;
+    let mut root_additions = 0;
     for edge in edges.edges() {
         if edge.kind() == EdgeKind::Imports && edge.to().as_str().ends_with("/chosen") {
             supplemental += 1;
-        } else if edge.kind() == EdgeKind::Contains
-            && edge.from().as_str() == "rift://symbol/cargo/crates.io/beacon/rust/beacon"
+        } else if (edge.kind() == EdgeKind::Contains
+            && edge.from().as_str() == "rift://symbol/cargo/crates.io/beacon/rust/beacon")
+            || (edge.kind() == EdgeKind::Reads
+                && edge.to().as_str() == "rift://symbol/cargo/crates.io/beacon/rust/beacon")
         {
-            root_contains += 1;
+            root_additions += 1;
         } else {
             primary.push(edge);
         }
@@ -622,7 +624,10 @@ fn supplemental_rust_macro_import_keeps_prior_edges_at_the_cap() {
         limited.semantics.edges().edges().collect::<Vec<_>>(),
         primary
     );
-    assert_eq!(limited.semantics.edges().dropped_edges(), 1 + root_contains);
+    assert_eq!(
+        limited.semantics.edges().dropped_edges(),
+        1 + root_additions
+    );
 }
 
 #[test]

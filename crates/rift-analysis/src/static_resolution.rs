@@ -108,6 +108,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_library_root_start: Option<usize>,
     /// First path occurrence resolved to the physical Cargo library root.
     pub(crate) rust_crate_paths_start: Option<usize>,
+    /// First restricted visibility occurrence resolved to the Cargo library root.
+    pub(crate) rust_crate_visibility_start: Option<usize>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
@@ -254,7 +256,16 @@ fn resolve_by<'source>(
     index.resolve_rust_receivers(&mut work, &mut resolution);
     index.resolve_rust_generics(&mut work, &mut resolution);
     index.resolve_rust_library_root(&mut work, &mut resolution);
-    index.resolve_rust_crate_paths(&mut work, &mut resolution);
+    resolution.rust_crate_paths_start = index.resolve_rust_crate_references(
+        &mut work,
+        &mut resolution,
+        StaticFacts::rust_crate_paths,
+    );
+    resolution.rust_crate_visibility_start = index.resolve_rust_crate_references(
+        &mut work,
+        &mut resolution,
+        StaticFacts::rust_crate_visibility,
+    );
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

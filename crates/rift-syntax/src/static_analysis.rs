@@ -544,6 +544,8 @@ pub struct StaticFactsParts {
     pub rust_generic_references: Vec<StaticRustGenericReference>,
     /// Written crate-root tokens in paths.
     pub rust_crate_paths: Vec<ByteRange>,
+    /// Written crate-root tokens in restricted visibility.
+    pub rust_crate_visibility: Vec<ByteRange>,
     /// Hoisted block-local value names with their scopes.
     pub rust_local_values: Vec<(ByteRange, ByteRange)>,
     /// Block-local type and module items with their lexical blocks.
@@ -675,6 +677,12 @@ impl StaticFacts {
     #[must_use]
     pub fn rust_crate_paths(&self) -> &[ByteRange] {
         &self.0.rust_crate_paths
+    }
+
+    /// Written crate-root tokens in restricted visibility.
+    #[must_use]
+    pub fn rust_crate_visibility(&self) -> &[ByteRange] {
+        &self.0.rust_crate_visibility
     }
 
     pub(crate) fn set_rust_generic_references(
@@ -1071,6 +1079,7 @@ impl StaticFacts {
             vector_capacity(&self.0.rust_value_reads),
             vector_capacity(&self.0.rust_generic_references),
             vector_capacity(&self.0.rust_crate_paths),
+            vector_capacity(&self.0.rust_crate_visibility),
             vector_capacity(&self.0.rust_local_values),
             vector_capacity(&self.0.rust_local_types),
             vector_capacity(&self.0.rust_field_sites),
@@ -1159,6 +1168,7 @@ impl StaticFacts {
             self.rust_value_reads().len(),
             self.rust_generic_references().len(),
             self.rust_crate_paths().len(),
+            self.rust_crate_visibility().len(),
             self.rust_local_values().len(),
             self.rust_local_types().len(),
             self.rust_field_sites().len(),
@@ -1249,6 +1259,7 @@ impl StaticFacts {
                 .iter()
                 .all(|(item, scope)| valid(*item) && valid(*scope) && scope.encloses(*item))
             && self.rust_crate_paths().iter().copied().all(valid)
+            && self.rust_crate_visibility().iter().copied().all(valid)
             && self.rust_macro_ranges_valid(valid)
             && self.rust_field_sites().iter().all(|site| {
                 valid(site.owner)
