@@ -50,6 +50,131 @@ fn module(body: &str) -> (Vec<String>, u64) {
 const NAMES: &str = "def f(): pass\nclass C: pass\nN = 1\n";
 
 #[test]
+fn test_python_direct_local_reads_keep_their_physical_binding() {
+    let source = "def choose(parameter: int) -> int:\n    local = parameter\n    def nested() -> int:\n        local = 7\n        return local\n    return local + nested()\n";
+    let (found, result) = accesses(&[("main.py", source)]);
+    assert_eq!(
+        found,
+        [
+            "4 main/choose/nested reads main/choose/nested/local",
+            "5 main/choose reads main/choose/local",
+        ]
+    );
+    let starts =
+        |text| u64::try_from(source.find(text).expect("source anchor")).expect("source offset");
+    for (suffix, read, declaration) in [
+        ("/nested/local", "local\n", "local = 7"),
+        ("/choose/local", "local +", "local = parameter"),
+    ] {
+        let site = result
+            .occurrences
+            .iter()
+            .find(|site| {
+                site.edge_kind.is_none()
+                    && site.role == ReferenceRole::Read
+                    && target(site).ends_with(suffix)
+            })
+            .expect("local read");
+        assert_eq!(site.binding.range().start(), starts(read));
+        assert_eq!(
+            site.target_binding
+                .as_ref()
+                .expect("local declaration")
+                .range()
+                .start(),
+            starts(declaration)
+        );
+    }
+}
+
+#[test]
+fn test_python_direct_local_reads_refuse_other_scopes_and_unavailable_values() {
+    let source = "def run(flag, values):\n    local = 1\n    def capture(): return local\n    def unbound():\n        return local\n        local = 2\n    def deleted():\n        local = 3\n        if flag: del local\n        return local\n    def reassigned():\n        local = 4\n        local += 1\n        return local\n    def annotated():\n        local: int\n        return local\n    def conditional():\n        if flag: local = 5\n        return local\n    def separate():\n        local: int = 6\n        return local\n    return local, [local for local in values], (local for value in values)\n";
+    let (found, _) = accesses(&[("main.py", source)]);
+    assert_eq!(
+        found,
+        [
+            "22 main/run/separate reads main/run/separate/local",
+            "23 main/run reads main/run/local",
+        ]
+    );
+}
+
+#[test]
+fn test_python_direct_local_reads_preserve_calls_qualifiers_and_writes() {
+    let source = "import other as mod\ndef run():\n    alias = mod.leaf\n    alias()\n    (alias)()\n    mod.leaf()\n    return alias\n";
+    let (found, result) = accesses(&[("main.py", source), ("other.py", "def leaf(): pass\n")]);
+    let owners = result
+        .occurrences
+        .iter()
+        .filter(|site| site.role == ReferenceRole::Call && target(site).ends_with("/other/leaf"))
+        .map(|site| source_of(site, source))
+        .collect::<Vec<_>>();
+    assert_eq!(owners, ["alias()", "mod.leaf()"]);
+    assert_eq!(
+        found,
+        [
+            "2 main/run reads other",
+            "5 main/run reads other",
+            "6 main/run reads main/run/alias",
+        ]
+    );
+}
+
+#[test]
+fn test_python_direct_local_read_work_keeps_older_edges() {
+    let prefix = "import other as mod\ndef run():\n    local = 1\n    mod.leaf()\n";
+    let source = format!("{prefix}{}", "    local\n".repeat(2_000));
+    let control = format!("{prefix}{}", "    pass \n".repeat(2_000));
+    let resolve = |source| {
+        resolution(
+            "python",
+            &[("main.py", source), ("other.py", "def leaf(): pass\n")],
+            &[],
+            1_000,
+        )
+    };
+    let edges = |result: &StaticResolution| {
+        result
+            .occurrences
+            .iter()
+            .filter(|site| {
+                !(site.role == ReferenceRole::Read && target(site).ends_with("/run/local"))
+            })
+            .map(|site| {
+                (
+                    site.role,
+                    site.edge_kind,
+                    site.binding.range().start(),
+                    target(site).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let baseline = resolve(&control);
+    let found = resolve(&source);
+    assert!(!baseline.ended);
+    assert!(found.ended);
+    assert!(!found.exhausted);
+    assert_eq!(edges(&found), edges(&baseline));
+    assert_eq!(found.omitted, baseline.omitted);
+    assert_eq!(
+        found
+            .occurrences
+            .iter()
+            .filter(|site| site.role == ReferenceRole::Call)
+            .count(),
+        1
+    );
+    assert!(
+        found
+            .edge_calls
+            .values()
+            .all(|coverage| !coverage.unavailable)
+    );
+}
+
+#[test]
 fn test_python_name_budget_keeps_other_facts_in_every_file() {
     let mut source = "N = 0\n".repeat(1_800);
     source.push_str(&"N\n".repeat(4_000));
@@ -203,12 +328,15 @@ fn test_python_callees_and_stated_names_are_no_reads() {
 }
 
 #[test]
-fn test_python_names_shadowed_in_their_scope_are_no_reads() {
+fn test_python_shadowed_names_do_not_read_outer_bindings() {
     assert_reads(&[
         ("def run(f): return f\n", &[]),
         ("def run(*f, **N): return f, N\n", &[]),
         ("def run(*f: int): return f\n", &[]),
-        ("def run():\n    f = 1\n    return f\n", &[]),
+        (
+            "def run():\n    f = 1\n    return f\n",
+            &["2 run reads run/f"],
+        ),
         ("def run():\n    print(f)\n    f = 1\n", &[]),
         ("def run():\n    for f in (): print(f)\n", &[]),
         ("def run():\n    with x as f: print(f)\n", &[]),

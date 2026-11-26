@@ -230,6 +230,9 @@ const BLOCK_COMMENT_CLOSE: &str = "*/";
 /// Leads each continuation line inside a `JSDoc` block.
 const JSDOC_LINE_MARKER: char = '*';
 
+/// Provider kind of an ordinary TypeScript value parameter.
+pub(crate) const PARAMETER_KIND: &str = "value_parameter";
+
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,7 +445,7 @@ pub(crate) struct EcmaScriptKinds {
     method_definition: u16,
     /// Constructor parameters that can declare a property; empty on the
     /// JavaScript grammar.
-    parameter_properties: Vec<u16>,
+    formal_parameter_kinds: Vec<u16>,
     /// The `readonly` token a parameter property can carry.
     readonly_token: Option<u16>,
     /// `pattern` field on a parameter; `None` on the JavaScript grammar.
@@ -572,7 +575,7 @@ impl EcmaScriptKinds {
             enum_body: None,
             property_identifier: kind_id(language, PROPERTY_IDENTIFIER_KIND),
             method_definition: kind_id(language, METHOD_DEFINITION_KIND),
-            parameter_properties: Vec::new(),
+            formal_parameter_kinds: Vec::new(),
             readonly_token: None,
             pattern: None,
             variable_declarator: kind_id(language, VARIABLE_DECLARATOR_KIND),
@@ -654,7 +657,7 @@ impl EcmaScriptKinds {
             abstract_method,
         ];
         kinds.enum_body = Some(kind_id(language, ENUM_BODY_KIND));
-        kinds.parameter_properties = [REQUIRED_PARAMETER_KIND, OPTIONAL_PARAMETER_KIND]
+        kinds.formal_parameter_kinds = [REQUIRED_PARAMETER_KIND, OPTIONAL_PARAMETER_KIND]
             .map(|kind| kind_id(language, kind))
             .to_vec();
         kinds.readonly_token = Some(token_id(language, "readonly"));
@@ -1001,6 +1004,26 @@ impl EcmaScriptKinds {
         None
     }
 
+    /// A simple parameter of a named TypeScript function with a body.
+    fn ordinary_parameter<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+        let parameter = visited.syntax_element();
+        if !self.formal_parameter_kinds.contains(&parameter.kind_id()) || parameter.has_error() {
+            return None;
+        }
+        let list = visited.parent()?;
+        let function = list.parent()?.syntax_element();
+        if list.syntax_element().kind() != "formal_parameters"
+            || function.kind() != FUNCTION_DECLARATION_KIND
+        {
+            return None;
+        }
+        self.child(function, EcmaScriptGrammarField::Name)?;
+        self.child(function, EcmaScriptGrammarField::Body)?;
+        parameter
+            .child_by_field_id(self.pattern?.get())
+            .filter(|name| name.kind_id() == self.identifier && !name.is_missing())
+    }
+
     /// The name a constructor parameter property declares: `name` in
     /// `constructor(public readonly name: string)`. Only a parameter carrying
     /// an accessibility modifier or `readonly` declares one.
@@ -1011,7 +1034,7 @@ impl EcmaScriptKinds {
     ) -> Option<Node<'tree>> {
         let syntax_element = visited.syntax_element();
         if !self
-            .parameter_properties
+            .formal_parameter_kinds
             .contains(&syntax_element.kind_id())
         {
             return None;
@@ -1576,6 +1599,22 @@ impl EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
+        if let Some(name) = self
+            .kinds
+            .ordinary_parameter(visited)
+            .and_then(|name| text.get(name.byte_range()))
+            .filter(|name| *name != "this" && name.is_ascii() && !name.contains('\\'))
+        {
+            return Ok(Some(Declaration {
+                name: name.to_owned(),
+                kind: PARAMETER_KIND,
+                kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
+                visibility: None,
+                body_range: None,
+                documentation: Vec::new(),
+                documentation_ranges: Vec::new(),
+            }));
+        }
         let parent = visited.parent().map(Visited::syntax_element);
         let (name, kind, kinds) = if let Some(declarator) = self.kinds.pattern_declarator(visited) {
             let name = text.get(syntax_element.byte_range()).unwrap_or_default();
@@ -1838,7 +1877,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
         }
         let parameter_name = self
             .kinds
-            .parameter_properties
+            .formal_parameter_kinds
             .contains(&syntax_element.kind_id())
             .then_some(self.kinds.pattern)
             .flatten()
@@ -2019,9 +2058,18 @@ impl GrammarRules for EcmaScriptRules<'_> {
         Some(class.to_owned())
     }
 
+    fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        self.kinds
+            .ordinary_parameter(visited)
+            .unwrap_or_else(|| visited.syntax_element())
+    }
+
     /// Starts the declaration at the statement carrying it, extended over the
     /// `JSDoc` comments attached before that statement.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
+        if let Some(name) = self.kinds.ordinary_parameter(visited) {
+            return name.start_byte();
+        }
         let statement = self.statement(visited);
         self.jsdoc_run(statement, text)
             .last()
@@ -2134,18 +2182,7 @@ pub(crate) fn analyze_included(
             .source_bytes_max(limits.source_bytes_max())
             .fail();
     }
-    let mut parser = Parser::new();
-    parser.set_language(grammar).map_err(|_| {
-        errors::syntax::incompatible_grammar()
-            .grammar_abi_version(grammar.abi_version())
-            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
-            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
-            .error()
-    })?;
-    assert!(
-        parser.set_included_ranges(ranges).is_ok(),
-        "host grammar ranges must be ordered and non-overlapping: ranges={ranges:?}",
-    );
+    let mut parser = parser_for_ranges(grammar, ranges)?;
     // A host grammar's ranges already select what this parser reads.
     let parsed = if ranges.is_empty() {
         recovery::parse(&mut parser, source.text)
@@ -2197,6 +2234,7 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
+    let parameters = take_parameters(kinds, &mut symbols);
     let mut static_facts = capture.map(crate::static_analysis::Capture::finish);
     if let Some(facts) = &mut static_facts {
         let aliases = members::record(
@@ -2209,6 +2247,9 @@ pub(crate) fn analyze_included(
             &mut symbols,
         )?;
         facts.set_member_aliases(aliases);
+        if !recovered && !tree.root_node().has_error() {
+            append_parameters(&mut symbols, parameters, facts);
+        }
     }
     symbols.sort_by_key(|symbol| symbol.range.start);
     let variance_errors_only = language.name == "typescript"
@@ -2229,6 +2270,85 @@ pub(crate) fn analyze_included(
     .with_export_bindings(export_bindings)
     .with_static_facts(static_facts)
     .with_syntax_limits(limits))
+}
+
+fn parser_for_ranges(
+    grammar: &tree_sitter::Language,
+    ranges: &[tree_sitter::Range],
+) -> Result<Parser, RiftError> {
+    let mut parser = Parser::new();
+    parser.set_language(grammar).map_err(|_| {
+        errors::syntax::incompatible_grammar()
+            .grammar_abi_version(grammar.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error()
+    })?;
+    assert!(
+        parser.set_included_ranges(ranges).is_ok(),
+        "host grammar ranges must be ordered and non-overlapping: ranges={ranges:?}",
+    );
+    Ok(parser)
+}
+
+/// Holds optional parameters aside while existing member facts are resolved.
+fn take_parameters(
+    kinds: &EcmaScriptKinds,
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+) -> Vec<crate::SyntaxSymbol> {
+    if kinds.formal_parameter_kinds.is_empty() {
+        return Vec::new();
+    }
+    symbols
+        .extract_if(.., |symbol| symbol.is_typescript_parameter())
+        .collect()
+}
+
+/// An ordinary parameter adds no competing facet of an existing lexical declaration.
+fn append_parameters(
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+    parameters: Vec<crate::SyntaxSymbol>,
+    facts: &crate::StaticFacts,
+) {
+    if parameters.is_empty() {
+        return;
+    }
+    let mut counts = BTreeMap::new();
+    for symbol in symbols.iter().chain(&parameters) {
+        *counts
+            .entry(symbol.qualified_name.as_str())
+            .or_insert(0_usize) += 1;
+    }
+    let anchors = facts
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.owner.is_some())
+        .map(|parameter| parameter.name)
+        .collect::<BTreeSet<_>>();
+    let retained = parameters
+        .iter()
+        .filter(|symbol| {
+            counts.get(symbol.qualified_name.as_str()) == Some(&1)
+                && symbol
+                    .container
+                    .as_deref()
+                    .and_then(|owner| counts.get(owner))
+                    == Some(&1)
+        })
+        .filter(|symbol| rift_core::is_portable_name(&symbol.qualified_name))
+        .filter(|symbol| {
+            symbol
+                .name_range
+                .is_some_and(|name| anchors.contains(&name))
+        })
+        .filter(|symbol| rift_core::is_portable_name(&symbol.name))
+        .map(|symbol| symbol.name_range)
+        .collect::<BTreeSet<_>>();
+    symbols.extend(
+        parameters
+            .into_iter()
+            .filter(|symbol| retained.contains(&symbol.name_range)),
+    );
 }
 
 /// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
@@ -2290,6 +2410,9 @@ fn suffix_kinds(kind: &str) -> Vec<SyntaxKind> {
 pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Option<&'static str> {
     if name == OBJECT_KIND {
         return Some(OBJECT_KIND);
+    }
+    if name == PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(PARAMETER_KIND);
     }
     kinds
         .declarations

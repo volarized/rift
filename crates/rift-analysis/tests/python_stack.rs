@@ -227,10 +227,46 @@ fn a_chain_of_container_elements_ends() {
     let links = chain(|link, before| {
         format!("    xs{link}: \"List[x{before}]\" = []\n    for x{link} in xs{link}: pass")
     });
-    let found = chained(format!(
+    let source = format!(
         "{CLASS}from typing import List\ndef f(xs0: List[C]):\n    for x0 in xs0: pass\n{links}    x{LAST}.m()\n"
-    ));
-    assert_edges(&found, 1005, &["module/C -> module/C/m"]);
+    );
+    let (reads, original): (Vec<_>, Vec<_>) = stored_edges(&module(source.as_str()), 65_536)
+        .into_iter()
+        .partition(|edge| edge.kinds == [EdgeKind::Reads]);
+    assert_edges(&edge_pairs(&original), 1005, &["module/C -> module/C/m"]);
+
+    let owner = "rift://symbol/pypi/pypi.org/beacon/python/module/f";
+    let mut actual = reads
+        .iter()
+        .map(|edge| {
+            let site = edge.occurrence.as_ref().expect("written iterable");
+            assert_eq!(edge.from.as_str(), owner);
+            assert_eq!(site.unit.0, "rift://source/pypi/pypi.org/beacon/module.py");
+            let name = edge
+                .to
+                .as_str()
+                .strip_prefix(owner)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .expect("local name in the function");
+            (site.range.start, site.range.end, name)
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    let expected = source
+        .match_indices(" in ")
+        .map(|(offset, prefix)| {
+            let start = offset + prefix.len();
+            let (name, _) = source[start..].split_once(':').expect("loop colon");
+            let start = u64::try_from(start).expect("offset");
+            (
+                start,
+                start + u64::try_from(name.len()).expect("name length"),
+                name,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expected.len(), LINKS);
+    assert_eq!(actual, expected);
 }
 
 #[test]

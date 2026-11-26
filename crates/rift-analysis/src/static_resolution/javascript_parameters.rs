@@ -1,0 +1,106 @@
+//! Physical ownership of ordinary TypeScript value parameters.
+
+use std::collections::BTreeMap;
+
+use rift_core::ReferenceRole;
+use rift_syntax::{ByteRange, StaticBindingKind, StaticFacts, StaticParameter, SyntaxFacts};
+
+use super::javascript::js_binding;
+use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
+
+/// Exact parameter ranges, built only when syntax holds an ordinary candidate.
+pub(super) fn parameter_sites<'source>(
+    syntax: &SyntaxFacts,
+    facts: &'source StaticFacts,
+) -> BTreeMap<ByteRange, &'source StaticParameter> {
+    if !syntax
+        .symbols()
+        .iter()
+        .any(rift_syntax::SyntaxSymbol::is_typescript_parameter)
+    {
+        return BTreeMap::new();
+    }
+    facts
+        .parameters()
+        .iter()
+        .map(|site| (site.name, site))
+        .collect()
+}
+
+impl File<'_> {
+    pub(super) fn typescript_parameter_read_candidate(&self, range: ByteRange) -> bool {
+        !self.typescript_parameters.is_empty()
+            && !self.members.contains_key(&range)
+            && self
+                .text(range)
+                .is_some_and(|name| self.typescript_parameters.contains_key(name))
+    }
+}
+
+impl<'source> Index<'source> {
+    /// Adds reads after previously collected facts have spent their reserved work.
+    pub(super) fn typescript_parameter_reads(
+        &self,
+        file: &File<'source>,
+        sites: Vec<ByteRange>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for range in sites {
+            if !work.charge() {
+                return;
+            }
+            if let Some(occurrence) = self.typescript_parameter_read(file, range, work) {
+                result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
+                result.record(Some(occurrence));
+            }
+        }
+    }
+
+    fn typescript_parameter_read(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let name = file.text(range)?;
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            name,
+            range.start,
+            ReferenceRole::Read,
+            work,
+        )?;
+        if binding.kind != StaticBindingKind::Shadow {
+            return None;
+        }
+        let parameter = file.typescript_parameters.get(name)?.get(&binding.name)?;
+        let site = parameter.site;
+        let owner = file.target_at(site.owner?)?;
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        if site.function != binding.scope
+            || owner.symbol.item_range != site.function
+            || parameter.symbol.container.as_deref() != Some(owner.symbol.qualified_name.as_str())
+            || !owner.symbol.body_range?.encloses(range)
+            || scopes.callables.resolve(range.start, range.end)?.item_range != site.function
+            || scopes
+                .function_values
+                .resolve(range.start, range.end)
+                .is_some_and(|nested| site.function.encloses(*nested))
+            || scopes
+                .classes
+                .resolve(range.start, range.end)
+                .is_some_and(|nested| site.function.encloses(nested.item_range))
+        {
+            return None;
+        }
+        let target = Target {
+            file: file.document,
+            symbol: parameter.symbol,
+        };
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Read, target)?;
+        occurrence.edge_from = Some(self.javascript_identity(owner)?);
+        Some(occurrence)
+    }
+}

@@ -227,6 +227,11 @@ fn test_class_bodies_declare_methods_with_member_categories() {
                 "method",
                 method(&[SymbolKind::Constructor])
             ),
+            (
+                "Model.__init__.name",
+                "parameter",
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            ),
             ("Model.label", "method", method(&[SymbolKind::Property])),
             ("Model.make", "method", method(&[SymbolKind::Static])),
             ("Model.build", "method", method(&[SymbolKind::Static])),
@@ -323,6 +328,7 @@ fn test_instance_attributes_assigned_in_methods_declare_class_members() {
             ("Model", None, "class"),
             ("Model.kind", Some("Model"), "variable"),
             ("Model.__init__", Some("Model"), "method"),
+            ("Model.__init__.name", Some("Model.__init__"), "parameter"),
             ("Model.name", Some("Model"), "variable"),
             ("Model.a", Some("Model"), "variable"),
             ("Model.b", Some("Model"), "variable"),
@@ -332,6 +338,10 @@ fn test_instance_attributes_assigned_in_methods_declare_class_members() {
             ("Model.name", Some("Model"), "variable"),
         ]
     );
+    let parameter = symbol(&document, "Model.__init__.name");
+    assert_eq!(parameter.name_range, Some(parameter.item_range));
+    assert_eq!(spelled(text, parameter.item_range), "name");
+    assert_eq!(parameter.kinds, [SymbolKind::Value, SymbolKind::Parameter]);
     let name = symbol(&document, "Model.name");
     assert_eq!(name.kinds, [SymbolKind::Value, SymbolKind::Member]);
     assert_eq!(spelled(text, name.range), "self.name = name");

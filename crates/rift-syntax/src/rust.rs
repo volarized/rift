@@ -16,6 +16,8 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{RiftError, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+pub(crate) mod local_bindings;
+
 /// Rust declaration kind emitted by the Tree-sitter provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::VariantArray)]
 enum RustSymbolKind {
@@ -51,6 +53,10 @@ enum RustSymbolKind {
     Impl,
     /// A local binding whose value is a closure.
     Closure,
+    /// A value bound by an ordinary let statement.
+    LocalBinding,
+    /// A value parameter named in a function's signature.
+    ParameterBinding,
 }
 
 impl RustSymbolKind {
@@ -73,6 +79,8 @@ impl RustSymbolKind {
             Self::AssociatedType => "associated_type",
             Self::Impl => "impl_item",
             Self::Closure => "let_declaration",
+            Self::LocalBinding => local_bindings::KIND,
+            Self::ParameterBinding => local_bindings::PARAMETER_KIND,
         }
     }
 
@@ -92,7 +100,8 @@ impl RustSymbolKind {
             Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
-            Self::Constant | Self::Static => vec![SymbolKind::Value],
+            Self::Constant | Self::Static | Self::LocalBinding => vec![SymbolKind::Value],
+            Self::ParameterBinding => vec![SymbolKind::Value, SymbolKind::Parameter],
             Self::Variant => vec![SymbolKind::Variant],
         }
     }
@@ -115,7 +124,9 @@ impl RustSymbolKind {
             | Self::Macro
             | Self::Field
             | Self::AssociatedType
-            | Self::Closure => None,
+            | Self::Closure
+            | Self::LocalBinding
+            | Self::ParameterBinding => None,
         }
     }
 }
@@ -130,6 +141,8 @@ impl RustSymbolKind {
 enum RustGrammarSyntaxKind {
     /// `let_declaration` binding.
     LetDeclaration,
+    /// `parameter` in a function's parameter list.
+    Parameter,
     /// `closure_expression` value.
     ClosureExpression,
     /// `const_item` declaration.
@@ -181,6 +194,7 @@ impl RustGrammarSyntaxKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::LetDeclaration => "let_declaration",
+            Self::Parameter => "parameter",
             Self::ClosureExpression => "closure_expression",
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
@@ -216,6 +230,7 @@ impl RustGrammarSyntaxKind {
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
             Self::LetDeclaration => Some(RustSymbolKind::Closure),
+            Self::Parameter => Some(RustSymbolKind::ParameterBinding),
             Self::ImplItem => Some(RustSymbolKind::Impl),
             Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
@@ -441,7 +456,7 @@ impl SyntaxProvider for RustSyntaxProvider {
         let rules = RustGrammarRules {
             traits: file_traits(tree.root_node(), source.text),
         };
-        let (syntax_elements, symbols, _) = extract::extract_with_capture(
+        let (syntax_elements, mut symbols, _) = extract::extract_with_capture(
             tree.root_node(),
             source,
             limits,
@@ -449,6 +464,8 @@ impl SyntaxProvider for RustSyntaxProvider {
             &rules,
             Some(&mut capture),
         )?;
+        let mut facts = capture.finish();
+        local_bindings::prepare(source.text, &syntax_elements, &mut symbols, &mut facts);
         Ok(SyntaxDocument::new_rust(
             self.language.clone(),
             source,
@@ -457,7 +474,7 @@ impl SyntaxProvider for RustSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_static_facts(Some(capture.finish())))
+        .with_static_facts(Some(facts)))
     }
 
     fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
@@ -614,8 +631,10 @@ impl GrammarRules for RustGrammarRules {
         syntax_element
             .child_by_field_name(RustGrammarField::Name.as_str())
             .or_else(|| {
-                (RustGrammarSyntaxKind::from_kind(syntax_element.kind())
-                    == Some(RustGrammarSyntaxKind::LetDeclaration))
+                matches!(
+                    RustGrammarSyntaxKind::from_kind(syntax_element.kind()),
+                    Some(RustGrammarSyntaxKind::LetDeclaration | RustGrammarSyntaxKind::Parameter)
+                )
                 .then(|| syntax_element.child_by_field_name(RustGrammarField::Pattern.as_str()))
                 .flatten()
             })
@@ -636,12 +655,24 @@ impl GrammarRules for RustGrammarRules {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
-        let Some(kind) = RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+        let Some(mut kind) = RustGrammarSyntaxKind::from_kind(syntax_element.kind())
             .and_then(RustGrammarSyntaxKind::symbol_kind)
         else {
             return Ok(None);
         };
-        let Some(name) = declaration_name(syntax_element, text) else {
+        let name = if kind == RustSymbolKind::ParameterBinding {
+            local_bindings::parameter_name(visited, text).map(str::to_owned)
+        } else {
+            declaration_name(syntax_element, text).or_else(|| {
+                if kind != RustSymbolKind::Closure {
+                    return None;
+                }
+                let name = local_bindings::name(visited, text)?;
+                kind = RustSymbolKind::LocalBinding;
+                Some(name.to_owned())
+            })
+        };
+        let Some(name) = name else {
             return Ok(None);
         };
         let visibility = match self.visibility_owner(visited, text) {
@@ -694,7 +725,15 @@ impl GrammarRules for RustGrammarRules {
     /// and outer doc comments so the whole declaration - not just the item
     /// syntax element - is what the symbol read returns.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
-        attachment::declaration_start(visited, text)
+        local_bindings::pattern(visited.syntax_element()).map_or_else(
+            || attachment::declaration_start(visited, text),
+            |name| name.start_byte(),
+        )
+    }
+
+    fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        let item = visited.syntax_element();
+        local_bindings::pattern(item).unwrap_or(item)
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -1427,6 +1466,7 @@ mod tests {
         let signatures: Vec<&str> = document
             .symbols()
             .iter()
+            .filter(|symbol| symbol.kinds.contains(&SymbolKind::Callable))
             .map(|symbol| symbol.signatures[0].display.as_str())
             .collect();
         assert_eq!(signatures, ["pub fn one()", "pub fn two(x: u8) -> u8"]);
@@ -1530,7 +1570,9 @@ mod tests {
                 "Measure",
                 "Measure::size",
                 "call",
+                "call::f#parameter0",
                 "old",
+                "old::f#parameter0",
                 "closure",
                 "closure::f",
             ]

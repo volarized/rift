@@ -138,6 +138,26 @@ pub struct SyntaxSymbol {
     pub python_overload: Option<PythonOverload>,
 }
 
+impl SyntaxSymbol {
+    /// Whether this is the physical name of an ordinary Python parameter.
+    #[must_use]
+    pub fn is_python_parameter(&self) -> bool {
+        self.kind == crate::python::PARAMETER_KIND_WORD
+    }
+
+    /// Whether this is an ordinary TypeScript function parameter candidate.
+    #[must_use]
+    pub fn is_typescript_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::PARAMETER_KIND
+    }
+
+    /// Whether this binding uses a package-only declaration reservation.
+    #[must_use]
+    pub fn is_package_binding(&self) -> bool {
+        self.is_rust_local_binding() || self.is_python_parameter() || self.is_typescript_parameter()
+    }
+}
+
 /// Form of one captured export binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxExportKind {
@@ -506,6 +526,22 @@ impl SyntaxDocument {
         }
     }
 
+    /// Keeps project declarations and the complete syntax tree without package-only bindings.
+    #[must_use]
+    pub fn without_package_bindings(mut self) -> Self {
+        if self
+            .facts
+            .symbols
+            .iter()
+            .any(SyntaxSymbol::is_package_binding)
+        {
+            Arc::make_mut(&mut self.facts)
+                .symbols
+                .retain(|symbol| !symbol.is_package_binding());
+        }
+        self
+    }
+
     /// Places these facts at another project path.
     ///
     /// The caller must establish that source bytes, language, dialect, and syntax bounds
@@ -714,6 +750,22 @@ impl SyntaxFacts {
     #[must_use]
     pub fn symbols(&self) -> &[SyntaxSymbol] {
         &self.symbols
+    }
+
+    /// Number of established declaration candidates before optional package bindings.
+    #[must_use]
+    pub fn primary_symbols_len(&self) -> usize {
+        if matches!(
+            self.language.name.as_str(),
+            "rust" | "python" | "typescript"
+        ) {
+            self.symbols
+                .iter()
+                .filter(|symbol| !symbol.is_package_binding())
+                .count()
+        } else {
+            self.symbols.len()
+        }
     }
 
     /// Full declarations omitted from the portable Contribution collection.

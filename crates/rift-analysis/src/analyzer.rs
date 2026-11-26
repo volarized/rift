@@ -17,7 +17,7 @@ use crate::documentation::{
     DocumentationDeclaration, DocumentationInput, DocumentationSourceSet, collect_documentation,
     content_chunk_identity, content_digest,
 };
-use crate::input::{ExactPackageInput, RetainedSourceLimits};
+use crate::input::{ExactPackageInput, ExactPackageLimits, RetainedSourceLimits};
 use crate::revision::analyzer_revision;
 use crate::selection::documentation_format;
 use crate::semantic::{PlacedFacts, WorkspaceSemantics};
@@ -368,7 +368,6 @@ impl PackageAnalyzer {
         revision: u64,
         mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     ) -> Result<PackageAnalysis, RiftError> {
-        let package = input.owner();
         let sources = input
             .files()
             .iter()
@@ -400,73 +399,213 @@ impl PackageAnalyzer {
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
         let namespace = place_namespace(&input, &mut analyzed)?;
         join::join_modules(&mut analyzed);
-        let placed = analyzed
-            .iter()
-            .map(AnalyzedFile::placed_facts)
-            .collect::<Vec<_>>();
-        let (external_work, external_work_max) = external_work_limits(&input);
-        let static_sources = analyzed
-            .iter()
-            .map(AnalyzedFile::static_source)
-            .collect::<Vec<_>>();
-        let built = WorkspaceSemantics::build_facts_placed_with_external(
-            &placed,
-            input.limits().declarations_max(),
-            input.limits().edges_max(),
-            revision,
-            &|reference| {
-                if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
-                    return None;
-                }
-                namespace.exports.iter().find_map(|export| {
-                    let work = external_work
-                        .get()
-                        .checked_add(1)?
-                        .checked_add(export.target.as_str().len())?;
-                    external_work.set(work);
-                    if work > external_work_max {
-                        return None;
-                    }
-                    let parsed =
-                        rift_protocol::identity::SymbolIdentity::parse(export.target.as_str())
-                            .ok()?;
-                    if parsed.owner() == input.owner() {
-                        return None;
-                    }
-                    let target =
-                        rift_core::ProviderSymbolId::for_symbol(export.target.as_str()).ok()?;
-                    (reference.symbol() == &target).then(|| export.target.clone())
-                })
-            },
-            (&static_sources, &input.namespace_input()),
-        )
-        .map_err(|error| {
-            errors::analysis::package_provider_failed()
-                .package(package_label(package))
-                .cause(error)
-                .error()
-        })?;
-        if let Some(path) = built.beyond_declaration_bound.first() {
-            return errors::analysis::package_declarations_exceeded()
-                .package(package_label(package))
-                .path(path.as_str())
-                .fail();
-        }
+        let (semantics, local_declaration_limit) =
+            assemble_package_graph(&input, &analyzed, &namespace, revision)?;
         let (publication, notebook_cells) = publish(
             &input,
             &analyzed,
-            &built.semantics,
+            &semantics,
             namespace.unresolved_exports,
+            local_declaration_limit,
         )?;
         Ok(PackageAnalysis {
             publication,
             files: analyzed,
-            semantics: built.semantics,
+            semantics,
             notebook_cells,
             syntax_work,
             warnings,
         })
     }
+}
+
+/// Assembles the captured package graph and reserves its primary declaration budget.
+fn assemble_package_graph(
+    input: &ExactPackageInput<'_>,
+    analyzed: &[AnalyzedFile],
+    namespace: &namespace::PreparedNamespace,
+    revision: u64,
+) -> Result<(WorkspaceSemantics, Option<usize>), RiftError> {
+    let placed = analyzed
+        .iter()
+        .map(AnalyzedFile::placed_facts)
+        .collect::<Vec<_>>();
+    let (bindings, mut binding_slots) = binding_capacity(
+        analyzed,
+        input.limits(),
+        usize::from(namespace.rust_package_root.is_some()),
+    );
+    let binding_limit = binding_slots.remaining();
+    let (external_work, external_work_max) = external_work_limits(input);
+    let static_sources = analyzed
+        .iter()
+        .map(AnalyzedFile::static_source)
+        .collect::<Vec<_>>();
+    let built = WorkspaceSemantics::build_facts_placed_with_external(
+        &placed,
+        input.limits().declarations_max(),
+        input.limits().edges_max(),
+        revision,
+        &|reference| {
+            if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
+                return None;
+            }
+            namespace.exports.iter().find_map(|export| {
+                let work = external_work
+                    .get()
+                    .checked_add(1)?
+                    .checked_add(export.target.as_str().len())?;
+                external_work.set(work);
+                if work > external_work_max {
+                    return None;
+                }
+                let parsed =
+                    rift_protocol::identity::SymbolIdentity::parse(export.target.as_str()).ok()?;
+                if parsed.owner() == input.owner() {
+                    return None;
+                }
+                let target =
+                    rift_core::ProviderSymbolId::for_symbol(export.target.as_str()).ok()?;
+                (reference.symbol() == &target).then(|| export.target.clone())
+            })
+        },
+        (&static_sources, &input.namespace_input()),
+        &mut binding_slots,
+    )
+    .map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(input.owner()))
+            .cause(error)
+            .error()
+    })?;
+    if let Some(path) = built.beyond_declaration_bound.first() {
+        return errors::analysis::package_declarations_exceeded()
+            .package(package_label(input.owner()))
+            .path(path.as_str())
+            .fail();
+    }
+    let truncated = (bindings > binding_limit - binding_slots.remaining()).then_some(binding_limit);
+    Ok((built.semantics, truncated))
+}
+
+fn binding_capacity(
+    documents: &[AnalyzedFile],
+    limits: ExactPackageLimits,
+    synthetic_objects: usize,
+) -> (usize, rift_syntax::PackageBindingSlots) {
+    let mut rust_locals = BindingDemand::default();
+    let mut rust_parameters = BindingDemand::default();
+    let mut python_parameters = BindingDemand::default();
+    let mut typescript_parameters = BindingDemand::default();
+    let mut primary = 0_usize;
+    let mut unnamed = 0_usize;
+    for document in documents {
+        let facts = document.file.syntax();
+        primary = primary
+            .saturating_add(facts.primary_symbols_len())
+            .saturating_add(document.placement.aliases_count());
+        unnamed = unnamed.saturating_add(facts.left_out_symbols().len());
+        for symbol in facts.symbols().iter().filter(|symbol| {
+            symbol.is_package_binding()
+                && document
+                    .placement
+                    .logical_identity(&symbol.qualified_name)
+                    .is_some()
+        }) {
+            let demand = if symbol.is_typescript_parameter() {
+                &mut typescript_parameters
+            } else if symbol.is_python_parameter() {
+                &mut python_parameters
+            } else if symbol.is_rust_parameter_binding() {
+                &mut rust_parameters
+            } else {
+                &mut rust_locals
+            };
+            demand.count += 1;
+            let range = symbol.item_range;
+            demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
+        }
+    }
+    let provider = limits.declarations_max().saturating_sub(primary);
+    let publication = bound(limits.publication().symbols).saturating_sub(
+        primary
+            .saturating_add(unnamed)
+            .saturating_add(synthetic_objects),
+    );
+    let count = rust_locals.count
+        + rust_parameters.count
+        + python_parameters.count
+        + typescript_parameters.count;
+    let (mut bytes, record) = limits
+        .retained_source()
+        .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
+        .map_or((u64::MAX, u64::MAX), |limits| {
+            let existing = documents.iter().fold(0_u64, |total, file| {
+                total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
+            });
+            (
+                limits.total_bytes_max.saturating_sub(existing),
+                u64::from(limits.record_bytes_max),
+            )
+        });
+    let mut slots = provider.min(publication);
+    let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
+    let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
+    let python_parameter_slots = python_parameters.reserve(&mut slots, &mut bytes, record);
+    let typescript_parameter_slots = typescript_parameters.reserve(&mut slots, &mut bytes, record);
+    (
+        count,
+        rift_syntax::PackageBindingSlots::new(
+            local_slots,
+            rust_parameter_slots,
+            python_parameter_slots,
+            typescript_parameter_slots,
+        ),
+    )
+}
+
+/// Candidate count and the longest retained name in one class of source-local binding.
+#[derive(Default)]
+struct BindingDemand {
+    count: usize,
+    largest: u64,
+}
+
+impl BindingDemand {
+    fn reserve(&self, slots: &mut usize, bytes: &mut u64, record: u64) -> usize {
+        let each = self.largest.min(record).max(1);
+        let fits = usize::try_from(*bytes / each).unwrap_or(usize::MAX);
+        let count = self.count.min(*slots).min(fits);
+        *slots -= count;
+        *bytes -= u64::try_from(count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(each);
+        count
+    }
+}
+
+/// Upper bound on the original units, declarations and their search documents.
+fn primary_retained_source_max(file: &AnalyzedFile, record_limit: u32) -> u64 {
+    let maximum = u64::from(record_limit);
+    let source = u64::try_from(file.file.source().len()).unwrap_or(u64::MAX);
+    let mut bytes = source.min(maximum).saturating_mul(2);
+    if documentation_format(file.file.path().as_str()) == Some(DocumentationSourceFormat::Notebook)
+    {
+        bytes = bytes.saturating_add(source);
+    }
+    for range in file
+        .file
+        .syntax()
+        .symbols()
+        .iter()
+        .filter(|symbol| !symbol.is_package_binding())
+        .map(|symbol| symbol.item_range)
+        .chain(file.placement.aliases().iter().map(|alias| alias.range))
+    {
+        let record = range.end.saturating_sub(range.start).min(maximum);
+        bytes = bytes.saturating_add(record.saturating_mul(2));
+    }
+    bytes
 }
 
 pub(crate) fn edge_kind(kind: rift_core::EdgeKind) -> rift_protocol::read::EdgeKind {
@@ -562,6 +701,7 @@ fn publish(
     analyzed: &[AnalyzedFile],
     semantics: &WorkspaceSemantics,
     unresolved_exports: bool,
+    local_declaration_limit: Option<usize>,
 ) -> Result<
     (
         PackagePublication,
@@ -631,6 +771,13 @@ fn publish(
         },
         package,
     )?;
+    if let Some(limit) = local_declaration_limit {
+        records.symbols_truncated = true;
+        records.warn(truncation(
+            "local_declarations",
+            u64::try_from(limit).unwrap_or(u64::MAX),
+        ));
+    }
     let coverage = publication_coverage(
         analyzed,
         &records,
@@ -3745,20 +3892,57 @@ class _Private:
         let changed_symbols: Vec<&str> = before
             .declarations
             .iter()
-            .zip(&after.declarations)
-            .filter(|(before, after)| before.digest != after.digest)
-            .map(|(before, _)| before.symbol.as_str())
+            .filter(|original| {
+                after
+                    .declarations
+                    .iter()
+                    .find(|record| original.symbol == record.symbol && original.unit == record.unit)
+                    .expect("retained original declaration")
+                    .digest
+                    != original.digest
+            })
+            .map(|original| original.symbol.as_str())
             .collect();
         assert_eq!(
             changed_symbols,
             ["rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"]
         );
+        let added = after
+            .declarations
+            .iter()
+            .filter(|record| {
+                !before
+                    .declarations
+                    .iter()
+                    .any(|original| original.symbol == record.symbol)
+            })
+            .collect::<Vec<_>>();
+        let [parameter] = added.as_slice() else {
+            panic!("the new formal parameter is the sole addition: {added:?}");
+        };
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(parameter.symbol.as_str())
+            .expect("parameter identity");
+        assert_eq!(
+            parsed.qualified_path(),
+            ["beacon", "a", "alpha", "count#parameter0"]
+        );
+        assert_eq!(parameter.source, "count");
+
         let changed_documents: Vec<&str> = before
             .documents
             .iter()
-            .zip(&after.documents)
-            .filter(|(before, after)| before.digest != after.digest)
-            .map(|(before, _)| before.identity.as_str())
+            .filter(|original| {
+                after
+                    .documents
+                    .iter()
+                    .find(|record| {
+                        original.identity == record.identity && original.kind == record.kind
+                    })
+                    .expect("retained original search document")
+                    .digest
+                    != original.digest
+            })
+            .map(|original| original.identity.as_str())
             .collect();
         assert_eq!(
             changed_documents,
@@ -3768,6 +3952,15 @@ class _Private:
             ],
             "the changed declaration's own document and its file's document move"
         );
+        for document in &after.documents {
+            if before
+                .documents
+                .iter()
+                .all(|original| original.identity != document.identity)
+            {
+                assert_eq!(document.identity.as_str(), parameter.symbol.as_str());
+            }
+        }
         assert_ne!(before.source_digest, after.source_digest);
     }
 

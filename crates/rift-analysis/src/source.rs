@@ -49,6 +49,7 @@ impl IndexedFile {
                 .symbols()
                 .iter()
                 .enumerate()
+                .filter(|(_, symbol)| !symbol.is_package_binding())
                 .map(|(position, symbol)| (symbol.range.start, symbol.range.end, position)),
         );
         Self {
@@ -159,6 +160,41 @@ mod tests {
     use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
 
     use super::*;
+
+    #[test]
+    fn indexed_file_keeps_the_existing_rust_enclosing_owner() {
+        let path = ProjectPath::new("src/lib.rs").expect("valid source path");
+        let source = "pub fn choose() -> u8 { let local = 3; local }";
+        let document = registry::provider_for_extension("rs")
+            .expect("Rust provider")
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("Rust source parses");
+        let local = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.is_rust_local_binding())
+            .expect("retained package candidate")
+            .item_range;
+        let file = IndexedFile::new(
+            path,
+            Arc::new(source.to_owned()),
+            FileDigest::of(source.as_bytes()),
+            false,
+            document,
+        );
+        assert_eq!(
+            file.enclosing_symbol(local.start, local.end)
+                .expect("existing owner")
+                .name,
+            "choose"
+        );
+    }
 
     #[test]
     fn indexed_file_keeps_declaration_syntax_element_fact_without_full_syntax_element_rows() {

@@ -1,6 +1,6 @@
 //! Python names: the targets that bind one, and where one is read or written.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::ReferenceRole;
 use rift_error::RiftError;
@@ -28,6 +28,8 @@ pub(super) struct NameKinds {
     splat: u16,
     dotted: u16,
     pub(super) type_alias: u16,
+    expression_statement: u16,
+    parenthesized: u16,
     /// Elements whose `name` field states a name.
     named: [u16; 3],
     /// Elements that hold stated names alone.
@@ -65,6 +67,8 @@ impl NameKinds {
             splat: id("splat_pattern"),
             dotted: id("dotted_name"),
             type_alias: id("type_alias_statement"),
+            expression_statement: id("expression_statement"),
+            parenthesized: id("parenthesized_expression"),
             named: [
                 id("keyword_argument"),
                 id("default_parameter"),
@@ -84,14 +88,39 @@ impl NameKinds {
 
 /// Python names and syntax checks collected during one walk.
 #[derive(Default)]
-pub(in crate::static_analysis) struct Names {
+pub(in crate::static_analysis) struct Names<'source> {
     deleted: Vec<StaticBinding>,
     /// The scope of each class body.
     classes: BTreeSet<ByteRange>,
     reads: Vec<ByteRange>,
+    direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
     /// Written names with the scope that holds the target.
     writes: Vec<(ByteRange, ByteRange, NameUse)>,
     pub(in crate::static_analysis) invalid_type_parameter_default: bool,
+}
+
+impl<'source> Names<'source> {
+    pub(super) fn direct_binding(
+        &mut self,
+        source: &'source str,
+        name: ByteRange,
+        scope: ByteRange,
+        end: u64,
+    ) {
+        if let Some(spelling) = text(source, name) {
+            self.direct_locals
+                .entry(spelling)
+                .or_default()
+                .entry(scope)
+                .or_insert(DirectLocal { name, end });
+        }
+    }
+}
+
+/// One parameter or initialized name directly inside a function body.
+struct DirectLocal {
+    name: ByteRange,
+    end: u64,
 }
 
 /// What one name does where it is written.
@@ -111,7 +140,7 @@ enum NameUse {
     Stated,
 }
 
-impl Names {
+impl Names<'_> {
     pub(super) fn class(&mut self, scope: ByteRange) {
         self.classes.insert(scope);
     }
@@ -202,12 +231,76 @@ fn text(source: &str, range: ByteRange) -> Option<&str> {
 }
 
 impl EdgePythonKinds {
+    /// Retains the initialized name of a plain assignment directly in a function's body.
+    pub(super) fn edge_direct_local<'source>(
+        &self,
+        visited: Visited<'_, '_>,
+        target: Node<'_>,
+        source: &'source str,
+        names: &mut Names<'source>,
+    ) -> Result<(), RiftError> {
+        let assignment = visited.syntax_element();
+        if assignment.kind_id() != self.assignment[0]
+            || target.kind_id() != self.identifier
+            || assignment.has_error()
+            || assignment.child_by_field_id(self.right).is_none()
+        {
+            return Ok(());
+        }
+        let Some(statement) = visited
+            .parent()
+            .filter(|parent| parent.syntax_element().kind_id() == self.names.expression_statement)
+        else {
+            return Ok(());
+        };
+        if let Some(owner) = statement
+            .parent()
+            .filter(|parent| parent.syntax_element().kind_id() == self.block)
+            .and_then(Visited::parent)
+            .filter(|parent| parent.syntax_element().kind_id() == self.definitions[0])
+        {
+            names.direct_binding(
+                source,
+                byte_range(target)?,
+                self.scope_range(owner.syntax_element())?,
+                byte_range(assignment)?.end,
+            );
+        }
+        Ok(())
+    }
+
+    /// A plain value is read in its nearest function, outside a class or an expression scope.
+    fn direct_local_read_scope<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+        let mut value = visited;
+        while let Some(parent) = value.parent() {
+            let node = parent.syntax_element();
+            if node.kind_id() == self.names.parenthesized {
+                value = parent;
+                continue;
+            }
+            let callee = node.kind_id() == self.call
+                && node.child_by_field_id(self.function) == Some(value.syntax_element());
+            if callee || node.kind_id() == self.attribute {
+                return None;
+            }
+            break;
+        }
+        let scope = edge_enclosing(visited, &self.scopes)?;
+        let body = scope.child_by_field_id(self.body)?;
+        (scope.kind_id() == self.definitions[0]
+            && byte_range(body)
+                .ok()?
+                .encloses(byte_range(visited.syntax_element()).ok()?))
+        .then_some(scope)
+    }
+
     /// Records what a name outside annotations does.
     pub(super) fn edge_name(
         &self,
         visited: Visited<'_, '_>,
+        source: &str,
         facts: &mut StaticFactsParts,
-        names: &mut Names,
+        names: &mut Names<'_>,
     ) -> Result<(), RiftError> {
         let name = visited.syntax_element();
         let range = byte_range(name)?;
@@ -216,6 +309,14 @@ impl EdgePythonKinds {
             NameUse::Stated => return Ok(()),
             NameUse::Read => {
                 names.reads.push(range);
+                if let Some(assignments) =
+                    text(source, range).and_then(|name| names.direct_locals.get(name))
+                    && let Some(scope) = self.direct_local_read_scope(visited)
+                    && let Some(local) = assignments.get(&byte_range(scope)?)
+                    && local.end <= range.start
+                {
+                    facts.python_local_reads.push((range, local.name));
+                }
                 return Ok(());
             }
             NameUse::Assigned | NameUse::Bound | NameUse::Augmented | NameUse::Deleted => {}

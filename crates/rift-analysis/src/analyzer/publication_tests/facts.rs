@@ -54,6 +54,27 @@ fn cover(publication: &mut PackagePublication, kind: FactKind) {
     });
 }
 
+/// Inserts a producer occurrence among the already recorded static evidence.
+fn add_producer_occurrence(publication: &mut PackagePublication) {
+    let added = occurrence(publication, 64, 68);
+    let position = publication.occurrences.partition_point(|old| {
+        (
+            old.unit.as_str(),
+            old.range.start,
+            old.range.end,
+            old.symbol.as_str(),
+            old.producer.as_ref(),
+        ) < (
+            added.unit.as_str(),
+            added.range.start,
+            added.range.end,
+            added.symbol.as_str(),
+            added.producer.as_ref(),
+        )
+    });
+    publication.occurrences.insert(position, added);
+}
+
 /// One change to an occurrence, given its unit's length.
 type OccurrenceChange = fn(&mut PackageOccurrence, u64);
 
@@ -67,7 +88,7 @@ fn refusal(publication: &PackagePublication) -> String {
 #[test]
 fn built_in_publication_covers_its_edges_and_no_occurrences() {
     let publication = publication(
-        &[("click/core.py", "def echo(value):\n    return value\n")],
+        &[("click/core.py", "def echo(value):\n    return 1\n")],
         None,
         &["click"],
     );
@@ -84,11 +105,29 @@ fn built_in_publication_covers_its_edges_and_no_occurrences() {
 }
 
 #[test]
+fn built_in_publication_covers_the_exact_parameter_read() {
+    let source = "def echo(value):\n    return value\n";
+    let publication = publication(&[("click/core.py", source)], None, &["click"]);
+    publication.validate_facts().expect("built-in facts agree");
+    let [read] = publication.occurrences.as_slice() else {
+        panic!(
+            "a single physical parameter read: {:?}",
+            publication.occurrences
+        );
+    };
+    assert!(read.producer.is_none());
+    assert_eq!(read.symbol.as_str(), format!("{ECHO}/value"));
+    let start = u64::try_from(source.rfind("value").expect("authored read")).expect("offset");
+    assert_eq!(read.range.start, start);
+    assert_eq!(read.range.end, start + 5);
+    assert!(publication.coverage[0].covers(FactKind::Occurrences, None));
+    assert!(!publication.coverage[0].covers(FactKind::Occurrences, Some(&producer())));
+}
+
+#[test]
 fn producer_facts_survive_a_round_trip_once_their_coverage_names_them() {
     let mut publication = click();
-    publication
-        .occurrences
-        .push(occurrence(&publication, 64, 68));
+    add_producer_occurrence(&mut publication);
     publication.edges.push(edge(ECHO, Some(producer())));
     cover(&mut publication, FactKind::Occurrences);
     cover(&mut publication, FactKind::Edges);
@@ -105,9 +144,7 @@ fn producer_facts_survive_a_round_trip_once_their_coverage_names_them() {
 #[test]
 fn uncovered_producer_facts_are_refused() {
     let mut occurrences = click();
-    occurrences
-        .occurrences
-        .push(occurrence(&occurrences, 64, 68));
+    add_producer_occurrence(&mut occurrences);
     assert!(
         refusal(&occurrences).contains("field occurrences, violation uncovered"),
         "{}",

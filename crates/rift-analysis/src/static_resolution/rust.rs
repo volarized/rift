@@ -758,6 +758,9 @@ impl<'source> Namespaces<'source> {
             inline: Vec::new(),
         };
         for symbol in file.document.facts.symbols() {
+            if symbol.is_rust_local_binding() {
+                continue;
+            }
             if !work.charge() {
                 return None;
             }

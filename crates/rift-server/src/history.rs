@@ -773,6 +773,7 @@ fn parse_blob(
     };
     let document = provider
         .analyze(SyntaxSource { path, text: &text }, syntax)
+        .map(SyntaxDocument::without_package_bindings)
         .ok();
     Ok(document.map(|document| ParsedRevision { text, document }))
 }

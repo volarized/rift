@@ -234,10 +234,27 @@ mod tests {
                     "function",
                     Some("function open(options: { flags: string; mode(): number }): void")
                 ),
+                ("open.options", "value_parameter", None),
                 ("open.flags", "property", None),
                 ("open.mode", "method", Some("mode(): number")),
             ]
         );
+        let options = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.qualified_name == "open.options")
+            .expect("ordinary value parameter");
+        assert_eq!(options.kinds, [SymbolKind::Value, SymbolKind::Parameter]);
+        let name =
+            u64::try_from(text.find("options:").expect("physical parameter")).expect("offset");
+        assert_eq!(
+            options.item_range,
+            crate::ByteRange {
+                start: name,
+                end: name + 7
+            }
+        );
+        assert_eq!(options.name_range, Some(options.item_range));
     }
 
     #[test]

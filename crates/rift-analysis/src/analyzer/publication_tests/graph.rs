@@ -12,6 +12,223 @@ use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, Publicat
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
 
 #[test]
+fn package_stores_python_direct_function_local_reads() {
+    let source = "def choose(parameter: int) -> int:\n    local = parameter\n    def nested() -> int:\n        local = 7\n        return local\n    return local + nested()\n";
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let rows = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    for (scope, text) in [("choose/nested", "local\n"), ("choose", "local +")] {
+        let owner = format!("{module}/{scope}");
+        let target = format!("{owner}/local");
+        let row = rows
+            .iter()
+            .find(|row| row.to.as_str() == target)
+            .expect("local target");
+        assert_eq!(row.from.as_str(), owner);
+        let site = row.occurrence.as_ref().expect("source use");
+        let start = u64::try_from(source.find(text).expect("written read")).expect("offset");
+        assert_eq!(site.range.start, start);
+        assert_eq!(site.range.end, start + 5);
+        assert!(
+            result
+                .declarations
+                .iter()
+                .any(|entry| entry.symbol.as_str() == target)
+        );
+    }
+}
+
+const PYTHON_PARAMETER_SOURCE: &str = concat!(
+    "parameter = 9\n",
+    "def choose(parameter: int) -> int:\n",
+    "    local = parameter\n",
+    "    def nested() -> int:\n",
+    "        local = 7\n",
+    "        return local\n",
+    "    return local + nested()\n",
+    "def other(parameter=parameter):\n",
+    "    return parameter\n",
+    "def owner(parameter):\n",
+    "    def nested(parameter):\n",
+    "        return parameter\n",
+    "    return parameter\n",
+    "def rebind(parameter):\n",
+    "    parameter = 3\n",
+    "    return parameter\n",
+    "class Receiver:\n",
+    "    def run(self, *args, **kwargs):\n",
+    "        return self, args, kwargs\n",
+);
+
+#[test]
+fn package_stores_python_function_parameter_names_and_reads() {
+    let source = PYTHON_PARAMETER_SOURCE;
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let id = |relative: &str| format!("{module}/{relative}");
+    let offset = |prefix: &str, spelling: &str| {
+        u64::try_from(
+            source.find(prefix).expect("written site")
+                + prefix.rfind(spelling).expect("token within site"),
+        )
+        .expect("offset")
+    };
+    let read_at = |from: &str, to: &str, at| {
+        result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.from.as_str() == id(from)
+                && edge.to.as_str() == id(to)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range.start == at && site.range.end == at + 9)
+        })
+    };
+    for (owner, signature, use_site) in [
+        ("choose", "choose(parameter", "local = parameter"),
+        (
+            "other",
+            "other(parameter",
+            "other(parameter=parameter):\n    return parameter",
+        ),
+        (
+            "owner",
+            "owner(parameter",
+            "        return parameter\n    return parameter",
+        ),
+        (
+            "owner/nested",
+            "nested(parameter",
+            "        return parameter",
+        ),
+    ] {
+        let target = format!("{owner}/parameter");
+        assert!(
+            result.objects.iter().any(|object| {
+                object
+                    .id
+                    .as_ref()
+                    .is_some_and(|symbol| symbol.as_str() == id(&target))
+                    && object.kinds.contains(&SymbolKind::Parameter)
+            }),
+            "{target}"
+        );
+        let name = offset(signature, "parameter");
+        assert!(
+            result.declarations.iter().any(|declaration| {
+                declaration.symbol.as_str() == id(&target)
+                    && declaration.range.start == name
+                    && declaration.range.end == name + 9
+                    && declaration.source == "parameter"
+            }),
+            "{target}"
+        );
+        assert!(
+            read_at(owner, &target, offset(use_site, "parameter")),
+            "{target}"
+        );
+    }
+    let default = offset("other(parameter=parameter", "parameter");
+    assert!(read_at("other", "parameter", default));
+    assert!(!read_at("other", "other/parameter", default));
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str() == id("choose")
+            && edge.to.as_str() == id("choose/nested")
+    }));
+
+    let rebind = id("rebind/parameter");
+    let declarations = result
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.symbol.as_str() == rebind)
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].source, "parameter = 3");
+    assert!(!result.objects.iter().any(|object| {
+        object.kinds.contains(&SymbolKind::Parameter)
+            && object.id.as_ref().is_some_and(|id| id.as_str() == rebind)
+    }));
+    for name in ["self", "args", "kwargs"] {
+        let target = id(&format!("Receiver/run/{name}"));
+        assert!(
+            !result
+                .declarations
+                .iter()
+                .any(|declaration| declaration.symbol.as_str() == target)
+        );
+    }
+}
+
+#[test]
+fn package_python_parameter_keeps_original_symbols_and_local_reads_under_caps() {
+    const SOURCE: &str = concat!(
+        "def helper(): return 1\n",
+        "def choose(parameter):\n",
+        "    local = parameter\n",
+        "    local + helper()\n",
+        "    return local\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let original = publication(&files, None, &["click"]);
+    let parameter = |id: &str| id.ends_with("/choose/parameter");
+    let symbol_limited = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 4,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    assert_eq!(
+        symbol_limited.declarations,
+        original
+            .declarations
+            .iter()
+            .filter(|entry| !parameter(entry.symbol.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        symbol_limited.edges,
+        original
+            .edges
+            .iter()
+            .filter(|edge| !parameter(edge.to.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        symbol_limited
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Calls])
+    );
+    assert_eq!(
+        symbol_limited
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/choose/local")
+            })
+            .count(),
+        2
+    );
+    assert!(
+        original
+            .edges
+            .iter()
+            .any(|edge| { edge.kinds == [EdgeKind::Reads] && parameter(edge.to.as_str()) })
+    );
+}
+
+#[test]
 fn package_collects_python_generic_aliases_in_their_own_scope() {
     let source = "class T: pass\nclass Bound: pass\n\
                   type Plain = T\n\
@@ -139,6 +356,178 @@ fn package_preserves_python_edges_beside_type_parameter_defaults() {
     ] {
         assert!(report(suffix).edges.is_empty(), "{suffix}");
     }
+}
+
+const TYPESCRIPT_PARAMETER_SOURCE: &str = concat!(
+    "export function choose<Value>(parameter: Value): Value {\n",
+    "  const local = parameter;\n",
+    "  { const local = parameter; void local; }\n",
+    "  return local;\n",
+    "}\n",
+    "export const seed = 3;\n",
+    "export function defaults(parameter: number = seed, fallback: number = parameter): number {\n",
+    "  const seed = 4;\n",
+    "  { const parameter = 5; void parameter; }\n",
+    "  return parameter + fallback + seed;\n",
+    "}\n",
+    "export function defaultsStable(parameter: number = seed, fallback: number = parameter) {\n",
+    "  return parameter + fallback;\n",
+    "}\n",
+    "export function first(name: number): number { return name; }\n",
+    "export function second(name: string): string { return name; }\n",
+    "export class Holder {\n",
+    "  constructor(public readonly name: string) { void name; }\n",
+    "  read(): string { return this.name; }\n",
+    "}\n",
+);
+
+fn typescript_parameter_publication() -> PackagePublication {
+    fixture::package_result_with_metadata(
+        rift_syntax::ShippedLanguage::TypeScript,
+        vec![("index.ts", TYPESCRIPT_PARAMETER_SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#,
+        )),
+    )
+    .expect("admitted TypeScript source")
+    .publication()
+    .clone()
+}
+
+fn typescript_parameter_site(prefix: &str, spelling: &str) -> u64 {
+    u64::try_from(
+        TYPESCRIPT_PARAMETER_SOURCE
+            .find(prefix)
+            .expect("written fixture site")
+            + prefix.rfind(spelling).expect("written name token"),
+    )
+    .expect("source offset")
+}
+
+#[test]
+fn package_stores_typescript_ordinary_parameters_and_their_body_reads() {
+    let publication = typescript_parameter_publication();
+    for (owner, name, source, sites) in [
+        (
+            "choose",
+            "parameter",
+            "choose<Value>(parameter",
+            &["const local = parameter;", "{ const local = parameter;"][..],
+        ),
+        (
+            "first",
+            "name",
+            "first(name",
+            &["first(name: number): number { return name;"][..],
+        ),
+        (
+            "second",
+            "name",
+            "second(name",
+            &["second(name: string): string { return name;"][..],
+        ),
+        (
+            "defaultsStable",
+            "parameter",
+            "defaultsStable(parameter",
+            &["return parameter + fallback;"][..],
+        ),
+    ] {
+        let path = format!("/beacon/{owner}/{name}");
+        let offset = typescript_parameter_site(source, name);
+        let parameter = publication
+            .objects
+            .iter()
+            .find(|object| {
+                object
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str().ends_with(&path))
+            })
+            .expect("physical parameter");
+        assert!(parameter.kinds.contains(&SymbolKind::Parameter));
+        let id = parameter.id.as_ref().expect("established identity");
+        assert!(publication.declarations.iter().any(|declaration| {
+            declaration.symbol == *id
+                && declaration.range.start == offset
+                && declaration.range.end
+                    == offset + u64::try_from(name.len()).expect("physical name")
+                && declaration.source == name
+        }));
+        let uses = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == *id)
+            .map(|edge| {
+                assert!(edge.from.as_str().ends_with(&format!("/beacon/{owner}")));
+                let range = &edge.occurrence.as_ref().expect("written read").range;
+                assert_eq!(
+                    range.end - range.start,
+                    u64::try_from(name.len()).expect("physical name length")
+                );
+                range.start
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = sites
+            .iter()
+            .map(|site| typescript_parameter_site(site, name))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(uses, expected, "{path}");
+    }
+}
+
+#[test]
+fn package_typescript_parameter_keeps_defaults_blocks_and_constructor_properties() {
+    let publication = typescript_parameter_publication();
+    let default_seed = typescript_parameter_site("defaultsStable(parameter: number = seed", "seed");
+    let nested_local = typescript_parameter_site("void parameter;", "parameter");
+    for (offset, target) in [
+        (default_seed, "/beacon/seed"),
+        (nested_local, "/beacon/defaults/parameter"),
+    ] {
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str().ends_with(target)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range.start == offset)
+            }),
+            "{target}"
+        );
+    }
+    let collision = publication
+        .objects
+        .iter()
+        .find(|object| {
+            object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.as_str().ends_with("/beacon/defaults/parameter"))
+        })
+        .expect("prior block-local binding");
+    assert!(!collision.kinds.contains(&SymbolKind::Parameter));
+    let property = publication
+        .objects
+        .iter()
+        .find(|object| {
+            object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.as_str().ends_with("/beacon/Holder/name"))
+        })
+        .expect("prior constructor property");
+    assert!(property.kinds.contains(&SymbolKind::Member));
+    assert!(!property.kinds.contains(&SymbolKind::Parameter));
+    assert!(!publication.declarations.iter().any(|declaration| {
+        declaration
+            .symbol
+            .as_str()
+            .ends_with("/Holder/constructor/name")
+    }));
 }
 
 #[test]
@@ -1180,7 +1569,8 @@ impl GraphFixture {
             .collect::<Result<Vec<_>, _>>()?;
         let input =
             ExactPackageInput::new(&self.owner, &self.language, &self.origin, &sources, limits)?;
-        publish(&input, self.analysis.files(), semantics, false).map(|(publication, _)| publication)
+        publish(&input, self.analysis.files(), semantics, false, None)
+            .map(|(publication, _)| publication)
     }
 }
 
@@ -1733,4 +2123,178 @@ fn four_byte_names_keep_full_artifact_facts_and_neighbor_publication() {
             serde_json::from_value(wire).expect("full artifact restore");
         assert_eq!(&restored, publication);
     }
+}
+#[test]
+fn package_python_local_reads_keep_earlier_supplemental_reads_at_the_cap() {
+    let package = rift_protocol::read::PackageIdentity {
+        manager: "pypi".to_owned(),
+        registry: "pypi.org".to_owned(),
+        name: "click".to_owned(),
+        version: "8.3.3".to_owned(),
+    };
+    let owner = package.owner().expect("package owner");
+    let origin = ContributionOrigin::new(
+        Some(rift_core::SourceLocation::Dependency { package }),
+        rift_core::SourceKind::Authored,
+    )
+    .expect("authored source");
+    let language = Language {
+        name: "python".to_owned(),
+        dialect: None,
+    };
+    let path = ProjectPath::new("click.py").expect("source path");
+    let text = concat!(
+        "sentinel = 1\n",
+        "def a_local():\n",
+        "    local_value = 2\n",
+        "    return local_value\n",
+        "def z_prior():\n",
+        "    return sentinel\n",
+    );
+    let source = [PackageSource::new(&path, text)];
+    let roots = [PackageImportRoot::new(
+        None,
+        vec!["click".to_owned()],
+        PackageImportRootOrigin::PyModules,
+    )
+    .expect("declared module root")];
+    for (cap, expected) in [
+        (5, &[("/z_prior", "/sentinel", 97_u64, 105_u64)][..]),
+        (
+            6,
+            &[
+                ("/a_local", "/a_local/local_value", 59, 70),
+                ("/z_prior", "/sentinel", 97, 105),
+            ][..],
+        ),
+    ] {
+        let limits = ExactPackageLimits::new(1, 4096)
+            .with_edges(cap)
+            .expect("bounded edges");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &source, limits)
+            .expect("valid source")
+            .with_import_roots(&roots)
+            .expect("stable module scope");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("analyzed package");
+        let edges = &analysis.publication().edges;
+        assert_eq!(edges.len(), cap);
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.kinds == [EdgeKind::Contains])
+                .count(),
+            4
+        );
+        for (from, to, start, end) in expected {
+            assert!(
+                edges.iter().any(|edge| {
+                    edge.kinds == [EdgeKind::Reads]
+                        && edge.from.as_str().ends_with(from)
+                        && edge.to.as_str().ends_with(to)
+                        && edge.occurrence.as_ref().is_some_and(|site| {
+                            site.range.start == *start && site.range.end == *end
+                        })
+                }),
+                "{from} {to} capacity {cap}"
+            );
+        }
+    }
+}
+
+#[test]
+fn package_python_value_parameters_preserve_required_provider_slots() {
+    parameter_provider_bound(rift_syntax::ShippedLanguage::Python, 2);
+}
+
+fn parameter_provider_bound(shipped: rift_syntax::ShippedLanguage, prior: u32) {
+    let mut package = fixture::identity();
+    let (file, text, manifest, roots) = if shipped == rift_syntax::ShippedLanguage::TypeScript {
+        package.manager = "npm".to_owned();
+        package.registry = "registry.npmjs.org".to_owned();
+        (
+            "index.ts",
+            "export function choose(value: number): number { return value; }",
+            Some(r#"{"name":"beacon","version":"1.0.0","types":"index.ts"}"#),
+            Vec::new(),
+        )
+    } else {
+        package.manager = "pypi".to_owned();
+        package.registry = "pypi.org".to_owned();
+        package.name = "click".to_owned();
+        package.version = "8.3.3".to_owned();
+        let root = PackageImportRoot::new(
+            None,
+            vec!["click".to_owned()],
+            PackageImportRootOrigin::PyModules,
+        )
+        .expect("physical module root");
+        (
+            "click.py",
+            "def choose(value: int) -> int:\n    return value\n",
+            None,
+            vec![root],
+        )
+    };
+    let language = fixture::language(shipped);
+    let owner = package.owner().expect("package identity");
+    let origin = fixture::origin(&package);
+    let path = ProjectPath::new(file).expect("source path");
+    let metadata = ProjectPath::new("package.json").expect("metadata path");
+    let sources = [PackageSource::new(&path, text)];
+    let manifest = manifest
+        .map(|text| PackageSource::new(&metadata, text))
+        .into_iter()
+        .collect::<Vec<_>>();
+    for (bound, optional) in [(prior, false), (prior + 1, true)] {
+        let limits = ExactPackageLimits::new(2, 4096)
+            .with_declarations(bound)
+            .expect("provider declaration bound");
+        let exact = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("valid source")
+            .with_framework_context(&manifest, &[])
+            .expect("authored metadata")
+            .with_import_roots(&roots)
+            .expect("authored route");
+        let analysis = PackageAnalyzer::analyze(exact, 1).expect("primary declaration accepted");
+        let publication = analysis.publication();
+        assert_eq!(
+            publication.declarations.len(),
+            usize::try_from(bound).expect("small bound")
+        );
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with("/choose"))
+        );
+        if shipped == rift_syntax::ShippedLanguage::Python {
+            assert!(
+                publication
+                    .declarations
+                    .iter()
+                    .any(|row| row.symbol.as_str().ends_with("/click"))
+            );
+        }
+        assert_eq!(
+            publication.declarations.iter().any(|row| row
+                .symbol
+                .as_str()
+                .ends_with("/choose/value")
+                && row.source == "value"),
+            optional
+        );
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str().ends_with("/choose/value")),
+            optional
+        );
+    }
+}
+
+#[test]
+fn package_typescript_value_parameters_preserve_required_provider_slots() {
+    parameter_provider_bound(rift_syntax::ShippedLanguage::TypeScript, 1);
 }

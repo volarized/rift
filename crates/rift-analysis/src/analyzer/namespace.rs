@@ -355,6 +355,15 @@ fn identity_anchors_with_roots(
     };
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols() {
+        if symbol.is_python_parameter()
+            && (input.release_version().is_none()
+                || !matches!(
+                    input.owner(),
+                    rift_protocol::identity::SymbolOwner::Package { .. }
+                ))
+        {
+            continue;
+        }
         let qualified_path = if symbol.kind == "module" {
             module.clone()
         } else {
