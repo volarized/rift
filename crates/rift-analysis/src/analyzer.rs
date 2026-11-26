@@ -497,10 +497,12 @@ fn binding_capacity(
     let mut rust_parameters = BindingDemand::default();
     let mut python_parameters = BindingDemand::default();
     let mut typescript_parameters = BindingDemand::default();
+    let mut python_receivers = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
         let facts = document.file.syntax();
+        let receiver_names = facts.python_receiver_names();
         primary = primary
             .saturating_add(facts.primary_symbols_len())
             .saturating_add(document.placement.aliases_count());
@@ -515,7 +517,14 @@ fn binding_capacity(
             let demand = if symbol.is_typescript_parameter() {
                 &mut typescript_parameters
             } else if symbol.is_python_parameter() {
-                &mut python_parameters
+                if symbol
+                    .name_range
+                    .is_some_and(|name| receiver_names.contains(&name))
+                {
+                    &mut python_receivers
+                } else {
+                    &mut python_parameters
+                }
             } else if symbol.is_rust_parameter_binding() {
                 &mut rust_parameters
             } else {
@@ -535,7 +544,8 @@ fn binding_capacity(
     let count = rust_locals.count
         + rust_parameters.count
         + python_parameters.count
-        + typescript_parameters.count;
+        + typescript_parameters.count
+        + python_receivers.count;
     let (mut bytes, record) = limits
         .retained_source()
         .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
@@ -553,6 +563,7 @@ fn binding_capacity(
     let rust_parameter_slots = rust_parameters.reserve(&mut slots, &mut bytes, record);
     let python_parameter_slots = python_parameters.reserve(&mut slots, &mut bytes, record);
     let typescript_parameter_slots = typescript_parameters.reserve(&mut slots, &mut bytes, record);
+    let python_receiver_slots = python_receivers.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -560,7 +571,8 @@ fn binding_capacity(
             rust_parameter_slots,
             python_parameter_slots,
             typescript_parameter_slots,
-        ),
+        )
+        .with_python_receiver_slots(python_receiver_slots),
     )
 }
 

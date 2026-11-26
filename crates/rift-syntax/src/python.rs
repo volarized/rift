@@ -1368,7 +1368,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
     }
 }
 
-/// Keeps the parameter candidates with exact non-receiver bindings and no other
+/// Keeps the parameter candidates with exact parameter bindings and no other
 /// declaration of the same Python name. An assignment may already own that name.
 fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::StaticFacts) {
     use std::collections::BTreeSet;
@@ -1385,6 +1385,7 @@ fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::
                     binding.kind,
                     crate::StaticBindingKind::Shadow
                         | crate::StaticBindingKind::PythonAnnotation { .. }
+                        | crate::StaticBindingKind::PythonReceiver { .. }
                 )
         })
         .map(|binding| binding.name)

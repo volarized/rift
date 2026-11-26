@@ -301,13 +301,111 @@ fn package_stores_python_function_parameter_names_and_reads() {
         object.kinds.contains(&SymbolKind::Parameter)
             && object.id.as_ref().is_some_and(|id| id.as_str() == rebind)
     }));
-    for name in ["self", "args", "kwargs"] {
+    for name in ["args", "kwargs"] {
         let target = id(&format!("Receiver/run/{name}"));
         assert!(
             !result
                 .declarations
                 .iter()
                 .any(|declaration| declaration.symbol.as_str() == target)
+        );
+    }
+}
+
+const PYTHON_RECEIVER_SOURCE: &str = concat!(
+    "class Counter:\n",
+    "    def current(self):\n",
+    "        return self\n",
+    "    def call_current(self):\n",
+    "        return self.current()\n",
+    "    @classmethod\n",
+    "    def factory(cls):\n",
+    "        return cls, cls()\n",
+    "    @staticmethod\n",
+    "    def identity(self):\n",
+    "        return self\n",
+    "def free(value):\n",
+    "    return value\n",
+);
+
+#[test]
+fn package_retains_python_method_receiver_declarations() {
+    let source = PYTHON_RECEIVER_SOURCE;
+    let files = [("click.py", source)];
+    let complete = publication(&files, None, &["click"]);
+    let parameter =
+        |owner, name| format!("rift://symbol/pypi/pypi.org/click/python/click/{owner}/{name}");
+    for (owner, written, name) in [
+        ("Counter/current", "def current(self)", "self"),
+        ("Counter/call_current", "def call_current(self)", "self"),
+        ("Counter/factory", "def factory(cls)", "cls"),
+        ("Counter/identity", "def identity(self)", "self"),
+        ("free", "def free(value)", "value"),
+    ] {
+        let symbol = parameter(owner, name);
+        let start = source.find(written).expect("authored method")
+            + written.find(name).expect("parameter name");
+        let range = rift_protocol::read::TextRange {
+            start: u64::try_from(start).expect("start"),
+            end: u64::try_from(start + name.len()).expect("end"),
+        };
+        assert!(
+            complete.declarations.iter().any(|entry| {
+                entry.symbol.as_str() == symbol && entry.range == range && entry.source == name
+            }),
+            "{symbol}"
+        );
+        assert!(
+            complete.objects.iter().any(|object| {
+                object.id.as_ref().is_some_and(|id| id.as_str() == symbol)
+                    && object.kinds.contains(&SymbolKind::Parameter)
+            }),
+            "{symbol}"
+        );
+    }
+    let prior = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 9,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    let is_receiver = |symbol: &str| {
+        ["/current/self", "/call_current/self", "/factory/cls"]
+            .iter()
+            .any(|suffix| symbol.ends_with(suffix))
+    };
+    assert_eq!(
+        prior.declarations,
+        complete
+            .declarations
+            .iter()
+            .filter(|entry| !is_receiver(entry.symbol.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        prior.edges,
+        complete
+            .edges
+            .iter()
+            .filter(|entry| !is_receiver(entry.to.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    for (caller, target) in [
+        ("/Counter/call_current", "/Counter/current"),
+        ("/Counter/factory", "/Counter"),
+    ] {
+        assert!(
+            prior.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with(caller)
+                    && edge.to.as_str().ends_with(target)
+            }),
+            "{caller}"
         );
     }
 }

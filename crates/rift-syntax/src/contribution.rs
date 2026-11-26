@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rift_core::{
@@ -23,6 +23,7 @@ pub struct PackageBindingSlots {
     rust_parameter: usize,
     python_parameter: usize,
     typescript_parameter: usize,
+    python_receiver: usize,
 }
 
 impl PackageBindingSlots {
@@ -39,7 +40,15 @@ impl PackageBindingSlots {
             rust_parameter,
             python_parameter,
             typescript_parameter,
+            python_receiver: 0,
         }
+    }
+
+    /// Reserves separate slots for Python method receivers after other bindings.
+    #[must_use]
+    pub const fn with_python_receiver_slots(mut self, slots: usize) -> Self {
+        self.python_receiver = slots;
+        self
     }
 
     /// The total number of reserved slots.
@@ -49,13 +58,25 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_parameter)
             .saturating_add(self.python_parameter)
             .saturating_add(self.typescript_parameter)
+            .saturating_add(self.python_receiver)
     }
 
-    fn admit(&mut self, symbol: &crate::SyntaxSymbol) -> bool {
+    fn admit(
+        &mut self,
+        symbol: &crate::SyntaxSymbol,
+        python_receivers: &BTreeSet<crate::ByteRange>,
+    ) -> bool {
         let available = if symbol.is_typescript_parameter() {
             &mut self.typescript_parameter
         } else if symbol.is_python_parameter() {
-            &mut self.python_parameter
+            if symbol
+                .name_range
+                .is_some_and(|name| python_receivers.contains(&name))
+            {
+                &mut self.python_receiver
+            } else {
+                &mut self.python_parameter
+            }
         } else if symbol.is_rust_parameter_binding() {
             &mut self.rust_parameter
         } else {
@@ -453,10 +474,11 @@ impl SyntaxPublicationBuilder {
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
         let mut remaining = *binding_slots;
+        let python_receivers = syntax.python_receiver_names();
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(symbol))
+                    || !remaining.admit(symbol, &python_receivers))
             {
                 continue;
             }
