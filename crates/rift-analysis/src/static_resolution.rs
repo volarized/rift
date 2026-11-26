@@ -112,6 +112,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_crate_visibility_start: Option<usize>,
     /// First occurrence resolved from a Rust argument value.
     pub(crate) rust_argument_value_start: Option<usize>,
+    /// First use-path qualifier resolved to a Rust module or type.
+    pub(crate) rust_import_qualifier_start: Option<usize>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
@@ -269,6 +271,7 @@ fn resolve_by<'source>(
         StaticFacts::rust_crate_visibility,
     );
     index.resolve_rust_argument_values(&mut work, &mut resolution);
+    index.resolve_rust_import_qualifiers(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

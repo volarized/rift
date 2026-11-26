@@ -2474,6 +2474,11 @@ fn value_shadow(named: u8) -> u8 { let local = named; local }
     let seen = result
         .occurrences
         .iter()
+        .take(
+            result
+                .rust_import_qualifier_start
+                .unwrap_or(result.occurrences.len()),
+        )
         .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
         .map(|edge| {
             (

@@ -726,3 +726,90 @@ pub fn inactive() -> u8 { consume(limits::MAXIMUM, leaf) }
     );
     assert_eq!(bounded.edges, established);
 }
+
+#[test]
+fn package_rust_grouped_imports_keep_written_qualifiers_and_terminal_imports() {
+    const SOURCE: &str = concat!(
+        "pub mod serial { pub mod wire {\n",
+        "    pub struct Code; pub struct Marker; pub struct Late; pub struct Base;\n",
+        "} }\n",
+        "use crate::serial::{wire::Code, wire::Marker};\n",
+        "pub use self::serial::{wire::Base as Public};\n",
+        "pub mod nested { pub use super::serial::{wire::Late as Local}; }\n",
+        "#[cfg(any())]\n",
+        "use crate::serial::{wire::Code as Inactive};\n",
+        "pub fn run(_: Code, _: Marker) {}\n",
+    );
+    let full = analyze(SOURCE);
+    let mut expected = std::collections::BTreeSet::new();
+    for (path, qualifiers) in [
+        (
+            "crate::serial::{wire::Code, wire::Marker}",
+            &[
+                ("crate", ""),
+                ("serial", "/serial"),
+                ("wire::Code", "/serial/wire"),
+                ("wire::Marker", "/serial/wire"),
+            ][..],
+        ),
+        (
+            "self::serial::{wire::Base as Public}",
+            &[
+                ("self", ""),
+                ("serial", "/serial"),
+                ("wire", "/serial/wire"),
+            ],
+        ),
+        (
+            "super::serial::{wire::Late as Local}",
+            &[
+                ("super", ""),
+                ("serial", "/serial"),
+                ("wire", "/serial/wire"),
+            ],
+        ),
+    ] {
+        let start = position(SOURCE, path);
+        for (token, suffix) in qualifiers {
+            let offset = start + position(path, token);
+            let spelling = token.split("::").next().expect("qualifier spelling");
+            let stop = offset + u64::try_from(spelling.len()).expect("token bytes");
+            assert!(expected.insert((offset, stop, format!("{ROOT}{suffix}"))));
+        }
+    }
+
+    let qualifier = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                let end = position(SOURCE, "pub fn run");
+                let start = position(SOURCE, "use crate::");
+                site.range.start >= start && site.range.end <= end
+            })
+    };
+    let actual = full
+        .edges
+        .iter()
+        .filter(|edge| qualifier(edge))
+        .map(|edge| {
+            let site = edge.occurrence.as_ref().expect("written qualifier");
+            (
+                site.range.start,
+                site.range.end,
+                edge.to.as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len(), "{actual:?}");
+    assert_eq!(
+        actual
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    for terminal in ["Code", "Marker", "Base", "Late"] {
+        assert!(full.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge.to.as_str() == format!("{ROOT}/serial/wire/{terminal}")
+        }));
+    }
+}

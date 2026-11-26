@@ -1,10 +1,12 @@
 //! Rust containment, field accesses, overrides, and type uses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::ReferenceRole;
+use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::read::{EdgeKind, SymbolKind};
-use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, StaticBindingKind, StaticCall, StaticCallee, StaticRustUse, SyntaxSymbol,
+};
 
 use super::receivers::split_references;
 use super::{
@@ -18,6 +20,12 @@ use crate::static_resolution::{
 pub(super) enum ReceiverOwner<'source> {
     Target(Target<'source>),
     TypePath(ByteRange),
+}
+
+#[derive(Default)]
+struct ImportQualifierSites {
+    seen: BTreeSet<ByteRange>,
+    sources: BTreeMap<ByteRange, Option<SymbolId>>,
 }
 
 impl<'source> Index<'source> {
@@ -269,12 +277,7 @@ impl<'source> Index<'source> {
         result: &mut StaticResolution,
         select: impl Fn(&rift_syntax::StaticFacts) -> &[ByteRange],
     ) -> Option<usize> {
-        let root = self.files.values().find_map(|file| {
-            Some(Target {
-                file: file.document,
-                symbol: file.rust_library_root?,
-            })
-        })?;
+        let root = self.rust_library_root_target()?;
         let crate_name = root.file.placement.module_path().first()?;
         let start = result.occurrences.len();
         for file in self.files.values() {
@@ -307,6 +310,105 @@ impl<'source> Index<'source> {
             }
         }
         (result.occurrences.len() != start).then_some(start)
+    }
+
+    fn rust_library_root_target(&self) -> Option<Target<'source>> {
+        self.files.values().find_map(|file| {
+            Some(Target {
+                file: file.document,
+                symbol: file.rust_library_root?,
+            })
+        })
+    }
+
+    /// Reads the established qualifiers of authored Rust imports after prior references.
+    pub(in crate::static_resolution) fn resolve_rust_import_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let root = self.rust_library_root_target();
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            let mut sites = ImportQualifierSites::default();
+            for imported in file.facts.rust_uses() {
+                if !work.charge() {
+                    break;
+                }
+                if file.conditional(imported.range, work)
+                    || file.blocked(imported.range.start, work)
+                {
+                    continue;
+                }
+                self.rust_import_qualifiers(file, imported, root, &mut sites, work, result);
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        result.rust_import_qualifier_start = (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn rust_import_qualifiers(
+        &self,
+        file: &File<'source>,
+        imported: &StaticRustUse,
+        root: Option<Target<'source>>,
+        sites: &mut ImportQualifierSites,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let Some(segments) = import_segments(file, imported, work) else {
+            return;
+        };
+        let names = segments.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let qualifier_count = segments.len().saturating_sub(usize::from(!imported.glob));
+        let position = imported.range.start;
+        for (index, &(_, token)) in segments.iter().take(qualifier_count).enumerate() {
+            // Grouped leaves share the same physical prefix and lexical scope.
+            if !sites.seen.insert(token) {
+                continue;
+            }
+            let prefix = &names[..=index];
+            if !prefix.iter().all(|_| work.charge()) {
+                return;
+            }
+            let Some(path) = self.rust.absolute_path(file, position, prefix, work) else {
+                continue;
+            };
+            let Some(target) = self
+                .rust
+                .lookup(file, position, &path, Namespace::Type, work)
+                .filter(|target| qualifier_kind(*target))
+                .or_else(|| {
+                    if work.exhausted
+                        || !matches!(prefix.first().copied(), Some("crate" | "self" | "super"))
+                    {
+                        return None;
+                    }
+                    root.filter(|target| target.file.placement.module_path() == path)
+                })
+            else {
+                continue;
+            };
+            let Some(mut occurrence) =
+                self.occurrence(file, token, token, ReferenceRole::Read, target)
+            else {
+                continue;
+            };
+            if !matches!(
+                occurrence.target,
+                rift_provider::NormalizedTarget::Symbol(_)
+            ) {
+                continue;
+            }
+            let source = sites
+                .sources
+                .entry(imported.scope)
+                .or_insert_with(|| self.rust_module_from(file, imported.range, work));
+            occurrence.edge_from.clone_from(source);
+            result.record(Some(occurrence));
+        }
     }
 
     /// Reads the module and type tokens written before a qualified callee's final name.
@@ -578,6 +680,32 @@ impl<'source> Index<'source> {
         occurrence.edge_from = Some(from);
         Some(occurrence)
     }
+}
+
+/// The token spans of an import, including the prefixes inherited from enclosing groups.
+fn import_segments<'source>(
+    file: &File<'source>,
+    imported: &StaticRustUse,
+    work: &mut Work,
+) -> Option<Vec<(&'source str, ByteRange)>> {
+    let mut segments = Vec::new();
+    for &range in &imported.path {
+        if !work.charge() {
+            return None;
+        }
+        let text = file.text(range)?;
+        for name in path_segments(text, work)? {
+            let token = text.as_bytes().subslice_range(name.as_bytes())?;
+            segments.push((
+                name,
+                ByteRange {
+                    start: range.start.checked_add(u64::try_from(token.start).ok()?)?,
+                    end: range.start.checked_add(u64::try_from(token.end).ok()?)?,
+                },
+            ));
+        }
+    }
+    Some(segments)
 }
 
 fn qualifier_kind(target: Target<'_>) -> bool {
