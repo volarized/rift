@@ -499,6 +499,7 @@ fn binding_capacity(
     let mut typescript_parameters = BindingDemand::default();
     let mut python_receivers = BindingDemand::default();
     let mut python_loop_bindings = BindingDemand::default();
+    let mut python_variadic_parameters = BindingDemand::default();
     let mut primary = 0_usize;
     let mut unnamed = 0_usize;
     for document in documents {
@@ -517,6 +518,8 @@ fn binding_capacity(
         }) {
             let demand = if symbol.is_typescript_parameter() {
                 &mut typescript_parameters
+            } else if symbol.is_python_variadic_parameter() {
+                &mut python_variadic_parameters
             } else if symbol.is_python_parameter() {
                 if symbol
                     .name_range
@@ -549,7 +552,8 @@ fn binding_capacity(
         + python_parameters.count
         + typescript_parameters.count
         + python_receivers.count
-        + python_loop_bindings.count;
+        + python_loop_bindings.count
+        + python_variadic_parameters.count;
     let (mut bytes, record) = limits
         .retained_source()
         .filter(|limits| count != 0 && limits.total_bytes_max != u64::MAX)
@@ -569,6 +573,7 @@ fn binding_capacity(
     let typescript_parameter_slots = typescript_parameters.reserve(&mut slots, &mut bytes, record);
     let python_receiver_slots = python_receivers.reserve(&mut slots, &mut bytes, record);
     let python_loop_binding_slots = python_loop_bindings.reserve(&mut slots, &mut bytes, record);
+    let python_variadic_slots = python_variadic_parameters.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -578,7 +583,8 @@ fn binding_capacity(
             typescript_parameter_slots,
         )
         .with_python_receiver_slots(python_receiver_slots)
-        .with_python_loop_binding_slots(python_loop_binding_slots),
+        .with_python_loop_binding_slots(python_loop_binding_slots)
+        .with_python_variadic_parameter_slots(python_variadic_slots),
     )
 }
 

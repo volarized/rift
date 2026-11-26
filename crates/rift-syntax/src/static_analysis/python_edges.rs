@@ -572,7 +572,12 @@ impl EdgePythonKinds {
                     if receiver.is_some() {
                         names.receiver_binding(scope_range, name);
                     } else {
-                        names.direct_binding(source, name, scope_range, scope_range.start, false);
+                        let kind = if collects {
+                            names::DirectBindingKind::VariadicParameter
+                        } else {
+                            names::DirectBindingKind::Parameter
+                        };
+                        names.direct_binding(source, name, scope_range, scope_range.start, kind);
                     }
                 }
                 facts.bindings.push(self.scoped_binding(

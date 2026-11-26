@@ -301,15 +301,6 @@ fn package_stores_python_function_parameter_names_and_reads() {
         object.kinds.contains(&SymbolKind::Parameter)
             && object.id.as_ref().is_some_and(|id| id.as_str() == rebind)
     }));
-    for name in ["args", "kwargs"] {
-        let target = id(&format!("Receiver/run/{name}"));
-        assert!(
-            !result
-                .declarations
-                .iter()
-                .any(|declaration| declaration.symbol.as_str() == target)
-        );
-    }
 }
 
 const PYTHON_RECEIVER_SOURCE: &str = concat!(
@@ -546,6 +537,70 @@ fn package_python_loop_targets_respect_existing_names_and_scope_redirects() {
     }));
     assert!(result.declarations.iter().any(|entry| {
         entry.symbol.as_str().ends_with("/receive/item") && entry.source == "item"
+    }));
+}
+
+#[test]
+fn package_python_variadic_parameters_keep_names_and_reads() {
+    const SOURCE: &str = concat!(
+        "def collect(*values: int, **options: str):\n",
+        "    return values, options\n",
+        "class Control:\n",
+        "    def existing(self, value):\n",
+        "        return self, value\n"
+    );
+    let files = [("click.py", SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    for (name, signature) in [("values", "*values"), ("options", "**options")] {
+        let symbol = format!("rift://symbol/pypi/pypi.org/click/python/click/collect/{name}");
+        let declaration_start = SOURCE.find(signature).expect("written parameter")
+            + signature.find(name).expect("parameter name");
+        let read_start = SOURCE.rfind(name).expect("written read");
+        assert!(
+            complete.declarations.iter().any(|entry| {
+                entry.symbol.as_str() == symbol
+                    && entry.source == name
+                    && entry.range.start == u64::try_from(declaration_start).expect("start")
+                    && entry.range.end
+                        == u64::try_from(declaration_start + name.len()).expect("end")
+            }),
+            "{symbol}"
+        );
+        assert!(
+            complete.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.from.as_str().ends_with("/collect")
+                    && edge.to.as_str() == symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == u64::try_from(read_start).expect("start")
+                            && site.range.end
+                                == u64::try_from(read_start + name.len()).expect("end")
+                    })
+            }),
+            "{symbol}"
+        );
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            !["/collect/values", "/collect/options"]
+                .iter()
+                .any(|suffix| edge.to.as_str().ends_with(suffix))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    assert_eq!(limited.declarations, complete.declarations);
+    assert_eq!(limited.edges, prior);
+    assert!(limited.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/existing/self")
     }));
 }
 

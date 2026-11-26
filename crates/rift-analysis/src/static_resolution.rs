@@ -73,6 +73,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_capture_start: Option<usize>,
     /// First method receiver read, after earlier local and captured reads.
     pub(crate) python_receiver_start: Option<usize>,
+    /// First variadic parameter read, after the earlier parameter reads.
+    pub(crate) python_variadic_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -227,6 +229,7 @@ enum DeferredReferences<'source> {
     PythonReassignments(Vec<python_edges::ReassignedLocalRead<'source>>),
     PythonCaptures,
     PythonReceivers,
+    PythonVariadics,
     TypeScriptParameters(Vec<ByteRange>),
     Rust {
         pass: RustReferencePass,
@@ -1068,15 +1071,24 @@ impl<'source> File<'source> {
     fn python_after_local_pass(&self) -> Option<DeferredReferences<'source>> {
         (!self.facts.python_captured_local_reads().is_empty())
             .then_some(DeferredReferences::PythonCaptures)
-            .or_else(|| self.python_receiver_pass())
+            .or_else(|| self.python_after_captures_pass())
     }
 
-    fn python_receiver_pass(&self) -> Option<DeferredReferences<'source>> {
+    fn python_after_captures_pass(&self) -> Option<DeferredReferences<'source>> {
         self.facts
             .python_receiver_reads()
             .iter()
             .any(|(_, name)| matches!(self.python_parameters.get(name), Some(Some(_))))
             .then_some(DeferredReferences::PythonReceivers)
+            .or_else(|| self.python_variadic_pass())
+    }
+
+    fn python_variadic_pass(&self) -> Option<DeferredReferences<'source>> {
+        self.facts
+            .python_variadic_reads()
+            .iter()
+            .any(|(_, name)| matches!(self.python_parameters.get(name), Some(Some(_))))
+            .then_some(DeferredReferences::PythonVariadics)
     }
 
     fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
@@ -1530,6 +1542,7 @@ impl<'source> Index<'source> {
                         | DeferredReferences::PythonReassignments(_)
                         | DeferredReferences::PythonCaptures
                         | DeferredReferences::PythonReceivers
+                        | DeferredReferences::PythonVariadics
                         | DeferredReferences::TypeScriptParameters(_) => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
@@ -1567,6 +1580,7 @@ impl<'source> Index<'source> {
         let mut python_reassigned_sites = VecDeque::new();
         let mut python_captured_sites = VecDeque::new();
         let mut python_receiver_sites = VecDeque::new();
+        let mut python_variadic_sites = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1577,54 +1591,13 @@ impl<'source> Index<'source> {
             .or_else(|| python_reassigned_sites.pop_front())
             .or_else(|| python_captured_sites.pop_front())
             .or_else(|| python_receiver_sites.pop_front())
+            .or_else(|| python_variadic_sites.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
-            let next = match sites {
-                DeferredReferences::Python { names, imports } => {
-                    self.resolve_python_names(file, names, imports, &mut deferred, resolution)
-                }
-                DeferredReferences::PythonQualifiers { imports, names } => {
-                    self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
-                    file.python_local_pass()
-                }
-                DeferredReferences::PythonLocals => {
-                    self.resolve_python_locals(file, &mut deferred, resolution)
-                }
-                DeferredReferences::PythonParameters(reassigned) => {
-                    let _ = self.python_local_reads(file, &mut deferred, resolution, true);
-                    (!reassigned.is_empty())
-                        .then_some(DeferredReferences::PythonReassignments(reassigned))
-                        .or_else(|| file.python_after_local_pass())
-                }
-                DeferredReferences::PythonReassignments(reassigned) => {
-                    self.python_reassigned_local_reads(file, reassigned, &mut deferred, resolution);
-                    file.python_after_local_pass()
-                }
-                DeferredReferences::PythonCaptures => {
-                    self.python_captured_local_reads(file, &mut deferred, resolution);
-                    file.python_receiver_pass()
-                }
-                DeferredReferences::PythonReceivers => {
-                    self.python_receiver_reads(file, &mut deferred, resolution);
-                    None
-                }
-                DeferredReferences::TypeScriptParameters(sites) => {
-                    self.typescript_parameter_reads(file, sites, &mut deferred, resolution);
-                    None
-                }
-                DeferredReferences::Rust {
-                    pass,
-                    macro_imports,
-                } => self
-                    .resolve_deferred_rust(file, &pass, &macro_imports, &mut deferred, resolution)
-                    .map(|pass| DeferredReferences::Rust {
-                        pass,
-                        macro_imports,
-                    }),
-            };
+            let next = self.resolve_deferred_sites(file, sites, &mut deferred, resolution);
             let used = budget.saturating_sub(deferred.budget.remaining());
             #[cfg(test)]
             self.performed
@@ -1638,6 +1611,7 @@ impl<'source> Index<'source> {
                     DeferredReferences::PythonReassignments(_) => &mut python_reassigned_sites,
                     DeferredReferences::PythonCaptures => &mut python_captured_sites,
                     DeferredReferences::PythonReceivers => &mut python_receiver_sites,
+                    DeferredReferences::PythonVariadics => &mut python_variadic_sites,
                     DeferredReferences::TypeScriptParameters(_) => &mut typescript_parameter_sites,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
@@ -1649,6 +1623,60 @@ impl<'source> Index<'source> {
                 };
                 queue.push_back((file, remaining.saturating_sub(used), next));
             }
+        }
+    }
+
+    fn resolve_deferred_sites(
+        &self,
+        file: &File<'source>,
+        sites: DeferredReferences<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) -> Option<DeferredReferences<'source>> {
+        match sites {
+            DeferredReferences::Python { names, imports } => {
+                self.resolve_python_names(file, names, imports, work, resolution)
+            }
+            DeferredReferences::PythonQualifiers { imports, names } => {
+                self.python_module_qualifiers(file, imports, names, work, resolution);
+                file.python_local_pass()
+            }
+            DeferredReferences::PythonLocals => self.resolve_python_locals(file, work, resolution),
+            DeferredReferences::PythonParameters(reassigned) => {
+                let _ = self.python_local_reads(file, work, resolution, true);
+                (!reassigned.is_empty())
+                    .then_some(DeferredReferences::PythonReassignments(reassigned))
+                    .or_else(|| file.python_after_local_pass())
+            }
+            DeferredReferences::PythonReassignments(reassigned) => {
+                self.python_reassigned_local_reads(file, reassigned, work, resolution);
+                file.python_after_local_pass()
+            }
+            DeferredReferences::PythonCaptures => {
+                self.python_captured_local_reads(file, work, resolution);
+                file.python_after_captures_pass()
+            }
+            DeferredReferences::PythonReceivers => {
+                self.python_receiver_reads(file, work, resolution);
+                file.python_variadic_pass()
+            }
+            DeferredReferences::PythonVariadics => {
+                self.python_variadic_reads(file, work, resolution);
+                None
+            }
+            DeferredReferences::TypeScriptParameters(sites) => {
+                self.typescript_parameter_reads(file, sites, work, resolution);
+                None
+            }
+            DeferredReferences::Rust {
+                pass,
+                macro_imports,
+            } => self
+                .resolve_deferred_rust(file, &pass, &macro_imports, work, resolution)
+                .map(|pass| DeferredReferences::Rust {
+                    pass,
+                    macro_imports,
+                }),
         }
     }
 
@@ -2222,6 +2250,10 @@ impl StaticResolution {
         }
         if matches!(sites, DeferredReferences::PythonReceivers) {
             self.python_receiver_start
+                .get_or_insert(self.occurrences.len());
+        }
+        if matches!(sites, DeferredReferences::PythonVariadics) {
+            self.python_variadic_start
                 .get_or_insert(self.occurrences.len());
         }
         if matches!(

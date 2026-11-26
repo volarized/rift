@@ -538,6 +538,8 @@ pub struct StaticFactsParts {
     pub python_captured_local_reads: Vec<(ByteRange, ByteRange)>,
     /// Reads of a Python method receiver paired with its parameter name.
     pub python_receiver_reads: Vec<(ByteRange, ByteRange)>,
+    /// Reads of Python variadic parameters paired with their declared names.
+    pub python_variadic_reads: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -933,9 +935,16 @@ impl StaticFacts {
         &self.0.python_receiver_reads
     }
 
+    /// Python variadic parameter reads and the names their bindings select.
+    #[must_use]
+    pub fn python_variadic_reads(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_variadic_reads
+    }
+
     pub(crate) fn retain_python_local_reads(&mut self, keep: impl Fn(ByteRange) -> bool) {
         self.0.python_local_reads.retain(|&(_, name)| keep(name));
         self.0.python_receiver_reads.retain(|&(_, name)| keep(name));
+        self.0.python_variadic_reads.retain(|&(_, name)| keep(name));
     }
 
     /// Python names checked for a non-`None` value and the bodies the checks admit.
@@ -997,6 +1006,7 @@ impl StaticFacts {
             vector_capacity(&self.0.python_local_reads),
             vector_capacity(&self.0.python_captured_local_reads),
             vector_capacity(&self.0.python_receiver_reads),
+            vector_capacity(&self.0.python_variadic_reads),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_writes),
             vector_capacity(&self.0.skippable),
@@ -1073,6 +1083,7 @@ impl StaticFacts {
             self.python_local_reads().len(),
             self.python_captured_local_reads().len(),
             self.python_receiver_reads().len(),
+            self.python_variadic_reads().len(),
             self.non_none_guards().len(),
             self.commonjs_writes().len(),
             self.skippable().len(),
@@ -1350,6 +1361,7 @@ impl StaticFacts {
             self.python_local_reads(),
             self.python_captured_local_reads(),
             self.python_receiver_reads(),
+            self.python_variadic_reads(),
         ]
         .into_iter()
         .all(|reads| {

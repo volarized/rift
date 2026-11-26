@@ -148,6 +148,26 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Resolves direct variadic parameter reads after the earlier parameter passes.
+    pub(in crate::static_resolution) fn python_variadic_reads(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for &(read, name) in file.facts.python_variadic_reads() {
+            if !work.charge() {
+                return;
+            }
+            if let Some(target) = file
+                .python_parameter_read_target(read, name, work)
+                .filter(|target| target.symbol.is_python_variadic_parameter())
+            {
+                self.record_python_local_read(file, read, target, result);
+            }
+        }
+    }
+
     fn record_python_local_read(
         &self,
         file: &File<'source>,
@@ -574,6 +594,15 @@ impl<'source> File<'source> {
         if receiver.name != name {
             return None;
         }
+        self.python_parameter_read_target(read, name, work)
+    }
+
+    fn python_parameter_read_target(
+        &self,
+        read: ByteRange,
+        name: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
         let symbol = self.python_parameters.get(&name).copied().flatten()?;
         let target = Target {
             file: self.document,

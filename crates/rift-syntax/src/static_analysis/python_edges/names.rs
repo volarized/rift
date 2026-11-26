@@ -111,18 +111,14 @@ impl<'source> Names<'source> {
         name: ByteRange,
         scope: ByteRange,
         end: u64,
-        capturable: bool,
+        kind: DirectBindingKind,
     ) {
         if let Some(spelling) = text(source, name) {
             self.direct_locals
                 .entry(spelling)
                 .or_default()
                 .entry(scope)
-                .or_insert(DirectLocal {
-                    name,
-                    end,
-                    capturable,
-                });
+                .or_insert(DirectLocal { name, end, kind });
         }
     }
 }
@@ -131,7 +127,15 @@ impl<'source> Names<'source> {
 struct DirectLocal {
     name: ByteRange,
     end: u64,
-    capturable: bool,
+    kind: DirectBindingKind,
+}
+
+/// The written binding a function-local read could select.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirectBindingKind {
+    Local,
+    Parameter,
+    VariadicParameter,
 }
 
 /// What one name does where it is written.
@@ -275,7 +279,7 @@ impl EdgePythonKinds {
                 byte_range(target)?,
                 self.scope_range(owner.syntax_element())?,
                 byte_range(assignment)?.end,
-                true,
+                DirectBindingKind::Local,
             );
         }
         Ok(())
@@ -339,11 +343,16 @@ impl EdgePythonKinds {
         let inner = byte_range(scope)?;
         if let Some(local) = assignments.get(&inner) {
             if local.end <= range.start {
-                facts.python_local_reads.push((range, local.name));
+                let reads = if local.kind == DirectBindingKind::VariadicParameter {
+                    &mut facts.python_variadic_reads
+                } else {
+                    &mut facts.python_local_reads
+                };
+                reads.push((range, local.name));
             }
         } else if let Some(outer) = self.enclosing_local_function(scope)
             && let Some(local) = assignments.get(&byte_range(outer)?)
-            && local.capturable
+            && local.kind == DirectBindingKind::Local
             && local.end <= inner.start
         {
             facts.python_captured_local_reads.push((range, local.name));

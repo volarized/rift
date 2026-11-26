@@ -455,28 +455,31 @@ impl EdgeStore {
         edges_max: usize,
     ) {
         let supplemental_start = resolution.supplemental_start.take();
-        let receiver_start = resolution
-            .python_receiver_start
-            .take()
-            .unwrap_or(resolution.occurrences.len());
-        let capture_start = resolution
-            .python_capture_start
-            .take()
-            .unwrap_or(receiver_start);
-        let python_reassignment_start = resolution
-            .python_reassignment_start
-            .take()
-            .unwrap_or(capture_start);
-        let late_start = resolution
-            .late_supplemental_start
-            .take()
-            .unwrap_or(python_reassignment_start);
+        let mut next_start = resolution.occurrences.len();
+        let [
+            variadic_start,
+            receiver_start,
+            capture_start,
+            python_reassignment_start,
+            late_start,
+        ] = [
+            resolution.python_variadic_start.take(),
+            resolution.python_receiver_start.take(),
+            resolution.python_capture_start.take(),
+            resolution.python_reassignment_start.take(),
+            resolution.late_supplemental_start.take(),
+        ]
+        .map(|start| {
+            next_start = start.unwrap_or(next_start);
+            next_start
+        });
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
         let (internal, external) =
             supplemental_start.unwrap_or((late_start, resolution.external.len()));
-        let (earlier, receiver_reads) = resolution.occurrences.split_at(receiver_start);
+        let (earlier, variadic_reads) = resolution.occurrences.split_at(variadic_start);
+        let (earlier, receiver_reads) = earlier.split_at(receiver_start);
         let (earlier, captured_reads) = earlier.split_at(capture_start);
         let (earlier, reassigned_reads) = earlier.split_at(python_reassignment_start);
         let (earlier, late_supplemental) = earlier.split_at(late_start);
@@ -485,48 +488,28 @@ impl EdgeStore {
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut primary = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut additional = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut late = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut reassigned = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut captured = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut receivers = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        admit_occurrences(occurrences, spans, &self.edge_modules, &mut primary);
-        admit_external(external, spans, &self.edge_modules, &mut primary);
-        admit_occurrences(supplemental, spans, &self.edge_modules, &mut additional);
+        let mut batches = [
+            occurrences,
+            supplemental,
+            late_supplemental,
+            reassigned_reads,
+            captured_reads,
+            receiver_reads,
+            variadic_reads,
+        ]
+        .map(|rows| {
+            let mut edges = BTreeMap::new();
+            admit_occurrences(rows, spans, &self.edge_modules, &mut edges);
+            edges
+        });
+        admit_external(external, spans, &self.edge_modules, &mut batches[0]);
         admit_external(
             supplemental_external,
             spans,
             &self.edge_modules,
-            &mut additional,
+            &mut batches[1],
         );
-        admit_occurrences(late_supplemental, spans, &self.edge_modules, &mut late);
-        admit_occurrences(reassigned_reads, spans, &self.edge_modules, &mut reassigned);
-        admit_occurrences(captured_reads, spans, &self.edge_modules, &mut captured);
-        admit_occurrences(receiver_reads, spans, &self.edge_modules, &mut receivers);
-        let mut batches = [primary, additional, late, reassigned, captured, receivers];
-        for position in 0..batches.len() {
-            let (prior, next) = batches.split_at_mut(position);
-            for (from, edges) in &mut next[0] {
-                edges.sort_by(edge_order);
-                edges.dedup();
-                let existing = self.outgoing(from);
-                // A shared row counts in the first batch even when the cap drops it.
-                edges.retain(|edge| {
-                    std::iter::once(existing)
-                        .chain(
-                            prior
-                                .iter()
-                                .filter_map(|batch| batch.get(from).map(Vec::as_slice)),
-                        )
-                        .all(|earlier| {
-                            earlier
-                                .binary_search_by(|other| edge_order(other, edge))
-                                .is_err()
-                        })
-                });
-            }
-        }
+        self.deduplicate_static_batches(&mut batches);
         for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);
             self.dropped_edges = self
@@ -554,6 +537,31 @@ impl EdgeStore {
             for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
                 edges.sort_by(edge_order);
                 edges.dedup();
+            }
+        }
+    }
+
+    fn deduplicate_static_batches(&self, batches: &mut [BTreeMap<&SymbolId, Vec<Edge>>]) {
+        for position in 0..batches.len() {
+            let (prior, next) = batches.split_at_mut(position);
+            for (from, edges) in &mut next[0] {
+                edges.sort_by(edge_order);
+                edges.dedup();
+                let existing = self.outgoing(from);
+                // A shared row counts in the first batch even when the cap drops it.
+                edges.retain(|edge| {
+                    std::iter::once(existing)
+                        .chain(
+                            prior
+                                .iter()
+                                .filter_map(|batch| batch.get(from).map(Vec::as_slice)),
+                        )
+                        .all(|earlier| {
+                            earlier
+                                .binary_search_by(|other| edge_order(other, edge))
+                                .is_err()
+                        })
+                });
             }
         }
     }

@@ -175,6 +175,7 @@ const FORMATTED_PREFIXES: [char; 2] = ['f', 'F'];
 const FUNCTION_KIND_WORD: &str = "function";
 /// Provider kind for an ordinary function parameter at its name token.
 pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
+pub(crate) const VARIADIC_PARAMETER_KIND_WORD: &str = "variadic_parameter";
 /// The kind word a Python class carries on the wire.
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
@@ -212,6 +213,7 @@ struct PythonKinds {
     call: u16,
     typed_parameter: u16,
     default_parameter: [u16; 2],
+    variadic_parameters: [u16; 2],
     string_start: u16,
     import_from: u16,
     aliased_import: u16,
@@ -270,6 +272,10 @@ impl PythonKinds {
                 kind_id(language, "default_parameter"),
                 kind_id(language, "typed_default_parameter"),
             ],
+            variadic_parameters: [
+                kind_id(language, "list_splat_pattern"),
+                kind_id(language, "dictionary_splat_pattern"),
+            ],
             string_start: kind_id(language, STRING_START_KIND),
             import_from: kind_id(language, IMPORT_FROM_KIND),
             aliased_import: kind_id(language, ALIASED_IMPORT_KIND),
@@ -303,7 +309,7 @@ impl PythonKinds {
     }
 }
 
-/// The written identifier of an ordinary non-variadic function parameter.
+/// The written identifier of a function parameter.
 pub(crate) fn parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
     let kinds = python_kinds();
     if parameter.has_error() {
@@ -318,10 +324,19 @@ pub(crate) fn parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
             .find(|child| !child.is_extra())
     } else if kinds.default_parameter.contains(&kind) {
         parameter.child_by_field_id(kinds.name.get())
+    } else if kinds.variadic_parameters.contains(&kind) {
+        Some(parameter)
     } else {
         None
     };
-    name.filter(|name| name.kind_id() == kinds.identifier)
+    let name = name?;
+    let name = if kinds.variadic_parameters.contains(&name.kind_id()) {
+        name.named_children(&mut name.walk())
+            .find(|child| !child.is_extra())?
+    } else {
+        name
+    };
+    (name.kind_id() == kinds.identifier).then_some(name)
 }
 
 /// Resolves one syntax element kind id, proving the pinned grammar defines it.
@@ -708,9 +723,16 @@ impl PythonRules {
     fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
         let name = visited.syntax_element();
         let parent = visited.parent()?;
-        let kind = parent.syntax_element().kind_id();
+        let variadic = self
+            .kinds
+            .variadic_parameters
+            .contains(&parent.syntax_element().kind_id());
+        let holder = if variadic { parent.parent()? } else { parent };
+        let kind = holder.syntax_element().kind_id();
         let parameter =
             if kind == self.kinds.typed_parameter || self.kinds.default_parameter.contains(&kind) {
+                holder
+            } else if variadic {
                 parent
             } else {
                 visited
@@ -725,7 +747,11 @@ impl PythonRules {
             return None;
         }
         Some(Declaration {
-            kind: PARAMETER_KIND_WORD,
+            kind: if variadic {
+                VARIADIC_PARAMETER_KIND_WORD
+            } else {
+                PARAMETER_KIND_WORD
+            },
             kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
             ..Self::variable(text.get(name.byte_range())?, DeclarationScope::Local)
         })
@@ -1505,6 +1531,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
     [
         FUNCTION_KIND_WORD,
         PARAMETER_KIND_WORD,
+        VARIADIC_PARAMETER_KIND_WORD,
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
         LOOP_BINDING_KIND_WORD,
