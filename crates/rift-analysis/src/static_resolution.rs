@@ -338,6 +338,38 @@ struct PendingPythonReferences<'index, 'source> {
     overload_reads: bool,
 }
 
+impl<'index, 'source> PendingPythonReferences<'index, 'source> {
+    fn capture(
+        file: &'index File<'source>,
+        remaining: usize,
+        resolution: &StaticResolution,
+        has_initializers: bool,
+    ) -> Option<Self> {
+        let initializers = if has_initializers {
+            python_edges::InitializerCalls::capture(file, resolution)
+        } else {
+            None
+        };
+        let quoted_types = file.document.facts.language().name == "python"
+            && file.facts.references().iter().any(|reference| {
+                reference.role == ReferenceRole::Type
+                    && python_edges::quoted_type_text(file, reference.target).is_some()
+            });
+        let overload_reads = file.facts.python_local_reads().iter().any(|(_, name)| {
+            file.python_parameters.get(name).is_some_and(|symbol| {
+                symbol.is_some_and(rift_syntax::SyntaxSymbol::is_python_overload_parameter)
+            })
+        });
+        (initializers.is_some() || quoted_types || overload_reads).then_some(Self {
+            file,
+            remaining,
+            initializers,
+            quoted_types,
+            overload_reads,
+        })
+    }
+}
+
 type PendingPythonFiles<'index, 'source> =
     BTreeMap<&'index str, PendingPythonReferences<'index, 'source>>;
 
@@ -1711,32 +1743,13 @@ impl<'source> Index<'source> {
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
                 let remaining = file_work.max(file).saturating_sub(apart.used);
-                let initializers = if has_initializers {
-                    python_edges::InitializerCalls::capture(file, &apart.resolution)
-                } else {
-                    None
-                };
-                let quoted_types = file.document.facts.language().name == "python"
-                    && file.facts.references().iter().any(|reference| {
-                        reference.role == ReferenceRole::Type
-                            && python_edges::quoted_type_text(file, reference.target).is_some()
-                    });
-                let overload_reads = file.facts.python_local_reads().iter().any(|(_, name)| {
-                    file.python_parameters.get(name).is_some_and(|symbol| {
-                        symbol.is_some_and(rift_syntax::SyntaxSymbol::is_python_overload_parameter)
-                    })
-                });
-                if initializers.is_some() || quoted_types || overload_reads {
-                    pending_python.insert(
-                        file.document.path.as_str(),
-                        PendingPythonReferences {
-                            file,
-                            remaining,
-                            initializers,
-                            quoted_types,
-                            overload_reads,
-                        },
-                    );
+                if let Some(pending) = PendingPythonReferences::capture(
+                    file,
+                    remaining,
+                    &apart.resolution,
+                    has_initializers,
+                ) {
+                    pending_python.insert(file.document.path.as_str(), pending);
                 }
                 if let Some(sites) = apart.deferred_references {
                     let queue = match sites {

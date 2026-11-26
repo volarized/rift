@@ -1174,7 +1174,10 @@ fn package_ambient_overloads_and_repeated_bodies_share_one_identity() {
     let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), overloads);
     let identities = found.anchors["buffer.d.ts"]
         .iter()
-        .filter(|(name, _)| name.ends_with(".read"))
+        .filter(|(name, _)| {
+            name.rsplit_once('.')
+                .is_some_and(|(_, item)| item == "read")
+        })
         .map(|(_, identity)| identity)
         .collect::<Vec<_>>();
     assert_eq!(
