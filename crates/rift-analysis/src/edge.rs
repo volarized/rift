@@ -1256,32 +1256,16 @@ mod tests {
         assert_eq!(room.outgoing(&alpha).len(), 2);
         assert_eq!(room.outgoing(&zeta), baseline.outgoing(&zeta));
 
-        let late = build(3, 3);
-        assert_eq!(late.dropped_edges(), 1);
-        assert_eq!(late.outgoing(&alpha), room.outgoing(&alpha));
-        assert_eq!(late.outgoing(&zeta), room.outgoing(&zeta));
-        let all = build(4, 3);
-        assert!(all.is_complete());
-        assert_eq!(all.edges().count(), 4);
-        let reassigned = build(4, 4);
-        assert_eq!(reassigned.dropped_edges(), 1);
-        assert_eq!(reassigned.outgoing(&alpha), all.outgoing(&alpha));
-        assert_eq!(reassigned.outgoing(&zeta), all.outgoing(&zeta));
-        let all = build(5, 4);
-        assert!(all.is_complete());
-        let captured = build(5, 5);
-        assert_eq!(captured.dropped_edges(), 1);
-        assert_eq!(captured.outgoing(&alpha), all.outgoing(&alpha));
-        assert_eq!(captured.outgoing(&zeta), all.outgoing(&zeta));
-        let all = build(6, 5);
-        assert!(all.is_complete());
-        let qualified = build(6, 6);
-        assert_eq!(qualified.dropped_edges(), 1);
-        assert_eq!(
-            qualified.edges().collect::<Vec<_>>(),
-            all.edges().collect::<Vec<_>>()
-        );
-        assert!(build(7, 6).is_complete());
+        for batch in 3..=6 {
+            let earlier = build(batch, batch - 1);
+            assert!(earlier.is_complete());
+            let capped = build(batch, batch);
+            assert_eq!(capped.dropped_edges(), 1);
+            assert!(capped.edges().eq(earlier.edges()));
+            let expanded = build(batch + 1, batch);
+            assert!(expanded.is_complete());
+            assert_eq!(expanded.edges().count(), batch + 1);
+        }
     }
 
     #[test]
