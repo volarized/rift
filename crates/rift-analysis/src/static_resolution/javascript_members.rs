@@ -612,11 +612,31 @@ impl<'source> Index<'source> {
         ) else {
             return false;
         };
-        if file.target_at(binding.name).is_some_and(same) {
+        let written = file.target_at(binding.name);
+        if written.is_some_and(same) {
             return true;
         }
         if name.len() != receiver.len() {
             return false;
+        }
+        // A variable that still holds a class's original value writes the same
+        // object. Resolve a bare initializer name in the scope where it was written.
+        if let Some(value) = written
+            .filter(|target| target.symbol.syntax_element_kind == Some("variable_declarator"))
+            .and_then(|target| target.symbol.body_range)
+            && !file.javascript_binding_reassigned(binding)
+            && let Some(name) = file.text(value)
+            && let Some(source) = super::javascript::js_binding(
+                file,
+                &self.javascript,
+                name,
+                value.start,
+                ReferenceRole::Read,
+                work,
+            )
+            && file.target_at(source.name).is_some_and(same)
+        {
+            return true;
         }
         if let Some(&Some(annotation)) = file.declared_types.get(&binding.name) {
             return self

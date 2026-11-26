@@ -860,6 +860,61 @@ export function captured(next) { Lexical.swap(next); return Lexical.make(); }
     );
 }
 
+#[test]
+fn package_javascript_class_alias_writes_withhold_the_replaced_method() {
+    let source = r"
+export class Aliased { static make() { return 1; } }
+const Alias = Aliased;
+export class Direct { static make() { return 2; } }
+export class Scoped { static make() { return 3; } }
+export class Other { static make() { return 4; } }
+export class Unchanged { static make() { return 5; } }
+const Exposed = Scoped;
+let Former = Unchanged;
+Former = Other;
+export function throughAlias(next) { Alias.make = next; return Aliased.make(); }
+export function throughDirect(next) { Direct.make = next; return Direct.make(); }
+export function nested(next) { const Exposed = Other; Exposed.make = next; return Scoped.make(); }
+export function reassigned(next) { Former.make = next; return Unchanged.make(); }
+";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.js"}"#,
+        )),
+    )
+    .expect("admitted JavaScript package");
+    let mut calls = analysis
+        .publication()
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls])
+        .map(|edge| {
+            let span = edge.occurrence.as_ref().expect("written call");
+            let start = usize::try_from(span.range.start).expect("start");
+            let end = usize::try_from(span.range.end).expect("end");
+            let owner = edge.from.as_str().rsplit("/beacon/").next().expect("owner");
+            let target = edge.to.as_str().rsplit("/beacon/").next().expect("target");
+            (start, &source[start..end], owner, target)
+        })
+        .collect::<Vec<_>>();
+    calls.sort_unstable();
+    let calls = calls
+        .into_iter()
+        .map(|(_, text, owner, target)| (text, owner, target))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        [
+            ("Scoped.make()", "nested", "Scoped/make"),
+            ("Unchanged.make()", "reassigned", "Unchanged/make"),
+        ]
+    );
+}
+
 struct GraphFixture {
     analysis: PackageAnalysis,
     owner: SymbolOwner,
