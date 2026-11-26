@@ -534,6 +534,110 @@ impl<'source> FileScopes<'source> {
         .then_some((scope, body))
     }
 
+    /// Places literal argument keys beneath an already scoped private initializer.
+    pub(super) fn place_scoped_call_argument_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        withheld: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+        scoped: &mut ScopedIdentityAnchors,
+    ) {
+        let Some(facts) = file.syntax.static_facts().filter(|_| {
+            !scoped.is_empty()
+                && file.syntax.language().name == "javascript"
+                && !file.syntax.has_errors()
+                && file.syntax.left_out_declaration_count() == 0
+        }) else {
+            return;
+        };
+        let calls = facts
+            .calls()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call.callee,
+                    StaticCallee::Direct | StaticCallee::Member { .. }
+                )
+            })
+            .map(|call| (call.range, call.callee_range.end))
+            .collect::<BTreeMap<_, _>>();
+        let parents = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                private_variable_declaration(symbol)
+                    && symbol.syntax_element_kind == Some("variable_declarator")
+            })
+            .filter_map(|symbol| {
+                let scope = self.checked_lexical_scope(file, symbol)?;
+                if !scope.encloses(symbol.item_range) {
+                    return None;
+                }
+                let body = symbol.body_range?;
+                let callee_end = *calls.get(&body)?;
+                let identity = scoped
+                    .get(&symbol.qualified_name)?
+                    .get(&symbol.declaration_ordinal)?;
+                let owner = SymbolIdentity::parse(identity.as_str()).ok()?;
+                Some((
+                    (symbol.qualified_name.as_str(), body.end),
+                    (body, callee_end, owner),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut proposed = BTreeMap::new();
+        for property in file.syntax.symbols() {
+            if !ordinary_private_property(property, file.source)
+                || !withheld.contains(property.qualified_name.as_str())
+                || scoped
+                    .get(&property.qualified_name)
+                    .is_some_and(|group| group.contains_key(&property.declaration_ordinal))
+            {
+                continue;
+            }
+            let Some((container, member)) = property
+                .container
+                .as_deref()
+                .zip(self.body_members.get(&property.item_range))
+            else {
+                continue;
+            };
+            let Some((body, callee_end, owner)) = parents.get(&(container, member.holder.end))
+            else {
+                continue;
+            };
+            if *callee_end > member.holder.start
+                || !body.encloses(member.holder)
+                || !member.holder.encloses(member.body)
+                || !member.body.encloses(property.item_range)
+            {
+                continue;
+            }
+            if let Some(identity) = literal_property_identity(owner, &property.name) {
+                proposed
+                    .entry(identity)
+                    .and_modify(|candidate| *candidate = None)
+                    .or_insert(Some(property));
+            }
+        }
+        let occupied = anchors
+            .values()
+            .chain(scoped.values().flat_map(|group| group.values()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for (identity, property) in proposed {
+            if let Some(property) = property
+                && !occupied.contains(&identity)
+            {
+                scoped
+                    .entry(property.qualified_name.clone())
+                    .or_default()
+                    .insert(property.declaration_ordinal, identity);
+            }
+        }
+    }
+
     /// Names distinct private lexical declarations that the file module cannot share.
     pub(super) fn withheld_lexical_bindings(
         &self,

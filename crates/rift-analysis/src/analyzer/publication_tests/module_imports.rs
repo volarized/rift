@@ -3416,6 +3416,85 @@ fn non_entry_callbacks_keep_properties_in_distinct_call_arguments() {
 }
 
 #[test]
+fn scoped_call_initializers_keep_argument_properties_without_result_reads() {
+    const SOURCE: &str = concat!(
+        "function wrap(value) { return { other: 1 }; }\n",
+        "export function build(first) {\n",
+        "  if (first === 0) { let record; return record; }\n",
+        "  if (first === 1) {\n",
+        "    const record = wrap({ code: 'one' });\n",
+        "    return record.code;\n",
+        "  }\n",
+        "  const record = wrap({ code: 'two' });\n",
+        "  return record.code;\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found.validate_facts().expect("physical call arguments");
+    let declaration = |written: &str| {
+        let start = SOURCE.find(written).expect("written declaration");
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical declaration")
+    };
+    for (index, written) in ["code: 'one'", "code: 'two'"].into_iter().enumerate() {
+        let call = format!("wrap({{ {written} }})");
+        let local = declaration(&format!("record = {call}"));
+        let property = declaration(written);
+        assert!(
+            local
+                .symbol
+                .as_str()
+                .ends_with(&format!("/record%23{}", index + 1))
+        );
+        assert_eq!(
+            property.symbol.as_str(),
+            format!("{}/code", local.symbol.as_str())
+        );
+        assert_eq!(property.unit, local.unit);
+        assert!(!property.public);
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&local.symbol)
+                && object.name == "code"
+        }));
+        let start = SOURCE.find(&call).expect("written call");
+        assert!(found.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with("/build")
+                && edge.to.as_str().ends_with("/wrap")
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == property.unit
+                        && occurrence.range == module_runtime_range(start, &call)
+                })
+        }));
+        assert!(
+            found.edges.iter().all(|edge| {
+                edge.to != property.symbol || !edge.kinds.contains(&EdgeKind::Reads)
+            })
+        );
+    }
+    assert!(
+        declaration("record")
+            .symbol
+            .as_str()
+            .ends_with("/record%230")
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
 fn javascript_file_modules_keep_local_names_without_an_established_method() {
     const SOURCE: &str = concat!(
         "export const codec = flag\n",
