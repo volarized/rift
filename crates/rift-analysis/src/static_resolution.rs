@@ -67,6 +67,8 @@ pub(crate) struct StaticResolution {
     pub(crate) supplemental_start: Option<(usize, usize)>,
     /// First internal occurrence added after the earlier supplemental passes.
     pub(crate) late_supplemental_start: Option<usize>,
+    /// First reassigned local read, after all earlier reference passes.
+    pub(crate) python_reassignment_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -217,7 +219,8 @@ enum DeferredReferences<'source> {
         names: Vec<ByteRange>,
     },
     PythonLocals,
-    PythonParameters,
+    PythonParameters(Vec<python_edges::ReassignedLocalRead<'source>>),
+    PythonReassignments(Vec<python_edges::ReassignedLocalRead<'source>>),
     TypeScriptParameters(Vec<ByteRange>),
     Rust {
         pass: RustReferencePass,
@@ -1497,7 +1500,8 @@ impl<'source> Index<'source> {
                         DeferredReferences::Python { .. }
                         | DeferredReferences::PythonQualifiers { .. }
                         | DeferredReferences::PythonLocals
-                        | DeferredReferences::PythonParameters
+                        | DeferredReferences::PythonParameters(_)
+                        | DeferredReferences::PythonReassignments(_)
                         | DeferredReferences::TypeScriptParameters(_) => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
@@ -1532,6 +1536,7 @@ impl<'source> Index<'source> {
         let mut rust_local_sites = VecDeque::new();
         let mut python_local_sites = VecDeque::new();
         let mut python_parameter_sites = VecDeque::new();
+        let mut python_reassigned_sites = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1539,6 +1544,7 @@ impl<'source> Index<'source> {
             .or_else(|| python_local_sites.pop_front())
             .or_else(|| python_parameter_sites.pop_front())
             .or_else(|| typescript_parameter_sites.pop_front())
+            .or_else(|| python_reassigned_sites.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1561,14 +1567,15 @@ impl<'source> Index<'source> {
                     locals
                 }
                 DeferredReferences::PythonLocals => {
-                    self.python_local_reads(file, &mut deferred, resolution, false);
-                    file.python_parameters
-                        .values()
-                        .any(Option::is_some)
-                        .then_some(DeferredReferences::PythonParameters)
+                    self.resolve_python_locals(file, &mut deferred, resolution)
                 }
-                DeferredReferences::PythonParameters => {
-                    self.python_local_reads(file, &mut deferred, resolution, true);
+                DeferredReferences::PythonParameters(reassigned) => {
+                    let _ = self.python_local_reads(file, &mut deferred, resolution, true);
+                    (!reassigned.is_empty())
+                        .then_some(DeferredReferences::PythonReassignments(reassigned))
+                }
+                DeferredReferences::PythonReassignments(reassigned) => {
+                    self.python_reassigned_local_reads(file, reassigned, &mut deferred, resolution);
                     None
                 }
                 DeferredReferences::TypeScriptParameters(sites) => {
@@ -1594,7 +1601,8 @@ impl<'source> Index<'source> {
             if let Some(next) = next {
                 let queue = match next {
                     DeferredReferences::PythonLocals => &mut python_local_sites,
-                    DeferredReferences::PythonParameters => &mut python_parameter_sites,
+                    DeferredReferences::PythonParameters(_) => &mut python_parameter_sites,
+                    DeferredReferences::PythonReassignments(_) => &mut python_reassigned_sites,
                     DeferredReferences::TypeScriptParameters(_) => &mut typescript_parameter_sites,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
@@ -1606,6 +1614,20 @@ impl<'source> Index<'source> {
                 };
                 queue.push_back((file, remaining.saturating_sub(used), next));
             }
+        }
+    }
+
+    fn resolve_python_locals(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) -> Option<DeferredReferences<'source>> {
+        let reassigned = self.python_local_reads(file, work, resolution, false);
+        if file.python_parameters.values().any(Option::is_some) {
+            Some(DeferredReferences::PythonParameters(reassigned))
+        } else {
+            (!reassigned.is_empty()).then_some(DeferredReferences::PythonReassignments(reassigned))
         }
     }
 
@@ -2134,13 +2156,17 @@ impl<'source> Index<'source> {
 
 impl StaticResolution {
     fn mark_late_admission(&mut self, sites: &DeferredReferences<'_>) {
+        if matches!(sites, DeferredReferences::PythonReassignments(_)) {
+            self.python_reassignment_start
+                .get_or_insert(self.occurrences.len());
+        }
         if matches!(
             sites,
             DeferredReferences::Rust {
                 pass: RustReferencePass::LocalBindings,
                 ..
             } | DeferredReferences::PythonLocals
-                | DeferredReferences::PythonParameters
+                | DeferredReferences::PythonParameters(_)
                 | DeferredReferences::TypeScriptParameters(_)
         ) {
             self.late_supplemental_start

@@ -43,6 +43,86 @@ fn package_stores_python_direct_function_local_reads() {
     }
 }
 
+const PYTHON_REASSIGNED_LOCAL_SOURCE: &str = concat!(
+    "def reassigned() -> int:\n",
+    "    local = 1\n",
+    "    local = 2\n",
+    "    return local\n",
+    "def outer() -> int:\n",
+    "    local = 9\n",
+    "    def read() -> int:\n",
+    "        return local\n",
+    "    return read()\n",
+    "def nested_scope():\n",
+    "    local = 3\n",
+    "    local = 4\n",
+    "    def read():\n",
+    "        local = 5\n",
+    "        return local\n",
+    "    return local + read()\n",
+    "def removed():\n",
+    "    local = 6\n",
+    "    local = 7\n",
+    "    del local\n",
+    "    return local\n",
+    "def expired():\n",
+    "    local = 8\n",
+    "    local = 9\n",
+    "    try:\n",
+    "        raise ValueError()\n",
+    "    except ValueError as local:\n",
+    "        pass\n",
+    "    return local\n",
+);
+
+#[test]
+fn package_stores_python_reassigned_local_reads_in_their_own_scope() {
+    let source = PYTHON_REASSIGNED_LOCAL_SOURCE;
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let id = |scope| format!("{module}/{scope}");
+    let declarations: Vec<_> = result
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.symbol.as_str() == id("reassigned/local"))
+        .map(|declaration| declaration.range.start)
+        .collect();
+    let start = |anchor| {
+        u64::try_from(source.find(anchor).expect("authored assignment")).expect("byte offset")
+    };
+    assert_eq!(declarations, [start("local = 1"), start("local = 2")]);
+
+    let reads: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local"))
+        .collect();
+    assert_eq!(reads.len(), 3);
+    for (scope, context) in [
+        ("reassigned", "local = 2\n    return local"),
+        ("nested_scope", "return local +"),
+        ("nested_scope/read", "local = 5\n        return local"),
+    ] {
+        let offset = start(context)
+            + u64::try_from(context.rfind("local").expect("written name")).expect("local offset");
+        assert!(
+            reads.iter().any(|edge| {
+                edge.from.as_str() == id(scope)
+                    && edge.to.as_str() == format!("{}/local", id(scope))
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == offset && site.range.end == offset + 5
+                    })
+            }),
+            "{scope} at {offset}"
+        );
+    }
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str() == id("outer")
+            && edge.to.as_str() == id("outer/read")
+    }));
+}
+
 const PYTHON_PARAMETER_SOURCE: &str = concat!(
     "parameter = 9\n",
     "def choose(parameter: int) -> int:\n",

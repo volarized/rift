@@ -42,6 +42,18 @@ impl Name<'_> {
 /// ended is refused, so an import cycle ends.
 type ImportedNames<'source> = BTreeMap<ModuleName<'source>, Name<'source>>;
 
+/// One earlier direct initialization whose scope has other bindings to verify.
+pub(in crate::static_resolution) struct ReassignedLocalRead<'source> {
+    read: ByteRange,
+    target: Target<'source>,
+    scope: Scope,
+}
+
+enum LocalReadScope {
+    Single,
+    Reassigned(Scope),
+}
+
 impl<'source> Index<'source> {
     /// Records direct function-local reads after all earlier reference work.
     pub(in crate::static_resolution) fn python_local_reads(
@@ -50,7 +62,8 @@ impl<'source> Index<'source> {
         work: &mut Work,
         result: &mut StaticResolution,
         parameters: bool,
-    ) {
+    ) -> Vec<ReassignedLocalRead<'source>> {
+        let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
             let target = match file.python_parameters.get(&name) {
                 Some(&Some(symbol)) if parameters => Some(Target {
@@ -61,15 +74,58 @@ impl<'source> Index<'source> {
                 _ => continue,
             };
             if !work.charge() {
+                break;
+            }
+            let Some(target) = target else {
+                continue;
+            };
+            match file.python_local_read_scope(read, name, target, work) {
+                Some(LocalReadScope::Single) => {
+                    self.record_python_local_read(file, read, target, result);
+                }
+                Some(LocalReadScope::Reassigned(scope)) => {
+                    reassigned.push(ReassignedLocalRead {
+                        read,
+                        target,
+                        scope,
+                    });
+                }
+                None => {}
+            }
+        }
+        reassigned
+    }
+
+    /// Records reads of one local variable written by several assignments in its own scope.
+    pub(in crate::static_resolution) fn python_reassigned_local_reads(
+        &self,
+        file: &File<'source>,
+        reads: Vec<ReassignedLocalRead<'source>>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for site in reads {
+            if !work.charge() {
                 return;
             }
-            if let Some(occurrence) = target
-                .and_then(|target| file.python_local_target(read, name, target, work))
-                .and_then(|target| self.python_access(file, read, ReferenceRole::Read, target))
-                .filter(|site| site.edge_from.is_some())
-            {
-                result.record(Some(occurrence));
+            if file.proves_local_reassignment(&site, work) {
+                self.record_python_local_read(file, site.read, site.target, result);
             }
+        }
+    }
+
+    fn record_python_local_read(
+        &self,
+        file: &File<'source>,
+        read: ByteRange,
+        target: Target<'source>,
+        result: &mut StaticResolution,
+    ) {
+        if let Some(occurrence) = self
+            .python_access(file, read, ReferenceRole::Read, target)
+            .filter(|site| site.edge_from.is_some())
+        {
+            result.record(Some(occurrence));
         }
     }
 
@@ -448,6 +504,13 @@ fn imports(binding: &StaticBinding) -> bool {
     )
 }
 
+fn physical_local_binding(binding: &StaticBinding) -> bool {
+    !matches!(
+        binding.kind,
+        StaticBindingKind::PythonGuard { .. } | StaticBindingKind::PythonMemberWrite { .. }
+    )
+}
+
 /// Whether a binding of a function scope declares or imports what it names.
 fn shares(kind: StaticBindingKind) -> bool {
     matches!(
@@ -460,14 +523,14 @@ fn shares(kind: StaticBindingKind) -> bool {
 }
 
 impl<'source> File<'source> {
-    /// The one authored local declaration available to this read in its own function.
-    fn python_local_target(
+    /// The authored local initialization available to this read in its own function.
+    fn python_local_read_scope(
         &self,
         read: ByteRange,
         name: ByteRange,
         target: Target<'source>,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
+    ) -> Option<LocalReadScope> {
         let caller = self.enclosing_callable(read)?;
         let body = caller.symbol.body_range?;
         let item = target.symbol.item_range;
@@ -492,13 +555,7 @@ impl<'source> File<'source> {
         let spelling = self.text(read)?;
         let bindings = self
             .bindings_around(spelling, read)
-            .filter(|binding| {
-                !matches!(
-                    binding.kind,
-                    StaticBindingKind::PythonGuard { .. }
-                        | StaticBindingKind::PythonMemberWrite { .. }
-                )
-            })
+            .filter(|binding| physical_local_binding(binding))
             .collect::<Vec<_>>();
         let ScopeLookup::Found(selected) = self.python_scope(&bindings, read.start, work) else {
             return None;
@@ -512,18 +569,53 @@ impl<'source> File<'source> {
             .into_iter()
             .filter(|binding| Scope::of(self, binding) == scope);
         let binding = local.next()?;
-        if binding.name != name || binding.available_from > read.start || local.next().is_some() {
+        if binding.name != name || binding.available_from > read.start {
             return None;
         }
-        let mut deletions = self
-            .python_deletions
+        if local.next().is_some() {
+            return (!target.symbol.is_python_parameter())
+                .then_some(LocalReadScope::Reassigned(scope));
+        }
+        (!self.local_deleted_before(spelling, scope, read, work)).then_some(LocalReadScope::Single)
+    }
+
+    fn local_deleted_before(
+        &self,
+        spelling: &str,
+        scope: Scope,
+        read: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        self.python_deletions
             .get(&(spelling, scope.range))
             .into_iter()
-            .flatten();
-        if deletions.any(|deletion| !work.charge() || deletion.name.end <= read.start) {
-            return None;
+            .flatten()
+            .any(|deletion| !work.charge() || deletion.name.end <= read.start)
+    }
+
+    fn proves_local_reassignment(
+        &self,
+        site: &ReassignedLocalRead<'source>,
+        work: &mut Work,
+    ) -> bool {
+        let spelling = site.target.symbol.name.as_str();
+        if self.local_deleted_before(spelling, site.scope, site.read, work) {
+            return false;
         }
-        Some(target)
+        self.bindings_around(spelling, site.read).all(|binding| {
+            if !work.charge() {
+                return false;
+            }
+            if !physical_local_binding(binding) || Scope::of(self, binding) != site.scope {
+                return true;
+            }
+            self.target_at(binding.name).is_some_and(|written| {
+                written.symbol.kind == "variable"
+                    && written.symbol.syntax_element_kind == Some("assignment")
+                    && written.symbol.qualified_name == site.target.symbol.qualified_name
+                    && site.scope.range.encloses(written.symbol.item_range)
+            })
+        })
     }
 
     /// The bindings of a name in module statements.
