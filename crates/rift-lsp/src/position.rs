@@ -88,6 +88,12 @@ impl<'text> LineIndex<'text> {
             .fail()
     }
 
+    /// Whether the addressed line contains only its line ending.
+    pub(crate) fn line_is_empty(&self, line: u32) -> bool {
+        self.line_start(line)
+            .is_ok_and(|start| without_ending(self.line_text(line as usize, start)).is_empty())
+    }
+
     /// Converts ordered, non-overlapping positions on one line in a single pass.
     /// The previous pair records the validated character and byte end of the
     /// preceding range, or character zero and the line start on a new line.

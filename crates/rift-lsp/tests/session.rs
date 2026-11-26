@@ -2578,7 +2578,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             "semanticTokensProvider": {
                 "full": true,
                 "legend": {
-                    "tokenTypes": ["parameter", "variable"],
+                    "tokenTypes": ["parameter", "variable", "string"],
                     "tokenModifiers": ["macro", "definition", "declaration"]
                 }
             }
@@ -2603,22 +2603,27 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             json!({"data": [
                 0, 4, 5, 0, 4,
                 0, 6, 4, 1, 5,
+                1, 0, 0, 2, 0,
                 1, 1, 5, 1, 2
             ]}),
         )
         .await;
-    let (id, _) = engine
-        .expect_request("textDocument/semanticTokens/full")
-        .await;
-    engine
-        .respond(
-            &id,
-            json!({"data": [
-                0, 4, 5, 0, 4,
-                0, 3, 4, 1, 2
-            ]}),
-        )
-        .await;
+    for bad_token in [
+        [0, 3, 4, 1, 2], // Overlap with the preceding declaration.
+        [1, 0, 0, 1, 2], // Empty declaration.
+        [1, 0, 0, 2, 2], // Empty string marked as a declaration.
+        [2, 0, 0, 2, 0], // Empty string on a nonempty line.
+        [3, 0, 0, 2, 0], // Empty string outside the source.
+    ] {
+        let (id, _) = engine
+            .expect_request("textDocument/semanticTokens/full")
+            .await;
+        let data = [0, 4, 5, 0, 4]
+            .into_iter()
+            .chain(bad_token)
+            .collect::<Vec<_>>();
+        engine.respond(&id, json!({"data": data})).await;
+    }
     assert_eq!(
         engine.next_message().await["method"],
         "textDocument/didClose"
@@ -2630,7 +2635,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
 
 #[tokio::test]
 async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
-    const SOURCE: &str = "é🪿 alpha beta\n gamma";
+    const SOURCE: &str = "é🪿 alpha beta\r\n\r\n gamma";
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
     let file = path("lib.rs");
@@ -2678,13 +2683,15 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
             ("gamma", rift_lsp::RustDeclarationKind::Local),
         ]
     );
-    assert_eq!(
-        session
-            .rust_declarations(&file, SOURCE)
-            .await
-            .expect("overlap fallback"),
-        None
-    );
+    for _ in 0..5 {
+        assert_eq!(
+            session
+                .rust_declarations(&file, SOURCE)
+                .await
+                .expect("malformed token fallback"),
+            None
+        );
+    }
     session.close(&file).await.expect("close");
     assert_eq!(
         session

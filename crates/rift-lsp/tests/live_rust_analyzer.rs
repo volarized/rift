@@ -340,7 +340,11 @@ async fn rust_analyzer_omits_macro_expansion_calls_from_outgoing_hierarchy() {
 
 #[tokio::test]
 async fn rust_analyzer_reports_authored_bindings_beside_macro_expansion() {
-    const SOURCE: &str = "macro_rules! bind { ($name:ident) => { let $name = 1u8; } }
+    const SOURCE: &str = "pub fn before(prior: u8) -> u8 { prior }
+pub const NOTE: &str = r#\"first
+
+last\"#;
+macro_rules! bind { ($name:ident) => { let $name = 1u8; } }
 pub fn choose(pair: (u8, u8)) -> u8 {
     let (left, right) = pair;
     bind!(expanded);
@@ -380,6 +384,7 @@ pub fn choose(pair: (u8, u8)) -> u8 {
     assert_eq!(
         bindings,
         [
+            ("prior", rift_lsp::RustDeclarationKind::Parameter),
             ("pair", rift_lsp::RustDeclarationKind::Parameter),
             ("left", rift_lsp::RustDeclarationKind::Local),
             ("right", rift_lsp::RustDeclarationKind::Local),

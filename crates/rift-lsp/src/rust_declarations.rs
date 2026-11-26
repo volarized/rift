@@ -125,12 +125,17 @@ impl<'legend> RustTokenLegend<'legend> {
         let mut lines = TokenLines::default();
         let mut tokens = Vec::new();
         for token in data {
-            let range = lines.advance(&index, encoding, token)?;
             let token_type = self.types.get(usize::try_from(token.token_type).ok()?)?;
             let modifiers = token.token_modifiers_bitset;
             if modifiers & !self.all_modifiers != 0 {
                 return None;
             }
+            let blank_string =
+                token.length == 0 && modifiers == 0 && token_type == &SemanticTokenType::STRING;
+            let TokenSpan::Range(range) = lines.advance(&index, encoding, token, blank_string)?
+            else {
+                continue;
+            };
             if modifiers & self.declarations == 0 || modifiers & self.macro_expansion != 0 {
                 continue;
             }
@@ -149,6 +154,11 @@ impl<'legend> RustTokenLegend<'legend> {
     }
 }
 
+enum TokenSpan {
+    Range(SourceRange),
+    BlankString,
+}
+
 #[derive(Default)]
 struct TokenLines {
     line: u32,
@@ -163,7 +173,8 @@ impl TokenLines {
         index: &LineIndex<'_>,
         encoding: PositionEncoding,
         token: &SemanticToken,
-    ) -> Option<SourceRange> {
+        blank_string: bool,
+    ) -> Option<TokenSpan> {
         // Token starts are delta-encoded from the previous start, while the index
         // converts from the previous end so every source character is scanned once.
         let column = if token.delta_line == 0 {
@@ -174,6 +185,15 @@ impl TokenLines {
             self.end_character = 0;
             token.delta_start
         };
+        if blank_string {
+            // The analyzer emits an empty token on an empty line of a multiline
+            // string. Its position still anchors the next token's delta.
+            if column != 0 || self.end_character != 0 || !index.line_is_empty(self.line) {
+                return None;
+            }
+            self.start_character = column;
+            return Some(TokenSpan::BlankString);
+        }
         let end = column.checked_add(token.length)?;
         let (start_byte, end_byte) = index.ordered_range(
             encoding,
@@ -189,5 +209,6 @@ impl TokenLines {
             u64::try_from(end_byte).ok()?,
         )
         .ok()
+        .map(TokenSpan::Range)
     }
 }
