@@ -567,3 +567,103 @@ pub fn choose() -> u8 {
             .all(|row| bounded.edges.contains(row))
     );
 }
+
+#[test]
+fn package_rust_lsp_declarations_add_only_anchored_bindings_under_their_callable() {
+    use crate::{RustLspDeclaration, RustLspDeclarationFile};
+    use rift_core::{FileDigest, SourceRange};
+    use rift_protocol::producer::{FactProducer, ProducerName, ProducerRevision};
+
+    let source = "macro_rules! bind { ($name:ident) => { let $name = 1u8; } }
+pub fn choose(pair: (u8, u8)) -> u8 {
+    let (left, right) = pair;
+    bind!(expanded);
+    left + right + expanded
+}
+";
+    let existing = analyze(source);
+    let file = ProjectPath::new("src/lib.rs").expect("Rust source path");
+    let observations = [
+        ("pair:", 4, true),
+        ("left,", 4, false),
+        ("right)", 5, false),
+        ("expanded);", 8, false),
+        ("left +", 4, false),
+        ("choose(", 6, false),
+    ]
+    .map(|(token, size, parameter)| {
+        let start = position(source, token);
+        RustLspDeclaration {
+            range: SourceRange::new(start, start + size).expect("ranged token"),
+            parameter,
+        }
+    });
+    let producer = FactProducer {
+        name: ProducerName::parse("rust-analyzer").expect("producer"),
+        revision: ProducerRevision::parse("1.0.0").expect("revision"),
+    };
+    let limits = ExactPackageLimits::new(2, 1 << 20);
+    let admit = |base: &mut PackagePublication, digest, limits| {
+        PackageAnalyzer::admit_rust_lsp_declarations(
+            base,
+            &[RustLspDeclarationFile {
+                path: &file,
+                digest,
+                declarations: &observations,
+            }],
+            &producer,
+            limits,
+        )
+        .expect("complete owned binding admission")
+    };
+    let mut augmented = existing.clone();
+    let wrong = admit(&mut augmented, FileDigest::of(b"other bytes"), limits);
+    assert_eq!(wrong.admitted, 0);
+    assert_eq!(augmented, existing);
+    let digest = FileDigest::of(source.as_bytes());
+    assert_eq!(admit(&mut augmented, digest, limits).admitted, 3);
+
+    for token in &observations[..3] {
+        let record = augmented
+            .declarations
+            .iter()
+            .find(|decl| decl.range.start == token.range.start())
+            .expect("exact token declaration");
+        assert_eq!(record.range.end, token.range.end());
+        assert!(!record.public && record.source_complete);
+        let object = augmented
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&record.symbol))
+            .expect("binding object");
+        assert!(
+            object
+                .container
+                .as_ref()
+                .is_some_and(|container| container.as_str().ends_with("/choose"))
+        );
+        assert!(object.document_local);
+        assert_eq!(
+            object.kinds,
+            [if token.parameter {
+                SymbolKind::Parameter
+            } else {
+                SymbolKind::Value
+            }]
+        );
+    }
+    assert_eq!(augmented.edges, existing.edges);
+    assert!(
+        existing
+            .declarations
+            .iter()
+            .all(|row| augmented.declarations.contains(row))
+    );
+    assert_eq!(admit(&mut augmented, digest, limits).admitted, 0);
+    let mut capped = existing.clone();
+    let cap = limits
+        .with_declarations(u32::try_from(existing.declarations.len()).expect("incumbent count"))
+        .expect("incumbent bound");
+    assert_eq!(admit(&mut capped, digest, cap).dropped_at_limit, 3);
+    assert_eq!(capped, existing);
+}
