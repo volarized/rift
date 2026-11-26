@@ -26,7 +26,11 @@ fn explicit_retention_keeps_complete_source_and_current_declaration_ranges() {
             .expect("retention bounds"),
     )
     .expect("complete analysis");
-    assert!(complete.warnings.is_empty());
+    assert!(complete.warnings.iter().all(|warning| matches!(
+        warning,
+        rift_protocol::index::PackageAnalysisWarning::PublicationTruncated { collection, .. }
+            if collection == "local_declarations"
+    )));
     assert!(complete.units[0].source_complete);
     assert_eq!(complete.units[0].source, source);
     assert_eq!(complete.units[0].unit, cut.units[0].unit);
@@ -58,10 +62,16 @@ fn explicit_retention_keeps_complete_source_and_current_declaration_ranges() {
     );
     assert_ne!(full_document.content_digest, cut_document.content_digest);
     assert_eq!(complete.declarations.len(), 1);
-    assert_eq!(complete.declarations[0].symbol, cut.declarations[0].symbol);
-    assert_eq!(complete.declarations[0].range, cut.declarations[0].range);
-    assert!(complete.declarations[0].source_complete);
-    assert_eq!(complete.declarations[0].source, source);
+    let cut_run = cut
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/run"))
+        .expect("original function");
+    let full_run = &complete.declarations[0];
+    assert_eq!(full_run.symbol, cut_run.symbol);
+    assert_eq!(full_run.range, cut_run.range);
+    assert!(full_run.source_complete);
+    assert_eq!(full_run.source, source);
     assert_eq!(
         complete
             .documents

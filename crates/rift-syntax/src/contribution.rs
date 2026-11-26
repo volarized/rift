@@ -33,6 +33,7 @@ pub struct PackageBindingSlots {
     javascript_callback_parameter: usize,
     typescript_overload_parameter: usize,
     typescript_method_parameter: usize,
+    rust_library_root: usize,
 }
 
 impl PackageBindingSlots {
@@ -59,6 +60,7 @@ impl PackageBindingSlots {
             javascript_callback_parameter: 0,
             typescript_overload_parameter: 0,
             typescript_method_parameter: 0,
+            rust_library_root: 0,
         }
     }
 
@@ -132,6 +134,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves an additional slot for the authored Cargo library root.
+    #[must_use]
+    pub const fn with_rust_library_root(mut self, rust_library_root: usize) -> Self {
+        self.rust_library_root = rust_library_root;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -149,6 +158,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_method_parameter)
             .saturating_add(self.javascript_callback_parameter)
             .saturating_add(self.typescript_overload_parameter)
+            .saturating_add(self.rust_library_root)
     }
 
     fn admit(
@@ -189,6 +199,8 @@ impl PackageBindingSlots {
             }
         } else if symbol.is_rust_receiver_binding() {
             &mut self.rust_receiver
+        } else if symbol.is_rust_library_root() {
+            &mut self.rust_library_root
         } else if symbol.is_rust_generic_parameter() {
             &mut self.rust_generic
         } else if symbol.is_rust_parameter_binding() {

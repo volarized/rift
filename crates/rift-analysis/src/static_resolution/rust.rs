@@ -764,7 +764,7 @@ impl<'source> Namespaces<'source> {
             inline: Vec::new(),
         };
         for symbol in file.document.facts.symbols() {
-            if symbol.is_rust_local_binding() {
+            if symbol.is_rust_local_binding() || symbol.is_rust_library_root() {
                 continue;
             }
             if !work.charge() {

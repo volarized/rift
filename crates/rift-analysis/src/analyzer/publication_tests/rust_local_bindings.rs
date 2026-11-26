@@ -9,6 +9,8 @@ use rift_syntax::ShippedLanguage;
 use super::fixture;
 use crate::{ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageSource};
 
+const ROOT: &str = "rift://symbol/cargo/crates.io/beacon/rust/beacon";
+
 fn analyze(source: &str) -> PackagePublication {
     analyze_with_limits(source, ExactPackageLimits::new(2, 1 << 20))
 }
@@ -172,13 +174,13 @@ fn package_rust_let_does_not_displace_older_declarations_or_edges() {
     let declarations = full
         .declarations
         .iter()
-        .filter(|row| row.symbol != local)
+        .filter(|row| row.symbol != local && row.symbol.as_str() != ROOT)
         .cloned()
         .collect::<Vec<_>>();
     let edges = full
         .edges
         .iter()
-        .filter(|row| row.to != local && row.from != local)
+        .filter(|row| row.to != local && row.from != local && row.from.as_str() != ROOT)
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(edges.len(), 128);
@@ -424,16 +426,22 @@ impl Counter {{
     let declarations = full
         .declarations
         .iter()
-        .filter(|row| &row.symbol != receiver)
+        .filter(|row| &row.symbol != receiver && row.symbol.as_str() != ROOT)
         .cloned()
         .collect::<Vec<_>>();
     let edges = full
         .edges
         .iter()
-        .filter(|edge| &edge.to != receiver && &edge.from != receiver)
+        .filter(|edge| &edge.to != receiver && &edge.from != receiver && edge.from.as_str() != ROOT)
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(full.edges.len(), edges.len() + 2);
+    assert_eq!(
+        full.edges
+            .iter()
+            .filter(|edge| &edge.to == receiver)
+            .count(),
+        2
+    );
     let no_declaration_room = analyze_with_limits(
         source,
         ExactPackageLimits::new(2, 1 << 20)

@@ -123,7 +123,10 @@ impl AnalyzedFile {
 
     /// The grammar kind of the item syntax element of the declaration bound at `range`; absent when
     /// the syntax provider names none.
-    fn item_kind(&self, range: rift_core::SourceRange) -> Option<String> {
+    fn item_kind(&self, range: rift_core::SourceRange, qualified_name: &str) -> Option<String> {
+        if qualified_name == "." && self.file.syntax().language().name == "rust" {
+            return Some("source_file".to_owned());
+        }
         let key = (range.start(), range.end());
         self.item_kinds.get(&key).map(|kind| (*kind).to_owned())
     }
@@ -498,6 +501,7 @@ fn binding_capacity(
     let mut rust_parameters = BindingDemand::default();
     let mut rust_receivers = BindingDemand::default();
     let mut rust_generics = BindingDemand::default();
+    let mut rust_library = BindingDemand::default();
     let mut python_parameters = BindingDemand::default();
     let mut typescript_parameters = BindingDemand::default();
     let mut python_receivers = BindingDemand::default();
@@ -558,6 +562,8 @@ fn binding_capacity(
                 }
             } else if symbol.is_rust_receiver_binding() {
                 &mut rust_receivers
+            } else if symbol.is_rust_library_root() {
+                &mut rust_library
             } else if symbol.is_rust_generic_parameter() {
                 &mut rust_generics
             } else if symbol.is_rust_parameter_binding() {
@@ -591,7 +597,8 @@ fn binding_capacity(
         + callback_parameters.count
         + overload_parameters.count
         + rust_receivers.count
-        + rust_generics.count;
+        + rust_generics.count
+        + rust_library.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -607,6 +614,7 @@ fn binding_capacity(
         typescript_method_parameters.reserve(&mut slots, &mut bytes, record);
     let rust_receiver_slots = rust_receivers.reserve(&mut slots, &mut bytes, record);
     let rust_generic_slots = rust_generics.reserve(&mut slots, &mut bytes, record);
+    let root_slot = rust_library.reserve(&mut slots, &mut bytes, record);
     let (callback_slots, overload_slots) = reserve_scoped_parameters(
         documents,
         &callback_parameters,
@@ -625,6 +633,7 @@ fn binding_capacity(
         )
         .with_rust_receivers(rust_receiver_slots)
         .with_rust_generics(rust_generic_slots)
+        .with_rust_library_root(root_slot)
         .with_python_receiver_slots(python_receiver_slots)
         .with_python_loop_binding_slots(python_loop_binding_slots)
         .with_python_variadic_parameter_slots(python_variadic_slots)
@@ -783,6 +792,7 @@ fn place_namespace(
             && path == held.file.path().as_str()
         {
             assigned.insert(".".to_owned(), root.clone());
+            place_rust_library_root(held, root);
         }
         held.placement = held
             .placement
@@ -876,6 +886,31 @@ fn complete_module_bytes(file: &AnalyzedFile, maximum: u64) -> Option<u64> {
         && syntax.primary_symbols_len() > 0
         && source <= maximum)
         .then_some(source)
+}
+
+fn place_rust_library_root(held: &mut AnalyzedFile, root: &CoreSymbolId) {
+    let Ok(identity) = SymbolIdentity::parse(root.as_str()) else {
+        return;
+    };
+    let [name] = identity.qualified_path() else {
+        return;
+    };
+    let source = held.file.source();
+    let Some(syntax) = held
+        .file
+        .syntax()
+        .clone()
+        .with_rust_library_root(name, source)
+    else {
+        return;
+    };
+    held.file = IndexedFile::new_with_shared_syntax(
+        held.file.path().clone(),
+        std::sync::Arc::clone(held.file.source_content()),
+        held.file.digest(),
+        held.file.executable(),
+        std::sync::Arc::new(syntax),
+    );
 }
 
 /// Renders the canonical publication over the analyzed files.
@@ -1640,6 +1675,9 @@ fn package_declarations<'declaration>(
 ) -> Result<Vec<DocumentationDeclaration<'declaration>>, RiftError> {
     let mut bindings = BTreeMap::new();
     for record in semantics.graph().records() {
+        let Some(id) = record.identity() else {
+            continue;
+        };
         for key in record.contributions() {
             let Some(contribution) = semantics.graph().contribution(key) else {
                 continue;
@@ -1649,6 +1687,7 @@ fn package_declarations<'declaration>(
             };
             bindings.insert(
                 (
+                    id.as_str(),
                     binding.unit().to_string(),
                     binding.range().start(),
                     binding.range().end(),
@@ -1661,6 +1700,7 @@ fn package_declarations<'declaration>(
     for declaration in &records.declarations {
         let facts = bindings
             .get(&(
+                declaration.symbol.as_str(),
                 declaration.unit.0.clone(),
                 declaration.range.start,
                 declaration.range.end,
@@ -2646,7 +2686,7 @@ impl Records {
                 start: binding.range().start(),
                 end: binding.range().end(),
             },
-            syntax_element_kind: held.item_kind(binding.range()),
+            syntax_element_kind: held.item_kind(binding.range(), facts.qualified_name()),
             line: line_of(starts, binding.range().start()),
             signature_indices: fact_indices(owner, &object.signatures, facts.signatures_slice())?,
             type_indices: fact_indices(owner, &object.types, facts.type_bindings())?,
@@ -3687,7 +3727,7 @@ mod tests {
             .iter()
             .map(|symbol| symbol.name.as_str())
             .collect();
-        assert_eq!(named, ["hidden", "spawn"]);
+        assert_eq!(named, ["beacon", "hidden", "spawn"]);
         let public: Vec<&str> = publication
             .objects
             .iter()
@@ -3716,7 +3756,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            [Some("function_item"), Some("function_item")],
+            [
+                Some("source_file"),
+                Some("function_item"),
+                Some("function_item")
+            ],
             "each declaration names its item syntax element's grammar kind"
         );
     }
@@ -4400,7 +4444,7 @@ class _Private:
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file().path().as_str(), "src/lib.rs");
         assert!(files[0].is_public("spawn"));
-        assert_eq!(analysis.publication().objects.len(), 1);
+        assert_eq!(analysis.publication().objects.len(), 2);
     }
 
     #[test]

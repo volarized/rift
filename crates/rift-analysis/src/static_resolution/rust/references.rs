@@ -30,7 +30,10 @@ impl<'source> Index<'source> {
     ) {
         let mut locals = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
-            if symbol.is_rust_receiver_binding() || symbol.is_rust_generic_parameter() {
+            if symbol.is_rust_receiver_binding()
+                || symbol.is_rust_generic_parameter()
+                || symbol.is_rust_library_root()
+            {
                 continue;
             }
             if !work.charge() {
@@ -216,6 +219,48 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Retains containment from the selected Cargo file to its authored items.
+    pub(in crate::static_resolution) fn resolve_rust_library_root(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            let Some(root) = file.rust_library_root else {
+                continue;
+            };
+            let from = Target {
+                file: file.document,
+                symbol: root,
+            };
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    break;
+                }
+                if symbol.container.is_some()
+                    || symbol.is_package_binding()
+                    || symbol.kind == "impl_item"
+                {
+                    continue;
+                }
+                let Some(name) = symbol.name_range else {
+                    continue;
+                };
+                let to = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if let Some(edge) = self.rust_edge(file, name, EdgeKind::Contains, from, to) {
+                    result.record(Some(edge));
+                }
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_library_root_start = Some(start);
+        }
+    }
+
     /// Reads the module and type tokens written before a qualified callee's final name.
     pub(in crate::static_resolution) fn rust_call_qualifiers(
         &self,
@@ -388,7 +433,7 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for symbol in file.document.facts.symbols() {
-            if symbol.is_rust_local_binding() {
+            if symbol.is_rust_local_binding() || symbol.is_rust_library_root() {
                 continue;
             }
             if !work.charge() {

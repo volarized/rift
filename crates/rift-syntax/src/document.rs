@@ -185,10 +185,19 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::OVERLOAD_PARAMETER_KIND
     }
 
+    /// Whether this is a selected Cargo library's physical source root.
+    #[must_use]
+    pub fn is_rust_library_root(&self) -> bool {
+        self.kind == "module"
+            && self.qualified_name == "."
+            && self.syntax_element_kind == Some("source_file")
+    }
+
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
         self.is_rust_local_binding()
+            || self.is_rust_library_root()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
             || self.is_ecmascript_parameter()
@@ -736,6 +745,49 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Adds the source-file declaration of a library established by its Cargo manifest.
+    ///
+    /// The caller supplies the selected crate name. The retained Rust facts must match
+    /// the complete source bytes and hold no parse error or omitted declaration.
+    #[must_use]
+    pub fn with_rust_library_root(mut self, name: &str, source: &str) -> Option<Self> {
+        if self.language.name != "rust"
+            || self.has_errors
+            || self.left_out_declaration_count() != 0
+            || self.source_digest != Some(FileDigest::of(source.as_bytes()))
+            || !is_portable_name(name)
+        {
+            return None;
+        }
+        let range = ByteRange {
+            start: 0,
+            end: u64::try_from(source.len()).ok()?,
+        };
+        self.symbols.insert(
+            0,
+            SyntaxSymbol {
+                declaration_ordinal: 0,
+                qualified_name: ".".to_owned(),
+                container: None,
+                name: name.to_owned(),
+                kind: "module",
+                syntax_element_kind: Some("source_file"),
+                kinds: vec![SymbolKind::Module],
+                visibility: None,
+                range,
+                item_range: range,
+                name_range: None,
+                body_range: Some(range),
+                signatures: Arc::from([]),
+                documentation: Arc::from([]),
+                documentation_ranges: Vec::new(),
+                module_path: None,
+                python_overload: None,
+            },
+        );
+        Some(self)
+    }
+
     /// Returns captured source-based name-resolution evidence, when recorded.
     #[must_use]
     pub const fn static_facts(&self) -> Option<&crate::StaticFacts> {
