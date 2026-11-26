@@ -56,10 +56,14 @@ impl<'source> Index<'source> {
             (None, Some(_)) => None,
         };
         for symbol in [holder, callable].into_iter().flatten() {
-            let identity = self.javascript_identity(Target {
+            let target = Target {
                 file: file.document,
                 symbol,
-            });
+            };
+            if target.is_scoped_javascript_lexical_binding() {
+                continue;
+            }
+            let identity = self.javascript_identity(target);
             if identity.is_some() {
                 return identity;
             }
@@ -184,6 +188,12 @@ impl<'source> Index<'source> {
                     .record_external_typescript_type_use(file, reference.target, work, result)
                     .is_some()
             {
+                continue;
+            }
+            if target.is_some_and(Target::is_scoped_javascript_lexical_binding)
+                && let Some(occurrence) = occurrence
+            {
+                result.deferred_scoped_javascript_lexical.push(occurrence);
                 continue;
             }
             if occurrence.is_none() && reference.role == ReferenceRole::Read {
@@ -366,14 +376,16 @@ impl<'source> Index<'source> {
             if let Some(from) = from {
                 let occurrence =
                     self.javascript_declaration_edge(file, target, from, EdgeKind::Contains);
-                match (
-                    target.is_physical_only_javascript_package_symbol(),
-                    occurrence,
-                ) {
-                    (true, Some(occurrence)) => {
+                if let Some(occurrence) = occurrence {
+                    if target.is_scoped_javascript_lexical_binding() {
+                        result.deferred_scoped_javascript_lexical.push(occurrence);
+                    } else if target.is_physical_only_javascript_package_symbol() {
                         result.deferred_literal_containment.push(occurrence);
+                    } else {
+                        result.record(Some(occurrence));
                     }
-                    (_, occurrence) => result.record(occurrence),
+                } else {
+                    result.record(None);
                 }
             }
             if matches!(symbol.kind, "method" | "property" | "field") {
@@ -921,6 +933,13 @@ impl<'source> Index<'source> {
 }
 
 impl Target<'_> {
+    /// A lexical variable added by the package's file module scope pass.
+    fn is_scoped_javascript_lexical_binding(self) -> bool {
+        self.symbol.kind == "variable"
+            && self.symbol.syntax_element_kind == Some("variable_declarator")
+            && self.is_physical_only_javascript_package_symbol()
+    }
+
     /// Package declarations admitted through a physical scope with no shared name anchor.
     pub(super) fn is_physical_only_javascript_package_symbol(self) -> bool {
         let placement = self.file.placement;

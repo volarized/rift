@@ -83,17 +83,18 @@ pub(super) fn prepare(
         let mut anchors = declaration_anchors(input, file, Some(&module));
         let scopes = scopes::FileScopes::new(file.syntax, file.source);
         let withheld = scopes.repeated_names(file);
-        let literal_properties = scopes.literal_properties(file, &withheld, &anchors);
+        let mut physical = scopes.literal_properties(file, &withheld, &anchors);
+        physical.extend(scopes.withheld_lexical_bindings(file, &withheld, &anchors));
         anchors.retain(|name, _| {
             ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
         });
         if prepare_anchors(input, file, &module, anchors, prepared) {
-            if !literal_properties.is_empty() {
+            if !physical.is_empty() {
                 prepared
                     .scoped_anchors
                     .entry(path.to_owned())
                     .or_default()
-                    .extend(literal_properties);
+                    .extend(physical);
             }
             modules.insert((language.name.clone(), module), Some(path.to_owned()));
             if metadata.exports.is_some() || script {

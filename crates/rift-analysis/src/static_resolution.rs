@@ -128,6 +128,10 @@ pub(crate) struct StaticResolution {
     pub(crate) scoped_javascript_function_start: Option<usize>,
     /// Reads of scoped JavaScript parameters awaiting capacity after earlier facts.
     pub(crate) deferred_scoped_javascript_parameters: Vec<StaticOccurrence>,
+    /// First occurrence of a private binding with only a physical scope anchor.
+    pub(crate) scoped_javascript_lexical_start: Option<usize>,
+    /// Occurrences of separately anchored private bindings after earlier facts.
+    pub(crate) deferred_scoped_javascript_lexical: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -276,6 +280,10 @@ fn resolve_by<'source>(
     resolution.scoped_javascript_function_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_scoped_javascript_parameters,
+    );
+    resolution.scoped_javascript_lexical_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_scoped_javascript_lexical,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -2766,6 +2774,8 @@ impl StaticResolution {
         self.occurrences.append(&mut apart.occurrences);
         self.deferred_literal_containment
             .append(&mut apart.deferred_literal_containment);
+        self.deferred_scoped_javascript_lexical
+            .append(&mut apart.deferred_scoped_javascript_lexical);
         self.external.append(&mut apart.external);
         self.rust_extern_candidates
             .append(&mut apart.rust_extern_candidates);

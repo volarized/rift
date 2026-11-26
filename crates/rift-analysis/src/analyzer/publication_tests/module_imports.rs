@@ -2302,3 +2302,110 @@ fn javascript_scoped_function_parameters_use_their_established_owner() {
         assert_eq!(site.range, module_runtime_range(read_start, "key"));
     }
 }
+
+#[test]
+fn non_entry_javascript_lexical_bindings_keep_their_physical_scope() {
+    const SOURCE: &str = concat!(
+        "export function choose(flag) {\n",
+        "  if (flag) { const result = 1; return result; }\n",
+        "  { const result = 2; return result; }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid physical declarations and reads");
+    let held = analysis
+        .files()
+        .iter()
+        .find(|file| file.file().path().as_str() == "reader.mjs")
+        .expect("retained module");
+    assert!(held.placement().logical_identity("choose.result").is_none());
+    let unit = &found
+        .units
+        .iter()
+        .find(|row| row.path.0 == "reader.mjs")
+        .expect("physical unit")
+        .unit;
+    let bindings = ["result = 1", "result = 2"].map(|spelling| {
+        let start = SOURCE.find(spelling).expect("variable declaration");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                &row.unit == unit
+                    && row.range == module_runtime_range(start, spelling)
+                    && row.source == spelling
+            })
+            .expect("physical lexical declaration");
+        assert!(!declaration.public);
+        let read_start = SOURCE[start..]
+            .find("return result")
+            .expect("authored read")
+            + start
+            + 7;
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read for {spelling}");
+        };
+        let site = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(site.unit, declaration.unit);
+        assert_eq!(site.range, module_runtime_range(read_start, "result"));
+        declaration.symbol.clone()
+    });
+    assert_ne!(bindings[0], bindings[1]);
+
+    let primary = found
+        .edges
+        .iter()
+        .filter(|edge| !bindings.contains(&edge.to))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!primary.is_empty());
+    // A module-level name cannot be treated as a second private lexical scope.
+    let module_scope = concat!(
+        "const external = 8;\n",
+        "run(() => { const external = 1; return external; });\n",
+    );
+    let without_override = non_entry_lexical_binding_analysis(module_scope, 64);
+    let rows = &without_override.publication().declarations;
+    assert!(rows.iter().all(|row| row.source != "external = 1"));
+
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    let bounded = bounded.publication();
+    assert!(bounded.edges.iter().all(|edge| primary.contains(edge)));
+    assert_eq!(bounded.declarations, found.declarations);
+}
+
+fn non_entry_lexical_binding_analysis(source: &str, edge_cap: usize) -> PackageAnalysis {
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let entry = ProjectPath::new("index.mjs").expect("entry");
+    let reader = ProjectPath::new("reader.mjs").expect("non-entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let files = [
+        PackageSource::new(&entry, "export const ready = true;"),
+        PackageSource::new(&reader, source),
+    ];
+    let context = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let limits = ExactPackageLimits::new(3, 4096)
+        .with_edges(edge_cap)
+        .expect("edge cap");
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+        .expect("checked source files")
+        .with_framework_context(&context, &[])
+        .expect("npm manifest");
+    PackageAnalyzer::analyze(input, 1).expect("validated publication")
+}

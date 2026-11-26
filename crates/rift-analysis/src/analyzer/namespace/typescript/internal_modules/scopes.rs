@@ -74,7 +74,13 @@ pub(in crate::analyzer::namespace::typescript) fn private_local_identities(
     let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
     let mut identities_by_name = BTreeMap::new();
     for (name, declarations) in named {
-        let Some(groups) = scopes.private_local_groups(file, &declarations) else {
+        if !declarations
+            .iter()
+            .all(|symbol| private_local_declaration(symbol))
+        {
+            continue;
+        }
+        let Some(groups) = scopes.lexical_groups(file, &declarations) else {
             continue;
         };
         let Some(first) = anchors.get(name) else {
@@ -452,16 +458,68 @@ impl<'source> FileScopes<'source> {
         .then_some((scope, body))
     }
 
-    fn private_local_groups(
+    /// Names distinct private lexical declarations that the file module cannot share.
+    pub(super) fn withheld_lexical_bindings(
+        &self,
+        file: &SelectedFile<'_>,
+        withheld: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+    ) -> ScopedIdentityAnchors {
+        if file.syntax.language().name != "javascript"
+            || file.syntax.has_errors()
+            || file.syntax.left_out_declaration_count() != 0
+        {
+            return BTreeMap::new();
+        }
+        let mut groups = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
+        for symbol in file.syntax.symbols() {
+            let name = symbol.qualified_name.as_str();
+            if withheld.contains(name) && anchors.contains_key(name) {
+                groups.entry(name).or_default().push(symbol);
+            }
+        }
+        groups
+            .into_iter()
+            .filter_map(|(name, declarations)| {
+                if !declarations.iter().all(|symbol| {
+                    symbol.kind == "variable"
+                        && symbol.syntax_element_kind == Some("variable_declarator")
+                        && !symbol.kinds.contains(&SymbolKind::Public)
+                        && !symbol.kinds.contains(&SymbolKind::Callable)
+                        && symbol.container.as_deref().is_none_or(|container| {
+                            anchors.contains_key(container)
+                                && !super::super::conflicting_assignment_name(container, withheld)
+                        })
+                }) {
+                    return None;
+                }
+                let original = anchors.get(name)?;
+                let groups = self.lexical_groups(file, &declarations)?;
+                if groups.len() < 2 {
+                    return None;
+                }
+                let mut exact = BTreeMap::new();
+                for ordinals in groups {
+                    let ordinal = ordinals.first().copied()?;
+                    let identity = local_group_identity(original, ordinal)?;
+                    exact.extend(
+                        ordinals
+                            .into_iter()
+                            .map(|ordinal| (ordinal, identity.clone())),
+                    );
+                }
+                Some((name.to_owned(), exact))
+            })
+            .collect()
+    }
+
+    fn lexical_groups(
         &self,
         file: &SelectedFile<'_>,
         declarations: &[&SyntaxSymbol],
     ) -> Option<Vec<Vec<usize>>> {
         let mut groups = BTreeMap::<ByteRange, Vec<usize>>::new();
         for &symbol in declarations {
-            if !private_local_declaration(symbol) {
-                return None;
-            }
             let captured = *self.bound.get(&symbol.name_range?)?;
             let scope = self.lexical(symbol, file.source);
             if captured != scope || scope == self.source {
