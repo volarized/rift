@@ -83,6 +83,10 @@ name = "configuration_admission"
 path = "tests/configuration_admission.rs"
 
 [[test]]
+name = "docs_examples"
+path = "tests/docs_examples.rs"
+
+[[test]]
 name = "documentation_selection"
 path = "tests/documentation_selection.rs"
 

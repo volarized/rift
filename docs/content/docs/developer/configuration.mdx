@@ -7,7 +7,7 @@ title: Configuration
 Rift reads `rift.toml` from the workspace root. The generated
 [`rift.schema.json`](https://volar.sh/rift/rift.schema.json)
 defines the file and rejects any key it doesn't know, so a typo fails at load rather than being
-silently ignored. Changes take effect for later requests once validation passes; while the file is
+silently ignored. Changes take effect for later requests once validation passes. While the file is
 invalid, requests fail with `configuration_invalid` until you fix it.
 
 An editor that supports TOML schema directives can load the generated schema:
@@ -19,10 +19,10 @@ An editor that supports TOML schema directives can load the generated schema:
 Treat `rift.toml` as executable workspace configuration: a selected LSP process starts with
 the server's OS permissions on its first request. Inspect the file before running Rift in a cloned repository.
 
-Each section states its defaults below its example. Durations take `ms`, `s`, `m`, `h`, or `d`;
-byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
+Each section states its defaults below its example. Durations take `ms`, `s`, `m`, `h`, or `d`.
+Byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
 The collection settings keep the existing defaults and collection algorithms. Their examples
-show those defaults; the stated ranges are the supported bounds, so a limit can be lowered or
+show those defaults. The stated ranges are the supported bounds, so a limit can be lowered or
 raised within its range. A value outside that range fails configuration validation.
 
 ## Environment variables
@@ -39,10 +39,10 @@ its members joined by `_` and uppercased. `[providers.syntax] max_syntax_element
 RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS=5000000 RIFT_PROVIDERS_SYNTAX_MAX_FILE=16mb rift server start
 ```
 
-- a variable's value replaces the file's value for its key; a key no variable names keeps the
+- a variable's value replaces the file's value for its key. A key no variable names keeps the
   file's value, or its default
 - a key that takes text, such as a size or a duration, takes the value as written, such as
-  `16mb`; any other key takes one TOML value, such as `5000000`, `true`, or `["vendor/**"]`
+  `16mb`. Any other key takes one TOML value, such as `5000000`, `true`, or `["vendor/**"]`
 - the merged configuration passes the same checks the file does, so a value outside its range
   fails with `configuration_invalid` naming the variable
 - a variable that starts with a table's prefix, such as `RIFT_PROVIDERS_`, and names none of its
@@ -83,14 +83,14 @@ readiness_timeout = "30s"
   expires, the request fails with `temporarily_unavailable` and the client can retry without
   stacking another waiter
 - `idle_timeout` stops the server once no request remains active and that span has passed after
-  the last response completed, 1s to 1d; the next `rift mcp` or `rift server start` brings it back
+  the last response completed, 1s to 1d. The next `rift mcp` or `rift server start` brings it back
 - `readiness_timeout` bounds one request's waiting, 1s to 1h. A read takes the deadline once,
   where it enters. Workspace index validation and language-engine reference waits spend what is
   left of that one budget. A search that meets a pending lexical commit returns identifier
   matching with `lexical_ranking_unavailable` instead of waiting for the transaction
-- `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
-  port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
-  two keys exclude each other
+- `port` pins the exact loopback port, 1024 or above. When `port` is omitted, the server picks
+  the first free port from `port_range`, which defaults to `{ min = 12000, max = 13000 }`.
+  The two keys exclude each other.
 
 The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later
@@ -118,14 +118,14 @@ workspaces = 16
   rebuild running when that interval ends. An unchanged check without a recorded failure queues
   no rebuild.
 - `version_control_timeout` bounds the wait for the worktree's Git `index.lock`, 1ms to 30s.
-  A lock retained past the bound is passed and named in the log; the server leaves the lock in place.
+  A lock retained past the bound is passed and named in the log. The server leaves the lock in place.
 - `workspaces` caps the workspaces retained by one repository process, 1 to 64.
-  A new workspace is refused once that limit is reached; concurrent admission waits within
+  A new workspace is refused once that limit is reached. Concurrent admission waits within
   `worker_queue_timeout` for an available worker.
 
 An explicitly started repository server accepts its `[server]` table from the main Git worktree,
 including environment overrides. A workspace uses that process only when its accepted table
-matches those startup settings; conflicting keys are logged, and the proxy starts a workspace server.
+matches those startup settings. Conflicting keys are logged, and the proxy starts a workspace server.
 
 A missing, bare, removed, or unreadable main worktree, or invalid main-worktree configuration,
 also selects a workspace server. Existing connections retain their startup settings until restart.
@@ -150,7 +150,7 @@ stall_delay = "10s"
 stderr_limit = "1mb"
 ```
 
-- `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
+- `retention_records` caps the records the store keeps, 100 to 1000000. A write past the cap
   drops the oldest records first
 - `queue_records` caps the records each log subscription holds, 1 to 65536. A full
   subscription drops and counts excess records independently of other subscriptions
@@ -169,7 +169,7 @@ stderr_limit = "1mb"
   keeps for as long as it runs is never reported
 - `stderr_limit` <VersionBadge version="v0.0.62" inline /> is how many bytes a foreground server writes to a standard error that
   is not a terminal, 1kb to 1gb. Past it the server prints one notice there and discards the
-  rest, counting the discarded bytes in `log.stderr.discarded`; the store keeps every record
+  rest, counting the discarded bytes in `log.stderr.discarded`. The store keeps every record
   `capture` admits either way. The server's stop records the count as
   `standard error bytes discarded`
 
@@ -226,7 +226,7 @@ rules, spending the same `files` budget as the first walk.
 
 `files` bounds how many files the index holds, 1000 to 5000000, and `workspace_size` bounds the
 bytes they hold together, 16mb to 64gb. The server refuses to index a workspace past either bound
-and names the key in the refusal; a change to either key rebuilds the index, as a change to
+and names the key in the refusal. A change to either key rebuilds the index, as a change to
 `include`, `exclude`, or `force_include` does.
 
 `declarations` bounds how many declarations those files publish together, 10000 to 50000000.
@@ -237,7 +237,7 @@ Rift is tested against - raise it on a machine with memory to spare, lower it on
 
 `edges` bounds edges retained together, 1 to 500000000. The index keeps the
 edges that fit and counts the omitted edges. `directory_depth` bounds the directory levels scanned
-below the workspace root, 1 to 4096; a deeper directory refuses the rebuild naming this key.
+below the workspace root, 1 to 4096. A deeper directory refuses the rebuild naming this key.
 
 `source` shapes what the index walks: a file it excludes stops reaching `search` and
 [`get_symbol`](/docs/mcp#tool-get_symbol) results. A single `search` request can still
@@ -284,10 +284,10 @@ max_layer_blocks = 2000000
 max_mappings = 6000000
 ```
 
-- `enabled` defaults to `true`; `false` collects no documentation file, while the documentation
+- `enabled` defaults to `true`. `false` collects no documentation file, while the documentation
   comments attached to declarations stay
 - `exclude` leaves out what its globs match beside the default exclusions, at most 512 patterns
-- `force_include` collects what a default exclusion leaves out, at most 512 patterns; a match
+- `force_include` collects what a default exclusion leaves out, at most 512 patterns. A match
   `exclude` also names stays out
 
 The patterns match project-relative paths the way [`[source]`](#source) patterns do. A workspace
@@ -301,13 +301,13 @@ force_include = ["CHANGELOG.md"]
 The collection bounds apply to local documentation and exact-package documentation:
 
 - `max_sources` caps selected sources, 1 to 5000000
-- `max_file` caps one source's bytes, 1b to 64mb; `max_total` caps their bytes together, 1b to 64gb
+- `max_file` caps one source's bytes, 1b to 64mb. `max_total` caps their bytes together, 1b to 64gb
 - `max_blocks` caps retained blocks, 1 to 50000000
 - `max_references` caps each collection's links, fragments, and reference candidates, 1 to 50000000
 - `max_text` caps one heading, language, destination, or reference spelling, 1b to 1mb
 - `max_heading_depth` caps a block's heading path and heading levels, 1 to 65536
 - `max_warnings` caps retained collection warnings, 1 to 65536
-- `max_syntax_elements` caps a documentation parser's syntax elements, 1 to 100000000; `max_depth` caps its
+- `max_syntax_elements` caps a documentation parser's syntax elements, 1 to 100000000. `max_depth` caps its
   nesting, 1 to 65536
 - `max_progress` caps one reStructuredText parser's progress callbacks, 1 to 4294967295
 - `max_layer_blocks` caps blocks held across a documentation layer's collections, 1 to 100000000
@@ -322,7 +322,7 @@ names of the headings above it, so `max_text` bounds them together. A selected-s
 use the declaration syntax pass, whose parsing bounds come from [`[providers.syntax]`](#providers).
 
 A documentation layer maps ranking identities to their documentation blocks. Its block and mapping
-bounds apply when the index builds that layer; an accepted configuration change also changes the
+bounds apply when the index builds that layer. An accepted configuration change also changes the
 keys used to reuse cached parser facts.
 
 Collection bounds do not change the exact-symbol response shape: documentation context returns at
@@ -356,12 +356,12 @@ command_timeout = "2m"
 
 - `resolution` selects whether a standard library version probe runs: `auto` runs
   `rustc --version`, and `node --version` when no Node.js pin names a version, in the workspace
-  root; `static` runs no program, so every version comes from the pins and project files alone,
+  root. `static` runs no program, so every version comes from the pins and project files alone,
   or goes out as the requirement `>=0`
 - `packages` names packages beside the ones the workspace's manifests and lockfiles state, at
   most 20000 of them. Each entry carries `manager`, `name`, and exactly one of `version` and
-  `requirement`; an entry naming both, or neither, is refused
-- `command_timeout` bounds one version probe, 1s to 1h; a probe past it is killed and the entry
+  `requirement`. An entry naming both, or neither, is refused
+- `command_timeout` bounds one version probe, 1s to 1h. A probe past it is killed and the entry
   goes out with its static reading
 
 A configured entry looks like this:
@@ -398,7 +398,7 @@ nesting_depth = 32
 
 - `lockfile_size` caps one manifest or lockfile read, 1b to 64mb
 - `toolchain_output` caps retained bytes from each version probe stream, 1b to 1mb
-- `manifests` caps manifests read by one resolver, 1 to 4096; ancestor comparisons take at most
+- `manifests` caps manifests read by one resolver, 1 to 4096. Ancestor comparisons take at most
   `manifests` squared work
 - `packages` caps packages held in one dependency context, 1 to 20000, within the global API's
   package bound
@@ -415,8 +415,8 @@ the other dependency keys.
 ## Package collection
 
 Exact-package collection separates input and parsing bounds from publication capacity.
-[`[source]`](#source) bounds selected files, source bytes, declarations, and edges;
-[`[providers.syntax]`](#providers) bounds each syntax parse; [`[documentation]`](#documentation)
+[`[source]`](#source) bounds selected files, source bytes, declarations, and edges.
+[`[providers.syntax]`](#providers) bounds each syntax parse. [`[documentation]`](#documentation)
 bounds collected documentation. `[package]` bounds the records that analysis publishes:
 
 ```toml
@@ -437,11 +437,11 @@ retained_source = "1mb"
 - `retained_source` caps source bytes retained per record, 1b to 64mb. Analysis cuts larger source
   at a UTF-8 boundary and reports the dropped bytes
 - `retained_total`, absent by default, caps retained source bytes across units, symbols, and
-  documents together. It accepts `retained_source` to 18446744073709551615b; a smaller total
+  documents together. It accepts `retained_source` to 18446744073709551615b. A smaller total
   fails validation
 
 The total counts every published copy before allocation. A file retained in both its source unit
-and its search document counts twice; a declaration with a published search document also counts
+and its search document counts twice. A declaration with a published search document also counts
 twice. A record without that search document counts once, and each published notebook cell document
 counts its retained decoded source once.
 
@@ -479,10 +479,10 @@ expansion_ratio = 200
 - `expanded_size` caps expanded bytes together, 1b to 64gb
 - `member_size` caps one member's bytes, 1b to `expanded_size`, at most 64gb
 - `extension_size` caps one GNU or PAX extended header, 1b to 64mb, checked before allocating
-  its contents; that header must also fit `member_size`
+  its contents. That header must also fit `member_size`
 - `members` caps archive members, including directories and links, and separately the GNU and PAX
   extended headers, which are no members, 1 to 5000000
-- `expansion_ratio` caps expanded bytes per compressed byte, 1 to 4294967295; `expanded_size`
+- `expansion_ratio` caps expanded bytes per compressed byte, 1 to 4294967295. `expanded_size`
   still bounds the result
 
 These keys use variables such as `RIFT_PACKAGE_ARCHIVE_COMPRESSED_SIZE` and
@@ -507,7 +507,7 @@ rift config set --telemetry.disabled=true
 ```
 
 `rift config set` updates the current directory's `rift.toml`, preserving other values and
-comments. The `telemetry.disabled` setting takes boolean `true` or `false`; malformed
+comments. The `telemetry.disabled` setting takes boolean `true` or `false`. Malformed
 documents and symbolic-link targets are refused without replacement. The command also
 applies [LSP selections](#lsp-recommendations).
 
@@ -519,12 +519,12 @@ rift config set --telemetry.disabled=true --user
 
 A global disable takes precedence over a project's `false` value. Set the global value to
 `false` to allow each project to choose its own value. `RIFT_TELEMETRY_DISABLED=true` also
-suppresses counters; `false` cannot override a disable in either file.
+suppresses counters. `false` cannot override a disable in either file.
 
 Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` for the same opt-out. They do
 not read the CLI's TOML files. Local-only use creates no telemetry request, so these counters
 cannot measure offline activity or unique daily active users. A disable affects future
-requests; existing counters expire under their retention policy.
+requests. Existing counters expire under their retention policy.
 
 ## Global
 
@@ -559,21 +559,21 @@ resolution_ttl = "15m"
 failure_ttl = "30s"
 ```
 
-- `enabled` defaults to `true`; `false` sends no package read to the global API, so a
+- `enabled` defaults to `true`. `false` sends no package read to the global API, so a
   package-scope read answers project hits alone and reports `global_access_disabled`
-- `endpoint` defaults to `https://api.volar.sh/rift/rest`; it must be an absolute base URL without
+- `endpoint` defaults to `https://api.volar.sh/rift/rest`. It must be an absolute base URL without
   user information, query, fragment, or trailing slash
 - `token_env` defaults to `RIFT_API_TOKEN` and names the environment variable holding the optional
   bearer token. An unset variable uses anonymous access
 - `connect_timeout` defaults to `"3s"` and accepts `100ms` to `30s`
-- `request_timeout` defaults to `"15s"` and accepts `1s` to `5m`; it covers connection, response,
+- `request_timeout` defaults to `"15s"` and accepts `1s` to `5m`. It covers connection, response,
   retry delays, and every attempt
 - `attempts` defaults to `3` and accepts `1` to `5`
 - `max_in_flight` defaults to `4` and accepts `1` to `32`
 - `max_request` caps one request body before sending, 1b to 64mb, default `4mb`
 - `max_response` caps one response body while reading, 1b to 1gb, default `32mb`
 - `max_source` caps one source payload, including documentation source and excerpts, 1b to 64mb,
-  default `1mb`; the client applies the smaller of this value and the source bound the global
+  default `1mb`. The client applies the smaller of this value and the source bound the global
   API advertises. Documentation excerpts also keep their separate response bound
 - `max_symbols` and `max_sources` cap original symbol and source records per edge page
 - `max_seeds` and `max_kinds` cap selected subjects and kinds per edge request
@@ -634,7 +634,7 @@ window = "5m"
 ```
 
 Every shipped syntax provider contributes its file patterns. An absent `include` keeps those
-patterns; a present list replaces them, and an empty list matches no file. `exclude` removes
+patterns. A present list replaces them, and an empty list matches no file. `exclude` removes
 matches from the effective list. `enabled` defaults to `true`, `exclude` defaults empty,
 and `lsp` is absent by default. A bare language and each of its dialect entries are independent.
 `enabled = false` turns off syntax and LSP service for paths the entry matches.
@@ -642,9 +642,9 @@ and `lsp` is absent by default. A bare language and each of its dialect entries 
 <VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
 
 Shipped providers select `.html`, `.htm`, `.css`, `.vue`, `.svelte`, `.c`, C++ source and header
-extensions, `.pyx`, `.pxd`, `.pxi`, and `.jsonc`. Extension selection ignores ASCII case;
-configured path patterns retain their own matching rules. Rift selects C for `.h` files by
-default; that extension does not establish whether a header contains C or C++. Select C++
+extensions, `.pyx`, `.pxd`, `.pxi`, and `.jsonc`. Extension selection ignores ASCII case.
+Configured path patterns retain their own matching rules. Rift selects C for `.h` files by
+default. That extension does not establish whether a header contains C or C++. Select C++
 headers explicitly, and give C an `include` list that leaves those paths to C++:
 
 ```toml
@@ -667,7 +667,7 @@ include = ["src/components/**/*.html"]
 ```
 
 A language no shipped syntax provider knows must carry a nonempty `include` list. It can still
-select an LSP process. One visible path may match one exact language; a current path two entries
+select an LSP process. One visible path may match one exact language. A current path two entries
 claim refuses the workspace candidate, naming the path and both identities. The previously
 published revision keeps serving.
 A visible file no language claims remains available to generic reads, and joins lexical search as
@@ -819,11 +819,11 @@ Profile roots stay below the root project and cannot overlap another profile roo
 selects its own languages and can refer to shared top-level `lsp` definitions. Rift reads the
 profile from the root configuration when serving that directory. A profile can override
 dependency and execution settings. Profile roots hold at most 63 path segments and cannot cross
-a Git repository boundary; register a separate repository through
+a Git repository boundary. Register a separate repository through
 [`[mcp.extra]`](#extra-projects).
 
 Profiles inherit shared server and provider settings. Profile servers use the default port
-range; the root's `server.port` and `server.port_range` apply to the primary project.
+range. The root's `server.port` and `server.port_range` apply to the primary project.
 
 ### Extra projects
 
@@ -877,7 +877,7 @@ connection did not register, such as `local@web:api`, fails with `parameter_inva
 accepted scopes.
 
 `rift mcp` reads each extra project's `rift.toml` when it starts. When that file can't be read or
-fails validation, the connection still starts and `local@name` stays registered; its server
+fails validation, the connection still starts and `local@name` stays registered. Its server
 reports the refusal when a request reaches it. That project serves no profiles: `all` leaves them
 out, and a scope such as `local@web:docs` fails with the same refusal.
 
@@ -903,7 +903,7 @@ engine in, so nothing is installed or started beside the server:
 embedded = "ty"
 ```
 
-`embedded` names an engine this build carries; `ty` serves Python. Exactly one of `command`,
+`embedded` names an engine this build carries. `ty` serves Python. Exactly one of `command`,
 `package_manager`, and `embedded` is present. An embedded engine takes no `environment` and no
 `initialization_options`: both configure a spawned process, so a table naming them beside
 `embedded` is refused.
@@ -921,33 +921,33 @@ typeshed stubs the engine ships. The server's `VIRTUAL_ENV`, `CONDA_PREFIX`, `PY
 server restart.
 
 `command` accepts a program string without whitespace or a nonempty list holding the program and
-its literal arguments. The list holds one program and at most 64 arguments; each argument holds
+its literal arguments. The list holds one program and at most 64 arguments. Each argument holds
 at most 4096 bytes. Rift starts the command directly without a shell. Absolute programs are
 refused. A bare name resolves through the server's `PATH`, with `environment` applied on top.
-`initialization_options` is absent by default and must be a JSON object when present;
+`initialization_options` is absent by default and must be a JSON object when present.
 `environment` defaults empty and holds at most 64 entries.
 
 `startup_timeout` defaults to `"30s"` and takes `"1s"` to `"10m"`. `request_timeout` defaults
 to `"1m"` and takes `"1s"` to `"10m"`. `settle_delay` defaults to `"500ms"` and takes `"10ms"` to
 `"1m"`. `output_limit` defaults to `"4kb"` and takes `"1kb"` to
-`"8mb"`; Rift still reports the full size, so you can tell a truncated log from a short one.
+`"8mb"`. Rift still reports the full size, so you can tell a truncated log from a short one.
 
 `request_timeout` measures engine silence, not the age of one request. When a request is still
 unanswered after `request_timeout`, Rift ends the process only if the engine sent nothing for
 that long and holds no work it announced over `$/progress`. An engine still working keeps
 running: Rift sends `$/cancelRequest` for the request and retries it on the same process. The
-read's own deadline, `[server] readiness_timeout`, bounds every wait; a request still waiting
+read's own deadline, `[server] readiness_timeout`, bounds every wait. A request still waiting
 there is cancelled the same way and the answer carries `engine_analysis_unavailable`.
 
 `retry` bounds repeated requests while an answer stays unsettled. `attempts` includes the first
-request; waits start at `delay`, double, and stop at `delay_limit`. `restart` bounds replacement
+request. Waits start at `delay`, double, and stop at `delay_limit`. `restart` bounds replacement
 processes after a process ends or stops answering. A process Rift replaces because a read was
 dropped midway is not counted. A replacement older than `window` stops counting. The server starts a process on its first request and keeps it across later requests.
 Configuration reload reuses unchanged process definitions and ends replaced processes.
 
 `retry.attempts` defaults to `8` and takes `1` to `64`. `retry.delay` defaults to `"250ms"` and
-takes `"1ms"` to `"1m"`; `retry.delay_limit` defaults to `"2s"` and takes `"1ms"` to `"10m"`.
-`restart.attempts` defaults to `3` and takes `0` to `16`; `restart.window` defaults to `"5m"` and
+takes `"1ms"` to `"1m"`. `retry.delay_limit` defaults to `"2s"` and takes `"1ms"` to `"10m"`.
+`restart.attempts` defaults to `3` and takes `0` to `16`. `restart.window` defaults to `"5m"` and
 takes `"1s"` to `"1d"`.
 
 A named process that no language selects is accepted but never started. A language that names a
@@ -964,7 +964,7 @@ is loading over work-done progress, and rust-analyzer ends and begins those repo
 its outstanding work empties several times inside one project load, well before the phase that
 resolves references has run. So Rift calls a process loaded only once its work has stayed
 announced and empty for `settle_delay`, measured at the last output Rift read from it. Raise it
-for a process whose load falls silent for longer than half a second between phases; the retry
+for a process whose load falls silent for longer than half a second between phases. The retry
 schedule above is what carries a request across the wait.
 
 A capability the server never advertised is not a refusal and returns at once.
@@ -1008,8 +1008,8 @@ packages in the project's manifest and install them before using the language se
 
 typescript-language-server refuses its initialize request unless a `typescript` package resolves
 from the workspace root, answering `Could not find a valid TypeScript installation`. Install that
-package in the workspace, or name an existing one with the `tsserver.path` initialization option;
-without either, language-server initialization fails with that message.
+package in the workspace, or name an existing one with the `tsserver.path` initialization option.
+Without either, language-server initialization fails with that message.
 
 The index still walks what `source` leaves visible, so the installed package directory needs an
 exclude:
@@ -1032,7 +1032,7 @@ byte bound. Any workspace with an installed package directory needs the same ent
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-The built-in providers run without configuration; the `providers` table exists to bound or
+The built-in providers run without configuration. The `providers` table exists to bound or
 disable them:
 
 ```toml
@@ -1059,7 +1059,7 @@ background, and the configuration allows you to describe:
 - `strategy` - which revisions the store holds: `everything`, the newest first-parent commits of
   every live worktree, or `selective`, the releases `releases` names
 - `releases` - tag names or tag patterns such as `v1.*`, at most 64, which `selective` requires and
-  no other strategy accepts; a pattern that does not compile as a glob, such as the unclosed class
+  no other strategy accepts. A pattern that does not compile as a glob, such as the unclosed class
   `v[1`, is refused
 - `max_revisions` - how many revisions the store holds, 1 to 100000: commits under `everything`,
   releases under `selective`
@@ -1096,13 +1096,13 @@ max_depth = 512
 A source past any bound is left out of the index while the rest of the workspace serves: a
 generated file of deeply nested literals answers no [`search`](/docs/mcp#tool-search), and
 every other file still does. The server records each such file under
-`rift server logs --component index`, with the path and the bound it crossed; raise that key to
+`rift server logs --component index`, with the path and the bound it crossed. Raise that key to
 index the file.
 
 <VersionBadge version="v0.0.66" languages={["Angular", "Tailwind"]} />
 
 Framework context is separate from language selection. Angular component imports establish
-ownership for literal inline and external templates; Tailwind requires a captured package
+ownership for literal inline and external templates. Tailwind requires a captured package
 version and applicable configuration or stylesheet evidence. An unresolved version or dynamic
 expression appears as `framework_context_unresolved` in read warnings, with its source and
 framework.
@@ -1120,7 +1120,7 @@ tailwind = "v4"
 ```
 
 The list defaults empty and holds at most 256 entries. Each `include` list holds at most 256
-patterns; an empty list selects no source. `angular` defaults `false`; `tailwind` is absent by
+patterns. An empty list selects no source. `angular` defaults `false`. `tailwind` is absent by
 default and accepts `"v3"` or `"v4"`. One entry can supply both frameworks. More than one entry
 matching a source leaves context unresolved and records warnings, so combined selections belong
 in one entry.
@@ -1129,11 +1129,11 @@ Explicit Tailwind selection supplies the supported major version without package
 evidence. Explicit Angular selection applies to matched HTML and templates owned by matched
 TypeScript components. It does not change the TypeScript class's parser identity. Paths outside
 selected or established context retain ordinary syntax. Static classes and supported CSS
-directives publish authored names; dynamic expressions retain source ranges and warnings.
+directives publish authored names. Dynamic expressions retain source ranges and warnings.
 Compiler resolution remains outside syntax analysis.
 
 Provider configuration does not set merge order or freshness. A provider rebuilding after a file
-change can serve its previous immutable revision; the result then carries a `stale_index` entry
+change can serve its previous immutable revision. The result then carries a `stale_index` entry
 in `warnings` naming the two tree revision digests.
 
 ## Search
@@ -1155,14 +1155,14 @@ local inventory returns `insufficient_coverage`. Use `SERVICE :search` to select
 
 `[search.query] page_limit` accepts 1 KiB to 4 MiB of encoded response and defaults to
 4 MiB. The request selects rows with `page` and `max_results`. A page above the byte bound
-returns a typed error; the caller can reduce `max_results`.
+returns a typed error. The caller can reduce `max_results`.
 
 <VersionBadge version="v0.0.84" />
 
 The server retains each answer in a view for 15 minutes, so a later `page` with the same
 `revision` reads it without evaluating the query again. Two `[search.query]` keys bound the
 retained views. The same bounds apply separately to proxy candidate and combined query
-answer stores; the 16 MiB candidate response bound still applies:
+answer stores. The 16 MiB candidate response bound still applies:
 
 ```toml
 [search.query]
@@ -1204,22 +1204,22 @@ journal_size_limit = "64mb"
 ```
 
 - `include` selects text files from the visible paths no language entry claimed, at most 64
-  patterns. It defaults to `["**"]`, so every such path joins the lexical text index; an explicit
+  patterns. It defaults to `["**"]`, so every such path joins the lexical text index. An explicit
   empty list leaves only language-selected files and required documentation sources
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
 - `results` caps results collected by one local search or symbol lookup, 1 to 10000, default
-  `1000`; an answer that reaches it reports `results_truncated`
+  `1000`. An answer that reaches it reports `results_truncated`
 - `symbol_alternatives_work` bounds one complete closest-declaration ranking, 1 to 1073741824,
   default `16777216`. Every visited file and declaration costs one work unit, including
-  language exclusions. Lowercase allocation reserves the configured weight per input byte;
-  a distance comparison reserves `(Q + 1) * L` units for the lowercase query and candidate
+  language exclusions. Lowercase allocation reserves the configured weight per input byte.
+  A distance comparison reserves `(Q + 1) * L` units for the lowercase query and candidate
   character counts. Stable ordering reserves three times the sum of qualified-name bytes,
-  path bytes, and one byte. Exhaustion discards all alternatives; `symbol_not_found.detail`
+  path bytes, and one byte. Exhaustion discards all alternatives. `symbol_not_found.detail`
   reports the configured bound, required work, remaining work, and recovery action
 - `symbol_alternatives_lowercase_work` sets that reservation weight, 12 to 1024, default `12`.
   Rust lowercase mappings return at most three characters, each at most four UTF-8 bytes.
-  Values below 12 are refused; larger values reserve more work without changing Unicode
+  Values below 12 are refused. Larger values reserve more work without changing Unicode
   mappings. Both keys apply to local project alternatives, including a revision read
 - `pool_slots` bounds SQLite connections the index database may hold open at once, and
   separately the vectors database, 1 to 16
@@ -1268,14 +1268,14 @@ excluded_lockfiles = ["Cargo.lock", "uv.lock", "package-lock.json", "bun.lock"]
 - `large_files` is `split`, the default, or `skip`. Under `split` the file is indexed as
   whole-line chunks of at most `max_chunk`, and a file past [`[providers.syntax]`](#providers)
   `max_file` is held as text the syntax provider does not parse, up to [`[source]`](#source)
-  `workspace_size`; the index build records such files in `rift server logs`, and symbol answers
+  `workspace_size`. The index build records such files in `rift server logs`, and symbol answers
   cover the declarations the index holds. Under
   `skip` the file leaves the text index, a file past `max_file` leaves the index entirely, and an
   answer whose `paths` reach one counts it in a `large_file_skipped` warning
 - `excluded_lockfiles` names the lockfiles search leaves out, matched against each visible file's
   final path segment, at most 64 names of up to 255 bytes. The default lists `Cargo.lock`,
   `uv.lock`, `package-lock.json`, `bun.lock`, `pnpm-lock.yaml`, `yarn.lock`, `poetry.lock`,
-  `Pipfile.lock`, `composer.lock`, `Gemfile.lock`, `go.sum`, and `deno.lock`; an empty list
+  `Pipfile.lock`, `composer.lock`, `Gemfile.lock`, `go.sum`, and `deno.lock`. An empty list
   indexes every lockfile
 
 A lockfile search leaves out answers no search and no symbol lookup, while
@@ -1296,7 +1296,7 @@ pattern_matches_per_file = 1000
 
 - `pattern_compiled_size` bounds the bytes one pattern's matcher compiles to, 64kb to 64mb
 - `pattern_candidate_rows` bounds the trigram index rows one search reads to select the files it
-  verifies, 100 to 1000000; a file split into chunks counts once per chunk
+  verifies, 100 to 1000000. A file split into chunks counts once per chunk
 - `pattern_verified_size` bounds the file text one search verifies, 1mb to 64gb
 - `pattern_matches_per_file` bounds the matches one file contributes, 1 to 100000
 
@@ -1335,7 +1335,7 @@ fusion_k = 60
   attached documentation, and over the text of every indexed file
 - `vector_weight` weighs the vector ranking, which reaches code sharing no word with the
   query
-- `fusion_k` sets how sharply a top rank counts, 1 to 1000; a larger value flattens the
+- `fusion_k` sets how sharply a top rank counts, 1 to 1000. A larger value flattens the
   contribution curve and lets agreement between the rankings outweigh one ranking's top
   position
 
@@ -1360,9 +1360,9 @@ max_tokens = 256
 - `candidates` bounds how many declarations the vector ranking returns before the rankings
   are fused, 1 to 1000
 - `candidates_per_file` bounds how many declarations one file contributes to that list, 1 to
-  64; the rest of the file's declarations are dropped, so one file whose declarations all rank
+  64. The rest of the file's declarations are dropped, so one file whose declarations all rank
   well can't fill the list on its own and leave every other file unreachable
-- `max_vectors` bounds how many vectors the workspace holds, 1000 to 1000000; each vector
+- `max_vectors` bounds how many vectors the workspace holds, 1000 to 1000000. Each vector
   costs the model's dimension in single-precision floats. Declarations past it rank by their
   text alone: the vector ranking is ready once the declarations it admits hold vectors, and
   each population records in `rift server logs` how many declarations it left out
@@ -1371,21 +1371,21 @@ max_tokens = 256
   every other Hugging Face client on the machine caches them, `directory` reads a directory
   the workspace already holds and downloads nothing, and `openai_compatible` sends embedding
   inputs to a service implementing the OpenAI embedding shape
-- `model` names which weights, in the form `kind` sets: under `hf` a repository identifier
-  such as `minishlab/potion-retrieval-32M`, optionally carrying a revision after `@`; under
-  `directory` a workspace-relative directory; under `openai_compatible` the model the
-  service exposes. The server stores vectors per model - two models' vectors aren't
+- `model` names the weights in the form selected by `kind`. For `hf`, use a repository
+  identifier such as `minishlab/potion-retrieval-32M`, optionally carrying a revision after `@`.
+  For `directory`, use a workspace-relative directory. For `openai_compatible`, use the
+  model the service exposes. The server stores vectors per model - two models' vectors aren't
   comparable - so changing the value embeds the workspace again
 - The model's own `config.json` decides how the server reads it. A `model_type` of
   `model2vec` names a static model, which embeds a declaration by averaging one row per
-  token; anything else is read as a BERT checkpoint, which runs a forward pass per batch.
+  token. Anything else is read as a BERT checkpoint, which runs a forward pass per batch.
   The shipped default is static, because a forward pass over every declaration in a
   workspace costs minutes on a laptop CPU and a row gather costs seconds
 - `download_timeout` and `download_attempts` bound one model acquisition under `hf`, 10s to
-  1h and 1 to 10; a spent budget leaves search lexical for the life of the server
+  1h and 1 to 10. A spent budget leaves search lexical for the life of the server
 - `batch_inputs` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512 under a
   local model. A BERT checkpoint's attention memory grows with the square of the token
-  window, so a raised window wants a lowered batch; a static model reads one row per token,
+  window, so a raised window wants a lowered batch. A static model reads one row per token,
   so its cost grows with the window rather than with its square
 
 An `openai_compatible` embedding sends declaration text outside the project while vectors are
@@ -1406,7 +1406,7 @@ batch_inputs = 64
 max_in_flight = 4
 ```
 
-- `endpoint` is the base URL the request path is appended to. It uses `https`; `http` is
+- `endpoint` is the base URL the request path is appended to. It uses `https`. `http` is
   accepted only when the host is `localhost`, `127.0.0.1`, or `::1`
 - `revision` is a deployment identifier the operator states, such as a dated release. It
   participates in vector invalidation, so an endpoint serving new weights under one model
@@ -1459,16 +1459,16 @@ the same two bounds.
 
 One unit holds at most 16mb of content, the largest chunk `max_chunk` accepts, so every chunk
 the configuration derives fits. A declaration's unit carries its names, signature, and
-documentation alone; its text lives in its file's chunks.
+documentation alone. Its text lives in its file's chunks.
 
 <VersionBadge version="v0.0.46" />
 
 `mmap_size` sets how much of the index database each connection reads through a memory map,
-0b to 2147418112b, the most the bundled SQLite maps; the default `1gb` maps the whole store of a
+0b to 2147418112b, the most the bundled SQLite maps. The default `1gb` maps the whole store of a
 workspace the size of the Bun or Next.js repositories. `0b` reads through SQLite's page cache
 alone. Every pooled connection maps the file on its own, so resident memory counts the mapped
 pages once per open connection, and an I/O error on the mapped file ends the server with a
-signal rather than an error; [SQLite's memory-map page](https://www.sqlite.org/mmap.html) states
+signal rather than an error. [SQLite's memory-map page](https://www.sqlite.org/mmap.html) states
 both costs.
 
 Connections of the vectors database map nothing and read through the page cache alone.

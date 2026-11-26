@@ -65,9 +65,9 @@ For the example project, a map can look like this:
 
 <WorkspaceMapExample />
 
-In the text, the first line names the map's revision. Each section, such as `languages:` or `packages:`, lists
-its entries indented under it, and a package shows the version the project locks or, as for
-`tokio` here, the requirement its manifest declares.
+The compact text groups its entries into sections such as `languages:` and `packages:`.
+A package shows its locked version or its manifest requirement. The JSON includes the indexed
+revision.
 
 <Callout type="info">
 
@@ -86,27 +86,21 @@ entry points and edges, and when they are available. It also shows a map as comp
 `search` evaluates SPARQL over the facts Rift holds. The request carries `query` and an
 optional `language`, whose default is `sparql`:
 
-```json
-{ "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } ORDER BY ?name LIMIT 10" }
-```
+<ReadExample name="select-symbols" />
 
 The empty prefix names `urn:rift:vocabulary:`. `r:`, `rdf:`, `rdfs:`, and `xsd:` are also
 available. An explicit `PREFIX` declaration can name another namespace.
 
 `SELECT` returns typed bindings, `ASK` returns a boolean, and `CONSTRUCT` and `DESCRIBE`
 return triples. The selected variables are the answer's columns. An unbound variable is
-absent from its row; an IRI, blank node, literal with a datatype, and literal with a language
+absent from its row. An IRI, blank node, literal with a datatype, and literal with a language
 remain distinct terms.
 
 ### Names and declarations
 
 A name is a fact rather than a ranking request:
 
-```sparql
-SELECT ?symbol ?kind {
-  ?symbol a :Symbol; :name "load_config"; :kind ?kind
-}
-```
+<ReadExample name="symbol-name" />
 
 A symbol's IRI is its canonical identity. A syntax element relates to its symbol through `:of`
 and can carry a `:range` and `:source`. Pass the symbol IRI to `get_symbol` for its declarations,
@@ -116,17 +110,7 @@ or to `facets` for its syntax and source at a selected revision.
 
 `SERVICE :search` exposes the existing full-text and identifier ranking:
 
-```sparql
-SELECT ?symbol ?name ?source {
-  SERVICE :search {
-    ?hit :query "load project settings"; :target "symbol";
-         :symbol ?symbol; :source ?source; :index ?index .
-    ?symbol :name ?name
-  }
-}
-ORDER BY ?index
-LIMIT 5
-```
+<ReadExample name="full-text" />
 
 The service's `:query` is the ranked text. The outer request's `query` is SPARQL.
 Project `:source` or `:score` when needed. Use outer `ORDER BY`, `LIMIT`, and `OFFSET`
@@ -144,19 +128,11 @@ ranking facts returns typed unavailability.
 
 Use `:pattern` in the service to select every regex match:
 
-```sparql
-SELECT ?path ?start ?end ?source {
-  SERVICE :search {
-    ?hit :pattern "tokio::[A-Za-z_]+"; :target "file";
-         :path ?path; :start ?start; :end ?end; :source ?source
-  }
-}
-ORDER BY ?path ?start
-```
+<ReadExample name="regex" />
 
 Matching uses Rust regex syntax and the existing trigram index, then verifies the selected
 text. File results keep each physical match and its UTF-8 byte range. Producer bounds
-remain in effect; a truncated acquisition cannot establish a complete SPARQL answer.
+remain in effect. A truncated acquisition cannot establish a complete SPARQL answer.
 
 ### Paths and package scope [#search-scope]
 
@@ -167,27 +143,19 @@ committed revision. The [protocol reference](/docs/developer/protocol/mcp#search
 describes selection and refusal behavior.
 
 `:packages` names releases beside the ones the workspace depends on. Each entry names its
-`manager`, `registry`, and `name`, and an optional exact `version`; without one, the newest
+`manager`, `registry`, and `name`, and an optional exact `version`. Without one, the newest
 collected release answers:
 
-```sparql
-SELECT ?symbol ?name {
-  SERVICE :search {
-    ?hit :query "Serialize"; :target "symbol"; :scope "global";
-         :packages '[{"manager":"cargo","registry":"crates.io","name":"serde_core"}]'^^rdf:JSON;
-         :symbol ?symbol; :index ?index .
-    ?symbol :name ?name
-  }
-}
-ORDER BY ?index
-LIMIT 5
-```
+<ReadExample name="package-scope" />
 
 The server refuses a `:packages` value written as a plain string, and an entry that names no
 `registry`. A workspace whose [`[search] default_scope`](/docs/developer/configuration#search)
 is `global` reads this service with no `:scope`.
 
 Global edge queries read facts already collected for the selected package or runtime.
+
+The local example project runs with the Global connection disabled. Its response shows what
+happens when the named package index cannot be read.
 
 ### Edge provider
 
@@ -202,38 +170,27 @@ selected producer facts.
 
 A query can check for edges from static analysis with `:provider`:
 
-```sparql
-ASK {
-  <symbol-id> :calls ?target .
-  ?edge a :Edge; :from <symbol-id>; :to ?target; :kinds :calls; :provider "static" .
-}
-```
+<ReadExample name="edge-provider" />
 
 The same pattern checks for embedded engine edges with `"engine"` or LSP edges with `"lsp"`.
 
 ### References and calls [#search-traversal]
 
-A canonical symbol identity anchors a graph question. These requests use a returned
-identity in place of `<symbol-id>`:
+These requests find `load_config` by name and use its canonical identity to traverse the graph.
 
-```sparql
-SELECT ?usage ?unit ?start ?end {
-  <symbol-id> :usages ?usage .
-  ?usage :range [ :unit ?unit; :start ?start; :end ?end ]
-}
-```
+<ReadExample name="physical-usages" />
 
 Each usage is a physical occurrence. Repeated uses inside one declaration and uses at file
 scope remain separate rows. Its enclosing declaration, when available, is a separate fact.
 
-```sparql
-SELECT ?caller { ?caller :references <symbol-id> }
-SELECT ?callee { <symbol-id> :calls/:calls/:calls ?callee }
-SELECT ?caller { <symbol-id> ^:references+ ?caller }
-```
+<ReadExample name="references" />
+
+<ReadExample name="calls" />
+
+<ReadExample name="transitive-references" />
 
 Property paths express fixed depth, alternatives, and closure. SPARQL owns path and
-binding semantics; a fixed three-step path can reach a symbol also reachable in one step.
+binding semantics. A fixed two-step path can reach a symbol also reachable in one step.
 Use `DISTINCT` when the question needs distinct endpoints.
 
 ### Language-engine references [#search-engine-references]
@@ -251,11 +208,15 @@ Revision comparisons use `SERVICE :search` with a `:change` JSON literal. Projec
 returned change record's kind and base and head paths. The comparison producer preserves
 its existing revision, history, and change bounds.
 
+<ReadExample name="changes" />
+
 ### Commit messages [#search-commits]
 
 Use `:target "commit"` and `:query` inside the service. Commit records retain their message,
 author, timestamp, revision, and ordered paths. SPARQL chooses which fields to project.
 An incomplete history store cannot establish a complete answer.
+
+<ReadExample name="commits" />
 
 ### Paging and retained results
 
@@ -267,7 +228,7 @@ set before paging. `ASK` returns a boolean without pagination.
 ## Symbols [#tool-get_symbol]
 
 Search discovers a symbol and returns its canonical `id`. `get_symbol` reads that exact
-logical symbol; ownership and language come from the address.
+logical symbol. Ownership and language come from the address.
 
 The example project declares `load_config` in `src/config.rs`. Its identity names the Rust
 crate and declaration, rather than the physical file:
@@ -291,7 +252,7 @@ Use the `include` object to select optional projections, such as
 | `documentation` | Bounded documentation referring to the exact declaration |
 | `history` | The logical symbol's history edges: the commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
 
-The members combine; an omitted member is `false`, and an omitted `include` adds neither. A
+The members combine. An omitted member is `false`, and an omitted `include` adds neither. A
 declaration's source comes from [`facets`](#tool-facets) with the symbol's `id`.
 
 `history` answers edges from the symbol. The commit edges come first, newest first, each naming
@@ -299,17 +260,17 @@ its commit as a `rift://revision/git/<commit>` revision with the commit's author
 declaration lived at:
 
 - `introduced_in` - the commit brought the symbol into existence
-- `changed_in` - the commit changed the declaration in place; `change` says whether the
+- `changed_in` - the commit changed the declaration in place. `change` says whether the
   signature, the body, or the decorators changed
-- `renamed_from` - the commit moved the declaration unchanged; `from` is the path it came from
+- `renamed_from` - the commit moved the declaration unchanged. `from` is the path it came from
 - `removed_in` - the commit deleted the declaration
 
 The `co_changes` edges follow, most shared commits first: each names a symbol the listed commits
 changed beside this one and how many of them did. A commit that changed more than 256
 declarations, such as a sweeping rename, counts toward no co-change edge, and one history answers
-at most 32 of them; `co_changes_truncated` counts what either bound left out.
+at most 32 of them. `co_changes_truncated` counts what either bound left out.
 
-The local server fills its history store in the background; an incomplete history answers
+The local server fills its history store in the background. An incomplete history answers
 `complete: false` until the store holds the selected revision.
 
 A package or runtime symbol has no commits in your project, so its `history` names releases
@@ -319,7 +280,7 @@ release as a revision such as `rift://revision/cargo/crates.io/demo@1.0.0`:
 
 - `introduced_in_release` - the oldest collected release that declares the symbol
 - `changed_in_release` - the release changed the declaration from the collected release before
-  it; `change` names the part, as it does for `changed_in`
+  it. `change` names the part, as it does for `changed_in`
 - `removed_in_release` - the release no longer declares the symbol the release before it declared
 
 A release history carries no `co_changes` edges. `complete: false` means the history stopped
@@ -382,7 +343,7 @@ The agent passes the symbol identity returned by `search` or `get_symbol`:
 
 Each declaration carries exact source and its syntax tree.
 `declaration` is its ordinal among the symbol's declarations. A syntax element's `index`
-is its pre-order position within that declaration, from the root at 0; `parent` names the
+is its pre-order position within that declaration, from the root at 0. `parent` names the
 index of the element around it. Nested declarations have their own facets.
 
 For a package or runtime symbol, Rift reads the global API at the release `revision`
@@ -396,7 +357,7 @@ Send `page` with the same symbol and revision to read later declarations.
 
 `feedback` sends a report from the local Rift server to the public Rift intake at
 `https://feedback.volar.sh/rift/feedback/v1/reports`. To use another HTTPS intake, set
-`RIFT_FEEDBACK_URL` to its full URL in the environment that starts the server; an empty value
+`RIFT_FEEDBACK_URL` to its full URL in the environment that starts the server. An empty value
 turns submission off. If a workspace server is already running, restart it from that environment
 for the change to apply.
 
@@ -420,7 +381,7 @@ As the agents edit the codebase, rift watches the project files and updates the 
 when they change, so the next read can use the new code.
 
 `search` also reaches collected package and runtime facts. `get_symbol` reads the exact
-owner named in its canonical identity; edits to project source update
+owner named in its canonical identity. Edits to project source update
 the local index. See [Index](/docs/developer/architecture#index) for local updates and
 [package scope](/docs/developer/protocol/mcp#get_symbol-scope) for dependency reads.
 
@@ -523,11 +484,11 @@ the same request again can help, and the line below states what failed:
 
 </Tabs>
 
-- `retry never` tells the agent to change its arguments first; `retry same_request` says the same
+- `retry never` tells the agent to change its arguments first. `retry same_request` says the same
   request can succeed later.
 - A `limit_exceeded` failure adds the limit it crossed, `limit source.files: 11 over 10`, so the
   agent can resize the request.
-- The `retry` of the first entry governs the call; a cause's `retry` says what could be done
+- The `retry` of the first entry governs the call. A cause's `retry` says what could be done
   about that cause.
 
 See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for the other

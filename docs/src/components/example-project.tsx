@@ -4,7 +4,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "fumadocs-ui/components
 import { FileIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
-import { exampleProjectFiles } from "@/lib/example-project";
+import examples from "./workspace-examples.generated.json";
+
+const exampleProjectFiles = examples.files;
 
 function FileButton({ path }: { path: string }) {
   return (

@@ -26,7 +26,6 @@ body > .scalar-app,
 .rift-scalar .scalar-app,
 .rift-scalar .light-mode,
 .rift-scalar .dark-mode {
-  /* void, rule, dim, ink */
   --scalar-background-1: var(--background);
   --scalar-background-2: var(--muted);
   --scalar-background-3: var(--muted);
@@ -35,7 +34,7 @@ body > .scalar-app,
   --scalar-color-1: var(--foreground);
   --scalar-color-2: var(--muted-foreground);
   --scalar-color-3: var(--muted-foreground);
-  --scalar-color-accent: var(--foreground);
+  --scalar-color-accent: var(--primary-text);
   --scalar-border-color: var(--border);
   --scalar-border-width: 1px;
   --scalar-focus-color: var(--ring);
@@ -52,22 +51,21 @@ body > .scalar-app,
   --scalar-shadow-1: none;
   --scalar-shadow-2: none;
 
-  /* Two families; the site loads Inter 300-500 and Geist Mono 400-500. */
-  --scalar-font: var(--font-inter);
-  --scalar-font-code: var(--font-geist-mono);
-  --scalar-font-normal: 300;
-  --scalar-regular: 300;
-  --scalar-font-medium: 400;
-  --scalar-semibold: 500;
-  --scalar-font-bold: 500;
-  --scalar-bold: 500;
+  --scalar-font: var(--font-body);
+  --scalar-font-code: var(--font-code);
+  --scalar-font-normal: 400;
+  --scalar-regular: 400;
+  --scalar-font-medium: 500;
+  --scalar-semibold: 600;
+  --scalar-font-bold: 600;
+  --scalar-bold: 600;
 
-  --scalar-button-1: var(--foreground);
-  --scalar-button-1-color: var(--background);
-  --scalar-button-1-hover: var(--muted-foreground);
-  --scalar-link-color: var(--foreground);
+  --scalar-button-1: var(--primary);
+  --scalar-button-1-color: var(--primary-foreground);
+  --scalar-button-1-hover: color-mix(in oklab, var(--primary), var(--background) 15%);
+  --scalar-link-color: var(--primary-text);
   --scalar-link-color-hover: var(--foreground);
-  --scalar-link-color-visited: var(--foreground);
+  --scalar-link-color-visited: var(--primary-text);
   --scalar-text-decoration: underline;
   --scalar-text-decoration-hover: underline;
   --scalar-text-decoration-color: var(--muted-foreground);
@@ -80,8 +78,6 @@ body > .scalar-app,
   --scalar-lifted-brightness: 1;
   --scalar-backdrop-brightness: 1;
 
-  /* Status colours stay inside the palette: the one chromatic token is
-     `--destructive`; an alert is ink on the muted fill. */
   --scalar-color-danger: var(--destructive);
   --scalar-color-red: var(--destructive);
   --scalar-background-danger: color-mix(in oklab, var(--destructive) 12%, transparent);
@@ -105,7 +101,7 @@ body > .scalar-app,
 }
 
 .rift-scalar .scalar-app {
-  font-weight: 300;
+  font-weight: 400;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -156,7 +152,7 @@ body > .scalar-app,
 }
 
 .rift-scalar .scalar-app :is(h1, h2, h3, h4, h5, h6) {
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
   font-weight: 400;
   letter-spacing: 0;
 }
@@ -166,7 +162,7 @@ body > .scalar-app,
   border: 1px solid var(--border);
   background: transparent;
   padding: 0.0625rem 0.3125rem;
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
   font-size: 0.8125em;
   white-space: nowrap;
   color: var(--foreground);
@@ -200,7 +196,7 @@ body > .scalar-app,
   min-width: 3.25rem;
   padding: 0;
   background: transparent;
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
   font-size: 0.6875rem;
   font-weight: 500;
   letter-spacing: 0.16em;
@@ -212,16 +208,16 @@ body > .scalar-app,
 }
 
 .rift-scalar .scalar-app .operation-path {
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
   font-size: 0.8125rem;
   font-weight: 400;
   color: var(--foreground);
 }
 
 .rift-scalar .scalar-app .endpoint-label-name {
-  font-family: var(--font-inter);
+  font-family: var(--font-body);
   font-size: 0.8125rem;
-  font-weight: 300;
+  font-weight: 400;
   color: var(--muted-foreground);
 }
 
@@ -233,7 +229,7 @@ body > .scalar-app,
 .rift-scalar .scalar-app .show-api-client-button {
   min-height: 1.75rem;
   padding: 0.125rem 0.625rem;
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
   font-size: 0.6875rem;
   font-weight: 500;
   letter-spacing: 0.08em;
@@ -292,7 +288,7 @@ body > .scalar-app,
 /* ---- Inside an operation: outline only, hairline weight. ---- */
 
 .rift-scalar .scalar-app .section-accordion-description {
-  font-weight: 300;
+  font-weight: 400;
 }
 
 .rift-scalar .scalar-app :is(.scalar-card, .scalar-code-block, .scalar-code-copy-backdrop),
@@ -307,10 +303,10 @@ body > .scalar-app,
 
 .rift-scalar .scalar-app .section-header-label,
 .rift-scalar .scalar-app .scalar-card-header-title {
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
   font-weight: 400;
 }
 
 .rift-scalar .scalar-app :is(pre, code, .scalar-code-block) {
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-code);
 }

@@ -298,8 +298,13 @@ mod tests {
     }
 
     /// Every `rift.toml` the repository keeps, by its path from the repository root.
-    const REPOSITORY_CONFIGURATIONS: [(&str, &str); 1] =
-        [("rift.toml", include_str!("../../../rift.toml"))];
+    const REPOSITORY_CONFIGURATIONS: [(&str, &str); 2] = [
+        (
+            "crates/rift-mcp/tests/fixtures/docs-example/rift.toml",
+            include_str!("../../rift-mcp/tests/fixtures/docs-example/rift.toml"),
+        ),
+        ("rift.toml", include_str!("../../../rift.toml")),
+    ];
 
     /// A server started in any directory of this repository that holds a `rift.toml` reads
     /// it under the model this module validates against, so each one accepts cleanly.

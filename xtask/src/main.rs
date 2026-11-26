@@ -1,8 +1,8 @@
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, ExitStatus};
 
 fn main() -> ExitCode {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    match run(&arguments) {
+    match run(&arguments, ProcessCommand::status) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -11,11 +11,44 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let command = parse_command(arguments)?;
+fn run(
+    arguments: &[String],
+    capture: impl FnOnce(&mut ProcessCommand) -> std::io::Result<ExitStatus>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let root = workspace_root()?;
-    execute(root, command)
+    match arguments {
+        [group, command] if group == "docs-examples" => {
+            if !matches!(command.as_str(), "generate" | "check") {
+                return Err(USAGE.into());
+            }
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut process = ProcessCommand::new(cargo);
+            process
+                .current_dir(root)
+                .env("RIFT_DOCS_EXAMPLES", command)
+                .args([
+                    "test",
+                    "--locked",
+                    "-p",
+                    "rift-mcp",
+                    "--test",
+                    "docs_examples",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                    "capture_docs_examples",
+                ]);
+            let status = capture(&mut process)?;
+            if !status.success() {
+                return Err(format!("docs example capture failed: {status}").into());
+            }
+            Ok(())
+        }
+        _ => execute(root, parse_command(arguments)?),
+    }
 }
+
+const USAGE: &str = "usage: cargo xtask <errors|docs-examples> <generate|check>";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
@@ -27,7 +60,7 @@ fn parse_command(arguments: &[String]) -> Result<Command, &'static str> {
     match arguments {
         [group, command] if group == "errors" && command == "generate" => Ok(Command::Generate),
         [group, command] if group == "errors" && command == "check" => Ok(Command::Check),
-        _ => Err("usage: cargo xtask errors <generate|check>"),
+        _ => Err(USAGE),
     }
 }
 
@@ -142,7 +175,14 @@ fn execute(root: &std::path::Path, command: Command) -> Result<(), Box<dyn std::
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, execute, parse_command, slash_form};
+    use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt as _;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+
+    use super::{Command, USAGE, execute, parse_command, run, slash_form, workspace_root};
 
     const REGISTRY: &str = r#"
 [registry]
@@ -165,6 +205,64 @@ fields = { field = { type = "string" } }
         )
         .expect("write test registry");
         directory
+    }
+
+    #[test]
+    fn docs_examples_dispatches_both_modes_to_the_capture() {
+        for mode in ["generate", "check"] {
+            run(&["docs-examples".to_owned(), mode.to_owned()], |process| {
+                assert_eq!(process.get_current_dir(), workspace_root().ok());
+                assert_eq!(
+                    process.get_envs().collect::<Vec<_>>(),
+                    [(OsStr::new("RIFT_DOCS_EXAMPLES"), Some(OsStr::new(mode)))]
+                );
+                assert_eq!(
+                    process.get_args().collect::<Vec<_>>(),
+                    [
+                        "test",
+                        "--locked",
+                        "-p",
+                        "rift-mcp",
+                        "--test",
+                        "docs_examples",
+                        "--",
+                        "--ignored",
+                        "--exact",
+                        "capture_docs_examples",
+                    ]
+                );
+                Ok(ExitStatus::from_raw(0))
+            })
+            .expect("successful capture");
+        }
+    }
+
+    #[test]
+    fn docs_examples_refuses_other_modes_and_reports_capture_errors() {
+        for group in ["docs-examples", "unknown"] {
+            let error = run(&[group.to_owned(), "bad".to_owned()], |_| {
+                panic!("invalid commands must not run the capture")
+            })
+            .expect_err("invalid command");
+            assert_eq!(error.to_string(), USAGE);
+        }
+
+        let args = ["docs-examples".to_owned(), "check".to_owned()];
+        let error =
+            run(&args, |_| Ok(ExitStatus::from_raw(1 << 8))).expect_err("nonzero capture exit");
+        assert!(
+            error
+                .to_string()
+                .starts_with("docs example capture failed:")
+        );
+        let error = run(&args, |_| Err(std::io::ErrorKind::NotFound.into()))
+            .expect_err("capture could not start");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound)
+        );
     }
 
     #[test]
