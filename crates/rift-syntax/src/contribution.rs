@@ -47,6 +47,7 @@ pub struct PackageBindingSlots {
     javascript_wrapped_parameter: usize,
     javascript_destructured_parameter: usize,
     typescript_function_type_parameter: usize,
+    typescript_destructured_parameter: usize,
     typescript_method_type_parameter: usize,
 }
 
@@ -88,6 +89,7 @@ impl PackageBindingSlots {
             javascript_wrapped_parameter: 0,
             javascript_destructured_parameter: 0,
             typescript_function_type_parameter: 0,
+            typescript_destructured_parameter: 0,
             typescript_method_type_parameter: 0,
         }
     }
@@ -267,6 +269,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds slots left for written TypeScript parameter pattern bindings.
+    #[must_use]
+    pub const fn with_typescript_destructured_parameters(mut self, count: usize) -> Self {
+        self.typescript_destructured_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -298,6 +307,7 @@ impl PackageBindingSlots {
             .saturating_add(self.javascript_wrapped_parameter)
             .saturating_add(self.javascript_destructured_parameter)
             .saturating_add(self.typescript_function_type_parameter)
+            .saturating_add(self.typescript_destructured_parameter)
             .saturating_add(self.typescript_method_type_parameter)
     }
 
@@ -334,6 +344,8 @@ impl PackageBindingSlots {
             &mut self.typescript_method_type_parameter
         } else if symbol.is_typescript_function_type_parameter() {
             &mut self.typescript_function_type_parameter
+        } else if symbol.is_typescript_destructured_parameter() {
+            &mut self.typescript_destructured_parameter
         } else if matches!(language, "javascript" | "typescript")
             && symbol.is_ecmascript_parameter()
         {

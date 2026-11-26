@@ -31,6 +31,7 @@ pub(super) enum ScopedParameterReads {
     JavaScriptDestructured,
     TypeScriptMethodType,
     TypeScriptFunctionType,
+    TypeScriptDestructured,
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +41,7 @@ enum CheckedParameterReads {
     JavaScriptDestructured,
     TypeScriptMethodType,
     TypeScriptFunctionType,
+    TypeScriptDestructured,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -154,6 +156,15 @@ impl<'source> Index<'source> {
                 );
                 return;
             }
+            ScopedParameterReads::TypeScriptDestructured => {
+                self.checked_parameter_uses(
+                    file,
+                    CheckedParameterReads::TypeScriptDestructured,
+                    work,
+                    result,
+                );
+                return;
+            }
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -202,6 +213,11 @@ impl<'source> Index<'source> {
                 ReferenceRole::Type,
                 &file.typescript_function_type_parameters,
                 &mut result.deferred_typescript_function_type_parameters,
+            ),
+            CheckedParameterReads::TypeScriptDestructured => (
+                ReferenceRole::Read,
+                &file.typescript_destructured_parameters,
+                &mut result.deferred_typescript_destructured_parameters,
             ),
         };
         for reference in file.facts.references() {

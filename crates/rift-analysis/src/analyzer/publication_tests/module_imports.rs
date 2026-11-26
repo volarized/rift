@@ -3184,3 +3184,62 @@ fn javascript_file_modules_keep_local_names_without_an_established_method() {
         .collect::<BTreeSet<_>>();
     assert_eq!(repeated_names, names);
 }
+
+#[test]
+fn typescript_typed_patterns_keep_bindings_apart_from_the_written_type() {
+    const SOURCE: &str = "export function pick({ key: label }: { key: string }, [item]: [number]) { return [label, item]; }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked typed bindings");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical typed binding facts");
+    let property = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/pick/key") && row.source == "key: string")
+        .expect("existing annotation declaration");
+    for name in ["label", "item"] {
+        let start = SOURCE.find(name).expect("written pattern token");
+        let suffix = format!("/pick/{name}");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, name)
+                    && row.source == name
+            })
+            .expect("written typed parameter binding");
+        assert_ne!(parameter.symbol, property.symbol);
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&parameter.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::Parameter)
+        }));
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of {name}");
+        };
+        assert!(read.from.as_str().ends_with("/pick"));
+        let written = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(written.unit, parameter.unit);
+        assert_eq!(
+            written.range,
+            module_runtime_range(SOURCE.rfind(name).expect("body reference"), name)
+        );
+    }
+}

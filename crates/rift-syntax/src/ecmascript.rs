@@ -253,6 +253,7 @@ pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
 pub(crate) const DESTRUCTURED_PARAMETER_KIND: &str = "javascript_destructured_parameter";
+pub(crate) const TYPED_DESTRUCTURED_PARAMETER_KIND: &str = "typescript_destructured_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
@@ -1661,11 +1662,12 @@ impl EcmaScriptRules<'_> {
                     wrapped_parameters::declared_name(written)
                         .map(|name| (name, WRAPPED_PARAMETER_KIND))
                         .or_else(|| {
-                            wrapped_parameters::destructured_name(written)
+                            wrapped_parameters::destructured_name(written, false)
                                 .map(|name| (name, DESTRUCTURED_PARAMETER_KIND))
                         })
                 } else {
-                    None
+                    wrapped_parameters::destructured_name(visited.syntax_element(), true)
+                        .map(|name| (name, TYPED_DESTRUCTURED_PARAMETER_KIND))
                 }
             })
             .or_else(|| {
@@ -2427,6 +2429,7 @@ fn append_package_parameters(
         destructured,
         method_types,
         function_types,
+        typed_patterns,
     } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
@@ -2474,6 +2477,12 @@ fn append_package_parameters(
         facts,
         type_parameters::function,
     );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        typed_patterns,
+        facts,
+        wrapped_parameters::accepted_owner,
+    );
 }
 
 #[derive(Default)]
@@ -2485,6 +2494,7 @@ struct ParameterDeclarations {
     wrapped: Vec<crate::SyntaxSymbol>,
     destructured: Vec<crate::SyntaxSymbol>,
     function_types: Vec<crate::SyntaxSymbol>,
+    typed_patterns: Vec<crate::SyntaxSymbol>,
     method_types: Vec<crate::SyntaxSymbol>,
 }
 
@@ -2506,6 +2516,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.method_types
         } else if symbol.is_typescript_function_type_parameter() {
             &mut candidates.function_types
+        } else if symbol.is_typescript_destructured_parameter() {
+            &mut candidates.typed_patterns
         } else {
             &mut candidates.values
         };
@@ -2667,6 +2679,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == FUNCTION_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(FUNCTION_TYPE_PARAMETER_KIND);
+    }
+    if name == TYPED_DESTRUCTURED_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(TYPED_DESTRUCTURED_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);
