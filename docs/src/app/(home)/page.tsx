@@ -1,238 +1,145 @@
 import { ArrowRightIcon } from "@phosphor-icons/react/dist/ssr";
 import Link from "next/link";
 
-import { type ExplodedKind, ExplodedObject } from "@/components/exploded-object";
-import { LineObject, type LineObjectKind } from "@/components/line-object";
+import { LandingMap } from "@/components/landing/map";
+import { LandingPanel } from "@/components/landing/panel";
 import { Logo } from "@/components/logo";
-import { Reveal } from "@/components/reveal";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import "./landing.css";
 
-const SHELL = "mx-auto w-full max-w-190 px-6 sm:px-7";
-const WIDE = "mx-auto w-full max-w-280 px-6 sm:px-7";
+const DIFFERENCES = [
+  {
+    id: "language-providers",
+    statement: "Code facts with symbol history.",
+    title: "Programming language providers",
+    body: "Rift combines syntax and symbol history to give agents context about the code they read.",
+  },
+  {
+    id: "dependencies",
+    statement: "Source from the project and its dependencies.",
+    title: "Dependency discovery",
+    body: "Rift works in accordance with your project context and dependencies, providing details about them for your agents.",
+  },
+  {
+    id: "mcp",
+    statement: "Structured code reads.",
+    title: "MCP tools and resources",
+    body: "Agents find declarations, inspect syntax, and follow edges through MCP tools.",
+  },
+];
 
-/** Most of a screen for the hero; a shallower band for every later section. */
-const HERO = "min-h-[80svh]";
-const SCREEN = "min-h-[60svh]";
-
-/** Inter 300 at display size - one statement per section, never more. */
-function Statement({ children, className }: { children: React.ReactNode; className?: string }) {
+function Statement({ children }: { children: React.ReactNode }) {
   return (
-    <p
-      className={cn(
-        "m-0 max-w-165 font-sans leading-[1.28] font-light tracking-[-0.015em] text-[2rem] text-balance text-foreground sm:text-[2.75rem]",
-        className,
-      )}
-    >
+    <h2 className="m-0 text-[clamp(1.65rem,3vw,2.8rem)] leading-[1.13] font-semibold tracking-tight text-balance">
+      {children}
+    </h2>
+  );
+}
+
+function Body({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="m-0 text-base leading-relaxed text-pretty text-muted-foreground sm:text-lg">
       {children}
     </p>
   );
 }
 
-/** Inter 300, 18/1.6 - body copy. */
-function Body({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <p
-      className={cn(
-        "m-0 max-w-150 text-lg leading-relaxed font-light text-pretty text-muted-foreground",
-        className,
-      )}
-    >
-      {children}
-    </p>
-  );
-}
-
-function Section({
+function Stop({
   children,
-  className,
-  wide,
-  tall,
   id,
+  alternate = false,
+  illustration,
 }: {
   children: React.ReactNode;
-  className?: string;
-  wide?: boolean;
-  tall?: boolean;
-  id?: string;
+  id: string;
+  alternate?: boolean;
+  illustration?: React.ReactNode;
 }) {
   return (
-    <section id={id} className={cn("flex scroll-mt-14 items-center", tall ? HERO : SCREEN)}>
-      <Reveal className={cn(wide ? WIDE : SHELL, "grid gap-9 py-16", className)}>{children}</Reveal>
+    <section
+      id={id}
+      data-map-stop=""
+      className={cn(
+        "landing-stop",
+        alternate && "landing-stop--alternate",
+        illustration && "landing-stop--hero",
+      )}
+    >
+      {illustration}
+      <LandingPanel className="landing-stop__panel">
+        <div className="grid gap-4 p-5 sm:gap-5 sm:p-7 lg:p-9">{children}</div>
+      </LandingPanel>
     </section>
   );
 }
 
-/**
- * One object per point: the provider stack is the solid taken apart, the other
- * two are attractors - a reversible system and a dynamo that swaps between two
- * states.
- */
-const DIFFERENCES: {
-  statement: string;
-  title: string;
-  body: string;
-  solid?: ExplodedKind;
-  line?: LineObjectKind;
-  tilt?: number;
-  spin?: number;
-  fit?: number;
-}[] = [
-  {
-    statement: "Code facts with symbol history.",
-    title: "Programming language providers",
-    body: "Rift combines syntax and symbol history to give agents context about the code they read.",
-    solid: "sphere",
-  },
-  {
-    statement: "Source from the project and its dependencies.",
-    title: "Dependency discovery",
-    body: "Rift works in accordance with your project context and dependencies, providing details about them for your agents.",
-    line: "shimizu",
-    // The butterfly stands in the x - z plane; turn it to face the camera.
-    tilt: 1.5,
-  },
-  {
-    statement: "Structured code reads.",
-    title: "MCP tools and resources",
-    body: "Agents find declarations, inspect syntax, and follow edges through MCP tools.",
-    line: "tsucs1",
-    tilt: 0.9,
-    spin: 0.4,
-    // A deep body, not a flat one: stand back a little further than the rest.
-    fit: 1,
-  },
-];
-
 export default function HomePage() {
   return (
-    <main className="flex flex-1 flex-col">
-      {/* 1 - hero, standing on a warped ground plane */}
-      <section className={cn("relative flex items-center overflow-hidden", HERO)}>
-        <div
-          className={cn(
-            SHELL,
-            "relative grid items-center gap-12 py-16 md:grid-cols-[1fr_auto] md:gap-16",
-          )}
-        >
-          <div className="grid justify-items-start gap-5">
-            <h1 className="m-0 font-mono text-[52px] leading-none font-medium tracking-[-0.03em] sm:text-[76px]">
-              rift
-            </h1>
+    <div className="landing-page">
+      <LandingMap />
+      <Stop
+        id="overview"
+        illustration={
+          <LandingPanel className="landing-stop__mark">
+            <Logo
+              aria-hidden="true"
+              strokeWidth={0.37}
+              className="w-full p-6 text-primary-text sm:p-9 lg:p-12"
+            />
+          </LandingPanel>
+        }
+      >
+        <h1 className="m-0 font-mono text-[clamp(3.5rem,8.5vw,7rem)] leading-[0.88] font-bold tracking-[-0.075em] dark:text-white">
+          rift
+        </h1>
+        <Body>
+          Rift is an agentic development toolkit for reading, discovering, and exploring codebases.
+        </Body>
+      </Stop>
 
-            <Body className="max-w-115">
-              Rift is an agentic development toolkit for reading, discovering, and exploring
-              codebases.
-            </Body>
-          </div>
+      <Stop id="context" alternate>
+        <Statement>Agents depend on context and tooling.</Statement>
+        <Body>rift provides contextual, precise and well-structured codebase reading tools.</Body>
+      </Stop>
 
-          {/* Stitched to the scroll: it draws itself in on the way down the
-              hero and unpicks itself as the hero leaves. */}
-          <Logo
-            bloom
-            strokeWidth={0.24}
-            className="h-64 w-full max-w-64 justify-self-center text-foreground/70 sm:h-80 sm:max-w-80 md:justify-self-end"
-          />
-        </div>
-      </section>
-
-      {/* 2 - the claim, over a soft Lorenz attractor */}
-      <Section wide className="md:grid-cols-[auto_1fr] md:items-center">
-        <LineObject
-          kind="lorenz"
-          reveal
-          // The butterfly lies in the x - z plane; stand it up to face the camera.
-          tilt={1.48}
-          fit={0.8}
-          opacity={0.15}
-          className="h-64 w-full justify-self-center sm:h-80 sm:min-w-96 md:w-80"
-        />
-        <div className="grid gap-5">
-          <Statement>Agents depend on context and tooling.</Statement>
-          <Body className="text-balance">
-            rift provides contextual, precise and well-structured codebase reading tools.
-          </Body>
-        </div>
-      </Section>
-
-      {/* 4 - the design position, one point per screen, each against the same
-          sphere taken apart on a different plane */}
       {DIFFERENCES.map((item, index) => (
-        <Section key={item.title} wide className="md:grid-cols-2 md:items-center text-base">
-          <div className="grid max-w-165 gap-7">
-            <Statement className="max-w-125">{item.statement}</Statement>
-            <div className="grid gap-3">
-              <h3 className="m-0 font-mono text-lg font-medium tracking-[0.02em] sm:text-xl">
-                {item.title}
-              </h3>
-              <Body>{item.body}</Body>
-            </div>
+        <Stop key={item.id} id={item.id} alternate={index === 1}>
+          <Statement>{item.statement}</Statement>
+          <div className="grid gap-2">
+            <h3 className="m-0 font-mono text-xs leading-relaxed font-medium text-primary-text sm:text-sm">
+              {item.title}
+            </h3>
+            <Body>{item.body}</Body>
           </div>
-
-          {/* Composed on the way in, apart at the centre line, composed
-              again on the way out. */}
-          {item.solid ? (
-            <ExplodedObject
-              kind={item.solid}
-              className={cn(
-                "h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80",
-                index % 2 === 1 && "md:order-first",
-              )}
-            />
-          ) : item.line ? (
-            <LineObject
-              kind={item.line}
-              reveal
-              tilt={item.tilt}
-              spin={item.spin}
-              fit={item.fit ?? 0.78}
-              opacity={0.15}
-              className={cn(
-                "h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80",
-                index % 2 === 1 && "md:order-first",
-              )}
-            />
-          ) : null}
-        </Section>
+        </Stop>
       ))}
 
-      {/* 7 - the two ways out, against the Aizawa attractor drawn on by the
-          scroll and unpicked again on the way back up */}
-      <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
-        <div className="grid gap-9">
-          <Statement className="max-w-125 text-[clamp(1.5rem,8vw,2.75rem)] md:text-[clamp(1.75rem,4vw,2.75rem)]">
-            Bring understanding and cohesiveness to your agentic workflow
-          </Statement>
-          <div className="flex flex-wrap items-center gap-3">
-            <Link
-              href="/docs/installation"
-              className={cn(buttonVariants({ variant: "outline", size: "lg" }), "text-base")}
-            >
-              Install
-              <ArrowRightIcon weight="bold" className="h-4 w-4" />
-            </Link>
-            <Link
-              href="/docs"
-              className={cn(buttonVariants({ variant: "outline", size: "lg" }), "text-base")}
-            >
-              Read the docs
-              <ArrowRightIcon weight="bold" className="h-4 w-4" />
-            </Link>
-          </div>
+      <Stop id="get-started" alternate>
+        <Statement>Bring understanding and cohesiveness to your agentic workflow</Statement>
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          <Link
+            href="/docs/installation"
+            className={cn(
+              buttonVariants({ size: "lg" }),
+              "font-mono font-semibold tracking-wide dark:shadow-[0_0_24px] dark:shadow-primary/35",
+            )}
+          >
+            Install
+            <ArrowRightIcon weight="bold" className="h-4 w-4" />
+          </Link>
+          <Link
+            href="/docs"
+            className={cn(
+              buttonVariants({ variant: "outline", size: "lg" }),
+              "font-mono tracking-wide",
+            )}
+          >
+            Read the docs
+            <ArrowRightIcon weight="bold" className="h-4 w-4 text-primary-text" />
+          </Link>
         </div>
-
-        {/* The disk lies in x - y with the tube down z: face it near-on, so the
-            trace reads as a vortex rather than a smear. */}
-        <LineObject
-          kind="aizawa"
-          reveal
-          tilt={0.26}
-          spin={-0.55}
-          fit={0.82}
-          opacity={0.14}
-          className="h-64 w-full max-w-72 justify-self-center sm:h-80 md:w-80"
-        />
-      </Section>
-    </main>
+      </Stop>
+    </div>
   );
 }
