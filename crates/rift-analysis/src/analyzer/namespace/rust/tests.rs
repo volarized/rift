@@ -4122,3 +4122,160 @@ fn implementations_refuse_competing_names_and_blocks() {
         );
     }
 }
+
+#[test]
+fn registry_conditional_chain_admits_the_authored_nested_module() {
+    let cases = [
+        (
+            "[dependencies]\ncfg-if = '1'\n",
+            "use cfg_if::cfg_if;",
+            true,
+            true,
+        ),
+        (
+            "[dependencies.cfg-if]\nversion = '1.0'\n",
+            "use cfg_if::cfg_if;",
+            true,
+            true,
+        ),
+        ("", "use cfg_if::cfg_if;", true, false),
+        (
+            "[dependencies]\ncfg-if = '1'\n",
+            "#[cfg(override_path)] use cfg_if::cfg_if;",
+            true,
+            false,
+        ),
+        (
+            "[dependencies]\ncfg-if = '1'\n",
+            "mod cfg_if { pub use crate::different; } use cfg_if::cfg_if;",
+            true,
+            false,
+        ),
+        (
+            "[dependencies.cfg-if]\nversion = '1'\npath = 'local'\n",
+            "use cfg_if::cfg_if;",
+            true,
+            false,
+        ),
+        (
+            "[dependencies]\ncfg-if = '1'\n",
+            "use other::cfg_if;",
+            true,
+            false,
+        ),
+        (
+            "[dependencies]\ncfg-if = '1'\n",
+            "use cfg_if::cfg_if;",
+            false,
+            false,
+        ),
+        (
+            "[dependencies]\ncfg-if = '1'\n",
+            "use cfg_if::cfg_if; macro_rules! cfg_if { ($($token:tt)*) => {}; }",
+            true,
+            false,
+        ),
+    ];
+    for (dependency, import, captured, selected) in cases {
+        let analysis = registry_conditional_chain_analysis(dependency, import, captured);
+        let publication = analysis.publication();
+        let found = publication.objects.iter().any(|object| {
+            object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.as_str().ends_with("/crate_root/engines/chosen/Chosen"))
+        });
+        assert_eq!(found, selected, "{dependency} {import}");
+        if selected {
+            assert!(publication.declarations.iter().any(|declaration| {
+                declaration
+                    .symbol
+                    .as_str()
+                    .ends_with("/crate_root/engines/chosen/Chosen")
+                    && declaration.source == "pub struct Chosen;"
+                    && declaration.unit.0.ends_with("/src/engines/chosen.rs")
+            }));
+        }
+        let call = |module: &str| {
+            let target = format!("/crate_root/engines/{module}/target");
+            publication.edges.iter().any(|edge| {
+                edge.kind.0 == rift_protocol::read::EdgeKind::Calls.as_ref()
+                    && edge.to.as_str().ends_with(&target)
+            })
+        };
+        assert_eq!(call("chosen"), selected, "{dependency} {import}");
+        assert!(!call("alternate") && !call("fallback"));
+    }
+}
+
+fn registry_conditional_chain_analysis(
+    dependency: &str,
+    import: &str,
+    captured: bool,
+) -> crate::PackageAnalysis {
+    let manifest = format!("{MANIFEST}edition='2021'\n{dependency}");
+    let branch = format!(
+        r#"{import}
+        cfg_if! {{
+            if #[cfg(override_path)] {{ pub mod alternate; }}
+            else if #[cfg(target_arch = "aarch64")] {{ pub mod chosen; }}
+            else {{ pub mod fallback; }}
+        }}"#
+    );
+    let package = PackageIdentity {
+        manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
+        name: "crate-root".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("fixture owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("fixture origin");
+    let lib = ProjectPath::new("src/lib.rs").expect("library path");
+    let engines = ProjectPath::new("src/engines.rs").expect("nested module path");
+    let chosen = ProjectPath::new("src/engines/chosen.rs").expect("chosen module path");
+    let alternate = ProjectPath::new("src/engines/alternate.rs").expect("alternate module path");
+    let fallback = ProjectPath::new("src/engines/fallback.rs").expect("fallback module path");
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let files = [
+        PackageSource::new(&lib, "#![doc = include_str!(\"engines.rs\")]\nmod engines;"),
+        PackageSource::new(&engines, &branch),
+        PackageSource::new(
+            &chosen,
+            "pub struct Chosen; fn caller() { target(); } fn target() {}",
+        ),
+        PackageSource::new(
+            &alternate,
+            "pub struct Alternate; fn caller() { target(); } fn target() {}",
+        ),
+        PackageSource::new(
+            &fallback,
+            "pub struct Fallback; fn caller() { target(); } fn target() {}",
+        ),
+    ];
+    let metadata = PackageSource::new(&manifest_path, &manifest);
+    let context = [metadata];
+    let flags = [r#"target_arch="aarch64""#];
+    let mut input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &files,
+        ExactPackageLimits::new(21, 16 * 1024 * 1024),
+    )
+    .expect("bounded input")
+    .with_framework_context(&context, &[])
+    .expect("captured metadata")
+    .with_library(&owner, metadata, files[0])
+    .expect("selected library");
+    if captured {
+        input = input
+            .with_rust_configuration(&manifest_path, &flags)
+            .expect("checked flags");
+    }
+    crate::PackageAnalyzer::analyze(input, 1).expect("published package")
+}

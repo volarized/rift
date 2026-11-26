@@ -16,6 +16,7 @@ type Binding = (bool, Option<(rift_core::ProjectPath, ByteRange)>);
 pub(super) struct Scope {
     symbols: Arc<BTreeMap<String, Binding>>,
     complete: bool,
+    registry_cfg_if: bool,
 }
 
 impl Default for Scope {
@@ -23,6 +24,7 @@ impl Default for Scope {
         Self {
             symbols: Arc::default(),
             complete: true,
+            registry_cfg_if: false,
         }
     }
 }
@@ -35,6 +37,9 @@ impl Scope {
         self.symbols.contains_key(name)
     }
     fn insert(&mut self, name: String, transparent: bool) {
+        if name == "cfg_if" {
+            self.registry_cfg_if = false;
+        }
         Arc::make_mut(&mut self.symbols).insert(name, (transparent, None));
     }
     fn define(
@@ -44,6 +49,9 @@ impl Scope {
         transparent: bool,
         original: Option<&str>,
     ) {
+        if symbol.name == "cfg_if" {
+            self.registry_cfg_if = false;
+        }
         if symbol.kind != "macro"
             || symbol.syntax_element_kind != Some("macro_definition")
             || original != Some(file.source)
@@ -66,6 +74,7 @@ impl Scope {
     fn clear(&mut self) {
         Arc::make_mut(&mut self.symbols).clear();
         self.complete = false;
+        self.registry_cfg_if = false;
     }
 }
 
@@ -978,9 +987,19 @@ pub(super) fn children<'a>(
         &mut Vec<Conditioned<'a>>,
     ),
     limits: rift_syntax::SyntaxLimits,
-    (library, ordinary): (bool, &[super::ChildModulePath]),
+    (library, ordinary, configuration): (
+        bool,
+        &[super::ChildModulePath],
+        &super::configuration::Configuration<'_>,
+    ),
 ) -> Vec<Child> {
     let (mut scope, admitted, exports, conditioned) = scope;
+    // An ordinary use binds this file module. Its children need their own import.
+    scope.registry_cfg_if = false;
+    let registry_cfg_if = configuration.captured_registry_cfg_if()
+        && !file.syntax.symbols().iter().any(|symbol| {
+            symbol.container.is_none() && symbol.name == "cfg_if" && symbol.kind == "module"
+        });
     let context = Context {
         inventory,
         originals,
@@ -1017,72 +1036,120 @@ pub(super) fn children<'a>(
                 let path = child.map(|(path, _)| path.as_str());
                 context.import_module(symbol, path, tokens.as_ref(), &mut scope);
             }
-            Event::Invocation((range, modules, direct)) => {
-                if tokens
-                    .as_ref()
-                    .is_some_and(|tokens| tokens.compile_error(*range, &scope, library))
-                {
-                    continue;
-                }
-                let name = invocation_name(file.source, *range);
-                if name.is_none_or(|name| scope.get(name) != Some(&true)) {
-                    if let Some(name) = name
-                        && direct.is_some()
-                        && let Some(literal) = tokens.as_ref().and_then(|tokens| {
-                            context.definition_children(
-                                file,
-                                *range,
-                                name,
-                                directory,
-                                (&scope, exports),
-                                tokens,
+            Event::Invocation(invocation) => context.invocation_children(
+                (file, directory, configuration),
+                invocation,
+                tokens.as_ref(),
+                (&mut scope, admitted, exports, conditioned),
+                &mut children,
+            ),
+            Event::Item(range) => {
+                let registry_import = registry_cfg_if
+                    && scope.complete
+                    && !scope.contains_key("cfg_if")
+                    && tokens
+                        .as_ref()
+                        .and_then(|tokens| tokens.range(range))
+                        .is_some_and(|item| {
+                            matches!(
+                                item.as_slice(),
+                                ["use", "cfg_if", ":", ":", "cfg_if", ";"]
+                                    | ["use", ":", ":", "cfg_if", ":", ":", "cfg_if", ";"]
                             )
                         })
-                    {
-                        children.extend(literal);
-                    }
-                    if let Some(name) = name
-                        && let Some(tokens) = tokens.as_ref()
-                    {
-                        let declared = (&mut children, &mut *conditioned);
-                        context.chain_children((*range, name, directory), &scope, tokens, declared);
-                    }
-                    scope.clear();
-                    continue;
-                }
-                let complete = tokens
-                    .as_ref()
-                    .zip(direct.as_ref())
-                    .is_some_and(|(tokens, _)| {
-                        tokens
-                            .item_modules(*range, &mut scope, library, modules, |range, scope| {
-                                let name = text_range(file.source, range)
-                                    .and_then(|item| item.strip_prefix("mod"))
-                                    .and_then(|item| item.strip_suffix(';'))
-                                    .map(str::trim)
-                                    .filter(|name| super::crate_name_is_valid(name));
-                                if let Some(name) = name
-                                    && let Some(path) = child_path(name, directory, inventory)
-                                {
-                                    children.push((path, vec![name.to_owned()], scope.clone()));
-                                }
-                                Some(())
-                            })
-                            .is_some()
-                    });
-                if complete {
-                    admitted.insert(*range);
-                } else {
-                    scope.clear();
+                    && configuration.admitted(file.syntax, file.source, range) == Some(true);
+                context.item(file, range, tokens.as_ref(), &mut scope, exports);
+                if registry_import && scope.complete {
+                    scope.registry_cfg_if = true;
                 }
             }
-            Event::Item(range) => context.item(file, range, tokens.as_ref(), &mut scope, exports),
         }
     }
     children
 }
 
+fn top_level(file: &SelectedFile<'_>, range: ByteRange) -> bool {
+    file.syntax
+        .scope()
+        .and_then(|scope| scope.first())
+        .and_then(|(_, children)| children.as_ref())
+        .is_some_and(|children| children.contains(&range))
+}
+
 impl Context<'_> {
+    fn invocation_children<'a>(
+        &self,
+        (file, directory, configuration): (
+            &SelectedFile<'_>,
+            &str,
+            &super::configuration::Configuration<'_>,
+        ),
+        (range, modules, direct): &rift_syntax::MacroInvocation,
+        tokens: Option<&scope::Tokens<'a>>,
+        (scope, admitted, exports, conditioned): (
+            &mut Scope,
+            &mut BTreeSet<ByteRange>,
+            &mut Vec<Export>,
+            &mut Vec<Conditioned<'a>>,
+        ),
+        children: &mut Vec<Child>,
+    ) {
+        if tokens.is_some_and(|tokens| tokens.compile_error(*range, scope, self.library)) {
+            return;
+        }
+        let name = invocation_name(file.source, *range);
+        if name.is_none_or(|name| scope.get(name) != Some(&true)) {
+            if let Some(name) = name
+                && direct.is_some()
+                && let Some(literal) = tokens.and_then(|tokens| {
+                    self.definition_children(
+                        file,
+                        *range,
+                        name,
+                        directory,
+                        (scope, exports),
+                        tokens,
+                    )
+                })
+            {
+                children.extend(literal);
+            }
+            if let Some(name) = name
+                && let Some(tokens) = tokens
+            {
+                let declared = (&mut *children, &mut *conditioned);
+                let registry = scope.registry_cfg_if
+                    && configuration.admitted(file.syntax, file.source, *range) == Some(true)
+                    && top_level(file, *range);
+                self.chain_children((*range, name, directory), scope, tokens, declared, registry);
+            }
+            scope.clear();
+            return;
+        }
+        let complete = tokens.zip(direct.as_ref()).is_some_and(|(tokens, _)| {
+            tokens
+                .item_modules(*range, scope, self.library, modules, |range, scope| {
+                    let name = text_range(file.source, range)
+                        .and_then(|item| item.strip_prefix("mod"))
+                        .and_then(|item| item.strip_suffix(';'))
+                        .map(str::trim)
+                        .filter(|name| super::crate_name_is_valid(name));
+                    if let Some(name) = name
+                        && let Some(path) = child_path(name, directory, self.inventory)
+                    {
+                        children.push((path, vec![name.to_owned()], scope.clone()));
+                    }
+                    Some(())
+                })
+                .is_some()
+        });
+        if complete {
+            admitted.insert(*range);
+        } else {
+            scope.clear();
+        }
+    }
+
     /// Adds the module files of a conditional item chain invocation to `children`, and
     /// each with its branch condition to `conditioned`.
     fn chain_children<'a>(
@@ -1091,10 +1158,16 @@ impl Context<'_> {
         scope: &Scope,
         tokens: &scope::Tokens<'a>,
         (children, conditioned): (&mut Vec<Child>, &mut Vec<Conditioned<'a>>),
+        registry: bool,
     ) {
-        let Some(modules) = self.chain(invocation, name, scope, tokens) else {
-            return;
+        let modules = if registry && name == "cfg_if" {
+            tokens
+                .range(invocation)
+                .and_then(|invocation| chain::modules(&invocation, self.depth_max))
+        } else {
+            self.chain(invocation, name, scope, tokens)
         };
+        let Some(modules) = modules else { return };
         let mut incomplete = scope.clone();
         incomplete.clear();
         for (module, condition) in modules {

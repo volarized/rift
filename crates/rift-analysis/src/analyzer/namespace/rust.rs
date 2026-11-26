@@ -104,7 +104,7 @@ pub(super) fn prepare(
             &originals,
             (scope, &mut admitted, &mut exports, &mut conditioned),
             input.syntax(),
-            (library, &ordinary),
+            (library, &ordinary, &configuration),
         );
         requested.extend(
             exports

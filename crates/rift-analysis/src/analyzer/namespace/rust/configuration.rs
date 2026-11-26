@@ -31,7 +31,7 @@ pub(crate) fn valid_flags(flags: &[&str]) -> bool {
 }
 
 pub(crate) struct Configurations<'input> {
-    manifests: BTreeMap<&'input str, Option<Features>>,
+    manifests: BTreeMap<&'input str, Option<ManifestConfiguration>>,
     captured: Option<(&'input str, BTreeSet<&'input str>)>,
     target: Option<RustTarget>,
     depth: usize,
@@ -39,6 +39,7 @@ pub(crate) struct Configurations<'input> {
 
 pub(crate) struct Configuration<'input> {
     features: Option<&'input Features>,
+    registry_cfg_if: bool,
     flags: Option<&'input BTreeSet<&'input str>>,
     target: Option<RustTarget>,
     depth: usize,
@@ -53,9 +54,55 @@ struct Manifest {
     dependencies: toml::Table,
     #[serde(default)]
     target: toml::Table,
+    patch: Option<toml::Table>,
+    replace: Option<toml::Table>,
+}
+
+struct ManifestConfiguration {
+    features: Features,
+    registry_cfg_if: bool,
 }
 
 impl Manifest {
+    /// The direct, unmodified crates.io cfg-if 1.x dependency under the extern prelude.
+    fn registry_cfg_if(&self) -> bool {
+        if !matches!(
+            self.package
+                .as_ref()
+                .and_then(|package| package.get("edition"))
+                .and_then(toml::Value::as_str),
+            Some("2018" | "2021" | "2024")
+        ) || self.patch.is_some()
+            || self.replace.is_some()
+            || self.target.values().any(|target| {
+                target
+                    .get("dependencies")
+                    .and_then(|dependencies| dependencies.get("cfg-if"))
+                    .is_some()
+            })
+        {
+            return false;
+        }
+        let version = match self.dependencies.get("cfg-if") {
+            Some(toml::Value::String(version)) => version,
+            Some(toml::Value::Table(dependency)) if dependency.len() == 1 => {
+                let Some(version) = dependency.get("version").and_then(toml::Value::as_str) else {
+                    return false;
+                };
+                version
+            }
+            _ => return false,
+        };
+        semver::VersionReq::parse(version).is_ok_and(|requirement| {
+            matches!(requirement.comparators.as_slice(), [comparator]
+            if comparator.major == 1 && comparator.pre.is_empty()
+                && matches!(
+                    comparator.op,
+                    semver::Op::Exact | semver::Op::Caret | semver::Op::Tilde | semver::Op::Wildcard
+                ))
+        })
+    }
+
     /// Declared features plus the implicit feature of each optional dependency that no
     /// feature names with `dep:`, as Cargo defines them.
     fn declared_features(self) -> BTreeMap<String, Vec<String>> {
@@ -140,11 +187,18 @@ impl<'input> Configurations<'input> {
             {
                 continue;
             }
-            let features = metadata.map(|metadata| Features::new(metadata.declared_features()));
+            let configuration = metadata.map(|metadata| ManifestConfiguration {
+                registry_cfg_if: matches!(
+                    input.owner(),
+                    rift_protocol::identity::SymbolOwner::Package { manager, registry, .. }
+                        if manager == "cargo" && registry == "crates.io"
+                ) && metadata.registry_cfg_if(),
+                features: Features::new(metadata.declared_features()),
+            });
             manifests
                 .entry(parent)
-                .and_modify(|features| *features = None)
-                .or_insert(features);
+                .and_modify(|configuration| *configuration = None)
+                .or_insert(configuration);
         }
         let captured = input.rust_configuration().map(|(manifest, flags)| {
             let parent = manifest
@@ -165,9 +219,12 @@ impl<'input> Configurations<'input> {
         let mut directory = path.rsplit_once('/').map_or("", |(parent, _)| parent);
         // Each lookup removes one path segment, under the source path bound.
         loop {
-            if let Some(features) = self.manifests.get(directory) {
+            if let Some(configuration) = self.manifests.get(directory) {
+                let configuration = configuration.as_ref();
                 return Configuration {
-                    features: features.as_ref(),
+                    features: configuration.map(|configuration| &configuration.features),
+                    registry_cfg_if: configuration
+                        .is_some_and(|configuration| configuration.registry_cfg_if),
                     flags: self
                         .captured
                         .as_ref()
@@ -180,6 +237,7 @@ impl<'input> Configurations<'input> {
             if directory.is_empty() {
                 return Configuration {
                     features: None,
+                    registry_cfg_if: false,
                     flags: None,
                     target: self.target,
                     depth: self.depth,
@@ -196,6 +254,10 @@ pub(super) enum SelectedModulePath {
 }
 
 impl Configuration<'_> {
+    pub(super) const fn captured_registry_cfg_if(&self) -> bool {
+        self.registry_cfg_if && self.flags.is_some()
+    }
+
     pub(super) fn module_path(
         &self,
         source: &str,
@@ -440,6 +502,7 @@ mod tests {
         let features = Features::new(declared);
         let configuration = Configuration {
             features: Some(&features),
+            registry_cfg_if: false,
             flags: None,
             target: Some(crate::RustTarget::PACKAGE),
             depth: 32,
