@@ -88,6 +88,45 @@ impl<'text> LineIndex<'text> {
             .fail()
     }
 
+    /// Converts ordered, non-overlapping positions on one line in a single pass.
+    /// The previous pair records the validated character and byte end of the
+    /// preceding range, or character zero and the line start on a new line.
+    pub(crate) fn ordered_range(
+        &self,
+        encoding: PositionEncoding,
+        line: u32,
+        previous: (u32, usize),
+        requested: (u32, u32),
+    ) -> Option<(usize, usize)> {
+        let line_start = self.line_start(line).ok()?;
+        let line = without_ending(self.line_text(line as usize, line_start));
+        let (previous_character, previous_byte) = previous;
+        let (start, end) = requested;
+        if start < previous_character || end <= start {
+            return None;
+        }
+        let mut units = previous_character;
+        let remaining = line.get(previous_byte.checked_sub(line_start)?..)?;
+        let mut start_byte = None;
+        for (byte, width) in remaining
+            .char_indices()
+            .map(|(byte, character)| (previous_byte + byte, unit_width(encoding, character)))
+            .chain(iter::once((line_start + line.len(), 0)))
+        {
+            if units == start {
+                start_byte = Some(byte);
+            }
+            if units == end {
+                return Some((start_byte?, byte));
+            }
+            if units > end {
+                return None;
+            }
+            units = units.checked_add(width)?;
+        }
+        None
+    }
+
     /// The position one byte offset addresses.
     ///
     /// # Errors
@@ -132,7 +171,7 @@ impl<'text> LineIndex<'text> {
     }
 
     /// The byte offset where one addressed line starts.
-    fn line_start(&self, line: u32) -> Result<usize, RiftError> {
+    pub(crate) fn line_start(&self, line: u32) -> Result<usize, RiftError> {
         self.line_starts.get(line as usize).copied().ok_or_else(|| {
             errors::lsp::position_line_out_of_range()
                 .line(line)

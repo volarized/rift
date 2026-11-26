@@ -13,7 +13,7 @@
 //! whose exchange was dropped midway can tell whether the session still
 //! serves ([`EngineSession::is_intact`]).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -40,7 +40,9 @@ use lsp_types::{
     TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressCreateParams,
     WorkDoneProgressParams, WorkspaceFolder,
 };
-use rift_core::{CapturedStream, ProjectPath, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use rift_core::{
+    CapturedStream, FileDigest, ProjectPath, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX,
+};
 use rift_error::{RiftError, errors};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -51,6 +53,7 @@ use crate::capabilities::{Capabilities, glob_matches, offered};
 
 mod batch;
 mod edges;
+mod rust_declarations;
 use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE};
 use crate::framing::Framing;
 use crate::uri::TreeRoot;
@@ -526,7 +529,7 @@ pub struct EngineSession {
     empty_answers: EmptyAnswers,
     watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
-    open_documents: BTreeSet<lsp_types::Uri>,
+    open_documents: BTreeMap<lsp_types::Uri, Option<FileDigest>>,
     open_documents_unrecorded: bool,
     frame_in_flight: bool,
     /// The instant the caller's read ends at: no request waits past it.
@@ -675,7 +678,7 @@ impl EngineSession {
             empty_answers: EmptyAnswers::default(),
             watched_file_watchers: Vec::new(),
             document_version: 0,
-            open_documents: BTreeSet::new(),
+            open_documents: BTreeMap::new(),
             open_documents_unrecorded: false,
             frame_in_flight: false,
             deadline: None,
@@ -860,6 +863,7 @@ impl EngineSession {
         text: String,
     ) -> Result<(), RiftError> {
         self.document_version += 1;
+        let digest = (language_id == "rust").then(|| FileDigest::of(text.as_bytes()));
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -869,10 +873,12 @@ impl EngineSession {
             },
         };
         self.notify::<DidOpenTextDocument>(&params).await?;
-        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX && !self.open_documents.contains(&uri) {
+        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX
+            && !self.open_documents.contains_key(&uri)
+        {
             self.open_documents_unrecorded = true;
         } else {
-            self.open_documents.insert(uri);
+            self.open_documents.insert(uri, digest);
         }
         Ok(())
     }
@@ -881,7 +887,7 @@ impl EngineSession {
     #[must_use]
     pub fn is_open(&self, path: &ProjectPath) -> bool {
         self.document_uri(path)
-            .is_ok_and(|uri| self.open_documents.contains(&uri))
+            .is_ok_and(|uri| self.open_documents.contains_key(&uri))
     }
 
     /// Closes one previously opened document.
@@ -934,7 +940,7 @@ impl EngineSession {
     /// later call closes it; one dropped while a frame is being written leaves the
     /// session not intact ([`EngineSession::is_intact`]).
     pub async fn close_open_documents(&mut self) -> Result<(), RiftError> {
-        let open: Vec<_> = self.open_documents.iter().cloned().collect();
+        let open: Vec<_> = self.open_documents.keys().cloned().collect();
         for uri in &open {
             self.close_uri(uri).await?;
         }

@@ -2571,3 +2571,162 @@ async fn workspace_root_without_a_name_still_initializes() {
         .expect("the filesystem root serves as a workspace root");
     session.shutdown().await;
 }
+
+async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStream>) {
+    engine
+        .handshake(json!({
+            "semanticTokensProvider": {
+                "full": true,
+                "legend": {
+                    "tokenTypes": ["parameter", "variable"],
+                    "tokenModifiers": ["macro", "definition", "declaration"]
+                }
+            }
+        }))
+        .await;
+    assert_eq!(
+        engine.next_message().await["method"],
+        "textDocument/didOpen"
+    );
+    let (id, params) = engine
+        .expect_request("textDocument/semanticTokens/full")
+        .await;
+    assert!(
+        params["textDocument"]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/lib.rs")
+    );
+    engine
+        .respond(
+            &id,
+            json!({"data": [
+                0, 4, 5, 0, 4,
+                0, 6, 4, 1, 5,
+                1, 1, 5, 1, 2
+            ]}),
+        )
+        .await;
+    let (id, _) = engine
+        .expect_request("textDocument/semanticTokens/full")
+        .await;
+    engine
+        .respond(
+            &id,
+            json!({"data": [
+                0, 4, 5, 0, 4,
+                0, 3, 4, 1, 2
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        engine.next_message().await["method"],
+        "textDocument/didClose"
+    );
+    let (id, _) = engine.expect_request("shutdown").await;
+    engine.respond(&id, Value::Null).await;
+    engine.expect_request("exit").await;
+}
+
+#[tokio::test]
+async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
+    const SOURCE: &str = "é🪿 alpha beta\n gamma";
+    let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
+
+    let file = path("lib.rs");
+    assert_eq!(
+        session
+            .rust_declarations(&file, SOURCE)
+            .await
+            .expect("unopened fallback"),
+        None
+    );
+    session
+        .open(&file, "rust", SOURCE.to_owned())
+        .await
+        .expect("open exact source");
+    assert_eq!(
+        session
+            .rust_declarations(&file, "stale")
+            .await
+            .expect("wrong source fallback"),
+        None
+    );
+    let observations = session
+        .rust_declarations(&file, SOURCE)
+        .await
+        .expect("answered")
+        .expect("valid full answer");
+    assert_eq!(observations.path(), &file);
+    assert_eq!(
+        observations.digest(),
+        rift_core::FileDigest::of(SOURCE.as_bytes())
+    );
+    let bindings = observations
+        .tokens()
+        .iter()
+        .map(|token| {
+            let start = usize::try_from(token.range.start()).expect("start");
+            let end = usize::try_from(token.range.end()).expect("end");
+            (&SOURCE[start..end], token.kind)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bindings,
+        [
+            ("alpha", rift_lsp::RustDeclarationKind::Parameter),
+            ("gamma", rift_lsp::RustDeclarationKind::Local),
+        ]
+    );
+    assert_eq!(
+        session
+            .rust_declarations(&file, SOURCE)
+            .await
+            .expect("overlap fallback"),
+        None
+    );
+    session.close(&file).await.expect("close");
+    assert_eq!(
+        session
+            .rust_declarations(&file, SOURCE)
+            .await
+            .expect("closed fallback"),
+        None
+    );
+    session.shutdown().await;
+    join(task).await;
+}
+
+#[tokio::test]
+async fn rust_declarations_skip_an_engine_without_full_tokens() {
+    let (_workspace, mut session, task) = started(|mut engine| async move {
+        engine.handshake(json!({
+            "semanticTokensProvider": {
+                "range": true,
+                "legend": { "tokenTypes": ["variable"], "tokenModifiers": ["macro", "declaration"] }
+            }
+        })).await;
+        assert_eq!(
+            engine.next_message().await["method"],
+            "textDocument/didOpen"
+        );
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.expect_request("exit").await;
+    })
+    .await;
+    let file = path("lib.rs");
+    session
+        .open(&file, "rust", "let value = 1;".to_owned())
+        .await
+        .expect("open");
+    assert_eq!(
+        session
+            .rust_declarations(&file, "let value = 1;")
+            .await
+            .expect("unsupported fallback"),
+        None
+    );
+    session.shutdown().await;
+    join(task).await;
+}

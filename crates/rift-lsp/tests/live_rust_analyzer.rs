@@ -337,3 +337,53 @@ async fn rust_analyzer_omits_macro_expansion_calls_from_outgoing_hierarchy() {
     }
     session.shutdown().await;
 }
+
+#[tokio::test]
+async fn rust_analyzer_reports_authored_bindings_beside_macro_expansion() {
+    const SOURCE: &str = "macro_rules! bind { ($name:ident) => { let $name = 1u8; } }
+pub fn choose(pair: (u8, u8)) -> u8 {
+    let (left, right) = pair;
+    bind!(expanded);
+    left + right + expanded
+}
+";
+    if !engine_live() {
+        return;
+    }
+    let workspace = cargo_project();
+    std::fs::write(workspace.path().join("lib.rs"), SOURCE).expect("source on disk");
+    require_rust_analyzer(workspace.path());
+    let mut session = walk_ready_session(workspace.path()).await;
+    let file = ProjectPath::new("lib.rs").expect("exact source path");
+    session
+        .open(&file, "rust", SOURCE.to_owned())
+        .await
+        .expect("open exact source");
+    let mut bindings = Vec::new();
+    for _ in 0..READINESS_PROBES_MAX {
+        if let Ok(Some(reply)) = session.rust_declarations(&file, SOURCE).await {
+            bindings = reply
+                .tokens()
+                .iter()
+                .map(|token| {
+                    let start = usize::try_from(token.range.start()).expect("start");
+                    let end = usize::try_from(token.range.end()).expect("end");
+                    (&SOURCE[start..end], token.kind)
+                })
+                .collect::<Vec<_>>();
+            if !bindings.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(READINESS_PAUSE).await;
+    }
+    assert_eq!(
+        bindings,
+        [
+            ("pair", rift_lsp::RustDeclarationKind::Parameter),
+            ("left", rift_lsp::RustDeclarationKind::Local),
+            ("right", rift_lsp::RustDeclarationKind::Local),
+        ]
+    );
+    session.shutdown().await;
+}

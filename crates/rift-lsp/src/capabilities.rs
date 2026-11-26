@@ -9,7 +9,8 @@ use lsp_types::{
     DiagnosticClientCapabilities, DiagnosticServerCapabilities,
     DiagnosticWorkspaceClientCapabilities, DidChangeWatchedFilesClientCapabilities,
     GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
-    ReferenceClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
+    ReferenceClientCapabilities, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensServerCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
     WorkspaceClientCapabilities,
 };
 use rift_error::{RiftError, errors};
@@ -57,6 +58,8 @@ pub struct Capabilities {
     pub edges: EdgeCapabilities,
     /// Whether the engine serves `textDocument/diagnostic`.
     pub pull_diagnostics: bool,
+    /// Legend negotiated for complete semantic-token answers.
+    pub semantic_tokens: Option<SemanticTokensLegend>,
     /// The identifier the engine registered its diagnostics under.
     pub diagnostic_identifier: Option<String>,
 }
@@ -71,6 +74,7 @@ impl Default for Capabilities {
             definitions: DefinitionCapabilities::default(),
             edges: EdgeCapabilities::default(),
             pull_diagnostics: false,
+            semantic_tokens: None,
             diagnostic_identifier: None,
         }
     }
@@ -133,6 +137,24 @@ impl Capabilities {
                 }
                 None => (false, None),
             };
+        let semantic_tokens = advertised
+            .semantic_tokens_provider
+            .as_ref()
+            .and_then(|provider| {
+                let options = match provider {
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(options) => options,
+                    SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                        registration,
+                    ) => &registration.semantic_tokens_options,
+                };
+                match options.full {
+                    Some(
+                        SemanticTokensFullOptions::Bool(true)
+                        | SemanticTokensFullOptions::Delta { .. },
+                    ) => Some(options.legend.clone()),
+                    Some(SemanticTokensFullOptions::Bool(false)) | None => None,
+                }
+            });
         Ok(Self {
             position_encoding,
             references,
@@ -158,6 +180,7 @@ impl Capabilities {
                 type_hierarchy: false,
             },
             pull_diagnostics,
+            semantic_tokens,
             diagnostic_identifier,
         })
     }
@@ -231,6 +254,7 @@ pub fn offered() -> ClientCapabilities {
             definition: Some(lsp_types::GotoCapability::default()),
             type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities::default()),
             call_hierarchy: Some(CallHierarchyClientCapabilities::default()),
+            semantic_tokens: Some(crate::rust_declarations::offered()),
             diagnostic: Some(DiagnosticClientCapabilities {
                 dynamic_registration: Some(true),
                 ..DiagnosticClientCapabilities::default()
