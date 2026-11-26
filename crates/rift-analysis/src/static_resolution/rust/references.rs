@@ -30,7 +30,7 @@ impl<'source> Index<'source> {
     ) {
         let mut locals = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
-            if symbol.is_rust_receiver_binding() {
+            if symbol.is_rust_receiver_binding() || symbol.is_rust_generic_parameter() {
                 continue;
             }
             if !work.charge() {
@@ -167,6 +167,52 @@ impl<'source> Index<'source> {
             {
                 result.record(Some(occurrence));
             }
+        }
+    }
+
+    /// Adds direct type annotation uses after the earlier occurrence classes.
+    pub(in crate::static_resolution) fn resolve_rust_generics(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            if file.rust_generics.is_empty() {
+                continue;
+            }
+            for reference in file.facts.rust_generic_references() {
+                if !work.charge() {
+                    break;
+                }
+                let Some(&symbol) = file.rust_generics.get(&reference.binding) else {
+                    continue;
+                };
+                if file.text(reference.range) != Some(symbol.name.as_str())
+                    || file.conditional(reference.range, work)
+                {
+                    continue;
+                }
+                let target = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if let Some(occurrence) = self.occurrence(
+                    file,
+                    reference.range,
+                    reference.range,
+                    reference.role,
+                    target,
+                ) {
+                    result.record(Some(occurrence));
+                }
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_generic_start = Some(start);
         }
     }
 
@@ -307,7 +353,13 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if file.conditional(reference.target, work)
+            if (reference.role == ReferenceRole::Type
+                && file
+                    .facts
+                    .rust_generic_references()
+                    .binary_search_by_key(&reference.target, |generic| generic.range)
+                    .is_ok())
+                || file.conditional(reference.target, work)
                 || self
                     .rust
                     .module(file, reference.target.start, work)

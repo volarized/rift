@@ -468,10 +468,14 @@ impl EdgeStore {
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
+        let rust_generic = resolution
+            .rust_generic_start
+            .take()
+            .unwrap_or(resolution.occurrences.len());
         let rust_receiver = resolution
             .rust_receiver_start
             .take()
-            .unwrap_or(resolution.occurrences.len());
+            .unwrap_or(rust_generic);
         let (alias, alias_external) = resolution
             .rust_extern_alias_start
             .take()
@@ -530,13 +534,14 @@ impl EdgeStore {
             typescript_overload,
             alias,
             rust_receiver,
+            rust_generic,
             resolution.occurrences.len(),
         ];
         let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 17] = std::array::from_fn(|index| {
+        let mut batches: [BTreeMap<_, _>; 18] = std::array::from_fn(|index| {
             let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
             admit_occurrences(
@@ -561,9 +566,8 @@ impl EdgeStore {
         self.deduplicate_static_batches(&mut batches);
         for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);
-            self.dropped_edges = self
-                .dropped_edges
-                .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
+            *dropped_edges =
+                dropped_edges.saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
             remaining -= fits;
             changed |= fits > 0;
             edges.truncate(fits);
@@ -572,18 +576,15 @@ impl EdgeStore {
             }
             // The admitted list becomes the outgoing list's tail: one copy per direction.
             for edge in &edges {
-                self.incoming
+                incoming
                     .entry(edge.to.clone())
                     .or_default()
                     .push(edge.clone());
             }
-            self.outgoing
-                .entry(from.clone())
-                .or_default()
-                .append(&mut edges);
+            outgoing.entry(from.clone()).or_default().append(&mut edges);
         }
         if changed {
-            for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
+            for edges in outgoing.values_mut().chain(incoming.values_mut()) {
                 edges.sort_by(edge_order);
                 edges.dedup();
             }

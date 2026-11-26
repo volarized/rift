@@ -451,3 +451,56 @@ impl Counter {{
     assert_eq!(no_edge_room.declarations, full.declarations);
     assert_eq!(no_edge_room.edges, edges);
 }
+
+#[test]
+fn package_rust_generic_parameters_keep_their_physical_item_scopes() {
+    let source = "pub struct Pair<T>(T);
+impl<T> Pair<T> {
+    pub fn pick<'a, U, const N: usize>(&self, values: &'a [U; N]) -> Option<&'a U> { values.first() }
+}
+pub fn keep<U>(value: U) -> U { value }
+";
+    let result = analyze(source);
+    let generics = [
+        ("T>(T)", "/Pair", SymbolKind::TypeParameter, 1),
+        ("T> Pair", "/Pair", SymbolKind::TypeParameter, 1),
+        ("'a, U", "/Pair/pick", SymbolKind::TypeParameter, 2),
+        ("U, const N", "/Pair/pick", SymbolKind::TypeParameter, 1),
+        ("N: usize", "/Pair/pick", SymbolKind::Parameter, 1),
+        ("U>(value", "/keep", SymbolKind::TypeParameter, 1),
+    ];
+    let mut identities = std::collections::BTreeSet::new();
+    for (written, scope, kind, length) in generics {
+        let parameter = declaration_at(&result, source, written);
+        assert!(!parameter.public);
+        assert_eq!(parameter.range.end, parameter.range.start + length);
+        assert!(parameter.symbol.as_str().contains(scope));
+        assert!(identities.insert(&parameter.symbol));
+        assert!(result.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&parameter.symbol) && object.kinds.contains(&kind)
+        }));
+    }
+    let generic_uses = [
+        ("T>(T)", "T);", 0, EdgeKind::HasType, 1),
+        ("T> Pair", "T> {", 0, EdgeKind::HasType, 1),
+        ("'a, U", "'a [U", 0, EdgeKind::HasType, 2),
+        ("'a, U", "'a U>", 0, EdgeKind::HasType, 2),
+        ("U, const N", "[U; N]", 1, EdgeKind::HasType, 1),
+        ("N: usize", "N])", 0, EdgeKind::Reads, 1),
+        ("U>(value", "U) -> U", 0, EdgeKind::HasType, 1),
+    ];
+    for (declaration, written, offset, kind, len) in generic_uses {
+        let parameter = declaration_at(&result, source, declaration);
+        let start = position(source, written) + offset;
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [kind]
+                    && edge.to == parameter.symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        (site.range.start, site.range.end) == (start, start + len)
+                    })
+            }),
+            "{written} resolves to {declaration}"
+        );
+    }
+}

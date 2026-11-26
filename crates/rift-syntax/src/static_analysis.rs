@@ -6,6 +6,7 @@ mod python_edges;
 mod rust;
 pub use heritage_edges::HeritageEdge;
 
+use rift_core::ReferenceRole;
 use rift_error::{RiftError, errors};
 use tree_sitter::{Language, Node};
 
@@ -443,6 +444,17 @@ pub struct StaticCommonJsExport {
     pub literal: Option<ByteRange>,
 }
 
+/// A direct type annotation use with its written generic binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticRustGenericReference {
+    /// Original use token.
+    pub range: ByteRange,
+    /// Original generic declaration token.
+    pub binding: ByteRange,
+    /// The role the token has in the type annotation.
+    pub role: ReferenceRole,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
@@ -528,6 +540,8 @@ pub struct StaticFactsParts {
     pub rust_uses: Vec<StaticRustUse>,
     /// Rust value paths and named pattern terminals.
     pub rust_value_reads: Vec<StaticRustValueRead>,
+    /// Direct uses of generic parameters in type annotations.
+    pub rust_generic_references: Vec<StaticRustGenericReference>,
     /// Hoisted block-local value names with their scopes.
     pub rust_local_values: Vec<(ByteRange, ByteRange)>,
     /// Block-local type and module items with their lexical blocks.
@@ -647,6 +661,20 @@ impl StaticFacts {
                     .and_then(|(start, end)| source.get(start..end))
                     .is_some_and(crate::rust::local_bindings::plain_name)
         })
+    }
+
+    /// Direct uses of generic parameters in type annotations.
+    #[must_use]
+    pub fn rust_generic_references(&self) -> &[StaticRustGenericReference] {
+        &self.0.rust_generic_references
+    }
+
+    pub(crate) fn set_rust_generic_references(
+        &mut self,
+        mut references: Vec<StaticRustGenericReference>,
+    ) {
+        references.sort_by_key(|reference| reference.range);
+        self.0.rust_generic_references = references;
     }
 
     pub(crate) fn add_rust_local_references(&mut self, references: Vec<StaticReference>) {
@@ -1033,6 +1061,7 @@ impl StaticFacts {
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.rust_value_reads),
+            vector_capacity(&self.0.rust_generic_references),
             vector_capacity(&self.0.rust_local_values),
             vector_capacity(&self.0.rust_local_types),
             vector_capacity(&self.0.rust_field_sites),
@@ -1119,6 +1148,7 @@ impl StaticFacts {
             self.inherent_impls().len(),
             self.rust_uses().len(),
             self.rust_value_reads().len(),
+            self.rust_generic_references().len(),
             self.rust_local_values().len(),
             self.rust_local_types().len(),
             self.rust_field_sites().len(),
@@ -1191,6 +1221,15 @@ impl StaticFacts {
         imports
             && conditional
             && self.rust_value_reads().iter().all(|read| valid(read.range))
+            && self
+                .rust_generic_references()
+                .windows(2)
+                .all(|pair| pair[0].range < pair[1].range)
+            && self.rust_generic_references().iter().all(|reference| {
+                valid(reference.range)
+                    && valid(reference.binding)
+                    && matches!(reference.role, ReferenceRole::Read | ReferenceRole::Type)
+            })
             && self
                 .rust_local_values()
                 .iter()

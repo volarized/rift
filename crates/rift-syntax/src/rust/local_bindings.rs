@@ -17,6 +17,9 @@ pub(super) fn pattern(item: Node<'_>) -> Option<Node<'_>> {
     if item.has_error() {
         return None;
     }
+    if generic_kind(item.kind()) {
+        return item.child_by_field_name("name");
+    }
     if let Some(receiver) = receiver(item) {
         return Some(receiver);
     }
@@ -40,6 +43,40 @@ pub(super) fn receiver(item: Node<'_>) -> Option<Node<'_>> {
             .filter(|pattern| pattern.kind() == "self"),
         _ => None,
     }
+}
+
+fn generic_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "type_parameter" | "lifetime_parameter" | "const_parameter"
+    )
+}
+
+/// The physical name in the generic parameter list of an authored item.
+pub(super) fn generic_name<'source>(
+    visited: Visited<'_, '_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let parameters = visited.parent()?;
+    let owner = parameters.parent()?.syntax_element();
+    if parameters.syntax_element().kind() != "type_parameters"
+        || !matches!(
+            owner.kind(),
+            "function_item"
+                | "function_signature_item"
+                | "impl_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "type_item"
+                | "associated_type"
+        )
+    {
+        return None;
+    }
+    let name = source.get(pattern(visited.syntax_element())?.byte_range())?;
+    rift_core::is_portable_name(name).then_some(name)
 }
 
 /// A plain authored function parameter or a method's receiver.
@@ -114,7 +151,7 @@ impl SyntaxSymbol {
     /// Whether this is a source-local Rust binding candidate.
     #[must_use]
     pub fn is_rust_local_binding(&self) -> bool {
-        matches!(self.kind, KIND | PARAMETER_KIND)
+        matches!(self.kind, KIND | PARAMETER_KIND) || self.is_rust_generic_parameter()
     }
 
     /// Whether this source-local Rust binding is a parameter.
@@ -129,6 +166,12 @@ impl SyntaxSymbol {
         self.is_rust_parameter_binding() && self.name == "self"
     }
 
+    /// Whether this is a source-local Rust type, lifetime or const parameter.
+    #[must_use]
+    pub fn is_rust_generic_parameter(&self) -> bool {
+        generic_kind(self.kind)
+    }
+
     /// The generated last path component of a physical Rust lexical binding.
     #[must_use]
     pub fn rust_local_binding_component(&self) -> Option<&str> {
@@ -137,14 +180,16 @@ impl SyntaxSymbol {
         }
         let (owner, component) = self.qualified_name.rsplit_once("::")?;
         let (name, ordinal) = component.rsplit_once('#')?;
-        let ordinal = if self.is_rust_parameter_binding() {
+        let ordinal = if self.is_rust_generic_parameter() {
+            ordinal.strip_prefix("generic")?
+        } else if self.is_rust_parameter_binding() {
             ordinal.strip_prefix("parameter")?
         } else {
             ordinal
         };
         (self.container.as_deref() == Some(owner)
             && name == self.name
-            && plain_name(name)
+            && (self.is_rust_generic_parameter() || plain_name(name))
             && ordinal
                 .parse::<usize>()
                 .is_ok_and(|value| value.to_string() == ordinal))
@@ -168,9 +213,12 @@ pub(super) fn prepare(
         || !facts.rust_textual_macro_calls().is_empty()
         || !facts.rust_macro_barriers().is_empty();
     if opaque_scope {
-        symbols
-            .retain(|symbol| !symbol.is_rust_local_binding() || symbol.is_rust_receiver_binding());
-        if !symbols.iter().any(SyntaxSymbol::is_rust_receiver_binding) {
+        symbols.retain(|symbol| {
+            !symbol.is_rust_local_binding()
+                || symbol.is_rust_receiver_binding()
+                || symbol.is_rust_generic_parameter()
+        });
+        if !symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
             return;
         }
     }
@@ -210,7 +258,8 @@ fn prepare_bindings(
             conditional_end = conditional_end.max(condition.end);
         }
         let receiver = symbol.is_rust_receiver_binding();
-        if !receiver && symbol.item_range.end <= conditional_end {
+        let generic = symbol.is_rust_generic_parameter();
+        if !receiver && !generic && symbol.item_range.end <= conditional_end {
             return false;
         }
         let Some(name) = source_name(source, symbol.name_range) else {
@@ -219,14 +268,16 @@ fn prepare_bindings(
         let Some(owner) = symbol.container.as_deref() else {
             return false;
         };
-        if !receiver && opaque.contains(name) {
+        if !receiver && !generic && opaque.contains(name) {
             return false;
         }
         let ordinal = same_name
             .entry((owner.to_owned(), name, symbol.kind))
             .or_insert(0_usize);
         // A Rust identifier cannot contain this ordinal separator.
-        let category = if symbol.kind == PARAMETER_KIND {
+        let category = if generic {
+            "generic"
+        } else if symbol.kind == PARAMETER_KIND {
             "parameter"
         } else {
             ""
@@ -239,7 +290,7 @@ fn prepare_bindings(
         *ordinal += 1;
         if receiver {
             has_receivers = true;
-        } else {
+        } else if !generic {
             retained.insert(name);
         }
         true

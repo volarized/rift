@@ -16,6 +16,7 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{RiftError, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+mod generics;
 pub(crate) mod local_bindings;
 
 /// Rust declaration kind emitted by the Tree-sitter provider.
@@ -57,6 +58,12 @@ enum RustSymbolKind {
     LocalBinding,
     /// A value parameter named in a function's signature.
     ParameterBinding,
+    /// A declared generic type.
+    TypeParameter,
+    /// A declared generic lifetime.
+    LifetimeParameter,
+    /// A declared generic constant.
+    ConstParameter,
 }
 
 impl RustSymbolKind {
@@ -81,6 +88,9 @@ impl RustSymbolKind {
             Self::Closure => "let_declaration",
             Self::LocalBinding => local_bindings::KIND,
             Self::ParameterBinding => local_bindings::PARAMETER_KIND,
+            Self::TypeParameter => "type_parameter",
+            Self::LifetimeParameter => "lifetime_parameter",
+            Self::ConstParameter => "const_parameter",
         }
     }
 
@@ -101,7 +111,11 @@ impl RustSymbolKind {
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
             Self::Constant | Self::Static | Self::LocalBinding => vec![SymbolKind::Value],
-            Self::ParameterBinding => vec![SymbolKind::Value, SymbolKind::Parameter],
+            Self::ParameterBinding | Self::ConstParameter => {
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            }
+            Self::TypeParameter => vec![SymbolKind::Type, SymbolKind::TypeParameter],
+            Self::LifetimeParameter => vec![SymbolKind::TypeParameter],
             Self::Variant => vec![SymbolKind::Variant],
         }
     }
@@ -126,7 +140,10 @@ impl RustSymbolKind {
             | Self::AssociatedType
             | Self::Closure
             | Self::LocalBinding
-            | Self::ParameterBinding => None,
+            | Self::ParameterBinding
+            | Self::TypeParameter
+            | Self::LifetimeParameter
+            | Self::ConstParameter => None,
         }
     }
 }
@@ -145,6 +162,12 @@ enum RustGrammarSyntaxKind {
     Parameter,
     /// Receiver parameter, including reference and lifetime forms.
     SelfParameter,
+    /// Generic type parameter.
+    TypeParameter,
+    /// Generic lifetime parameter.
+    LifetimeParameter,
+    /// Generic const parameter.
+    ConstParameter,
     /// `closure_expression` value.
     ClosureExpression,
     /// `const_item` declaration.
@@ -198,6 +221,9 @@ impl RustGrammarSyntaxKind {
             Self::LetDeclaration => "let_declaration",
             Self::Parameter => "parameter",
             Self::SelfParameter => "self_parameter",
+            Self::TypeParameter => "type_parameter",
+            Self::LifetimeParameter => "lifetime_parameter",
+            Self::ConstParameter => "const_parameter",
             Self::ClosureExpression => "closure_expression",
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
@@ -234,6 +260,9 @@ impl RustGrammarSyntaxKind {
         match self {
             Self::LetDeclaration => Some(RustSymbolKind::Closure),
             Self::Parameter | Self::SelfParameter => Some(RustSymbolKind::ParameterBinding),
+            Self::TypeParameter => Some(RustSymbolKind::TypeParameter),
+            Self::LifetimeParameter => Some(RustSymbolKind::LifetimeParameter),
+            Self::ConstParameter => Some(RustSymbolKind::ConstParameter),
             Self::ImplItem => Some(RustSymbolKind::Impl),
             Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
@@ -469,6 +498,9 @@ impl SyntaxProvider for RustSyntaxProvider {
         )?;
         let mut facts = capture.finish();
         local_bindings::prepare(source.text, &syntax_elements, &mut symbols, &mut facts);
+        let generic_references =
+            generics::references(source.text, &syntax_elements, &symbols, &facts);
+        facts.set_rust_generic_references(generic_references);
         Ok(SyntaxDocument::new_rust(
             self.language.clone(),
             source,
@@ -666,6 +698,13 @@ impl GrammarRules for RustGrammarRules {
         };
         let name = if kind == RustSymbolKind::ParameterBinding {
             local_bindings::parameter_name(visited, text).map(str::to_owned)
+        } else if matches!(
+            kind,
+            RustSymbolKind::TypeParameter
+                | RustSymbolKind::LifetimeParameter
+                | RustSymbolKind::ConstParameter
+        ) {
+            local_bindings::generic_name(visited, text).map(str::to_owned)
         } else {
             declaration_name(syntax_element, text).or_else(|| {
                 if kind != RustSymbolKind::Closure {
@@ -710,6 +749,8 @@ impl GrammarRules for RustGrammarRules {
             | RustGrammarSyntaxKind::StructItem
             | RustGrammarSyntaxKind::EnumItem
             | RustGrammarSyntaxKind::TraitItem
+            | RustGrammarSyntaxKind::TypeItem
+            | RustGrammarSyntaxKind::AssociatedType
             | RustGrammarSyntaxKind::UnionItem
             | RustGrammarSyntaxKind::EnumVariant
             | RustGrammarSyntaxKind::FunctionItem
@@ -1387,9 +1428,11 @@ mod tests {
             names,
             [
                 "Holder",
+                "Holder::Store#generic0",
                 "Holder::store",
                 "Plain",
                 "Holder",
+                "Holder::Store#generic1",
                 "Holder::run",
                 "Holder::run::self#parameter0",
                 "Plain",
@@ -1407,8 +1450,10 @@ mod tests {
             [
                 None,
                 Some("Holder"),
+                Some("Holder"),
                 None,
                 None,
+                Some("Holder"),
                 Some("Holder"),
                 Some("Holder::run"),
                 None,
@@ -1581,8 +1626,10 @@ mod tests {
                 "Measure::size",
                 "Measure::size::self#parameter0",
                 "call",
+                "call::F#generic0",
                 "call::f#parameter0",
                 "old",
+                "old::F#generic0",
                 "old::f#parameter0",
                 "closure",
                 "closure::f",
