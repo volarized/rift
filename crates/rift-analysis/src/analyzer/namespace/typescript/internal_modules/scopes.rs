@@ -231,8 +231,8 @@ impl<'source> FileScopes<'source> {
         repeated
     }
 
-    /// Names repeated private keys by their captured argument literal and physical ordinal.
-    pub(super) fn argument_properties(
+    /// Names repeated private keys by their captured literal and physical ordinal.
+    pub(super) fn literal_properties(
         &self,
         file: &SelectedFile<'source>,
         repeated: &BTreeSet<&str>,
@@ -281,6 +281,7 @@ impl<'source> FileScopes<'source> {
         for call in facts.calls() {
             calls.entry(call.range.end).or_default().push(call);
         }
+        let returned = returned_literal_owners(symbols, facts, anchors);
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
         let mut scoped = BTreeMap::new();
         for (name, declarations) in candidates {
@@ -290,15 +291,20 @@ impl<'source> FileScopes<'source> {
                     groups.clear();
                     break;
                 };
-                if self.of(declaration, file) != Scope::Body(row.body, false)
-                    || nested.resolve(row.body.start, row.body.end).is_some()
-                    || !calls.get(&row.holder.end).is_some_and(|calls| {
-                        calls.iter().any(|call| {
-                            call.callee_range.end <= row.holder.start
-                                && call.range.encloses(row.holder)
-                        })
-                    })
-                {
+                let exact_body = match declaration.container.as_deref() {
+                    Some(owner) => returned.get(&row.body) == Some(&Some(owner)),
+                    None => {
+                        declaration.qualified_name == declaration.name
+                            && nested.resolve(row.body.start, row.body.end).is_none()
+                            && calls.get(&row.holder.end).is_some_and(|calls| {
+                                calls.iter().any(|call| {
+                                    call.callee_range.end <= row.holder.start
+                                        && call.range.encloses(row.holder)
+                                })
+                            })
+                    }
+                };
+                if self.of(declaration, file) != Scope::Body(row.body, false) || !exact_body {
                     groups.clear();
                     break;
                 }
@@ -430,10 +436,54 @@ impl<'source> FileScopes<'source> {
     }
 }
 
+/// Selects returned literal ranges from one admitted, physically named function declaration.
+fn returned_literal_owners<'source>(
+    symbols: &'source [SyntaxSymbol],
+    facts: &StaticFacts,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<ByteRange, Option<&'source str>> {
+    let mut owners = BTreeMap::new();
+    if facts.returned_objects().is_empty() {
+        return owners;
+    }
+    let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
+    for symbol in symbols {
+        unique
+            .entry(&symbol.qualified_name)
+            .and_modify(|owner| *owner = None)
+            .or_insert(Some(symbol));
+    }
+    let declarations = unique
+        .into_values()
+        .flatten()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("function_declaration")
+                && anchors.contains_key(&symbol.qualified_name)
+        })
+        .filter_map(|symbol| Some((symbol.name_range?, symbol)))
+        .collect::<BTreeMap<_, _>>();
+    for &(name, object) in facts.returned_objects() {
+        let Some((owner, body)) = declarations.get(&name).zip(object) else {
+            continue;
+        };
+        if !owner.item_range.encloses(body) {
+            continue;
+        }
+        let name = owner.qualified_name.as_str();
+        owners
+            .entry(body)
+            .and_modify(|owner| {
+                if *owner != Some(name) {
+                    *owner = None;
+                }
+            })
+            .or_insert(Some(name));
+    }
+    owners
+}
+
 fn ordinary_private_property(symbol: &SyntaxSymbol, source: &str) -> bool {
     if symbol.kind != "property"
-        || symbol.container.is_some()
-        || symbol.qualified_name != symbol.name
         || symbol.kinds.contains(&SymbolKind::Public)
         || !matches!(
             symbol.syntax_element_kind,

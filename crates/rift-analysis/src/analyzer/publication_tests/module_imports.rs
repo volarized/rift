@@ -169,6 +169,89 @@ fn non_entry_argument_properties_keep_the_prior_retained_byte_budget() {
     assert_eq!(generous.declarations.len(), primary.len() + 2);
 }
 
+const RETURNED_LITERAL_PROPERTIES: &str = r#"
+import { inspect } from "../index.mjs";
+export function returned(first) {
+  if (first) return { result: 31 };
+  return ({ result: 42 });
+}
+export function read(first) {
+  return returned(first).result;
+}
+export function established() {
+  const options = { stable: 8 };
+  return inspect(options.stable);
+}
+export function unsupported(first) {
+  return first ? { opaque: 5 } : { opaque: 6 };
+}
+"#;
+
+#[test]
+fn package_retains_private_properties_of_distinct_returned_literals() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function inspect(value) { return value; }",
+            ),
+            ("lib/branches.mjs", RETURNED_LITERAL_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/branches.mjs")
+        .expect("non-entry unit")
+        .unit;
+    let property = |written: &str| {
+        publication.declarations.iter().find(|row| {
+            &row.unit == unit
+                && row.source == written
+                && u64::try_from(
+                    RETURNED_LITERAL_PROPERTIES
+                        .find(written)
+                        .expect("source key"),
+                ) == Ok(row.range.start)
+        })
+    };
+    let first = property("result: 31").expect("first returned property");
+    let second = property("result: 42").expect("second returned property");
+    assert_ne!(first.symbol, second.symbol);
+    for row in [first, second] {
+        assert!(!row.public);
+        assert!(row.symbol.as_str().contains("/returned/result%23"));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.name == "result"
+                && object.kind.0 == "property"
+        }));
+        assert!(
+            !publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds.contains(&EdgeKind::Reads) && edge.to == row.symbol)
+        );
+    }
+    let stable = property("stable: 8").expect("named control");
+    assert!(
+        stable
+            .symbol
+            .as_str()
+            .ends_with("/established/options/stable")
+    );
+    assert!(property("opaque: 5").is_none());
+    assert!(property("opaque: 6").is_none());
+}
+
 const MODULE: &str = "rift://symbol/npm/npmjs.org/app/typescript/app";
 const SIBLING: &str = "rift://symbol/npm/npmjs.org/app/typescript/app%2Fnear";
 const DEPENDENCY: &str = "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType";
