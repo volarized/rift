@@ -804,6 +804,9 @@ fn publish(
         &mut records,
     )?;
     records.retain_ecmascript_file_modules(package, analyzed, limits.declarations_max())?;
+    if matches!(package, SymbolOwner::Package { manager, .. } if manager == "npm") {
+        records.retain_ecmascript_file_module_edges(semantics, limits.edges_max());
+    }
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));
@@ -1870,7 +1873,11 @@ impl Records {
                     && matches!(language, "javascript" | "typescript" | "rust")
                     && let Some(module) = held.placement.logical_identity(".")
                     && !objects.contains(module.as_str())
-                    && !semantics.edges().outgoing(module).is_empty()
+                    && semantics
+                        .edges()
+                        .outgoing(module)
+                        .iter()
+                        .any(|edge| !edge.is_file_module_reference())
                 {
                     let proven = (language != "javascript"
                         || javascript_module_source(owner, held))
@@ -1901,7 +1908,7 @@ impl Records {
                 .edges()
                 .outgoing(id)
                 .iter()
-                .filter(|edge| !edge.is_graph_edge())
+                .filter(|edge| !edge.is_graph_edge() && !edge.is_file_module_reference())
             {
                 if self.edges.len() >= limit {
                     self.warn(truncation(
@@ -2008,6 +2015,7 @@ impl Records {
                         .as_ref()
                         .is_some_and(|scopes| scopes.resolve(range.start(), range.end()).is_none());
                 if edge.is_graph_edge()
+                    || edge.is_file_module_reference()
                     || !(import || direct)
                     || occurrence.unit() != held.placement.unit()
                     || held
@@ -2076,7 +2084,13 @@ impl Records {
             let Some(module) = held.placement.logical_identity(".") else {
                 continue;
             };
-            if objects.contains(module.as_str()) || !semantics.edges().outgoing(module).is_empty() {
+            if objects.contains(module.as_str())
+                || semantics
+                    .edges()
+                    .outgoing(module)
+                    .iter()
+                    .any(|edge| !edge.is_file_module_reference())
+            {
                 continue;
             }
             let syntax = held.file.syntax();

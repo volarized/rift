@@ -81,6 +81,8 @@ pub(crate) struct StaticResolution {
     /// First reference inside a compound Python string annotation.
     pub(crate) python_quoted_type_start: Option<usize>,
     pub(crate) python_overload_parameter_start: Option<usize>,
+    /// First reference to an authored file module from an ECMAScript module pass.
+    pub(crate) file_module_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -236,8 +238,15 @@ enum DeferredReferences<'source> {
     PythonCaptures,
     PythonReceivers,
     PythonVariadics,
-    EcmaScriptParameters(ParameterReads),
-    TypeScriptMethodParameters(Vec<ByteRange>),
+    EcmaScriptParameters {
+        reads: ParameterReads,
+        file_module: bool,
+    },
+    TypeScriptMethodParameters {
+        sites: Vec<ByteRange>,
+        file_module: bool,
+    },
+    EcmaScriptModuleSpecifiers,
     Rust {
         pass: RustReferencePass,
         macro_imports: Vec<ByteRange>,
@@ -1609,8 +1618,9 @@ impl<'source> Index<'source> {
                         | DeferredReferences::PythonCaptures
                         | DeferredReferences::PythonReceivers
                         | DeferredReferences::PythonVariadics
-                        | DeferredReferences::EcmaScriptParameters(_)
-                        | DeferredReferences::TypeScriptMethodParameters(_) => {
+                        | DeferredReferences::EcmaScriptParameters { .. }
+                        | DeferredReferences::TypeScriptMethodParameters { .. }
+                        | DeferredReferences::EcmaScriptModuleSpecifiers => {
                             &mut deferred_references
                         }
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
@@ -1628,7 +1638,6 @@ impl<'source> Index<'source> {
                 resolution,
                 &mut pending_python,
             );
-            self.resolve_python_tail(pending_python, work, resolution);
         }
     }
 
@@ -1647,7 +1656,7 @@ impl<'source> Index<'source> {
         }
         let (ecmascript_parameter_sites, mut existing): (VecDeque<_>, VecDeque<_>) =
             references.into_iter().partition(|(_, _, sites)| {
-                matches!(sites, DeferredReferences::EcmaScriptParameters(_))
+                matches!(sites, DeferredReferences::EcmaScriptParameters { .. })
             });
         let (mut javascript_parameter_sites, mut typescript_parameter_sites): (
             VecDeque<_>,
@@ -1664,6 +1673,7 @@ impl<'source> Index<'source> {
         let mut python_captured_sites = VecDeque::new();
         let mut python_receiver_sites = VecDeque::new();
         let mut python_variadic_sites = VecDeque::new();
+        let mut module_specifiers = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1677,6 +1687,11 @@ impl<'source> Index<'source> {
             .or_else(|| python_captured_sites.pop_front())
             .or_else(|| python_receiver_sites.pop_front())
             .or_else(|| python_variadic_sites.pop_front())
+            .or_else(|| {
+                self.resolve_python_tail(std::mem::take(pending_python), work, resolution);
+                None
+            })
+            .or_else(|| module_specifiers.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1700,15 +1715,18 @@ impl<'source> Index<'source> {
                     DeferredReferences::PythonCaptures => &mut python_captured_sites,
                     DeferredReferences::PythonReceivers => &mut python_receiver_sites,
                     DeferredReferences::PythonVariadics => &mut python_variadic_sites,
-                    DeferredReferences::EcmaScriptParameters(_)
+                    DeferredReferences::EcmaScriptParameters { .. }
                         if file.document.facts.language().name == "javascript" =>
                     {
                         &mut javascript_parameter_sites
                     }
-                    DeferredReferences::EcmaScriptParameters(_) => &mut typescript_parameter_sites,
-                    DeferredReferences::TypeScriptMethodParameters(_) => {
+                    DeferredReferences::EcmaScriptParameters { .. } => {
+                        &mut typescript_parameter_sites
+                    }
+                    DeferredReferences::TypeScriptMethodParameters { .. } => {
                         &mut typescript_method_sites
                     }
+                    DeferredReferences::EcmaScriptModuleSpecifiers => &mut module_specifiers,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -1830,19 +1848,24 @@ impl<'source> Index<'source> {
                 self.python_variadic_reads(file, work, resolution);
                 None
             }
-            DeferredReferences::EcmaScriptParameters(sites) => {
+            DeferredReferences::EcmaScriptParameters { reads, file_module } => {
                 self.ecmascript_parameter_reads(
                     file,
-                    sites.functions,
+                    reads.functions,
                     &file.ecmascript_parameters,
                     work,
                     resolution,
                 );
-                (!sites.methods.is_empty()).then_some(
-                    DeferredReferences::TypeScriptMethodParameters(sites.methods),
-                )
+                if reads.methods.is_empty() {
+                    file_module.then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                } else {
+                    Some(DeferredReferences::TypeScriptMethodParameters {
+                        sites: reads.methods,
+                        file_module,
+                    })
+                }
             }
-            DeferredReferences::TypeScriptMethodParameters(sites) => {
+            DeferredReferences::TypeScriptMethodParameters { sites, file_module } => {
                 self.ecmascript_parameter_reads(
                     file,
                     sites,
@@ -1850,6 +1873,13 @@ impl<'source> Index<'source> {
                     work,
                     resolution,
                 );
+                file_module.then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+            }
+            DeferredReferences::EcmaScriptModuleSpecifiers => {
+                resolution
+                    .file_module_start
+                    .get_or_insert(resolution.occurrences.len());
+                self.javascript_module_specifiers(file, work, resolution);
                 None
             }
             DeferredReferences::Rust {
@@ -2069,9 +2099,17 @@ impl<'source> Index<'source> {
             self.javascript_edges(file, work, result, &mut parameter_reads);
         }
         let deferred = match file.document.facts.language().name.as_str() {
-            "javascript" | "typescript" => (!work.exhausted
-                && (!parameter_reads.functions.is_empty() || !parameter_reads.methods.is_empty()))
-            .then_some(DeferredReferences::EcmaScriptParameters(parameter_reads)),
+            "javascript" | "typescript" => {
+                let file_module = self.javascript_has_file_module(file);
+                (!work.exhausted
+                    && (file_module
+                        || !parameter_reads.functions.is_empty()
+                        || !parameter_reads.methods.is_empty()))
+                .then_some(DeferredReferences::EcmaScriptParameters {
+                    reads: parameter_reads,
+                    file_module,
+                })
+            }
             "python" => {
                 let names = self.python_references(file, work, result);
                 (!work.exhausted
@@ -2448,8 +2486,9 @@ impl StaticResolution {
                 ..
             } | DeferredReferences::PythonLocals
                 | DeferredReferences::PythonParameters(_)
-                | DeferredReferences::EcmaScriptParameters(_)
-                | DeferredReferences::TypeScriptMethodParameters(_)
+                | DeferredReferences::EcmaScriptParameters { .. }
+                | DeferredReferences::TypeScriptMethodParameters { .. }
+                | DeferredReferences::EcmaScriptModuleSpecifiers
         ) {
             self.late_supplemental_start
                 .get_or_insert(self.occurrences.len());

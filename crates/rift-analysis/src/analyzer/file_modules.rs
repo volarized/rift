@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::{SourceKind, SymbolId as CoreSymbolId};
+
+use crate::WorkspaceSemantics;
 use rift_error::RiftError;
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
@@ -17,6 +19,47 @@ use super::{
 };
 
 impl Records {
+    /// Adds authored module references once both ends have retained declarations.
+    pub(super) fn retain_ecmascript_file_module_edges(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        edge_limit: usize,
+    ) {
+        let modules = self
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Module))
+            .filter_map(|object| object.id.as_ref())
+            .collect::<BTreeSet<_>>();
+        let declared = self
+            .declarations
+            .iter()
+            .filter(|declaration| modules.contains(&declaration.symbol))
+            .map(|declaration| (declaration.symbol.as_str(), declaration.unit.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        for (module, unit) in &declared {
+            let Ok(module) = CoreSymbolId::new((*module).to_owned()) else {
+                continue;
+            };
+            for edge in semantics.edges().outgoing(&module) {
+                if !edge.is_file_module_reference()
+                    || !declared.contains_key(edge.to().as_str())
+                    || edge.occurrence().unit().to_string() != *unit
+                {
+                    continue;
+                }
+                if self.edges.len() >= edge_limit {
+                    self.warn(truncation(
+                        "edges",
+                        u64::try_from(edge_limit).unwrap_or(u64::MAX),
+                    ));
+                    return;
+                }
+                self.edges.push(edge.to_protocol());
+            }
+        }
+    }
+
     /// Admits whole-file declarations after the earlier publication rows.
     pub(super) fn retain_ecmascript_file_modules(
         &mut self,

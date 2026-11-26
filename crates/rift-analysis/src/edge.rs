@@ -50,12 +50,18 @@ pub struct Edge {
     static_callee: Option<rift_syntax::ByteRange>,
     derivation: rift_protocol::read::EdgeDerivation,
     from_graph: bool,
+    file_module_reference: bool,
 }
 
 impl Edge {
     /// Whether the normalized graph already carries this edge.
     pub(crate) const fn is_graph_edge(&self) -> bool {
         self.from_graph
+    }
+
+    /// Whether this reference needs two admitted ECMAScript file modules.
+    pub(crate) const fn is_file_module_reference(&self) -> bool {
+        self.file_module_reference
     }
 
     /// Projects this resolved reference with its physical occurrence.
@@ -272,6 +278,7 @@ fn reference_edges<'graph>(
             static_callee: None,
             derivation: rift_protocol::read::EdgeDerivation::Resolution,
             from_graph: false,
+            file_module_reference: false,
         })
     })
 }
@@ -397,6 +404,7 @@ fn admit_external<'a>(
             static_callee: (occurrence.role == ReferenceRole::Call)
                 .then_some(occurrence.callee_range),
             from_graph: false,
+            file_module_reference: false,
             derivation: if occurrence.declared {
                 rift_protocol::read::EdgeDerivation::Resolution
             } else {
@@ -412,6 +420,7 @@ fn admit_occurrences<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     admitted: &mut BTreeMap<&'a SymbolId, Vec<Edge>>,
+    file_module_reference: bool,
 ) {
     for occurrence in occurrences {
         if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
@@ -437,6 +446,7 @@ fn admit_occurrences<'a>(
             static_callee: (occurrence.role == ReferenceRole::Call)
                 .then_some(occurrence.callee_range),
             from_graph: false,
+            file_module_reference,
             derivation: if occurrence.edge_kind.is_some() {
                 rift_protocol::read::EdgeDerivation::Syntax
             } else {
@@ -460,6 +470,7 @@ impl EdgeStore {
         }
         let mut next_start = resolution.occurrences.len();
         let [
+            file_module,
             overload,
             quoted_type,
             initializer,
@@ -469,6 +480,7 @@ impl EdgeStore {
             reassigned,
             late,
         ] = [
+            resolution.file_module_start.take(),
             resolution.python_overload_parameter_start.take(),
             resolution.python_quoted_type_start.take(),
             resolution.python_initializer_start.take(),
@@ -494,16 +506,17 @@ impl EdgeStore {
             initializer,
             quoted_type,
             overload,
+            file_module,
             resolution.occurrences.len(),
         ];
         let (external, supplemental_external) = resolution.external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 10] = std::array::from_fn(|index| {
+        let mut batches: [BTreeMap<_, _>; 11] = std::array::from_fn(|index| {
             let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
-            admit_occurrences(rows, spans, &self.edge_modules, &mut edges);
+            admit_occurrences(rows, spans, &self.edge_modules, &mut edges, index == 10);
             edges
         });
         admit_external(external, spans, &self.edge_modules, &mut batches[0]);
@@ -668,6 +681,7 @@ impl EdgeStore {
                         static_callee: None,
                         derivation,
                         from_graph: true,
+                        file_module_reference: false,
                     };
                     outgoing.entry(from.clone()).or_default().push(edge.clone());
                     incoming.entry(to.clone()).or_default().push(edge);

@@ -9,7 +9,8 @@ use rift_syntax::{
     SyntaxExportKind, SyntaxSymbol,
 };
 
-use super::javascript::MemberMode;
+use super::javascript::{MemberMode, ModuleMode};
+use super::javascript_exports::{self, matches_export_form};
 use super::javascript_parameters::ParameterReads;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
@@ -797,5 +798,108 @@ impl<'source> Index<'source> {
                 result.record(occurrence);
             }
         }
+    }
+}
+
+impl<'source> Index<'source> {
+    pub(super) fn javascript_has_file_module(&self, file: &File<'source>) -> bool {
+        matches!(
+            &self.javascript.owner,
+            rift_protocol::identity::SymbolOwner::Package { manager, .. } if manager == "npm"
+        ) && file.document.placement.logical_identity(".").is_some()
+            && !file.document.facts.has_errors()
+    }
+
+    /// Retains a checked relative import at the written module specifier.
+    pub(super) fn javascript_module_specifiers(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let mut selected = std::collections::BTreeSet::new();
+        for binding in file.facts.bindings() {
+            if !work.charge() {
+                return;
+            }
+            let (module, require) = match binding.kind {
+                StaticBindingKind::JavaScriptImport { module, .. }
+                | StaticBindingKind::JavaScriptEdgeNamespace { module } => (module, false),
+                StaticBindingKind::JavaScriptRequire {
+                    module, require, ..
+                } if self.builtin_require(file, require.start, work) => (module, true),
+                _ => continue,
+            };
+            if file.inactive(binding.name, work) || !selected.insert(module) {
+                continue;
+            }
+            let occurrence = self.javascript_module_specifier(file, module, require, work);
+            if occurrence.is_some() {
+                result.record(occurrence);
+            }
+        }
+        for binding in file.document.facts.export_bindings().unwrap_or_default() {
+            if !work.charge() {
+                return;
+            }
+            let Some(source) = binding.source else {
+                continue;
+            };
+            let module = ByteRange {
+                start: source.start + 1,
+                end: source.end.saturating_sub(1),
+            };
+            if binding.container.is_some()
+                || module.start >= module.end
+                || !file
+                    .text(binding.range)
+                    .is_some_and(|written| matches_export_form(written, ModuleMode::Esm))
+                || !selected.insert(module)
+            {
+                continue;
+            }
+            let occurrence = self.javascript_module_specifier(file, module, false, work);
+            if occurrence.is_some() {
+                result.record(occurrence);
+            }
+        }
+    }
+
+    fn javascript_module_specifier(
+        &self,
+        file: &File<'source>,
+        module: ByteRange,
+        require: bool,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let range = ByteRange {
+            start: module.start.checked_sub(1)?,
+            end: module.end.checked_add(1)?,
+        };
+        let literal = file.text(range)?.as_bytes();
+        if !matches!(literal.first().copied(), Some(b'\'' | b'"'))
+            || literal.first() != literal.last()
+        {
+            return None;
+        }
+        let current = file.document.path.as_str();
+        let path = javascript_exports::relative_path(current, file.text(module)?, work)?;
+        let declaration_only = javascript_exports::is_declaration_file(current);
+        let imported = if declaration_only {
+            javascript_exports::declared_file(&self.files, &self.javascript, &path)
+        } else {
+            if !require && self.javascript.mode(current, work) == ModuleMode::CommonJs {
+                return None;
+            }
+            javascript_exports::module_file_with_runtime_observations(
+                &self.files,
+                &self.javascript,
+                &path,
+                false,
+                require,
+            )
+        }?;
+        imported.document.placement.logical_identity(".")?;
+        self.javascript_import_module_occurrence(file, range, imported, work)
     }
 }

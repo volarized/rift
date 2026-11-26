@@ -96,7 +96,21 @@ fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
         .iter()
         .filter(|edge| edge.from.as_str() == MODULE)
         .collect::<Vec<_>>();
-    assert_eq!(imports.len(), 2);
+    assert_eq!(imports.len(), 4);
+    let written = "\"./near\"";
+    for (start, _) in SOURCE.match_indices(written) {
+        let start = u64::try_from(start).expect("module specifier position");
+        let end = start + u64::try_from(written.len()).expect("module specifier length");
+        assert!(imports.iter().any(|edge| {
+            edge.to.as_str() == SIBLING
+                && edge.kinds == [EdgeKind::Imports]
+                && edge.provider == EdgeProvider::Static
+                && edge.derivation == EdgeDerivation::Resolution
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == unit.unit && occurrence.range == TextRange { start, end }
+                })
+        }));
+    }
     let sibling_item = format!("{SIBLING}/Local");
     for (target, name, derivation) in [
         (DEPENDENCY, "Imported", EdgeDerivation::Syntax),
@@ -442,12 +456,12 @@ fn assert_javascript_module_imports(
         .filter(|row| row.from.as_str() == module && row.kinds == [EdgeKind::Imports])
         .collect::<Vec<_>>();
     if import {
-        assert_eq!(written_imports.len(), 1, "{written_imports:?}");
-        assert_eq!(written_imports[0].to.as_str(), target);
-        let binding = written_imports[0]
-            .occurrence
-            .as_ref()
-            .expect("written import");
+        let named_import = written_imports
+            .iter()
+            .filter(|row| row.to.as_str() == target)
+            .collect::<Vec<_>>();
+        assert_eq!(named_import.len(), 1, "{written_imports:?}");
+        let binding = named_import[0].occurrence.as_ref().expect("written import");
         let start =
             u64::try_from(source.find("alpha").expect("imported name")).expect("byte offset");
         assert_eq!(&binding.unit, unit);
@@ -459,7 +473,19 @@ fn assert_javascript_module_imports(
             }
         );
     } else {
-        assert!(written_imports.is_empty());
+        assert_eq!(written_imports.len(), 1, "{written_imports:?}");
+        let module_target = target.strip_suffix("/alpha").expect("required module");
+        assert_eq!(written_imports[0].to.as_str(), module_target);
+        let binding = written_imports[0]
+            .occurrence
+            .as_ref()
+            .expect("written module");
+        let specifier = "'./left.cjs'";
+        assert_eq!(&binding.unit, unit);
+        assert_eq!(
+            binding.range,
+            module_runtime_range(source.find(specifier).expect("module specifier"), specifier)
+        );
         assert!(found.edges.iter().any(|row| {
             row.from.as_str() == format!("{module}/alpha")
                 && row.to.as_str() == target
@@ -708,9 +734,16 @@ fn assert_new_runtime_roles_follow_prior_package_edges(
     module: &str,
     language: &str,
 ) {
+    let module_references = semantics
+        .edges()
+        .edges()
+        .filter(|edge| edge.is_file_module_reference())
+        .map(crate::Edge::to_protocol)
+        .collect::<Vec<_>>();
     let available_before = publication
         .edges
         .iter()
+        .filter(|edge| !module_references.contains(edge))
         .filter(|edge| {
             edge.from.as_str() != module
                 || match edge.kinds.as_slice() {
@@ -882,6 +915,22 @@ fn npm_written_file_modules_publish_their_own_source() {
         assert_eq!(row.source, source);
         assert!(row.source_complete);
     }
+    let specifier = "'./leaf.mjs'";
+    let start = u64::try_from(MAIN.find(specifier).expect("written module")).expect("byte offset");
+    let end = start + u64::try_from(specifier.len()).expect("specifier bytes");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("module unit");
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/beacon")
+            && edge.to.as_str().ends_with("/beacon%2Fleaf.mjs")
+            && edge.kinds == [EdgeKind::Imports]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == unit.unit && site.range == TextRange { start, end }
+            })
+    }));
 }
 
 fn assert_empty_module_respects_the_symbol_bound(

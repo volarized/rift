@@ -722,7 +722,7 @@ pub(crate) fn is_declaration_file(path: &str) -> bool {
 /// The file a specifier of a declaration file names: the TypeScript source in place of the
 /// written runtime file, else the declaration file. Two of one rank name none. A folder names
 /// what its manifest writes as types or as `main`, else its index.
-fn declared_file<'index, 'source>(
+pub(super) fn declared_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
     path: &str,
@@ -827,7 +827,7 @@ pub(super) fn module_file<'index, 'source>(
     module_file_with_runtime_observations(files, modes, path, declarations, false)
 }
 
-fn module_file_with_runtime_observations<'index, 'source>(
+pub(super) fn module_file_with_runtime_observations<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
     path: &str,
@@ -1763,7 +1763,7 @@ impl File<'_> {
     }
 }
 
-fn matches_export_form(source: &str, mode: ModuleMode) -> bool {
+pub(super) fn matches_export_form(source: &str, mode: ModuleMode) -> bool {
     let source = source.trim_start();
     let esm = source.strip_prefix("export").is_some_and(|rest| {
         rest.starts_with(|character: char| {
