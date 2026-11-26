@@ -28,6 +28,10 @@ fn package_publishes_direct_macro_export_visibility() {
     let source = "#[macro_export]\nmacro_rules! plain_export { () => { 8u8 }; }\n\
                   #[macro_export (/* comment */ local_inner_macros, )]\n\n\
                   // comment\nmacro_rules! qualified_export { () => { 7u8 }; }\n\
+                  #[r#macro_export(local_inner_macros)]\n\
+                  macro_rules! raw_attribute { () => { 5u8 }; }\n\
+                  #[macro_export(r#local_inner_macros)]\n\
+                  macro_rules! raw_argument { () => { 6u8 }; }\n\
                   #[cfg_attr(any(), macro_export(local_inner_macros))]\n\
                   macro_rules! conditional { () => { 9u8 }; }\n\
                   macro_rules! private_macro { () => { 0u8 }; }\n";
@@ -42,10 +46,12 @@ fn package_publishes_direct_macro_export_visibility() {
         .iter()
         .filter(|row| row.syntax_element_kind.as_deref() == Some("macro_definition"))
         .collect::<Vec<_>>();
-    assert_eq!(macros.len(), 4);
+    assert_eq!(macros.len(), 6);
     for (name, public) in [
         ("plain_export", true),
         ("qualified_export", true),
+        ("raw_attribute", true),
+        ("raw_argument", true),
         ("conditional", false),
         ("private_macro", false),
     ] {
@@ -57,6 +63,100 @@ fn package_publishes_direct_macro_export_visibility() {
         assert_eq!(declaration.unit, unit.unit);
         assert_eq!(declaration.public, public, "{name}");
     }
+}
+
+#[test]
+fn lint_expect_keeps_rust_module_declarations_and_physical_call_targets() {
+    use rift_core::ReferenceRole;
+
+    let source = r#"
+#[expect(non_snake_case)]
+mod child;
+
+#[cfg(any())]
+#[path = "inactive.rs"]
+#[expect(non_snake_case)]
+mod chosen;
+
+#[cfg(all())]
+#[path = "active.rs"]
+#[expect(non_snake_case)]
+mod chosen;
+
+mod inline {
+    #![expect(non_snake_case)]
+    pub fn WideName() -> u16 { 8 }
+}
+
+#[rustfmt::skip]
+mod opaque;
+
+#[cfg_attr(all(), path = "elsewhere.rs")]
+mod conditional;
+
+#[allow(non_snake_case)]
+fn WideName() -> u8 { 2 }
+
+pub fn run() -> (u8, u8, u8, u16) {
+    (child::WideName(), WideName(), chosen::WideName(), inline::WideName())
+}
+"#;
+    let (publication, files, semantics, _) = analyze_rust_root(
+        vec![
+            ("src/lib.rs", source),
+            ("src/child.rs", "pub fn WideName() -> u8 { 3 }"),
+            ("src/active.rs", "pub fn WideName() -> u8 { 5 }"),
+            ("src/inactive.rs", "pub fn WideName() -> u16 { 9 }"),
+            ("src/opaque.rs", "pub fn OpaqueName() {}"),
+            ("src/elsewhere.rs", "pub fn ElsewhereName() {}"),
+            ("src/conditional.rs", "pub fn DecoyName() {}"),
+        ],
+        MANIFEST,
+    )
+    .into_parts();
+    publication.validate_facts().expect("valid package facts");
+    let authority = |unit: &rift_core::SourceUnitId| {
+        files
+            .iter()
+            .find(|file| file.placement().unit() == unit)
+            .expect("known source unit")
+            .file()
+            .path()
+            .as_str()
+    };
+    let calls = semantics
+        .static_occurrences()
+        .iter()
+        .filter(|row| row.role == ReferenceRole::Call)
+        .map(|row| {
+            let span = row.binding.range();
+            let begin = usize::try_from(span.start()).expect("call start");
+            let end = usize::try_from(span.end()).expect("call end");
+            let target = row.target_binding.as_ref().expect("physical target");
+            assert_eq!(authority(row.binding.unit()), "src/lib.rs");
+            (&source[begin..end], authority(target.unit()))
+        })
+        .collect::<Vec<_>>();
+    for (written, owner) in [
+        ("child::WideName()", "src/child.rs"),
+        ("WideName()", "src/lib.rs"),
+        ("chosen::WideName()", "src/active.rs"),
+        ("inline::WideName()", "src/lib.rs"),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.0 == written)
+                .collect::<Vec<_>>(),
+            [&(written, owner)]
+        );
+    }
+    assert!(publication.declarations.iter().all(|declaration| {
+        let name = declaration.symbol.as_str();
+        !name.ends_with("/OpaqueName")
+            && !name.ends_with("/ElsewhereName")
+            && !name.ends_with("/DecoyName")
+    }));
 }
 
 #[test]

@@ -105,7 +105,10 @@ pub(super) fn exports_macro(visited: Visited<'_, '_>, text: &str) -> bool {
             return false;
         };
         if item.has_error()
-            || semantic_attribute_name(attribute, text) != Some("macro_export")
+            || !matches!(
+                semantic_attribute_name(attribute, text),
+                Some("macro_export" | "r#macro_export")
+            )
             || attribute.child_by_field_name("value").is_some()
         {
             return false;
@@ -118,7 +121,12 @@ pub(super) fn exports_macro(visited: Visited<'_, '_>, text: &str) -> bool {
             .children(&mut cursor)
             .filter(|child| !child.is_extra())
             .map(|child| text.get(child.byte_range()).unwrap_or_default());
-        if tokens.next() != Some("(") || tokens.next() != Some("local_inner_macros") {
+        if tokens.next() != Some("(")
+            || !matches!(
+                tokens.next(),
+                Some("local_inner_macros" | "r#local_inner_macros")
+            )
+        {
             return false;
         }
         let mut close = tokens.next();
@@ -166,6 +174,7 @@ pub(super) fn module_path(
                     "cfg"
                     | "doc"
                     | "allow"
+                    | "expect"
                     | "warn"
                     | "deny"
                     | "forbid"
@@ -199,6 +208,7 @@ pub(super) fn module_path(
             | "macro_use"
             | "doc"
             | "allow"
+            | "expect"
             | "warn"
             | "deny"
             | "forbid"

@@ -438,6 +438,84 @@ pub fn run() -> u16 {
 }
 
 #[test]
+fn package_rust_closure_local_constructor_keeps_its_physical_owner() {
+    use rift_core::ReferenceRole;
+    use rift_provider::NormalizedTarget;
+
+    let source = r"
+pub struct Holder(pub u8);
+
+pub fn run(value: u16) -> (u16, u8) {
+    let inner = || {
+        struct Holder(u16);
+        let item = Holder(value);
+        let outer = crate::Holder(3);
+        (item.0, outer.0)
+    };
+    inner()
+}
+
+pub fn outside(value: u8) -> u8 {
+    { struct Holder(u32); let _ = Holder(4); }
+    Holder(value).0
+}";
+    let analysis =
+        fixture::package_result(ShippedLanguage::Rust, vec![("src/lib.rs", source)], None)
+            .expect("admitted Rust package");
+    let (_, _, semantics, _) = analysis.into_parts();
+    let written = |binding: &DeclarationBinding| {
+        let range = binding.range();
+        &source[offset_in(range.start())..offset_in(range.end())]
+    };
+    let mut occurrences = source.match_indices("Holder(value)");
+    let (closure_call, _) = occurrences.next().expect("closure invocation");
+    let (outside_call, _) = occurrences.next().expect("sibling control invocation");
+    for (start, occurrence, owner, definition) in [
+        (
+            closure_call,
+            "Holder(value)",
+            "/beacon/run/inner/Holder",
+            "struct Holder(u16);",
+        ),
+        (
+            source
+                .find("crate::Holder(3)")
+                .expect("qualified invocation"),
+            "crate::Holder(3)",
+            "/beacon/Holder",
+            "pub struct Holder(pub u8);",
+        ),
+        (
+            outside_call,
+            "Holder(value)",
+            "/beacon/Holder",
+            "pub struct Holder(pub u8);",
+        ),
+    ] {
+        let edges = semantics
+            .static_occurrences()
+            .iter()
+            .filter(|edge| {
+                edge.role == ReferenceRole::Call && offset_in(edge.binding.range().start()) == start
+            })
+            .collect::<Vec<_>>();
+        let [edge] = edges.as_slice() else {
+            panic!("expected one Call of {occurrence} at {start}, got {edges:?}");
+        };
+        assert_eq!(written(&edge.binding), occurrence);
+        assert!(
+            matches!(&edge.target, NormalizedTarget::Symbol(id) if id.as_str().ends_with(owner)),
+            "{:?}",
+            edge.target
+        );
+        assert_eq!(
+            written(edge.target_binding.as_ref().expect("physical target")),
+            definition
+        );
+    }
+}
+
+#[test]
 fn package_rust_initializer_local_types_do_not_name_the_module_type() {
     use rift_core::ReferenceRole;
     use rift_provider::NormalizedTarget;

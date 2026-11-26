@@ -1830,9 +1830,10 @@ impl File<'_> {
             // An impl through an alias can lack a physical declaration in this unit.
             return true;
         };
+        // Named closures own physical callable bodies just like function items.
         !work.charge()
             || target.symbol.kind != "module"
-                && !(target.symbol.kind == "function"
+                && !(target.symbol.kinds.contains(&SymbolKind::Callable)
                     && target
                         .symbol
                         .body_range
