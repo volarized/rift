@@ -111,6 +111,7 @@ mod tests {
                 ("pages", "function"),
                 ("Router", "class"),
                 ("route", "method"),
+                ("path", "method_parameter"),
                 ("limit", "variable"),
                 ("legacy", "variable"),
             ]
@@ -132,8 +133,10 @@ mod tests {
             [
                 ("Router", None),
                 ("Router.of", Some("Router")),
+                ("Router.of.kind", Some("Router.of")),
                 ("Router.#secret", Some("Router")),
                 ("Router.route", Some("Router")),
+                ("Router.route.path", Some("Router.route")),
             ]
         );
     }
