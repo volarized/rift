@@ -222,6 +222,18 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::SCOPED_FUNCTION_PARAMETER_KIND
     }
 
+    /// Whether this is the written type parameter of a TypeScript declaration.
+    #[must_use]
+    pub fn is_typescript_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this ECMAScript binding uses a package declaration reservation.
+    #[must_use]
+    pub fn is_ecmascript_package_binding(&self) -> bool {
+        self.is_ecmascript_parameter() || self.is_typescript_type_parameter()
+    }
+
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
@@ -230,7 +242,7 @@ impl SyntaxSymbol {
             || self.is_rust_module_source()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
-            || self.is_ecmascript_parameter()
+            || self.is_ecmascript_package_binding()
     }
 }
 

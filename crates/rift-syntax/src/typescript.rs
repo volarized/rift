@@ -202,6 +202,7 @@ mod tests {
             symbols,
             [
                 ("Array", "interface", None),
+                ("Array.T", "typescript_type_parameter", None),
                 ("Array.length", "property", None),
                 (
                     "Array.map",

@@ -2409,3 +2409,69 @@ fn non_entry_lexical_binding_analysis(source: &str, edge_cap: usize) -> PackageA
         .expect("npm manifest");
     PackageAnalyzer::analyze(input, 1).expect("validated publication")
 }
+
+#[test]
+fn typescript_structured_declarations_own_their_written_type_parameters() {
+    const SOURCE: &str = concat!(
+        "export interface Reader<Value> { get(): Value; }\n",
+        "export type Identity<Value> = (value: Value) => Value;\n",
+        "export class Box<Value> { read(value: Value): Value { return value; } }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked generic declarations");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("valid authored type bindings");
+    for (owner, expected) in [("Reader", 1), ("Identity", 2), ("Box", 2)] {
+        let suffix = format!("/{owner}/Value");
+        let start = SOURCE
+            .find(&format!("{owner}<Value>"))
+            .expect("generic owner")
+            + owner.len()
+            + 1;
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, "Value")
+                    && row.source == "Value"
+            })
+            .expect("written type parameter");
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&declaration.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::TypeParameter)
+        }));
+        let end = SOURCE[start..].find('\n').expect("generic declaration end") + start;
+        let ranges = SOURCE[start + 5..end]
+            .match_indices("Value")
+            .map(|(offset, _)| {
+                let range = module_runtime_range(start + 5 + offset, "Value");
+                (range.start, range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ranges.len(), expected);
+        let uses = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::HasType])
+            .map(|edge| {
+                let site = edge.occurrence.as_ref().expect("written type use");
+                assert_eq!(site.unit, declaration.unit);
+                (site.range.start, site.range.end)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(uses, ranges);
+    }
+}

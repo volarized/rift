@@ -23,6 +23,7 @@ pub(super) enum ScopedParameterReads {
     Overload,
     JavaScriptMethod,
     JavaScriptScopedFunction,
+    TypeScriptType,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -88,6 +89,10 @@ impl<'source> Index<'source> {
                 &file.scoped_javascript_parameters,
                 &mut result.deferred_scoped_javascript_parameters,
             ),
+            ScopedParameterReads::TypeScriptType => {
+                self.typescript_type_parameter_uses(file, work, result);
+                return;
+            }
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -102,6 +107,61 @@ impl<'source> Index<'source> {
                 pending.push(occurrence);
             }
         }
+    }
+
+    fn typescript_type_parameter_uses(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return;
+            }
+            if reference.role != ReferenceRole::Type || file.members.contains_key(&reference.target)
+            {
+                continue;
+            }
+            if let Some(occurrence) =
+                self.typescript_type_parameter_use(file, reference.target, work)
+            {
+                result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
+                result.deferred_typescript_type_parameters.push(occurrence);
+            }
+        }
+    }
+
+    fn typescript_type_parameter_use(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let name = file.text(range)?;
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            name,
+            range.start,
+            ReferenceRole::Type,
+            work,
+        )?;
+        let symbol = *file.typescript_type_parameters.get(&binding.name)?;
+        let owner = file.qualified_target(symbol.container.as_deref()?)?;
+        if binding.kind != StaticBindingKind::Shadow
+            || binding.scope != owner.symbol.item_range
+            || !binding.scope.encloses(range)
+        {
+            return None;
+        }
+        let target = Target {
+            file: file.document,
+            symbol,
+        };
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Type, target)?;
+        occurrence.edge_from = Some(self.javascript_identity(owner)?);
+        Some(occurrence)
     }
 
     fn ecmascript_scoped_parameter_read(

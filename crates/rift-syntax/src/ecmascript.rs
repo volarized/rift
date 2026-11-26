@@ -86,6 +86,7 @@ mod members;
 mod overload_parameters;
 pub(crate) mod recovery;
 mod scoped_function_parameters;
+mod type_parameters;
 mod variance;
 
 use tree_sitter::{Node, Parser};
@@ -240,6 +241,7 @@ pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
 pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
+pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -1629,6 +1631,20 @@ impl EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
+        if let Some(name) = type_parameters::declared_name(visited)
+            .and_then(|name| text.get(name.byte_range()))
+            .filter(|name| name.is_ascii() && !name.contains('\\'))
+        {
+            return Ok(Some(Declaration {
+                name: name.to_owned(),
+                kind: TYPE_PARAMETER_KIND,
+                kinds: vec![SymbolKind::Type, SymbolKind::TypeParameter],
+                visibility: None,
+                body_range: None,
+                documentation: Vec::new(),
+                documentation_ranges: Vec::new(),
+            }));
+        }
         if let Some((name, method)) = self
             .kinds
             .ordinary_parameter(visited)
@@ -2095,13 +2111,20 @@ impl GrammarRules for EcmaScriptRules<'_> {
     fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
         self.kinds
             .ordinary_parameter(visited)
-            .map_or_else(|| visited.syntax_element(), |(name, _)| name)
+            .map(|(name, _)| name)
+            .or_else(|| type_parameters::declared_name(visited))
+            .unwrap_or_else(|| visited.syntax_element())
     }
 
     /// Starts the declaration at the statement carrying it, extended over the
     /// `JSDoc` comments attached before that statement.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
-        if let Some((name, _)) = self.kinds.ordinary_parameter(visited) {
+        if let Some(name) = self
+            .kinds
+            .ordinary_parameter(visited)
+            .map(|(name, _)| name)
+            .or_else(|| type_parameters::declared_name(visited))
+        {
             return name.start_byte();
         }
         let statement = self.statement(visited);
@@ -2282,7 +2305,7 @@ pub(crate) fn analyze_included(
         )?;
         facts.set_member_aliases(aliases);
         if !recovered && !tree.root_node().has_error() {
-            append_value_parameters(
+            append_package_parameters(
                 language,
                 tree.root_node(),
                 source.text,
@@ -2332,12 +2355,12 @@ fn parser_for_ranges(
     Ok(parser)
 }
 
-fn append_value_parameters(
+fn append_package_parameters(
     language: &Language,
     root: Node<'_>,
     source: &str,
     symbols: &mut Vec<crate::SyntaxSymbol>,
-    parameters: Vec<crate::SyntaxSymbol>,
+    (parameters, type_parameters): (Vec<crate::SyntaxSymbol>, Vec<crate::SyntaxSymbol>),
     facts: &crate::StaticFacts,
 ) {
     let scoped = if language.name == "typescript" {
@@ -2348,13 +2371,16 @@ fn append_value_parameters(
     append_parameters(symbols, parameters, facts);
     symbols.extend(scoped);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
+    type_parameters::append(symbols, type_parameters, facts);
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
-fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> Vec<crate::SyntaxSymbol> {
+fn take_parameters(
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+) -> (Vec<crate::SyntaxSymbol>, Vec<crate::SyntaxSymbol>) {
     symbols
-        .extract_if(.., |symbol| symbol.is_ecmascript_parameter())
-        .collect()
+        .extract_if(.., |symbol| symbol.is_ecmascript_package_binding())
+        .partition(crate::SyntaxSymbol::is_ecmascript_parameter)
 }
 
 /// An ordinary parameter adds no competing facet of an existing lexical declaration.
@@ -2489,6 +2515,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == SCOPED_FUNCTION_PARAMETER_KIND {
         return Some(SCOPED_FUNCTION_PARAMETER_KIND);
+    }
+    if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(TYPE_PARAMETER_KIND);
     }
     kinds
         .declarations

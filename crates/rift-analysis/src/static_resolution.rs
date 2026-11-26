@@ -132,6 +132,10 @@ pub(crate) struct StaticResolution {
     pub(crate) scoped_javascript_lexical_start: Option<usize>,
     /// Occurrences of separately anchored private bindings after earlier facts.
     pub(crate) deferred_scoped_javascript_lexical: Vec<StaticOccurrence>,
+    /// First occurrence of a written TypeScript type parameter after earlier facts.
+    pub(crate) typescript_type_parameter_start: Option<usize>,
+    /// Type uses awaiting the capacity left by earlier package edges.
+    pub(crate) deferred_typescript_type_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -284,6 +288,10 @@ fn resolve_by<'source>(
     resolution.scoped_javascript_lexical_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_scoped_javascript_lexical,
+    );
+    resolution.typescript_type_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_type_parameters,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -694,6 +702,7 @@ struct File<'source> {
     typescript_overload_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     javascript_method_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -870,6 +879,7 @@ impl<'source> File<'source> {
             typescript_overload_parameters: BTreeMap::new(),
             javascript_method_parameters: BTreeMap::new(),
             scoped_javascript_parameters: BTreeMap::new(),
+            typescript_type_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -1176,6 +1186,8 @@ impl<'source> File<'source> {
             if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
                 self.python_parameters
                     .insert(name, admitted.then_some(symbol));
+            } else if admitted && symbol.is_typescript_type_parameter() {
+                self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && let Some(site) = site {
                 if symbol.is_typescript_signature_parameter() {
                     return;
@@ -1322,24 +1334,34 @@ impl<'source> File<'source> {
         [
             (
                 ScopedParameterReads::Callback,
-                &self.javascript_callback_parameters,
+                !self.javascript_callback_parameters.is_empty(),
             ),
             (
                 ScopedParameterReads::Overload,
-                &self.typescript_overload_parameters,
+                !self.typescript_overload_parameters.is_empty(),
             ),
             (
                 ScopedParameterReads::JavaScriptMethod,
-                &self.javascript_method_parameters,
+                !self.javascript_method_parameters.is_empty(),
             ),
             (
                 ScopedParameterReads::JavaScriptScopedFunction,
-                &self.scoped_javascript_parameters,
+                !self.scoped_javascript_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptType,
+                !self.typescript_type_parameters.is_empty(),
             ),
         ]
         .into_iter()
         .skip(earlier.map_or(0, |class| class as usize + 1))
-        .find_map(|(class, parameters)| (!parameters.is_empty()).then_some(class))
+        .find_map(|(class, present)| present.then_some(class))
+    }
+
+    fn typescript_type_parameter_pass(&self) -> Option<DeferredReferences<'source>> {
+        (!self.typescript_type_parameters.is_empty()).then_some(
+            DeferredReferences::ScopedParameters(ScopedParameterReads::TypeScriptType),
+        )
     }
 
     fn has_python_local_reads(&self) -> bool {
@@ -1913,7 +1935,7 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
-        let mut scoped_parameters = std::array::from_fn::<_, 4, _>(|_| VecDeque::new());
+        let mut scoped_parameters = std::array::from_fn::<_, 5, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -2103,7 +2125,9 @@ impl<'source> Index<'source> {
                     resolution,
                 );
                 if reads.methods.is_empty() {
-                    file_module.then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                    file_module
+                        .then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                        .or_else(|| file.typescript_type_parameter_pass())
                 } else {
                     Some(DeferredReferences::TypeScriptMethodParameters {
                         sites: reads.methods,
@@ -2119,7 +2143,9 @@ impl<'source> Index<'source> {
                     work,
                     resolution,
                 );
-                file_module.then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                file_module
+                    .then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
+                    .or_else(|| file.typescript_type_parameter_pass())
             }
             DeferredReferences::EcmaScriptModuleSpecifiers => {
                 resolution
@@ -2373,7 +2399,8 @@ impl<'source> Index<'source> {
                 (!work.exhausted
                     && (file_module
                         || !parameter_reads.functions.is_empty()
-                        || !parameter_reads.methods.is_empty()))
+                        || !parameter_reads.methods.is_empty()
+                        || !file.typescript_type_parameters.is_empty()))
                 .then_some(DeferredReferences::EcmaScriptParameters {
                     reads: parameter_reads,
                     file_module,

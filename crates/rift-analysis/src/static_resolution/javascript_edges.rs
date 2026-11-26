@@ -352,7 +352,7 @@ impl<'source> Index<'source> {
         let module = self.javascript_module_identity(file, work);
         self.javascript_alias_edges(file, module.as_ref(), work, result);
         for symbol in file.document.facts.symbols() {
-            if symbol.is_ecmascript_parameter() {
+            if symbol.is_ecmascript_package_binding() {
                 continue;
             }
             if !work.charge() {
@@ -714,7 +714,7 @@ impl<'source> Index<'source> {
             return Some(identity.clone());
         }
         for symbol in file.document.facts.symbols() {
-            if symbol.is_ecmascript_parameter() {
+            if symbol.is_ecmascript_package_binding() {
                 continue;
             }
             if !work.charge() {

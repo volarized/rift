@@ -486,7 +486,7 @@ fn declaration_targets<'facts>(
 ) -> BTreeMap<(Option<String>, String), Option<DeclarationTarget<'facts>>> {
     let mut targets = BTreeMap::new();
     for symbol in syntax.symbols() {
-        if symbol.is_ecmascript_parameter() {
+        if symbol.is_ecmascript_package_binding() {
             continue;
         }
         let Some(identity) = anchors.get(&symbol.qualified_name) else {
@@ -1303,7 +1303,7 @@ fn declaration_anchors_with_public(
     // Process containing declarations first without changing the document's source order.
     declarations.sort_by_key(|symbol| symbol.qualified_name.len());
     for symbol in declarations {
-        if symbol.is_ecmascript_parameter()
+        if symbol.is_ecmascript_package_binding()
             && (input.release_version().is_none()
                 || !matches!(
                     input.owner(),
