@@ -194,6 +194,19 @@ impl RiftMcp {
         if local_semantics.is_some() {
             selected = None;
         }
+        let configuration = resolved
+            .published
+            .configuration
+            .search_configuration()
+            .query;
+        if !configuration.local_symbol_inventory
+            && selected.is_none()
+            && needs_local_symbol_inventory(query, local_semantics)
+        {
+            return Ok(Err(coverage_unavailable(vec![
+                ReadWarning::LocalSymbolInventoryUnavailable,
+            ])));
+        }
         let mut acquired = match self
             .prepare_edges(
                 &resolved,
@@ -224,21 +237,6 @@ impl RiftMcp {
             }
             Err(error) => return Err(read_failure(error)),
         };
-        let configuration = resolved
-            .published
-            .configuration
-            .search_configuration()
-            .query;
-        if !configuration.local_symbol_inventory
-            && selected.is_none()
-            && local_semantics.is_none()
-            && exact.is_none()
-            && query.symbol_selection().is_some()
-        {
-            return Ok(Err(coverage_unavailable(vec![
-                ReadWarning::LocalSymbolInventoryUnavailable,
-            ])));
-        }
         let retrieved = match tokio::time::timeout_at(
             deadline.at(),
             Box::pin(self.prepare_retrievals(&resolved, query, limits, deadline)),
@@ -492,6 +490,22 @@ const fn reads_inventory(selection: rift_search::sparql::SymbolSelection<'_>) ->
         selection,
         rift_search::sparql::SymbolSelection::Identified(_)
     )
+}
+
+/// Whether the selected projection needs the inventory of local symbol identities.
+fn needs_local_symbol_inventory(query: &GraphQuery, semantics: Option<SemanticInventory>) -> bool {
+    if let Some(required) = semantics {
+        return required.symbols;
+    }
+    query
+        .history_selection()
+        .or_else(|| {
+            query
+                .syntax_element_selection()
+                .map(|selection| selection.symbols)
+        })
+        .or_else(|| query.symbol_selection())
+        .is_some_and(reads_inventory)
 }
 
 /// What a projection that reads the captured inventory, or one exact selection, reads from.

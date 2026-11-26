@@ -802,6 +802,9 @@ async fn disabled_local_symbol_inventory_refuses_absence_and_keeps_package_reads
         SYMBOL_PAGE,
         SYMBOL_EXISTS,
         "SELECT ?s { ?s a :Symbol; :name 'beacon' }",
+        "SELECT ?name { ?s a :Symbol; :name ?name; :contains ?child }",
+        "SELECT ?element { ?element a :SyntaxElement; :of ?s . ?s :name 'beacon' }",
+        "SELECT ?revision { ?s :introducedIn ?revision . ?revision a :Commit }",
     ] {
         let answer = statement(&client, text).await?;
         assert_eq!(answer["outcome"], "unavailable", "{text}: {answer}");
@@ -831,6 +834,29 @@ async fn disabled_local_symbol_inventory_refuses_absence_and_keeps_package_reads
             .any(|row| query::literal(row, "name").is_ok_and(|name| name == "beacon")),
         "{package}"
     );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_local_symbol_inventory_keeps_an_exact_local_symbol() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", METADATA),
+            ("graph.py", "def beacon() -> int:\n    return 1\n"),
+        ],
+        Some("[search.query]\nlocal_symbol_inventory = false\n".to_owned()),
+    )
+    .await?;
+    let answer = statement(
+        &client,
+        "SELECT ?name { <rift://symbol/local/python/graph/beacon> :name ?name }",
+    )
+    .await?;
+    let [row] = query::rows(&answer)? else {
+        return Err(format!("expected the identified local symbol: {answer}").into());
+    };
+    assert_eq!(query::literal(row, "name")?, "beacon");
     client.cancel().await?;
     Ok(())
 }
