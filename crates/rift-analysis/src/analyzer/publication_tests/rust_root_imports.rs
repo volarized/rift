@@ -1002,3 +1002,83 @@ path='sources/library.rs'
     );
     publication.validate_facts().expect("covered publication");
 }
+
+#[test]
+fn authored_crate_path_tokens_reference_the_selected_library_root() {
+    const LIBRARY: &str = "
+pub mod child;
+pub fn leaf() {}
+pub fn call() { crate::leaf(); }
+#[cfg(any())]
+pub fn inactive() { crate::leaf(); }
+pub(crate) fn private() {}
+";
+    const CHILD: &str = "
+use crate::leaf as imported;
+pub fn run() { crate::leaf(); imported(); }
+";
+    let (publication, files, _, _) = analyze_rust_root(
+        vec![
+            ("src/lib.rs", LIBRARY),
+            ("src/child.rs", CHILD),
+            ("src/main.rs", "fn main() { crate::missing(); }"),
+        ],
+        MANIFEST,
+    )
+    .into_parts();
+    for (path, source, expected) in [
+        (
+            "src/lib.rs",
+            LIBRARY,
+            vec![LIBRARY.find("crate::").expect("written qualifier")],
+        ),
+        (
+            "src/child.rs",
+            CHILD,
+            CHILD
+                .match_indices("crate::")
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let unit = files
+            .iter()
+            .find(|file| file.file().path().as_str() == path)
+            .expect("selected source")
+            .placement()
+            .unit()
+            .to_string();
+        let mut actual = publication
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let occurrence = edge.occurrence.as_ref()?;
+                (edge.to.as_str() == ROOT
+                    && edge.kinds == [EdgeKind::Reads]
+                    && occurrence.unit.0 == unit)
+                    .then_some(occurrence.range.clone())
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|range| range.start);
+        let expected = expected
+            .into_iter()
+            .map(|start| TextRange {
+                start: start as u64,
+                end: (start + 5) as u64,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{source}");
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/call")
+            && edge.to.as_str().ends_with("/leaf")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    assert!(publication.edges.iter().all(|edge| {
+        edge.to.as_str() != ROOT
+            || edge
+                .occurrence
+                .as_ref()
+                .is_none_or(|span| !span.unit.0.ends_with("/src/main.rs"))
+    }));
+}

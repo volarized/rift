@@ -261,6 +261,58 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Resolves explicit crate qualifiers to the selected library's physical declaration.
+    pub(in crate::static_resolution) fn resolve_rust_crate_paths(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let Some(root) = self.files.values().find_map(|file| {
+            Some(Target {
+                file: file.document,
+                symbol: file.rust_library_root?,
+            })
+        }) else {
+            return;
+        };
+        let Some(crate_name) = root.file.placement.module_path().first() else {
+            return;
+        };
+        let start = result.occurrences.len();
+        for file in self.files.values() {
+            if file.document.placement.module().is_none() {
+                continue;
+            }
+            for &range in file.facts.rust_crate_paths() {
+                if !work.charge() {
+                    break;
+                }
+                if file.text(range) != Some("crate")
+                    || file.conditional(range, work)
+                    || file.blocked(range.start, work)
+                    || self
+                        .rust
+                        .module(file, range.start, work)
+                        .and_then(|module| module.first())
+                        != Some(crate_name)
+                {
+                    continue;
+                }
+                if let Some(occurrence) =
+                    self.occurrence(file, range, range, ReferenceRole::Read, root)
+                {
+                    result.record(Some(occurrence));
+                }
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        if result.occurrences.len() != start {
+            result.rust_crate_paths_start = Some(start);
+        }
+    }
+
     /// Reads the module and type tokens written before a qualified callee's final name.
     pub(in crate::static_resolution) fn rust_call_qualifiers(
         &self,

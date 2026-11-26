@@ -17,6 +17,13 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let element = visited.syntax_element();
         let id = element.kind_id();
+        if element.kind() == "crate"
+            && let Some(parent) = visited.parent().map(Visited::syntax_element)
+            && (parent.child_by_field_id(self.path) == Some(element)
+                || parent.kind() == "use_wildcard")
+        {
+            facts.rust_crate_paths.push(byte_range(element)?);
+        }
         let constructor = id == self.local_value_struct
             && element
                 .child_by_field_id(self.body)
