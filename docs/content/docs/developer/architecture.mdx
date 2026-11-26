@@ -20,7 +20,7 @@ HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports).
 <VersionBadge version="v0.0.47" />
 
 A foreground repository server can hold several workspaces from the same Git repository.
-`rift mcp` adopts it when the workspace accepts its settings; automatic startup continues to
+`rift mcp` adopts it when the workspace accepts its settings. Automatic startup continues to
 start a workspace server. Each workspace retains its own index, configuration, watcher, and databases.
 
 The `rift server` coordinates source discovery and providers. Source
@@ -28,7 +28,7 @@ resolvers identify project files, dependencies, and generated code. Providers an
 and produce facts such as symbols, syntax elements, edges, and diagnostics.
 
 The server stores searchable provider output in an embedded index under `.rift`. The
-[`search`](/docs/mcp#tool-search) tool always retrieves lexical matches; when
+[`search`](/docs/mcp#tool-search) tool always retrieves lexical matches. When
 `rift.toml` selects an embedding model, a local model adds vector ranking.
 
 <FlatDiagram
@@ -75,7 +75,7 @@ process the port and token it needs to reach that server. For example:
 ```
 
 When no live server stands behind the file, `rift mcp` starts one. An exclusive file lock
-elects one starter if several processes race; the winner binds a port and publishes the file,
+elects one starter if several processes race. The winner binds a port and publishes the file,
 and the rest connect to it. The winner holds the lock from its election onward, while its
 index prepares source in the background.
 
@@ -104,8 +104,8 @@ token and are not separated by this boundary.
 
 A browser introduces another route to a localhost port: a remote page can issue requests through
 DNS rebinding or a forged origin. The HTTP server therefore accepts only the literal loopback
-`Host` for its bound port. It also rejects a present `Origin` unless that origin is loopback;
-non-browser MCP clients omit `Origin` and still authenticate with the token.
+`Host` for its bound port. It also rejects a present `Origin` unless that origin is loopback.
+Non-browser MCP clients omit `Origin` and still authenticate with the token.
 
 <Callout type="info">
 You might be asking why there's a server at all. Assume your agent launches a couple of
@@ -148,7 +148,7 @@ A served workspace keeps three databases under `.rift`:
 - the index database, `.rift/index`, holds the lexical index `search` ranks from
 - the vectors database, `.rift/vectors`, holds the vector ranking's rows. The server creates it
   at the first vector operation, and never while vector ranking is disabled
-- the metrics database, `.rift/metrics`, holds the server's own log records; under repository
+- the metrics database, `.rift/metrics`, holds the server's own log records. Under repository
   serving, each workspace's metrics database holds the records that name that workspace, and a
   record that names none reaches stderr alone
 
@@ -195,7 +195,7 @@ workspace`.
 
 Each readable project file becomes a source unit in the source catalog, named by a
 [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) such as
-`rift://source/project/src/lib.rs`; a package file the global index answers from takes the same
+`rift://source/project/src/lib.rs`. A package file the global index answers from takes the same
 form. Its
 `location` says whether it belongs to the project, a dependency, the standard library, or an
 external source. Its `source_kind` separately says whether a human authored it or a tool
@@ -297,7 +297,7 @@ installed, downloaded, or written.
 A package's declarations come from the [global index](/docs/vision#index), which holds facts for
 collected OSS package versions. A `global` search reaches collected package and runtime facts selected by the dependency
 context. Explicit `packages` replaces versions of named packages or adds packages the context
-lacks; an omitted list keeps the snapshot context unchanged. An `all` search merges global results with the
+lacks. An omitted list keeps the snapshot context unchanged. An `all` search merges global results with the
 primary project and accepted extra projects. A package declaration is a
 [`Symbol`](/docs/developer/protocol/reference#Symbol) like any other, and its returned `id`
 selects one exact [`get_symbol`](/docs/mcp#get_symbol-scope) read.
@@ -383,7 +383,7 @@ changed byte, and the declarations whose shape changed. Git stays the source of 
 stored commit id names the git object it came from.
 
 One store serves every worktree of a repository. It lives in the `.rift/` folder of the common git
-directory, `.git/.rift/` in a plain checkout, so worktrees analyze the commits they share once; when
+directory, `.git/.rift/` in a plain checkout, so worktrees analyze the commits they share once. When
 that directory refuses writes, the store sits in the worktree's own `.rift/` folder instead.
 
 A history task fills the store. The server spawns it at start, and it analyzes newest first, so
@@ -398,7 +398,7 @@ answered before the fill lands carries a `history_store_filling` warning naming 
 
 The task follows a declaration across files as it analyzes each commit. A deletion and an
 addition carrying one blob id are a rename, and a declaration an added file holds with the exact
-bytes a deleted file held is a move; a blob id or a declaration with more than one candidate pairs
+bytes a deleted file held is a move. A blob id or a declaration with more than one candidate pairs
 nothing, since no evidence says which addition answers which deletion.
 
 ### Custom
@@ -432,11 +432,11 @@ Contributions, so later answers still identify its inputs.
 
 For example, a CSS integration can send templates and configuration to a registered Tailwind CLI,
 parse its generated CSS with a CSS syntax provider, and publish those facts beside authored CSS. The
-server runs the command with declared inputs, environment, timeout, and output limits; the
+server runs the command with declared inputs, environment, timeout, and output limits. The
 composition step decodes its output.
 
 Rift validates the composition's inputs, outputs, merge rules, and cycles before it runs. The server
-then owns scheduling, caching, and invalidation; MCP requests do not assemble or modify the
+then owns scheduling, caching, and invalidation. MCP requests do not assemble or modify the
 composition. Composition controls data flow and provider selection. It cannot establish
 Contribution equivalence or `SymbolRecord` identity.
 
@@ -450,7 +450,7 @@ result carries a `stale_index` entry in `warnings` naming the two tree revision 
 provider with no usable revision contributes nothing, and the result's `warnings` say so.
 
 A read captures one tree revision, one index revision where it searches, and the provider
-revisions it uses. Later writes create new revisions; they do not alter the captured result. A
+revisions it uses. Later writes create new revisions. They do not alter the captured result. A
 request addresses one page with `page`, and a page past the end returns an empty page
 with the true `pages`.
 
@@ -479,7 +479,7 @@ resolved by the publication that completes preparation: an earlier publication h
 reports its static call coverage as unavailable.
 
 Every publication owns its preparation counts and map together, so progress describes the
-answer the caller received. A tree change can reduce those counts; completion applies to the
+answer the caller received. A tree change can reduce those counts. Completion applies to the
 current selection of files.
 
 The server watches the workspace and validates the source each current-tree tool read uses,
@@ -509,12 +509,12 @@ their effective language entry selects. The units persist in the index database 
 
 The rebuilt index becomes current as soon as its syntax index is built, and the units are written
 behind that publication. The store records which bytes each file's rows were derived from, so a
-write, startup's included, touches only the files that moved; the first load of a large workspace
+write, startup's included, touches only the files that moved. The first load of a large workspace
 still runs for longer than a read is willing to wait, so the publication never waits for it.
 
 A search that captures the publication before its transaction lands is ranked by identifier
 matching alone and carries a `lexical_ranking_unavailable` warning naming the tree revision the
-store is still committing; the store's ranking joins the answer once the transaction ends. A
+store is still committing. The store's ranking joins the answer once the transaction ends. A
 transaction that refuses leaves the previous rows and stamp intact and is recorded in
 [`rift server logs`](/docs/developer/implementation#server-logs), and the next publication compares every file with
 what the store recorded rather than applying its change on top of rows the store missed.
@@ -551,8 +551,8 @@ exclusion remains the way to keep such files out of the walk altogether.
 Under the default [`[search.text]`](/docs/developer/configuration#search)
 `large_files = "split"`, a file past [`[providers.syntax]`](/docs/developer/configuration#providers)
 `max_file` stays in the index as text the syntax provider does not parse: search reads it in
-chunks, its declarations are absent, and the index build records it in `rift server logs`;
-symbol enumeration answers over the declarations the index holds, as if the source policy had
+chunks, its declarations are absent, and the index build records it in `rift server logs`.
+Symbol enumeration answers over the declarations the index holds, as if the source policy had
 excluded the file. Under `skip` the per-file byte bound is `max_file`, so such a file is left out as above,
 and a file past `max_chunk` keeps no text in search, which a search whose `paths` reach it counts
 in a `large_file_skipped` warning.
@@ -621,14 +621,14 @@ translated copies by default. The [`[documentation]`](/docs/developer/configurat
 table overrides that default for the workspace.
 
 Each regular source keeps its existing text chunks. Notebook markdown and code cells receive
-separate content owners; outputs and raw notebook JSON stay outside ranking. Collection records
+separate content owners. Outputs and raw notebook JSON stay outside ranking. Collection records
 block ranges, headings, links, source digests, and exact-symbol references beside those owners.
 It neither executes code nor follows links to acquire more sources.
 
 Before fusion, the read maps existing ranked documents to block identities and keeps the best
 position once per ranking input. A heading and its text chunk therefore return one documentation
-hit. Under `target: "all"`, an attached comment keeps its symbol result when that symbol answered;
-a file match outside the comment remains a file result.
+hit. Under `target: "all"`, an attached comment keeps its symbol result when that symbol answered.
+A file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
 `get_symbol` with its established `id` and `include: {"documentation": true}`. The reference resolves only
@@ -664,9 +664,9 @@ index's exact hit.
 
 The rankings below answer, and their answers fuse together:
 
-- **identifier matching** over the declaration names, for the identifiers the query carried;
+- **identifier matching** over the declaration names, for the identifiers the query carried
 - **full-text matching** over the document's searchable fields, by
-  [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) under the weights above;
+  [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) under the weights above
 - **vector similarity** over the embedded declarations, when a model is configured and its
   vectors are in.
 
@@ -683,7 +683,7 @@ alone and combines them by weighted reciprocal rank.
 sets how sharply a top rank counts, and `identifier_weight`, `lexical_weight`, and
 `vector_weight` set each input's share. Only the inputs that answered take part, so an
 unavailable vector ranking contributes nothing and leaves the order the other two state.
-Several selected indexes may each contribute one kind; that kind's share then splits among
+Several selected indexes may each contribute one kind. That kind's share then splits among
 them, so reaching for the global index does not double what full-text matching is worth.
 
 Fusion holds no project path and resolves no symbol. It answers ordered identities, and the
@@ -735,7 +735,7 @@ configuration key, a line from a traceback - has handed the full-text ranking an
 score, while the embedding maps that name into a space where its near neighbours crowd it.
 
 A declaration is embedded as its own source under its qualified name. The name carries the
-module the source doesn't state; the source carries the identifiers and documentation an
+module the source doesn't state. The source carries the identifiers and documentation an
 encoder trained on code reads best. The path is left out, because the full-text ranking already
 covers it.
 
@@ -762,11 +762,11 @@ the other two inputs and says so, rather than waiting for a model to load.
 ### Retrieve symbol
 
 [`get_symbol`](/docs/mcp#tool-get_symbol) reads one logical symbol by its canonical `id`.
-The answer separates the symbol from its declaration bindings; [`facets`](/docs/mcp#tool-facets)
+The answer separates the symbol from its declaration bindings. [`facets`](/docs/mcp#tool-facets)
 reads a declaration's source. The answer names the `revision` it was read at, and its
 `page` selects declarations at that revision.
 
-A Symbol carries `id` when the index established one identity for the declaration; a symbol
+A Symbol carries `id` when the index established one identity for the declaration. A symbol
 the providers could not settle answers without an `id`, and a retained provider disagreement
 lands as a `symbol_disagreement` entry in the result's `warnings`.
 

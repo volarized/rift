@@ -12,10 +12,39 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let command = parse_command(arguments)?;
     let root = workspace_root()?;
-    execute(root, command)
+    match arguments {
+        [group, command] if group == "docs-examples" => {
+            if !matches!(command.as_str(), "generate" | "check") {
+                return Err(USAGE.into());
+            }
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let status = std::process::Command::new(cargo)
+                .current_dir(root)
+                .env("RIFT_DOCS_EXAMPLES", command)
+                .args([
+                    "test",
+                    "--locked",
+                    "-p",
+                    "rift-mcp",
+                    "--test",
+                    "docs_examples",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                    "capture_docs_examples",
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(format!("docs example capture failed: {status}").into());
+            }
+            Ok(())
+        }
+        _ => execute(root, parse_command(arguments)?),
+    }
 }
+
+const USAGE: &str = "usage: cargo xtask <errors|docs-examples> <generate|check>";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
@@ -27,7 +56,7 @@ fn parse_command(arguments: &[String]) -> Result<Command, &'static str> {
     match arguments {
         [group, command] if group == "errors" && command == "generate" => Ok(Command::Generate),
         [group, command] if group == "errors" && command == "check" => Ok(Command::Check),
-        _ => Err("usage: cargo xtask errors <generate|check>"),
+        _ => Err(USAGE),
     }
 }
 

@@ -157,8 +157,20 @@ html:has(.landing-page) {
   height: 1.45rem;
 }
 
+.landing-stop--hero {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 1rem;
+}
+
 .landing-stop__panel--hero {
   inline-size: 100%;
+}
+
+.landing-stop__actions {
+  align-self: flex-start;
+  max-inline-size: 100%;
 }
 
 .landing-stop__intro {

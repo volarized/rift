@@ -45,6 +45,33 @@ function Body({ children }: { children: React.ReactNode }) {
   );
 }
 
+function StartLinks({ className }: { className?: string }) {
+  return (
+    <div className={cn("flex flex-wrap items-center gap-2 sm:gap-3", className)}>
+      <Link
+        href="/docs/installation"
+        className={cn(
+          buttonVariants({ size: "lg" }),
+          "font-mono font-semibold tracking-wide dark:shadow-[0_0_24px] dark:shadow-primary/35",
+        )}
+      >
+        Install
+        <ArrowRightIcon weight="bold" className="h-4 w-4" />
+      </Link>
+      <Link
+        href="/docs"
+        className={cn(
+          buttonVariants({ variant: "outline", size: "lg" }),
+          "font-mono tracking-wide",
+        )}
+      >
+        Read the docs
+        <ArrowRightIcon weight="bold" className="h-4 w-4 text-primary-text" />
+      </Link>
+    </div>
+  );
+}
+
 function Stop({
   children,
   id,
@@ -65,6 +92,7 @@ function Stop({
       className={cn(
         "landing-stop",
         alternate && "landing-stop--alternate",
+        hero && "landing-stop--hero",
         finale && "landing-stop--finale",
       )}
     >
@@ -73,6 +101,11 @@ function Stop({
           {children}
         </div>
       </LandingPanel>
+      {hero && (
+        <LandingPanel className="landing-stop__actions">
+          <StartLinks className="p-4 sm:px-6" />
+        </LandingPanel>
+      )}
       {finale && <div className="landing-stop__sphere" aria-hidden="true" />}
     </section>
   );
@@ -118,28 +151,7 @@ export default function HomePage() {
 
       <Stop id="get-started" finale>
         <Statement>Bring understanding and cohesiveness to your agentic workflow</Statement>
-        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <Link
-            href="/docs/installation"
-            className={cn(
-              buttonVariants({ size: "lg" }),
-              "font-mono font-semibold tracking-wide dark:shadow-[0_0_24px] dark:shadow-primary/35",
-            )}
-          >
-            Install
-            <ArrowRightIcon weight="bold" className="h-4 w-4" />
-          </Link>
-          <Link
-            href="/docs"
-            className={cn(
-              buttonVariants({ variant: "outline", size: "lg" }),
-              "font-mono tracking-wide",
-            )}
-          >
-            Read the docs
-            <ArrowRightIcon weight="bold" className="h-4 w-4 text-primary-text" />
-          </Link>
-        </div>
+        <StartLinks />
       </Stop>
     </div>
   );

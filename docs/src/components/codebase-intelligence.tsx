@@ -78,7 +78,7 @@ const CHART = `
     global_context --> global_search
     global_search --> global_ranking
     global_ranking --> global_mcp
-    global_ranking -. "API · global / all · project package context" .-> local_mcp
+    global_ranking -. "API with project package context (global or all)" .-> local_mcp
 `;
 
 function Logo({ name, size = 24 }: { name: string; size?: number }) {
@@ -130,18 +130,16 @@ export function CodebaseIntelligence() {
       </div>
       <FlatDiagram
         chart={CHART}
-        alt="Static analysis connects calls to declarations using syntax. Language servers and in-process engines supply semantic facts. The planned global index applies these layers to collected package versions. Local hybrid search combines identifier, BM25, and vector rankings through weighted reciprocal rank fusion."
+        alt="Static analysis connects calls to declarations using syntax. Language servers and in-process engines supply semantic facts. The global index holds facts for collected package versions. Local hybrid search combines identifier, BM25, and vector rankings through weighted reciprocal rank fusion."
         variant="soft"
         icons={ICONS}
         nodeBadges={{
-          global_mcp: "Planned",
           global_static: "Planned",
           local_documentation: "Planned",
           global_documentation: "Planned",
           global_search: "Planned",
           global_ranking: "Planned",
         }}
-        groupBadges={{ global: "Planned" }}
         connectorRoutes={{
           "global_ranking->global_mcp": { from: "top", to: "bottom" },
           "global_ranking->local_mcp": { from: "left", to: "right" },
@@ -246,7 +244,7 @@ const LANGUAGES: LanguageSummary[] = [
     local: ["Syntax", "LSP"],
     global: ["Syntax", "LSP"],
     description:
-      "Syntax providers preserve templates, styles, and embedded JavaScript or TypeScript ranges. Angular template ownership follows component declarations or explicit configuration. Tailwind context publishes authored utilities and variants; dynamic expressions retain source facts and warnings. Compiler resolution remains separate.",
+      "Syntax providers preserve templates, styles, and embedded JavaScript or TypeScript ranges. Angular template ownership follows component declarations or explicit configuration. Tailwind context publishes authored utilities and variants. Dynamic expressions retain source facts and warnings. Compiler resolution remains separate.",
   },
   {
     name: "C / C++ / Cython",
@@ -254,7 +252,7 @@ const LANGUAGES: LanguageSummary[] = [
     local: ["Syntax", "LSP"],
     global: ["Syntax", "LSP"],
     description:
-      "Syntax providers extract native declarations and include syntax. The .h extension selects C by default; C++ headers require explicit language selection. Cython keeps its own source identity for .pyx, .pxd, and .pxi files.",
+      "Syntax providers extract native declarations and include syntax. The .h extension selects C by default. C++ headers require explicit language selection. Cython keeps its own source identity for .pyx, .pxd, and .pxi files.",
   },
   {
     name: "Markdown / JSON / JSONC / YAML / TOML",

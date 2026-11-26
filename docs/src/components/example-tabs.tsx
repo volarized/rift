@@ -1,5 +1,6 @@
 import {
   BracketsCurlyIcon,
+  CodeIcon,
   PlugsConnectedIcon,
   TextAlignLeftIcon,
 } from "@phosphor-icons/react/ssr";
@@ -8,6 +9,7 @@ import type { ReactNode } from "react";
 
 // The views one example can show, with the title and icon of each tab.
 const views = {
+  query: { label: "SPARQL query", icon: CodeIcon },
   call: { label: "MCP call", icon: PlugsConnectedIcon },
   text: { label: "Text response", icon: TextAlignLeftIcon },
   json: { label: "JSON response", icon: BracketsCurlyIcon },

@@ -112,13 +112,20 @@ function useRoadStops(host: RefObject<HTMLDivElement | null>, enabled: boolean) 
     const measure = () => {
       frame = 0;
       const viewport = element.getBoundingClientRect();
-      if (!viewport.width || !viewport.height || panels.length < 2) return;
+      const sphereBox = sphere.getBoundingClientRect();
+      if (
+        !viewport.width ||
+        !viewport.height ||
+        !sphereBox.width ||
+        !sphereBox.height ||
+        panels.length < 2
+      )
+        return;
       const compact = viewport.width < 768;
       const units = viewHeight(viewport.width) / viewport.height;
       const center = viewport.left + viewport.width / 2;
       const { start, end } = scrollBounds();
       const scroll = window.scrollY;
-      const sphereBox = sphere.getBoundingClientRect();
       const finalSnap = THREE.MathUtils.clamp(
         scroll + finale.getBoundingClientRect().top - start,
         0,

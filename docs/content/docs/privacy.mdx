@@ -17,7 +17,7 @@ recognized agent category, operation, HTTP method, and response status. Download
 also include recognized release and platform. Other release tags share an unknown category.
 
 The service derives country from the request's network location. An existing User-Agent header
-can identify Codex or Claude; other callers share one category. These values describe the
+can identify Codex or Claude. Other callers share one category. These values describe the
 request, so a proxy can change the country and a caller can change the agent category.
 
 The counters contain no IP addresses, installation identifiers, account identifiers, raw
@@ -54,13 +54,13 @@ The first command writes `[telemetry] disabled = true` in the current directory'
 The second writes it in `~/.rift/config.toml`. A global disable takes precedence over a
 project's setting.
 `RIFT_TELEMETRY_DISABLED=true` also disables counters. A `false` value removes only that
-source's disable; it cannot override another source's disable. Downloads and API use continue
+source's disable. It cannot override another source's disable. Downloads and API use continue
 to work.
 
-Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` in their environment; they do
-not read these TOML files. Other API clients can send `DNT: 1`. Opt-out excludes future requests; previous counters
+Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` in their environment. They do
+not read these TOML files. Other API clients can send `DNT: 1`. Opt-out excludes future requests. Previous counters
 expire under their retention policy. These
-settings control Rift's counters; Cloudflare and GitHub have separate processing described below.
+settings control Rift's counters. Cloudflare and GitHub have separate processing described below.
 
 ## Feedback reports
 

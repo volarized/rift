@@ -1,7 +1,7 @@
 # Documentation site
 
 This directory contains the Fumadocs site for Rift. Hand-written pages live under
-`content/docs`; installation, the MCP surface, and usage are top-level pages, while
+`content/docs`. Installation, the MCP surface, and usage are top-level pages, while
 architecture, implementation, configuration, testing, and protocol details live under
 `content/docs/developer`. `public/mcp.json` carries the served MCP tool surface exported from
 the Rust workspace.
@@ -28,6 +28,13 @@ Use these checks for documentation changes:
 bun run lint
 bun run build
 ```
+
+Write prose without middle dots, semicolons, em dashes, or en dashes. Preserve literal punctuation
+in code examples and protocol output.
+
+The example project, map, and search responses are captured from a local Rift MCP server.
+Run `cargo xtask docs-examples generate` from the repository root to refresh the JSON artifact.
+Run `cargo xtask docs-examples check` to compare it with a fresh capture.
 
 `bun run pack` copies the static export into `dist/rift` with the deployment base path applied.
 Generated directories such as `.next`, `.source`, `out`, and `dist` aren't source files and shouldn't

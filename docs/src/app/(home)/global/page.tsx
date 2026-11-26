@@ -35,7 +35,7 @@ export default function GlobalPage() {
               </Command>
             </div>
             <p className="text-muted-foreground">
-              The API accepts anonymous requests. It records daily request counts; a{" "}
+              The API accepts anonymous requests and records daily request counts. A{" "}
               <code className="font-mono text-[13px]">DNT: 1</code> header opts out - see{" "}
               <Link
                 className="underline underline-offset-2 hover:text-foreground"

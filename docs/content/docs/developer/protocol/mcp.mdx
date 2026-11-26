@@ -10,7 +10,8 @@ limits, and failures. For an introduction through an agent's workflow, see the
 [MCP guide](/docs/mcp).
 
 The expandable tool properties and examples come from the served [JSON schema](https://volar.sh/rift/mcp.json).
-A result example on this page shows one answer in two tabs: its compact text and its JSON.
+A recorded example shows the MCP call, compact text, and JSON. Search examples also show
+the SPARQL query on its own.
 [Result content](#result-content) defines the compact text.
 
 ## Map [#resource-map]
@@ -30,7 +31,6 @@ codebase. The answer carries:
   count descending
 - `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
   `name`, then selector order
-- `pagination` - always page zero of one, the whole map on one page
 
 During local preparation, file counts and documentation paths can describe discovered files
 before their declarations are prepared. Symbol counts describe prepared declarations. The
@@ -81,12 +81,10 @@ server recommendations. Each text section shows up to eight entries. With
 <McpTool name="search" />
 
 `search` accepts `query: string` and optional `language: "sparql"`. `language` defaults to
-`sparql`; unknown languages and former top-level selectors fail request validation. The
+`sparql`. Unknown languages and former top-level selectors fail request validation. The
 query uses the library's SPARQL parser, algebra, and evaluator over immutable selected facts.
 
-```json
-{ "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } ORDER BY ?name LIMIT 20", "language": "sparql" }
-```
+<ReadExample name="select-symbols" />
 
 ### Vocabulary and terms
 
@@ -120,7 +118,7 @@ entire graph and its only subject is an unreferenced blank node, text groups tha
 properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct. Structured
 content carries the exact RDF terms and identities.
 
-`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine fact. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
+`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine fact. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms. Bounds still refuse incomplete admission.
 
 ### Full-text search [#search-fulltext]
 
@@ -128,31 +126,21 @@ The local `SERVICE :search` reuses identifier, lexical, and available vector ran
 constant input triples select the producer request, while its graph pattern projects and
 filters the acquired records:
 
-```sparql
-SELECT ?symbol ?name ?source ?score {
-  SERVICE :search {
-    ?hit :query "loads workspace configuration"; :target "symbol";
-         :symbol ?symbol; :source ?source; :score ?score .
-    ?symbol :name ?name
-  }
-}
-ORDER BY DESC(?score)
-LIMIT 5
-```
+<ReadExample name="full-text" />
 
 `:query`, `:pattern`, `:scope`, `:target`, `:order`, `:rev`, `:paths`, `:packages`, `:include`,
 `:change`, `:max_results`, `:page`, and `:view` retain their producer meanings inside the service. Structured inputs
-use `rdf:JSON` literals. Conflicting constant inputs refuse. Portable categories use `:kinds`; the language-specific string uses `:kind`.
+use `rdf:JSON` literals. Conflicting constant inputs refuse. Portable categories use `:kinds`. The language-specific string uses `:kind`.
 Requesting `:source` and `:score` projects the corresponding producer payload. Service input triples select records rather than
 require those input values as stored facts on every result.
 
 `:max_results` and `:page` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
-SPARQL result after evaluation. Missing producer coverage can make the query unavailable; a
+SPARQL result after evaluation. Missing producer coverage can make the query unavailable. A
 producer bound does not. When a producer stops at one of its bounds (`results_truncated`,
 `lexical_ranking_truncated`, `pattern_matches_truncated`, `query_narrowed`, `change_truncated`),
 or the server reaches the solution, byte, or page bound of the producer pages it reads, the
 query evaluates over the rows the producer returned and pages them, with `pagination.total`
-counting those rows. `rift server logs` records the bound; the answer carries no warning for it.
+counting those rows. `rift server logs` records the bound. The answer carries no warning for it.
 A package answered from the nearest collected release under `package_substituted` is covered.
 A global API read that fails answers `unavailable` with reason `read_failed`, and
 `rift server logs` names its `failure_class`.
@@ -162,32 +150,19 @@ A global API read that fails answers `unavailable` with reason `read_failed`, an
 `:pattern` in `SERVICE :search` uses the existing Rust regex matcher and trigram candidate
 index. It preserves every file match, including several matches in one declaration:
 
-```sparql
-SELECT ?path ?start ?end ?source {
-  SERVICE :search {
-    ?hit :pattern "tokio::[A-Za-z_]+"; :target "file";
-         :path ?path; :start ?start; :end ?end; :source ?source
-  }
-}
-ORDER BY ?path ?start
-```
+<ReadExample name="regex" />
 
 Matching runs line by line. `(?i)` selects case-insensitive matching. Existing pattern length,
 compiled size, candidate rows, verified text size, and matches-per-file bounds remain in
 effect. Invalid patterns refuse with the registered field error. A pattern index that is still
-preparing cannot be evaluated as a complete graph, boolean, aggregate, or binding result; the
+preparing cannot be evaluated as a complete graph, boolean, aggregate, or binding result. The
 matches a bound kept answer as the producer returned them.
 
 ### References and calls [#search-traversal]
 
 Graph predicates replace the former `traversal` selector:
 
-```sparql
-SELECT ?usage ?unit ?start ?end {
-  <symbol-id> :usages ?usage .
-  ?usage :range [ :unit ?unit; :start ?start; :end ?end ]
-}
-```
+<ReadExample name="physical-usages" />
 
 `:usages` exposes raw physical occurrences. Each occurrence retains target, enclosing symbol
 when established, source unit, byte range, and supplied kinds. Repeated locations in one
@@ -196,14 +171,14 @@ supplied under two kinds has one occurrence identity with both kinds.
 
 Symbol adjacency remains separate:
 
-```sparql
-SELECT ?caller { ?caller :references <symbol-id> }
-SELECT ?callee { <symbol-id> :calls/:calls/:calls ?callee }
-SELECT ?caller { <symbol-id> ^:references+ ?caller }
-```
+<ReadExample name="references" />
+
+<ReadExample name="calls" />
+
+<ReadExample name="transitive-references" />
 
 The library evaluates property paths, unions, filters, subqueries, aggregates, and negation.
-Acquisition may restrict a proven anchored shape to its required frontier; otherwise it
+Acquisition may restrict a proven anchored shape to its required frontier. Otherwise it
 acquires the complete required domain. A valid generic query cannot be rejected solely for
 not matching an acquisition optimization. Requested depth counts edges rather than shortest
 paths. Cycles and duplicate intermediate bindings follow SPARQL semantics.
@@ -218,7 +193,7 @@ evaluation share cancellation and request bounds.
 Dependency continuation uses admitted source ownership and exact selected context. Supported
 complete-empty facts establish an empty answer. Unsupported kinds, an incomplete publication,
 missing source authority, or a bound reached before completeness returns explicit
-unavailability. Global query serving reads existing collected facts; it does not collect,
+unavailability. Global query serving reads existing collected facts. It does not collect,
 ingest, or backfill global language-engine facts. Local request facts do not enter collection.
 
 ### Flow search [#search-flows]
@@ -230,20 +205,7 @@ can follow calls into and out of a matched symbol, so that symbol can be a step 
 The caller supplies a constant string in `:query` and may supply an integer `:max_results` from 1 to 32.
 The default is 5. The server rejects conflicting inputs before it runs retrieval.
 
-**Query**
-
-```sparql
-SELECT ?flow ?score ?index ?symbol {
-  SERVICE :flows {
-    ?flow :query "authentication middleware";
-          :max_results 5;
-          :score ?score;
-          :steps ?step .
-    ?step :index ?index; :value ?symbol .
-  }
-}
-ORDER BY DESC(?score) ?flow ?index
-```
+<ReadExample name="flows" />
 
 `:steps` links a flow to its ordered steps. Each step carries a zero-based `:index` and a
 `:value` that identifies the symbol. The caller can join that value with symbol facts such as
@@ -274,17 +236,7 @@ bound, narrow the flow query and run it again to discover paths within that requ
 
 `:change` selects the existing revision-comparison producer inside `SERVICE :search`:
 
-```sparql
-SELECT ?symbol ?kind ?base_path ?head_path {
-  SERVICE :search {
-    ?hit :change '{"base":"main","head":"HEAD"}'^^rdf:JSON;
-         :symbol ?symbol; :change ?change .
-    ?change :kind ?kind .
-    OPTIONAL { ?change :base_path ?base_path }
-    OPTIONAL { ?change :head_path ?head_path }
-  }
-}
-```
+<ReadExample name="changes" />
 
 The producer keeps existing classifications, base and head identities, source selection, and
 history bounds. A working-tree head uses `{"kind":"working_tree"}`. Unsupported combinations
@@ -295,15 +247,7 @@ SPARQL evaluates the selected records.
 
 `:target "commit"` selects the existing commit-message producer:
 
-```sparql
-SELECT ?message ?revision {
-  SERVICE :search {
-    ?hit :target "commit"; :query "change path bound"; :hit ?record .
-    ?record :commit ?commit .
-    ?commit :message ?message; :revision ?revision
-  }
-}
-```
+<ReadExample name="commits" />
 
 Commit records preserve message, truncation fields, author, timestamp, revision, and ordered
 paths. A filling or bounded history store cannot establish an answer requiring facts it has
@@ -311,7 +255,7 @@ not supplied. Existing history selection and commit-search refusals remain typed
 
 ### Package scope [#search-scope]
 
-`:scope "local"` selects the primary project; accepted `local@name` and `local@name:profile` contexts
+`:scope "local"` selects the primary project. Accepted `local@name` and `local@name:profile` contexts
 select an extra project or profile. `:scope "global"` selects dependency facts and `:scope "all"`
 combines accepted contexts. `:packages` carries requested package selections as an `rdf:JSON`
 literal, such as `'[{"manager":"cargo","registry":"crates.io","name":"serde_core"}]'^^rdf:JSON`.
@@ -347,7 +291,7 @@ other answer, and `rift server logs` records the bound and its value.
 
 A query over the captured inventory - every symbol, call, reference, or usage it holds - answers
 from partly covered facts. This holds for a `SELECT` that joins, projects, filters, binds, orders,
-or slices, and for an `ASK` that finds a witness; every row such an answer returns stands.
+or slices, and for an `ASK` that finds a witness. Every row such an answer returns stands.
 
 The answer's warnings name what is missing:
 
@@ -356,9 +300,9 @@ The answer's warnings name what is missing:
   per-file byte bound, past `[providers.syntax]` `max_file`, or past the declarations the index
   holds - is outside the indexed set, as a file the source policy excludes is: no answer names
   it, and `rift server logs` records it
-- `framework_context_unresolved` - a framework whose context is unresolved; the file's ordinary
+- `framework_context_unresolved` - a framework whose context is unresolved. The file's ordinary
   declarations still answer
-- `engine_analysis_unavailable` - a language whose engine analysis is missing; the captured static
+- `engine_analysis_unavailable` - a language whose engine analysis is missing. The captured static
   facts still answer
 
 Any other query needs complete coverage and returns `insufficient_coverage` with the same warnings:
@@ -369,7 +313,7 @@ Any other query needs complete coverage and returns `insufficient_coverage` with
 - a graph result
 
 Available-empty facts differ from unavailable facts. A query needing only published symbol names does not require
-unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved; query evaluation
+unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved. Query evaluation
 does not reparse source to manufacture a complete syntax family.
 
 ### Migration
@@ -384,7 +328,7 @@ producers. Send `page` and `max_results` for answer pages.
 <McpTool name="get_symbol" />
 
 `id` selects one canonical logical symbol. Ownership and language are encoded in that
-identity; declaration source addresses remain separate. `get_symbol` accepts neither
+identity. Declaration source addresses remain separate. `get_symbol` accepts neither
 name discovery nor `scope`, `packages`, or `limit`.
 
 Every declaration of one qualified path binds to that one identity, so `declarations` lists
@@ -398,7 +342,7 @@ object. A runtime symbol's answer names the runtime release it read as `revision
 
 <ReadExample name="runtime-symbol" />
 
-`missing` means the exact selection was searched completely; `symbol_not_found`
+`missing` means the exact selection was searched completely. `symbol_not_found`
 names the requested identity and up to three actual structural alternatives. An incomplete
 selection answers `unavailable` with a typed reason.
 
@@ -443,12 +387,12 @@ from the served revision and answers edges from the symbol. The commit edges com
 declaration move came from, and `removed_in`. Each names its commit as a
 `rift://revision/git/<commit>` revision and the path the declaration lived at in it. A commit
 whose source cannot be parsed, or where the symbol is absent, contributes no edge. Commit author
-name and email remain the commit's author; timestamps remain committer time.
+name and email remain the commit's author. Timestamps remain committer time.
 
 The `co_changes` edges follow the commit edges, most shared commits first, then by symbol. Each
 names a symbol the served tree binds to a declaration one of the listed commits changed, and the
 number of listed commits that changed both. A commit that changed more than 256 declarations
-counts toward no co-change edge, and the server answers at most 32 of them;
+counts toward no co-change edge, and the server answers at most 32 of them.
 `co_changes_truncated` counts the commits and symbols past those bounds and is absent when they
 left out nothing.
 
@@ -526,7 +470,7 @@ The server reads package and runtime symbols through the global API. The answer'
 a release of the symbol's owner with `invalid_request`.
 
 `max_results` defaults to 10 and accepts 1 through 100. The source bound is 1 MiB across the
-syntax elements. A page above that byte bound returns a typed error; the caller can reduce
+syntax elements. A page above that byte bound returns a typed error. The caller can reduce
 `max_results`. A declaration's syntax structure stays with its source. The caller sends the same
 symbol and revision for later pages.
 
@@ -567,7 +511,7 @@ Callers read code through these tools:
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
-The index never follows or indexes a symlink, so no read returns one; the file a link points
+The index never follows or indexes a symlink, so no read returns one. The file a link points
 at answers under its own path.
 
 `search`, `get_symbol`, and `facets` accept `page` and `max_results`. The response names the
@@ -578,7 +522,7 @@ A `stale_index` record names the revision an answer used and the newer tree revi
 
 The server logs `local_index_preparing` while the requested local scope remains
 incomplete. `prepared` counts visible files whose capture and analysis finished, including files
-refused under an accepted bound; `total` is omitted until discovery finishes. `ready_in` is
+refused under an accepted bound. `total` is omitted until discovery finishes. `ready_in` is
 omitted because the server has no preparation estimate.
 
 An exact symbol read cannot establish complete declaration coverage while selected files
@@ -590,7 +534,7 @@ and `pattern_index_preparing` warnings of its read. The text of that answer open
 counts, such as `unavailable · indexing is in progress (2048 of 3951 files)`.
 
 The server also logs `stale_index` when the last rebuild failed, with a `detail`
-naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
+naming the failure. The next filesystem event retries the rebuild. When its two digests are equal,
 the tree moved in recorded files outside the syntax-indexed ones or in the configuration file, and
 `detail` says which.
 
@@ -599,24 +543,24 @@ The server logs diagnostics for ranking and result bounds:
 - `vector_index_preparing` - the vector ranking holds no vectors for the tree this answer
   was read from: the pass over that tree is still running, or the tree was published after
   the corpus the ranking holds was described. A query sharing no token with the code it
-  describes reaches nothing until that pass lands; `prepared` and `total` state how far it
+  describes reaches nothing until that pass lands. `prepared` and `total` state how far it
   has progressed.
 - `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
   server: the model weights could not be acquired, or the model failed to load.
 - `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
   missed a commit, holds no indexed tree, failed to load, got no database connection within
   `[search] busy_timeout`, or still answers for a newer publication after the request's capture
-  attempts; the `detail` names which, with the tree revision in the first three cases. Ranking
+  attempts. The `detail` names which, with the tree revision in the first three cases. Ranking
   falls back to identifier matching, so a query phrased as prose finds nothing. The tier is read
   under the answer's own tree revision, so one that has moved past it is recaptured, up to those
   attempts, before the server logs the fallback. A later search can use the full-text tier after
   the commit lands.
 - `history_store_filling` - a [commit search](#search-commits) answered while the history store
-  lacks some of the commits its latest fill selects, or the commit `HEAD` names; `analyzed` and
+  lacks some of the commits its latest fill selects, or the commit `HEAD` names. `analyzed` and
   `total` state how far the fill has got.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `pages` counts the units
-  that did; a narrower `query` brings the rest inside the bound.
+  that did. A narrower `query` brings the rest inside the bound.
 - `documentation_unavailable` - the documentation this search projects onto crossed a bound, so
   no documentation block joins the answer and declarations and files answer as they would without
   it. The `detail` names the documentation left out - the project's, the `force_include` files',
@@ -636,7 +580,7 @@ provider's own facts disagree.
 A `source_unavailable` record names a file the index left out - bytes that are not valid UTF-8,
 a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
 lookup while every other file stays available. A read logs at most eight omitted files in
-project-path order, followed by a `source_unavailable` summary if more files were omitted; a
+project-path order, followed by a `source_unavailable` summary if more files were omitted. A
 file a bound left out is not among them. The index build records each omission with its bound
 and measured value, one record per file for the first 64 files one build reads, then one record
 per publication counting the rest.
@@ -649,15 +593,15 @@ Text search can produce these diagnostics:
 - `pattern_index_preparing` - the trigram index lacks rows of stored file text, and verifying them
   beside the selected rows would pass `pattern_candidate_rows` or `pattern_verified_size`, so a
   match in those rows is missing from the answer. `prepared` counts the rows the index holds and
-  `total` the rows the store holds; the warning stops once the index has caught up.
+  `total` the rows the store holds. The warning stops once the index has caught up.
 - `large_file_skipped` - under `[search.text] large_files = "skip"`, files past `max_chunk` are
-  left out of the text index; `skipped` counts the ones the request's `paths` reach. A
+  left out of the text index. `skipped` counts the ones the request's `paths` reach. A
   declaration such a file holds still answers.
 - `large_file_unparsed` - files past `[providers.syntax] max_file` are held as text the syntax
   provider does not parse: their text answers `search`, and none of their declarations answers a
   symbol hit or `get_symbol`. `files` names them, at most eight, in project-path order. An
   answer carries it only for files the request names in `paths.force_include` or a
-  comparison; the index build records every other such file in the log.
+  comparison. The index build records every other such file in the log.
 - `lockfile_excluded` - a lockfile the request's `paths.include` selects is left out of search
   under the `[search.text]` key `excluded_lockfiles`. `rift://map` still carries the versions it
   pins, and naming the file in `paths.force_include` searches it for one request.
@@ -783,7 +727,7 @@ A tree revision reads the working tree the index serves. The server **MUST** ref
 revision naming any other tree with `resource_not_found`
 (`rift.server.read_revision_unserved`), naming the requested and the served revision, since the
 index retains no earlier tree. A release revision **MUST** name the release a package or runtime
-identity carries; beside a project identity the server refuses it the same way.
+identity carries. Beside a project identity the server refuses it the same way.
 
 A revision search refuses `force_include`: reaching index-excluded files is a walk of the
 working tree, which a revision does not have.
@@ -843,21 +787,10 @@ answers from the nearest collected release under `package_substituted`. A packag
 collected release answers `package_absent`, or `package_requirement_absent` for an entry without
 `version`.
 
-This search reads Tokio 1.54.1 beside the project, in place of the version the workspace's
-`Cargo.lock` pins:
+This search requests Tokio 1.54.1 alongside project results. The local fixture runs with the
+Global connection disabled, so the response shows unavailability:
 
-```sparql
-SELECT ?symbol ?name {
-  SERVICE :search {
-    ?hit :query "spawn_blocking"; :target "symbol"; :scope "all";
-         :packages '[{"manager":"cargo","registry":"crates.io","name":"tokio","version":"1.54.1"}]'^^rdf:JSON;
-         :symbol ?symbol; :index ?index .
-    ?symbol :name ?name
-  }
-}
-ORDER BY ?index
-LIMIT 10
-```
+<ReadExample name="pinned-package" />
 
 The server refuses `:packages` as `invalid_request` naming the field `packages` beside the `local`
 scope, since a project read consults no package, and beside a git revision, since package facts
@@ -878,8 +811,8 @@ The map's `recommendations` entries carry `language`, `root`, and `command` for 
 language servers without a selected configuration. The server **MUST** omit `recommendations`
 when none remain and remove a matching entry from the next publication after accepting its
 configuration. `root` is relative to the map's project, with `.` selecting the project itself.
-A `command` is a `rift config set` invocation quoted for the server's operating system;
-the caller runs it from the map project's root.
+A `command` is a `rift config set` invocation quoted for the server's operating system.
+The caller runs it from the map project's root.
 
 The listings of resources and resource templates declare `application/json`, the type of the
 JSON body. A caller **SHOULD** select a content by its `mimeType`.
@@ -910,7 +843,7 @@ page count.
 The compact text has these parts:
 
 - the header `workspace`, with ` · page P/T` on a multi-page answer
-- directly below the header, the sections `languages` and `source`, in that order, each a title such as `languages:` with its entries indented by one level; the server **MUST** omit a section that has no entry
+- directly below the header, the sections `languages` and `source`, in that order, each a title such as `languages:` with its entries indented by one level. The server **MUST** omit a section that has no entry
 - a language entry: the language identity, `disabled` when `enabled` is `false`, `syntax` and `execution` when they hold, and `lsp <process> <state>` when the language has a selected LSP process
 - under a language entry, `include` and `exclude` lines with their patterns joined by `, `, each only when the list is not empty
 - a source entry as `path · language`, with only the path when no language matched
@@ -1007,14 +940,14 @@ carry `structuredContent` under either output selection. The MCP specification
 in the result, where the model can read the failure and adjust its request.
 
 The advertised `outputSchema` describes typed tool answers, including the `get_symbol`
-`missing` outcome; registered operating failures carry no such answer. A proxy started
+`missing` outcome. Registered operating failures carry no such answer. A proxy started
 with `--output text` forwards the failure unchanged: it keeps `isError` and `content`, and the
 result had no `structuredContent` to remove.
 
 The text of a failure is one section. Its title is `N errors`, or `1 error`, where N is 1 plus the number of entries of `causes`. Its entries are the failure, then each entry of `causes`, outermost first, as one list. Each line is written on one line, with control characters as escapes:
 
 - the head of an entry, at one level: `<code> · retry <directive>`, the `code` and `retry` of [`ErrorData`](/docs/developer/protocol/reference) or of the cause
-- below the head, at two levels, the `message` of the entry; an empty message writes no line
+- below the head, at two levels, the `message` of the entry. An empty message writes no line
 - below the failure's message, `limit <field>: <required> over <limit>`, when the failure carries `limit`
 - then one line for each entry of `diagnostics`, as the `severity`, the code in brackets, the file of the span followed by `:line:column`, and `: <message>`, each part only when the diagnostic carries it
 - after the diagnostics, the registered identity on its own line, at two levels, for a registered failure
@@ -1121,7 +1054,7 @@ request can be resized without parsing the message meant for a human. Any other 
 `limit`.
 
 Each entry of `causes` holds a `code`, a `message`, and a `retry` for one link of the failure
-chain, outermost first. The `retry` of the failure governs the call; a cause's own `retry`
+chain, outermost first. The `retry` of the failure governs the call. A cause's own `retry`
 says what could be done about that cause. The text writes the `code` and the `retry` of every cause.
 
 ### Protocol failures [#protocol-failures]
