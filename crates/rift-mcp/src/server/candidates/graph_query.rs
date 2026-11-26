@@ -1579,6 +1579,7 @@ mod tests {
     fn remote_graph_routes(
         requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
         endpoint_expiry: String,
+        complete: bool,
     ) -> axum::Router {
         use axum::routing::{get, post};
 
@@ -1606,8 +1607,8 @@ mod tests {
                     let (seed_symbol, seed_source) = graph_fixture_symbol(seed, source);
                     let (next_symbol, next_source) = graph_fixture_symbol(next, source);
                     let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
-                    let result = json!({
-                        "groups": [{"seed":seed,"complete":true,"edges":[{
+                    let mut result = json!({
+                        "groups": [{"seed":seed,"complete":complete,"edges":[{
                             "id": format!("{number:064x}"),
                             "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"providers": ["static"], "derivation":"resolution"}
                         }]}],
@@ -1616,6 +1617,11 @@ mod tests {
                         "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
                         "view":{"id":VIEW,"expires_at":expires}
                     });
+                    if !complete {
+                        result["warnings"] = json!([{
+                            "code": "edge_coverage_missing", "detail": "Some adjacency is missing."
+                        }]);
+                    }
                     requests.lock().await.push(request);
                     json_response(&result)
                 }
@@ -1849,7 +1855,7 @@ mod tests {
             .checked_add(jiff::Span::new().minutes(2))?
             .to_string();
         let requests_seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
-        let app = remote_graph_routes(Arc::clone(&requests_seen), expires.clone());
+        let app = remote_graph_routes(Arc::clone(&requests_seen), expires.clone(), true);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let endpoint = listener.local_addr()?;
         let service = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -1929,10 +1935,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_query_keeps_retained_edge_witnesses_and_refuses_exact_claims() -> TestResult {
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = remote_graph_routes(
+            Arc::clone(&requests),
+            "2099-01-01T00:00:00Z".to_owned(),
+            false,
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = listener.local_addr()?;
+        let service = tokio::spawn(async move { axum::serve(listener, app).await });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        crate::server::hermetic_workspace(
+            &root,
+            &format!(
+                "[global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n\n\
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'demo'\nversion = '1.0.0'\n"
+            ),
+        )?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        for (query, witnesses) in [
+            (
+                format!("SELECT ?callee {{ <{ROOT}> :calls ?callee }}"),
+                true,
+            ),
+            (
+                format!("SELECT ?callee {{ <{ROOT}> :calls ?callee FILTER(?callee != <{A}>) }}"),
+                false,
+            ),
+            (
+                format!("SELECT (COUNT(?callee) AS ?n) {{ <{ROOT}> :calls ?callee }}"),
+                false,
+            ),
+        ] {
+            let graph = GraphQuery::parse(&query, &GraphLimits::default())?;
+            assert!(graph.adjacency_selection().is_some(), "{query}");
+            let response = server
+                .graph_query(QueryParams {
+                    query,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0
+                .result;
+            let warnings = match &response {
+                QueryReadResult::Results(answer) if witnesses => {
+                    assert!(
+                        matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
+                        if matches!(bindings.as_slice(), [row] if matches!(
+                            row.get("callee"), Some(rift_protocol::query::RdfTerm::Iri { value }) if value == A
+                        ))),
+                        "{answer:?}"
+                    );
+                    &answer.warnings
+                }
+                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason,
+                    warnings,
+                    ..
+                }) if !witnesses => {
+                    assert_eq!(*reason, SymbolUnavailableReason::InsufficientCoverage);
+                    warnings
+                }
+                other => return Err(format!("unexpected query result: {other:?}").into()),
+            };
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| matches!(warning, ReadWarning::EdgeCoverageMissing { .. })),
+                "{response:?}"
+            );
+        }
+        assert_eq!(requests.lock().await.len(), 3);
+        service.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_query_reads_captured_declaration_excerpts_without_an_exact_syntax_element_read()
     -> TestResult {
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let app = remote_graph_routes(Arc::clone(&requests), "2099-01-01T00:00:00Z".to_owned());
+        let app = remote_graph_routes(
+            Arc::clone(&requests),
+            "2099-01-01T00:00:00Z".to_owned(),
+            true,
+        );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let endpoint = listener.local_addr()?;
         let service = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -2015,6 +2105,7 @@ mod tests {
         let app = remote_graph_routes(
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             "2099-01-01T00:00:00Z".to_owned(),
+            true,
         )
         .route("/rift/v1/symbols", axum::routing::post(|bytes: axum::body::Bytes| async move {
             let request: Value = serde_json::from_slice(&bytes).expect("exact symbol request");

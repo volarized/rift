@@ -159,6 +159,39 @@ async fn complete_raw_pages_require_reached_symbol_and_physical_source_projectio
 }
 
 #[tokio::test]
+async fn raw_edge_coverage_warning_admits_only_retained_witnesses() {
+    let warn = json!([{"code":"edge_coverage_missing","detail":"Some adjacency is missing."}]);
+    let mut partial = page(0, false, None);
+    partial["warnings"] = warn.clone();
+    let (_server, client) = operation_client(OperationFixture::Edges {
+        pages: vec![partial.clone()],
+        advertised: true,
+    })
+    .await;
+    let result = client
+        .edge_pages(&request(), limits())
+        .await
+        .expect("witness");
+    let EdgeSearchResult::Page(result) = result else {
+        panic!("partial edge page");
+    };
+    assert_eq!(result.groups[0].edges.len(), 1);
+    assert!(!result.groups[0].complete);
+    assert_eq!(
+        serde_json::to_value(result.warnings).expect("warnings"),
+        warn
+    );
+
+    partial["groups"][0]["edges"] = json!([]);
+    let (_server, client) = operation_client(OperationFixture::Edges {
+        pages: vec![partial],
+        advertised: true,
+    })
+    .await;
+    assert!(client.edge_pages(&request(), limits()).await.is_err());
+}
+
+#[tokio::test]
 async fn raw_edge_failure_never_exposes_a_partial_batch() {
     let mut changed_view = page(2, true, None);
     changed_view["view"]["expires_at"] = json!("2000-01-01T00:00:00Z");

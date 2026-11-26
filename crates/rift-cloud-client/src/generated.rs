@@ -4243,7 +4243,8 @@ pub struct EdgeGroup {
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
     pub occurrences: Option<Vec<EdgeOccurrence>>,
-    /// Provider exhausted this subject's adjacency under the selected exact domain.
+    /// Provider exhausted this subject's adjacency and established complete coverage.
+    /// A page with `edge_coverage_missing` can carry retained witnesses with `complete: false`.
     pub complete: bool,
 }
 /// The optional projections of read records. An omitted member is `false`.

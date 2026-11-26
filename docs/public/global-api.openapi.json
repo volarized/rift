@@ -8884,7 +8884,7 @@
           },
           "complete": {
             "type": "boolean",
-            "description": "Provider exhausted this subject's adjacency under the selected exact domain."
+            "description": "Provider exhausted this subject's adjacency and established complete coverage.\nA page with `edge_coverage_missing` can carry retained witnesses with `complete: false`."
           }
         },
         "required": [
