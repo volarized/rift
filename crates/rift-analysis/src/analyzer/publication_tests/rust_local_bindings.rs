@@ -860,6 +860,141 @@ pub fn choose(pair: (u8, u8)) -> u8 {
     assert_eq!(capped, existing);
 }
 
+const SHARED_BINDING_SOURCE: &str = "
+pub struct Row { pub member: u8 }
+pub fn choose(value: Option<Row>) -> u8 {
+    match value {
+        Some(found) => { let Row { member } = found; member }
+        None => 0,
+    }
+}
+";
+
+fn shared_rust_binding_publication() -> PackagePublication {
+    const MODULES: &str = r#"
+#[path = "shared.rs"]
+pub mod left;
+#[path = "shared.rs"]
+pub mod right;
+"#;
+    fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![
+            ("src/lib.rs", MODULES),
+            ("src/shared.rs", SHARED_BINDING_SOURCE),
+        ],
+        None,
+    )
+    .expect("checked shared Rust source")
+    .into_parts()
+    .0
+}
+
+#[test]
+fn rust_shared_source_preserves_semantic_bindings_and_refuses_ambiguous_shorthand() {
+    use crate::{RustLspDeclaration, RustLspDeclarationFile};
+    use rift_core::{FileDigest, SourceRange};
+    use rift_protocol::producer::{FactProducer, ProducerName, ProducerRevision};
+
+    let base = shared_rust_binding_publication();
+    let path = ProjectPath::new("src/shared.rs").expect("opened Rust source");
+    let unit = base
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == path.as_str())
+        .expect("one shared physical unit");
+    let owners = base
+        .declarations
+        .iter()
+        .filter(|row| row.unit == unit.unit && row.symbol.as_str().ends_with("/choose"))
+        .collect::<Vec<_>>();
+    let [first, other] = owners.as_slice() else {
+        panic!("two checked callable owners");
+    };
+    assert_eq!(first.range, other.range);
+    assert_ne!(first.symbol, other.symbol);
+
+    let token = |text, width, parameter| {
+        let start = position(SHARED_BINDING_SOURCE, text);
+        RustLspDeclaration {
+            range: SourceRange::new(start, start + width).expect("exact token range"),
+            parameter,
+        }
+    };
+    let ordinary = [token("value:", 5, true), token("found)", 5, false)];
+    let shorthand = [token("member }", 6, false)];
+    assert!(base.declarations.iter().all(|row| row.unit != unit.unit
+        || row.range.start != shorthand[0].range.start()
+        || row.range.end != shorthand[0].range.end()));
+    let producer = FactProducer {
+        name: ProducerName::parse("rust-analyzer").expect("producer"),
+        revision: ProducerRevision::parse("1.0.0").expect("revision"),
+    };
+    let limits = ExactPackageLimits::new(2, 1 << 20);
+    let observation = |declarations| {
+        [RustLspDeclarationFile {
+            path: &path,
+            digest: FileDigest::of(SHARED_BINDING_SOURCE.as_bytes()),
+            declarations,
+        }]
+    };
+    let mut held = base.clone();
+    let refused = PackageAnalyzer::admit_rust_lsp_shorthand_declarations(
+        &mut held,
+        &observation(&shorthand),
+        &producer,
+        limits,
+    )
+    .expect("normal shorthand admission");
+    assert_eq!(refused.admitted, 0);
+    assert_eq!(held, base);
+    let mut augmented = base.clone();
+    let result = PackageAnalyzer::admit_rust_lsp_declarations(
+        &mut augmented,
+        &observation(&ordinary),
+        &producer,
+        limits,
+    )
+    .expect("normal semantic token admission");
+    assert_eq!(result.admitted, 2);
+    for token in &ordinary {
+        let row = augmented
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == unit.unit
+                    && row.range.start == token.range.start()
+                    && row.range.end == token.range.end()
+            })
+            .expect("same physical binding");
+        let object = augmented
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&row.symbol))
+            .expect("binding object");
+        assert_eq!(object.container.as_ref(), Some(&first.symbol));
+    }
+    assert_eq!(augmented.units, base.units);
+    assert_eq!(augmented.edges, base.edges);
+    assert!(
+        base.declarations
+            .iter()
+            .all(|row| augmented.declarations.contains(row))
+    );
+    let cap = limits
+        .with_declarations(u32::try_from(base.declarations.len()).expect("declaration count"))
+        .expect("capacity for incumbent declarations");
+    let dropped = PackageAnalyzer::admit_rust_lsp_declarations(
+        &mut held,
+        &observation(&ordinary),
+        &producer,
+        cap,
+    )
+    .expect("capped semantic token admission");
+    assert_eq!(dropped.dropped_at_limit, 2);
+    assert_eq!(held, base);
+}
+
 #[test]
 fn package_rust_value_paths_read_direct_arguments_without_replacing_calls() {
     let source = "pub mod limits { pub const MAXIMUM: u8 = 2; }

@@ -260,7 +260,7 @@ impl<'a> Supplement<'a> {
             return Ok(());
         };
         let syntax = BindingSyntax::new(syntax.syntax_elements());
-        let owners = callable_owners(existing);
+        let owners = callable_owners(existing, self.proof);
         let ranges = existing
             .iter()
             .map(|row| (row.range.start, row.range.end))
@@ -418,17 +418,28 @@ fn callable(kind: &str) -> bool {
 
 fn callable_owners<'a>(
     declarations: &[&'a PackageSymbol],
+    proof: BindingProof,
 ) -> EnclosingDefinitions<Option<&'a PackageSymbol>> {
-    let mut owners = BTreeMap::new();
-    for &declaration in declarations {
-        if declaration.origin.source_kind != SourceKind::Authored
-            || !declaration
+    let authored = declarations.iter().copied().filter(|declaration| {
+        declaration.origin.source_kind == SourceKind::Authored
+            && declaration
                 .syntax_element_kind
                 .as_deref()
                 .is_some_and(callable)
-        {
-            continue;
-        }
+    });
+    if proof == BindingProof::SemanticToken {
+        // Equal spans keep the first authored callable in publication order.
+        return EnclosingDefinitions::new(authored.map(|declaration| {
+            (
+                declaration.range.start,
+                declaration.range.end,
+                Some(declaration),
+            )
+        }));
+    }
+    // A shorthand Definition response requires one owner for the written range.
+    let mut owners = BTreeMap::new();
+    for declaration in authored {
         owners
             .entry((declaration.range.start, declaration.range.end))
             .and_modify(|existing: &mut Option<&PackageSymbol>| {
