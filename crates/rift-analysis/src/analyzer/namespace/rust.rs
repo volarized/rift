@@ -14,6 +14,7 @@ use crate::NamespaceInput;
 
 pub(super) mod configuration;
 mod implementations;
+mod macro_methods;
 mod macros;
 mod module_sources;
 mod shared;
@@ -154,6 +155,7 @@ pub(super) fn prepare(
         ..Default::default()
     };
     module_sources::retain(input, &inventory, &declaring, &admitted, &mut prepared);
+    macro_methods::retain(input, selected, &configurations, &admitted, &mut prepared);
     local_exports(input, selected, &requested, &admitted, &mut prepared);
     retain_root_anchor(input, root, &inventory, &assigned, &mut prepared);
     prepared

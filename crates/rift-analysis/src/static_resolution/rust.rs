@@ -315,7 +315,7 @@ impl<'source> Namespaces<'source> {
             if alternatives.contains(file.document.path.as_str()) {
                 continue;
             }
-            namespaces.index_file(file, work)?;
+            namespaces.index_file(file, admitted_binding, work)?;
         }
         for document in shared {
             if let Some(file) = files.get(document.path.as_str()) {
@@ -767,7 +767,12 @@ impl<'source> Namespaces<'source> {
         Some(())
     }
 
-    fn index_file(&mut self, file: &File<'source>, work: &mut Work) -> Option<()> {
+    fn index_file(
+        &mut self,
+        file: &File<'source>,
+        admitted_binding: &impl Fn(Target<'source>) -> bool,
+        work: &mut Work,
+    ) -> Option<()> {
         let mut namespace = FileNamespace {
             base: file.document.placement.module_path().to_vec(),
             inline: Vec::new(),
@@ -783,6 +788,9 @@ impl<'source> Namespaces<'source> {
                 file: file.document,
                 symbol,
             };
+            if symbol.is_rust_macro_method() && !admitted_binding(target) {
+                continue;
+            }
             let Some(path) = target.admitted_path() else {
                 continue;
             };

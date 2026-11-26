@@ -121,7 +121,7 @@ pub(super) fn tokens(source: &str) -> Option<Vec<&str>> {
     Some(output)
 }
 
-fn consume(input: &mut &[&str], expected: &[&str]) -> bool {
+pub(super) fn consume(input: &mut &[&str], expected: &[&str]) -> bool {
     if input.starts_with(expected) {
         *input = &input[expected.len()..];
         true
@@ -130,7 +130,7 @@ fn consume(input: &mut &[&str], expected: &[&str]) -> bool {
     }
 }
 
-fn group<'tokens, 'source>(
+pub(super) fn group<'tokens, 'source>(
     input: &mut &'tokens [&'source str],
     open: &str,
     close: &str,

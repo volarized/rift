@@ -116,6 +116,13 @@ impl AnalyzedFile {
             .as_deref()
             .unwrap_or_else(|| self.file.syntax())
     }
+    fn primary_declaration_count(&self) -> usize {
+        self.placed_syntax()
+            .primary_symbols_len()
+            .saturating_mul(self.shared_rust_placements.len().max(1))
+            .saturating_add(self.placement.aliases_count())
+    }
+
     fn static_source(&self) -> crate::static_resolution::StaticSource<'_> {
         crate::static_resolution::StaticSource {
             path: self.file.path(),
@@ -555,6 +562,7 @@ struct BindingDemands {
     rust_library: BindingDemand,
     rust_explicit: BindingDemand,
     rust_shorthand: BindingDemand,
+    rust_macro_methods: BindingDemand,
     python_parameters: BindingDemand,
     python_receivers: BindingDemand,
     python_loop_bindings: BindingDemand,
@@ -572,12 +580,7 @@ impl BindingDemands {
             let facts = document.placed_syntax();
             demands.primary = demands
                 .primary
-                .saturating_add(
-                    facts
-                        .primary_symbols_len()
-                        .saturating_mul(document.shared_rust_placements.len().max(1)),
-                )
-                .saturating_add(document.placement.aliases_count());
+                .saturating_add(document.primary_declaration_count());
             demands.unnamed = demands
                 .unnamed
                 .saturating_add(facts.left_out_symbols().len());
@@ -617,6 +620,8 @@ impl BindingDemands {
                     &mut demands.rust_receivers
                 } else if symbol.is_rust_shorthand_binding() {
                     &mut demands.rust_shorthand
+                } else if language == "rust" && symbol.is_rust_macro_method() {
+                    &mut demands.rust_macro_methods
                 } else if symbol.is_rust_explicit_local_binding() {
                     &mut demands.rust_explicit
                 } else if symbol.is_rust_library_root() {
@@ -651,6 +656,7 @@ impl BindingDemands {
             + self.rust_library.count
             + self.rust_explicit.count
             + self.rust_shorthand.count
+            + self.rust_macro_methods.count
             + self.ecmascript.count()
     }
 }
@@ -731,9 +737,13 @@ fn binding_capacity(
     .with_typescript_method_parameters(typescript_method_slots);
     (
         count,
-        demands.ecmascript.reserve_later_parameters(
+        demands.ecmascript.reserve_late_bindings(
             documents,
-            (&rust_module_sources, &demands.rust_shorthand),
+            (
+                &rust_module_sources,
+                &demands.rust_shorthand,
+                &demands.rust_macro_methods,
+            ),
             (slots, bytes),
             record,
             established,
@@ -763,14 +773,15 @@ struct EcmaScriptBindingDemand {
 }
 
 impl EcmaScriptBindingDemand {
-    fn reserve_later_parameters(
+    fn reserve_late_bindings(
         &self,
         documents: &[AnalyzedFile],
-        rust: (&BindingDemand, &BindingDemand),
+        rust: (&BindingDemand, &BindingDemand, &BindingDemand),
         capacity: (usize, u64),
         record: u64,
         established: rift_syntax::PackageBindingSlots,
     ) -> rift_syntax::PackageBindingSlots {
+        let (rust_modules, rust_shorthand, rust_macro_methods) = rust;
         let (mut slots, mut bytes) = capacity;
         let [
             callback_slots,
@@ -789,13 +800,14 @@ impl EcmaScriptBindingDemand {
             method_type_slots,
             function_type_slots,
             typed_pattern_slots,
+            macro_method_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
                 &self.javascript_callbacks,
                 &self.typescript_overloads,
-                rust.0,
-                rust.1,
+                rust_modules,
+                rust_shorthand,
                 &self.javascript_methods,
                 &self.typescript_signatures,
                 &self.javascript_scoped_functions,
@@ -808,6 +820,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_method_types,
                 &self.typescript_function_types,
                 &self.typescript_patterns,
+                rust_macro_methods,
             ],
             &mut slots,
             &mut bytes,
@@ -830,6 +843,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_method_type_parameters(method_type_slots)
             .with_typescript_function_type_parameters(function_type_slots)
             .with_typescript_destructured_parameters(typed_pattern_slots)
+            .with_rust_macro_methods(macro_method_slots)
     }
 
     fn classify(
@@ -1061,6 +1075,14 @@ fn place_namespace(
             && let Some(module) = namespace.rust_modules.get(path.as_str())
         {
             place_rust_module_source(held, module);
+        }
+        if let Some(methods) = namespace.rust_macro_methods.remove(path.as_str()) {
+            held.item_kinds.extend(item_kinds(&methods));
+            let facts = held
+                .placed_syntax
+                .take()
+                .map_or_else(|| held.file.syntax().clone(), |facts| *facts);
+            held.placed_syntax = Some(Box::new(facts.with_rust_macro_methods(methods)));
         }
         held.shared_rust_placements = namespace
             .shared_rust_modules

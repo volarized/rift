@@ -1127,6 +1127,80 @@ pub fn caller() { leaf(); other(); }
 }
 
 #[test]
+fn package_rust_places_selected_local_macro_method_names_at_authored_tokens() {
+    let source = r"
+pub struct Clock;
+macro_rules! methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(pub fn $name(&self) -> u8 { $value })*
+    };
+}
+impl Clock {
+    methods! { hour => 7; minute => 13; }
+}
+macro_rules! setters {
+    ($($(#[$attr:meta])* fn $method:ident($field:ident: $ty:ty);)+) => {
+        $($(#[$attr])* #[inline] pub fn $method(self, $field: $ty) -> Self { self })+
+    };
+}
+impl Clock {
+    setters! { /// Sets the second.
+        fn with_second(second: u8);
+    }
+}
+trait Others { fn denied(&self) -> u8; }
+macro_rules! trait_methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(fn $name(&self) -> u8 { $value })*
+    };
+}
+impl Others for Clock {
+    trait_methods! { denied => 9; }
+}
+macro_rules! methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(pub fn unrelated(&self) -> u8 { $value })*
+    };
+}
+impl Clock { methods! { absent => 0; } }
+pub fn read(clock: &Clock) -> u8 { clock.hour() }
+";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    for name in ["hour", "minute", "with_second"] {
+        let key = format!("/Clock/{name}");
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(&key))
+            .unwrap_or_else(|| panic!("expected authored method {name}"));
+        let start =
+            usize::try_from(declaration.range.start).expect("fixture source offset fits usize");
+        let end = usize::try_from(declaration.range.end).expect("fixture source offset fits usize");
+        assert_eq!(&source[start..end], name);
+        assert_eq!(
+            declaration.syntax_element_kind.as_deref(),
+            Some("identifier")
+        );
+        assert!(declaration.signature_indices.is_empty());
+    }
+    for name in ["denied", "absent", "unrelated"] {
+        let key = format!("/Clock/{name}");
+        assert!(
+            !publication
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with(&key))
+        );
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/read")
+            && edge.to.as_str().ends_with("/Clock/hour")
+    }));
+}
+
+#[test]
 fn package_rust_feature_guarded_documentation_preserves_its_authored_module() {
     let root = "#[cfg_attr(feature = \"extra\", doc(cfg(feature = \"extra\")))]
 pub mod child;

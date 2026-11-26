@@ -49,6 +49,7 @@ pub struct PackageBindingSlots {
     typescript_function_type_parameter: usize,
     typescript_destructured_parameter: usize,
     typescript_method_type_parameter: usize,
+    rust_macro_method: usize,
 }
 
 impl PackageBindingSlots {
@@ -91,6 +92,7 @@ impl PackageBindingSlots {
             typescript_function_type_parameter: 0,
             typescript_destructured_parameter: 0,
             typescript_method_type_parameter: 0,
+            rust_macro_method: 0,
         }
     }
 
@@ -276,6 +278,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves slots for names emitted by checked Rust macro method matchers.
+    #[must_use]
+    pub const fn with_rust_macro_methods(mut self, slots: usize) -> Self {
+        self.rust_macro_method = slots;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -309,6 +318,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_function_type_parameter)
             .saturating_add(self.typescript_destructured_parameter)
             .saturating_add(self.typescript_method_type_parameter)
+            .saturating_add(self.rust_macro_method)
     }
 
     fn admit(
@@ -377,6 +387,8 @@ impl PackageBindingSlots {
             &mut self.rust_receiver
         } else if symbol.is_rust_shorthand_binding() {
             &mut self.rust_shorthand
+        } else if language == "rust" && symbol.is_rust_macro_method() {
+            &mut self.rust_macro_method
         } else if symbol.is_rust_explicit_local_binding() {
             &mut self.rust_explicit
         } else if symbol.is_rust_module_source() {

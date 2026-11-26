@@ -291,12 +291,22 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::FUNCTION_TYPE_PARAMETER_KIND
     }
 
+    /// Whether a checked local macro emits a method at this written name.
+    #[must_use]
+    pub fn is_rust_macro_method(&self) -> bool {
+        self.kind == "function"
+            && self.syntax_element_kind == Some("identifier")
+            && self.container.is_some()
+            && self.name_range == Some(self.item_range)
+    }
+
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
         self.is_rust_local_binding()
             || self.is_rust_library_root()
             || self.is_rust_module_source()
+            || self.is_rust_macro_method()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
             || self.is_ecmascript_package_binding()
@@ -858,6 +868,16 @@ impl SyntaxFacts {
         let root = self.rust_source_module(name, source, ".")?;
         self.symbols.insert(0, root);
         Some(self)
+    }
+
+    /// Adds checked authored Rust macro method names after other syntax declarations.
+    ///
+    /// The caller establishes the selected macro arm and the admitted inherent owner.
+    #[must_use]
+    pub fn with_rust_macro_methods(mut self, methods: Vec<SyntaxSymbol>) -> Self {
+        self.symbols.extend(methods);
+        self.symbols.sort_by_key(|symbol| symbol.item_range.start);
+        self
     }
 
     /// Captures a separate whole-file declaration for an out-of-line Rust module.
