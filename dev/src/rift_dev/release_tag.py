@@ -2,7 +2,8 @@
 
 The command reads that commit from the remote, so the local checkout's branch and
 its uncommitted work decide nothing. Pushing the tag starts `rift-release`: six
-target archives, the checksum manifest, the GitHub release, and the docs deploy.
+target archives, the checksum manifest, and the GitHub release. The same tag
+starts `rift-release-docs` to build and deploy the documentation.
 
 The remote reads go through `repository`. Signing and pushing run `git` itself:
 it signs with the user's signing configuration, and it authenticates through the

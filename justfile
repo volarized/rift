@@ -102,6 +102,10 @@ quick-gate: format dashes generate-check check clippy
 rust-gate: quick-gate docs doctest audit test release-test installer-test
 
 # One signed tag on the commit `origin/main` names right now; pushing it starts
-# `rift-release`.
+# `rift-release` and `rift-release-docs`.
 release tag:
     {{ rift_dev }} release {{ tag }}
+
+# Publish the docs from main.
+release-docs:
+    gh workflow run rift-release-docs.yml --ref main
