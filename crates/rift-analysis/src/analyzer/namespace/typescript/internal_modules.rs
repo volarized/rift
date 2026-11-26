@@ -3,13 +3,14 @@
 use super::entry::{Entry, PackageFiles};
 use super::{
     BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SymbolIdentity, SymbolOwner, declaration_anchors, prepare_anchors,
+    SelectedFile, SymbolIdentity, SymbolOwner, binding_name, declaration_anchors, prepare_anchors,
     selected_source_is_valid,
 };
 use crate::static_resolution::is_declaration_file;
 use serde::Deserialize;
 
 mod scopes;
+pub(super) use scopes::private_local_identities;
 
 /// Names every remaining selected source by its package-relative path.
 ///

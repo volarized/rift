@@ -2,10 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rift_core::SymbolId;
+use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
-use rift_syntax::{ByteRange, StaticBodyMember, StaticFacts, SyntaxFacts, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, ScopedIdentityAnchors, StaticBodyMember, StaticFacts, SyntaxFacts, SyntaxSymbol,
+};
 
-use super::SelectedFile;
+use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
@@ -42,6 +46,101 @@ pub(super) fn repeated_names<'source>(file: &SelectedFile<'source>) -> BTreeSet<
         }
     }
     repeated
+}
+
+/// Keeps the older identity of the first private lexical group and names later groups
+/// by the source ordinal of their first physical declaration.
+pub(in crate::analyzer::namespace::typescript) fn private_local_identities(
+    file: &SelectedFile<'_>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> ScopedIdentityAnchors {
+    if file.syntax.has_errors() || file.syntax.left_out_declaration_count() != 0 {
+        return BTreeMap::new();
+    }
+    let symbols = file.syntax.symbols();
+    let repeated = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.declaration_ordinal > 0
+                && private_local_declaration(symbol)
+                && anchors.contains_key(&symbol.qualified_name)
+        })
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let Some(bindings) = file
+        .syntax
+        .export_bindings()
+        .filter(|_| !repeated.is_empty())
+    else {
+        return BTreeMap::new();
+    };
+    let exported = bindings
+        .iter()
+        .flat_map(|binding| [binding.local, binding.exported])
+        .flatten()
+        .filter_map(|range| binding_name(file.source, range))
+        .collect::<BTreeSet<_>>();
+    let mut named = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
+    for symbol in symbols {
+        let name = symbol.qualified_name.as_str();
+        if repeated.contains(name) && !exported.contains(name) {
+            named.entry(name).or_default().push(symbol);
+        }
+    }
+    if named.is_empty() {
+        return BTreeMap::new();
+    }
+    let scopes = FileScopes::new(file.syntax, file.source);
+    let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+    let mut identities_by_name = BTreeMap::new();
+    for (name, declarations) in named {
+        let Some(groups) = scopes.private_local_groups(file, &declarations) else {
+            continue;
+        };
+        let Some(first) = anchors.get(name) else {
+            continue;
+        };
+        let identities = groups
+            .into_iter()
+            .skip(1)
+            .map(|ordinals| {
+                let identity = local_group_identity(first, ordinals.first().copied()?)?;
+                (!occupied.contains(&identity)).then_some((ordinals, identity))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(identities) = identities.filter(|groups| !groups.is_empty()) else {
+            continue;
+        };
+        let mut overrides = BTreeMap::new();
+        for (ordinals, identity) in identities {
+            occupied.insert(identity.clone());
+            for ordinal in ordinals {
+                overrides.insert(ordinal, identity.clone());
+            }
+        }
+        identities_by_name.insert(name.to_owned(), overrides);
+    }
+    identities_by_name
+}
+
+fn private_local_declaration(symbol: &SyntaxSymbol) -> bool {
+    symbol.container.is_none()
+        && symbol.qualified_name == symbol.name
+        && !symbol.kinds.contains(&SymbolKind::Public)
+        && matches!(
+            symbol.syntax_element_kind,
+            Some("function_declaration" | "variable_declarator")
+        )
+}
+
+fn local_group_identity(original: &SymbolId, ordinal: usize) -> Option<SymbolId> {
+    let original = SymbolIdentity::parse(original.as_str()).ok()?;
+    let mut path = original.qualified_path().to_vec();
+    let name = path.last_mut()?;
+    *name = format!("{name}#{ordinal}");
+    let identity =
+        SymbolIdentity::new(original.owner().clone(), original.language().clone(), path).ok()?;
+    SymbolId::new(identity.wire_identity()).ok()
 }
 
 struct FileScopes<'source> {
@@ -131,6 +230,31 @@ impl<'source> FileScopes<'source> {
                 .map(|symbol| (symbol.qualified_name.as_str(), symbol.item_range.end))
                 .collect(),
         }
+    }
+
+    fn private_local_groups(
+        &self,
+        file: &SelectedFile<'_>,
+        declarations: &[&SyntaxSymbol],
+    ) -> Option<Vec<Vec<usize>>> {
+        let mut groups = BTreeMap::<ByteRange, Vec<usize>>::new();
+        for &symbol in declarations {
+            if !private_local_declaration(symbol) {
+                return None;
+            }
+            let captured = *self.bound.get(&symbol.name_range?)?;
+            let scope = self.lexical(symbol, file.source);
+            if captured != scope || scope == self.source {
+                return None;
+            }
+            groups
+                .entry(scope)
+                .or_default()
+                .push(symbol.declaration_ordinal);
+        }
+        let mut groups = groups.into_values().collect::<Vec<_>>();
+        groups.sort_by_key(|ordinals| ordinals.first().copied());
+        Some(groups)
     }
 
     fn of(&self, symbol: &SyntaxSymbol, file: &SelectedFile<'_>) -> Scope {

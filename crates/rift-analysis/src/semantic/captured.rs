@@ -290,6 +290,9 @@ impl WorkspaceSemantics {
                 .placement
                 .clone()
                 .with_identity_anchors(namespace.anchors.remove(path).unwrap_or_default())
+                .with_scoped_identity_anchors(
+                    namespace.scoped_anchors.remove(path).unwrap_or_default(),
+                )
                 .with_module(namespace.rust_modules.remove(path))
                 .with_logical_declarations(namespace.mappings.remove(path).unwrap_or_default())
                 .with_aliases(aliases.remove(path).unwrap_or_default());

@@ -653,9 +653,29 @@ export class Overloads { go(a: 1): void; go(a: 2): void; go() {} constructor(rea
 #[test]
 fn an_entry_keeps_the_identities_of_names_in_several_scopes() {
     let analysis = analyze(MAIN, &[("index.js", REPEATED)]);
-    let counted = counted(&analysis, "beacon");
-    for (name, count) in [("helper", 2), ("dup", 2), ("A/x", 2)] {
-        assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
+    let counts = counted(&analysis, "beacon");
+    for (name, count) in [("helper", 1), ("helper#1", 1), ("dup", 2), ("A/x", 2)] {
+        assert_eq!(counts.get(name), Some(&count), "{name} {counts:?}");
+    }
+    let publication = analysis.publication();
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.js")
+        .expect("authored entry source");
+    for (name, declaration) in [
+        ("helper", "function helper() {}"),
+        ("helper#1", "helper = 1"),
+    ] {
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == unit.unit && spelled(row.symbol.as_str()) == ["beacon", name])
+            .expect("physical helper declaration");
+        let start = usize::try_from(row.range.start).expect("declaration start");
+        let end = usize::try_from(row.range.end).expect("declaration end");
+        assert_eq!(REPEATED.get(start..end), Some(declaration));
+        assert!(!row.public);
     }
 }
 

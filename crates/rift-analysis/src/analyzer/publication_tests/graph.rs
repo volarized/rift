@@ -2902,3 +2902,95 @@ fn parameter_provider_bound(shipped: rift_syntax::ShippedLanguage, prior: u32) {
 fn package_typescript_value_parameters_preserve_required_provider_slots() {
     parameter_provider_bound(rift_syntax::ShippedLanguage::TypeScript, 1);
 }
+
+#[test]
+fn private_ecmascript_lexical_groups_keep_exact_declarations_and_callers() {
+    const SOURCE: &str = r"function leaf() {}
+function exposed() {}
+exports.exposed = exposed;
+unknown('f', function () {
+    function helper() { leaf(); }
+    helper();
+});
+unknown('v', function () {
+    var helper = 'first';
+    var helper = 'same';
+    consume(helper);
+});
+unknown('w', function () {
+    var helper = 'other';
+    consume(helper);
+});
+";
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"index.js"}"#;
+    const PREFIX: &str = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon/";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("captured scoped JavaScript package");
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("valid physical records");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.js")
+        .expect("original source unit");
+    let declaration = |text: &str| {
+        let start = SOURCE.find(text).expect("written declaration");
+        let range = TextRange {
+            start: u64::try_from(start).expect("declaration start"),
+            end: u64::try_from(start + text.len()).expect("declaration end"),
+        };
+        let mut declarations = publication
+            .declarations
+            .iter()
+            .filter(|row| row.unit == unit.unit && row.range == range);
+        let found = declarations.next().expect("physical declaration");
+        assert!(declarations.next().is_none(), "{text}");
+        assert!(!found.public);
+        found
+    };
+    let first = declaration("function helper() { leaf(); }");
+    let second = declaration("helper = 'first'");
+    let same = declaration("helper = 'same'");
+    let other = declaration("helper = 'other'");
+    assert_eq!(first.symbol.as_str(), format!("{PREFIX}helper"));
+    assert_eq!(second.symbol, same.symbol);
+    assert_ne!(first.symbol, second.symbol);
+    assert_ne!(first.symbol, other.symbol);
+    assert_ne!(second.symbol, other.symbol);
+    for (row, scopes) in [(second, "helper#1"), (other, "helper#3")] {
+        let identity = SymbolIdentity::parse(row.symbol.as_str()).expect("scoped identity");
+        assert_eq!(identity.qualified_path(), ["beacon", scopes]);
+    }
+    for (row, callable) in [(first, true), (second, false), (other, false)] {
+        let symbol = publication
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&row.symbol))
+            .expect("object for scope");
+        assert_eq!(symbol.name, "helper");
+        assert_eq!(symbol.kinds.contains(&SymbolKind::Callable), callable);
+    }
+    let calls = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Calls] && edge.to.as_str() == format!("{PREFIX}leaf")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].from, first.symbol);
+    let authored = calls[0].occurrence.as_ref().expect("physical call");
+    assert_eq!(authored.unit, unit.unit);
+    assert_eq!(
+        SOURCE.get(offset_in(authored.range.start)..offset_in(authored.range.end)),
+        Some("leaf()")
+    );
+}

@@ -152,6 +152,9 @@ pub struct LogicalDeclaration {
     pub language: rift_protocol::read::Language,
 }
 
+/// Logical identities of physical declarations keyed by qualified name and ordinal.
+pub type ScopedIdentityAnchors = BTreeMap<String, BTreeMap<usize, SymbolId>>;
+
 /// Where one document's declarations are filed: origin, source unit, and identity path.
 ///
 /// `unit` is the [`SourceUnitId`] every declaration's binding names, and
@@ -166,6 +169,7 @@ pub struct DocumentPlacement {
     unit: SourceUnitId,
     identity_path: String,
     identity_anchors: BTreeMap<String, SymbolId>,
+    scoped_identity_anchors: ScopedIdentityAnchors,
     module: Option<SymbolId>,
     module_path: Vec<String>,
     aliases: Vec<PlacedAlias>,
@@ -185,6 +189,7 @@ impl DocumentPlacement {
             unit,
             identity_path: identity_path.into(),
             identity_anchors: BTreeMap::new(),
+            scoped_identity_anchors: BTreeMap::new(),
             module: None,
             module_path: Vec::new(),
             aliases: Vec::new(),
@@ -230,6 +235,9 @@ impl DocumentPlacement {
             tracker,
             GetSize::get_heap_size_with_tracker,
         );
+        let (scoped_anchors, tracker) = self
+            .scoped_identity_anchors
+            .get_heap_size_with_tracker(tracker);
         let (mappings, mut tracker) = rift_protocol::retained_map_material(
             &self.logical_declarations,
             tracker,
@@ -249,6 +257,7 @@ impl DocumentPlacement {
                 .saturating_mul(std::mem::size_of::<String>()),
             self.module_path.iter().map(String::capacity).sum(),
             anchors,
+            scoped_anchors,
             mappings,
             self.aliases
                 .capacity()
@@ -297,6 +306,14 @@ impl DocumentPlacement {
     #[must_use]
     pub fn with_identity_anchors(mut self, anchors: BTreeMap<String, SymbolId>) -> Self {
         self.identity_anchors = anchors;
+        self.scoped_identity_anchors.clear();
+        self
+    }
+
+    /// Supplies distinct identities for declarations of one name in separate scopes.
+    #[must_use]
+    pub fn with_scoped_identity_anchors(mut self, anchors: ScopedIdentityAnchors) -> Self {
+        self.scoped_identity_anchors = anchors;
         self
     }
 
@@ -332,6 +349,22 @@ impl DocumentPlacement {
             .get(qualified_name)
             .map(|declaration| &declaration.identity)
             .or_else(|| self.identity_anchors.get(qualified_name))
+    }
+
+    /// Returns the identity of this physical declaration, including any scoped override.
+    #[must_use]
+    pub fn logical_identity_for_symbol(&self, symbol: &crate::SyntaxSymbol) -> Option<&SymbolId> {
+        self.logical_declarations
+            .get(&symbol.qualified_name)
+            .map(|declaration| &declaration.identity)
+            .or_else(|| self.syntax_identity_anchor(symbol))
+    }
+
+    fn syntax_identity_anchor(&self, symbol: &crate::SyntaxSymbol) -> Option<&SymbolId> {
+        self.scoped_identity_anchors
+            .get(&symbol.qualified_name)
+            .and_then(|anchors| anchors.get(&symbol.declaration_ordinal))
+            .or_else(|| self.identity_anchors.get(&symbol.qualified_name))
     }
 
     /// Supplies source-backed export aliases beside existing declarations.
@@ -521,15 +554,12 @@ impl SyntaxPublicationBuilder {
             let logical = placement.logical_declarations.get(&symbol.qualified_name);
             let address = symbol.provider_address(&language_segment, placement.identity_path());
             let provider_symbol = ProviderSymbolId::for_symbol(&address)?;
-            let anchor = logical.map_or_else(
-                || {
-                    placement
-                        .identity_anchors
-                        .get(&symbol.qualified_name)
-                        .cloned()
-                },
-                |logical| Some(logical.identity.clone()),
-            );
+            let anchor = logical
+                .map_or_else(
+                    || placement.syntax_identity_anchor(symbol),
+                    |logical| Some(&logical.identity),
+                )
+                .cloned();
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
             let mut facts = symbol.placed_facts(language, anchor.as_ref());
             if let Some(container) = &symbol.container {

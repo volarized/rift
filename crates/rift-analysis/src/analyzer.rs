@@ -711,6 +711,12 @@ fn place_namespace(
             .placement
             .clone()
             .with_identity_anchors(assigned)
+            .with_scoped_identity_anchors(
+                namespace
+                    .scoped_anchors
+                    .remove(held.file.path().as_str())
+                    .unwrap_or_default(),
+            )
             .with_module(namespace.rust_modules.remove(held.file.path().as_str()))
             .with_logical_declarations(
                 namespace

@@ -8,7 +8,7 @@ use std::{
 use rift_core::SymbolId;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
-use rift_syntax::SyntaxFacts;
+use rift_syntax::{ScopedIdentityAnchors, SyntaxFacts};
 
 use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportRootOrigin};
 
@@ -50,6 +50,7 @@ pub(crate) struct ExportBinding {
 #[derive(Default)]
 pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
+    pub(crate) scoped_anchors: BTreeMap<String, ScopedIdentityAnchors>,
     /// The source path and accepted crate namespace of a Cargo library root.
     pub(crate) rust_package_root: Option<(String, SymbolId)>,
     /// The module of each Rust file a captured library's module tree reaches.

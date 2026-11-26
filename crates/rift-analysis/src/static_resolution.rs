@@ -433,7 +433,7 @@ impl Target<'_> {
         let anchor = self
             .file
             .placement
-            .logical_identity(&self.symbol.qualified_name)?;
+            .logical_identity_for_symbol(self.symbol)?;
         let identity = rift_protocol::identity::SymbolIdentity::parse(anchor.as_str()).ok()?;
         Some(identity.qualified_path().to_vec())
     }

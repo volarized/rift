@@ -129,7 +129,46 @@ pub(super) fn prepare(
             }
         }
     }
+    retain_unique_scoped_identities(&mut prepared);
     prepared
+}
+
+fn retain_unique_scoped_identities(prepared: &mut PreparedNamespace) {
+    if prepared.scoped_anchors.is_empty() {
+        return;
+    }
+    let mut owners = BTreeMap::<&SymbolId, Option<&str>>::new();
+    for (path, anchors) in &prepared.anchors {
+        for identity in anchors.values() {
+            owners
+                .entry(identity)
+                .and_modify(|owner| {
+                    if *owner != Some(path.as_str()) {
+                        *owner = None;
+                    }
+                })
+                .or_insert(Some(path.as_str()));
+        }
+    }
+    let aliases = prepared
+        .exports
+        .iter()
+        .map(|binding| &binding.identity)
+        .collect::<BTreeSet<_>>();
+    let anchors = &prepared.anchors;
+    prepared.scoped_anchors.retain(|path, scoped| {
+        scoped.retain(|name, overrides| {
+            anchors
+                .get(path)
+                .and_then(|anchors| anchors.get(name))
+                .and_then(|original| owners.get(original).copied().flatten())
+                == Some(path.as_str())
+                && overrides
+                    .values()
+                    .all(|identity| !owners.contains_key(identity) && !aliases.contains(identity))
+        });
+        !scoped.is_empty()
+    });
 }
 
 /// Names what the files of a package declare in ambient modules.
@@ -177,6 +216,12 @@ fn prepare_anchors(
         return previous == &anchors;
     }
     let (exports, unresolved) = export_bindings(input, file, module, &anchors);
+    let scoped = internal_modules::private_local_identities(file, &anchors);
+    if !scoped.is_empty() {
+        prepared
+            .scoped_anchors
+            .insert(file.path.as_str().to_owned(), scoped);
+    }
     prepared.unresolved_exports |= unresolved;
     prepared.exports.extend(exports);
     prepared
