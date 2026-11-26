@@ -10,7 +10,7 @@ const DEPENDENCY: &str = "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType
 const ENTRY: &str = "src/index.ts";
 const NEAR: &str = "src/near.ts";
 const MANIFEST: &str = r#"{"name":"app","version":"1.0.0","type":"module","exports":{".":{"types":"./src/index.ts"},"./near":{"types":"./src/near.ts"}},"dependencies":{"shape":"npm:zod@^4"}}"#;
-const AMBIGUOUS: &str = r#"{"name":"app","version":"1.0.0","exports":{".":{"types":"./src/index.ts"},"./other":{"types":"./src/index.ts"}},"dependencies":{"shape":"npm:zod@^4"}}"#;
+const SHARED_ROOT: &str = r#"{"name":"app","version":"1.0.0","type":"module","exports":{"./other":{"types":"./src/index.ts"},"./near":{"types":"./src/near.ts"},".":{"types":"./src/index.ts"}},"dependencies":{"shape":"npm:zod@^4"}}"#;
 const SOURCE: &str = "// é\n\
     import type { ZodType as Imported } from \"shape\";\n\
     import type { Local as Neighbor } from \"./near\";\n\
@@ -138,6 +138,40 @@ fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
 }
 
 #[test]
+fn module_imports_keep_the_same_authored_root_when_an_alias_selects_it() {
+    let single = analyze_module(SOURCE, MANIFEST, PackageConfiguration::default());
+    let aliased = analyze_module(SOURCE, SHARED_ROOT, PackageConfiguration::default());
+    let single = single.publication();
+    let aliased = aliased.publication();
+    let expected = single
+        .edges
+        .iter()
+        .filter(|row| row.from.as_str() == MODULE)
+        .collect::<Vec<_>>();
+    assert!(!expected.is_empty());
+    let found = aliased
+        .edges
+        .iter()
+        .filter(|row| row.from.as_str() == MODULE)
+        .collect::<Vec<_>>();
+    assert_eq!(found, expected);
+
+    let shape = format!("{MODULE}/Shape");
+    let declaration = single
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str() == shape);
+    assert!(declaration.is_some());
+    assert_eq!(
+        aliased
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str() == shape),
+        declaration,
+    );
+}
+
+#[test]
 fn module_imports_refuse_uncertain_sources_and_publication_bounds() {
     let malformed = format!("{SOURCE}export type Broken = ;\n");
     let cases = [
@@ -146,7 +180,6 @@ fn module_imports_refuse_uncertain_sources_and_publication_bounds() {
             MANIFEST,
             PackageConfiguration::default(),
         ),
-        (SOURCE, AMBIGUOUS, PackageConfiguration::default()),
         (
             "import type { ZodType as Imported } from \"shape\";\nexport type Shape = string;",
             MANIFEST,

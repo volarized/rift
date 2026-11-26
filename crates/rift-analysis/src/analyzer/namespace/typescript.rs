@@ -450,8 +450,8 @@ fn entry_modules(
     let modules = candidates
         .into_iter()
         .map(|(path, candidates)| {
-            let module = file_module(candidates);
-            unresolved |= module.is_none();
+            let (module, unresolved_aliases) = file_module(candidates);
+            unresolved |= unresolved_aliases || module.is_none();
             (path, module)
         })
         .collect();
@@ -465,16 +465,20 @@ struct EntryCandidate<'metadata> {
     unconditional: bool,
 }
 
-/// The one module a file is published under. An unconditional subpath keeps the file before
-/// a conditional one, and two of them leave it unresolved. Among conditional subpaths the
-/// package entry holds it, else the first key in order; the others are aliases.
-fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> Option<String> {
+/// The module of the selected file and whether competing unconditional aliases remain.
+/// Among unconditional routes only the authored package root can settle a shared file.
+/// Otherwise preserve the existing precedence of unconditional routes and ordered keys.
+fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> (Option<String>, bool) {
     let unconditional = candidates
         .iter()
         .filter(|candidate| candidate.unconditional)
         .count();
     if unconditional > 1 {
-        return None;
+        let root = candidates
+            .into_iter()
+            .find(|candidate| candidate.unconditional && candidate.key == ".")
+            .map(|candidate| candidate.module);
+        return (root, true);
     }
     candidates.sort_by_key(|candidate| {
         (
@@ -483,10 +487,11 @@ fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> Option<String> {
             candidate.key,
         )
     });
-    candidates
+    let module = candidates
         .into_iter()
         .next()
-        .map(|candidate| candidate.module)
+        .map(|candidate| candidate.module);
+    (module, false)
 }
 
 fn export_subpath_is_valid(path: &str) -> bool {

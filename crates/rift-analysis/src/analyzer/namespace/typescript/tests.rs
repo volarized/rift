@@ -2165,7 +2165,18 @@ fn export_subpaths_of_one_file_keep_one_module() {
             Some("prettier%2Fa"),
             false,
         ),
-        (r#"{".":"./a.js","./a":"./a.js"}"#, "a.js", None, true),
+        (
+            r#"{".":"./a.js","./a":"./a.js"}"#,
+            "a.js",
+            Some("prettier"),
+            true,
+        ),
+        (
+            r#"{"./a":{"default":"./a.js"},".":{"default":"./a.js"}}"#,
+            "a.js",
+            Some("prettier"),
+            true,
+        ),
         (
             r#"{"./sub":{"require":"./s.cjs","import":"./s.mjs"}}"#,
             "s.mjs",
