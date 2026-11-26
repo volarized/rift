@@ -17,6 +17,13 @@ pub(super) struct ParameterReads {
     pub(super) methods: Vec<ByteRange>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ScopedParameterReads {
+    Callback,
+    Overload,
+    JavaScriptMethod,
+}
+
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
 pub(super) fn parameter_sites<'source>(
     syntax: &SyntaxFacts,
@@ -59,20 +66,23 @@ impl<'source> Index<'source> {
     pub(super) fn ecmascript_scoped_parameter_reads(
         &self,
         file: &File<'source>,
-        overloads: bool,
+        class: ScopedParameterReads,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
-        let (parameters, pending) = if overloads {
-            (
-                &file.typescript_overload_parameters,
-                &mut result.deferred_overload_parameters,
-            )
-        } else {
-            (
+        let (parameters, pending) = match class {
+            ScopedParameterReads::Callback => (
                 &file.javascript_callback_parameters,
                 &mut result.deferred_callback_parameters,
-            )
+            ),
+            ScopedParameterReads::Overload => (
+                &file.typescript_overload_parameters,
+                &mut result.deferred_overload_parameters,
+            ),
+            ScopedParameterReads::JavaScriptMethod => (
+                &file.javascript_method_parameters,
+                &mut result.deferred_javascript_method_parameters,
+            ),
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -109,7 +119,9 @@ impl<'source> Index<'source> {
         if binding.kind != StaticBindingKind::Shadow || binding.scope != parameter.site.function {
             return None;
         }
-        if parameter.symbol.is_ecmascript_overload_parameter() {
+        if parameter.symbol.is_ecmascript_overload_parameter()
+            || parameter.symbol.is_javascript_method_parameter()
+        {
             let owner = file.target_at(parameter.site.owner?)?;
             if owner.symbol.item_range != binding.scope || !owner.symbol.body_range?.encloses(range)
             {

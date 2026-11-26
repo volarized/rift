@@ -556,15 +556,11 @@ struct BindingDemands {
     rust_explicit: BindingDemand,
     rust_shorthand: BindingDemand,
     python_parameters: BindingDemand,
-    typescript_parameters: BindingDemand,
     python_receivers: BindingDemand,
     python_loop_bindings: BindingDemand,
     python_variadic_parameters: BindingDemand,
     python_overload_parameters: BindingDemand,
-    javascript_parameters: BindingDemand,
-    callback_parameters: BindingDemand,
-    overload_parameters: BindingDemand,
-    typescript_method_parameters: BindingDemand,
+    ecmascript: EcmaScriptBindingDemand,
     primary: usize,
     unnamed: usize,
 }
@@ -597,24 +593,13 @@ impl BindingDemands {
                         .logical_identity(&symbol.qualified_name)
                         .is_some()
             }) {
-                let demand = if symbol.is_ecmascript_callback_parameter() {
-                    &mut demands.callback_parameters
-                } else if facts.language().name == "typescript"
-                    && symbol.is_ecmascript_overload_parameter()
+                let language = facts.language().name.as_str();
+                let demand = if matches!(language, "javascript" | "typescript")
+                    && symbol.is_ecmascript_parameter()
                 {
-                    &mut demands.overload_parameters
-                } else if symbol.is_ecmascript_parameter() {
-                    if facts.language().name == "javascript" {
-                        &mut demands.javascript_parameters
-                    } else if symbol
-                        .container
-                        .as_deref()
-                        .is_some_and(|owner| methods.contains(owner))
-                    {
-                        &mut demands.typescript_method_parameters
-                    } else {
-                        &mut demands.typescript_parameters
-                    }
+                    demands
+                        .ecmascript
+                        .classify(symbol, language == "javascript", &methods)
                 } else if symbol.is_python_variadic_parameter() {
                     &mut demands.python_variadic_parameters
                 } else if symbol.is_python_overload_parameter() {
@@ -657,20 +642,16 @@ impl BindingDemands {
         self.rust_locals.count
             + self.rust_parameters.count
             + self.python_parameters.count
-            + self.typescript_parameters.count
             + self.python_receivers.count
             + self.python_loop_bindings.count
             + self.python_variadic_parameters.count
             + self.python_overload_parameters.count
-            + self.javascript_parameters.count
-            + self.typescript_method_parameters.count
-            + self.callback_parameters.count
-            + self.overload_parameters.count
             + self.rust_receivers.count
             + self.rust_generics.count
             + self.rust_library.count
             + self.rust_explicit.count
             + self.rust_shorthand.count
+            + self.ecmascript.count()
     }
 }
 
@@ -699,7 +680,8 @@ fn binding_capacity(
         .python_parameters
         .reserve(&mut slots, &mut bytes, record);
     let typescript_parameter_slots = demands
-        .typescript_parameters
+        .ecmascript
+        .typescript_functions
         .reserve(&mut slots, &mut bytes, record);
     let python_receiver_slots = demands
         .python_receivers
@@ -714,10 +696,12 @@ fn binding_capacity(
         .python_overload_parameters
         .reserve(&mut slots, &mut bytes, record);
     let javascript_parameter_slots = demands
-        .javascript_parameters
+        .ecmascript
+        .javascript_functions
         .reserve(&mut slots, &mut bytes, record);
     let typescript_method_slots = demands
-        .typescript_method_parameters
+        .ecmascript
+        .typescript_methods
         .reserve(&mut slots, &mut bytes, record);
     let rust_receiver_slots = demands
         .rust_receivers
@@ -729,18 +713,25 @@ fn binding_capacity(
     let explicit_slots = demands
         .rust_explicit
         .reserve(&mut slots, &mut bytes, record);
-    let (callback_slots, overload_slots) = reserve_scoped_parameters(
+    let [
+        callback_slots,
+        overload_slots,
+        module_slots,
+        shorthand_slots,
+        method_slots,
+    ] = reserve_scoped_parameters(
         documents,
-        &demands.callback_parameters,
-        &demands.overload_parameters,
+        [
+            &demands.ecmascript.javascript_callbacks,
+            &demands.ecmascript.typescript_overloads,
+            &rust_module_sources,
+            &demands.rust_shorthand,
+            &demands.ecmascript.javascript_methods,
+        ],
         &mut slots,
         &mut bytes,
         record,
     );
-    let module_slots = rust_module_sources.reserve(&mut slots, &mut bytes, record);
-    let shorthand_slots = demands
-        .rust_shorthand
-        .reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -762,8 +753,55 @@ fn binding_capacity(
         .with_javascript_callback_parameters(callback_slots)
         .with_typescript_overload_parameters(overload_slots)
         .with_rust_module_sources(module_slots)
-        .with_rust_shorthand(shorthand_slots),
+        .with_rust_shorthand(shorthand_slots)
+        .with_javascript_method_parameters(method_slots),
     )
+}
+
+#[derive(Default)]
+struct EcmaScriptBindingDemand {
+    typescript_functions: BindingDemand,
+    javascript_functions: BindingDemand,
+    typescript_methods: BindingDemand,
+    javascript_callbacks: BindingDemand,
+    typescript_overloads: BindingDemand,
+    javascript_methods: BindingDemand,
+}
+
+impl EcmaScriptBindingDemand {
+    fn classify(
+        &mut self,
+        symbol: &SyntaxSymbol,
+        javascript: bool,
+        methods: &BTreeSet<&str>,
+    ) -> &mut BindingDemand {
+        if symbol.is_ecmascript_callback_parameter() {
+            &mut self.javascript_callbacks
+        } else if symbol.is_ecmascript_overload_parameter() {
+            &mut self.typescript_overloads
+        } else if symbol.is_javascript_method_parameter() {
+            &mut self.javascript_methods
+        } else if javascript {
+            &mut self.javascript_functions
+        } else if symbol
+            .container
+            .as_deref()
+            .is_some_and(|owner| methods.contains(owner))
+        {
+            &mut self.typescript_methods
+        } else {
+            &mut self.typescript_functions
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.typescript_functions.count
+            + self.javascript_functions.count
+            + self.typescript_methods.count
+            + self.javascript_callbacks.count
+            + self.typescript_overloads.count
+            + self.javascript_methods.count
+    }
 }
 
 fn binding_source_capacity(
@@ -786,16 +824,15 @@ fn binding_source_capacity(
 }
 
 /// Leaves room for established ECMAScript file declarations before scoped parameters.
-fn reserve_scoped_parameters(
+fn reserve_scoped_parameters<const N: usize>(
     documents: &[AnalyzedFile],
-    callbacks: &BindingDemand,
-    overloads: &BindingDemand,
+    demands: [&BindingDemand; N],
     slots: &mut usize,
     bytes: &mut u64,
     record: u64,
-) -> (usize, usize) {
-    if callbacks.count == 0 && overloads.count == 0 {
-        return (0, 0);
+) -> [usize; N] {
+    if demands.iter().all(|demand| demand.count == 0) {
+        return [0; N];
     }
     for file in documents {
         if let Some(source) = complete_module_bytes(file, record) {
@@ -803,10 +840,7 @@ fn reserve_scoped_parameters(
             *bytes = bytes.saturating_sub(source);
         }
     }
-    (
-        callbacks.reserve(slots, bytes, record),
-        overloads.reserve(slots, bytes, record),
-    )
+    demands.map(|demand| demand.reserve(slots, bytes, record))
 }
 
 /// Candidate count and the longest retained name in one class of source-local binding.

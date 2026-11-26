@@ -236,6 +236,7 @@ const JSDOC_LINE_MARKER: char = '*';
 pub(crate) const PARAMETER_KIND: &str = "value_parameter";
 pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
 pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
+pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -1008,8 +1009,11 @@ impl EcmaScriptKinds {
         None
     }
 
-    /// A simple parameter of a named function or TypeScript method.
-    fn ordinary_parameter<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+    /// A simple parameter of a named function or method, with its JavaScript method class.
+    fn ordinary_parameter<'tree>(
+        &self,
+        visited: Visited<'_, 'tree>,
+    ) -> Option<(Node<'tree>, bool)> {
         let parameter = visited.syntax_element();
         let name = if parameter.kind_id() == self.identifier {
             parameter
@@ -1029,8 +1033,7 @@ impl EcmaScriptKinds {
         let direct = function.kind() == FUNCTION_DECLARATION_KIND;
         let generator = self.formal_parameter_kinds.is_empty()
             && function.kind() == GENERATOR_FUNCTION_DECLARATION_KIND;
-        let method = self.pattern.is_some()
-            && function.kind_id() == self.method_definition
+        let method = function.kind_id() == self.method_definition
             && !self.parameter_property_marked(parameter);
         let signature = matches!(
             function.kind(),
@@ -1043,7 +1046,7 @@ impl EcmaScriptKinds {
         if !signature {
             self.child(function, EcmaScriptGrammarField::Body)?;
         }
-        Some(name)
+        Some((name, method && self.formal_parameter_kinds.is_empty()))
     }
 
     /// The name a constructor parameter property declares: `name` in
@@ -1623,15 +1626,19 @@ impl EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
-        if let Some(name) = self
+        if let Some((name, method)) = self
             .kinds
             .ordinary_parameter(visited)
-            .and_then(|name| text.get(name.byte_range()))
-            .filter(|name| *name != "this" && name.is_ascii() && !name.contains('\\'))
+            .and_then(|(name, method)| text.get(name.byte_range()).map(|name| (name, method)))
+            .filter(|(name, _)| *name != "this" && name.is_ascii() && !name.contains('\\'))
         {
             return Ok(Some(Declaration {
                 name: name.to_owned(),
-                kind: PARAMETER_KIND,
+                kind: if method {
+                    METHOD_PARAMETER_KIND
+                } else {
+                    PARAMETER_KIND
+                },
                 kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
                 visibility: None,
                 body_range: None,
@@ -2085,13 +2092,13 @@ impl GrammarRules for EcmaScriptRules<'_> {
     fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
         self.kinds
             .ordinary_parameter(visited)
-            .unwrap_or_else(|| visited.syntax_element())
+            .map_or_else(|| visited.syntax_element(), |(name, _)| name)
     }
 
     /// Starts the declaration at the statement carrying it, extended over the
     /// `JSDoc` comments attached before that statement.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
-        if let Some(name) = self.kinds.ordinary_parameter(visited) {
+        if let Some((name, _)) = self.kinds.ordinary_parameter(visited) {
             return name.start_byte();
         }
         let statement = self.statement(visited);
@@ -2468,6 +2475,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == OVERLOAD_PARAMETER_KIND {
         return Some(OVERLOAD_PARAMETER_KIND);
+    }
+    if name == METHOD_PARAMETER_KIND {
+        return Some(METHOD_PARAMETER_KIND);
     }
     kinds
         .declarations

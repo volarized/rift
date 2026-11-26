@@ -32,6 +32,7 @@ pub struct PackageBindingSlots {
     javascript_parameter: usize,
     javascript_callback_parameter: usize,
     typescript_overload_parameter: usize,
+    javascript_method_parameter: usize,
     typescript_method_parameter: usize,
     rust_library_root: usize,
     rust_module_source: usize,
@@ -62,6 +63,7 @@ impl PackageBindingSlots {
             python_overload_parameter: 0,
             javascript_callback_parameter: 0,
             typescript_overload_parameter: 0,
+            javascript_method_parameter: 0,
             typescript_method_parameter: 0,
             rust_library_root: 0,
             rust_module_source: 0,
@@ -168,6 +170,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for authored JavaScript method parameters.
+    #[must_use]
+    pub const fn with_javascript_method_parameters(mut self, count: usize) -> Self {
+        self.javascript_method_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -189,6 +198,7 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_module_source)
             .saturating_add(self.rust_explicit)
             .saturating_add(self.rust_shorthand)
+            .saturating_add(self.javascript_method_parameter)
     }
 
     fn admit(
@@ -202,7 +212,11 @@ impl PackageBindingSlots {
             &mut self.javascript_callback_parameter
         } else if language == "typescript" && symbol.is_ecmascript_overload_parameter() {
             &mut self.typescript_overload_parameter
-        } else if symbol.is_ecmascript_parameter() {
+        } else if symbol.is_javascript_method_parameter() {
+            &mut self.javascript_method_parameter
+        } else if matches!(language, "javascript" | "typescript")
+            && symbol.is_ecmascript_parameter()
+        {
             if language == "javascript" {
                 &mut self.javascript_parameter
             } else if symbol

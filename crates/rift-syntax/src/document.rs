@@ -171,6 +171,7 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::PARAMETER_KIND
             || self.is_ecmascript_callback_parameter()
             || self.is_ecmascript_overload_parameter()
+            || self.is_javascript_method_parameter()
     }
 
     /// Whether this is the physical parameter of a JavaScript function value.
@@ -199,6 +200,12 @@ impl SyntaxSymbol {
         self.kind == "module"
             && self.qualified_name == ".."
             && self.syntax_element_kind == Some("source_file")
+    }
+
+    /// Whether this parameter belongs to an authored JavaScript method.
+    #[must_use]
+    pub fn is_javascript_method_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::METHOD_PARAMETER_KIND
     }
 
     /// Whether this binding uses a package-only declaration reservation.

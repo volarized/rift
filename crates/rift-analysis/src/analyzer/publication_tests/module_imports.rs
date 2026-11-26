@@ -2027,3 +2027,129 @@ fn overload_parameters_preserve_regular_parameter_and_module_slots() {
     assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
     assert_eq!(roomy.declarations.len() - bounded.declarations.len(), 3);
 }
+
+#[test]
+fn npm_javascript_methods_retain_their_value_parameters_and_reads() {
+    const SOURCE: &str = concat!(
+        "export const table = {\n",
+        "  read(key) { return key; },\n",
+        "};\n",
+        "export class Reader {\n",
+        "  read(key) { const reroute = (key) => key; return reroute(key); }\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked method source");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid package facts");
+    for (holder, declaration_start, reading, offset) in [
+        (
+            "table",
+            SOURCE.find("read(key)").expect("object method") + 5,
+            "return key",
+            7,
+        ),
+        (
+            "Reader",
+            SOURCE.rfind("read(key)").expect("class method") + 5,
+            "reroute(key);",
+            8,
+        ),
+    ] {
+        let suffix = format!("/{holder}/read/key");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(declaration_start, "key")
+            })
+            .expect("physical method parameter");
+        let owner = format!("/{holder}/read");
+        let read_start = SOURCE.find(reading).expect("authored use") + offset;
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of the {holder} method parameter")
+        };
+        assert!(read.from.as_str().ends_with(&owner));
+        let occurrence = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(occurrence.unit, declaration.unit);
+        assert_eq!(occurrence.range, module_runtime_range(read_start, "key"));
+    }
+}
+
+#[test]
+fn javascript_method_parameters_preserve_existing_parameter_slots() {
+    const SOURCE: &str = concat!(
+        "export const table = { read(key) { return key; } };\n",
+        "export function plain(initial) { const keep = (item) => item; return keep(initial); }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(7);
+    let roomy = collect(9);
+    assert_eq!(bounded.declarations.len(), 7);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/plain/initial"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/keep/item"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    let added = roomy
+        .declarations
+        .iter()
+        .filter(|row| !bounded.declarations.contains(row))
+        .collect::<Vec<_>>();
+    assert_eq!(added.len(), 1);
+    assert!(added[0].symbol.as_str().ends_with("/table/read/key"));
+}
