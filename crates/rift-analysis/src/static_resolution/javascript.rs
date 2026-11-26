@@ -9,7 +9,7 @@ use rift_syntax::{
 
 use super::{Binding, File, Index, Target, Work};
 use crate::NamespaceInput;
-use crate::analyzer::namespace::typescript::PackageFiles;
+use crate::analyzer::namespace::typescript::{PackageFiles, nested_runtime_candidates};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModuleMode {
@@ -36,8 +36,12 @@ pub(super) struct Folder {
     pub(super) known: bool,
     /// The file a runtime loads, as the manifest writes it.
     pub(super) main: Option<String>,
-    /// The outer index selected by complete runtime path observations.
-    pub(super) observed_index: Option<rift_core::ProjectPath>,
+    /// The explicit script entry, or the extensionless entry's outer JavaScript index.
+    pub(super) observed_entry: Option<rift_core::ProjectPath>,
+    /// Captured path observations decide the full runtime order for this explicit script entry.
+    pub(super) observes_explicit_main: bool,
+    /// Whether an observed file wins before the folder for a bare specifier.
+    pub(super) earlier_file: Option<bool>,
     /// The declaration file, as the manifest writes it.
     pub(super) types: Option<String>,
 }
@@ -80,15 +84,22 @@ impl<'source> PackageModes<'source> {
                 let mut folder = folder(manifest.as_ref());
                 if namespace.build_paths().is_some()
                     && !directory.is_empty()
-                    && let Some(main) = folder
-                        .main
-                        .as_deref()
-                        .and_then(|main| super::javascript_exports::folder_path(directory, main))
-                    && std::path::Path::new(&main).extension().is_none()
+                    && let Some(main) = folder.main.as_deref()
+                    && let Some(candidates) = nested_runtime_candidates(main, directory)
                 {
-                    folder.observed_index = observed_files
-                        .get_or_insert_with(|| PackageFiles::captured(namespace))
-                        .observed_folder_index(&main, directory);
+                    let files =
+                        observed_files.get_or_insert_with(|| PackageFiles::captured(namespace));
+                    folder.observes_explicit_main = candidates.explicit_script;
+                    folder.observed_entry =
+                        files
+                            .observed_folder_entry(candidates.paths)
+                            .filter(|path| {
+                                folder.observes_explicit_main
+                                    || path.as_str() == format!("{directory}/index.js")
+                            });
+                    if folder.observed_entry.is_some() {
+                        folder.earlier_file = files.file_before_folder(directory);
+                    }
                 }
                 folder
             });
@@ -211,7 +222,9 @@ fn folder(manifest: Option<&Manifest>) -> Folder {
     Folder {
         known: true,
         main: written("main"),
-        observed_index: None,
+        observed_entry: None,
+        observes_explicit_main: false,
+        earlier_file: None,
         types: written("types").or_else(|| written("typings")),
     }
 }

@@ -124,13 +124,26 @@ impl<'input> PackageFiles<'input> {
         }
     }
 
-    /// The written nested main's outer index, when every earlier runtime candidate
-    /// is established absent and the selected source is this folder's JavaScript index.
-    pub(crate) fn observed_folder_index(&self, main: &str, directory: &str) -> Option<ProjectPath> {
-        let Entry::File(path) = self.first(runtime_candidates(Some(main), directory)?) else {
-            return None;
-        };
-        (path.as_str() == format!("{directory}/index.js")).then_some(path)
+    /// The first file a written nested main reaches, including files outside the source selection.
+    pub(crate) fn observed_folder_entry(&self, candidates: Vec<String>) -> Option<ProjectPath> {
+        match self.first(candidates) {
+            Entry::File(path) => Some(path),
+            Entry::Unknown | Entry::Absent => None,
+        }
+    }
+
+    /// Whether a file wins before the directory for a specifier without a trailing slash.
+    /// Returns `None` when no file was observed and at least one candidate remains unknown.
+    pub(crate) fn file_before_folder(&self, directory: &str) -> Option<bool> {
+        let mut unknown = false;
+        for candidate in runtime_file_candidates(directory) {
+            match self.presence(&candidate) {
+                Presence::File => return Some(true),
+                Presence::Unknown => unknown = true,
+                Presence::NoFile | Presence::Missing => {}
+            }
+        }
+        (!unknown).then_some(false)
     }
 
     pub(super) fn types(&self, metadata: &PackageMetadata) -> Entry {
@@ -192,8 +205,7 @@ fn runtime_candidates(main: Option<&str>, directory: &str) -> Option<Vec<String>
     if let Some(main) = main.filter(|main| !main.is_empty()) {
         let path = normalized(main)?;
         if !path.is_empty() {
-            candidates.push(path.clone());
-            candidates.extend(RUNTIME_EXTENSIONS.map(|extension| format!("{path}{extension}")));
+            candidates.extend(runtime_file_candidates(&path));
             candidates
                 .extend(RUNTIME_EXTENSIONS.map(|extension| format!("{path}/index{extension}")));
         }
@@ -205,6 +217,43 @@ fn runtime_candidates(main: Option<&str>, directory: &str) -> Option<Vec<String>
     };
     candidates.extend(RUNTIME_EXTENSIONS.map(|extension| format!("{index}{extension}")));
     Some(candidates)
+}
+
+fn runtime_file_candidates(path: &str) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(path.to_owned()).chain(
+        RUNTIME_EXTENSIONS
+            .into_iter()
+            .map(move |extension| format!("{path}{extension}")),
+    )
+}
+
+/// Runtime candidates for a written nested main.
+pub(crate) struct NestedRuntimeCandidates {
+    pub(crate) paths: Vec<String>,
+    pub(crate) explicit_script: bool,
+}
+
+/// The nested entries whose runtime choice can use captured path observations.
+pub(crate) fn nested_runtime_candidates(
+    main: &str,
+    directory: &str,
+) -> Option<NestedRuntimeCandidates> {
+    if main.is_empty() {
+        return None;
+    }
+    let path = folder_path(directory, main)?;
+    let explicit_script = match std::path::Path::new(&path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+    {
+        Some("js" | "cjs" | "mjs") => true,
+        None => false,
+        Some(_) => return None,
+    };
+    Some(NestedRuntimeCandidates {
+        paths: runtime_candidates(Some(&path), directory)?,
+        explicit_script,
+    })
 }
 
 /// The order TypeScript tries for a written `types`. `None` for a target outside the package.
@@ -232,10 +281,18 @@ fn types_candidates(types: &str) -> Option<Vec<String>> {
 /// A written path as Node joins it to the package folder: empty and `.` segments vanish and
 /// `..` removes the segment before it. `None` when it leaves the package or is absolute.
 fn normalized(target: &str) -> Option<String> {
+    folder_path("", target)
+}
+
+/// A written path joined to its folder, bounded by the selected package or workspace.
+pub(crate) fn folder_path(directory: &str, target: &str) -> Option<String> {
     if target.starts_with('/') || target.contains('\\') {
         return None;
     }
-    let mut segments = Vec::new();
+    let mut segments = directory
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
     for segment in target.split('/') {
         match segment {
             "" | "." => {}
@@ -254,8 +311,22 @@ pub(in crate::analyzer) fn build_paths(
     manifest: PackageSource<'_>,
     source_bytes_max: usize,
 ) -> Option<Vec<ObservationPath>> {
-    if manifest.path().as_str() != "package.json" || manifest.text().len() > source_bytes_max {
+    if manifest.text().len() > source_bytes_max {
         return None;
+    }
+    let path = manifest.path().as_str();
+    if path != "package.json" {
+        let directory = path.strip_suffix("/package.json")?;
+        let metadata: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(manifest.text()).ok()?;
+        let main = metadata.get("main")?.as_str()?;
+        let candidates = nested_runtime_candidates(main, directory)?;
+        return Some(requested_paths(
+            candidates
+                .paths
+                .into_iter()
+                .chain(runtime_file_candidates(directory)),
+        ));
     }
     let metadata: PackageMetadata = serde_json::from_str(manifest.text()).ok()?;
     if metadata.exports.is_some() {
@@ -266,11 +337,19 @@ pub(in crate::analyzer) fn build_paths(
         Some(types) => types_candidates(types).unwrap_or_default(),
         None => default_types(metadata.main.as_deref()).unwrap_or_default(),
     };
-    let paths = runtime_candidates(metadata.main.as_deref(), "")
-        .unwrap_or_default()
-        .into_iter()
-        .chain(declared)
+    Some(requested_paths(
+        runtime_candidates(metadata.main.as_deref(), "")
+            .unwrap_or_default()
+            .into_iter()
+            .chain(declared),
+    ))
+}
+
+fn requested_paths(paths: impl Iterator<Item = String>) -> Vec<ObservationPath> {
+    paths
         .filter(|path| ProjectPath::new(path.as_str()).is_ok())
-        .collect::<BTreeSet<_>>();
-    Some(paths.into_iter().map(ObservationPath).collect())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(ObservationPath)
+        .collect()
 }

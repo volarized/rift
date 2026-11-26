@@ -303,18 +303,26 @@ fn an_extensionless_nested_main_can_use_its_observed_outer_index() {
         PackageSource::new(&nested, NESTED),
     ];
 
-    for (observed_json, found) in [
-        (Some(None), true),
-        (None, false),
-        (Some(Some(crate::ArchiveMemberKind::File)), false),
+    let present = Some(Some(crate::ArchiveMemberKind::File));
+    for (observed_json, sibling_json, found) in [
+        (Some(None), Some(None), true),
+        (None, Some(None), false),
+        (present, Some(None), false),
+        (Some(None), None, false),
+        (Some(None), present, false),
     ] {
         let mut observed = BTreeMap::from([
+            (ObservedPath("lib.js".to_owned()), None),
+            (ObservedPath("lib.node".to_owned()), None),
             (ObservedPath("lib/entry".to_owned()), None),
             (ObservedPath("lib/entry.js".to_owned()), None),
             (ObservedPath("lib/entry.node".to_owned()), None),
         ]);
         if let Some(kind) = observed_json {
             observed.insert(ObservedPath("lib/entry.json".to_owned()), kind);
+        }
+        if let Some(kind) = sibling_json {
+            observed.insert(ObservedPath("lib.json".to_owned()), kind);
         }
         let input = ExactPackageInput::new(
             &owner,
@@ -349,7 +357,175 @@ fn an_extensionless_nested_main_can_use_its_observed_outer_index() {
                 assert!(occurrence(edge, CALLER, source));
             }
         } else {
-            assert!(edges.is_empty(), "{observed_json:?}");
+            assert!(edges.is_empty(), "{observed_json:?} {sibling_json:?}");
         }
     }
+}
+
+#[cfg(feature = "archive")]
+#[test]
+fn an_explicit_nested_main_does_not_fall_through_an_unavailable_runtime_file() {
+    use rift_protocol::read::SourceLocation;
+
+    const CALLER: &str =
+        "const { work } = require(\"./lib\");\nexports.run = function run() { return work(); };\n";
+    const INDEX: &str = "exports.work = function work() { return 42; };\n";
+    const NESTED: &str = r#"{"main":"entry.js"}"#;
+    let package = rift_protocol::read::PackageIdentity {
+        manager: "npm".to_owned(),
+        registry: "registry.npmjs.org".to_owned(),
+        name: "beacon".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("npm owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("authored npm source");
+    let language = ShippedLanguage::JavaScript.language();
+    for (extra, keep, unobserved, expected) in [
+        (None, false, None, Some("lib/index.js")),
+        (None, false, Some("lib/entry.js"), None),
+        (Some("lib/entry.js"), false, None, None),
+        (Some("lib/entry.js"), true, None, Some("lib/entry.js")),
+        (
+            Some("lib/entry.js"),
+            true,
+            Some("lib.js"),
+            Some("lib/entry.js"),
+        ),
+        (Some("lib/entry.js.js"), false, None, None),
+        (Some("lib/entry.js.json"), false, None, None),
+        (Some("lib/entry.js.node"), false, None, None),
+        (Some("lib.node"), false, None, None),
+    ] {
+        let archive = nested_main_archive(
+            [
+                ("index.js", CALLER),
+                ("lib/index.js", INDEX),
+                ("package.json", ROOT_ONLY_MANIFEST),
+                ("lib/package.json", NESTED),
+            ]
+            .into_iter()
+            .chain(extra.map(|path| (path, INDEX))),
+            extra.filter(|_| !keep),
+        );
+        let (context, selected): (Vec<_>, Vec<_>) = archive
+            .files()
+            .iter()
+            .map(|(path, bytes)| {
+                PackageSource::new(path, std::str::from_utf8(bytes).expect("authored source"))
+            })
+            .partition(|source| source.path().as_str().ends_with("package.json"));
+        let observed = nested_main_observations(&archive, &context, &selected, unobserved);
+        if let Some(extra) = extra {
+            let member = rift_protocol::read::ProjectPath(extra.to_owned());
+            assert_eq!(observed[&member], Some(crate::ArchiveMemberKind::File));
+            assert_eq!(
+                selected.iter().any(|file| file.path().as_str() == extra),
+                keep
+            );
+        }
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &selected,
+            ExactPackageLimits::new(32, 16_384),
+        )
+        .expect("captured byte bounds")
+        .with_framework_context(&context, &[])
+        .expect("both written manifests")
+        .with_build_paths(&observed)
+        .expect("observed paths");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("package analysis");
+        let publication = analysis.publication();
+        publication.validate_facts().expect("valid stored edges");
+        for (kind, written) in [(EdgeKind::Imports, "work"), (EdgeKind::Calls, "work()")] {
+            let edges = publication
+                .edges
+                .iter()
+                .filter(|edge| edge.kinds == [kind] && occurrence(edge, CALLER, written))
+                .map(|edge| edge.to.as_str())
+                .collect::<Vec<_>>();
+            let target =
+                expected.map(|path| format!("/beacon%2F{}/work", path.replace('/', "%2F")));
+            assert_eq!(
+                edges.len(),
+                usize::from(target.is_some()),
+                "{extra:?} {keep} {unobserved:?} {kind:?} {edges:?}"
+            );
+            assert!(
+                edges
+                    .iter()
+                    .zip(target)
+                    .all(|(edge, target)| edge.ends_with(&target))
+            );
+        }
+    }
+}
+
+#[cfg(feature = "archive")]
+fn nested_main_archive(
+    entries: impl IntoIterator<Item = (&'static str, &'static str)>,
+    omitted: Option<&str>,
+) -> crate::archive::ArchiveFiles {
+    use crate::archive::{ArchiveDigest, ArchiveFormat, ArchiveLimits, read_archive_from};
+    use sha2::{Digest, Sha512};
+
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gzip);
+    for (path, source) in entries {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(u64::try_from(source.len()).expect("source length"));
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, format!("package/{path}"), source.as_bytes())
+            .expect("authored archive entry");
+    }
+    let bytes = builder
+        .into_inner()
+        .expect("authored archive")
+        .finish()
+        .expect("complete compressed archive");
+    read_archive_from(
+        std::io::Cursor::new(&bytes),
+        ArchiveFormat::TarGzip,
+        &ArchiveDigest::Sha512(Sha512::digest(&bytes).into()),
+        Some("package"),
+        ArchiveLimits::default(),
+        &|path, _| omitted != Some(path.as_str()),
+    )
+    .expect("verified package archive")
+}
+
+#[cfg(feature = "archive")]
+fn nested_main_observations(
+    archive: &crate::archive::ArchiveFiles,
+    context: &[PackageSource<'_>],
+    selected: &[PackageSource<'_>],
+    unobserved: Option<&str>,
+) -> BTreeMap<rift_protocol::read::ProjectPath, Option<crate::ArchiveMemberKind>> {
+    context
+        .iter()
+        .flat_map(|manifest| {
+            crate::build_paths(*manifest, selected, rift_syntax::SyntaxLimits::DEFAULT)
+                .unwrap_or_default()
+        })
+        .filter(|path| unobserved != Some(path.0.as_str()))
+        .map(|path| {
+            let name = format!("package/{}", path.0);
+            let kind = archive.members().get(&name).copied().or_else(|| {
+                let prefix = format!("{name}/");
+                archive
+                    .members()
+                    .range(prefix.clone()..)
+                    .next()
+                    .filter(|(name, _)| name.starts_with(&prefix))
+                    .map(|_| crate::ArchiveMemberKind::Directory)
+            });
+            (path, kind)
+        })
+        .collect()
 }

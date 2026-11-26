@@ -2,6 +2,7 @@
 
 use super::javascript::{ModuleMode, PackageModes, js_binding};
 use super::{File, Target, Work};
+use crate::analyzer::namespace::typescript::folder_path;
 use rift_syntax::{StaticBindingKind, SyntaxExportKind};
 use std::collections::BTreeMap;
 
@@ -53,17 +54,25 @@ impl<'source> Exports<'_, 'source> {
         module: &str,
         work: &mut Work,
     ) -> Option<&File<'source>> {
-        let from = from.document.path.as_str();
-        let path = relative_path(from, module, work)?;
-        if is_declaration_file(from) {
+        let from_path = from.document.path.as_str();
+        let path = relative_path(from_path, module, work)?;
+        if is_declaration_file(from_path) {
             return declared_file(self.files, self.modes, &path);
         }
-        let observed_index = self
+        let commonjs = self
             .modes
             .folder(path.strip_suffix('/').unwrap_or(&path))
-            .and_then(|folder| folder.observed_index.as_ref())
-            .filter(|_| self.modes.mode(from, work) == ModuleMode::CommonJs);
-        module_file_with_observed_index(self.files, self.modes, &path, false, observed_index)
+            .is_some_and(|folder| {
+                (folder.observes_explicit_main
+                    || (folder.observed_entry.is_some()
+                        && (path.ends_with('/') || folder.earlier_file == Some(false))))
+                    && !from.facts.has_javascript_module_syntax()
+                    && self.modes.mode(from_path, work) == ModuleMode::CommonJs
+            });
+        if work.exhausted {
+            return None;
+        }
+        module_file_with_runtime_observations(self.files, self.modes, &path, false, commonjs)
     }
 
     /// The file a specifier names for one export: in a declaration file the declaration file
@@ -809,46 +818,24 @@ fn first_declared<'index, 'source>(
     None
 }
 
-/// A path a folder's manifest writes, as Node joins it to the folder. `None` when it leaves
-/// the files of the analysis.
-pub(super) fn folder_path(directory: &str, written: &str) -> Option<String> {
-    let mut segments = directory
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if written.starts_with('/') || written.contains('\\') {
-        return None;
-    }
-    for segment in written.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
-            }
-            segment => segments.push(segment),
-        }
-    }
-    Some(segments.join("/"))
-}
-
 pub(super) fn module_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
     path: &str,
     declarations: bool,
 ) -> Option<&'index File<'source>> {
-    module_file_with_observed_index(files, modes, path, declarations, None)
+    module_file_with_runtime_observations(files, modes, path, declarations, false)
 }
 
-fn module_file_with_observed_index<'index, 'source>(
+fn module_file_with_runtime_observations<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
     path: &str,
     declarations: bool,
-    observed_index: Option<&rift_core::ProjectPath>,
+    commonjs: bool,
 ) -> Option<&'index File<'source>> {
-    if let Some(directory) = path.strip_suffix('/') {
-        let found = match folder_file(files, modes, directory, observed_index) {
+    if path.ends_with('/') {
+        let found = match folder_file(files, modes, path, commonjs) {
             Candidate::File(file) => Some(file),
             Candidate::Open => return None,
             Candidate::Missing => None,
@@ -880,7 +867,7 @@ fn module_file_with_observed_index<'index, 'source>(
         Candidate::File(_) | Candidate::Open => return None,
         // `./x.js` never names a folder by its manifest.
         Candidate::Missing if stem != path => folder_index(files, stem),
-        Candidate::Missing => folder_file(files, modes, stem, observed_index),
+        Candidate::Missing => folder_file(files, modes, stem, commonjs),
     };
     let found = match candidate {
         Candidate::File(file) => Some(file),
@@ -940,9 +927,10 @@ fn folder_index<'index, 'source>(
 fn folder_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
-    directory: &str,
-    observed_index: Option<&rift_core::ProjectPath>,
+    specifier: &str,
+    commonjs: bool,
 ) -> Candidate<'index, 'source> {
+    let directory = specifier.strip_suffix('/').unwrap_or(specifier);
     let index = |directory: &str| folder_index(files, directory);
     let Some(manifest) = modes.folder(directory) else {
         return index(directory);
@@ -956,6 +944,24 @@ fn folder_file<'index, 'source>(
     let Some(path) = folder_path(directory, main) else {
         return Candidate::Open;
     };
+    let observed = || {
+        if !commonjs || !(specifier.ends_with('/') || manifest.earlier_file == Some(false)) {
+            return None;
+        }
+        files.get(manifest.observed_entry.as_ref()?.as_str())
+    };
+    if commonjs && manifest.observes_explicit_main {
+        let entry = if !specifier.ends_with('/') && manifest.earlier_file.is_none() {
+            // A bounded observation can leave earlier paths unknown. Keep the already
+            // selected written source, while requiring complete observations for any fallback.
+            files.get(path.as_str())
+        } else {
+            observed()
+        };
+        return entry
+            .filter(|file| file.document.facts.language().name.as_str() == "javascript")
+            .map_or(Candidate::Open, Candidate::File);
+    }
     if let Some(file) = files.get(path.as_str()) {
         return Candidate::File(file);
     }
@@ -976,9 +982,9 @@ fn folder_file<'index, 'source>(
     match index(&path) {
         // Node tries a data or native file of this name before the folder's index, and the
         // selected files of a package name none.
-        Candidate::Missing if !matches!(extension, Some("js" | "cjs" | "mjs")) => observed_index
-            .and_then(|selected| files.get(selected.as_str()))
-            .map_or(Candidate::Open, Candidate::File),
+        Candidate::Missing if !matches!(extension, Some("js" | "cjs" | "mjs")) => {
+            observed().map_or(Candidate::Open, Candidate::File)
+        }
         Candidate::Missing => index(directory),
         found => found,
     }

@@ -1855,7 +1855,57 @@ fn package_entry_paths_are_requested_within_the_source_bound() {
     );
     assert!(requested(manifest.len() - 1).is_none());
     let nested = ProjectPath::new("nested/package.json").expect("nested manifest path");
-    assert!(super::build_paths(PackageSource::new(&nested, manifest), 1024).is_none());
+    let paths = super::build_paths(PackageSource::new(&nested, manifest), 1024)
+        .expect("nested runtime candidates");
+    assert_eq!(
+        paths.iter().map(|path| path.0.as_str()).collect::<Vec<_>>(),
+        [
+            "nested",
+            "nested.js",
+            "nested.json",
+            "nested.node",
+            "nested/index.js",
+            "nested/index.json",
+            "nested/index.node",
+            "nested/lib",
+            "nested/lib.js",
+            "nested/lib.json",
+            "nested/lib.node",
+            "nested/lib/index.js",
+            "nested/lib/index.json",
+            "nested/lib/index.node",
+        ]
+    );
+    let written = r#"{"main":"entry.js"}"#;
+    let paths = super::build_paths(PackageSource::new(&nested, written), written.len())
+        .expect("written nested JavaScript runtime candidates");
+    assert_eq!(
+        paths.iter().map(|path| path.0.as_str()).collect::<Vec<_>>(),
+        [
+            "nested",
+            "nested.js",
+            "nested.json",
+            "nested.node",
+            "nested/entry.js",
+            "nested/entry.js.js",
+            "nested/entry.js.json",
+            "nested/entry.js.node",
+            "nested/entry.js/index.js",
+            "nested/entry.js/index.json",
+            "nested/entry.js/index.node",
+            "nested/index.js",
+            "nested/index.json",
+            "nested/index.node",
+        ]
+    );
+    assert!(super::build_paths(PackageSource::new(&nested, written), written.len() - 1).is_none());
+    for manifest in [
+        r#"{"main":"../../outside"}"#,
+        r#"{"main":"data.json"}"#,
+        r#"{"main":"#,
+    ] {
+        assert!(super::build_paths(PackageSource::new(&nested, manifest), 1024).is_none());
+    }
 }
 
 /// An observed `import` build holds the module; the file `main` names takes no second copy.
