@@ -414,17 +414,17 @@ impl WorkProgress {
         read.saturating_duration_since(since) >= settle_delay
     }
 
-    /// The next moment after `now` at which a read could prove a settle
-    /// delay of quiet: one settle delay past the last transition, the walk's
-    /// last transition, or the first read. `None` when every such moment has
-    /// passed.
+    /// The next moment a read could prove a settle delay of quiet after a
+    /// transition or the first read. A boundary the last read has not
+    /// reached still needs a poll when it has already passed.
     fn next_quiet_boundary(&self, now: Instant, settle_delay: Duration) -> Option<Instant> {
         [self.last_transition, self.walk_transition, self.first_read]
             .into_iter()
             .flatten()
             .map(|since| since + settle_delay)
-            .filter(|boundary| *boundary > now)
+            .filter(|boundary| self.last_read.is_none_or(|read| read < *boundary))
             .min()
+            .map(|boundary| boundary.max(now))
     }
 
     /// Whether the record has stayed empty for `settle_delay`, up to the
