@@ -541,6 +541,110 @@ fn package_python_loop_targets_respect_existing_names_and_scope_redirects() {
 }
 
 #[test]
+fn package_python_comprehensions_keep_exact_bindings_and_scope_reads() {
+    const SOURCE: &str = concat!(
+        "def choices():\n",
+        "    return ((1, 2),)\n",
+        "def gather(rows):\n",
+        "    label = 0\n",
+        "    one = [label for label, amount in rows if amount]\n",
+        "    two = [(label, [label for label in label]) for label in rows]\n",
+        "    three = {choices for choices in choices()}\n",
+        "    four = {item: item for item in rows}\n",
+        "    five = (entry for entry in rows)\n",
+        "    for amount in rows:\n",
+        "        pass\n",
+        "    return label, one, two, three, four, five\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let result = publication(&files, None, &["click"]);
+    let position = |context: &str, token: &str| {
+        u64::try_from(
+            SOURCE.find(context).expect("written context")
+                + context.find(token).expect("written token"),
+        )
+        .expect("source offset")
+    };
+    let declaration = |context: &str, name: &str| {
+        let start = position(context, name);
+        result
+            .declarations
+            .iter()
+            .find(|entry| {
+                entry.source == name
+                    && entry.range.start == start
+                    && entry.range.end == start + u64::try_from(name.len()).expect("name length")
+            })
+            .map(|entry| entry.symbol.as_str())
+            .expect("exact scoped declaration")
+    };
+    let read = |context: &str, name: &str, target: &str| {
+        let start = position(context, name);
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str() == target
+                    && edge.from.as_str().ends_with("/gather")
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == start
+                            && site.range.end
+                                == start + u64::try_from(name.len()).expect("name length")
+                    })
+            }),
+            "{context} reads {target}"
+        );
+    };
+    let first = declaration("for label, amount", "label");
+    let amount = declaration("for label, amount", "amount");
+    let statement_loop = declaration("for amount in rows:", "amount");
+    assert!(statement_loop.ends_with("/gather/amount"));
+    assert_ne!(amount, statement_loop);
+    let inner = declaration("for label in label", "label");
+    let outer = declaration("for label in rows", "label");
+    assert_ne!(first, inner);
+    assert_ne!(first, outer);
+    assert_ne!(inner, outer);
+    read("[label for label, amount", "label", first);
+    read("if amount]", "amount", amount);
+    read("[label for label in label", "label", inner);
+    read("in label])", "label", outer);
+    read("(label, [", "label", outer);
+    let choices = declaration("for choices in choices()", "choices");
+    read("{choices for choices", "choices", choices);
+    let item = declaration("for item in rows", "item");
+    read("{item: item", "item", item);
+    let entry = declaration("for entry in rows", "entry");
+    read("(entry for entry", "entry", entry);
+    read(
+        "return label, one",
+        "label",
+        "rift://symbol/pypi/pypi.org/click/python/click/gather/label",
+    );
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/gather")
+            && edge.to.as_str() == "rift://symbol/pypi/pypi.org/click/python/click/choices"
+    }));
+
+    let targets = [first, amount, inner, outer, choices, item, entry];
+    let incumbent = result
+        .edges
+        .iter()
+        .filter(|edge| !targets.contains(&edge.to.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let tight = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(incumbent.len()),
+    );
+    assert_eq!(tight.declarations, result.declarations);
+    assert_eq!(tight.edges, incumbent);
+}
+
+#[test]
 fn package_python_variadic_parameters_keep_names_and_reads() {
     const SOURCE: &str = concat!(
         "def collect(*values: int, **options: str):\n",

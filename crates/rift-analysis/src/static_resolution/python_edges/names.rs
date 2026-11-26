@@ -196,6 +196,29 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Resolves scoped comprehension reads after established reference work.
+    pub(in crate::static_resolution) fn resolve_python_comprehension_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_comprehension_start = Some(result.occurrences.len());
+        for file in self
+            .files
+            .values()
+            .filter(|file| !file.python_comprehension_bindings.is_empty())
+        {
+            for &read in file.facts.python_comprehension_reads() {
+                if !work.charge() {
+                    return;
+                }
+                if let Some(target) = file.python_comprehension_read_target(read, work) {
+                    result.record(self.python_access(file, read, ReferenceRole::Read, target));
+                }
+            }
+        }
+    }
+
     fn record_python_local_read(
         &self,
         file: &File<'source>,
@@ -605,6 +628,32 @@ fn shares(kind: StaticBindingKind) -> bool {
 }
 
 impl<'source> File<'source> {
+    fn python_comprehension_read_target(
+        &self,
+        read: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if self.blocked(read.start, work) {
+            return None;
+        }
+        let spelling = self.text(read)?;
+        let (scope, bindings) = self.python_local_binding_scope(spelling, read, work)?;
+        let mut bindings = bindings
+            .into_iter()
+            .filter(|binding| Scope::of(self, binding) == scope);
+        let binding = bindings.next()?;
+        if bindings.next().is_some() || binding.available_from > read.start {
+            return None;
+        }
+        Some(Target {
+            file: self.document,
+            symbol: self
+                .python_comprehension_bindings
+                .get(&binding.name)
+                .copied()?,
+        })
+    }
+
     fn python_receiver_read_target(
         &self,
         read: ByteRange,

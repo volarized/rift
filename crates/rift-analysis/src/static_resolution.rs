@@ -120,6 +120,7 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_shared_start: Option<usize>,
     /// First reference to an authored parent module after existing Rust references.
     pub(crate) rust_parent_module_start: Option<usize>,
+    pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
     /// Existing call sites left unresolved in files with authored extern bindings.
@@ -318,6 +319,7 @@ fn resolve_by<'source>(
     index.resolve_rust_shorthand(&mut work, &mut resolution);
     index.resolve_rust_shared_sources(documents.1, namespace, &mut work, &mut resolution);
     index.resolve_rust_parent_modules(&mut work, &mut resolution);
+    index.resolve_python_comprehension_reads(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -776,6 +778,7 @@ struct File<'source> {
     javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
+    python_comprehension_bindings: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
@@ -958,6 +961,7 @@ impl<'source> File<'source> {
             typescript_method_type_parameters: BTreeMap::new(),
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
+            python_comprehension_bindings: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
@@ -1263,6 +1267,8 @@ impl<'source> File<'source> {
             if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
                 self.python_parameters
                     .insert(name, admitted.then_some(symbol));
+            } else if admitted && symbol.is_python_comprehension_binding() {
+                self.python_comprehension_bindings.insert(name, symbol);
             } else if admitted && symbol.is_typescript_type_parameter() {
                 self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && symbol.is_javascript_wrapped_parameter() {

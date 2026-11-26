@@ -27,6 +27,7 @@ pub struct PackageBindingSlots {
     typescript_parameter: usize,
     python_receiver: usize,
     python_loop_binding: usize,
+    python_comprehension_binding: usize,
     python_variadic_parameter: usize,
     python_overload_parameter: usize,
     javascript_parameter: usize,
@@ -72,6 +73,7 @@ impl PackageBindingSlots {
             javascript_parameter: 0,
             python_receiver: 0,
             python_loop_binding: 0,
+            python_comprehension_binding: 0,
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
             javascript_callback_parameter: 0,
@@ -109,6 +111,13 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_python_loop_binding_slots(mut self, slots: usize) -> Self {
         self.python_loop_binding = slots;
+        self
+    }
+
+    /// Reserves slots remaining for Python comprehension targets.
+    #[must_use]
+    pub const fn with_python_comprehension_bindings(mut self, slots: usize) -> Self {
+        self.python_comprehension_binding = slots;
         self
     }
 
@@ -306,6 +315,7 @@ impl PackageBindingSlots {
             .saturating_add(self.javascript_parameter)
             .saturating_add(self.python_receiver)
             .saturating_add(self.python_loop_binding)
+            .saturating_add(self.python_comprehension_binding)
             .saturating_add(self.python_variadic_parameter)
             .saturating_add(self.python_overload_parameter)
             .saturating_add(self.typescript_method_parameter)
@@ -414,6 +424,8 @@ impl PackageBindingSlots {
             &mut self.rust_parameter
         } else if symbol.is_python_loop_binding() {
             &mut self.python_loop_binding
+        } else if symbol.is_python_comprehension_binding() {
+            &mut self.python_comprehension_binding
         } else {
             &mut self.rust_local
         };

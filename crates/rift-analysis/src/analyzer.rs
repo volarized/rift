@@ -572,6 +572,7 @@ struct BindingDemands {
     python_parameters: BindingDemand,
     python_receivers: BindingDemand,
     python_loop_bindings: BindingDemand,
+    python_comprehension_bindings: BindingDemand,
     python_variadic_parameters: BindingDemand,
     python_overload_parameters: BindingDemand,
     ecmascript: EcmaScriptBindingDemand,
@@ -640,6 +641,8 @@ impl BindingDemands {
                     &mut demands.rust_parameters
                 } else if symbol.is_python_loop_binding() {
                     &mut demands.python_loop_bindings
+                } else if symbol.is_python_comprehension_binding() {
+                    &mut demands.python_comprehension_bindings
                 } else {
                     &mut demands.rust_locals
                 };
@@ -655,6 +658,7 @@ impl BindingDemands {
             + self.python_parameters.count
             + self.python_receivers.count
             + self.python_loop_bindings.count
+            + self.python_comprehension_bindings.count
             + self.python_variadic_parameters.count
             + self.python_overload_parameters.count
             + self.rust_receivers.count
@@ -752,9 +756,10 @@ fn binding_capacity(
                 &demands.rust_macro_methods,
                 &demands.rust_disjoint,
             ],
+            &demands.python_comprehension_bindings,
             (slots, bytes),
             record,
-            established,
+            &established,
         ),
     )
 }
@@ -785,9 +790,10 @@ impl EcmaScriptBindingDemand {
         &self,
         documents: &[AnalyzedFile],
         rust: [&BindingDemand; 4],
+        python_comprehensions: &BindingDemand,
         capacity: (usize, u64),
         record: u64,
-        established: rift_syntax::PackageBindingSlots,
+        established: &rift_syntax::PackageBindingSlots,
     ) -> rift_syntax::PackageBindingSlots {
         let [
             rust_modules,
@@ -860,6 +866,9 @@ impl EcmaScriptBindingDemand {
             .with_typescript_destructured_parameters(typed_pattern_slots)
             .with_rust_macro_methods(macro_method_slots)
             .with_disjoint_rust_bindings(disjoint_slots)
+            .with_python_comprehension_bindings(
+                python_comprehensions.reserve(&mut slots, &mut bytes, record),
+            )
     }
 
     fn classify(

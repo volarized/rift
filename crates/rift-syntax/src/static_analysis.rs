@@ -589,6 +589,8 @@ pub struct StaticFactsParts {
     pub python_receiver_reads: Vec<(ByteRange, ByteRange)>,
     /// Reads of Python variadic parameters paired with their declared names.
     pub python_variadic_reads: Vec<(ByteRange, ByteRange)>,
+    /// Plain reads that an enclosing Python comprehension may bind.
+    pub python_comprehension_reads: Vec<ByteRange>,
     /// Authored class fields for a possible generated Python initializer.
     pub python_initializers: Vec<StaticPythonInitializer>,
     /// The call and keyword name ranges of Python keyword arguments.
@@ -1032,6 +1034,12 @@ impl StaticFacts {
         &self.0.python_variadic_reads
     }
 
+    /// Plain reads that a Python comprehension may bind in one of its scopes.
+    #[must_use]
+    pub fn python_comprehension_reads(&self) -> &[ByteRange] {
+        &self.0.python_comprehension_reads
+    }
+
     /// The authored fields an initializer may expose as keyword arguments.
     #[must_use]
     pub fn python_initializers(&self) -> &[StaticPythonInitializer] {
@@ -1115,6 +1123,7 @@ impl StaticFacts {
             vector_capacity(&self.0.python_captured_local_reads),
             vector_capacity(&self.0.python_receiver_reads),
             vector_capacity(&self.0.python_variadic_reads),
+            vector_capacity(&self.0.python_comprehension_reads),
             vector_capacity(&self.0.python_initializers),
             vector_capacity(&self.0.python_keyword_arguments),
             vector_capacity(&self.0.non_none_guards),
@@ -1206,6 +1215,7 @@ impl StaticFacts {
             self.python_captured_local_reads().len(),
             self.python_receiver_reads().len(),
             self.python_variadic_reads().len(),
+            self.python_comprehension_reads().len(),
             self.python_initializers().len(),
             self.python_keyword_arguments().len(),
             self.non_none_guards().len(),
@@ -1469,6 +1479,11 @@ impl StaticFacts {
         let rust = self.rust_rows_valid(&valid, limits);
         let flow = self.python_flow_valid(valid)
             && self.python_local_reads_valid(source, valid)
+            && self.python_comprehension_reads().iter().copied().all(valid)
+            && self
+                .python_comprehension_reads()
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
             && self.python_initializers_valid(valid, limits);
         if !(edges
             && references
@@ -1988,6 +2003,35 @@ mod python_local_read_tests {
         let mut inverted = original.0.clone();
         inverted.python_captured_local_reads[0] = (local[0], local[1]);
         assert!(StaticFacts::from_parts(source, SyntaxLimits::default(), inverted).is_err());
+    }
+
+    #[test]
+    fn test_python_comprehension_reads_restore_in_source_order() {
+        let source = "def collect(rows):\n    return [value for value in rows if value]\n";
+        let values = source
+            .match_indices("value")
+            .map(|(start, name)| ByteRange {
+                start: u64::try_from(start).expect("start"),
+                end: u64::try_from(start + name.len()).expect("end"),
+            })
+            .collect::<Vec<_>>();
+        let captured = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &rift_core::ProjectPath::new("collect.py").expect("path"),
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("authored Python source");
+        let facts = captured.facts().static_facts().expect("captured facts");
+        assert_eq!(facts.python_comprehension_reads(), [values[0], values[2]]);
+        let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), facts.0.clone())
+            .expect("restored comprehension reads");
+        assert_eq!(&restored, facts);
+        let mut reversed = facts.0.clone();
+        reversed.python_comprehension_reads.reverse();
+        assert!(StaticFacts::from_parts(source, SyntaxLimits::default(), reversed).is_err());
     }
 
     #[test]

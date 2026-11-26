@@ -461,7 +461,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 37] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 38] {
     let supplemental_start = resolution.supplemental_start.take();
     let (alias, alias_external) = resolution
         .rust_extern_alias_start
@@ -505,11 +505,12 @@ fn static_admission_batches<'a>(
         resolution.rust_shorthand_start.take(),
         resolution.rust_shared_start.take(),
         resolution.rust_parent_module_start.take(),
+        resolution.python_comprehension_start.take(),
     ];
-    let mut boundaries = [0; 38];
+    let mut boundaries = [0; 39];
     let mut next = resolution.occurrences.len();
-    boundaries[37] = next;
-    for (boundary, start) in boundaries[2..37].iter_mut().zip(tail_starts).rev() {
+    boundaries[38] = next;
+    for (boundary, start) in boundaries[2..38].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }
