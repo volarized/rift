@@ -3073,9 +3073,9 @@ fn package_javascript_parameters_follow_typescript_parameters_under_provider_bou
     )];
 
     for (bound, expected) in [
-        (3, &[][..]),
-        (4, &["value"][..]),
-        (5, &["gift", "value"][..]),
+        (2, &[][..]),
+        (3, &["value"][..]),
+        (4, &["gift", "value"][..]),
     ] {
         let limits = ExactPackageLimits::new(3, 4096)
             .with_declarations(bound)

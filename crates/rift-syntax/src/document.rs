@@ -799,7 +799,7 @@ impl SyntaxFacts {
     pub fn primary_symbols_len(&self) -> usize {
         if matches!(
             self.language.name.as_str(),
-            "rust" | "python" | "typescript"
+            "rust" | "python" | "javascript" | "typescript"
         ) {
             self.symbols
                 .iter()
