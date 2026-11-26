@@ -148,6 +148,10 @@ pub(crate) struct StaticResolution {
     pub(crate) javascript_destructured_parameter_start: Option<usize>,
     /// Pattern binding Reads after earlier package edges.
     pub(crate) deferred_javascript_destructured_parameters: Vec<StaticOccurrence>,
+    /// First containment edge of a property in a physical TypeScript union branch.
+    pub(crate) typescript_union_property_start: Option<usize>,
+    /// Union properties awaiting the capacity left by earlier package facts.
+    pub(crate) deferred_typescript_union_properties: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -316,6 +320,10 @@ fn resolve_by<'source>(
     resolution.javascript_destructured_parameter_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_javascript_destructured_parameters,
+    );
+    resolution.typescript_union_property_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_union_properties,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -2871,6 +2879,8 @@ impl StaticResolution {
             .append(&mut apart.deferred_literal_containment);
         self.deferred_scoped_javascript_lexical
             .append(&mut apart.deferred_scoped_javascript_lexical);
+        self.deferred_typescript_union_properties
+            .append(&mut apart.deferred_typescript_union_properties);
         self.external.append(&mut apart.external);
         self.rust_extern_candidates
             .append(&mut apart.rust_extern_candidates);

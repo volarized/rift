@@ -381,6 +381,8 @@ impl<'source> Index<'source> {
                         result.deferred_scoped_javascript_lexical.push(occurrence);
                     } else if target.is_physical_only_javascript_package_symbol() {
                         result.deferred_literal_containment.push(occurrence);
+                    } else if target.is_scoped_typescript_union_property() {
+                        result.deferred_typescript_union_properties.push(occurrence);
                     } else {
                         result.record(Some(occurrence));
                     }
@@ -942,15 +944,24 @@ impl Target<'_> {
 
     /// Package declarations admitted through a physical scope with no shared name anchor.
     pub(super) fn is_physical_only_javascript_package_symbol(self) -> bool {
+        self.file.facts.language().name == "javascript" && self.is_physical_only_package_symbol()
+    }
+
+    fn is_scoped_typescript_union_property(self) -> bool {
+        self.file.facts.language().name == "typescript"
+            && self.symbol.kind == "property"
+            && self.symbol.syntax_element_kind == Some("property_signature")
+            && self.is_physical_only_package_symbol()
+    }
+
+    fn is_physical_only_package_symbol(self) -> bool {
         let placement = self.file.placement;
-        self.file.facts.language().name == "javascript"
-            && matches!(
-                placement.origin().location(),
-                Some(SourceLocation::Dependency { .. })
-            )
-            && placement
-                .logical_identity(&self.symbol.qualified_name)
-                .is_none()
+        matches!(
+            placement.origin().location(),
+            Some(SourceLocation::Dependency { .. })
+        ) && placement
+            .logical_identity(&self.symbol.qualified_name)
+            .is_none()
             && placement.logical_identity_for_symbol(self.symbol).is_some()
     }
 }

@@ -513,6 +513,107 @@ impl<'source> FileScopes<'source> {
             .collect()
     }
 
+    /// Names the same property separately when the source writes distinct union branches.
+    pub(super) fn withheld_union_properties(
+        &self,
+        file: &SelectedFile<'_>,
+        withheld: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+    ) -> ScopedIdentityAnchors {
+        if file.syntax.language().name != "typescript"
+            || file.syntax.has_errors()
+            || file.syntax.left_out_declaration_count() != 0
+        {
+            return BTreeMap::new();
+        }
+        let mut owners = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
+        let mut groups = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
+        for symbol in file.syntax.symbols() {
+            let name = symbol.qualified_name.as_str();
+            if anchors.contains_key(name) {
+                owners
+                    .entry(name)
+                    .and_modify(|owner| *owner = None)
+                    .or_insert(Some(symbol));
+                if withheld.contains(name) {
+                    groups.entry(name).or_default().push(symbol);
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .filter_map(|(name, members)| {
+                let container = members.first()?.container.as_deref()?;
+                let owner = owners.get(container).copied().flatten()?;
+                if owner.syntax_element_kind != Some("type_alias_declaration")
+                    || super::super::conflicting_assignment_name(container, withheld)
+                {
+                    return None;
+                }
+                let original = anchors.get(name)?;
+                let identities = self
+                    .checked_union_branches(file, owner, &members)?
+                    .into_values()
+                    .map(|ordinals| {
+                        let identity = local_group_identity(original, *ordinals.first()?)?;
+                        Some(
+                            ordinals
+                                .into_iter()
+                                .map(move |ordinal| (ordinal, identity.clone())),
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                Some((name.to_owned(), identities))
+            })
+            .collect()
+    }
+
+    fn checked_union_branches(
+        &self,
+        file: &SelectedFile<'_>,
+        owner: &SyntaxSymbol,
+        members: &[&SyntaxSymbol],
+    ) -> Option<BTreeMap<ByteRange, Vec<usize>>> {
+        let first = self.body_members.get(&members.first()?.item_range)?;
+        let mut branches = BTreeMap::<ByteRange, Vec<usize>>::new();
+        for member in members {
+            let body = self.body_members.get(&member.item_range)?;
+            if member.kind != "property"
+                || member.syntax_element_kind != Some("property_signature")
+                || member.container.as_deref() != Some(owner.qualified_name.as_str())
+                || self.of(member, file) != Scope::Body(body.body, false)
+                || !body.holder.encloses(body.body)
+                || !body.body.encloses(member.item_range)
+                || !owner.item_range.encloses(body.holder)
+                || first.holder != body.holder
+            {
+                return None;
+            }
+            branches
+                .entry(body.body)
+                .or_default()
+                .push(member.declaration_ordinal);
+        }
+        if branches.len() < 2 {
+            return None;
+        }
+        let separate = branches
+            .keys()
+            .zip(branches.keys().skip(1))
+            .all(|(left, right)| {
+                let start = usize::try_from(left.end).ok();
+                let end = usize::try_from(right.start).ok();
+                start
+                    .zip(end)
+                    .and_then(|(start, end)| file.source.get(start..end))
+                    .is_some_and(|separator| separator.trim() == "|")
+            });
+        separate.then_some(branches)
+    }
+
     fn lexical_groups(
         &self,
         file: &SelectedFile<'_>,

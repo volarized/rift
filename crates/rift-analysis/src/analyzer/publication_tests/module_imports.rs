@@ -2793,3 +2793,61 @@ fn javascript_object_and_array_parameters_keep_their_written_lexical_bindings() 
         edge.to.as_str().ends_with("/ordinary/input") && edge.kinds == [EdgeKind::Reads]
     }));
 }
+
+#[test]
+fn non_entry_typescript_union_properties_keep_their_written_branches() {
+    const SOURCE: &str = concat!(
+        "export type Result = { kind: 'ready'; value: number } | { kind: 'waiting'; value: string };\n",
+        "export function read(result: Result) { return result.kind; }\n",
+    );
+    let analyze = |entry| {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","types":"./{entry}"}}"#);
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.ts", "export const ready = true;"),
+                ("result.ts", SOURCE),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked union sources")
+    };
+    let non_entry = analyze("index.ts");
+    let entry = analyze("result.ts");
+    let found = non_entry.publication();
+    found.validate_facts().expect("physical union members");
+    let entry_facts = entry.publication();
+    let branch = |publication: &PackagePublication, property: &str| {
+        let start = SOURCE.find(property).expect("written property");
+        publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.range == module_runtime_range(start, property) && row.source == property
+            })
+            .expect("physical union branch property")
+            .symbol
+            .clone()
+    };
+    for pair in [
+        ["kind: 'ready'", "kind: 'waiting'"],
+        ["value: number", "value: string"],
+    ] {
+        let separate = pair.map(|property| branch(found, property));
+        assert_ne!(separate[0], separate[1]);
+        assert_eq!(branch(entry_facts, pair[0]), branch(entry_facts, pair[1]));
+        assert!(
+            found
+                .edges
+                .iter()
+                .all(|edge| !separate.contains(&edge.to) || edge.kinds != [EdgeKind::Reads])
+        );
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/Result"))
+    );
+}
