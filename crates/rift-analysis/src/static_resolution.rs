@@ -140,6 +140,10 @@ pub(crate) struct StaticResolution {
     pub(crate) javascript_shorthand_parameter_start: Option<usize>,
     /// Shorthand parameter Reads awaiting capacity after earlier package edges.
     pub(crate) deferred_javascript_shorthand_parameters: Vec<StaticOccurrence>,
+    /// First Read of a named JavaScript defaulted or rest parameter.
+    pub(crate) javascript_wrapped_parameter_start: Option<usize>,
+    /// Defaulted and rest parameter Reads behind earlier package edges.
+    pub(crate) deferred_javascript_wrapped_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -300,6 +304,10 @@ fn resolve_by<'source>(
     resolution.javascript_shorthand_parameter_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_javascript_shorthand_parameters,
+    );
+    resolution.javascript_wrapped_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_wrapped_parameters,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -711,6 +719,7 @@ struct File<'source> {
     javascript_method_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
@@ -889,6 +898,7 @@ impl<'source> File<'source> {
             javascript_method_parameters: BTreeMap::new(),
             scoped_javascript_parameters: BTreeMap::new(),
             typescript_type_parameters: BTreeMap::new(),
+            javascript_wrapped_parameters: BTreeMap::new(),
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
@@ -1198,6 +1208,8 @@ impl<'source> File<'source> {
                     .insert(name, admitted.then_some(symbol));
             } else if admitted && symbol.is_typescript_type_parameter() {
                 self.typescript_type_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_javascript_wrapped_parameter() {
+                self.javascript_wrapped_parameters.insert(name, symbol);
             } else if admitted && let Some(site) = site {
                 if symbol.is_typescript_signature_parameter()
                     || symbol.is_typescript_callable_type_parameter()
@@ -1373,16 +1385,29 @@ impl<'source> File<'source> {
                 ScopedParameterReads::JavaScriptShorthand,
                 !self.javascript_shorthand_parameters.is_empty(),
             ),
+            (
+                ScopedParameterReads::JavaScriptWrapped,
+                !self.javascript_wrapped_parameters.is_empty(),
+            ),
         ]
         .into_iter()
         .skip(earlier.map_or(0, |class| class as usize + 1))
         .find_map(|(class, present)| present.then_some(class))
     }
 
-    fn typescript_type_parameter_pass(&self) -> Option<DeferredReferences<'source>> {
-        (!self.typescript_type_parameters.is_empty()).then_some(
-            DeferredReferences::ScopedParameters(ScopedParameterReads::TypeScriptType),
-        )
+    fn retained_parameter_pass_without_file_module(&self) -> Option<DeferredReferences<'source>> {
+        [
+            (
+                ScopedParameterReads::TypeScriptType,
+                !self.typescript_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptWrapped,
+                !self.javascript_wrapped_parameters.is_empty(),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(class, present)| present.then_some(DeferredReferences::ScopedParameters(class)))
     }
 
     fn has_python_local_reads(&self) -> bool {
@@ -1956,7 +1981,7 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
-        let mut scoped_parameters = std::array::from_fn::<_, 6, _>(|_| VecDeque::new());
+        let mut scoped_parameters = std::array::from_fn::<_, 7, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -2148,7 +2173,7 @@ impl<'source> Index<'source> {
                 if reads.methods.is_empty() {
                     file_module
                         .then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
-                        .or_else(|| file.typescript_type_parameter_pass())
+                        .or_else(|| file.retained_parameter_pass_without_file_module())
                 } else {
                     Some(DeferredReferences::TypeScriptMethodParameters {
                         sites: reads.methods,
@@ -2166,7 +2191,7 @@ impl<'source> Index<'source> {
                 );
                 file_module
                     .then_some(DeferredReferences::EcmaScriptModuleSpecifiers)
-                    .or_else(|| file.typescript_type_parameter_pass())
+                    .or_else(|| file.retained_parameter_pass_without_file_module())
             }
             DeferredReferences::EcmaScriptModuleSpecifiers => {
                 resolution
@@ -2421,7 +2446,8 @@ impl<'source> Index<'source> {
                     && (file_module
                         || !parameter_reads.functions.is_empty()
                         || !parameter_reads.methods.is_empty()
-                        || !file.typescript_type_parameters.is_empty()))
+                        || !file.typescript_type_parameters.is_empty()
+                        || !file.javascript_wrapped_parameters.is_empty()))
                 .then_some(DeferredReferences::EcmaScriptParameters {
                     reads: parameter_reads,
                     file_module,

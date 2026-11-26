@@ -82,6 +82,7 @@ use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 
 mod callback_parameters;
+mod checked_parameters;
 mod commonjs;
 mod members;
 mod overload_parameters;
@@ -91,6 +92,7 @@ mod shorthand_parameters;
 mod type_parameters;
 mod type_signature_parameters;
 mod variance;
+mod wrapped_parameters;
 
 use tree_sitter::{Node, Parser};
 
@@ -247,6 +249,7 @@ pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_funct
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
+pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
@@ -1642,6 +1645,14 @@ impl EcmaScriptRules<'_> {
                     .map(|name| (name, INDEX_SIGNATURE_PARAMETER_KIND))
             })
             .or_else(|| {
+                if self.kinds.formal_parameter_kinds.is_empty() {
+                    wrapped_parameters::declared_name(visited.syntax_element())
+                        .map(|name| (name, WRAPPED_PARAMETER_KIND))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
                 self.kinds
                     .ordinary_parameter(visited)
                     .map(|(name, method)| {
@@ -1960,10 +1971,17 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .then_some(self.kinds.pattern)
             .flatten()
             .and_then(|pattern| syntax_element.child_by_field_id(pattern.get()));
+        let wrapped_parameter = self
+            .kinds
+            .formal_parameter_kinds
+            .is_empty()
+            .then(|| wrapped_parameters::declared_name(syntax_element))
+            .flatten();
         let name = self
             .kinds
             .name_syntax_element(syntax_element)
             .or(parameter_name)
+            .or(wrapped_parameter)
             .or_else(|| {
                 (syntax_element.kind_id() == self.kinds.assignment_expression)
                     .then(|| {
@@ -2388,6 +2406,7 @@ fn append_package_parameters(
         types: type_parameters,
         callable_types,
         index_signatures,
+        wrapped,
     } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
@@ -2403,9 +2422,20 @@ fn append_package_parameters(
     symbols.extend(scoped);
     symbols.extend(shorthand);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
-    type_parameters::append(symbols, type_parameters, facts);
+    checked_parameters::append_under_named_owner(
+        symbols,
+        type_parameters,
+        facts,
+        type_parameters::structured,
+    );
     type_signature_parameters::append_callable_types(root, symbols, callable_types, facts);
     type_signature_parameters::append_indexes(root, symbols, index_signatures);
+    checked_parameters::append_under_named_owner(
+        symbols,
+        wrapped,
+        facts,
+        wrapped_parameters::accepted_owner,
+    );
 }
 
 #[derive(Default)]
@@ -2414,6 +2444,7 @@ struct ParameterDeclarations {
     types: Vec<crate::SyntaxSymbol>,
     callable_types: Vec<crate::SyntaxSymbol>,
     index_signatures: Vec<crate::SyntaxSymbol>,
+    wrapped: Vec<crate::SyntaxSymbol>,
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
@@ -2426,6 +2457,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.callable_types
         } else if symbol.is_typescript_index_signature_parameter() {
             &mut candidates.index_signatures
+        } else if symbol.is_javascript_wrapped_parameter() {
+            &mut candidates.wrapped
         } else {
             &mut candidates.values
         };
@@ -2575,6 +2608,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == INDEX_SIGNATURE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(INDEX_SIGNATURE_PARAMETER_KIND);
+    }
+    if name == WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(WRAPPED_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

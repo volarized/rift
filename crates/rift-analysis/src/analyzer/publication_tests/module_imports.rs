@@ -2666,3 +2666,65 @@ fn typescript_index_signature_parameters_keep_separate_non_runtime_scopes() {
         edge.to.as_str().ends_with("/read/key") && edge.kinds == [EdgeKind::Reads]
     }));
 }
+
+#[test]
+fn javascript_defaulted_and_rest_parameters_use_their_written_body_scope() {
+    const SOURCE: &str = concat!(
+        "const seed = 1;\n",
+        "export function withDefault(value = seed) { return value; }\n",
+        "export function withRest(...items) { return items; }\n",
+        "export function control(input) { return input; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked wrapped parameters");
+    let found = analysis.publication();
+    found.validate_facts().expect("physical parameter bindings");
+    for (owner, name, header) in [
+        ("withDefault", "value", "value = seed"),
+        ("withRest", "items", "items)"),
+        ("control", "input", "input)"),
+    ] {
+        let suffix = format!("/{owner}/{name}");
+        let start = SOURCE.find(header).expect("physical parameter");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, name)
+                    && row.source == name
+            })
+            .expect("written parameter");
+        let reading = format!("return {name}");
+        let at = SOURCE.find(&reading).expect("body reference") + "return ".len();
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read for {owner}");
+        };
+        assert!(read.from.as_str().ends_with(&format!("/{owner}")));
+        let written = read.occurrence.as_ref().expect("physical parameter read");
+        assert_eq!(written.range, module_runtime_range(at, name));
+        assert_eq!(written.unit, parameter.unit);
+    }
+    let seed = SOURCE.find("= seed").expect("written initializer") + "= ".len();
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/seed")
+            && edge.kinds == [EdgeKind::Reads]
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.range == module_runtime_range(seed, "seed"))
+    }));
+}

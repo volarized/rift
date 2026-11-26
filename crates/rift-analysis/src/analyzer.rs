@@ -755,6 +755,7 @@ struct EcmaScriptBindingDemand {
     javascript_shorthand: BindingDemand,
     typescript_callable_types: BindingDemand,
     typescript_index_signatures: BindingDemand,
+    javascript_wrapped: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -779,6 +780,7 @@ impl EcmaScriptBindingDemand {
             shorthand_slots,
             callable_type_slots,
             index_signature_slots,
+            wrapped_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -793,6 +795,7 @@ impl EcmaScriptBindingDemand {
                 &self.javascript_shorthand,
                 &self.typescript_callable_types,
                 &self.typescript_index_signatures,
+                &self.javascript_wrapped,
             ],
             &mut slots,
             &mut bytes,
@@ -810,6 +813,7 @@ impl EcmaScriptBindingDemand {
             .with_javascript_shorthand_parameters(shorthand_slots)
             .with_typescript_callable_type_parameters(callable_type_slots)
             .with_typescript_index_signature_parameters(index_signature_slots)
+            .with_javascript_wrapped_parameters(wrapped_slots)
     }
 
     fn classify(
@@ -836,6 +840,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_callable_types
         } else if symbol.is_typescript_index_signature_parameter() {
             &mut self.typescript_index_signatures
+        } else if symbol.is_javascript_wrapped_parameter() {
+            &mut self.javascript_wrapped
         } else if javascript {
             &mut self.javascript_functions
         } else if symbol
@@ -862,6 +868,7 @@ impl EcmaScriptBindingDemand {
             + self.javascript_shorthand.count
             + self.typescript_callable_types.count
             + self.typescript_index_signatures.count
+            + self.javascript_wrapped.count
     }
 }
 

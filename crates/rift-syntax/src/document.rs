@@ -177,6 +177,7 @@ impl SyntaxSymbol {
             || self.is_javascript_shorthand_parameter()
             || self.is_typescript_callable_type_parameter()
             || self.is_typescript_index_signature_parameter()
+            || self.is_javascript_wrapped_parameter()
     }
 
     /// Whether this is the physical parameter of a JavaScript function value.
@@ -241,6 +242,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_typescript_index_signature_parameter(&self) -> bool {
         self.kind == crate::ecmascript::INDEX_SIGNATURE_PARAMETER_KIND
+    }
+
+    /// Whether this is a named JavaScript defaulted or rest parameter.
+    #[must_use]
+    pub fn is_javascript_wrapped_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::WRAPPED_PARAMETER_KIND
     }
 
     /// Whether this is the written type parameter of a TypeScript declaration.

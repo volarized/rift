@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use rift_core::ReferenceRole;
-use rift_syntax::{ByteRange, StaticBindingKind, StaticFacts, StaticParameter, SyntaxFacts};
+use rift_syntax::{
+    ByteRange, StaticBindingKind, StaticFacts, StaticParameter, SyntaxFacts, SyntaxSymbol,
+};
 
 use super::javascript::js_binding;
 use super::{
@@ -25,6 +27,7 @@ pub(super) enum ScopedParameterReads {
     JavaScriptScopedFunction,
     TypeScriptType,
     JavaScriptShorthand,
+    JavaScriptWrapped,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -95,7 +98,11 @@ impl<'source> Index<'source> {
                 &mut result.deferred_javascript_shorthand_parameters,
             ),
             ScopedParameterReads::TypeScriptType => {
-                self.typescript_type_parameter_uses(file, work, result);
+                self.checked_parameter_uses(file, ReferenceRole::Type, work, result);
+                return;
+            }
+            ScopedParameterReads::JavaScriptWrapped => {
+                self.checked_parameter_uses(file, ReferenceRole::Read, work, result);
                 return;
             }
         };
@@ -114,49 +121,56 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn typescript_type_parameter_uses(
+    fn checked_parameter_uses(
         &self,
         file: &File<'source>,
+        role: ReferenceRole,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
+        let (parameters, pending) = if role == ReferenceRole::Type {
+            (
+                &file.typescript_type_parameters,
+                &mut result.deferred_typescript_type_parameters,
+            )
+        } else {
+            (
+                &file.javascript_wrapped_parameters,
+                &mut result.deferred_javascript_wrapped_parameters,
+            )
+        };
         for reference in file.facts.references() {
             if !work.charge() {
                 return;
             }
-            if reference.role != ReferenceRole::Type || file.members.contains_key(&reference.target)
-            {
+            if reference.role != role || file.members.contains_key(&reference.target) {
                 continue;
             }
             if let Some(occurrence) =
-                self.typescript_type_parameter_use(file, reference.target, work)
+                self.checked_parameter_use(file, reference.target, role, parameters, work)
             {
                 result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
-                result.deferred_typescript_type_parameters.push(occurrence);
+                pending.push(occurrence);
             }
         }
     }
 
-    fn typescript_type_parameter_use(
+    fn checked_parameter_use(
         &self,
         file: &File<'source>,
         range: ByteRange,
+        role: ReferenceRole,
+        parameters: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let name = file.text(range)?;
-        let binding = js_binding(
-            file,
-            &self.javascript,
-            name,
-            range.start,
-            ReferenceRole::Type,
-            work,
-        )?;
-        let symbol = *file.typescript_type_parameters.get(&binding.name)?;
+        let binding = js_binding(file, &self.javascript, name, range.start, role, work)?;
+        let symbol = *parameters.get(&binding.name)?;
         let owner = file.qualified_target(symbol.container.as_deref()?)?;
         if binding.kind != StaticBindingKind::Shadow
             || binding.scope != owner.symbol.item_range
             || !binding.scope.encloses(range)
+            || (role == ReferenceRole::Read && !owner.symbol.body_range?.encloses(range))
         {
             return None;
         }
@@ -164,7 +178,7 @@ impl<'source> Index<'source> {
             file: file.document,
             symbol,
         };
-        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Type, target)?;
+        let mut occurrence = self.occurrence(file, range, range, role, target)?;
         occurrence.edge_from = Some(self.javascript_identity(owner)?);
         Some(occurrence)
     }
