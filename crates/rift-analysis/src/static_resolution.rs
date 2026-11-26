@@ -118,6 +118,10 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_shorthand_start: Option<usize>,
     /// First occurrence resolved in an explicitly placed shared Rust source.
     pub(crate) rust_shared_start: Option<usize>,
+    /// First reference to an authored parent module after existing Rust references.
+    pub(crate) rust_parent_module_start: Option<usize>,
+    /// Authored parent-module sites already resolved by the qualified-call pass.
+    pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
     /// Existing call sites left unresolved in files with authored extern bindings.
     pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// First JavaScript method parameter read after earlier parameter reads.
@@ -313,6 +317,7 @@ fn resolve_by<'source>(
     index.resolve_rust_import_qualifiers(&mut work, &mut resolution);
     index.resolve_rust_shorthand(&mut work, &mut resolution);
     index.resolve_rust_shared_sources(documents.1, namespace, &mut work, &mut resolution);
+    index.resolve_rust_parent_modules(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -2949,6 +2954,8 @@ impl StaticResolution {
             .append(&mut apart.deferred_scoped_javascript_lexical);
         self.deferred_typescript_union_properties
             .append(&mut apart.deferred_typescript_union_properties);
+        self.rust_call_parent_sites
+            .append(&mut apart.rust_call_parent_sites);
         self.external.append(&mut apart.external);
         self.rust_extern_candidates
             .append(&mut apart.rust_extern_candidates);

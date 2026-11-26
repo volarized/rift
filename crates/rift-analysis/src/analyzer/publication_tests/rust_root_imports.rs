@@ -1277,3 +1277,76 @@ pub fn call() { selected::entry(); }";
         );
     }
 }
+
+#[test]
+fn authored_super_tokens_resolve_only_to_the_checked_parent_module() {
+    const LIBRARY: &str = r"
+pub struct RootType;
+pub fn check() {}
+pub mod child;
+pub mod outer {
+    pub struct OuterType;
+    pub mod inner {
+        pub(super) fn identity(value: super::OuterType) -> super::OuterType { value }
+    }
+}
+pub fn outside(_: super::RootType) {}
+";
+    const CHILD: &str = r"
+pub(super) fn touch(_: super::RootType) { super::check(); }
+pub struct Holder;
+impl Holder { pub fn keep(&self) -> &Self { self } }
+";
+    let (publication, files, _, _) = analyze_rust_root(
+        vec![("src/lib.rs", LIBRARY), ("src/child.rs", CHILD)],
+        MANIFEST,
+    )
+    .into_parts();
+    for (path, source, module, expected_count) in [
+        ("src/lib.rs", LIBRARY, format!("{ROOT}/outer"), 3),
+        ("src/child.rs", CHILD, ROOT.to_owned(), 3),
+    ] {
+        let unit = files
+            .iter()
+            .find(|file| file.file().path().as_str() == path)
+            .expect("selected module source")
+            .placement()
+            .unit()
+            .to_string();
+        let mut actual = publication
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let span = edge.occurrence.as_ref()?;
+                (edge.to.as_str() == module
+                    && edge.kinds.as_slice() == [EdgeKind::Reads]
+                    && span.unit.0 == unit)
+                    .then_some(span.range.clone())
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|range| range.start);
+        let expected = source
+            .match_indices("super")
+            .take(expected_count)
+            .map(|(start, name)| TextRange {
+                start: start as u64,
+                end: (start + name.len()) as u64,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{path}");
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str() == format!("{ROOT}/child/touch")
+            && edge.to.as_str() == format!("{ROOT}/check")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    let outside = LIBRARY
+        .rfind("super")
+        .expect("parent qualifier outside a module") as u64;
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.occurrence.as_ref().is_some_and(|span| {
+                span.unit.0.ends_with("/src/lib.rs") && span.range.start == outside
+            })
+    }));
+}

@@ -548,6 +548,8 @@ pub struct StaticFactsParts {
     pub rust_crate_paths: Vec<ByteRange>,
     /// Written crate-root tokens in restricted visibility.
     pub rust_crate_visibility: Vec<ByteRange>,
+    /// Written relative paths and visibility qualifiers naming the immediate parent.
+    pub rust_parent_module_references: Vec<ByteRange>,
     /// Hoisted block-local value names with their scopes.
     pub rust_local_values: Vec<(ByteRange, ByteRange)>,
     /// Block-local type and module items with their lexical blocks.
@@ -691,6 +693,12 @@ impl StaticFacts {
     #[must_use]
     pub fn rust_crate_visibility(&self) -> &[ByteRange] {
         &self.0.rust_crate_visibility
+    }
+
+    /// Written relative paths and visibility qualifiers naming the immediate parent.
+    #[must_use]
+    pub fn rust_parent_module_references(&self) -> &[ByteRange] {
+        &self.0.rust_parent_module_references
     }
 
     pub(crate) fn set_rust_generic_references(
@@ -1089,6 +1097,7 @@ impl StaticFacts {
             vector_capacity(&self.0.rust_generic_references),
             vector_capacity(&self.0.rust_crate_paths),
             vector_capacity(&self.0.rust_crate_visibility),
+            vector_capacity(&self.0.rust_parent_module_references),
             vector_capacity(&self.0.rust_local_values),
             vector_capacity(&self.0.rust_local_types),
             vector_capacity(&self.0.rust_field_sites),
@@ -1179,6 +1188,7 @@ impl StaticFacts {
             self.rust_generic_references().len(),
             self.rust_crate_paths().len(),
             self.rust_crate_visibility().len(),
+            self.rust_parent_module_references().len(),
             self.rust_local_values().len(),
             self.rust_local_types().len(),
             self.rust_field_sites().len(),
@@ -1271,6 +1281,11 @@ impl StaticFacts {
                 .all(|(item, scope)| valid(*item) && valid(*scope) && scope.encloses(*item))
             && self.rust_crate_paths().iter().copied().all(valid)
             && self.rust_crate_visibility().iter().copied().all(valid)
+            && self
+                .rust_parent_module_references()
+                .iter()
+                .copied()
+                .all(valid)
             && self.rust_macro_ranges_valid(valid)
             && self.rust_field_sites().iter().all(|site| {
                 valid(site.owner)

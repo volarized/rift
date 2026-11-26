@@ -28,6 +28,16 @@ impl Kinds {
                 facts.rust_crate_paths.push(byte_range(element)?);
             }
         }
+        if element.kind() == "super"
+            && let Some(parent) = visited.parent().map(Visited::syntax_element)
+            && (parent.kind() == "visibility_modifier"
+                || parent.child_by_field_id(self.path) == Some(element))
+            && enclosing(visited, &[self.use_declaration]).is_none()
+        {
+            facts
+                .rust_parent_module_references
+                .push(byte_range(element)?);
+        }
         let constructor = id == self.local_value_struct
             && element
                 .child_by_field_id(self.body)

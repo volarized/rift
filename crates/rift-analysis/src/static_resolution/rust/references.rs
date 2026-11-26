@@ -442,6 +442,51 @@ impl<'source> Index<'source> {
         })
     }
 
+    /// Reads the parent module named by each checked, written relative qualifier.
+    pub(in crate::static_resolution) fn resolve_rust_parent_modules(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let root = self.rust_library_root_target();
+        let start = result.occurrences.len();
+        'files: for file in self.files.values() {
+            for &range in file.facts.rust_parent_module_references() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if result
+                    .rust_call_parent_sites
+                    .get(file.document.placement.unit())
+                    .is_some_and(|sites| sites.contains(&range))
+                    || file.text(range) != Some("super")
+                    || file.conditional(range, work)
+                    || file.blocked(range.start, work)
+                {
+                    continue;
+                }
+                let Some(path) = self.rust.absolute_path(file, range.start, &["super"], work)
+                else {
+                    continue;
+                };
+                let target = root
+                    .filter(|target| target.file.placement.module_path() == path)
+                    .or_else(|| {
+                        self.rust
+                            .lookup(file, range.start, &path, Namespace::Type, work)
+                            .filter(|target| {
+                                target.symbol.kind == "module"
+                                    && target.admitted_path().as_deref() == Some(path.as_slice())
+                            })
+                    });
+                if let Some(target) = target {
+                    result.record(self.occurrence(file, range, range, ReferenceRole::Read, target));
+                }
+            }
+        }
+        result.rust_parent_module_start = (result.occurrences.len() != start).then_some(start);
+    }
+
     /// Reads the established qualifiers of authored Rust imports after prior references.
     pub(in crate::static_resolution) fn resolve_rust_import_qualifiers(
         &self,
@@ -610,6 +655,13 @@ impl<'source> Index<'source> {
                     rift_provider::NormalizedTarget::Symbol(_)
                 )
             {
+                if *part == "super" {
+                    result
+                        .rust_call_parent_sites
+                        .entry(file.document.placement.unit().clone())
+                        .or_default()
+                        .insert(range);
+                }
                 result.occurrences.push(occurrence);
             }
         }
