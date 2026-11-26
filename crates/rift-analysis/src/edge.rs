@@ -461,7 +461,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 29] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 30] {
     let supplemental_start = resolution.supplemental_start.take();
     let (alias, alias_external) = resolution
         .rust_extern_alias_start
@@ -487,6 +487,7 @@ fn static_admission_batches<'a>(
         resolution.scoped_javascript_function_start.take(),
         resolution.scoped_javascript_lexical_start.take(),
         resolution.typescript_type_parameter_start.take(),
+        resolution.javascript_shorthand_parameter_start.take(),
         alias,
         resolution.rust_receiver_start.take(),
         resolution.rust_generic_start.take(),
@@ -498,10 +499,10 @@ fn static_admission_batches<'a>(
         resolution.rust_shorthand_start.take(),
         resolution.rust_shared_start.take(),
     ];
-    let mut boundaries = [0; 30];
+    let mut boundaries = [0; 31];
     let mut next = resolution.occurrences.len();
-    boundaries[29] = next;
-    for (boundary, start) in boundaries[2..29].iter_mut().zip(tail_starts).rev() {
+    boundaries[30] = next;
+    for (boundary, start) in boundaries[2..30].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }
@@ -523,9 +524,9 @@ fn static_admission_batches<'a>(
     });
     admit_external(primary_external, spans, edge_modules, &mut batches[0]);
     admit_external(supplemental_external, spans, edge_modules, &mut batches[1]);
-    admit_external(alias_external_rows, spans, edge_modules, &mut batches[19]);
+    admit_external(alias_external_rows, spans, edge_modules, &mut batches[20]);
     // New ECMAScript references use the capacity left by the earlier stages.
-    batches[15..].rotate_left(4);
+    batches[15..].rotate_left(5);
     // Preserve the established Rust and ECMAScript order ahead of newer Rust sites.
     batches[10..22].rotate_left(5);
     batches

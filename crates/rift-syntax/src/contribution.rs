@@ -41,6 +41,7 @@ pub struct PackageBindingSlots {
     rust_explicit: usize,
     rust_shorthand: usize,
     typescript_type_parameter: usize,
+    javascript_shorthand_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -75,6 +76,7 @@ impl PackageBindingSlots {
             rust_explicit: 0,
             rust_shorthand: 0,
             typescript_type_parameter: 0,
+            javascript_shorthand_parameter: 0,
         }
     }
 
@@ -204,6 +206,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for JavaScript parameters with a same-name shorthand property.
+    #[must_use]
+    pub const fn with_javascript_shorthand_parameters(mut self, count: usize) -> Self {
+        self.javascript_shorthand_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -229,6 +238,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_signature_parameter)
             .saturating_add(self.javascript_scoped_function_parameter)
             .saturating_add(self.typescript_type_parameter)
+            .saturating_add(self.javascript_shorthand_parameter)
     }
 
     fn admit(
@@ -250,6 +260,8 @@ impl PackageBindingSlots {
             &mut self.javascript_scoped_function_parameter
         } else if symbol.is_typescript_type_parameter() {
             &mut self.typescript_type_parameter
+        } else if symbol.is_javascript_shorthand_parameter() {
+            &mut self.javascript_shorthand_parameter
         } else if matches!(language, "javascript" | "typescript")
             && symbol.is_ecmascript_parameter()
         {

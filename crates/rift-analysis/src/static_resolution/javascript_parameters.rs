@@ -24,6 +24,7 @@ pub(super) enum ScopedParameterReads {
     JavaScriptMethod,
     JavaScriptScopedFunction,
     TypeScriptType,
+    JavaScriptShorthand,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -88,6 +89,10 @@ impl<'source> Index<'source> {
             ScopedParameterReads::JavaScriptScopedFunction => (
                 &file.scoped_javascript_parameters,
                 &mut result.deferred_scoped_javascript_parameters,
+            ),
+            ScopedParameterReads::JavaScriptShorthand => (
+                &file.javascript_shorthand_parameters,
+                &mut result.deferred_javascript_shorthand_parameters,
             ),
             ScopedParameterReads::TypeScriptType => {
                 self.typescript_type_parameter_uses(file, work, result);
@@ -187,6 +192,7 @@ impl<'source> Index<'source> {
         if parameter.symbol.is_ecmascript_overload_parameter()
             || parameter.symbol.is_javascript_method_parameter()
             || parameter.symbol.is_javascript_scoped_function_parameter()
+            || parameter.symbol.is_javascript_shorthand_parameter()
         {
             let owner = file.target_at(parameter.site.owner?)?;
             if owner.symbol.item_range != binding.scope || !owner.symbol.body_range?.encloses(range)

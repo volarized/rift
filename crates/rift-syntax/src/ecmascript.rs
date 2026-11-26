@@ -86,6 +86,7 @@ mod members;
 mod overload_parameters;
 pub(crate) mod recovery;
 mod scoped_function_parameters;
+mod shorthand_parameters;
 mod type_parameters;
 mod variance;
 
@@ -242,6 +243,7 @@ pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -2368,8 +2370,14 @@ fn append_package_parameters(
     } else {
         scoped_function_parameters::capture(symbols, &parameters, facts)
     };
+    let shorthand = if language.name == "javascript" {
+        shorthand_parameters::capture(symbols, &parameters, facts)
+    } else {
+        Vec::new()
+    };
     append_parameters(symbols, parameters, facts);
     symbols.extend(scoped);
+    symbols.extend(shorthand);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
     type_parameters::append(symbols, type_parameters, facts);
 }
@@ -2515,6 +2523,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == SCOPED_FUNCTION_PARAMETER_KIND {
         return Some(SCOPED_FUNCTION_PARAMETER_KIND);
+    }
+    if name == SHORTHAND_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(SHORTHAND_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

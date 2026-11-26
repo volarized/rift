@@ -174,6 +174,7 @@ impl SyntaxSymbol {
             || self.is_javascript_method_parameter()
             || self.is_typescript_signature_parameter()
             || self.is_javascript_scoped_function_parameter()
+            || self.is_javascript_shorthand_parameter()
     }
 
     /// Whether this is the physical parameter of a JavaScript function value.
@@ -220,6 +221,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_javascript_scoped_function_parameter(&self) -> bool {
         self.kind == crate::ecmascript::SCOPED_FUNCTION_PARAMETER_KIND
+    }
+
+    /// Whether this JavaScript parameter shares its name with a shorthand property.
+    #[must_use]
+    pub fn is_javascript_shorthand_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::SHORTHAND_PARAMETER_KIND
     }
 
     /// Whether this is the written type parameter of a TypeScript declaration.

@@ -1431,7 +1431,9 @@ fn conflicting_assignment_name(mut name: &str, conflicts: &BTreeSet<&str>) -> bo
 fn supplemental_parameter_scope(symbol: &SyntaxSymbol) -> Option<&str> {
     let name = if symbol.is_ecmascript_callback_parameter() && symbol.container.is_none() {
         symbol.qualified_name.as_str()
-    } else if symbol.is_ecmascript_overload_parameter() {
+    } else if symbol.is_ecmascript_overload_parameter()
+        || symbol.is_javascript_shorthand_parameter()
+    {
         symbol
             .qualified_name
             .strip_prefix(symbol.container.as_deref()?)?

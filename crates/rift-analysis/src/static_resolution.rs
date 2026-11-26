@@ -136,6 +136,10 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_type_parameter_start: Option<usize>,
     /// Type uses awaiting the capacity left by earlier package edges.
     pub(crate) deferred_typescript_type_parameters: Vec<StaticOccurrence>,
+    /// First Read of a JavaScript parameter that shares a name with a shorthand property.
+    pub(crate) javascript_shorthand_parameter_start: Option<usize>,
+    /// Shorthand parameter Reads awaiting capacity after earlier package edges.
+    pub(crate) deferred_javascript_shorthand_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -292,6 +296,10 @@ fn resolve_by<'source>(
     resolution.typescript_type_parameter_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_typescript_type_parameters,
+    );
+    resolution.javascript_shorthand_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_shorthand_parameters,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -703,6 +711,7 @@ struct File<'source> {
     javascript_method_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -880,6 +889,7 @@ impl<'source> File<'source> {
             javascript_method_parameters: BTreeMap::new(),
             scoped_javascript_parameters: BTreeMap::new(),
             typescript_type_parameters: BTreeMap::new(),
+            javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -1209,6 +1219,10 @@ impl<'source> File<'source> {
                     self.scoped_javascript_parameters.insert(name, parameter);
                     return;
                 }
+                if symbol.is_javascript_shorthand_parameter() {
+                    self.javascript_shorthand_parameters.insert(name, parameter);
+                    return;
+                }
                 let parameters = if symbol
                     .container
                     .as_deref()
@@ -1351,6 +1365,10 @@ impl<'source> File<'source> {
             (
                 ScopedParameterReads::TypeScriptType,
                 !self.typescript_type_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptShorthand,
+                !self.javascript_shorthand_parameters.is_empty(),
             ),
         ]
         .into_iter()
@@ -1935,7 +1953,7 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
-        let mut scoped_parameters = std::array::from_fn::<_, 5, _>(|_| VecDeque::new());
+        let mut scoped_parameters = std::array::from_fn::<_, 6, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())

@@ -2475,3 +2475,96 @@ fn typescript_structured_declarations_own_their_written_type_parameters() {
         assert_eq!(uses, ranges);
     }
 }
+
+#[test]
+fn javascript_shorthand_property_preserves_both_the_key_and_parameter() {
+    const SOURCE: &str = concat!(
+        "export function choose(value) { return { value }; }\n",
+        "export function control(input) { return { output: input }; }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("validated source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("validated publication")
+            .into_parts()
+            .0
+    };
+    let found = collect(10);
+    found
+        .validate_facts()
+        .expect("valid property and parameter declarations");
+    let written = SOURCE.find("choose(value)").expect("signature") + "choose(".len();
+    let shorthand = SOURCE.find("{ value }").expect("property") + "{ ".len();
+    let property = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.symbol.as_str().ends_with("/choose/value")
+                && row.range == module_runtime_range(shorthand, "value")
+        })
+        .expect("existing shorthand property identity");
+    let parameter = found
+        .declarations
+        .iter()
+        .find(|row| row.range == module_runtime_range(written, "value") && row.source == "value")
+        .expect("authored value parameter");
+    assert_ne!(parameter.symbol, property.symbol);
+    assert_eq!(parameter.unit, property.unit);
+    assert!(found.objects.iter().any(|row| {
+        row.id.as_ref() == Some(&parameter.symbol)
+            && row
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Parameter)
+    }));
+    let reads = found
+        .edges
+        .iter()
+        .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+        .collect::<Vec<_>>();
+    let [read] = reads.as_slice() else {
+        panic!("one authored shorthand Read");
+    };
+    assert_eq!(
+        read.occurrence.as_ref().expect("physical Read").range,
+        property.range
+    );
+    let bounded = collect(6);
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/control/input"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol == property.symbol)
+    );
+    assert!(
+        !bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol == parameter.symbol)
+    );
+    assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
+}
