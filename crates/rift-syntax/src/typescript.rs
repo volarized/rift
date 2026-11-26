@@ -183,10 +183,14 @@ mod tests {
                     function open(options: { flags: string; mode(): number }): void {}\n";
         let document = analyze(text);
         assert!(!document.has_errors());
+        assert_callable_type_parameter_rows(document.symbols());
         let symbols = document
             .symbols()
             .iter()
-            .filter(|symbol| !symbol.is_ecmascript_overload_parameter())
+            .filter(|symbol| {
+                !symbol.is_ecmascript_overload_parameter()
+                    && !symbol.is_typescript_callable_type_parameter()
+            })
             .map(|symbol| {
                 (
                     symbol.qualified_name.as_str(),
@@ -211,39 +215,14 @@ mod tests {
                 ),
                 ("Array.map.callbackfn", "value_parameter", None),
                 (
-                    "Array.map.$signature#0.value",
-                    "typescript_callable_type_parameter",
-                    None
-                ),
-                (
                     "Array.reduce",
                     "method",
                     Some("reduce(callbackfn: (a: T, b: T) => T): T")
                 ),
                 (
-                    "Array.reduce.$signature#0.a",
-                    "typescript_callable_type_parameter",
-                    None
-                ),
-                (
-                    "Array.reduce.$signature#0.b",
-                    "typescript_callable_type_parameter",
-                    None
-                ),
-                (
                     "Array.reduce",
                     "method",
                     Some("reduce<U>(callbackfn: (a: U, b: T) => U, initial: U): U")
-                ),
-                (
-                    "Array.reduce.$signature#1.a",
-                    "typescript_callable_type_parameter",
-                    None
-                ),
-                (
-                    "Array.reduce.$signature#1.b",
-                    "typescript_callable_type_parameter",
-                    None
                 ),
                 ("Reader", "class", None),
                 ("Reader.read", "method", Some("read(size?: number): string")),
@@ -284,6 +263,27 @@ mod tests {
             }
         );
         assert_eq!(options.name_range, Some(options.item_range));
+    }
+
+    fn assert_callable_type_parameter_rows(symbols: &[crate::SyntaxSymbol]) {
+        let names = symbols
+            .iter()
+            .filter(|symbol| symbol.is_typescript_callable_type_parameter())
+            .map(|symbol| {
+                assert!(symbol.signatures.is_empty());
+                symbol.qualified_name.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Array.map.$signature#0.value",
+                "Array.reduce.$signature#0.a",
+                "Array.reduce.$signature#0.b",
+                "Array.reduce.$signature#1.a",
+                "Array.reduce.$signature#1.b",
+            ]
+        );
     }
 
     #[test]
