@@ -87,12 +87,12 @@ covered under the `types` family.
 
 A search result carries the answer, `pagination`, and `warnings`. An exact symbol read carries
 an `outcome` and the `revision` it was read at, and carries declaration `pagination`. A condition the caller must
-weigh - an index that lags the tree - arrives as a typed entry in `warnings`; the
+weigh - an index that lags the tree - arrives as a typed entry in `warnings`. The
 [Reads](/docs/developer/protocol/mcp#reads) section in the MCP reference states the paging and warning
 contract.
 
 [`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin) keeps source location separate from
-source kind. A synthetic symbol carries neither a location nor a package; dependency and
+source kind. A synthetic symbol carries neither a location nor a package. Dependency and
 standard-library symbols can carry facts even when their provider cannot return source bytes.
 The declaration's own source-catalog unit, where its location differs from the project, rides on
 a [`get_symbol`](/docs/mcp#tool-get_symbol) declaration binding, addressed by `unit` instead
@@ -104,7 +104,7 @@ that physical source address.
 Stored edges retain one row per analysis: `static` for static analysis captured into the
 index, `engine` for a language engine embedded in Rift, or `lsp` for a language server reached
 through LSP. Read answers merge rows with the same `from`, `kind`, `to`, and `occurrence`.
-Their `derivation` records resolution, syntax, or heuristic analysis; optional `producer` names
+Their `derivation` records resolution, syntax, or heuristic analysis. Optional `producer` names
 an external producer.
 
 Read edges omit analyses by default. `include: { providers: true }` attaches the sorted
@@ -135,7 +135,7 @@ that holds the declaration, so the server binds those keys to symbols through th
 served tree no longer holds answers no `co_changes` edge.
 
 The walk is bounded by the configured history depth. A commit that changed more than 256
-declarations counts toward no `co_changes` edge, and one history answers at most 32 of them;
+declarations counts toward no `co_changes` edge, and one history answers at most 32 of them.
 [`CoChangeTruncation`](/docs/developer/protocol/reference#CoChangeTruncation) counts what either
 bound left out. The history rides a [`get_symbol`](/docs/mcp#tool-get_symbol) result when the
 request asks for it.

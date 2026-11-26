@@ -22,7 +22,7 @@ export const CONTROL =
 /** A tab of a panel header: the label style, marked by a hairline on the panel's rule. */
 export const PANEL_TAB =
   "h-10 flex-none px-2 font-mono text-[0.6875rem] font-normal uppercase tracking-[0.16em] " +
-  "focus-visible:ring-1 focus-visible:outline-0 " +
+  "focus-visible:ring-1 focus-visible:outline-0 data-active:text-primary-text dark:data-active:text-primary-text after:bg-primary-text " +
   "group-data-horizontal/tabs:after:inset-x-2 group-data-horizontal/tabs:after:-bottom-px group-data-horizontal/tabs:after:h-px";
 
 export const PANEL_TABS = "gap-1 p-0 group-data-horizontal/tabs:h-auto";

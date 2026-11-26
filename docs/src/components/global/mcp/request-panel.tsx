@@ -48,7 +48,7 @@ export const EMPTY_EDITOR: Editor = {
   attempted: false,
 };
 
-const OUTLINE = "bg-transparent font-mono font-normal dark:bg-transparent";
+const OUTLINE = "font-mono font-normal";
 
 /**
  * The form of the selected tool and the controls that run it. Both modes edit

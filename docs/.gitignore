@@ -5,6 +5,7 @@
 .contentlayer
 .content-collections
 .source
+/scripts/check-prose.mjs
 
 # test & build
 /coverage

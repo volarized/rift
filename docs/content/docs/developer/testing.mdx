@@ -20,8 +20,8 @@ replacement, deletion, restoration, and case changes. The comparison keeps file 
 values, index documents, documentation metadata, symbol pages, and edge rows.
 
 Live MCP cases validate partial maps and preparation warnings against the served schema. Worker
-and database cases force queue exhaustion, cancellation, publication ordering, and shutdown;
-resource cases verify published paging without recapturing every source file.
+and database cases force queue exhaustion, cancellation, publication ordering, and shutdown.
+Resource cases verify published paging without recapturing every source file.
 
 Background validation tests force elapsed deadlines under continuous events and recover edits
 without watcher reports. Supervisor tests hold one capture under a paused clock, supersede it,
@@ -36,7 +36,7 @@ retain its read service, and equal the cold digests and derived facts.
 
 Global resolution cases verify repeated bounded reads share their context and request bytes.
 Changed entry bounds, published dependency contexts, and requested packages refill the latest
-cache entry; replacement releases the preceding context and request.
+cache entry. Replacement releases the preceding context and request.
 
 CI compiles through [sccache](https://github.com/mozilla/sccache), which keeps compiled crates in
 the `rift-oss-build-cache` R2 bucket, so a job compiles only the crates whose inputs changed since
@@ -44,7 +44,7 @@ a cached build. On Windows the native jobs link with `/Brepro`: without it, ever
 carries a new timestamp, and each crate that uses the macro misses the cache. The release workflow
 starts the same build cache and restores the Cargo registry `main` saved, so a tag recompiles only
 what changed since an earlier tag.
-`rift-dev build-cache` starts it; a run without the bucket's secrets, such as a pull request from
+`rift-dev build-cache` starts it. A run without the bucket's secrets, such as a pull request from
 a fork, compiles everything.
 
 ## Unit tests
@@ -65,12 +65,12 @@ single test at a time.
 
 `just test` runs one instrumented nextest invocation through `rift-dev`. The appliance sets
 `OTEL_SDK_DISABLED=false` and starts a local OTLP HTTP/protobuf collector before execution.
-Test processes and their children inherit the same logs, traces, and metrics endpoints; the
+Test processes and their children inherit the same logs, traces, and metrics endpoints. The
 collector stays open through process cleanup and exporter shutdown.
 
 Nextest captures test output and emits JSON+ results. Python validates those results and the
 saved telemetry JSONL through Pydantic models. Discovery supplies an exact lookup from each
-JSON+ full name to its binary ID and test name; OTLP resources carry those identities with the
+JSON+ full name to its binary ID and test name. OTLP resources carry those identities with the
 run ID and opaque attempt ID. Retries remain zero, and tests keep nextest's concurrent scheduling.
 
 A successful run prints its start time followed by:
@@ -83,7 +83,7 @@ A failed run groups output by test, with the error first, then timestamped logs 
 Its report keeps original multiline records, trace and span IDs, span duration and status, and
 metric units and temporality. Rust exports OTLP through the standard SDK Tokio batch processors
 and periodic reader, using async HTTP. Python receives the exported records. SDK providers stay
-open until test process exit; synchronous SDK shutdown runs on Tokio's blocking pool within the
+open until test process exit. Synchronous SDK shutdown runs on Tokio's blocking pool within the
 existing deadline. The upstream `tracing-opentelemetry` crate is used without a vendor patch.
 `ScopedRecorderBuilder::clock` names the clock span timings and `measure_elapsed!` read on the
 recorder's thread, so a test advances time instead of sleeping.
@@ -92,7 +92,7 @@ Each invocation retains artifacts under `target/integration/nextest/nextest-<pro
 `run.json` separates execution results from collection errors, `telemetry.jsonl` keeps original
 OTLP records and collector request timing, and `recording.zip` exports that invocation's nextest
 recording. `RIFT_TEST_REPORT_DIRECTORY` selects another parent directory. The appliance bounds
-console evidence at 64 KiB, each captured stream at 16 MiB, and telemetry at 256 MiB; it continues
+console evidence at 64 KiB, each captured stream at 16 MiB, and telemetry at 256 MiB. It continues
 draining after retention limits and reports omissions. Cache evictions have separate counters
 because original records remain on disk. JSON+ exposes no source-output truncation count, so the
 report names the recording as the source for nextest's captured output.
@@ -100,7 +100,7 @@ report names the recording as the source for nextest's captured output.
 A failed binary test that opened a `FailureWindow` prints it to stderr. Its heading names the test
 with `NEXTEST_BINARY_ID`, `NEXTEST_TEST_NAME`, and `NEXTEST_ATTEMPT_ID`, then the window's bounds.
 A `T:` line states when the window ended, and a `machine:` line states the host's logical CPUs,
-system, and architecture; the harness reads no physical memory, so `memory_bytes` says so. When
+system, and architecture. The harness reads no physical memory, so `memory_bytes` says so. When
 the window covers one workspace, each line a registered `rift mcp` child wrote to stderr merges
 into that workspace's records by timestamp, opening with `rift mcp <pid> | `. A stderr copy keeps
 at most 16 MiB and states the bytes it read and dropped past that bound. A server stderr file that
@@ -110,7 +110,7 @@ file for the records the store lacks.
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust. The appliance retains their captured output and
 suite-scoped telemetry under `target/integration/doctest`. Stable batched rustdoc execution
-supplies no supported per-example OTLP identity; failed example names come from rustdoc output.
+supplies no supported per-example OTLP identity. Failed example names come from rustdoc output.
 
 The remaining local checks cover formatting, generated files, crate boundaries, Clippy, Rust
 documentation, dependency policy, and developer tooling. The crate boundary check,
@@ -140,14 +140,14 @@ CI keeps native, live, corpus, artifact, agent, and cold-start suites in their o
 The hook sets `CARGO_PROFILE_DEV_DEBUG=0` when that variable is unset and keeps any value already
 supplied.
 
-CI retains compiled test archives and the CLI as artifacts. Test jobs reuse those artifacts;
-dependency caches avoid compiling unchanged dependencies on each run.
+CI retains compiled test archives and the CLI as artifacts. Test jobs reuse those artifacts.
+Dependency caches avoid compiling unchanged dependencies on each run.
 
 ## Integration tests
 
-Live suites require `rust-analyzer` and Bun, plus network access for model weights; the corpus
+Live suites require `rust-analyzer` and Bun, plus network access for model weights. The corpus
 suites also need the pinned corpus source. Install the language tool with
-`rustup component add rust-analyzer`; the TypeScript suite starts its language server through
+`rustup component add rust-analyzer`. The TypeScript suite starts its language server through
 Bun. Model and package caches are reused between runs. Run the heavy suites from the repository
 root:
 
@@ -188,7 +188,7 @@ that crosses the bound fails naming the action it was running, rather than being
 evidence of where it stood.
 
 The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
-commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate
+commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history. A separate
 depth-one checkout tests the shallow-history response. Every run compares Git tree counts and
 sizes with the pin and requires reachable history objects before serving the tree.
 A repin must update the recorded measurements.
@@ -228,7 +228,7 @@ the action that ran long instead of tearing down whatever the next budget out wa
 A tool's first read waits for the index the workspace is still building. Every read after it
 answers from a published index and never enters the readiness wait, so a steady read that does
 start waiting fails the case rather than hiding inside the first read's room. After writes stop,
-the check repeats only reads that returned older source with `stale_index`; older source without
+the check repeats only reads that returned older source with `stale_index`. Older source without
 that warning fails. The report records source revisions, warnings, each call's duration and its
 own deadline, its overlapping writes, and each tool's first and maximum duration.
 
@@ -247,15 +247,15 @@ When a case stops a server, the runner reads that server's persisted records wit
 the newest 1 MiB beside the report as `<report>.server-<n>.records.log`, led by a line that counts
 the bytes left out. The `stops` list in the report holds one entry per stop with the log path, the
 records path, and the size in bytes of `index`, `metrics`, `vectors` and their `-wal` files. An
-absent file reads `"absent"`; `vectors` exists only after the first vector operation. A records
-read that fails sets `records` to null and states the error in `records_error`; the case
+absent file reads `"absent"`. `vectors` exists only after the first vector operation. A records
+read that fails sets `records` to null and states the error in `records_error`. The case
 continues. One case keeps at most three records files, 3 MiB.
 
 Each `stops` entry also carries the values the stop recorded, read from the records of that server
 alone. `database_close` lists the `busy`, `log`, and `checkpointed` values of each `database.close`
 record, one per database. `stop_stages` lists the `stage`, `remaining`, and `outcome` of each
 `stop stage ended` record. `lacks` names each of the two record kinds the records did not hold, and
-`records_lines` counts the records read; a count of 5000 means older records may be missing.
+`records_lines` counts the records read. A count of 5000 means older records may be missing.
 
 The report also carries a `machine` section: `logical_cpus`, `cpu_model`, `memory_bytes`, `system`,
 `architecture`, and the runner values `runner_os`, `runner_arch`, `image_os`, `image_version` read
@@ -273,7 +273,7 @@ of each `rift mcp` proxy, the persisted records, and the failure window. The fai
 the records that `rift server logs --tail 5000 --since <start> --until <end>` selects. The output
 carries the newest 256 KiB of it, and the newest 1 MiB is kept beside the
 report as `<report>.server-<n>.window.log`. Its start is the end of the last action the report
-recorded, or the start of the server when that is later; the failing action began at or after it.
+recorded, or the start of the server when that is later. The failing action began at or after it.
 Its end is the moment the runner began collecting evidence.
 
 The newest `operations in flight` record before the window's end follows the window. Then come
@@ -282,7 +282,7 @@ what the collector received inside the same window, oldest first:
 - the newest 200 metric points, each with its time, kind, name, the `service.instance.id` of the
   server that sent it, its instrumentation scope as `otel.scope.name` and `otel.scope.version`
   when the point carries one, its attributes, and its value
-- the newest 100 spans, each at its end time with its name, attributes, and elapsed time; a span
+- the newest 100 spans, each at its end time with its name, attributes, and elapsed time. A span
   that carries `request_id` adds `records=`, the count of the window's log records whose `req` is
   the same, so the span and the records of its request read together
 
@@ -331,7 +331,7 @@ just coldstart-test --binary target/release/rift
 The container has no network, language servers, or existing Rift cache. It starts with an empty
 workspace, then reads a newly created source file. After configuration selects a missing language
 server, an incoming-reference request must report the launch failure while syntax reads remain
-available. CI runs this check with its compiled Linux artifact; a local macOS run needs a Linux binary.
+available. CI runs this check with its compiled Linux artifact. A local macOS run needs a Linux binary.
 
 When the cold check fails, it prints the container's standard error, the persisted records, the
 proxy's standard error, and the failure window read through `docker exec` from just before the

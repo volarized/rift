@@ -93,7 +93,7 @@ function Block({ block, index }: { block: ContentBlock; index: number }) {
     <div className="border-b border-border last:border-b-0">
       <div className="flex h-8 items-center justify-between pr-1.5 pl-3">
         <span className={LABEL}>
-          {index + 1} · {block.type}
+          {index + 1}. {block.type}
         </span>
         <CopyButton
           label={`Copy content block ${index + 1}`}

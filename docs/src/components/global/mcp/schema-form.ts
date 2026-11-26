@@ -242,7 +242,7 @@ export function constraintText(spec: FieldSpec): string {
     parts.push(`at most ${spec.maximum}`);
   }
   if (spec.defaultValue !== undefined) parts.push(`default ${JSON.stringify(spec.defaultValue)}`);
-  return parts.join(" · ");
+  return parts.join(", ");
 }
 
 /** Placeholder of a field: its first example, else its default, as the control shows it. */
