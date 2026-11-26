@@ -428,9 +428,22 @@ impl WorkspaceSemantics {
         revision: u64,
         external: &ExternalTarget<'_>,
         static_inputs: StaticInputs<'_, '_>,
+        rust_locals_remaining: &mut usize,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::prepare_facts_placed(documents, declarations_max, revision, false)?
-            .build_with_external(edges_max, None, Some(external), Some(static_inputs))
+        Self::prepare_facts_with(
+            documents,
+            declarations_max,
+            revision,
+            false,
+            |_, placed, builder| {
+                builder.add_facts_placed_with_rust_locals(
+                    placed.facts,
+                    &placed.placement,
+                    rust_locals_remaining,
+                )
+            },
+        )?
+        .build_with_external(edges_max, None, Some(external), Some(static_inputs))
     }
 
     fn prepare_facts_placed(
@@ -474,8 +487,7 @@ impl WorkspaceSemantics {
         for (offered, placed) in documents.iter().enumerate() {
             if placed
                 .facts
-                .symbols()
-                .len()
+                .primary_symbols_len()
                 .saturating_add(placed.placement.aliases_count())
                 > builder.declarations_remaining()
             {

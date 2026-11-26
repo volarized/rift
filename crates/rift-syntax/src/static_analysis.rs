@@ -593,6 +593,27 @@ impl StaticFacts {
         &self.0.references
     }
 
+    /// The boundary between established Rust reference rows and bare local reads.
+    ///
+    /// The Rust producer appends its plain reads. Earlier Rust reads name field paths
+    /// and preserve the dotted expression's range. The supplied source must be the
+    /// exact bytes these facts were captured from.
+    #[must_use]
+    pub fn rust_local_reference_start(&self, source: &str) -> usize {
+        self.references().partition_point(|reference| {
+            reference.role != rift_core::ReferenceRole::Read
+                || !usize::try_from(reference.target.start)
+                    .ok()
+                    .zip(usize::try_from(reference.target.end).ok())
+                    .and_then(|(start, end)| source.get(start..end))
+                    .is_some_and(crate::rust::local_bindings::plain_name)
+        })
+    }
+
+    pub(crate) fn add_rust_local_references(&mut self, references: Vec<StaticReference>) {
+        self.0.references.extend(references);
+    }
+
     /// Captured member expressions with their original receiver and property spans.
     #[must_use]
     pub fn members(&self) -> &[StaticMember] {
@@ -1590,6 +1611,58 @@ fn call(
         callee_range: byte_range(callee)?,
         callee: shape,
     })
+}
+
+#[cfg(test)]
+mod rust_local_read_tests {
+    use super::StaticFacts;
+    use crate::rust::RustSyntaxProvider;
+    use crate::{SyntaxLimits, SyntaxProvider, SyntaxSource};
+
+    #[test]
+    fn test_rust_local_reads_restore_after_existing_field_references() {
+        let source = "struct Item { value: u8 }\nfn choose(item: Item) -> u8 { let local = item.value; local + item.value }\n";
+        let path = rift_core::ProjectPath::new("src/lib.rs").expect("path");
+        let limits = SyntaxLimits::default();
+        let parsed = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: source,
+                },
+                limits,
+            )
+            .expect("original Rust source");
+        let facts = parsed.facts().static_facts().expect("captured facts");
+        let restored = StaticFacts::from_parts(source, limits, facts.0.clone())
+            .expect("checked original references");
+        let split = restored.rust_local_reference_start(source);
+        let written = |reference: &super::StaticReference| {
+            &source[usize::try_from(reference.target.start).expect("start")
+                ..usize::try_from(reference.target.end).expect("end")]
+        };
+        assert_eq!(
+            restored.references()[..split]
+                .iter()
+                .map(written)
+                .collect::<Vec<_>>(),
+            ["Item", "item.value", "item.value"]
+        );
+        assert_eq!(
+            restored.references()[split..]
+                .iter()
+                .map(written)
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        let mut earlier = facts.0.clone();
+        earlier.references.truncate(split);
+        let earlier = StaticFacts::from_parts(source, limits, earlier).expect("earlier Rust rows");
+        assert_eq!(
+            earlier.rust_local_reference_start(source),
+            earlier.references().len()
+        );
+    }
 }
 
 #[cfg(test)]

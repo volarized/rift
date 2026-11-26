@@ -16,6 +16,8 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{RiftError, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+pub(crate) mod local_bindings;
+
 /// Rust declaration kind emitted by the Tree-sitter provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::VariantArray)]
 enum RustSymbolKind {
@@ -51,6 +53,8 @@ enum RustSymbolKind {
     Impl,
     /// A local binding whose value is a closure.
     Closure,
+    /// A value bound by an ordinary let statement.
+    LocalBinding,
 }
 
 impl RustSymbolKind {
@@ -73,6 +77,7 @@ impl RustSymbolKind {
             Self::AssociatedType => "associated_type",
             Self::Impl => "impl_item",
             Self::Closure => "let_declaration",
+            Self::LocalBinding => local_bindings::KIND,
         }
     }
 
@@ -92,7 +97,7 @@ impl RustSymbolKind {
             Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
-            Self::Constant | Self::Static => vec![SymbolKind::Value],
+            Self::Constant | Self::Static | Self::LocalBinding => vec![SymbolKind::Value],
             Self::Variant => vec![SymbolKind::Variant],
         }
     }
@@ -115,7 +120,8 @@ impl RustSymbolKind {
             | Self::Macro
             | Self::Field
             | Self::AssociatedType
-            | Self::Closure => None,
+            | Self::Closure
+            | Self::LocalBinding => None,
         }
     }
 }
@@ -441,7 +447,7 @@ impl SyntaxProvider for RustSyntaxProvider {
         let rules = RustGrammarRules {
             traits: file_traits(tree.root_node(), source.text),
         };
-        let (syntax_elements, symbols, _) = extract::extract_with_capture(
+        let (syntax_elements, mut symbols, _) = extract::extract_with_capture(
             tree.root_node(),
             source,
             limits,
@@ -449,6 +455,8 @@ impl SyntaxProvider for RustSyntaxProvider {
             &rules,
             Some(&mut capture),
         )?;
+        let mut facts = capture.finish();
+        local_bindings::prepare(source.text, &syntax_elements, &mut symbols, &mut facts);
         Ok(SyntaxDocument::new_rust(
             self.language.clone(),
             source,
@@ -457,7 +465,7 @@ impl SyntaxProvider for RustSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_static_facts(Some(capture.finish())))
+        .with_static_facts(Some(facts)))
     }
 
     fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
@@ -636,12 +644,20 @@ impl GrammarRules for RustGrammarRules {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
-        let Some(kind) = RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+        let Some(mut kind) = RustGrammarSyntaxKind::from_kind(syntax_element.kind())
             .and_then(RustGrammarSyntaxKind::symbol_kind)
         else {
             return Ok(None);
         };
-        let Some(name) = declaration_name(syntax_element, text) else {
+        let name = declaration_name(syntax_element, text).or_else(|| {
+            if kind != RustSymbolKind::Closure {
+                return None;
+            }
+            let name = local_bindings::name(visited, text)?;
+            kind = RustSymbolKind::LocalBinding;
+            Some(name.to_owned())
+        });
+        let Some(name) = name else {
             return Ok(None);
         };
         let visibility = match self.visibility_owner(visited, text) {
@@ -694,7 +710,15 @@ impl GrammarRules for RustGrammarRules {
     /// and outer doc comments so the whole declaration - not just the item
     /// syntax element - is what the symbol read returns.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
-        attachment::declaration_start(visited, text)
+        local_bindings::pattern(visited.syntax_element()).map_or_else(
+            || attachment::declaration_start(visited, text),
+            |name| name.start_byte(),
+        )
+    }
+
+    fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        let item = visited.syntax_element();
+        local_bindings::pattern(item).unwrap_or(item)
     }
 
     fn qualification_separator(&self) -> &'static str {

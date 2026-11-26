@@ -716,6 +716,19 @@ impl SyntaxFacts {
         &self.symbols
     }
 
+    /// Number of established declaration candidates before optional Rust package bindings.
+    #[must_use]
+    pub fn primary_symbols_len(&self) -> usize {
+        if self.language.name == "rust" {
+            self.symbols
+                .iter()
+                .filter(|symbol| !symbol.is_rust_local_binding())
+                .count()
+        } else {
+            self.symbols.len()
+        }
+    }
+
     /// Full declarations omitted from the portable Contribution collection.
     #[must_use]
     pub fn left_out_symbols(&self) -> &[SyntaxSymbol] {

@@ -17,7 +17,7 @@ use crate::documentation::{
     DocumentationDeclaration, DocumentationInput, DocumentationSourceSet, collect_documentation,
     content_chunk_identity, content_digest,
 };
-use crate::input::{ExactPackageInput, RetainedSourceLimits};
+use crate::input::{ExactPackageInput, ExactPackageLimits, RetainedSourceLimits};
 use crate::revision::analyzer_revision;
 use crate::selection::documentation_format;
 use crate::semantic::{PlacedFacts, WorkspaceSemantics};
@@ -368,7 +368,6 @@ impl PackageAnalyzer {
         revision: u64,
         mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     ) -> Result<PackageAnalysis, RiftError> {
-        let package = input.owner();
         let sources = input
             .files()
             .iter()
@@ -400,73 +399,171 @@ impl PackageAnalyzer {
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
         let namespace = place_namespace(&input, &mut analyzed)?;
         join::join_modules(&mut analyzed);
-        let placed = analyzed
-            .iter()
-            .map(AnalyzedFile::placed_facts)
-            .collect::<Vec<_>>();
-        let (external_work, external_work_max) = external_work_limits(&input);
-        let static_sources = analyzed
-            .iter()
-            .map(AnalyzedFile::static_source)
-            .collect::<Vec<_>>();
-        let built = WorkspaceSemantics::build_facts_placed_with_external(
-            &placed,
-            input.limits().declarations_max(),
-            input.limits().edges_max(),
-            revision,
-            &|reference| {
-                if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
-                    return None;
-                }
-                namespace.exports.iter().find_map(|export| {
-                    let work = external_work
-                        .get()
-                        .checked_add(1)?
-                        .checked_add(export.target.as_str().len())?;
-                    external_work.set(work);
-                    if work > external_work_max {
-                        return None;
-                    }
-                    let parsed =
-                        rift_protocol::identity::SymbolIdentity::parse(export.target.as_str())
-                            .ok()?;
-                    if parsed.owner() == input.owner() {
-                        return None;
-                    }
-                    let target =
-                        rift_core::ProviderSymbolId::for_symbol(export.target.as_str()).ok()?;
-                    (reference.symbol() == &target).then(|| export.target.clone())
-                })
-            },
-            (&static_sources, &input.namespace_input()),
-        )
-        .map_err(|error| {
-            errors::analysis::package_provider_failed()
-                .package(package_label(package))
-                .cause(error)
-                .error()
-        })?;
-        if let Some(path) = built.beyond_declaration_bound.first() {
-            return errors::analysis::package_declarations_exceeded()
-                .package(package_label(package))
-                .path(path.as_str())
-                .fail();
-        }
+        let (semantics, local_declaration_limit) =
+            assemble_package_graph(&input, &analyzed, &namespace, revision)?;
         let (publication, notebook_cells) = publish(
             &input,
             &analyzed,
-            &built.semantics,
+            &semantics,
             namespace.unresolved_exports,
+            local_declaration_limit,
         )?;
         Ok(PackageAnalysis {
             publication,
             files: analyzed,
-            semantics: built.semantics,
+            semantics,
             notebook_cells,
             syntax_work,
             warnings,
         })
     }
+}
+
+/// Assembles the captured package graph and reserves its primary declaration budget.
+fn assemble_package_graph(
+    input: &ExactPackageInput<'_>,
+    analyzed: &[AnalyzedFile],
+    namespace: &namespace::PreparedNamespace,
+    revision: u64,
+) -> Result<(WorkspaceSemantics, Option<usize>), RiftError> {
+    let placed = analyzed
+        .iter()
+        .map(AnalyzedFile::placed_facts)
+        .collect::<Vec<_>>();
+    let (rust_locals, rust_local_limit) = rust_local_capacity(
+        analyzed,
+        input.limits(),
+        usize::from(namespace.rust_package_root.is_some()),
+    );
+    let mut rust_locals_remaining = rust_local_limit;
+    let (external_work, external_work_max) = external_work_limits(input);
+    let static_sources = analyzed
+        .iter()
+        .map(AnalyzedFile::static_source)
+        .collect::<Vec<_>>();
+    let built = WorkspaceSemantics::build_facts_placed_with_external(
+        &placed,
+        input.limits().declarations_max(),
+        input.limits().edges_max(),
+        revision,
+        &|reference| {
+            if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
+                return None;
+            }
+            namespace.exports.iter().find_map(|export| {
+                let work = external_work
+                    .get()
+                    .checked_add(1)?
+                    .checked_add(export.target.as_str().len())?;
+                external_work.set(work);
+                if work > external_work_max {
+                    return None;
+                }
+                let parsed =
+                    rift_protocol::identity::SymbolIdentity::parse(export.target.as_str()).ok()?;
+                if parsed.owner() == input.owner() {
+                    return None;
+                }
+                let target =
+                    rift_core::ProviderSymbolId::for_symbol(export.target.as_str()).ok()?;
+                (reference.symbol() == &target).then(|| export.target.clone())
+            })
+        },
+        (&static_sources, &input.namespace_input()),
+        &mut rust_locals_remaining,
+    )
+    .map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(input.owner()))
+            .cause(error)
+            .error()
+    })?;
+    if let Some(path) = built.beyond_declaration_bound.first() {
+        return errors::analysis::package_declarations_exceeded()
+            .package(package_label(input.owner()))
+            .path(path.as_str())
+            .fail();
+    }
+    let truncated =
+        (rust_locals > rust_local_limit - rust_locals_remaining).then_some(rust_local_limit);
+    Ok((built.semantics, truncated))
+}
+
+fn rust_local_capacity(
+    documents: &[AnalyzedFile],
+    limits: ExactPackageLimits,
+    synthetic_objects: usize,
+) -> (usize, usize) {
+    let mut locals = 0;
+    let mut primary = 0_usize;
+    let mut unnamed = 0_usize;
+    let mut largest_local = 0_u64;
+    for document in documents {
+        let facts = document.file.syntax();
+        primary = primary
+            .saturating_add(facts.primary_symbols_len())
+            .saturating_add(document.placement.aliases_count());
+        unnamed = unnamed.saturating_add(facts.left_out_symbols().len());
+        if facts.language().name == "rust" {
+            for symbol in facts.symbols().iter().filter(|symbol| {
+                symbol.is_rust_local_binding()
+                    && document
+                        .placement
+                        .logical_identity(&symbol.qualified_name)
+                        .is_some()
+            }) {
+                locals += 1;
+                largest_local = largest_local.max(
+                    symbol
+                        .item_range
+                        .end
+                        .saturating_sub(symbol.item_range.start),
+                );
+            }
+        }
+    }
+    let provider = limits.declarations_max().saturating_sub(primary);
+    let publication = bound(limits.publication().symbols).saturating_sub(
+        primary
+            .saturating_add(unnamed)
+            .saturating_add(synthetic_objects),
+    );
+    let retained = limits
+        .retained_source()
+        .filter(|limits| largest_local != 0 && limits.total_bytes_max != u64::MAX)
+        .map_or(usize::MAX, |limits| {
+            let existing = documents.iter().fold(0_u64, |total, file| {
+                total.saturating_add(primary_retained_source_max(file, limits.record_bytes_max))
+            });
+            let each = largest_local.min(u64::from(limits.record_bytes_max));
+            usize::try_from(limits.total_bytes_max.saturating_sub(existing) / each)
+                .unwrap_or(usize::MAX)
+        });
+    (locals, locals.min(provider).min(publication).min(retained))
+}
+
+/// Upper bound on the original units, declarations and their search documents.
+fn primary_retained_source_max(file: &AnalyzedFile, record_limit: u32) -> u64 {
+    let maximum = u64::from(record_limit);
+    let source = u64::try_from(file.file.source().len()).unwrap_or(u64::MAX);
+    let mut bytes = source.min(maximum).saturating_mul(2);
+    if documentation_format(file.file.path().as_str()) == Some(DocumentationSourceFormat::Notebook)
+    {
+        bytes = bytes.saturating_add(source);
+    }
+    for range in file
+        .file
+        .syntax()
+        .symbols()
+        .iter()
+        .filter(|symbol| !symbol.is_rust_local_binding())
+        .map(|symbol| symbol.item_range)
+        .chain(file.placement.aliases().iter().map(|alias| alias.range))
+    {
+        let record = range.end.saturating_sub(range.start).min(maximum);
+        bytes = bytes.saturating_add(record.saturating_mul(2));
+    }
+    bytes
 }
 
 pub(crate) fn edge_kind(kind: rift_core::EdgeKind) -> rift_protocol::read::EdgeKind {
@@ -562,6 +659,7 @@ fn publish(
     analyzed: &[AnalyzedFile],
     semantics: &WorkspaceSemantics,
     unresolved_exports: bool,
+    local_declaration_limit: Option<usize>,
 ) -> Result<
     (
         PackagePublication,
@@ -631,6 +729,13 @@ fn publish(
         },
         package,
     )?;
+    if let Some(limit) = local_declaration_limit {
+        records.symbols_truncated = true;
+        records.warn(truncation(
+            "local_declarations",
+            u64::try_from(limit).unwrap_or(u64::MAX),
+        ));
+    }
     let coverage = publication_coverage(
         analyzed,
         &records,

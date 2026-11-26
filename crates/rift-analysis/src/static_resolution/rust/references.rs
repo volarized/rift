@@ -1,5 +1,7 @@
 //! Rust containment, field accesses, overrides, and type uses.
 
+use std::collections::BTreeMap;
+
 use rift_core::ReferenceRole;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
@@ -19,6 +21,79 @@ pub(super) enum ReceiverOwner<'source> {
 }
 
 impl<'source> Index<'source> {
+    /// Adds authored Rust local definitions and reads on the work left by other references.
+    pub(in crate::static_resolution) fn rust_local_bindings(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let mut locals = BTreeMap::new();
+        for symbol in file.document.facts.symbols() {
+            if !work.charge() {
+                return;
+            }
+            if !symbol.is_rust_local_binding()
+                || file
+                    .document
+                    .placement
+                    .logical_identity(&symbol.qualified_name)
+                    .is_none()
+                || file.conditional(symbol.item_range, work)
+            {
+                continue;
+            }
+            let Some(range) = symbol.name_range else {
+                continue;
+            };
+            let Some(parent) = file.parent_callable(symbol) else {
+                continue;
+            };
+            let target = Target {
+                file: file.document,
+                symbol,
+            };
+            if let Some(occurrence) =
+                self.rust_edge(file, range, EdgeKind::Contains, parent, target)
+            {
+                locals.insert(range, (target, parent.symbol.item_range));
+                result.record(Some(occurrence));
+            }
+        }
+        if locals.is_empty() {
+            return;
+        }
+        for reference in &file.facts.references()[file.primary_reference_count..] {
+            if !work.charge() {
+                return;
+            }
+            let read = reference.target;
+            let Some(name) = file.text(read) else {
+                continue;
+            };
+            if file.conditional(read, work) || file.blocked(read.start, work) {
+                continue;
+            }
+            let Binding::Found(binding) = file.binding(name, read.start, is_value_binding, work)
+            else {
+                continue;
+            };
+            let Some(&(target, holder)) = locals.get(&binding.name) else {
+                continue;
+            };
+            if file
+                .enclosing_callable(read)
+                .is_none_or(|caller| caller.symbol.item_range != holder)
+            {
+                continue;
+            }
+            if let Some(occurrence) = self.occurrence(file, read, read, ReferenceRole::Read, target)
+            {
+                result.record(Some(occurrence));
+            }
+        }
+    }
+
     /// Reads the module and type tokens written before a qualified callee's final name.
     pub(in crate::static_resolution) fn rust_call_qualifiers(
         &self,
@@ -152,7 +227,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
-        for reference in file.facts.references() {
+        for reference in &file.facts.references()[..file.primary_reference_count] {
             if !work.charge() {
                 return;
             }
@@ -185,6 +260,9 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for symbol in file.document.facts.symbols() {
+            if symbol.is_rust_local_binding() {
+                continue;
+            }
             if !work.charge() {
                 return;
             }

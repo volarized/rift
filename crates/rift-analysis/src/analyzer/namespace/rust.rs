@@ -642,6 +642,35 @@ fn file_anchors(
     let mut anchors = BTreeMap::new();
     let mut owners = BTreeMap::<String, Vec<String>>::new();
     for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
+        if symbol.is_rust_local_binding() {
+            let Some(mut names) = symbol
+                .container
+                .as_deref()
+                .and_then(|owner| owner_path(owner, &owners))
+            else {
+                continue;
+            };
+            let Some(component) = symbol.rust_local_binding_component() else {
+                continue;
+            };
+            if input.release_version().is_none()
+                || !matches!(
+                    input.owner(),
+                    rift_protocol::identity::SymbolOwner::Package { .. }
+                )
+            {
+                continue;
+            }
+            names.push(component.to_owned());
+            let path = namespace.iter().cloned().chain(names).collect();
+            if let Ok(identity) =
+                SymbolIdentity::new(input.owner().clone(), syntax.language().clone(), path)
+                && let Ok(identity) = SymbolId::new(identity.wire_identity())
+            {
+                anchors.insert(symbol.qualified_name.clone(), identity);
+            }
+            continue;
+        }
         let base = match symbol.container.as_deref() {
             Some(container) => format!("{container}::{}", symbol.name),
             None => symbol.name.clone(),
@@ -1368,7 +1397,7 @@ fn local_declarations<'input>(
             continue;
         };
         for symbol in file.syntax.symbols() {
-            if symbol.kind == "impl_item" {
+            if symbol.kind == "impl_item" || symbol.is_rust_local_binding() {
                 continue;
             }
             *work = work.checked_add(1)?;

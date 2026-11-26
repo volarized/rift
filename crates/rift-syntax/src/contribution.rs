@@ -371,7 +371,7 @@ impl SyntaxPublicationBuilder {
         self.add_facts_placed(document.facts(), placement)
     }
 
-    /// Adds every declaration from path-independent syntax facts under `placement`.
+    /// Adds the primary declarations from path-independent syntax facts under `placement`.
     ///
     /// # Errors
     ///
@@ -381,10 +381,32 @@ impl SyntaxPublicationBuilder {
         syntax: &SyntaxFacts,
         placement: &DocumentPlacement,
     ) -> Result<(), RiftError> {
+        self.add_facts_placed_with_rust_locals(syntax, placement, &mut 0)
+    }
+
+    /// Adds the primary declarations and any Rust package bindings allowed by the caller.
+    /// Only a binding with a canonical package anchor can use a supplemental slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RiftError` when one symbol identity or Contribution is invalid.
+    pub fn add_facts_placed_with_rust_locals(
+        &mut self,
+        syntax: &SyntaxFacts,
+        placement: &DocumentPlacement,
+        rust_locals_remaining: &mut usize,
+    ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
+        let mut remaining = *rust_locals_remaining;
         for symbol in syntax.symbols() {
+            if symbol.is_rust_local_binding() {
+                if remaining == 0 || placement.logical_identity(&symbol.qualified_name).is_none() {
+                    continue;
+                }
+                remaining -= 1;
+            }
             let logical = placement.logical_declarations.get(&symbol.qualified_name);
             let address = symbol.provider_address(&language_segment, placement.identity_path());
             let provider_symbol = ProviderSymbolId::for_symbol(&address)?;
@@ -440,6 +462,7 @@ impl SyntaxPublicationBuilder {
         }
         self.add_alias_contributions(syntax, placement, &mut additions)?;
         self.contributions.extend(additions);
+        *rust_locals_remaining = remaining;
         Ok(())
     }
 

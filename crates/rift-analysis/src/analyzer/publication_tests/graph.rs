@@ -1180,7 +1180,8 @@ impl GraphFixture {
             .collect::<Result<Vec<_>, _>>()?;
         let input =
             ExactPackageInput::new(&self.owner, &self.language, &self.origin, &sources, limits)?;
-        publish(&input, self.analysis.files(), semantics, false).map(|(publication, _)| publication)
+        publish(&input, self.analysis.files(), semantics, false, None)
+            .map(|(publication, _)| publication)
     }
 }
 

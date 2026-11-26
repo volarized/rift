@@ -64,6 +64,8 @@ pub(crate) struct StaticResolution {
     pub(crate) occurrences: Vec<StaticOccurrence>,
     /// First internal and external occurrence from a pass that uses the capacity left by primary edges.
     pub(crate) supplemental_start: Option<(usize, usize)>,
+    /// First internal occurrence added after the earlier supplemental passes.
+    pub(crate) late_supplemental_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -224,6 +226,7 @@ enum RustReferencePass {
     RootMacros,
     TextualMacros,
     MacroImports,
+    LocalBindings,
 }
 
 struct DeferredImports<'source> {
@@ -480,6 +483,9 @@ struct File<'source> {
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
+    /// The reference prefix and declaration count before additional Rust bindings.
+    primary_reference_count: usize,
+    rust_local_count: usize,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
@@ -638,6 +644,8 @@ impl<'source> File<'source> {
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
+            primary_reference_count: facts.references().len(),
+            rust_local_count: 0,
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
@@ -669,6 +677,7 @@ impl<'source> File<'source> {
             chain_modules: BTreeMap::new(),
         };
         if document.facts.language().name == "rust" {
+            file.primary_reference_count = facts.rust_local_reference_start(document.source);
             file.chain_modules = crate::analyzer::namespace::rust_chain_modules(
                 document.source,
                 document.facts,
@@ -920,6 +929,10 @@ impl<'source> File<'source> {
             self.python_whole = python_edges::WholeFile::Expression;
         }
         for symbol in self.document.facts.symbols() {
+            if symbol.is_rust_local_binding() {
+                self.rust_local_count += 1;
+                continue;
+            }
             if self.inactive(symbol.item_range, work) {
                 continue;
             }
@@ -980,11 +993,11 @@ impl<'source> File<'source> {
     fn elements(&self) -> usize {
         [
             self.facts.calls().len(),
-            self.facts.references().len(),
+            self.primary_reference_count,
             self.facts.bindings().len(),
             self.facts.python_deletions().len(),
             self.facts.heritage_edges().len(),
-            self.document.facts.symbols().len(),
+            self.document.facts.symbols().len() - self.rust_local_count,
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -1418,9 +1431,13 @@ impl<'source> Index<'source> {
         }
         let mut existing = VecDeque::from(references);
         let mut macro_sites = VecDeque::new();
-        while let Some((file, remaining, sites)) =
-            existing.pop_front().or_else(|| macro_sites.pop_front())
+        let mut local_sites = VecDeque::new();
+        while let Some((file, remaining, sites)) = existing
+            .pop_front()
+            .or_else(|| macro_sites.pop_front())
+            .or_else(|| local_sites.pop_front())
         {
+            resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
@@ -1440,6 +1457,8 @@ impl<'source> Index<'source> {
                     pass,
                     macro_imports,
                 } => {
+                    let locals =
+                        (file.rust_local_count != 0).then_some(RustReferencePass::LocalBindings);
                     let next = match pass {
                         RustReferencePass::Paths => {
                             self.rust_call_qualifiers(file, &mut deferred, resolution);
@@ -1449,16 +1468,20 @@ impl<'source> Index<'source> {
                                 || !file.facts.rust_textual_macro_calls().is_empty()
                                 || !macro_imports.is_empty())
                             .then_some(RustReferencePass::RootMacros)
+                            .or(locals)
                         }
                         RustReferencePass::RootMacros => {
                             self.rust_root_macro_calls(file, &mut deferred, resolution);
                             (!file.facts.rust_textual_macro_calls().is_empty()
                                 || !macro_imports.is_empty())
                             .then_some(RustReferencePass::TextualMacros)
+                            .or(locals)
                         }
                         RustReferencePass::TextualMacros => {
                             self.rust_textual_macro_calls(file, &mut deferred, resolution);
-                            (!macro_imports.is_empty()).then_some(RustReferencePass::MacroImports)
+                            (!macro_imports.is_empty())
+                                .then_some(RustReferencePass::MacroImports)
+                                .or(locals)
                         }
                         RustReferencePass::MacroImports => {
                             self.rust_macro_imports(
@@ -1467,6 +1490,10 @@ impl<'source> Index<'source> {
                                 &mut deferred,
                                 resolution,
                             );
+                            locals
+                        }
+                        RustReferencePass::LocalBindings => {
+                            self.rust_local_bindings(file, &mut deferred, resolution);
                             None
                         }
                     };
@@ -1483,10 +1510,14 @@ impl<'source> Index<'source> {
             work.budget = LoopBudget::new(left.saturating_sub(used));
             resolution.ended |= deferred.exhausted;
             if let Some(next) = next {
-                let queue = if matches!(next, DeferredReferences::PythonQualifiers { .. }) {
-                    &mut existing
-                } else {
-                    &mut macro_sites
+                let queue = match next {
+                    DeferredReferences::Python { .. }
+                    | DeferredReferences::PythonQualifiers { .. } => &mut existing,
+                    DeferredReferences::Rust {
+                        pass: RustReferencePass::LocalBindings,
+                        ..
+                    } => &mut local_sites,
+                    DeferredReferences::Rust { .. } => &mut macro_sites,
                 };
                 queue.push_back((file, remaining.saturating_sub(used), next));
             }
@@ -1633,11 +1664,12 @@ impl<'source> Index<'source> {
                     || !file.facts.rust_field_sites().is_empty()
                     || !file.facts.rust_root_macro_calls().is_empty()
                     || !file.facts.rust_textual_macro_calls().is_empty()
-                    || !rust_macros.is_empty())
-                .then_some(DeferredReferences::Rust {
-                    pass: RustReferencePass::Paths,
-                    macro_imports: rust_macros,
-                })
+                    || !rust_macros.is_empty()
+                    || file.rust_local_count != 0)
+                    .then_some(DeferredReferences::Rust {
+                        pass: RustReferencePass::Paths,
+                        macro_imports: rust_macros,
+                    })
             }
             _ => None,
         };
@@ -1986,6 +2018,19 @@ impl<'source> Index<'source> {
 }
 
 impl StaticResolution {
+    fn mark_late_admission(&mut self, sites: &DeferredReferences<'_>) {
+        if matches!(
+            sites,
+            DeferredReferences::Rust {
+                pass: RustReferencePass::LocalBindings,
+                ..
+            }
+        ) {
+            self.late_supplemental_start
+                .get_or_insert(self.occurrences.len());
+        }
+    }
+
     /// Adds one file's result after the results of the files before it. A file whose
     /// pass ended on its own share keeps what it resolved and reports unavailable call
     /// coverage for its unit.
