@@ -2417,15 +2417,22 @@ fn rust_macro_doc_comments_keep_original_line_endings_and_refuse_hidden_code() {
 }
 
 #[test]
-fn documentation_cfg_module_paths_restore_original_source_and_unknown_effects() {
+fn documentation_cfg_module_paths_restore_original_conditional_evidence() {
+    const ATTRIBUTE: &str = "#[cfg_attr(docsrs, doc(hidden), path = \"other.rs\")]";
+    let conditional = format!("{ATTRIBUTE}\nmod task;");
     for (source, expected) in [
         (
             "#[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))]\npub mod task;",
             rift_syntax::RustModulePath::Absent,
         ),
         (
-            "#[cfg_attr(docsrs, doc(hidden), path = \"other.rs\")]\nmod task;",
-            rift_syntax::RustModulePath::Unknown,
+            conditional.as_str(),
+            rift_syntax::RustModulePath::Conditional {
+                attributes: vec![ByteRange {
+                    start: 0,
+                    end: u64::try_from(ATTRIBUTE.len()).expect("attribute byte length"),
+                }],
+            },
         ),
     ] {
         let document = parsed(ShippedLanguage::Rust, source);
@@ -2438,6 +2445,17 @@ fn documentation_cfg_module_paths_restore_original_source_and_unknown_effects() 
             restored.symbols()[0].item_range,
             document.symbols()[0].item_range
         );
+        let mut altered = parts(document.facts());
+        if let Some(rift_syntax::RustModulePath::Conditional { attributes }) =
+            &mut altered.symbols[0].module_path
+        {
+            attributes[0].end += 1;
+            assert_eq!(
+                SyntaxFacts::from_parts(source, SyntaxLimits::default(), altered)
+                    .map_err(|error| error.slug()),
+                Err(errors::syntax::facts_structure_invalid::SLUG),
+            );
+        }
     }
 }
 

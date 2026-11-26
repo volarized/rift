@@ -594,9 +594,14 @@ pub fn run() -> (u8, u8, u8, u16) {
     }
     assert!(publication.declarations.iter().all(|declaration| {
         let name = declaration.symbol.as_str();
-        !name.ends_with("/OpaqueName")
-            && !name.ends_with("/ElsewhereName")
-            && !name.ends_with("/DecoyName")
+        !name.ends_with("/OpaqueName") && !name.ends_with("/DecoyName")
+    }));
+    assert!(publication.declarations.iter().any(|declaration| {
+        declaration
+            .symbol
+            .as_str()
+            .ends_with("/conditional/ElsewhereName")
+            && declaration.unit.as_str().ends_with("src/elsewhere.rs")
     }));
 }
 
@@ -1119,4 +1124,53 @@ pub fn caller() { leaf(); other(); }
             .count(),
         2
     );
+}
+
+#[test]
+fn package_rust_cfg_attr_path_keeps_only_the_selected_file_owner() {
+    let native = "#[cfg_attr(feature = \"native\", path = \"platform.rs\")] pub mod selected;
+pub fn call() { selected::entry(); }";
+    let manifest =
+        |enabled| format!("{MANIFEST}\n[features]\ndefault = [{enabled}]\nnative = []\n");
+    let sources = |source| {
+        vec![
+            ("src/lib.rs", source),
+            ("src/platform.rs", "pub fn entry() {}"),
+            ("src/selected.rs", "pub fn entry() {}"),
+        ]
+    };
+    for (feature, physical) in [("\"native\"", "src/platform.rs"), ("", "src/selected.rs")] {
+        let selected = analyze_rust_root(sources(native), &manifest(feature));
+        let declaration = selected
+            .publication()
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/selected/entry"))
+            .expect("selected child declaration");
+        assert!(declaration.unit.as_str().ends_with(physical));
+        assert!(
+            selected
+                .publication()
+                .edges
+                .iter()
+                .any(|row| row.kinds == [EdgeKind::Calls]
+                    && row.from.as_str().ends_with("/call")
+                    && row.to == declaration.symbol)
+        );
+    }
+    for refused in [
+        "#[cfg_attr(unknown, path = \"platform.rs\")] pub mod selected;",
+        "#[cfg_attr(feature = \"native\", path = \"platform.rs\", path = \"selected.rs\")] pub mod selected;",
+        "#[cfg_attr(feature = \"native\", path = \"platform.rs\", transform)] pub mod selected;",
+    ] {
+        let result = analyze_rust_root(sources(refused), &manifest("\"native\""));
+        assert!(
+            result
+                .publication()
+                .declarations
+                .iter()
+                .all(|row| !row.symbol.as_str().ends_with("/selected/entry")),
+            "{refused}"
+        );
+    }
 }

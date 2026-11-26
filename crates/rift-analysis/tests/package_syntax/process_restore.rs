@@ -18,6 +18,7 @@ const SOURCE: &str = "/// Opens a file.\npub mod client { pub fn open() {} pub f
 enum CapturedModulePath {
     Absent,
     Literal { path: String, range: [u64; 2] },
+    Conditional { attributes: Vec<[u64; 2]> },
     Unknown,
 }
 
@@ -29,6 +30,9 @@ impl CapturedModulePath {
                 path: path.as_str().to_owned(),
                 range: captured_range(*range),
             },
+            RustModulePath::Conditional { attributes } => Self::Conditional {
+                attributes: attributes.iter().copied().map(captured_range).collect(),
+            },
             RustModulePath::Unknown => Self::Unknown,
         }
     }
@@ -39,6 +43,9 @@ impl CapturedModulePath {
             Self::Literal { path, range } => RustModulePath::Literal {
                 path: rift_core::ProjectPath::new(path).expect("recorded module path"),
                 range: restored_range(range),
+            },
+            Self::Conditional { attributes } => RustModulePath::Conditional {
+                attributes: attributes.into_iter().map(restored_range).collect(),
             },
             Self::Unknown => RustModulePath::Unknown,
         }

@@ -248,6 +248,11 @@ pub enum RustModulePath {
         /// Original literal content, before the module item.
         range: ByteRange,
     },
+    /// Exact outer path attributes whose Cargo predicates decide the selected path.
+    Conditional {
+        /// Authored attribute ranges in source order.
+        attributes: Vec<ByteRange>,
+    },
     /// Unsupported or conflicting attributes prevent an established module path.
     Unknown,
 }

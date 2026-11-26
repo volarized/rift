@@ -187,6 +187,8 @@ pub(super) fn module_path(
         }
     }
     let mut state = crate::RustModulePath::Absent;
+    let mut paths = Vec::new();
+    let mut conditional = false;
     for syntax_element in outer_attributes(visited) {
         let Some(attribute) = syntax_element
             .named_child(0)
@@ -199,6 +201,7 @@ pub(super) fn module_path(
         };
         match name {
             "path" if state == crate::RustModulePath::Absent => {
+                paths.push(extract::byte_range(syntax_element)?);
                 state = literal_path(attribute, text)?;
                 if state == crate::RustModulePath::Unknown {
                     return Ok(state);
@@ -215,10 +218,31 @@ pub(super) fn module_path(
             | "deprecated"
             | "no_implicit_prelude" => {}
             "cfg_attr" if documentation_cfg_attribute(attribute, text) => {}
+            "cfg_attr"
+                if visited
+                    .syntax_element()
+                    .child_by_field_name("body")
+                    .is_none()
+                    && attribute
+                        .child_by_field_name("arguments")
+                        .is_some_and(|arguments| {
+                            !arguments.has_error()
+                                && text
+                                    .get(arguments.byte_range())
+                                    .is_some_and(|text| text.contains("path"))
+                        }) =>
+            {
+                paths.push(extract::byte_range(syntax_element)?);
+                conditional = true;
+            }
             _ => return Ok(crate::RustModulePath::Unknown),
         }
     }
-    Ok(state)
+    if conditional {
+        Ok(crate::RustModulePath::Conditional { attributes: paths })
+    } else {
+        Ok(state)
+    }
 }
 
 fn semantic_attribute_name<'source>(

@@ -38,6 +38,12 @@ impl GetSize for RustModulePath {
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         match self {
             Self::Literal { path, .. } => path.get_heap_size_with_tracker(tracker),
+            Self::Conditional { attributes } => (
+                attributes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ByteRange>()),
+                tracker,
+            ),
             Self::Absent | Self::Unknown => (0, tracker),
         }
     }

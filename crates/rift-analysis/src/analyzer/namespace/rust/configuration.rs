@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rift_core::ProjectPath;
+use rift_syntax::ByteRange;
 use serde::Deserialize;
 
 use super::macros::{Condition, configured_with_flags, tokens};
@@ -188,7 +190,67 @@ impl<'input> Configurations<'input> {
     }
 }
 
+pub(super) enum SelectedModulePath {
+    Default,
+    Literal(ProjectPath),
+}
+
 impl Configuration<'_> {
+    pub(super) fn module_path(
+        &self,
+        source: &str,
+        attributes: &[ByteRange],
+    ) -> Option<SelectedModulePath> {
+        let mut path = None;
+        for &range in attributes {
+            let source = super::macros::text_range(source, range)?;
+            let tokens = tokens(source)?;
+            let ["#", "[", attribute @ .., "]"] = tokens.as_slice() else {
+                return None;
+            };
+            self.path_attribute(attribute, self.depth, &mut path)?;
+        }
+        Some(path.map_or(SelectedModulePath::Default, SelectedModulePath::Literal))
+    }
+
+    fn path_attribute(
+        &self,
+        input: &[&str],
+        depth: usize,
+        path: &mut Option<ProjectPath>,
+    ) -> Option<()> {
+        let depth = depth.checked_sub(1)?;
+        match input {
+            ["path", "=", literal] if path.is_none() => {
+                let content = literal.strip_prefix('"')?.strip_suffix('"')?;
+                if content.contains('\\')
+                    || content.len() > rift_core::constants::PROJECT_PATH_BYTES_MAX
+                {
+                    return None;
+                }
+                *path = Some(ProjectPath::new(content).ok()?);
+            }
+            ["cfg_attr", "(", body @ .., ")"] => {
+                let parts = split(body)?;
+                let (predicate, nested) = parts.split_first()?;
+                if nested.is_empty() {
+                    return None;
+                }
+                if self.predicate(predicate, depth)? {
+                    for attribute in nested {
+                        self.path_attribute(attribute, depth, path)?;
+                    }
+                }
+            }
+            [
+                "cfg" | "allow" | "expect" | "warn" | "deny" | "forbid" | "doc" | "deprecated",
+                ..,
+            ] => {}
+            _ => return None,
+        }
+        Some(())
+    }
+
     pub(crate) fn admitted(
         &self,
         facts: &rift_syntax::SyntaxFacts,

@@ -577,6 +577,31 @@ fn validate_module_path(
             return Err(errors::syntax::facts_structure_invalid().error());
         }
     }
+    if let crate::RustModulePath::Conditional { attributes } = state {
+        if attributes.is_empty() {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+        for (index, &attribute) in attributes.iter().enumerate() {
+            range(source, attribute)?;
+            if attribute.start == attribute.end
+                || attribute.end > symbol.item_range.start
+                || attributes
+                    .get(index + 1)
+                    .is_some_and(|next| next.start < attribute.end)
+                || !usize::try_from(attribute.start)
+                    .ok()
+                    .zip(usize::try_from(attribute.end).ok())
+                    .and_then(|(start, end)| source.get(start..end))
+                    .is_some_and(|text| {
+                        text.strip_prefix('#').is_some_and(|text| {
+                            text.trim_start().starts_with('[') && text.ends_with(']')
+                        })
+                    })
+            {
+                return Err(errors::syntax::facts_structure_invalid().error());
+            }
+        }
+    }
     Ok(())
 }
 

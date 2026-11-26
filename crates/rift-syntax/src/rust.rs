@@ -1327,7 +1327,6 @@ mod tests {
             "#[path = \"\"]",
             "#[path = \"/shared.rs\"]",
             "#[path = \"mapped\\u{2e}rs\"]",
-            "#[cfg_attr(feature = \"alternate\", path = \"other.rs\")]",
             "#[path = \"one.rs\"]\n#[path = \"two.rs\"]",
             "#[path = \"same.rs\"]\n#[path = \"same.rs\"]",
             "#[custom_module]",
@@ -2215,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_documentation_cfg_attributes_refuse_unknown_or_mixed_effects() {
+    fn test_documentation_cfg_attributes_keep_conditional_path_evidence_separate() {
         for attribute in [
             "cfg_attr(docsrs, doc(hidden), path = \"other.rs\")",
             "cfg_attr(docsrs, doc(hidden), macro_use)",
@@ -2232,11 +2231,16 @@ mod tests {
                 format!("mod inline {{ #![{attribute}] mod child; }}"),
             ] {
                 let document = analyze(&text);
-                assert_eq!(
-                    document.symbols()[0].module_path,
-                    Some(crate::RustModulePath::Unknown),
-                    "{text}"
-                );
+                let state = &document.symbols()[0].module_path;
+                if text.starts_with("#[") && attribute.contains("path =") {
+                    let Some(crate::RustModulePath::Conditional { attributes }) = state else {
+                        panic!("expected conditional path metadata: {text}");
+                    };
+                    assert_eq!(attributes.len(), 1, "{text}");
+                    assert_eq!(text_at(&text, attributes[0]), format!("#[{attribute}]"));
+                } else {
+                    assert_eq!(state, &Some(crate::RustModulePath::Unknown), "{text}");
+                }
             }
         }
         let attribute = format!(

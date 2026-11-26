@@ -978,7 +978,7 @@ pub(super) fn children<'a>(
         &mut Vec<Conditioned<'a>>,
     ),
     limits: rift_syntax::SyntaxLimits,
-    library: bool,
+    (library, ordinary): (bool, &[super::ChildModulePath]),
 ) -> Vec<Child> {
     let (mut scope, admitted, exports, conditioned) = scope;
     let context = Context {
@@ -987,7 +987,6 @@ pub(super) fn children<'a>(
         depth_max: limits.syntax_depth_max(),
         library,
     };
-    let ordinary = super::module_children(file, directory, inventory, limits);
     // Keyed by the declaring item: alternative `mod` items of one name each keep their file.
     let direct = ordinary
         .iter()
