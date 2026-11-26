@@ -13,6 +13,25 @@ pub(crate) fn invalid_declarations(
     limits: SyntaxLimits,
     declarations: &[ByteRange],
 ) -> Result<BTreeSet<ByteRange>, RiftError> {
+    checked_declarations(language, source, limits, declarations, false)
+}
+
+pub(crate) fn incomplete_declarations(
+    language: &Language,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    declarations: &[ByteRange],
+) -> Result<BTreeSet<ByteRange>, RiftError> {
+    checked_declarations(language, source, limits, declarations, true)
+}
+
+fn checked_declarations(
+    language: &Language,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    declarations: &[ByteRange],
+    whole_item: bool,
+) -> Result<BTreeSet<ByteRange>, RiftError> {
     limits.admit_source(source)?;
     if declarations.len() > limits.syntax_elements_max() {
         return errors::syntax::too_many_syntax_elements()
@@ -79,6 +98,7 @@ pub(crate) fn invalid_declarations(
         limits,
         &declarations,
         HeaderRules {
+            whole_item,
             terminator: header_terminator,
             recovered: recovered_header,
             value: ecmascript
@@ -107,6 +127,8 @@ pub(crate) fn invalid_declarations(
 /// Grammar facts that decide which header errors keep a declaration's name.
 #[derive(Clone, Copy)]
 struct HeaderRules {
+    /// Whether errors anywhere in the declaration's subtree invalidate the item.
+    whole_item: bool,
     /// Token that ends a header before an optional body.
     terminator: Option<u16>,
     /// Header field whose own errors leave the name and the other header parts intact.
@@ -152,8 +174,12 @@ fn invalid_ranges(
         if declarations.contains(&range)
             && (in_error
                 || (syntax_element != root
-                    && header_has_error(syntax_element, body_field, rules)
-                    && !opaque_macro_body(syntax_element)))
+                    && if rules.whole_item {
+                        syntax_element.has_error()
+                    } else {
+                        header_has_error(syntax_element, body_field, rules)
+                            && !opaque_macro_body(syntax_element)
+                    }))
         {
             invalid.insert(range);
         }

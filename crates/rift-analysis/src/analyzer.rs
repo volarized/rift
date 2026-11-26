@@ -71,6 +71,10 @@ mod publication_tests;
 #[cfg(test)]
 mod retained_tests;
 mod rust_lsp_declarations;
+mod rust_lsp_macro_items;
+pub use rust_lsp_macro_items::{
+    RustLspMacroAdmission, RustLspMacroFile, RustLspMacroItems, RustLspMacroSite,
+};
 mod rust_lsp_operators;
 
 use join::ModuleRole;

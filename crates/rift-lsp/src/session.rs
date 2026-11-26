@@ -54,9 +54,11 @@ use crate::capabilities::{Capabilities, glob_matches, offered};
 mod batch;
 mod edges;
 mod rust_declarations;
+mod rust_macro_expansion;
 use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE};
 use crate::framing::Framing;
 use crate::uri::TreeRoot;
+pub use rust_macro_expansion::RustMacroExpansion;
 
 /// Wall-clock bound on the shutdown request and on the exit wait.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);

@@ -563,7 +563,7 @@ fn syntax_callable(
     None
 }
 
-fn retained_source_bytes(publication: &PackagePublication) -> u64 {
+pub(super) fn retained_source_bytes(publication: &PackagePublication) -> u64 {
     let lengths = publication
         .units
         .iter()

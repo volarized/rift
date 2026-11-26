@@ -465,6 +465,23 @@ pub struct RustSyntaxProvider {
     language: Language,
 }
 
+impl RustSyntaxProvider {
+    /// Finds requested Rust declaration items with errors anywhere inside them.
+    ///
+    /// The caller supplies ranges matched by the parser. Errors in a disjoint sibling
+    /// do not invalidate an admitted item.
+    /// # Errors
+    /// Returns the syntax refusal when the source or range walk exceeds its bounds.
+    pub fn incomplete_items(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        declarations: &[crate::ByteRange],
+    ) -> Result<std::collections::BTreeSet<crate::ByteRange>, RiftError> {
+        crate::parse_errors::incomplete_declarations(&self.language, source, limits, declarations)
+    }
+}
+
 impl Default for RustSyntaxProvider {
     fn default() -> Self {
         Self {
