@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use rift_dependency::{JvmBuildFile, JvmBuildSystem};
 use rift_error::{RiftError, errors};
 use rift_index::WorkspaceSourcePolicy;
+use rift_lsp::JvmLanguageServer;
 use rift_protocol::configuration::{
     CONFIGURATION_FILE_BYTES_MAX, EmbeddedEngine, LspPackageManager, WorkspaceConfiguration,
 };
@@ -216,6 +218,7 @@ fn collect(
     policy: &WorkspaceSourcePolicy,
 ) -> Result<BTreeMap<(PathBuf, String), PathBuf>, RiftError> {
     let roots = manifest_roots(paths);
+    let jvm_roots = jvm_manifest_roots(paths);
     let mut projects = BTreeMap::new();
     for path in paths {
         let Some(language) = policy
@@ -231,16 +234,19 @@ fn collect(
         let Some(candidate) = Candidate::for_language(identity) else {
             continue;
         };
-        let primary_cargo = candidate.manifest == "Cargo.toml"
-            && roots.contains(&("Cargo.toml".to_owned(), PathBuf::new()));
-        let project = if primary_cargo {
-            PathBuf::new()
-        } else {
-            nearest_root(Path::new(path.as_str()), candidate.manifest, &roots)
+        let path = Path::new(path.as_str());
+        let project = match candidate.manifest {
+            ProjectManifest::Named("Cargo.toml")
+                if roots.contains(&("Cargo.toml".to_owned(), PathBuf::new())) =>
+            {
+                PathBuf::new()
+            }
+            ProjectManifest::Named(manifest) => nearest_root(path, manifest, &roots),
+            ProjectManifest::Jvm(_) => nearest_jvm_root(path, &jvm_roots),
         };
         projects
             .entry((root.join(project), identity.to_owned()))
-            .or_insert_with(|| root.join(path.as_str()));
+            .or_insert_with(|| root.join(path));
     }
     Ok(projects)
 }
@@ -336,10 +342,55 @@ fn nearest_root(path: &Path, manifest: &str, roots: &BTreeSet<(String, PathBuf)>
         .to_owned()
 }
 
+/// The recognized build file nearest each JVM project directory.
+fn jvm_manifest_roots(paths: &[rift_core::ProjectPath]) -> BTreeMap<PathBuf, JvmBuildFile> {
+    let mut roots = BTreeMap::new();
+    for path in paths {
+        let path = Path::new(path.as_str());
+        let Some((file, parent)) = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(JvmBuildFile::from_name)
+            .zip(path.parent())
+        else {
+            continue;
+        };
+        roots
+            .entry(parent.to_owned())
+            .and_modify(|previous: &mut JvmBuildFile| *previous = (*previous).min(file))
+            .or_insert(file);
+    }
+    roots
+}
+
+/// A settings file owns a Gradle subproject. A nearer POM ends the search.
+fn nearest_jvm_root(path: &Path, roots: &BTreeMap<PathBuf, JvmBuildFile>) -> PathBuf {
+    let mut gradle_build = None;
+    for parent in path.parent().into_iter().flat_map(Path::ancestors) {
+        match roots.get(parent) {
+            Some(settings) if settings.is_gradle_settings() => return parent.to_owned(),
+            Some(file) if file.system() == JvmBuildSystem::Maven => {
+                return gradle_build.unwrap_or(parent).to_owned();
+            }
+            Some(_) => {
+                gradle_build.get_or_insert(parent);
+            }
+            None => {}
+        }
+    }
+    gradle_build.map_or_else(PathBuf::new, Path::to_owned)
+}
+
+#[derive(Clone, Copy)]
+enum ProjectManifest {
+    Named(&'static str),
+    Jvm(JvmLanguageServer),
+}
+
 struct Candidate {
     language: &'static str,
     program: &'static str,
-    manifest: &'static str,
+    manifest: ProjectManifest,
     /// Engine this build links in for the language, selected when no executable is installed.
     embedded: Option<EmbeddedEngine>,
 }
@@ -351,29 +402,45 @@ enum Selection {
         manager: LspPackageManager,
         program: String,
     },
+    /// A language server selected by its explicit executable and arguments.
+    Command {
+        program: String,
+        arguments: Vec<String>,
+    },
     /// An engine this build links in.
     Embedded(EmbeddedEngine),
 }
 
 impl Selection {
-    /// The `rift config set` argument that writes this selection.
-    fn argument(&self) -> String {
+    /// The `rift config set` arguments that write this selection.
+    fn arguments(&self) -> Vec<String> {
         match self {
             Self::Installed { manager, .. } => {
-                format!("--lsp-package-manager={}", manager.as_str())
+                vec![format!("--lsp-package-manager={}", manager.as_str())]
             }
-            Self::Embedded(engine) => format!("--lsp-embedded={}", embedded_name(*engine)),
+            Self::Command { program, arguments } => {
+                std::iter::once(format!("--lsp-program={program}"))
+                    .chain(
+                        arguments
+                            .iter()
+                            .map(|argument| format!("--lsp-argument={argument}")),
+                    )
+                    .collect()
+            }
+            Self::Embedded(engine) => vec![format!("--lsp-embedded={}", embedded_name(*engine))],
         }
     }
 
     /// The recommendation status that applies this selection with `command` in `scope`.
     fn status(self, command: String, scope: SearchScope) -> LspRecommendationStatus {
         match self {
-            Self::Installed { program, .. } => LspRecommendationStatus::Available {
-                program,
-                command,
-                scope,
-            },
+            Self::Installed { program, .. } | Self::Command { program, .. } => {
+                LspRecommendationStatus::Available {
+                    program,
+                    command,
+                    scope,
+                }
+            }
             Self::Embedded(engine) => LspRecommendationStatus::Embedded {
                 engine,
                 command,
@@ -396,22 +463,27 @@ impl Candidate {
             "rust" => Some(Self {
                 language: "rust",
                 program: "rust-analyzer",
-                manifest: "Cargo.toml",
+                manifest: ProjectManifest::Named("Cargo.toml"),
                 embedded: None,
             }),
             "python" => Some(Self {
                 language: "python",
                 program: "ty",
-                manifest: "pyproject.toml",
+                manifest: ProjectManifest::Named("pyproject.toml"),
                 embedded: Some(EmbeddedEngine::Ty),
             }),
             "typescript" | "typescript:tsx" | "javascript" => Some(Self {
                 language: "typescript",
                 program: "typescript-language-server",
-                manifest: "package.json",
+                manifest: ProjectManifest::Named("package.json"),
                 embedded: None,
             }),
-            _ => None,
+            _ => JvmLanguageServer::for_language(language).map(|server| Self {
+                language: server.language_id(),
+                program: server.program(),
+                manifest: ProjectManifest::Jvm(server),
+                embedded: None,
+            }),
         }
     }
 
@@ -433,6 +505,13 @@ impl Candidate {
         search: Option<&OsStr>,
         dependencies: &rift_protocol::dependencies::DependenciesConfiguration,
     ) -> Option<Selection> {
+        if let ProjectManifest::Jvm(server) = self.manifest {
+            which::which_in(server.program(), search, root).ok()?;
+            return Some(Selection::Command {
+                program: server.program().to_owned(),
+                arguments: server.arguments(root)?,
+            });
+        }
         self.installed(root, search, dependencies)
             .map(|(manager, program)| Selection::Installed { manager, program })
             .or_else(|| self.embedded.map(Selection::Embedded))
@@ -509,7 +588,7 @@ fn decisions(
                     SearchScope::ProfileLocal { name } => Some(name.as_str()),
                     _ => None,
                 },
-                &selected.argument(),
+                selected.arguments(),
             );
             if extra.is_some() {
                 command = format!("cd {} && {command}", quote(&project.to_string_lossy()));
@@ -608,8 +687,9 @@ fn project_name(root: &Path, project: &Path) -> String {
         .map_or_else(|_| project.to_string_lossy().into_owned(), slash)
 }
 
-fn command(language: &str, root: &str, profile: Option<&str>, selection: &str) -> String {
-    let mut arguments = vec![format!("--language={language}"), selection.to_owned()];
+fn command(language: &str, root: &str, profile: Option<&str>, selection: Vec<String>) -> String {
+    let mut arguments = vec![format!("--language={language}")];
+    arguments.extend(selection);
     if let Some(profile) = profile {
         arguments.push(format!("--profile={profile}"));
         arguments.push(format!("--profile-root={root}"));
@@ -1110,16 +1190,107 @@ mod tests {
     }
 
     #[test]
+    fn jvm_build_files_select_the_settings_root_or_nearest_pom() {
+        let paths = [
+            "gradle/settings.gradle.kts",
+            "gradle/app/build.gradle",
+            "gradle/standalone/pom.xml",
+            "gradle/standalone/build.gradle.kts",
+            "maven/pom.xml",
+            "single/build.gradle.kts",
+            "single/build.gradle.kts.bak",
+        ]
+        .into_iter()
+        .map(|path| rift_core::ProjectPath::new(path).expect("project path"))
+        .collect::<Vec<_>>();
+        let roots = jvm_manifest_roots(&paths);
+        assert_eq!(
+            nearest_jvm_root(Path::new("gradle/app/src/main/kotlin/Main.kt"), &roots),
+            Path::new("gradle")
+        );
+        assert_eq!(
+            nearest_jvm_root(Path::new("gradle/standalone/src/Main.java"), &roots),
+            Path::new("gradle/standalone")
+        );
+        assert_eq!(
+            nearest_jvm_root(Path::new("maven/src/main/java/Main.java"), &roots),
+            Path::new("maven")
+        );
+        assert_eq!(
+            nearest_jvm_root(Path::new("single/src/main/java/Main.java"), &roots),
+            Path::new("single")
+        );
+        assert_eq!(
+            nearest_jvm_root(Path::new("Main.java"), &roots),
+            Path::new("")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jvm_recommendations_select_installed_explicit_launch_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("workspace root");
+        let bin = path.join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let path = path.canonicalize()?;
+        let bin = path.join("bin");
+        let projects = project_entries(
+            &path,
+            &[("", "java", "Main.java"), ("", "kotlin", "Main.kt")],
+        );
+        for server in [JvmLanguageServer::Java, JvmLanguageServer::Kotlin] {
+            let launch = bin.join(server.program());
+            std::fs::write(&launch, b"#!/bin/sh\nexit 91\n")?;
+            std::fs::set_permissions(&launch, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let batch = decisions(
+            &path,
+            &WorkspaceConfiguration::default(),
+            projects,
+            &BTreeMap::new(),
+            RecommendationSelection::Available,
+            Some(bin.as_os_str()),
+        )?;
+        assert_eq!(batch.items.len(), 2);
+        for (item, server) in batch
+            .items
+            .into_iter()
+            .zip([JvmLanguageServer::Java, JvmLanguageServer::Kotlin])
+        {
+            let LspRecommendationStatus::Available {
+                program,
+                command,
+                scope,
+            } = item.status
+            else {
+                unreachable!("installed server is available");
+            };
+            assert_eq!(item.language, server.language_id());
+            assert_eq!(program, server.program());
+            assert_eq!(scope, SearchScope::Local);
+            assert!(command.contains(&quote(&format!("--lsp-program={program}"))));
+            for argument in server.arguments(&path).expect("workspace path is text") {
+                assert!(command.contains(&quote(&format!("--lsp-argument={argument}"))));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_recommendation_command_selects_manager_and_profile_root() {
         let command = command(
             "typescript:tsx",
             "docs",
             Some("docs"),
-            &Selection::Installed {
+            Selection::Installed {
                 manager: LspPackageManager::Bun,
                 program: "bun".to_owned(),
             }
-            .argument(),
+            .arguments(),
         );
         assert!(command.contains("'--profile=docs'"));
         assert!(command.contains("'--profile-root=docs'"));

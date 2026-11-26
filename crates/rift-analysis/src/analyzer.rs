@@ -3426,6 +3426,10 @@ pub enum PackageLanguage {
     Rust,
     /// Python public declarations and protocol methods of visible classes.
     Python,
+    /// Java declarations and their authored visibility.
+    Java,
+    /// Kotlin declarations and their authored visibility.
+    Kotlin,
     /// TypeScript declarations exclude private and protected members. A TypeScript package
     /// ships its JavaScript builds beside its declaration files.
     TypeScript,
@@ -3472,6 +3476,8 @@ impl PackageLanguage {
         match shipped_language(language)? {
             ShippedLanguage::Rust => Some(Self::Rust),
             ShippedLanguage::Python => Some(Self::Python),
+            ShippedLanguage::Java => Some(Self::Java),
+            ShippedLanguage::Kotlin => Some(Self::Kotlin),
             ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => Some(Self::TypeScript),
             ShippedLanguage::Html => Some(Self::Html),
             ShippedLanguage::HtmlAngular => Some(Self::HtmlAngular),
@@ -3495,6 +3501,7 @@ impl PackageLanguage {
         match self {
             Self::Rust => &[ShippedLanguage::Rust],
             Self::Python => &[ShippedLanguage::Python, ShippedLanguage::Cython],
+            Self::Java | Self::Kotlin => &[ShippedLanguage::Java, ShippedLanguage::Kotlin],
             Self::TypeScript => &[
                 ShippedLanguage::JavaScript,
                 ShippedLanguage::TypeScript,
@@ -3531,6 +3538,7 @@ impl PackageLanguage {
     fn is_public(self, symbol: &SyntaxSymbol, python: Option<&PythonExports<'_>>) -> bool {
         match self {
             Self::Rust => symbol.visibility.as_deref() == Some("pub"),
+            Self::Java | Self::Kotlin => is_exported(symbol),
             Self::Python | Self::Cython => python.is_some_and(|exports| exports.is_public(symbol)),
             Self::TypeScript | Self::Vue | Self::Svelte => !symbol
                 .visibility
@@ -3705,6 +3713,21 @@ fn is_exported(symbol: &SyntaxSymbol) -> bool {
     symbol.kinds.contains(&SymbolKind::Public)
 }
 
+fn jvm_public_scope(symbol: &SyntaxSymbol, scopes: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+    let mut container = symbol.container.as_deref();
+    // Each container name is a proper prefix of its declaration's name.
+    while let Some(scope) = container.and_then(|name| scopes.get(name)) {
+        if !is_exported(scope) {
+            return false;
+        }
+        container = scope
+            .container
+            .as_deref()
+            .filter(|parent| parent.len() < scope.qualified_name.len());
+    }
+    true
+}
+
 /// Qualified names of declarations a package file exposes under its language's export
 /// rule, read from `source` and its syntax facts.
 ///
@@ -3749,8 +3772,24 @@ pub fn public_qualified_names(
     } else {
         BTreeMap::new()
     };
-    let public = |symbol| rule.is_public(symbol, &by_name, &classes, python.as_ref());
-    if python.is_some() {
+    let jvm = matches!(
+        rule,
+        ExportRule::Language(PackageLanguage::Java | PackageLanguage::Kotlin)
+    );
+    let jvm_scopes = if jvm {
+        symbols
+            .iter()
+            .filter(|symbol| symbol.kinds.contains(&SymbolKind::MemberContainer))
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    let public = |symbol: &SyntaxSymbol| {
+        rule.is_public(symbol, &by_name, &classes, python.as_ref())
+            && (!jvm || jvm_public_scope(symbol, &jvm_scopes))
+    };
+    if python.is_some() || jvm {
         // Name-keyed visibility must hold for every physical declaration that shares it.
         let mut visibility = BTreeMap::new();
         for symbol in symbols {
@@ -4282,6 +4321,74 @@ mod tests {
             let publication = analyzed(shipped, vec![(path, source)]);
             assert_eq!(publication.units.len(), 1, "{path}");
             assert!(!publication.objects.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn jvm_package_keeps_both_languages_and_respects_visibility() {
+        let java = r"package example;
+public class Client {
+    public void open() {}
+    private void hidden() {}
+}
+class Hidden { public void run() {} }";
+        let kotlin = r"package example
+
+class Service {
+    fun start() { }
+    internal fun stop() { }
+}
+";
+        let java_path = ProjectPath::new("Client.java").expect("Java fixture path");
+        let kotlin_path = ProjectPath::new("Service.kt").expect("Kotlin fixture path");
+        let sources = [
+            PackageSource::new(&java_path, java),
+            PackageSource::new(&kotlin_path, kotlin),
+        ];
+        for (language, version) in [
+            (ShippedLanguage::Java, "25.0.0"),
+            (ShippedLanguage::Kotlin, "2.2.21"),
+        ] {
+            let language = language.language();
+            let runtime = rift_protocol::read::RuntimeIdentity {
+                runtime: language.name.clone(),
+                version: version.to_owned(),
+            };
+            let owner = runtime.owner().expect("runtime fixture owner");
+            let origin = ContributionOrigin::new(
+                Some(SourceLocation::Stdlib {
+                    runtime: Some(runtime),
+                }),
+                SourceKind::Authored,
+            )
+            .expect("runtime fixture origin");
+            let input = ExactPackageInput::new(
+                &owner,
+                &language,
+                &origin,
+                &sources,
+                ExactPackageLimits::new(2, 1024),
+            )
+            .expect("mixed-language source inventory");
+            let analysis =
+                PackageAnalyzer::analyze(input, 1).expect("mixed-language runtime publication");
+            let files = analysis.files();
+            assert_eq!(files.len(), 2);
+            assert_eq!(
+                *files[0].file().syntax().language(),
+                ShippedLanguage::Java.language()
+            );
+            assert_eq!(
+                *files[1].file().syntax().language(),
+                ShippedLanguage::Kotlin.language()
+            );
+            assert!(files[0].is_public("example.Client.open"));
+            assert!(!files[0].is_public("example.Client.hidden"));
+            assert!(!files[0].is_public("example.Hidden.run"));
+            assert!(files[1].is_public("example.Service.start"));
+            assert!(!files[1].is_public("example.Service.stop"));
+            assert_eq!(analysis.publication().owner, owner);
+            assert_eq!(analysis.publication().units.len(), 2);
         }
     }
 

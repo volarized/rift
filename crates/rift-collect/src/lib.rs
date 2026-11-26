@@ -2,12 +2,20 @@
 
 #[cfg(feature = "runtime")]
 mod cache;
+#[cfg(feature = "runtime")]
+mod jvm;
+#[cfg(feature = "runtime")]
+mod lsp;
 mod model;
 #[cfg(feature = "runtime")]
 mod stdio;
 
 #[cfg(feature = "runtime")]
 pub use cache::{CollectionCache, CollectionStats};
+#[cfg(feature = "runtime")]
+pub use jvm::JvmSyntaxCollector;
+#[cfg(feature = "runtime")]
+pub use lsp::LspCollector;
 pub use model::{
     Batch, ByteRange, Category, CollectionError, CollectionInput, CollectionSource, Collector,
     Coverage, DEPENDENCIES_MAX, Evidence, Inventory, OBSERVATIONS_MAX, Observation, Producer,
@@ -26,6 +34,9 @@ pub enum Error {
     /// Source or batch admission failed.
     #[error(transparent)]
     Admission(#[from] CollectionError),
+    /// A language engine refused an operation.
+    #[error(transparent)]
+    Engine(#[from] rift_error::RiftError),
     /// A producer returned an invalid or unsupported protocol message.
     #[error("collector protocol: {0}")]
     Protocol(String),

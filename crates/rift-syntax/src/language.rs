@@ -61,6 +61,10 @@ pub enum ShippedLanguage {
     Toml,
     /// Python.
     Python,
+    /// Java.
+    Java,
+    /// Kotlin, including scripts.
+    Kotlin,
 }
 
 impl ShippedLanguage {
@@ -77,6 +81,8 @@ impl ShippedLanguage {
             Self::Yaml => ("yaml", None),
             Self::Toml => ("toml", None),
             Self::Python => ("python", None),
+            Self::Java => ("java", None),
+            Self::Kotlin => ("kotlin", None),
             Self::Html => ("html", None),
             Self::HtmlAngular => ("html", Some("angular")),
             Self::Css => ("css", None),
@@ -151,6 +157,8 @@ pub fn definitions() -> &'static [&'static dyn LanguageDefinition] {
         &YamlDefinition,
         &TomlDefinition,
         &PythonDefinition,
+        &crate::jvm::JvmLanguage::Java,
+        &crate::jvm::JvmLanguage::Kotlin,
         &HtmlDefinition,
         &AngularDefinition,
         &CssDefinition,

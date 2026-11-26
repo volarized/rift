@@ -146,3 +146,60 @@ async fn partial_and_nonzero_host_exit_keep_distinct_status() {
     assert_eq!(failed.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&failed.stderr).contains("collector exited with"));
 }
+
+#[tokio::test]
+async fn jvm_cli_uses_separate_checkpoints_for_syntax_and_lsp() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Entry.java");
+    let manifest = root.path().join("sources.json");
+    let cache = root.path().join("checkpoints.sqlite");
+    std::fs::write(&source, "class Entry { int call() { return helper(); } }").expect("source");
+    std::fs::write(
+        &manifest,
+        json!({
+            "producer": "fixture.jvm",
+            "revision": "a".repeat(64),
+            "context": "b".repeat(64),
+            "category": "calls",
+            "sources": [{"unit": "rift://source/project/Entry.java", "path": "Entry.java", "filename": "Entry.java"}]
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+
+    let mut syntax = command();
+    syntax.arg("static").arg(&manifest).arg(&cache);
+    let syntax = run(syntax).await;
+    assert!(syntax.status.success(), "{:?}", syntax.stderr);
+    let syntax: Value = serde_json::from_slice(&syntax.stdout).expect("syntax batch");
+    assert_eq!(syntax["batch"]["observations"][0]["evidence"], "syntax");
+
+    let mut kotlin = command();
+    kotlin.args(["lsp", "kotlin"]).arg(&manifest).arg(&cache);
+    let kotlin = run(kotlin).await;
+    assert!(kotlin.status.success(), "{:?}", kotlin.stderr);
+    let kotlin: Value = serde_json::from_slice(&kotlin.stdout).expect("LSP batch");
+    assert_eq!(kotlin["batch"]["coverage"], "unsupported");
+    assert_ne!(kotlin["context"], syntax["context"]);
+
+    let mut java = command();
+    java.args(["lsp", "java"])
+        .arg(&manifest)
+        .arg(&cache)
+        .args(["--", "rift-unavailable-fixture-language-server"]);
+    let java = run(java).await;
+    assert_eq!(java.status.code(), Some(1));
+    assert!(java.stdout.is_empty());
+
+    std::fs::write(
+        &source,
+        "class Entry { int another() { return helper(); } }",
+    )
+    .expect("new source");
+    let mut rerun = command();
+    rerun.args(["lsp", "kotlin"]).arg(&manifest).arg(&cache);
+    let rerun = run(rerun).await;
+    assert!(rerun.status.success(), "{:?}", rerun.stderr);
+    let rerun: Value = serde_json::from_slice(&rerun.stdout).expect("changed LSP batch");
+    assert_ne!(rerun["context"], kotlin["context"]);
+}

@@ -135,6 +135,8 @@ fn grammar(shipped: ShippedLanguage) -> &'static tree_sitter::Language {
 
     match shipped {
         ShippedLanguage::Rust => RUST.get_or_init(crate::rust::rust_grammar),
+        ShippedLanguage::Java => crate::jvm::JvmLanguage::Java.grammar(),
+        ShippedLanguage::Kotlin => crate::jvm::JvmLanguage::Kotlin.grammar(),
         ShippedLanguage::JavaScript => {
             JAVASCRIPT.get_or_init(crate::javascript::javascript_grammar)
         }
@@ -178,6 +180,9 @@ impl SyntaxNames {
     pub fn symbol_kind(&self, name: &str) -> Option<&'static str> {
         let base = match self.shipped {
             ShippedLanguage::Rust => crate::rust::restored_symbol_kind(name),
+            ShippedLanguage::Java | ShippedLanguage::Kotlin => {
+                crate::jvm::restored_symbol_kind(name)
+            }
             ShippedLanguage::JavaScript => {
                 crate::ecmascript::restored_symbol_kind(crate::javascript::javascript_kinds(), name)
             }
