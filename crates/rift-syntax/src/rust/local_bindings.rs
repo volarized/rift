@@ -260,34 +260,100 @@ pub(super) fn prepare(
     elements: &[SyntaxElement],
     symbols: &mut Vec<SyntaxSymbol>,
     facts: &mut StaticFacts,
+    has_errors: bool,
 ) {
     if !symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
         return;
     }
-    let opaque_scope = facts.rust_uses().iter().any(|import| import.glob)
+    let opaque_file = facts.rust_uses().iter().any(|import| import.glob)
+        || !facts.rust_root_macro_calls().is_empty();
+    let established_explicit = opaque_file
         || !facts.unsupported_bindings().is_empty()
-        || !facts.rust_root_macro_calls().is_empty()
         || !facts.rust_textual_macro_calls().is_empty()
         || !facts.rust_macro_barriers().is_empty();
-    if opaque_scope {
-        symbols.retain(|symbol| {
-            !symbol.is_rust_local_binding()
-                || symbol.is_rust_receiver_binding()
-                || symbol.is_rust_generic_parameter()
-                || symbol.is_rust_explicit_local_binding()
-        });
-        if !symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
-            return;
+    let scopes = (!opaque_file)
+        .then(|| opaque_macro_scopes(elements, symbols, facts, has_errors))
+        .flatten();
+    let mut pending = scopes.iter().flatten().peekable();
+    let mut opaque_end = 0;
+    symbols.retain_mut(|symbol| {
+        if !symbol.is_rust_local_binding() {
+            return true;
         }
-    } else {
-        for symbol in symbols
-            .iter_mut()
-            .filter(|symbol| symbol.is_rust_explicit_local_binding())
-        {
+        while let Some(scope) = pending.next_if(|scope| scope.start <= symbol.item_range.start) {
+            opaque_end = opaque_end.max(scope.end);
+        }
+        if scopes.is_none() || symbol.item_range.end <= opaque_end {
+            return symbol.is_rust_receiver_binding()
+                || symbol.is_rust_generic_parameter()
+                || symbol.is_rust_explicit_local_binding();
+        }
+        if !established_explicit && symbol.is_rust_explicit_local_binding() {
             symbol.kind = KIND;
         }
+        true
+    });
+    if symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
+        prepare_bindings(source, elements, symbols, facts, scopes.is_none());
     }
-    prepare_bindings(source, elements, symbols, facts, opaque_scope);
+}
+
+/// Finds the enclosing callable of each opaque operation. A file-level or
+/// otherwise unproved scope keeps the file-wide restriction.
+fn opaque_macro_scopes(
+    elements: &[SyntaxElement],
+    symbols: &[SyntaxSymbol],
+    facts: &StaticFacts,
+    has_errors: bool,
+) -> Option<Vec<ByteRange>> {
+    let mut hazards = facts
+        .rust_textual_macro_calls()
+        .iter()
+        .map(|call| call.range)
+        .collect::<BTreeSet<_>>();
+    // The same occurrence can also be recorded as a possible binding. Other
+    // unsupported patterns retain the file-wide guard.
+    if facts
+        .unsupported_bindings()
+        .iter()
+        .any(|range| !hazards.contains(range))
+    {
+        return None;
+    }
+    hazards.extend(facts.rust_macro_barriers().iter().map(|(_, scope)| *scope));
+    if hazards.is_empty() {
+        return Some(Vec::new());
+    }
+    if has_errors {
+        return None;
+    }
+    let callables = symbols
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some("function_item"))
+        .filter_map(|symbol| Some((symbol.item_range, symbol.body_range?)))
+        .collect::<BTreeMap<_, _>>();
+    let mut enclosing: Vec<Option<usize>> = Vec::with_capacity(elements.len());
+    let mut opaque = BTreeSet::new();
+    for (index, element) in elements.iter().enumerate() {
+        let owner = if element.kind == "function_item" {
+            Some(index)
+        } else {
+            element
+                .parent
+                .and_then(|parent| enclosing.get(parent))
+                .copied()
+                .flatten()
+        };
+        enclosing.push(owner);
+        if hazards.remove(&element.range) {
+            let owner = elements.get(owner?)?.range;
+            if !callables.get(&owner)?.encloses(element.range) {
+                return None;
+            }
+            opaque.insert(owner);
+        }
+    }
+    hazards.is_empty().then(|| opaque.into_iter().collect())
 }
 
 fn prepare_bindings(

@@ -567,6 +567,7 @@ struct BindingDemands {
     rust_explicit: BindingDemand,
     rust_shorthand: BindingDemand,
     rust_macro_methods: BindingDemand,
+    rust_disjoint: BindingDemand,
     python_parameters: BindingDemand,
     python_receivers: BindingDemand,
     python_loop_bindings: BindingDemand,
@@ -622,6 +623,8 @@ impl BindingDemands {
                     }
                 } else if symbol.is_rust_receiver_binding() {
                     &mut demands.rust_receivers
+                } else if facts.is_disjoint_rust_binding(symbol) {
+                    &mut demands.rust_disjoint
                 } else if symbol.is_rust_shorthand_binding() {
                     &mut demands.rust_shorthand
                 } else if language == "rust" && symbol.is_rust_macro_method() {
@@ -639,9 +642,7 @@ impl BindingDemands {
                 } else {
                     &mut demands.rust_locals
                 };
-                demand.count += 1;
-                let range = symbol.item_range;
-                demand.largest = demand.largest.max(range.end.saturating_sub(range.start));
+                demand.observe(symbol.item_range);
             }
         }
         demands
@@ -661,6 +662,7 @@ impl BindingDemands {
             + self.rust_explicit.count
             + self.rust_shorthand.count
             + self.rust_macro_methods.count
+            + self.rust_disjoint.count
             + self.ecmascript.count()
     }
 }
@@ -743,11 +745,12 @@ fn binding_capacity(
         count,
         demands.ecmascript.reserve_late_bindings(
             documents,
-            (
+            [
                 &rust_module_sources,
                 &demands.rust_shorthand,
                 &demands.rust_macro_methods,
-            ),
+                &demands.rust_disjoint,
+            ],
             (slots, bytes),
             record,
             established,
@@ -780,12 +783,17 @@ impl EcmaScriptBindingDemand {
     fn reserve_late_bindings(
         &self,
         documents: &[AnalyzedFile],
-        rust: (&BindingDemand, &BindingDemand, &BindingDemand),
+        rust: [&BindingDemand; 4],
         capacity: (usize, u64),
         record: u64,
         established: rift_syntax::PackageBindingSlots,
     ) -> rift_syntax::PackageBindingSlots {
-        let (rust_modules, rust_shorthand, rust_macro_methods) = rust;
+        let [
+            rust_modules,
+            rust_shorthand,
+            rust_macro_methods,
+            rust_disjoint,
+        ] = rust;
         let (mut slots, mut bytes) = capacity;
         let [
             callback_slots,
@@ -805,6 +813,7 @@ impl EcmaScriptBindingDemand {
             function_type_slots,
             typed_pattern_slots,
             macro_method_slots,
+            disjoint_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -825,6 +834,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_function_types,
                 &self.typescript_patterns,
                 rust_macro_methods,
+                rust_disjoint,
             ],
             &mut slots,
             &mut bytes,
@@ -848,6 +858,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_function_type_parameters(function_type_slots)
             .with_typescript_destructured_parameters(typed_pattern_slots)
             .with_rust_macro_methods(macro_method_slots)
+            .with_disjoint_rust_bindings(disjoint_slots)
     }
 
     fn classify(
@@ -965,6 +976,11 @@ struct BindingDemand {
 }
 
 impl BindingDemand {
+    fn observe(&mut self, range: ByteRange) {
+        self.count += 1;
+        self.largest = self.largest.max(range.end.saturating_sub(range.start));
+    }
+
     fn module_sources(documents: &[AnalyzedFile]) -> Self {
         let mut demand = Self::default();
         for facet in documents

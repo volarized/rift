@@ -959,6 +959,22 @@ impl SyntaxFacts {
             .collect()
     }
 
+    /// Whether the Rust binding was recovered in a function disjoint from macro effects.
+    ///
+    /// Those bindings use their ordinary identities and have a later package admission
+    /// reservation, so they cannot consume slots for previously retained declarations.
+    #[must_use]
+    pub fn is_disjoint_rust_binding(&self, symbol: &SyntaxSymbol) -> bool {
+        symbol.is_rust_local_binding()
+            && !symbol.is_rust_receiver_binding()
+            && !symbol.is_rust_generic_parameter()
+            && !symbol.is_rust_explicit_local_binding()
+            && self.static_facts().is_some_and(|facts| {
+                !facts.rust_textual_macro_calls().is_empty()
+                    || !facts.rust_macro_barriers().is_empty()
+            })
+    }
+
     /// Returns the complete named tree in pre-order, or `None` when these facts hold none.
     #[must_use]
     pub fn syntax_elements(&self) -> Option<&[SyntaxElement]> {

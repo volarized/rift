@@ -520,7 +520,13 @@ impl SyntaxProvider for RustSyntaxProvider {
             Some(&mut capture),
         )?;
         let mut facts = capture.finish();
-        local_bindings::prepare(source.text, &syntax_elements, &mut symbols, &mut facts);
+        local_bindings::prepare(
+            source.text,
+            &syntax_elements,
+            &mut symbols,
+            &mut facts,
+            tree.root_node().has_error(),
+        );
         let generic_references =
             generics::references(source.text, &syntax_elements, &symbols, &facts);
         facts.set_rust_generic_references(generic_references);

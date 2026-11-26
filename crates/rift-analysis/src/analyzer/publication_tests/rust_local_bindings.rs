@@ -706,6 +706,80 @@ pub fn test(panel: Panel) -> bool {
 }
 
 #[test]
+fn package_rust_macro_calls_preserve_bindings_in_disjoint_functions() {
+    let source = r"
+macro_rules! literal { () => { 3u16 } }
+pub fn independent() -> u16 { literal!() }
+
+pub fn choose(parameter: u16) -> u16 {
+    let local = parameter;
+    let mut kept = local;
+    kept += 1;
+    local
+}
+
+pub fn opaque(input: u16) -> u16 {
+    let hidden = input;
+    literal!();
+    hidden
+}
+";
+    let full = analyze(source);
+    let parameter = declaration_at(&full, source, "parameter: u16");
+    let local = declaration_at(&full, source, "local = parameter");
+    let established = declaration_at(&full, source, "kept = local");
+    assert!(established.symbol.as_str().ends_with("/kept%23explicit0"));
+    let plain = source.replace("literal!()", "3u16");
+    let control = analyze(&plain);
+    assert_eq!(
+        declaration_at(&control, &plain, "parameter: u16").symbol,
+        parameter.symbol
+    );
+    assert_eq!(
+        declaration_at(&control, &plain, "local = parameter").symbol,
+        local.symbol
+    );
+    for (written, target) in [("parameter;", parameter), ("local\n}", local)] {
+        assert!(full.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to == target.symbol
+                && edge.from.as_str().ends_with("/choose")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|occurrence| occurrence.range.start == position(source, written))
+        }));
+    }
+    assert!(full.declarations.iter().all(|row| {
+        row.range.start != position(source, "input: u16")
+            && row.range.start != position(source, "hidden = input")
+    }));
+    let retained = full
+        .declarations
+        .iter()
+        .filter(|row| row.symbol != parameter.symbol && row.symbol != local.symbol)
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounded = analyze_with_limits(
+        source,
+        ExactPackageLimits::new(2, 1 << 20)
+            .with_declarations(u32::try_from(retained.len()).expect("declaration count"))
+            .expect("room for existing declarations"),
+    );
+    assert_eq!(bounded.declarations, retained);
+
+    let root_macro = format!(
+        "macro_rules! marker {{ () => {{ const MARKER: u16 = 1; }} }} marker!();\n{source}"
+    );
+    assert!(
+        analyze(&root_macro)
+            .declarations
+            .iter()
+            .all(|row| { row.symbol != parameter.symbol && row.symbol != local.symbol })
+    );
+}
+
+#[test]
 fn package_rust_explicit_lets_keep_declarations_when_macro_output_is_opaque() {
     let source = "mod values { #[allow(non_upper_case_globals)] pub const constant: () = (); }
 use values::*;

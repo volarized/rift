@@ -50,6 +50,7 @@ pub struct PackageBindingSlots {
     typescript_destructured_parameter: usize,
     typescript_method_type_parameter: usize,
     rust_macro_method: usize,
+    rust_disjoint: usize,
 }
 
 impl PackageBindingSlots {
@@ -93,6 +94,7 @@ impl PackageBindingSlots {
             typescript_destructured_parameter: 0,
             typescript_method_type_parameter: 0,
             rust_macro_method: 0,
+            rust_disjoint: 0,
         }
     }
 
@@ -285,6 +287,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves slots for Rust bindings outside the effects of a disjoint macro call.
+    #[must_use]
+    pub const fn with_disjoint_rust_bindings(mut self, slots: usize) -> Self {
+        self.rust_disjoint = slots;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -319,15 +328,17 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_destructured_parameter)
             .saturating_add(self.typescript_method_type_parameter)
             .saturating_add(self.rust_macro_method)
+            .saturating_add(self.rust_disjoint)
     }
 
     fn admit(
         &mut self,
         symbol: &crate::SyntaxSymbol,
-        language: &str,
+        syntax: &SyntaxFacts,
         python_receivers: &BTreeSet<crate::ByteRange>,
         methods: &std::collections::BTreeSet<&str>,
     ) -> bool {
+        let language = syntax.language().name.as_str();
         let available = if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callback_parameter
         } else if language == "typescript" && symbol.is_ecmascript_overload_parameter() {
@@ -385,6 +396,8 @@ impl PackageBindingSlots {
             }
         } else if symbol.is_rust_receiver_binding() {
             &mut self.rust_receiver
+        } else if syntax.is_disjoint_rust_binding(symbol) {
+            &mut self.rust_disjoint
         } else if symbol.is_rust_shorthand_binding() {
             &mut self.rust_shorthand
         } else if language == "rust" && symbol.is_rust_macro_method() {
@@ -834,12 +847,7 @@ impl SyntaxPublicationBuilder {
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(
-                        symbol,
-                        &syntax.language().name,
-                        &python_receivers,
-                        &methods,
-                    ))
+                    || !remaining.admit(symbol, syntax, &python_receivers, &methods))
             {
                 continue;
             }
