@@ -237,6 +237,7 @@ pub(crate) const PARAMETER_KIND: &str = "value_parameter";
 pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
 pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
 pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
+pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -2366,7 +2367,7 @@ fn append_parameters(
             .entry(symbol.qualified_name.as_str())
             .or_insert(0_usize) += 1;
     }
-    let standalone = symbols
+    let signatures = symbols
         .iter()
         .filter(|symbol| symbol.syntax_element_kind == Some(FUNCTION_SIGNATURE_KIND))
         .filter_map(|symbol| symbol.name_range)
@@ -2374,13 +2375,8 @@ fn append_parameters(
     let anchors = facts
         .parameters()
         .iter()
-        .filter(|parameter| {
-            parameter
-                .owner
-                .is_some_and(|owner| !standalone.contains(&owner))
-        })
-        .map(|parameter| parameter.name)
-        .collect::<BTreeSet<_>>();
+        .filter_map(|parameter| Some((parameter.name, parameter.owner?)))
+        .collect::<BTreeMap<_, _>>();
     let retained = parameters
         .iter()
         .filter(|symbol| {
@@ -2395,16 +2391,20 @@ fn append_parameters(
         .filter(|symbol| {
             symbol
                 .name_range
-                .is_some_and(|name| anchors.contains(&name))
+                .is_some_and(|name| anchors.contains_key(&name))
         })
         .filter(|symbol| rift_core::is_portable_name(&symbol.name))
         .map(|symbol| symbol.name_range)
         .collect::<BTreeSet<_>>();
-    symbols.extend(
-        parameters
-            .into_iter()
-            .filter(|symbol| retained.contains(&symbol.name_range)),
-    );
+    symbols.extend(parameters.into_iter().filter_map(|mut symbol| {
+        if !retained.contains(&symbol.name_range) {
+            return None;
+        }
+        if signatures.contains(anchors.get(&symbol.name_range?)?) {
+            symbol.kind = SIGNATURE_PARAMETER_KIND;
+        }
+        Some(symbol)
+    }));
 }
 
 /// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
@@ -2478,6 +2478,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == METHOD_PARAMETER_KIND {
         return Some(METHOD_PARAMETER_KIND);
+    }
+    if name == SIGNATURE_PARAMETER_KIND {
+        return Some(SIGNATURE_PARAMETER_KIND);
     }
     kinds
         .declarations

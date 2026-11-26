@@ -172,6 +172,7 @@ impl SyntaxSymbol {
             || self.is_ecmascript_callback_parameter()
             || self.is_ecmascript_overload_parameter()
             || self.is_javascript_method_parameter()
+            || self.is_typescript_signature_parameter()
     }
 
     /// Whether this is the physical parameter of a JavaScript function value.
@@ -206,6 +207,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_javascript_method_parameter(&self) -> bool {
         self.kind == crate::ecmascript::METHOD_PARAMETER_KIND
+    }
+
+    /// Whether this is the physical parameter of a TypeScript function signature.
+    #[must_use]
+    pub fn is_typescript_signature_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::SIGNATURE_PARAMETER_KIND
     }
 
     /// Whether this binding uses a package-only declaration reservation.

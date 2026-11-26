@@ -2153,3 +2153,74 @@ fn javascript_method_parameters_preserve_existing_parameter_slots() {
     assert_eq!(added.len(), 1);
     assert!(added[0].symbol.as_str().ends_with("/table/read/key"));
 }
+
+#[test]
+fn standalone_typescript_signatures_keep_their_written_value_parameters() {
+    const SOURCE: &str = concat!(
+        "export declare function display(value: string, radix?: number): string;\n",
+        "export function plain(input: string) { return input; }\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::TypeScript.language();
+    let file = ProjectPath::new("index.ts").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.ts"}}}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(4);
+    let roomy = collect(8);
+    roomy
+        .validate_facts()
+        .expect("valid signature declarations");
+    assert_eq!(bounded.declarations.len(), 4);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/plain/input"))
+    );
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| roomy.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
+    assert_eq!(roomy.declarations.len() - bounded.declarations.len(), 2);
+    for name in ["value", "radix"] {
+        let suffix = format!("/display/{name}");
+        let declaration = roomy
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(&suffix))
+            .expect("authored signature parameter");
+        let start = SOURCE.find(name).expect("parameter declaration");
+        assert_eq!(declaration.range, module_runtime_range(start, name));
+        assert!(
+            !roomy
+                .edges
+                .iter()
+                .any(|edge| { edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads] })
+        );
+    }
+}

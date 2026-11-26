@@ -1159,6 +1159,9 @@ impl<'source> File<'source> {
                 self.python_parameters
                     .insert(name, admitted.then_some(symbol));
             } else if admitted && let Some(site) = site {
+                if symbol.is_typescript_signature_parameter() {
+                    return;
+                }
                 let parameter = EcmaScriptParameter { symbol, site };
                 if symbol.is_ecmascript_callback_parameter() {
                     self.javascript_callback_parameters.insert(name, parameter);
