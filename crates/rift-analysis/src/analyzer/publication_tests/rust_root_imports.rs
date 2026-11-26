@@ -1127,6 +1127,35 @@ pub fn caller() { leaf(); other(); }
 }
 
 #[test]
+fn package_rust_feature_guarded_documentation_preserves_its_authored_module() {
+    let root = "#[cfg_attr(feature = \"extra\", doc(cfg(feature = \"extra\")))]
+pub mod child;
+pub fn call() -> u8 { child::answer() }";
+    let child = "pub fn answer() -> u8 { 7 }";
+    for enabled in ["", "\"extra\""] {
+        let manifest = format!("{MANIFEST}\n[features]\ndefault = [{enabled}]\nextra = []\n");
+        let analysis = analyze_rust_root(
+            vec![("src/lib.rs", root), ("src/child.rs", child)],
+            &manifest,
+        );
+        let publication = analysis.publication();
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/child/answer")
+                    && row.unit.as_str().ends_with("/src/child.rs")
+            })
+            .expect("checked documentation attribute keeps the module path");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with("/call")
+                && edge.to == declaration.symbol
+        }));
+    }
+}
+
+#[test]
 fn package_rust_cfg_attr_path_keeps_only_the_selected_file_owner() {
     let native = "#[cfg_attr(feature = \"native\", path = \"platform.rs\")] pub mod selected;
 pub fn call() { selected::entry(); }";
