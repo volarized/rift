@@ -457,6 +457,7 @@ impl EdgeStore {
         let supplemental_start = resolution.supplemental_start.take();
         let mut next_start = resolution.occurrences.len();
         let [
+            quoted_type_start,
             initializer_start,
             variadic_start,
             receiver_start,
@@ -464,6 +465,7 @@ impl EdgeStore {
             python_reassignment_start,
             late_start,
         ] = [
+            resolution.python_quoted_type_start.take(),
             resolution.python_initializer_start.take(),
             resolution.python_variadic_start.take(),
             resolution.python_receiver_start.take(),
@@ -480,7 +482,8 @@ impl EdgeStore {
         }
         let (internal, external) =
             supplemental_start.unwrap_or((late_start, resolution.external.len()));
-        let (earlier, initializer_keywords) = resolution.occurrences.split_at(initializer_start);
+        let (earlier, quoted_types) = resolution.occurrences.split_at(quoted_type_start);
+        let (earlier, initializer_keywords) = earlier.split_at(initializer_start);
         let (earlier, variadic_reads) = earlier.split_at(variadic_start);
         let (earlier, receiver_reads) = earlier.split_at(receiver_start);
         let (earlier, captured_reads) = earlier.split_at(capture_start);
@@ -500,6 +503,7 @@ impl EdgeStore {
             receiver_reads,
             variadic_reads,
             initializer_keywords,
+            quoted_types,
         ]
         .map(|rows| {
             let mut edges = BTreeMap::new();

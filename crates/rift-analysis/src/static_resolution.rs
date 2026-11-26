@@ -77,6 +77,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_variadic_start: Option<usize>,
     /// First generated initializer keyword reference, after earlier references.
     pub(crate) python_initializer_start: Option<usize>,
+    /// First reference inside a compound Python string annotation.
+    pub(crate) python_quoted_type_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -252,8 +254,15 @@ struct DeferredImports<'source> {
     rust_macros: Vec<ByteRange>,
 }
 
-type PendingInitializers<'index, 'source> =
-    BTreeMap<&'index str, (&'index File<'source>, usize, python_edges::InitializerCalls)>;
+struct PendingPythonReferences<'index, 'source> {
+    file: &'index File<'source>,
+    remaining: usize,
+    initializers: Option<python_edges::InitializerCalls>,
+    quoted_types: bool,
+}
+
+type PendingPythonFiles<'index, 'source> =
+    BTreeMap<&'index str, PendingPythonReferences<'index, 'source>>;
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
 ///
@@ -1501,7 +1510,7 @@ impl<'source> Index<'source> {
         let mut pending = files.as_slice();
         let mut deferred_references = Vec::new();
         let mut rust_qualifiers = Vec::new();
-        let mut pending_initializers = PendingInitializers::new();
+        let mut pending_python = PendingPythonFiles::new();
         let has_initializers = files
             .iter()
             .any(|file| !file.facts.python_initializers().is_empty());
@@ -1542,12 +1551,26 @@ impl<'source> Index<'source> {
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
                 let remaining = file_work.max(file).saturating_sub(apart.used);
-                if has_initializers
-                    && let Some(calls) =
-                        python_edges::InitializerCalls::capture(file, &apart.resolution)
-                {
-                    pending_initializers
-                        .insert(file.document.path.as_str(), (*file, remaining, calls));
+                let initializers = if has_initializers {
+                    python_edges::InitializerCalls::capture(file, &apart.resolution)
+                } else {
+                    None
+                };
+                let quoted_types = file.document.facts.language().name == "python"
+                    && file.facts.references().iter().any(|reference| {
+                        reference.role == ReferenceRole::Type
+                            && python_edges::quoted_type_text(file, reference.target).is_some()
+                    });
+                if initializers.is_some() || quoted_types {
+                    pending_python.insert(
+                        file.document.path.as_str(),
+                        PendingPythonReferences {
+                            file,
+                            remaining,
+                            initializers,
+                            quoted_types,
+                        },
+                    );
                 }
                 if let Some(sites) = apart.deferred_references {
                     let queue = match sites {
@@ -1573,9 +1596,9 @@ impl<'source> Index<'source> {
                 deferred_references,
                 work,
                 resolution,
-                &mut pending_initializers,
+                &mut pending_python,
             );
-            self.resolve_python_initializers(pending_initializers, work, resolution);
+            self.resolve_python_tail(pending_python, work, resolution);
         }
     }
 
@@ -1586,7 +1609,7 @@ impl<'source> Index<'source> {
         references: Vec<(&File<'source>, usize, DeferredReferences<'source>)>,
         work: &mut Work,
         resolution: &mut StaticResolution,
-        pending_initializers: &mut PendingInitializers<'_, 'source>,
+        pending_python: &mut PendingPythonFiles<'_, 'source>,
     ) {
         if !references.is_empty() {
             resolution.supplemental_start =
@@ -1627,10 +1650,8 @@ impl<'source> Index<'source> {
                 .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
             work.budget = LoopBudget::new(left.saturating_sub(used));
             resolution.ended |= deferred.exhausted;
-            if let Some((_, remaining, _)) =
-                pending_initializers.get_mut(file.document.path.as_str())
-            {
-                *remaining = remaining.saturating_sub(used);
+            if let Some(pending) = pending_python.get_mut(file.document.path.as_str()) {
+                pending.remaining = pending.remaining.saturating_sub(used);
             }
             if let Some(next) = next {
                 let queue = match next {
@@ -1654,28 +1675,63 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn resolve_python_initializers(
+    fn resolve_python_tail(
         &self,
-        pending: PendingInitializers<'_, 'source>,
+        mut pending: PendingPythonFiles<'_, 'source>,
         work: &mut Work,
         resolution: &mut StaticResolution,
     ) {
         if pending.is_empty() {
             return;
         }
+        #[cfg(test)]
+        let initial_work = work.budget.remaining();
         resolution.python_initializer_start = Some(resolution.occurrences.len());
-        for (file, remaining, calls) in pending.into_values() {
-            let left = work.budget.remaining();
-            let budget = left.min(remaining);
-            let mut keyword_work = Work::new(budget);
-            self.python_initializer_keywords(file, &calls, &mut keyword_work, resolution);
-            let used = budget.saturating_sub(keyword_work.budget.remaining());
-            #[cfg(test)]
-            self.performed
-                .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
-            work.budget = LoopBudget::new(left.saturating_sub(used));
-            resolution.ended |= keyword_work.exhausted;
+        for site in pending.values_mut() {
+            let Some(calls) = site.initializers.take() else {
+                continue;
+            };
+            Self::resolve_python_shared_file_work(
+                site,
+                work,
+                resolution,
+                |file, work, resolution| {
+                    self.python_initializer_keywords(file, &calls, work, resolution);
+                },
+            );
         }
+        resolution.python_quoted_type_start = Some(resolution.occurrences.len());
+        for site in pending.values_mut().filter(|site| site.quoted_types) {
+            Self::resolve_python_shared_file_work(
+                site,
+                work,
+                resolution,
+                |file, work, resolution| {
+                    self.python_quoted_type_references(file, work, resolution);
+                },
+            );
+        }
+        #[cfg(test)]
+        self.performed.fetch_add(
+            initial_work.saturating_sub(work.budget.remaining()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn resolve_python_shared_file_work(
+        site: &mut PendingPythonReferences<'_, 'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+        resolve: impl FnOnce(&File<'source>, &mut Work, &mut StaticResolution),
+    ) {
+        let left = work.budget.remaining();
+        let budget = left.min(site.remaining);
+        let mut pending_work = Work::new(budget);
+        resolve(site.file, &mut pending_work, resolution);
+        let used = budget.saturating_sub(pending_work.budget.remaining());
+        work.budget = LoopBudget::new(left.saturating_sub(used));
+        site.remaining = site.remaining.saturating_sub(used);
+        resolution.ended |= pending_work.exhausted;
     }
 
     fn resolve_deferred_sites(
