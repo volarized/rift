@@ -28,13 +28,24 @@ pub struct RustLspMacroSite {
     pub invocation: SourceRange,
 }
 
+/// One singleton selected Rust macro definition in an admitted package unit.
+#[derive(Debug, Clone, Copy)]
+pub struct RustLspMacroDefinition<'source> {
+    /// Path of the selected definition, which may differ from the invocation's path.
+    pub path: &'source ProjectPath,
+    /// Digest of the definition unit supplied to the language server.
+    pub digest: FileDigest,
+    /// Original name token reported by the server.
+    pub range: SourceRange,
+}
+
 /// An emitted item shape and the independently confirmed original names it selected.
 #[derive(Debug, Clone, Copy)]
 pub struct RustLspMacroItems<'source> {
     /// Exact original location of the invocation and its name.
     pub site: RustLspMacroSite,
     /// Original token named by the server's definition response at the macro invocation.
-    pub definition: SourceRange,
+    pub definition: RustLspMacroDefinition<'source>,
     /// Parsed only to establish emitted kind and relative owner.
     pub expansion: &'source str,
     /// Unique same-source definitions that point to their exact original input token.
@@ -69,7 +80,7 @@ impl PackageAnalyzer {
         source: &str,
         limits: SyntaxLimits,
     ) -> Vec<RustLspMacroSite> {
-        if !source.contains("macro_rules") {
+        if !source.contains('!') {
             return Vec::new();
         }
         let Some(document) = parse(path, source, limits) else {
@@ -137,11 +148,13 @@ impl PackageAnalyzer {
                 .or_default()
                 .push(declaration);
         }
+        let definitions =
+            selected_macro_definitions(publication, observed, &declarations, limits.syntax());
         for unit in &publication.units {
             let Some(file) = selected.get(unit.path.0.as_str()).copied().flatten() else {
                 continue;
             };
-            if !same_source(publication, file, unit) {
+            if !same_source(publication, file.path, file.digest, unit) {
                 continue;
             }
             let Some(existing) = declarations.get(unit.unit.as_str()) else {
@@ -152,7 +165,7 @@ impl PackageAnalyzer {
                 file,
                 unit,
                 existing,
-                &objects,
+                (&objects, &definitions),
                 limits.syntax(),
                 &mut output,
             );
@@ -410,7 +423,8 @@ fn checked_emitted_items(
 
 fn same_source(
     publication: &PackagePublication,
-    file: &RustLspMacroFile<'_>,
+    path: &ProjectPath,
+    digest: FileDigest,
     unit: &PackageSourceUnit,
 ) -> bool {
     let Ok(identity) = SourceUnitId::parse(unit.unit.as_str()) else {
@@ -419,9 +433,105 @@ fn same_source(
     unit.source_complete
         && unit.language.name == "rust"
         && identity.source_owner() == Some(&publication.owner)
-        && identity.key().as_str() == file.path.as_str()
-        && file.digest == FileDigest::of(unit.source.as_bytes())
-        && file_digest(file.digest) == unit.content_digest
+        && identity.key().as_str() == path.as_str()
+        && digest == FileDigest::of(unit.source.as_bytes())
+        && file_digest(digest) == unit.content_digest
+}
+
+struct Definition<'publication> {
+    name: String,
+    item_end: u64,
+    unit: &'publication PackageSourceUnit,
+    digest: FileDigest,
+    identity: SymbolIdentity,
+}
+
+type Definitions<'publication> =
+    BTreeMap<&'publication str, BTreeMap<SourceRange, Definition<'publication>>>;
+type Objects<'publication> = BTreeMap<&'publication SymbolId, &'publication Symbol>;
+
+fn selected_macro_definitions<'publication>(
+    publication: &'publication PackagePublication,
+    observed: &[RustLspMacroFile<'_>],
+    declarations: &BTreeMap<&str, Vec<&PackageSymbol>>,
+    limits: SyntaxLimits,
+) -> Definitions<'publication> {
+    let mut requested = BTreeMap::new();
+    for file in observed {
+        for observation in file.expansions.iter().take(limits.syntax_elements_max()) {
+            let site = observation.definition;
+            let digests = requested
+                .entry(site.path.as_str())
+                .or_insert_with(BTreeMap::new);
+            digests
+                .entry(site.range)
+                .or_insert_with(BTreeSet::new)
+                .insert(site.digest);
+        }
+    }
+    let mut output = BTreeMap::new();
+    for unit in &publication.units {
+        let Some(names) = requested.get(unit.path.0.as_str()) else {
+            continue;
+        };
+        let Ok(path) = ProjectPath::new(&unit.path.0) else {
+            continue;
+        };
+        let digest = FileDigest::of(unit.source.as_bytes());
+        if !same_source(publication, &path, digest, unit) {
+            continue;
+        }
+        let Some(existing) = declarations.get(unit.unit.as_str()) else {
+            continue;
+        };
+        let Some(source) = parse(&path, &unit.source, limits) else {
+            continue;
+        };
+        let mut found = BTreeMap::new();
+        for symbol in source.facts().symbols() {
+            let Some(name) = symbol.name_range.and_then(range) else {
+                continue;
+            };
+            if symbol.kind != "macro"
+                || symbol.syntax_element_kind != Some("macro_definition")
+                || !names
+                    .get(&name)
+                    .is_some_and(|digests| digests.contains(&digest))
+            {
+                continue;
+            }
+            let Some(retained) = retained_macro(existing, symbol) else {
+                continue;
+            };
+            let Ok(identity) = SymbolIdentity::parse(retained.symbol.as_str()) else {
+                continue;
+            };
+            if identity.owner() != &publication.owner
+                || identity.language() != &unit.language
+                || identity.qualified_path().last() != Some(&symbol.name)
+            {
+                continue;
+            }
+            found
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(Definition {
+                    name: symbol.name.clone(),
+                    item_end: symbol.item_range.end,
+                    unit,
+                    digest,
+                    identity,
+                }));
+        }
+        output.insert(
+            unit.path.0.as_str(),
+            found
+                .into_iter()
+                .filter_map(|(name, def)| Some((name, def?)))
+                .collect(),
+        );
+    }
+    output
 }
 
 struct Observed<'a> {
@@ -432,6 +542,7 @@ struct Observed<'a> {
     line: u64,
     invocation: SourceRange,
     definition: SourceRange,
+    definition_unit: &'a PackageSourceUnit,
     expansion_digest: FileDigest,
     parent: SymbolId,
     symbol: SymbolId,
@@ -442,7 +553,7 @@ fn collect_file<'a>(
     file: &RustLspMacroFile<'_>,
     unit: &'a PackageSourceUnit,
     existing: &[&'a PackageSymbol],
-    objects: &BTreeMap<&SymbolId, &Symbol>,
+    inventory: (&Objects<'_>, &Definitions<'a>),
     limits: SyntaxLimits,
     output: &mut BTreeMap<SymbolId, Option<Observed<'a>>>,
 ) {
@@ -450,15 +561,7 @@ fn collect_file<'a>(
         return;
     };
     let sites = sites(&original);
-    let definitions = original
-        .facts()
-        .symbols()
-        .iter()
-        .filter(|symbol| {
-            symbol.kind == "macro" && symbol.syntax_element_kind == Some("macro_definition")
-        })
-        .filter_map(|symbol| Some((range(symbol.name_range?)?, symbol)))
-        .collect::<BTreeMap<_, _>>();
+    let (objects, definitions) = inventory;
     let starts = line_starts(&unit.source);
     let mut work = limits.source_bytes_max();
     for observation in file.expansions.iter().take(limits.syntax_elements_max()) {
@@ -471,12 +574,15 @@ fn collect_file<'a>(
         else {
             continue;
         };
-        let Some(definition) = definitions.get(&observation.definition) else {
+        let selected = observation.definition;
+        let Some(definition) = definitions
+            .get(selected.path.as_str())
+            .and_then(|unit| unit.get(&selected.range))
+        else {
             continue;
         };
-        if definition.item_range.end > site.invocation.start()
+        if selected.digest != definition.digest
             || text_at(&unit.source, site.name) != Some(definition.name.as_str())
-            || !has_retained_macro(existing, definition)
         {
             continue;
         }
@@ -492,6 +598,9 @@ fn collect_file<'a>(
             continue;
         };
         if module.owner() != &publication.owner || module.language() != &unit.language {
+            continue;
+        }
+        if !selected_in_scope(definition, unit, site.invocation, &module) {
             continue;
         }
         let mut names = candidates(
@@ -531,7 +640,8 @@ fn collect_file<'a>(
                     range,
                     line: line_of(&starts, range.start()),
                     invocation: site.invocation,
-                    definition: observation.definition,
+                    definition: observation.definition.range,
+                    definition_unit: definition.unit,
                     expansion_digest,
                     parent,
                     symbol,
@@ -540,13 +650,36 @@ fn collect_file<'a>(
     }
 }
 
-fn has_retained_macro(existing: &[&PackageSymbol], definition: &SyntaxSymbol) -> bool {
-    existing.iter().any(|declaration| {
+fn selected_in_scope(
+    definition: &Definition<'_>,
+    invocation_unit: &PackageSourceUnit,
+    invocation: SourceRange,
+    module: &SymbolIdentity,
+) -> bool {
+    if definition.unit.unit == invocation_unit.unit {
+        return definition.item_end <= invocation.start();
+    }
+    let Some((_, declaring_module)) = definition.identity.qualified_path().split_last() else {
+        return false;
+    };
+    let invoking_module = module.qualified_path();
+    !declaring_module.is_empty()
+        && declaring_module.len() < invoking_module.len()
+        && invoking_module.starts_with(declaring_module)
+}
+
+fn retained_macro<'publication>(
+    existing: &[&'publication PackageSymbol],
+    definition: &SyntaxSymbol,
+) -> Option<&'publication PackageSymbol> {
+    let mut matches = existing.iter().copied().filter(|declaration| {
         declaration.syntax_element_kind.as_deref() == Some("macro_definition")
             && declaration.range.start == definition.item_range.start
             && declaration.range.end == definition.item_range.end
             && declaration.origin.source_kind == SourceKind::Authored
-    })
+    });
+    let known = matches.next()?;
+    matches.next().is_none().then_some(known)
 }
 
 fn module_owner<'a>(
@@ -715,6 +848,7 @@ fn append(
                     "producer": producer,
                     "invocation": [row.invocation.start(), row.invocation.end()],
                     "definition": [row.definition.start(), row.definition.end()],
+                    "definition_unit": row.definition_unit.unit,
                     "expansion_digest": row.expansion_digest.as_bytes(),
                 }),
             },
@@ -767,19 +901,15 @@ pub mod api {
                 .expect("macro definition range");
         let observation = RustLspMacroItems {
             site,
-            definition,
+            definition: RustLspMacroDefinition {
+                path: &path,
+                digest,
+                range: definition,
+            },
             expansion: EXPANSION,
             names: &names,
         };
-        let base = fixture::package_result_with_metadata(
-            ShippedLanguage::Rust,
-            vec![("src/lib.rs", SOURCE)],
-            None,
-            Some(("Cargo.toml", MANIFEST)),
-        )
-        .expect("authored fixture")
-        .publication()
-        .clone();
+        let base = authored_macro_fixture(vec![("src/lib.rs", SOURCE)]);
         let producer = FactProducer {
             name: ProducerName::parse("rust-analyzer").expect("fixture producer"),
             revision: ProducerRevision::parse("1").expect("fixture producer revision"),
@@ -814,25 +944,28 @@ pub mod api {
             apply(&mut refused, FileDigest::of(b"other"), observation, limits).admitted,
             0
         );
+        let mut refused_observation = |observation| {
+            assert_eq!(apply(&mut refused, digest, observation, limits).admitted, 0);
+        };
         let duplicates = [names[0], names[0]];
         let duplicate = RustLspMacroItems {
             names: &duplicates,
             ..observation
         };
-        assert_eq!(apply(&mut refused, digest, duplicate, limits).admitted, 0);
+        refused_observation(duplicate);
         let wrong_macro = RustLspMacroItems {
-            definition: site.name,
+            definition: RustLspMacroDefinition {
+                range: site.name,
+                ..observation.definition
+            },
             ..observation
         };
-        assert_eq!(apply(&mut refused, digest, wrong_macro, limits).admitted, 0);
+        refused_observation(wrong_macro);
         let malformed_owner = RustLspMacroItems {
             expansion: "pub struct Produced { generated: }",
             ..observation
         };
-        assert_eq!(
-            apply(&mut refused, digest, malformed_owner, limits).admitted,
-            0
-        );
+        refused_observation(malformed_owner);
         let bound = limits
             .with_declarations(u32::try_from(base.declarations.len()).expect("fixture bound"))
             .expect("positive bound");
@@ -842,6 +975,84 @@ pub mod api {
         );
         assert_eq!(refused, base);
     }
+    #[test]
+    fn selected_cross_file_macro_requires_the_exact_ancestor_definition() {
+        const MACRO: &str = "macro_rules! declare_type { ($name:ident) => { pub struct $name; }; }";
+        const INVOCATION: &str = "declare_type!(Produced);";
+        let source = format!("{MACRO}\npub mod api; pub mod sibling;");
+        let root = ProjectPath::new("src/lib.rs").expect("root path");
+        let child = ProjectPath::new("src/api.rs").expect("invocation path");
+        let sibling = ProjectPath::new("src/sibling.rs").expect("other module path");
+        let limits = ExactPackageLimits::new(16, 2 * 1024 * 1024);
+        let macro_name_start =
+            u64::try_from(MACRO.find("declare_type").expect("macro name")).expect("offset fits");
+        let macro_name =
+            SourceRange::new(macro_name_start, macro_name_start + 12).expect("definition range");
+        let site = PackageAnalyzer::rust_lsp_macro_sites(&child, INVOCATION, limits.syntax())[0];
+        let expansion = "pub struct Produced;";
+        let names = PackageAnalyzer::rust_lsp_macro_name_sites(
+            &child,
+            INVOCATION,
+            site.invocation,
+            expansion,
+            limits.syntax(),
+        );
+        let producer = FactProducer {
+            name: ProducerName::parse("rust-analyzer").expect("producer"),
+            revision: ProducerRevision::parse("1").expect("producer revision"),
+        };
+        let base = authored_macro_fixture(vec![
+            ("src/lib.rs", &source),
+            ("src/api.rs", INVOCATION),
+            ("src/sibling.rs", MACRO),
+        ]);
+        for (path, digest, accepted) in [
+            (&root, FileDigest::of(source.as_bytes()), 1),
+            (&root, FileDigest::of(b"changed"), 0),
+            (&sibling, FileDigest::of(MACRO.as_bytes()), 0),
+        ] {
+            let mut publication = base.clone();
+            let report = PackageAnalyzer::admit_rust_lsp_macro_items(
+                &mut publication,
+                &[RustLspMacroFile {
+                    path: &child,
+                    digest: FileDigest::of(INVOCATION.as_bytes()),
+                    expansions: &[RustLspMacroItems {
+                        site,
+                        definition: RustLspMacroDefinition {
+                            path,
+                            digest,
+                            range: macro_name,
+                        },
+                        expansion,
+                        names: &names,
+                    }],
+                }],
+                &producer,
+                limits,
+            )
+            .expect("bounded admission");
+            assert_eq!(report.admitted, accepted);
+            if accepted == 1 {
+                assert_authored_facet(&publication, &base, names[0]);
+            } else {
+                assert_eq!(publication, base);
+            }
+        }
+    }
+
+    fn authored_macro_fixture(files: Vec<(&str, &str)>) -> PackagePublication {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::Rust,
+            files,
+            None,
+            Some(("Cargo.toml", MANIFEST)),
+        )
+        .expect("authored fixture")
+        .publication()
+        .clone()
+    }
+
     fn assert_authored_facet(
         accepted: &PackagePublication,
         base: &PackagePublication,
