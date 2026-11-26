@@ -3310,6 +3310,63 @@ fn package_javascript_callback_patterns_keep_separate_reads() {
 }
 
 #[test]
+fn non_entry_returns_keep_nested_keys_under_their_physical_parent() {
+    const SOURCE: &str = concat!(
+        "export function build(first) {\n",
+        "  if (first) return { payload: { code: 1 } };\n",
+        "  return { payload: { code: 2 } };\n",
+        "}\n",
+        "export function duplicate(first) {\n",
+        "  if (first) return { opaque: { key: 3, key: 4 } };\n",
+        "  return { opaque: { key: 5, key: 6 } };\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found.validate_facts().expect("authored nested properties");
+
+    let property = |written: &str| {
+        let start = SOURCE.find(written).expect("written property");
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property")
+    };
+    let ids = [
+        ("payload: { code: 1 }", "code: 1"),
+        ("payload: { code: 2 }", "code: 2"),
+    ]
+    .map(|(outer, inner)| {
+        let parent = property(outer);
+        let member = property(inner);
+        assert_eq!(member.unit, parent.unit);
+        assert!(!member.public);
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&member.symbol)
+                && row.container.as_ref() == Some(&parent.symbol)
+        }));
+        member.symbol.clone()
+    });
+    assert_ne!(ids[0], ids[1]);
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.source.starts_with("key: "))
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
 fn javascript_file_modules_keep_local_names_without_an_established_method() {
     const SOURCE: &str = concat!(
         "export const codec = flag\n",

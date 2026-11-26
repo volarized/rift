@@ -335,7 +335,73 @@ impl<'source> FileScopes<'source> {
             &mut occupied,
             &mut scoped,
         );
+        self.scope_nested_properties(file, repeated, &mut occupied, &mut scoped);
         scoped
+    }
+
+    /// A placed property can hold one literal. Its direct members have that physical owner.
+    fn scope_nested_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        repeated: &BTreeSet<&str>,
+        occupied: &mut BTreeSet<SymbolId>,
+        scoped: &mut ScopedIdentityAnchors,
+    ) {
+        let properties = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| ordinary_private_property(symbol, file.source));
+        let parents = properties
+            .clone()
+            .filter(|symbol| symbol.syntax_element_kind == Some("pair"))
+            .map(|symbol| (symbol.item_range, symbol))
+            .collect::<BTreeMap<_, _>>();
+        let mut members = BTreeMap::new();
+        let mut counts = BTreeMap::new();
+        for child in properties {
+            let Some(member) = self.body_members.get(&child.item_range) else {
+                continue;
+            };
+            let Some(parent) = parents.get(&member.holder) else {
+                continue;
+            };
+            if child.container.as_deref() != Some(parent.qualified_name.as_str())
+                || !repeated.contains(child.qualified_name.as_str())
+            {
+                continue;
+            }
+            *counts
+                .entry((member.body, child.name.as_str()))
+                .or_insert(0_usize) += 1;
+            members.insert(child.item_range, (*parent, child, member.body));
+        }
+        // Parent pairs start before their literal's members.
+        for (parent, child, body) in members.into_values() {
+            if counts.get(&(body, child.name.as_str())) != Some(&1)
+                || scoped
+                    .get(&child.qualified_name)
+                    .is_some_and(|group| group.contains_key(&child.declaration_ordinal))
+            {
+                continue;
+            }
+            let Some(owner) = scoped
+                .get(&parent.qualified_name)
+                .and_then(|group| group.get(&parent.declaration_ordinal))
+                .and_then(|id| SymbolIdentity::parse(id.as_str()).ok())
+            else {
+                continue;
+            };
+            let Some(id) = literal_property_identity(&owner, &child.name) else {
+                continue;
+            };
+            if occupied.insert(id.clone()) {
+                scoped
+                    .entry(child.qualified_name.clone())
+                    .or_default()
+                    .insert(child.declaration_ordinal, id);
+            }
+        }
     }
 
     /// The authored variable, initializer and member must share one physical holder.
