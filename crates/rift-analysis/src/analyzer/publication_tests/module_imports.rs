@@ -3113,6 +3113,80 @@ fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
 }
 
 #[test]
+fn non_entry_class_methods_keep_properties_of_returned_call_arguments() {
+    const SOURCE: &str = concat!(
+        "export class Builder {\n",
+        "  convert(first) {\n",
+        "    if (first) return this.wrap({ state: 'initial', value: 1 });\n",
+        "    return this.wrap({ state: 'final', value: 2 });\n",
+        "  }\n",
+        "  wrap(data) { return data; }\n",
+        "  existing() {\n",
+        "    const options = { stable: 3 };\n",
+        "    return this.wrap(options);\n",
+        "  }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical argument properties");
+
+    let mut identities = BTreeSet::new();
+    for written in ["state: 'initial'", "value: 1", "state: 'final'", "value: 2"] {
+        let start = SOURCE.find(written).expect("written property");
+        let property = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("class method argument property");
+        assert!(!property.public);
+        assert!(property.symbol.as_str().contains("/Builder/convert/"));
+        assert!(identities.insert(&property.symbol));
+    }
+    assert!(found.declarations.iter().any(|row| {
+        row.source == "stable: 3"
+            && row
+                .symbol
+                .as_str()
+                .ends_with("/Builder/existing/options/stable")
+    }));
+    let calls = found
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/Builder/convert")
+                && edge.to.as_str().ends_with("/Builder/wrap")
+                && edge.kinds == [EdgeKind::Calls]
+        })
+        .map(|edge| {
+            let range = &edge.occurrence.as_ref().expect("written call").range;
+            (range.start, range.end)
+        })
+        .collect::<BTreeSet<_>>();
+    let written = [
+        "this.wrap({ state: 'initial', value: 1 })",
+        "this.wrap({ state: 'final', value: 2 })",
+    ]
+    .map(|call| {
+        let range = module_runtime_range(SOURCE.find(call).expect("authored call"), call);
+        (range.start, range.end)
+    });
+    assert_eq!(calls, written.into_iter().collect());
+
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
 fn javascript_file_modules_keep_local_names_without_an_established_method() {
     const SOURCE: &str = concat!(
         "export const codec = flag\n",

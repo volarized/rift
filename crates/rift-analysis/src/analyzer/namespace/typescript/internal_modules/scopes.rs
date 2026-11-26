@@ -461,7 +461,8 @@ impl<'source> FileScopes<'source> {
             .resolve(symbol.item_range.start, symbol.item_range.end)
             .copied()
             .flatten()?;
-        (symbol.container.as_deref() == Some(owner.qualified_name.as_str())
+        (owner.syntax_element_kind == Some("function_declaration")
+            && symbol.container.as_deref() == Some(owner.qualified_name.as_str())
             && owner.body_range?.encloses(scope)
             && scope.encloses(symbol.item_range)
             && captured.contains(&(name, scope)))
@@ -868,7 +869,7 @@ impl<'source> LiteralOwners<'source> {
         facts: &'source StaticFacts,
         anchors: &BTreeMap<String, SymbolId>,
     ) -> Self {
-        let functions = named_functions(symbols, anchors);
+        let functions = literal_callable_owners(symbols, facts, anchors);
         let enclosing = EnclosingDefinitions::new(
             symbols
                 .iter()
@@ -940,9 +941,10 @@ impl<'source> LiteralOwners<'source> {
     }
 }
 
-/// Names ordinary functions only where the written declaration has one qualified owner.
-fn named_functions<'source>(
+/// Names functions and class methods with one authored and placed declaration.
+fn literal_callable_owners<'source>(
     symbols: &'source [SyntaxSymbol],
+    facts: &StaticFacts,
     anchors: &BTreeMap<String, SymbolId>,
 ) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
     let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
@@ -952,12 +954,34 @@ fn named_functions<'source>(
             .and_modify(|owner| *owner = None)
             .or_insert(Some(symbol));
     }
+    let classes = unique
+        .values()
+        .flatten()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("class_declaration")
+                && anchors.contains_key(&symbol.qualified_name)
+        })
+        .map(|symbol| (symbol.item_range, symbol.qualified_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let class_methods = facts
+        .body_members()
+        .iter()
+        .filter_map(|member| Some((member.member, *classes.get(&member.body)?)))
+        .collect::<BTreeMap<_, _>>();
     unique
         .into_values()
         .flatten()
         .filter(|symbol| {
-            symbol.syntax_element_kind == Some("function_declaration")
-                && anchors.contains_key(&symbol.qualified_name)
+            anchors.contains_key(&symbol.qualified_name)
+                && match symbol.syntax_element_kind {
+                    Some("function_declaration") => true,
+                    Some("method_definition") if symbol.kind == "method" => {
+                        class_methods.get(&symbol.item_range).copied()
+                            == symbol.container.as_deref()
+                            && symbol.container.is_some()
+                    }
+                    _ => false,
+                }
         })
         .filter_map(|symbol| Some((symbol.name_range?, symbol)))
         .collect()
@@ -973,7 +997,9 @@ fn returned_literal_owners<'source>(
         let Some((owner, body)) = declarations.get(&name).zip(object) else {
             continue;
         };
-        if !owner.item_range.encloses(body) {
+        if owner.syntax_element_kind != Some("function_declaration")
+            || !owner.item_range.encloses(body)
+        {
             continue;
         }
         let name = owner.qualified_name.as_str();
