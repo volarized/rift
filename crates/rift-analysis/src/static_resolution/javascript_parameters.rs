@@ -28,6 +28,14 @@ pub(super) enum ScopedParameterReads {
     TypeScriptType,
     JavaScriptShorthand,
     JavaScriptWrapped,
+    JavaScriptDestructured,
+}
+
+#[derive(Clone, Copy)]
+enum CheckedParameterReads {
+    TypeScriptType,
+    JavaScriptWrapped,
+    JavaScriptDestructured,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -98,11 +106,30 @@ impl<'source> Index<'source> {
                 &mut result.deferred_javascript_shorthand_parameters,
             ),
             ScopedParameterReads::TypeScriptType => {
-                self.checked_parameter_uses(file, ReferenceRole::Type, work, result);
+                self.checked_parameter_uses(
+                    file,
+                    CheckedParameterReads::TypeScriptType,
+                    work,
+                    result,
+                );
                 return;
             }
             ScopedParameterReads::JavaScriptWrapped => {
-                self.checked_parameter_uses(file, ReferenceRole::Read, work, result);
+                self.checked_parameter_uses(
+                    file,
+                    CheckedParameterReads::JavaScriptWrapped,
+                    work,
+                    result,
+                );
+                return;
+            }
+            ScopedParameterReads::JavaScriptDestructured => {
+                self.checked_parameter_uses(
+                    file,
+                    CheckedParameterReads::JavaScriptDestructured,
+                    work,
+                    result,
+                );
                 return;
             }
         };
@@ -124,20 +151,26 @@ impl<'source> Index<'source> {
     fn checked_parameter_uses(
         &self,
         file: &File<'source>,
-        role: ReferenceRole,
+        class: CheckedParameterReads,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
-        let (parameters, pending) = if role == ReferenceRole::Type {
-            (
+        let (role, parameters, pending) = match class {
+            CheckedParameterReads::TypeScriptType => (
+                ReferenceRole::Type,
                 &file.typescript_type_parameters,
                 &mut result.deferred_typescript_type_parameters,
-            )
-        } else {
-            (
+            ),
+            CheckedParameterReads::JavaScriptWrapped => (
+                ReferenceRole::Read,
                 &file.javascript_wrapped_parameters,
                 &mut result.deferred_javascript_wrapped_parameters,
-            )
+            ),
+            CheckedParameterReads::JavaScriptDestructured => (
+                ReferenceRole::Read,
+                &file.javascript_destructured_parameters,
+                &mut result.deferred_javascript_destructured_parameters,
+            ),
         };
         for reference in file.facts.references() {
             if !work.charge() {

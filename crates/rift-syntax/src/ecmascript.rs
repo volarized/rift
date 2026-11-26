@@ -250,6 +250,7 @@ pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
+pub(crate) const DESTRUCTURED_PARAMETER_KIND: &str = "javascript_destructured_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
@@ -1646,8 +1647,13 @@ impl EcmaScriptRules<'_> {
             })
             .or_else(|| {
                 if self.kinds.formal_parameter_kinds.is_empty() {
-                    wrapped_parameters::declared_name(visited.syntax_element())
+                    let written = visited.syntax_element();
+                    wrapped_parameters::declared_name(written)
                         .map(|name| (name, WRAPPED_PARAMETER_KIND))
+                        .or_else(|| {
+                            wrapped_parameters::destructured_name(written)
+                                .map(|name| (name, DESTRUCTURED_PARAMETER_KIND))
+                        })
                 } else {
                     None
                 }
@@ -2407,6 +2413,7 @@ fn append_package_parameters(
         callable_types,
         index_signatures,
         wrapped,
+        destructured,
     } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
@@ -2436,6 +2443,12 @@ fn append_package_parameters(
         facts,
         wrapped_parameters::accepted_owner,
     );
+    checked_parameters::append_under_named_owner(
+        symbols,
+        destructured,
+        facts,
+        wrapped_parameters::accepted_owner,
+    );
 }
 
 #[derive(Default)]
@@ -2445,6 +2458,7 @@ struct ParameterDeclarations {
     callable_types: Vec<crate::SyntaxSymbol>,
     index_signatures: Vec<crate::SyntaxSymbol>,
     wrapped: Vec<crate::SyntaxSymbol>,
+    destructured: Vec<crate::SyntaxSymbol>,
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
@@ -2459,6 +2473,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.index_signatures
         } else if symbol.is_javascript_wrapped_parameter() {
             &mut candidates.wrapped
+        } else if symbol.is_javascript_destructured_parameter() {
+            &mut candidates.destructured
         } else {
             &mut candidates.values
         };
@@ -2611,6 +2627,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(WRAPPED_PARAMETER_KIND);
+    }
+    if name == DESTRUCTURED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(DESTRUCTURED_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

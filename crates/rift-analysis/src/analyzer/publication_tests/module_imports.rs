@@ -2728,3 +2728,68 @@ fn javascript_defaulted_and_rest_parameters_use_their_written_body_scope() {
                 .is_some_and(|site| site.range == module_runtime_range(seed, "seed"))
     }));
 }
+
+#[test]
+fn javascript_object_and_array_parameters_keep_their_written_lexical_bindings() {
+    const SOURCE: &str = concat!(
+        "const key = 1;\n",
+        "export function select({ key }, [{ label: item }]) { return [key, item]; }\n",
+        "export function outside() { return key; }\n",
+        "export function ordinary(input) { return input; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked destructured parameters");
+    let found = analysis.publication();
+    found.validate_facts().expect("physical parameter facts");
+    for (name, header, marker) in [
+        ("key", "{ key }", "[key, item]"),
+        ("item", "item }", "item];"),
+    ] {
+        let start = SOURCE.find(header).expect("written binding") + usize::from(name == "key") * 2;
+        let suffix = format!("/select/{name}");
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(start, name)
+                    && row.source == name
+            })
+            .expect("authored pattern binding");
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&parameter.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::Parameter)
+        }));
+        let read_start = SOURCE.find(marker).expect("written read") + usize::from(name == "key");
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of {name}");
+        };
+        assert!(read.from.as_str().ends_with("/select"));
+        let written = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(written.unit, parameter.unit);
+        assert_eq!(written.range, module_runtime_range(read_start, name));
+    }
+    assert!(found.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/outside")
+            && edge.to.as_str().ends_with("/beacon/key")
+            && edge.kinds == [EdgeKind::Reads]
+    }));
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/ordinary/input") && edge.kinds == [EdgeKind::Reads]
+    }));
+}
