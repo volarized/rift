@@ -9,6 +9,7 @@ use rift_syntax::{
 
 use super::{Binding, File, Index, Target, Work};
 use crate::NamespaceInput;
+use crate::analyzer::namespace::typescript::PackageFiles;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModuleMode {
@@ -35,6 +36,8 @@ pub(super) struct Folder {
     pub(super) known: bool,
     /// The file a runtime loads, as the manifest writes it.
     pub(super) main: Option<String>,
+    /// The outer index selected by complete runtime path observations.
+    pub(super) observed_index: Option<rift_core::ProjectPath>,
     /// The declaration file, as the manifest writes it.
     pub(super) types: Option<String>,
 }
@@ -59,6 +62,7 @@ impl<'source> PackageModes<'source> {
     ) -> Option<Self> {
         let mut modes = BTreeMap::new();
         let mut folders = BTreeMap::new();
+        let mut observed_files = None;
         for source in namespace.files().iter().chain(namespace.context_sources()) {
             if !work.charge() {
                 return None;
@@ -72,9 +76,22 @@ impl<'source> PackageModes<'source> {
             modes
                 .entry(directory.to_owned())
                 .or_insert_with(|| package_mode(manifest.as_ref()));
-            folders
-                .entry(directory.to_owned())
-                .or_insert_with(|| folder(manifest.as_ref()));
+            folders.entry(directory.to_owned()).or_insert_with(|| {
+                let mut folder = folder(manifest.as_ref());
+                if namespace.build_paths().is_some()
+                    && !directory.is_empty()
+                    && let Some(main) = folder
+                        .main
+                        .as_deref()
+                        .and_then(|main| super::javascript_exports::folder_path(directory, main))
+                    && std::path::Path::new(&main).extension().is_none()
+                {
+                    folder.observed_index = observed_files
+                        .get_or_insert_with(|| PackageFiles::captured(namespace))
+                        .observed_folder_index(&main, directory);
+                }
+                folder
+            });
         }
         let mut scopes = BTreeMap::new();
         let mut module_syntax = std::collections::BTreeSet::new();
@@ -194,6 +211,7 @@ fn folder(manifest: Option<&Manifest>) -> Folder {
     Folder {
         known: true,
         main: written("main"),
+        observed_index: None,
         types: written("types").or_else(|| written("typings")),
     }
 }

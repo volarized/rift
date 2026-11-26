@@ -17,8 +17,9 @@ mod entry;
 mod internal_modules;
 mod observations;
 
+use entry::Entry;
+pub(crate) use entry::PackageFiles;
 pub(super) use entry::build_paths;
-use entry::{Entry, PackageFiles};
 
 /// Establishes declarations in an entry module from captured owner and metadata.
 /// Conditional targets no static consumer selects and uncaptured module roots remain unresolved.

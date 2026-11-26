@@ -58,7 +58,12 @@ impl<'source> Exports<'_, 'source> {
         if is_declaration_file(from) {
             return declared_file(self.files, self.modes, &path);
         }
-        module_file(self.files, self.modes, &path, false)
+        let observed_index = self
+            .modes
+            .folder(path.strip_suffix('/').unwrap_or(&path))
+            .and_then(|folder| folder.observed_index.as_ref())
+            .filter(|_| self.modes.mode(from, work) == ModuleMode::CommonJs);
+        module_file_with_observed_index(self.files, self.modes, &path, false, observed_index)
     }
 
     /// The file a specifier names for one export: in a declaration file the declaration file
@@ -832,8 +837,18 @@ pub(super) fn module_file<'index, 'source>(
     path: &str,
     declarations: bool,
 ) -> Option<&'index File<'source>> {
+    module_file_with_observed_index(files, modes, path, declarations, None)
+}
+
+fn module_file_with_observed_index<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    modes: &PackageModes<'source>,
+    path: &str,
+    declarations: bool,
+    observed_index: Option<&rift_core::ProjectPath>,
+) -> Option<&'index File<'source>> {
     if let Some(directory) = path.strip_suffix('/') {
-        let found = match folder_file(files, modes, directory) {
+        let found = match folder_file(files, modes, directory, observed_index) {
             Candidate::File(file) => Some(file),
             Candidate::Open => return None,
             Candidate::Missing => None,
@@ -865,7 +880,7 @@ pub(super) fn module_file<'index, 'source>(
         Candidate::File(_) | Candidate::Open => return None,
         // `./x.js` never names a folder by its manifest.
         Candidate::Missing if stem != path => folder_index(files, stem),
-        Candidate::Missing => folder_file(files, modes, stem),
+        Candidate::Missing => folder_file(files, modes, stem, observed_index),
     };
     let found = match candidate {
         Candidate::File(file) => Some(file),
@@ -926,6 +941,7 @@ fn folder_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
     directory: &str,
+    observed_index: Option<&rift_core::ProjectPath>,
 ) -> Candidate<'index, 'source> {
     let index = |directory: &str| folder_index(files, directory);
     let Some(manifest) = modes.folder(directory) else {
@@ -960,7 +976,9 @@ fn folder_file<'index, 'source>(
     match index(&path) {
         // Node tries a data or native file of this name before the folder's index, and the
         // selected files of a package name none.
-        Candidate::Missing if !matches!(extension, Some("js" | "cjs" | "mjs")) => Candidate::Open,
+        Candidate::Missing if !matches!(extension, Some("js" | "cjs" | "mjs")) => observed_index
+            .and_then(|selected| files.get(selected.as_str()))
+            .map_or(Candidate::Open, Candidate::File),
         Candidate::Missing => index(directory),
         found => found,
     }
