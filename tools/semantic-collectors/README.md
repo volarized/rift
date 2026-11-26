@@ -2,7 +2,7 @@
 
 `rift-collect` runs a collector over an admitted inventory of UTF-8 sources. It emits one JSON line per selected source and category. Each line names the producer, its implementation and context revisions, the canonical source unit, the source digest, coverage, and the original observations.
 
-The Python collector uses the standard library AST. It records explicit calls, including repeated and module-level occurrences. The JavaScript collector uses TypeScript 5.9.3 for JavaScript, JSX, TypeScript and TSX. It also records same-source signature declarations as candidates. Both parse target source without executing it. The reference collectors report unsupported coverage for categories other than calls.
+The Python collector uses the standard library AST. It records explicit calls, including repeated and module-level occurrences. The JavaScript collector uses TypeScript 5.9.3 for JavaScript, JSX, TypeScript and TSX. It also records same-source signature declarations as candidates. Both parse target source without executing it and report unsupported coverage for categories other than calls. The JVM compiler collector records calls, references and imports in Java and Kotlin.
 
 ## Run and rerun
 
@@ -38,6 +38,64 @@ The manifest resolves `path` relative to its own directory. The collector uses `
 Repeat the command with the same database. The runner reuses a checkpoint when the producer, context, category, selected source and supporting source witnesses match. A read of a missing unit is also a witness. Adding that unit invalidates the dependent batch. Removing a unit from the selection removes it from subsequent output. Complete batches commit independently. A restart after failure reuses them. A partial batch remains due, and the CLI exits with status 2 after returning its output. Other failures exit with status 1.
 
 Use a separate database for each collection. A new database has a 1 GiB page limit. The runner accepts up to 20,000 sources, 128 MiB of total source text and 1 MiB per source. It admits up to 16,384 observations and 512 supporting units per batch. The CLI gives each request 30 seconds. A complete batch establishes coverage of the selected source and category. A candidate does not establish runtime dispatch.
+
+## Run the Java and Kotlin syntax and LSP collectors
+
+Use a manifest with category `calls`, `references`, or `imports`. List Java or Kotlin source
+files with their own extensions in `filename`. The syntax collector records authored occurrences
+in Java, Kotlin source, and Kotlin scripts.
+
+```sh
+rift-collect static sources.json syntax.sqlite
+rift-collect lsp java sources.json java-lsp.sqlite
+rift-collect lsp kotlin sources.json kotlin-lsp.sqlite
+```
+
+The LSP collector resolves those occurrences through the selected language server. Keep the manifest
+in the project root and admit the source files that can supply target declarations. Set
+`"selected": false` to admit a target without collecting its own batch. A definition URI without a
+matching admitted file stays unresolved. Include the build files, toolchain, server and classpath
+inputs outside the inventory in the context digest. The runner adds the paths and digests of all
+admitted files to the LSP context.
+
+By default the Java session starts `jdtls` with `-data` under `.rift/jdtls`. The Kotlin session
+starts `kotlin-lsp --stdio` with `--system-path` under `.rift/kotlin-lsp`. Put the selected server
+on `PATH`. Pass `-- PROGRAM [ARGS...]` to select a different command. The server loads the project
+and its dependencies. See [LSP recommendations](../../docs/content/docs/developer/configuration.mdx#lsp-recommendations)
+for Maven and Gradle detection and server setup.
+
+## Run the JVM compiler collector
+
+The Java collector uses the JDK compiler tree API. The Kotlin collector uses the K2 frontend in Kotlin 2.2.21. Both resolve names and overloads against the admitted source and the compiler classpath. A target has an anchor only when the compiler reports a declaration range in an admitted source.
+
+Set `JAVA_HOME` to a JDK 25 installation and `KOTLIN_HOME` to the root of the Kotlin 2.2.21 command-line distribution. Build the compiler collector from the repository root:
+
+```sh
+build=$(mktemp -d)
+mkdir "$build/classes"
+sources=tools/semantic-collectors/jvm
+"$JAVA_HOME/bin/javac" -proc:none -d "$build/classes" "$sources"/*.java
+"$KOTLIN_HOME/bin/kotlinc" -Xcontext-parameters \
+  -classpath "$KOTLIN_HOME/lib/kotlin-compiler.jar:$build/classes" \
+  -d "$build/classes" "$sources/KotlinFacts.kt"
+"$JAVA_HOME/bin/jar" --create --file "$build/jvm-facts.jar" \
+  -C "$build/classes" . -C "$sources" META-INF
+```
+
+A Java-only build can omit the Kotlin compiler command and the `META-INF` argument to `jar`. Run the collector with a manifest whose category is `calls`, `references`, or `imports`:
+
+```sh
+rift-collect collect sources.json checkpoints.sqlite -- \
+  python3 -B -S tools/semantic-collectors/jvm.py \
+  --java "$JAVA_HOME/bin/java" --engine "$build/jvm-facts.jar" \
+  --kotlin-home "$KOTLIN_HOME"
+```
+
+Use `--source-unit UNIT` for each supporting source in the manifest. For a build classpath, pass one `--classpath PATH` per classes directory or JAR. The collector reads those paths without invoking Maven or Gradle. Include the JVM collector files in the implementation digest. Include the JDK and Kotlin versions, classpath contents, supporting unit names and compiler options in the context digest.
+
+For JDK source from `$JAVA_HOME/lib/src.zip`, pass `--java-module java.base` and one `--java-module-source UNIT` per admitted file in that module. For Kotlin standard library source from the matching source JAR, pass `--kotlin-stdlib` and the admitted unit with `--source-unit UNIT`. The option lets the compiler collect declarations in the `kotlin` package against its matching standard library.
+
+The compiler reads only the selected and supporting source units, plus compiler and classpath inputs. Java annotation processing and Kotlin scripting are disabled. The Kotlin compiler writes its output to a temporary directory. The collector reports partial coverage if a compiler reports an error, or a source, observation or time bound interrupts collection. Kotlin scripts (`.kts`) use the static analyzer.
 
 ## Use a collector from another host
 
