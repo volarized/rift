@@ -54,6 +54,9 @@ export default function Layout({ children }: LayoutProps<"/">) {
         <RootProvider
           theme={{ defaultTheme: "dark" }}
           search={{
+            // Keep the closed dialog out of SSR so Base UI overlays cannot
+            // mark its footer as inert before React hydrates it.
+            preload: false,
             options: {
               type: "static",
               api: `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/search`,
