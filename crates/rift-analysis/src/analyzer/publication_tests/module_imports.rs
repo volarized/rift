@@ -1850,3 +1850,44 @@ fn callback_parameters_preserve_earlier_package_declarations() {
     assert!(bounded.edges.iter().all(|edge| roomy.edges.contains(edge)));
     assert!(bounded.declarations.iter().all(|row| row.source != "item"));
 }
+
+#[test]
+fn npm_callback_parameter_keeps_a_same_named_module_export() {
+    let source = concat!(
+        "export function run(values) { return values.map(item => item); }\n",
+        "const item = 7;\n",
+        "export { item as stable };\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", source)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked alias beside a callback");
+    let found = analysis.publication();
+    assert!(
+        found.objects.iter().any(|object| {
+            object.name == "item" && object.kinds.contains(&SymbolKind::Parameter)
+        })
+    );
+    let module = "rift://symbol/npm/registry.npmjs.org/beacon/javascript/beacon";
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("module");
+    let export = "export { item as stable };";
+    let start = source.find(export).expect("written export");
+    assert!(found.edges.iter().any(|edge| {
+        edge.from.as_str() == format!("{module}/stable")
+            && edge.to.as_str() == format!("{module}/item")
+            && edge.kinds == [EdgeKind::Aliases]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == unit.unit && site.range == module_runtime_range(start, export)
+            })
+    }));
+}

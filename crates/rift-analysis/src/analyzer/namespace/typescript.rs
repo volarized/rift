@@ -410,6 +410,9 @@ fn declaration_targets<'facts>(
 ) -> BTreeMap<(Option<String>, String), Option<DeclarationTarget<'facts>>> {
     let mut targets = BTreeMap::new();
     for symbol in syntax.symbols() {
+        if symbol.is_ecmascript_parameter() {
+            continue;
+        }
         let Some(identity) = anchors.get(&symbol.qualified_name) else {
             continue;
         };
