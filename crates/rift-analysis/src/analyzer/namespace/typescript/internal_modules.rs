@@ -89,6 +89,10 @@ pub(super) fn prepare(
         anchors.retain(|name, _| {
             ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
         });
+        if input.release_version().is_some() {
+            let bindings = scopes.unplaced_lexical_bindings(file, &anchors, &physical);
+            physical.extend(bindings);
+        }
         if prepare_anchors(input, file, &module, anchors, prepared) {
             if !physical.is_empty() {
                 prepared

@@ -3111,3 +3111,76 @@ fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
         .collect::<BTreeSet<_>>();
     assert_eq!(calls, written);
 }
+
+#[test]
+fn javascript_file_modules_keep_local_names_without_an_established_method() {
+    const SOURCE: &str = concat!(
+        "export const codec = flag\n",
+        "  ? { decode(text) { const result = text; return result; } }\n",
+        "  : { decode(text) { const result = String(text); return result; } };\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found.validate_facts().expect("physical private bindings");
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/codec"))
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.symbol.as_str().ends_with("/codec/decode"))
+    );
+    let mut names = BTreeSet::new();
+    for written in ["result = text", "result = String(text)"] {
+        let start = SOURCE.find(written).expect("written binding");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical local under a checked file module");
+        assert!(!row.public);
+        let identity = rift_protocol::identity::SymbolIdentity::parse(row.symbol.as_str())
+            .expect("checked identity");
+        assert_eq!(
+            identity.qualified_path().first().map(String::as_str),
+            Some("beacon/reader.mjs")
+        );
+        assert!(
+            identity
+                .qualified_path()
+                .get(1)
+                .is_some_and(|scope| scope.starts_with("$scope#"))
+        );
+        assert_eq!(
+            identity.qualified_path().last().map(String::as_str),
+            Some("result")
+        );
+        assert!(names.insert(row.symbol.clone()));
+        let position = SOURCE[start..].find("return result").expect("written read") + start + 7;
+        let reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == row.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = reads.as_slice() else {
+            panic!("one read of the written variable");
+        };
+        let site = read.occurrence.as_ref().expect("physical read");
+        assert_eq!(site.unit, row.unit);
+        assert_eq!(site.range, module_runtime_range(position, "result"));
+    }
+    assert_eq!(names.len(), 2);
+    let repeated = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let repeated_names = repeated
+        .publication()
+        .declarations
+        .iter()
+        .filter(|row| row.source.starts_with("result = "))
+        .map(|row| row.symbol.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(repeated_names, names);
+}

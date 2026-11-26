@@ -119,6 +119,16 @@ fn private_local_declaration(symbol: &SyntaxSymbol) -> bool {
         )
 }
 
+fn private_variable_declaration(symbol: &SyntaxSymbol) -> bool {
+    symbol.kind == "variable"
+        && matches!(
+            symbol.syntax_element_kind,
+            Some("variable_declarator" | "identifier" | "shorthand_property_identifier_pattern")
+        )
+        && !symbol.kinds.contains(&SymbolKind::Public)
+        && !symbol.kinds.contains(&SymbolKind::Callable)
+}
+
 fn local_group_identity(original: &SymbolId, ordinal: usize) -> Option<SymbolId> {
     let original = SymbolIdentity::parse(original.as_str()).ok()?;
     let mut path = original.qualified_path().to_vec();
@@ -482,17 +492,7 @@ impl<'source> FileScopes<'source> {
             .into_iter()
             .filter_map(|(name, declarations)| {
                 if !declarations.iter().all(|symbol| {
-                    symbol.kind == "variable"
-                        && matches!(
-                            symbol.syntax_element_kind,
-                            Some(
-                                "variable_declarator"
-                                    | "identifier"
-                                    | "shorthand_property_identifier_pattern"
-                            )
-                        )
-                        && !symbol.kinds.contains(&SymbolKind::Public)
-                        && !symbol.kinds.contains(&SymbolKind::Callable)
+                    private_variable_declaration(symbol)
                         && symbol.container.as_deref().is_none_or(|container| {
                             anchors.contains_key(container)
                                 && !super::super::conflicting_assignment_name(container, withheld)
@@ -657,6 +657,114 @@ impl<'source> FileScopes<'source> {
         (branches.len() > 1).then_some(branches)
     }
 
+    /// A captured private name can keep its scope in a checked file even if its
+    /// containing declaration has no established identity.
+    pub(super) fn unplaced_lexical_bindings(
+        &self,
+        file: &SelectedFile<'_>,
+        anchors: &BTreeMap<String, SymbolId>,
+        earlier: &ScopedIdentityAnchors,
+    ) -> ScopedIdentityAnchors {
+        if file.syntax.language().name != "javascript"
+            || file.syntax.has_errors()
+            || file.syntax.left_out_declaration_count() != 0
+        {
+            return BTreeMap::new();
+        }
+        let Some(module) = anchors
+            .get(".")
+            .and_then(|id| SymbolIdentity::parse(id.as_str()).ok())
+        else {
+            return BTreeMap::new();
+        };
+        let type_names = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kinds.contains(&SymbolKind::Type))
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<BTreeSet<_>>();
+        let owners = EnclosingDefinitions::new(file.syntax.symbols().iter().filter_map(|symbol| {
+            let name = symbol.qualified_name.as_str();
+            if !symbol.kinds.contains(&SymbolKind::Callable)
+                || symbol.kinds.contains(&SymbolKind::Public)
+                || anchors.contains_key(name)
+                || type_names.contains(name)
+            {
+                return None;
+            }
+            Some((
+                symbol.item_range.start,
+                symbol.item_range.end,
+                (name, symbol.body_range?),
+            ))
+        }));
+        let candidates = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                private_variable_declaration(symbol)
+                    && !anchors.contains_key(&symbol.qualified_name)
+                    && !earlier.contains_key(&symbol.qualified_name)
+            })
+            .filter_map(|symbol| {
+                let scope = self.checked_lexical_scope(file, symbol)?;
+                let &(owner, body) = owners.resolve(scope.start, scope.end)?;
+                let name = symbol.name_range?;
+                let spelling = file
+                    .source
+                    .get(usize::try_from(name.start).ok()?..usize::try_from(name.end).ok()?)?;
+                (symbol.container.as_deref() == Some(owner)
+                    && body.encloses(symbol.item_range)
+                    && scope.encloses(symbol.item_range)
+                    && spelling == symbol.name)
+                    .then_some((scope, symbol))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return BTreeMap::new();
+        }
+        let scopes = self
+            .bound
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, scope)| (scope, ordinal))
+            .collect::<BTreeMap<_, _>>();
+        let mut placed = ScopedIdentityAnchors::new();
+        for (scope, symbol) in candidates {
+            let Some(ordinal) = scopes.get(&scope) else {
+                continue;
+            };
+            let mut path = module.qualified_path().to_vec();
+            path.push(format!("$scope#{ordinal}"));
+            path.push(symbol.name.clone());
+            if let Ok(identity) =
+                SymbolIdentity::new(module.owner().clone(), module.language().clone(), path)
+                && let Ok(id) = SymbolId::new(identity.wire_identity())
+            {
+                placed
+                    .entry(symbol.qualified_name.clone())
+                    .or_default()
+                    .insert(symbol.declaration_ordinal, id);
+            }
+        }
+        placed
+    }
+
+    fn checked_lexical_scope(
+        &self,
+        file: &SelectedFile<'_>,
+        symbol: &SyntaxSymbol,
+    ) -> Option<ByteRange> {
+        let captured = *self.bound.get(&symbol.name_range?)?;
+        let scope = self.lexical(symbol, file.source);
+        (captured == scope && scope != self.source).then_some(scope)
+    }
+
     fn lexical_groups(
         &self,
         file: &SelectedFile<'_>,
@@ -664,11 +772,7 @@ impl<'source> FileScopes<'source> {
     ) -> Option<Vec<Vec<usize>>> {
         let mut groups = BTreeMap::<ByteRange, Vec<usize>>::new();
         for &symbol in declarations {
-            let captured = *self.bound.get(&symbol.name_range?)?;
-            let scope = self.lexical(symbol, file.source);
-            if captured != scope || scope == self.source {
-                return None;
-            }
+            let scope = self.checked_lexical_scope(file, symbol)?;
             groups
                 .entry(scope)
                 .or_default()
