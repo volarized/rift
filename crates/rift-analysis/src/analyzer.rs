@@ -502,6 +502,7 @@ fn binding_capacity(
     let mut rust_receivers = BindingDemand::default();
     let mut rust_generics = BindingDemand::default();
     let mut rust_library = BindingDemand::default();
+    let mut rust_explicit = BindingDemand::default();
     let mut python_parameters = BindingDemand::default();
     let mut typescript_parameters = BindingDemand::default();
     let mut python_receivers = BindingDemand::default();
@@ -562,6 +563,8 @@ fn binding_capacity(
                 }
             } else if symbol.is_rust_receiver_binding() {
                 &mut rust_receivers
+            } else if symbol.is_rust_explicit_local_binding() {
+                &mut rust_explicit
             } else if symbol.is_rust_library_root() {
                 &mut rust_library
             } else if symbol.is_rust_generic_parameter() {
@@ -598,7 +601,8 @@ fn binding_capacity(
         + overload_parameters.count
         + rust_receivers.count
         + rust_generics.count
-        + rust_library.count;
+        + rust_library.count
+        + rust_explicit.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -615,6 +619,7 @@ fn binding_capacity(
     let rust_receiver_slots = rust_receivers.reserve(&mut slots, &mut bytes, record);
     let rust_generic_slots = rust_generics.reserve(&mut slots, &mut bytes, record);
     let root_slot = rust_library.reserve(&mut slots, &mut bytes, record);
+    let explicit_slots = rust_explicit.reserve(&mut slots, &mut bytes, record);
     let (callback_slots, overload_slots) = reserve_scoped_parameters(
         documents,
         &callback_parameters,
@@ -634,6 +639,7 @@ fn binding_capacity(
         .with_rust_receivers(rust_receiver_slots)
         .with_rust_generics(rust_generic_slots)
         .with_rust_library_root(root_slot)
+        .with_rust_explicit_locals(explicit_slots)
         .with_python_receiver_slots(python_receiver_slots)
         .with_python_loop_binding_slots(python_loop_binding_slots)
         .with_python_variadic_parameter_slots(python_variadic_slots)

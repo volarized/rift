@@ -1081,7 +1081,8 @@ impl<'source> File<'source> {
                 self.rust_generics.insert(name, symbol);
             }
         } else if symbol.is_rust_local_binding() {
-            self.rust_local_count += usize::from(admitted);
+            self.rust_local_count +=
+                usize::from(admitted && !symbol.is_rust_explicit_local_binding());
         } else if let Some(name) = symbol.name_range {
             if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
                 self.python_parameters

@@ -734,7 +734,13 @@ impl GrammarRules for RustGrammarRules {
             attachment::attached_documentation(visited, text)?;
         Ok(Some(Declaration {
             name,
-            kind: kind.word(),
+            kind: if kind == RustSymbolKind::LocalBinding
+                && local_bindings::explicit_mut(syntax_element)
+            {
+                local_bindings::EXPLICIT_LOCAL_KIND
+            } else {
+                kind.word()
+            },
             kinds,
             visibility: visibility.as_ref().map(RustVisibility::authored),
             body_range: body_range(syntax_element, kind)?,

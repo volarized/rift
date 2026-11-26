@@ -33,6 +33,7 @@ impl<'source> Index<'source> {
             if symbol.is_rust_receiver_binding()
                 || symbol.is_rust_generic_parameter()
                 || symbol.is_rust_library_root()
+                || symbol.is_rust_explicit_local_binding()
             {
                 continue;
             }

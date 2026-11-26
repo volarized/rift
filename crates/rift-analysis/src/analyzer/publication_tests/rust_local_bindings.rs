@@ -512,3 +512,58 @@ pub fn keep<U>(value: U) -> U { value }
         );
     }
 }
+
+#[test]
+fn package_rust_explicit_lets_keep_declarations_when_macro_output_is_opaque() {
+    let source = "mod values { #[allow(non_upper_case_globals)] pub const constant: () = (); }
+use values::*;
+macro_rules! shadow { ($name:ident) => { let $name = 3u8; } }
+pub fn choose() -> u8 {
+    let constant = ();
+    #[cfg(any())] let mut local = 0;
+    let mut local = 1;
+    {
+        let mut local = 2;
+        local += 1;
+    }
+    shadow!(local);
+    local
+}
+";
+    let full = analyze(source);
+    let first = declaration_at(&full, source, "local = 1");
+    let second = declaration_at(&full, source, "local = 2");
+    assert_ne!(first.symbol, second.symbol);
+    assert!(first.symbol.as_str().ends_with("/local%23explicit0"));
+    assert!(second.symbol.as_str().ends_with("/local%23explicit1"));
+    assert!(!first.public && !second.public);
+    for excluded in ["constant = ();", "local = 0", "local);", "local\n}"] {
+        assert!(
+            full.declarations
+                .iter()
+                .all(|row| row.range.start != position(source, excluded))
+        );
+    }
+    assert!(full.edges.iter().all(|edge| edge.kinds != [EdgeKind::Reads]
+        || (edge.to != first.symbol && edge.to != second.symbol)));
+
+    let previous = full
+        .declarations
+        .iter()
+        .filter(|row| row.symbol != first.symbol && row.symbol != second.symbol)
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounded = analyze_with_limits(
+        source,
+        ExactPackageLimits::new(2, 1 << 20)
+            .with_declarations(u32::try_from(previous.len()).expect("declaration count"))
+            .expect("room for established declarations"),
+    );
+    assert_eq!(bounded.declarations, previous);
+    assert!(
+        full.edges
+            .iter()
+            .filter(|row| row.to != first.symbol && row.to != second.symbol)
+            .all(|row| bounded.edges.contains(row))
+    );
+}

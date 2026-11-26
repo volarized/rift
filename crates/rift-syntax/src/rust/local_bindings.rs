@@ -11,6 +11,7 @@ use crate::{ByteRange, SyntaxElement, SyntaxSymbol};
 
 pub(super) const KIND: &str = "local_binding";
 pub(super) const PARAMETER_KIND: &str = "parameter_binding";
+pub(super) const EXPLICIT_LOCAL_KIND: &str = "explicit_local_binding";
 
 /// The physical identifier of a supported let statement or value parameter.
 pub(super) fn pattern(item: Node<'_>) -> Option<Node<'_>> {
@@ -109,6 +110,14 @@ pub(super) fn parameter_name<'source>(
     plain_name(name).then_some(name)
 }
 
+/// Whether this let writes a mutable binding rather than a named pattern path.
+pub(super) fn explicit_mut(item: Node<'_>) -> bool {
+    item.kind() == "let_declaration"
+        && item
+            .named_children(&mut item.walk())
+            .any(|child| child.kind() == "mutable_specifier")
+}
+
 /// An initialized, plain binding in a named function, outside other bodies.
 pub(super) fn name<'source>(
     visited: Visited<'_, '_>,
@@ -151,7 +160,8 @@ impl SyntaxSymbol {
     /// Whether this is a source-local Rust binding candidate.
     #[must_use]
     pub fn is_rust_local_binding(&self) -> bool {
-        matches!(self.kind, KIND | PARAMETER_KIND) || self.is_rust_generic_parameter()
+        matches!(self.kind, KIND | PARAMETER_KIND | EXPLICIT_LOCAL_KIND)
+            || self.is_rust_generic_parameter()
     }
 
     /// Whether this source-local Rust binding is a parameter.
@@ -172,6 +182,12 @@ impl SyntaxSymbol {
         generic_kind(self.kind)
     }
 
+    /// Whether the written modifier establishes a declaration in an opaque scope.
+    #[must_use]
+    pub fn is_rust_explicit_local_binding(&self) -> bool {
+        self.kind == EXPLICIT_LOCAL_KIND
+    }
+
     /// The generated last path component of a physical Rust lexical binding.
     #[must_use]
     pub fn rust_local_binding_component(&self) -> Option<&str> {
@@ -180,7 +196,9 @@ impl SyntaxSymbol {
         }
         let (owner, component) = self.qualified_name.rsplit_once("::")?;
         let (name, ordinal) = component.rsplit_once('#')?;
-        let ordinal = if self.is_rust_generic_parameter() {
+        let ordinal = if self.is_rust_explicit_local_binding() {
+            ordinal.strip_prefix("explicit")?
+        } else if self.is_rust_generic_parameter() {
             ordinal.strip_prefix("generic")?
         } else if self.is_rust_parameter_binding() {
             ordinal.strip_prefix("parameter")?
@@ -217,9 +235,17 @@ pub(super) fn prepare(
             !symbol.is_rust_local_binding()
                 || symbol.is_rust_receiver_binding()
                 || symbol.is_rust_generic_parameter()
+                || symbol.is_rust_explicit_local_binding()
         });
         if !symbols.iter().any(SyntaxSymbol::is_rust_local_binding) {
             return;
+        }
+    } else {
+        for symbol in symbols
+            .iter_mut()
+            .filter(|symbol| symbol.is_rust_explicit_local_binding())
+        {
+            symbol.kind = KIND;
         }
     }
     prepare_bindings(source, elements, symbols, facts, opaque_scope);
@@ -259,6 +285,7 @@ fn prepare_bindings(
         }
         let receiver = symbol.is_rust_receiver_binding();
         let generic = symbol.is_rust_generic_parameter();
+        let explicit = symbol.is_rust_explicit_local_binding();
         if !receiver && !generic && symbol.item_range.end <= conditional_end {
             return false;
         }
@@ -268,14 +295,16 @@ fn prepare_bindings(
         let Some(owner) = symbol.container.as_deref() else {
             return false;
         };
-        if !receiver && !generic && opaque.contains(name) {
+        if !receiver && !generic && !explicit && opaque.contains(name) {
             return false;
         }
         let ordinal = same_name
             .entry((owner.to_owned(), name, symbol.kind))
             .or_insert(0_usize);
         // A Rust identifier cannot contain this ordinal separator.
-        let category = if generic {
+        let category = if explicit {
+            "explicit"
+        } else if generic {
             "generic"
         } else if symbol.kind == PARAMETER_KIND {
             "parameter"
@@ -290,7 +319,7 @@ fn prepare_bindings(
         *ordinal += 1;
         if receiver {
             has_receivers = true;
-        } else if !generic {
+        } else if !generic && !explicit {
             retained.insert(name);
         }
         true
