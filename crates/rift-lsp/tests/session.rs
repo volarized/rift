@@ -2603,7 +2603,9 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             json!({"data": [
                 0, 4, 5, 0, 4,
                 0, 6, 4, 1, 5,
+                0, 4, 0, 2, 1,
                 1, 0, 0, 2, 0,
+                1, 0, 0, 2, 1,
                 1, 1, 5, 1, 2
             ]}),
         )
@@ -2612,8 +2614,10 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
         [0, 3, 4, 1, 2], // Overlap with the preceding declaration.
         [1, 0, 0, 1, 2], // Empty declaration.
         [1, 0, 0, 2, 2], // Empty string marked as a declaration.
-        [2, 0, 0, 2, 0], // Empty string on a nonempty line.
-        [3, 0, 0, 2, 0], // Empty string outside the source.
+        [3, 0, 0, 2, 0], // Empty string on a nonempty line.
+        [4, 0, 0, 2, 0], // Empty string outside the source.
+        [0, 5, 0, 2, 1], // Macro string before the line end.
+        [1, 0, 0, 2, 3], // Macro string marked as a declaration.
     ] {
         let (id, _) = engine
             .expect_request("textDocument/semanticTokens/full")
@@ -2635,7 +2639,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
 
 #[tokio::test]
 async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
-    const SOURCE: &str = "é🪿 alpha beta\r\n\r\n gamma";
+    const SOURCE: &str = "é🪿 alpha beta\r\n\r\n\r\n gamma";
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
     let file = path("lib.rs");
@@ -2683,7 +2687,7 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
             ("gamma", rift_lsp::RustDeclarationKind::Local),
         ]
     );
-    for _ in 0..5 {
+    for _ in 0..7 {
         assert_eq!(
             session
                 .rust_declarations(&file, SOURCE)

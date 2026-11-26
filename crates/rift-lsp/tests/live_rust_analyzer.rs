@@ -344,6 +344,11 @@ async fn rust_analyzer_reports_authored_bindings_beside_macro_expansion() {
 pub const NOTE: &str = r#\"first
 
 last\"#;
+pub fn render() -> String {
+    format!(r#\"first {{
+
+last }}\"#)
+}
 macro_rules! bind { ($name:ident) => { let $name = 1u8; } }
 pub fn choose(pair: (u8, u8)) -> u8 {
     let (left, right) = pair;

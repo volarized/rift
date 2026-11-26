@@ -130,9 +130,18 @@ impl<'legend> RustTokenLegend<'legend> {
             if modifiers & !self.all_modifiers != 0 {
                 return None;
             }
-            let blank_string =
-                token.length == 0 && modifiers == 0 && token_type == &SemanticTokenType::STRING;
-            let TokenSpan::Range(range) = lines.advance(&index, encoding, token, blank_string)?
+            let placeholder = if token.length == 0 && token_type == &SemanticTokenType::STRING {
+                match modifiers {
+                    0 => Some(StringPlaceholder::BlankLine),
+                    mask if mask == self.macro_expansion && mask.is_power_of_two() => {
+                        Some(StringPlaceholder::MacroLineEnd)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let TokenSpan::Range(range) = lines.advance(&index, encoding, token, placeholder)?
             else {
                 continue;
             };
@@ -156,7 +165,12 @@ impl<'legend> RustTokenLegend<'legend> {
 
 enum TokenSpan {
     Range(SourceRange),
-    BlankString,
+    Placeholder,
+}
+
+enum StringPlaceholder {
+    BlankLine,
+    MacroLineEnd,
 }
 
 #[derive(Default)]
@@ -173,7 +187,7 @@ impl TokenLines {
         index: &LineIndex<'_>,
         encoding: PositionEncoding,
         token: &SemanticToken,
-        blank_string: bool,
+        placeholder: Option<StringPlaceholder>,
     ) -> Option<TokenSpan> {
         // Token starts are delta-encoded from the previous start, while the index
         // converts from the previous end so every source character is scanned once.
@@ -185,14 +199,20 @@ impl TokenLines {
             self.end_character = 0;
             token.delta_start
         };
-        if blank_string {
-            // The analyzer emits an empty token on an empty line of a multiline
-            // string. Its position still anchors the next token's delta.
-            if column != 0 || self.end_character != 0 || !index.line_is_empty(self.line) {
+        if let Some(placeholder) = placeholder {
+            // Empty string fragments retain their exact position in the token deltas.
+            if matches!(placeholder, StringPlaceholder::BlankLine) && column != 0 {
                 return None;
             }
+            self.end_byte = index.ordered_line_end(
+                encoding,
+                self.line,
+                (self.end_character, self.end_byte),
+                column,
+            )?;
             self.start_character = column;
-            return Some(TokenSpan::BlankString);
+            self.end_character = column;
+            return Some(TokenSpan::Placeholder);
         }
         let end = column.checked_add(token.length)?;
         let (start_byte, end_byte) = index.ordered_range(

@@ -88,10 +88,22 @@ impl<'text> LineIndex<'text> {
             .fail()
     }
 
-    /// Whether the addressed line contains only its line ending.
-    pub(crate) fn line_is_empty(&self, line: u32) -> bool {
-        self.line_start(line)
-            .is_ok_and(|start| without_ending(self.line_text(line as usize, start)).is_empty())
+    /// Validates a line end from the preceding checked token boundary.
+    pub(crate) fn ordered_line_end(
+        &self,
+        encoding: PositionEncoding,
+        line: u32,
+        previous: (u32, usize),
+        requested: u32,
+    ) -> Option<usize> {
+        let start = self.line_start(line).ok()?;
+        let text = without_ending(self.line_text(line as usize, start));
+        let (character, byte) = previous;
+        let remaining = text.get(byte.checked_sub(start)?..)?;
+        let end = remaining.chars().try_fold(character, |units, character| {
+            units.checked_add(unit_width(encoding, character))
+        })?;
+        (requested == end).then_some(start + text.len())
     }
 
     /// Converts ordered, non-overlapping positions on one line in a single pass.
