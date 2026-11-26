@@ -473,6 +473,8 @@ struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
+    /// Exact class initializer bodies, by the stable variable's physical name.
+    javascript_class_bodies: BTreeMap<ByteRange, ByteRange>,
     /// The names with more than [`SCANNED_BINDINGS_MAX`] bindings whose scopes nest.
     by_scope: BTreeMap<&'source str, ScopedBindings<'source>>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
@@ -631,6 +633,7 @@ impl<'source> File<'source> {
             document,
             facts,
             by_name: BTreeMap::new(),
+            javascript_class_bodies: BTreeMap::new(),
             by_scope: BTreeMap::new(),
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
@@ -755,6 +758,9 @@ impl<'source> File<'source> {
                 continue;
             }
             let name = self.text(binding.name)?;
+            if let StaticBindingKind::JavaScriptClassValue { body } = binding.kind {
+                self.javascript_class_bodies.insert(binding.name, body);
+            }
             if matches!(binding.kind, StaticBindingKind::PythonMemberWrite { .. }) {
                 continue;
             }
@@ -1760,11 +1766,11 @@ impl<'source> Index<'source> {
         edge: &rift_syntax::HeritageEdge,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
-        let target = if file.document.facts.language().name == "python" {
-            self.edge_python_base(file, edge.target, work)?
-        } else {
-            self.edge_type_target(file, edge.target, work)?
-        };
+        let target = match file.document.facts.language().name.as_str() {
+            "python" => self.edge_python_base(file, edge.target, work),
+            "javascript" | "typescript" => self.javascript_heritage_target(file, edge, work),
+            _ => self.edge_type_target(file, edge.target, work),
+        }?;
         let mut occurrence =
             self.occurrence(file, edge.target, edge.target, ReferenceRole::Type, target)?;
         if let NormalizedTarget::Symbol(from) = self.heritage_source(file, edge, work)? {

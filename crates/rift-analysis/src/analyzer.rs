@@ -46,7 +46,9 @@ use rift_protocol::read::{
     Digest, EdgeKind, ExactKind, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol,
     SymbolId, SymbolKind, SymbolOrigin, TextRange,
 };
-use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, DocumentPlacement, ShippedLanguage, StaticBindingKind, SyntaxFacts, SyntaxSymbol,
+};
 use serde::Serialize;
 
 use rift_ranking::split_identifier_words;
@@ -2658,11 +2660,12 @@ impl ExportRule {
         self,
         symbol: &SyntaxSymbol,
         by_name: &BTreeMap<&str, &SyntaxSymbol>,
+        classes: &BTreeMap<ByteRange, ByteRange>,
         python: Option<&PythonExports<'_>>,
     ) -> bool {
         match self {
             Self::Language(rules) => rules.is_public(symbol, python),
-            Self::JavaScriptModule => is_javascript_export(symbol, by_name),
+            Self::JavaScriptModule => is_javascript_export(symbol, by_name, classes),
         }
     }
 }
@@ -2759,7 +2762,11 @@ impl<'facts> PythonExports<'facts> {
 /// member of a declaration so marked and no ES private element. A class declares members in
 /// its body. An assignment declares a member of any declaration it writes to, as
 /// `app.init = function () {}` and `Router.prototype.handle = function () {}` do.
-fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+fn is_javascript_export(
+    symbol: &SyntaxSymbol,
+    by_name: &BTreeMap<&str, &SyntaxSymbol>,
+    classes: &BTreeMap<ByteRange, ByteRange>,
+) -> bool {
     let exported = is_exported(symbol);
     let private_element = symbol.name.starts_with(PRIVATE_ELEMENT_PREFIX);
     let assigned_member = symbol.syntax_element_kind == Some("assignment_expression")
@@ -2769,7 +2776,18 @@ fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxS
         .as_deref()
         .and_then(|container| by_name.get(container))
         .is_some_and(|container| {
-            (assigned_member || JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind))
+            let class_member = container
+                .name_range
+                .and_then(|name| classes.get(&name))
+                .is_some_and(|body| {
+                    body.encloses(symbol.item_range)
+                        && container
+                            .body_range
+                            .is_some_and(|initializer| initializer.encloses(*body))
+                });
+            (assigned_member
+                || class_member
+                || JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind))
                 && is_exported(container)
         });
     exported || (member_of_exported_declaration && !private_element)
@@ -2811,7 +2829,20 @@ pub fn public_qualified_names(
     } else {
         BTreeMap::new()
     };
-    let public = |symbol| rule.is_public(symbol, &by_name, python.as_ref());
+    let classes = if rule == ExportRule::JavaScriptModule {
+        facts
+            .static_facts()
+            .into_iter()
+            .flat_map(rift_syntax::StaticFacts::bindings)
+            .filter_map(|binding| match binding.kind {
+                StaticBindingKind::JavaScriptClassValue { body } => Some((binding.name, body)),
+                _ => None,
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let public = |symbol| rule.is_public(symbol, &by_name, &classes, python.as_ref());
     if python.is_some() {
         // Name-keyed visibility must hold for every physical declaration that shares it.
         let mut visibility = BTreeMap::new();

@@ -75,7 +75,12 @@ impl<'source> Index<'source> {
                     .and_then(|range| file.text(range))
                     .is_some_and(|value| value.starts_with('{'));
             if !namespace && !object_value {
-                return None;
+                if role == ReferenceRole::Type || !self.javascript_stable_class_value(owner) {
+                    return None;
+                }
+                owner =
+                    self.javascript_class_member(owner, member, MemberMode::Static, role, work)?;
+                continue;
             }
             let target = declared?;
             if object_value && !owner.symbol.body_range?.encloses(target.symbol.item_range) {
@@ -607,11 +612,31 @@ impl<'source> Index<'source> {
         ) else {
             return false;
         };
-        if file.target_at(binding.name).is_some_and(same) {
+        let written = file.target_at(binding.name);
+        if written.is_some_and(same) {
             return true;
         }
         if name.len() != receiver.len() {
             return false;
+        }
+        // A variable that still holds a class's original value writes the same
+        // object. Resolve a bare initializer name in the scope where it was written.
+        if let Some(value) = written
+            .filter(|target| target.symbol.syntax_element_kind == Some("variable_declarator"))
+            .and_then(|target| target.symbol.body_range)
+            && !file.javascript_binding_reassigned(binding)
+            && let Some(name) = file.text(value)
+            && let Some(source) = super::javascript::js_binding(
+                file,
+                &self.javascript,
+                name,
+                value.start,
+                ReferenceRole::Read,
+                work,
+            )
+            && file.target_at(source.name).is_some_and(same)
+        {
+            return true;
         }
         if let Some(&Some(annotation)) = file.declared_types.get(&binding.name) {
             return self
@@ -640,7 +665,7 @@ impl<'source> Index<'source> {
             }
             if edge.kind == EdgeKind::Extends
                 && Some(edge.from) == class.symbol.name_range
-                && let Some(base) = self.edge_javascript_target(file, edge.target, work)
+                && let Some(base) = self.javascript_heritage_target(file, edge, work)
             {
                 bases.push(base);
             }
@@ -660,7 +685,11 @@ impl<'source> File<'source> {
         };
         let binding = match self.binding(receiver, member.receiver.start, |_| true, work) {
             super::Binding::Found(binding)
-                if binding.kind == rift_syntax::StaticBindingKind::Local =>
+                if matches!(
+                    binding.kind,
+                    rift_syntax::StaticBindingKind::Local
+                        | rift_syntax::StaticBindingKind::JavaScriptClassValue { .. }
+                ) =>
             {
                 binding
             }

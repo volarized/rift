@@ -37,9 +37,12 @@ impl<'source> Scopes<'source> {
                 return None;
             }
             let entry = (symbol.range.start, symbol.range.end, symbol);
-            if symbol.kind == "class"
-                && let Some(body) = symbol.body_range
-            {
+            let class_body = if symbol.kind == "class" {
+                symbol.body_range
+            } else {
+                file.javascript_class_value_body(symbol)
+            };
+            if let Some(body) = class_body {
                 classes.push((body.start, body.end, symbol));
             }
             if let Some(range) = captured.callable(symbol, &value_ranges) {
@@ -78,6 +81,17 @@ impl<'source> Scopes<'source> {
                     .collect::<Vec<_>>(),
             ),
         })
+    }
+}
+
+impl File<'_> {
+    /// A held class body belongs to the exact physical variable that initializes it.
+    pub(super) fn javascript_class_value_body(&self, symbol: &SyntaxSymbol) -> Option<ByteRange> {
+        if symbol.syntax_element_kind != Some("variable_declarator") {
+            return None;
+        }
+        let body = *self.javascript_class_bodies.get(&symbol.name_range?)?;
+        symbol.body_range?.encloses(body).then_some(body)
     }
 }
 

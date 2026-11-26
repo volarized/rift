@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
+use rift_protocol::read::EdgeKind;
+use rift_syntax::{
+    ByteRange, HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee,
+};
 
 use super::{Binding, File, Index, Target, Work};
 use crate::NamespaceInput;
@@ -212,6 +215,31 @@ impl<'source> Index<'source> {
         self.javascript_target(file, range, rift_core::ReferenceRole::Type, work)
     }
 
+    /// A class extends a constructor value. Keep the normal type path for
+    /// interfaces and implements, and admit an authored class value only for extends.
+    pub(super) fn javascript_heritage_target(
+        &self,
+        file: &File<'source>,
+        edge: &HeritageEdge,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        self.edge_javascript_target(file, edge.target, work)
+            .or_else(|| {
+                if edge.kind != EdgeKind::Extends
+                    || file.target_at(edge.from)?.symbol.kind != "class"
+                {
+                    return None;
+                }
+                let base = self.javascript_target(
+                    file,
+                    edge.target,
+                    rift_core::ReferenceRole::Read,
+                    work,
+                )?;
+                self.javascript_stable_class_value(base).then_some(base)
+            })
+    }
+
     pub(super) fn javascript_target(
         &self,
         file: &File<'source>,
@@ -344,7 +372,8 @@ impl<'source> Index<'source> {
                     .kinds
                     .contains(&rift_protocol::read::SymbolKind::Constructible)
                 || javascript_constructor_function(target)
-                || self.javascript_declared_signature(target, true, work))
+                || self.javascript_declared_signature(target, true, work)
+                || self.javascript_stable_class_value(target))
             .then_some(target);
         }
         target
@@ -538,6 +567,14 @@ impl<'source> Index<'source> {
             })
     }
 
+    /// Whether the selected physical variable still holds its written class.
+    pub(super) fn javascript_stable_class_value(&self, target: Target<'source>) -> bool {
+        self.files
+            .get(target.file.path.as_str())
+            .and_then(|file| file.javascript_class_value_body(target.symbol))
+            .is_some()
+    }
+
     fn javascript_binding_target(
         &self,
         file: &File<'source>,
@@ -554,7 +591,8 @@ impl<'source> Index<'source> {
                     symbol,
                 })
             }),
-            StaticBindingKind::JavaScriptInstance { .. }
+            StaticBindingKind::JavaScriptClassValue { .. }
+            | StaticBindingKind::JavaScriptInstance { .. }
             | StaticBindingKind::JavaScriptConstInstance { .. } => file.target_at(binding.name),
             StaticBindingKind::JavaScriptImport { module, export } => {
                 let name = match export {
@@ -696,6 +734,9 @@ impl<'source> Index<'source> {
             StaticBindingKind::JavaScriptImport { .. } => {
                 self.javascript_imported_member(file, binding, member, role, work)
             }
+            StaticBindingKind::JavaScriptClassValue { .. } => self
+                .javascript_binding_target(file, binding, role, work)
+                .and_then(|target| self.javascript_object_member(target, member, role, work)),
             StaticBindingKind::Local => self
                 .javascript_binding_target(file, binding, role, work)
                 .and_then(|target| self.javascript_object_member(target, member, role, work))
