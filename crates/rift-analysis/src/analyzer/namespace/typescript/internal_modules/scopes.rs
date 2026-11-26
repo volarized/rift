@@ -27,27 +27,6 @@ enum Scope {
     Body(ByteRange, bool),
 }
 
-/// The qualified names of `file` that declarations of different scopes share.
-pub(super) fn repeated_names<'source>(file: &SelectedFile<'source>) -> BTreeSet<&'source str> {
-    let scopes = FileScopes::new(file.syntax, file.source);
-    let mut first = BTreeMap::new();
-    let mut repeated = BTreeSet::new();
-    for symbol in file.syntax.symbols() {
-        let scope = scopes.of(symbol, file);
-        match first.entry(symbol.qualified_name.as_str()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(scope);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                if *entry.get() != scope {
-                    repeated.insert(symbol.qualified_name.as_str());
-                }
-            }
-        }
-    }
-    repeated
-}
-
 /// Keeps the older identity of the first private lexical group and names later groups
 /// by the source ordinal of their first physical declaration.
 pub(in crate::analyzer::namespace::typescript) fn private_local_identities(
@@ -143,7 +122,7 @@ fn local_group_identity(original: &SymbolId, ordinal: usize) -> Option<SymbolId>
     SymbolId::new(identity.wire_identity()).ok()
 }
 
-struct FileScopes<'source> {
+pub(super) struct FileScopes<'source> {
     source: ByteRange,
     /// The scope of each bound name, by the range of the name.
     bound: BTreeMap<ByteRange, ByteRange>,
@@ -160,7 +139,7 @@ struct FileScopes<'source> {
 }
 
 impl<'source> FileScopes<'source> {
-    fn new(syntax: &'source SyntaxFacts, source: &str) -> Self {
+    pub(super) fn new(syntax: &'source SyntaxFacts, source: &str) -> Self {
         let facts = syntax.static_facts();
         let mut bound = BTreeMap::<ByteRange, ByteRange>::new();
         for binding in facts.map_or(&[][..], StaticFacts::bindings) {
@@ -230,6 +209,129 @@ impl<'source> FileScopes<'source> {
                 .map(|symbol| (symbol.qualified_name.as_str(), symbol.item_range.end))
                 .collect(),
         }
+    }
+
+    /// The qualified names that physical declarations of different scopes share.
+    pub(super) fn repeated_names(&self, file: &SelectedFile<'source>) -> BTreeSet<&'source str> {
+        let mut first = BTreeMap::new();
+        let mut repeated = BTreeSet::new();
+        for symbol in file.syntax.symbols() {
+            let scope = self.of(symbol, file);
+            match first.entry(symbol.qualified_name.as_str()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(scope);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    if *entry.get() != scope {
+                        repeated.insert(symbol.qualified_name.as_str());
+                    }
+                }
+            }
+        }
+        repeated
+    }
+
+    /// Names repeated private keys by their captured argument literal and physical ordinal.
+    pub(super) fn argument_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        repeated: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+    ) -> ScopedIdentityAnchors {
+        if repeated.is_empty()
+            || file.syntax.language().name != "javascript"
+            || file.syntax.has_errors()
+            || file.syntax.left_out_declaration_count() != 0
+        {
+            return BTreeMap::new();
+        }
+        let symbols = file.syntax.symbols();
+        let mut candidates = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
+        for symbol in symbols {
+            let name = symbol.qualified_name.as_str();
+            if repeated.contains(name) && anchors.contains_key(name) {
+                candidates.entry(name).or_default().push(symbol);
+            }
+        }
+        candidates.retain(|_, group| {
+            group
+                .iter()
+                .all(|symbol| ordinary_private_property(symbol, file.source))
+        });
+        let Some(facts) = file
+            .syntax
+            .static_facts()
+            .filter(|_| !candidates.is_empty())
+        else {
+            return BTreeMap::new();
+        };
+        let nested = EnclosingDefinitions::new(
+            symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.kind == "class" || symbol.kinds.contains(&SymbolKind::Callable)
+                })
+                .map(|symbol| symbol.item_range)
+                .chain(facts.function_scopes().iter().copied())
+                .chain(facts.function_values().iter().map(|&(scope, _)| scope))
+                .chain(facts.static_blocks().iter().copied())
+                .map(|scope| (scope.start, scope.end, ())),
+        );
+        let mut calls = BTreeMap::<u64, Vec<_>>::new();
+        for call in facts.calls() {
+            calls.entry(call.range.end).or_default().push(call);
+        }
+        let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+        let mut scoped = BTreeMap::new();
+        for (name, declarations) in candidates {
+            let mut groups = BTreeMap::<ByteRange, Vec<usize>>::new();
+            for declaration in declarations {
+                let Some(row) = self.body_members.get(&declaration.item_range) else {
+                    groups.clear();
+                    break;
+                };
+                if self.of(declaration, file) != Scope::Body(row.body, false)
+                    || nested.resolve(row.body.start, row.body.end).is_some()
+                    || !calls.get(&row.holder.end).is_some_and(|calls| {
+                        calls.iter().any(|call| {
+                            call.callee_range.end <= row.holder.start
+                                && call.range.encloses(row.holder)
+                        })
+                    })
+                {
+                    groups.clear();
+                    break;
+                }
+                groups
+                    .entry(row.body)
+                    .or_default()
+                    .push(declaration.declaration_ordinal);
+            }
+            if groups.len() < 2 {
+                continue;
+            }
+            let Some(original) = anchors.get(name) else {
+                continue;
+            };
+            let identities = groups
+                .into_values()
+                .map(|ordinals| {
+                    let identity = local_group_identity(original, *ordinals.iter().min()?)?;
+                    (!occupied.contains(&identity)).then_some((ordinals, identity))
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(identities) = identities {
+                let mut overrides = BTreeMap::new();
+                for (ordinals, identity) in identities {
+                    occupied.insert(identity.clone());
+                    for ordinal in ordinals {
+                        overrides.insert(ordinal, identity.clone());
+                    }
+                }
+                scoped.insert(name.to_owned(), overrides);
+            }
+        }
+        scoped
     }
 
     fn private_local_groups(
@@ -326,6 +428,26 @@ impl<'source> FileScopes<'source> {
         }
         *scope
     }
+}
+
+fn ordinary_private_property(symbol: &SyntaxSymbol, source: &str) -> bool {
+    if symbol.kind != "property"
+        || symbol.container.is_some()
+        || symbol.qualified_name != symbol.name
+        || symbol.kinds.contains(&SymbolKind::Public)
+        || !matches!(
+            symbol.syntax_element_kind,
+            Some("pair" | "shorthand_property_identifier")
+        )
+    {
+        return false;
+    }
+    let name = symbol.name_range.and_then(|range| {
+        let start = usize::try_from(range.start).ok()?;
+        let end = usize::try_from(range.end).ok()?;
+        source.get(start..end)
+    });
+    name.is_some_and(|name| name == symbol.name && !name.contains(['"', '\'', '`']))
 }
 
 /// Whether a type literal or an interface declares the member.

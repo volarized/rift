@@ -155,14 +155,30 @@ fn retain_unique_scoped_identities(prepared: &mut PreparedNamespace) {
         .iter()
         .map(|binding| &binding.identity)
         .collect::<BTreeSet<_>>();
+    let mut physical_groups = BTreeMap::<SymbolId, usize>::new();
+    for groups in prepared.scoped_anchors.values() {
+        for group in groups.values() {
+            for identity in group.values().collect::<BTreeSet<_>>() {
+                *physical_groups.entry(identity.clone()).or_default() += 1;
+            }
+        }
+    }
     let anchors = &prepared.anchors;
     prepared.scoped_anchors.retain(|path, scoped| {
         scoped.retain(|name, overrides| {
-            anchors
-                .get(path)
-                .and_then(|anchors| anchors.get(name))
-                .and_then(|original| owners.get(original).copied().flatten())
-                == Some(path.as_str())
+            let Some(anchors) = anchors.get(path) else {
+                return false;
+            };
+            let unique = if let Some(original) = anchors.get(name) {
+                owners.get(original).copied().flatten() == Some(path.as_str())
+            } else {
+                // A private literal key has a physical identity in each body and no
+                // common name that a bare use could resolve.
+                overrides
+                    .values()
+                    .all(|identity| physical_groups.get(identity) == Some(&1))
+            };
+            unique
                 && overrides
                     .values()
                     .all(|identity| !owners.contains_key(identity) && !aliases.contains(identity))

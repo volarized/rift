@@ -4,6 +4,171 @@ use super::*;
 use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
+const NON_ENTRY_ARGUMENT_PROPERTIES: &str = r#"
+import { receive } from "../index.mjs";
+receive({ action: "first" });
+receive({ action: "second" });
+const options = { action: "named" };
+receive(options);
+"#;
+const NESTED_ARGUMENT_PROPERTIES: &str = r#"
+import { receive } from "../index.mjs";
+run(() => receive({ action: "first" }));
+run(() => receive({ action: "second" }));
+"#;
+
+#[test]
+fn package_retains_distinct_top_level_argument_properties_in_non_entry_files() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            (
+                "index.mjs",
+                "export function receive(value) { return value.action; }",
+            ),
+            ("bin/options.mjs", NON_ENTRY_ARGUMENT_PROPERTIES),
+            ("bin/nested.mjs", NESTED_ARGUMENT_PROPERTIES),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+        )),
+    )
+    .expect("captured package");
+    let publication = analysis.publication();
+    let path = "bin/options.mjs";
+    let analyzed = analysis
+        .files()
+        .iter()
+        .find(|file| file.file().path().as_str() == path)
+        .expect("retained file");
+    assert!(analyzed.placement().logical_identity("action").is_none());
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == path)
+        .expect("source unit");
+    let declarations = ["first", "second", "named"].map(|value| {
+        let written = format!("action: \"{value}\"");
+        let start = u64::try_from(
+            NON_ENTRY_ARGUMENT_PROPERTIES
+                .find(&written)
+                .expect("property"),
+        )
+        .expect("source offset");
+        let matching = publication
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.unit == unit.unit
+                    && declaration.range.start == start
+                    && declaration.source == written
+            })
+            .collect::<Vec<_>>();
+        let [declaration] = matching.as_slice() else {
+            panic!("authored declaration for {value}");
+        };
+        assert!(!declaration.public);
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&declaration.symbol)
+                && object.name == "action"
+                && object.kind.0 == "property"
+        }));
+        declaration.symbol.clone()
+    });
+    let [first, second, named] = declarations;
+    assert_ne!(first, second);
+    assert_ne!(first, named);
+    assert_ne!(second, named);
+    assert!(named.as_str().ends_with("/options/action"));
+    assert!(publication.declarations.iter().all(|declaration| {
+        !declaration.unit.0.ends_with("/bin/nested.mjs")
+            || !declaration.source.starts_with("action:")
+    }));
+}
+
+/// An authored package with two private non-entry argument keys and older established facts.
+fn argument_property_publication(retained_bytes: u64) -> Result<PackagePublication, RiftError> {
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owner");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let root = ProjectPath::new("index.mjs").expect("entry");
+    let non_entry = ProjectPath::new("bin/options.mjs").expect("non-entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let files = [
+        PackageSource::new(
+            &root,
+            "export function receive(value) { return value.action; }",
+        ),
+        PackageSource::new(&non_entry, NON_ENTRY_ARGUMENT_PROPERTIES),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+    )];
+    let limits = ExactPackageLimits::new(3, 4096)
+        .with_retained_source_bytes(192, retained_bytes)
+        .expect("bounded retained records");
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+        .expect("bounded archive facts")
+        .with_framework_context(&metadata, &[])
+        .expect("npm manifest");
+    PackageAnalyzer::analyze(input, 1).map(|analysis| analysis.into_parts().0)
+}
+
+#[test]
+fn non_entry_argument_properties_keep_the_prior_retained_byte_budget() {
+    let room = argument_property_publication(u64::MAX).expect("publication with room");
+    let primary = room
+        .declarations
+        .iter()
+        .filter(|row| {
+            !matches!(
+                row.source.as_str(),
+                "action: \"first\"" | "action: \"second\""
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(primary.len(), 6);
+    let bytes = room
+        .units
+        .iter()
+        .map(|unit| unit.source.as_str())
+        .chain(primary.iter().map(|row| row.source.as_str()))
+        .chain(room.documents.iter().flat_map(|doc| {
+            [
+                doc.file_content.as_deref(),
+                doc.declaration_source.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+        }))
+        .map(|source| u64::try_from(source.len()).expect("captured source bytes"))
+        .sum();
+    let exact = argument_property_publication(bytes).unwrap_or_else(|error| {
+        panic!("old publication fits exactly at {bytes} source bytes: {error:?}")
+    });
+    assert_eq!(exact.declarations, primary);
+    assert_eq!(exact.units, room.units);
+    assert_eq!(exact.documents, room.documents);
+    assert_eq!(exact.edges, room.edges);
+    assert_eq!(exact.objects.len(), room.objects.len());
+    assert_eq!(
+        exact.objects.iter().filter(|row| row.id.is_none()).count(),
+        2
+    );
+    let generous = argument_property_publication(bytes + 192).expect("bounded surplus");
+    assert_eq!(generous.declarations, room.declarations);
+    assert_eq!(generous.objects, room.objects);
+    assert_eq!(generous.edges, room.edges);
+    assert_eq!(generous.declarations.len(), primary.len() + 2);
+}
+
 const MODULE: &str = "rift://symbol/npm/npmjs.org/app/typescript/app";
 const SIBLING: &str = "rift://symbol/npm/npmjs.org/app/typescript/app%2Fnear";
 const DEPENDENCY: &str = "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType";

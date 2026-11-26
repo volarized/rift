@@ -708,7 +708,7 @@ fn place_namespace(
         },
     )?;
     let exposed = namespace.exposed_names();
-    for held in analyzed {
+    for held in analyzed.iter_mut() {
         held.public_names.extend(
             namespace
                 .public_names
@@ -732,12 +732,6 @@ fn place_namespace(
             .placement
             .clone()
             .with_identity_anchors(assigned)
-            .with_scoped_identity_anchors(
-                namespace
-                    .scoped_anchors
-                    .remove(held.file.path().as_str())
-                    .unwrap_or_default(),
-            )
             .with_module(namespace.rust_modules.remove(held.file.path().as_str()))
             .with_logical_declarations(
                 namespace
@@ -752,7 +746,75 @@ fn place_namespace(
             );
     }
 
+    place_scoped_anchors(analyzed, &mut namespace, input.limits());
     Ok(namespace)
+}
+
+/// Optional physical anchors reuse captured source, but each new declaration retains a
+/// bounded copy. Leave the earlier unresolved rows when the existing sources may need
+/// the caller's full budget.
+fn place_scoped_anchors(
+    analyzed: &mut [AnalyzedFile],
+    namespace: &mut namespace::PreparedNamespace,
+    limits: ExactPackageLimits,
+) {
+    if namespace.scoped_anchors.is_empty() {
+        return;
+    }
+    let reserve_fits = limits.retained_source().is_none_or(|limit| {
+        limit.total_bytes_max == u64::MAX
+            || !analyzed.iter().any(|held| {
+                namespace
+                    .scoped_anchors
+                    .get(held.file.path().as_str())
+                    .is_some_and(|anchors| {
+                        anchors
+                            .keys()
+                            .any(|name| held.placement.logical_identity(name).is_none())
+                    })
+            })
+            || analyzed.iter().fold(0_u64, |total, held| {
+                total.saturating_add(scoped_anchor_source_max(held, limit.record_bytes_max))
+            }) <= limit.total_bytes_max
+    });
+    for held in analyzed {
+        let Some(mut anchors) = namespace.scoped_anchors.remove(held.file.path().as_str()) else {
+            continue;
+        };
+        if !reserve_fits {
+            anchors.retain(|name, _| held.placement.logical_identity(name).is_some());
+        }
+        held.placement = held.placement.clone().with_scoped_identity_anchors(anchors);
+    }
+}
+
+/// Existing package bindings and complete file modules can also retain source.
+fn scoped_anchor_source_max(file: &AnalyzedFile, record_limit: u32) -> u64 {
+    let primary = primary_retained_source_max(file, record_limit);
+    let syntax = file.file.syntax();
+    let maximum = u64::from(record_limit);
+    let bindings = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.is_package_binding())
+        .map(|symbol| {
+            symbol
+                .item_range
+                .end
+                .saturating_sub(symbol.item_range.start)
+                .min(maximum)
+        })
+        .fold(0, u64::saturating_add);
+    let source = u64::try_from(file.file.source().len()).unwrap_or(u64::MAX);
+    let file_module = matches!(syntax.language().name.as_str(), "javascript" | "typescript")
+        && file.placement.logical_identity(".").is_some()
+        && !syntax.has_errors()
+        && syntax.left_out_declaration_count() == 0
+        && syntax.primary_symbols_len() > 0
+        && source <= maximum;
+    primary
+        .saturating_add(bindings)
+        .saturating_add(if file_module { source } else { 0 })
 }
 
 /// Renders the canonical publication over the analyzed files.
