@@ -55,6 +55,7 @@ use rift_ranking::split_identifier_words;
 
 #[cfg(test)]
 mod coverage_tests;
+mod file_modules;
 #[cfg(test)]
 mod fixture;
 mod join;
@@ -802,6 +803,7 @@ fn publish(
         semantics,
         &mut records,
     )?;
+    records.retain_ecmascript_file_modules(package, analyzed, limits.declarations_max())?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));

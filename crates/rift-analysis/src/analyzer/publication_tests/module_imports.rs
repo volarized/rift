@@ -60,26 +60,29 @@ fn analyze_module(
 fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
     let analysis = analyze_module(SOURCE, MANIFEST, PackageConfiguration::default());
     let (publication, _, semantics, _) = analysis.into_parts();
-    let mut modules = publication
+    let modules = publication
         .objects
         .iter()
-        .filter(|object| object.kinds.contains(&SymbolKind::Module));
-    let module = modules.next().expect("checked importing module");
-    assert!(modules.next().is_none());
+        .filter(|object| object.kinds.contains(&SymbolKind::Module))
+        .collect::<Vec<_>>();
+    assert_eq!(modules.len(), 2);
+    let module = modules
+        .iter()
+        .find(|object| object.id.as_ref().map(SymbolId::as_str) == Some(MODULE))
+        .expect("checked importing module");
     assert_eq!(module.id.as_ref().map(SymbolId::as_str), Some(MODULE));
     assert_eq!(module.name, "app");
-    assert_eq!(module.origin.source_kind, SourceKind::Synthetic);
-    assert!(module.origin.location.is_none());
-    assert!(module.origin.package.is_none());
+    assert_eq!(module.origin.source_kind, SourceKind::Authored);
+    assert!(module.origin.location.is_some());
+    assert!(module.origin.package.is_some());
     assert!(module.origin.runtime.is_none());
     publication
         .validate_facts()
         .expect("covered published edges");
     assert!(
-        publication
-            .declarations
-            .iter()
-            .all(|declaration| declaration.symbol.as_str() != MODULE)
+        publication.declarations.iter().any(
+            |declaration| declaration.symbol.as_str() == MODULE && declaration.source == SOURCE
+        )
     );
 
     let unit = publication
@@ -416,13 +419,12 @@ fn assert_javascript_module_declaration(
         .find(|object| object.id.as_ref().is_some_and(|id| id.as_str() == module))
         .expect("checked JavaScript module");
     assert_eq!(object.kinds, [SymbolKind::Module]);
-    assert_eq!(object.origin.source_kind, SourceKind::Synthetic);
+    assert_eq!(object.origin.source_kind, SourceKind::Authored);
     assert!(
         found
             .declarations
             .iter()
-            .all(|row| row.symbol.as_str() != module),
-        "a synthetic module does not claim an authored declaration"
+            .any(|row| { row.symbol.as_str() == module && row.unit != target_source.unit })
     );
 }
 
@@ -781,14 +783,6 @@ fn npm_complete_file_modules_can_publish_without_outgoing_edges() {
             "export const = ;\n",
             false,
         ),
-        (
-            ShippedLanguage::JavaScript,
-            "javascript",
-            "index.mjs",
-            "module",
-            "export function leaf() {}\n",
-            false,
-        ),
     ] {
         let selector = if shipped == ShippedLanguage::TypeScript {
             "types"
@@ -833,6 +827,60 @@ fn npm_complete_file_modules_can_publish_without_outgoing_edges() {
             assert!(publication.declarations.is_empty());
             assert_empty_module_respects_the_symbol_bound(publication, &files, &semantics);
         }
+    }
+}
+
+#[test]
+fn npm_written_file_modules_publish_their_own_source() {
+    const MAIN: &str = "import { leaf } from './leaf.mjs';\nexport function run() { leaf(); }\n";
+    const LEAF: &str = "export function leaf() {}\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", MAIN), ("leaf.mjs", LEAF)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("authored package modules");
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid package modules");
+    for (path, suffix, source) in [
+        ("index.mjs", "/beacon", MAIN),
+        ("leaf.mjs", "/beacon%2Fleaf.mjs", LEAF),
+    ] {
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("source unit");
+        let object = publication
+            .objects
+            .iter()
+            .find(|object| {
+                object.kinds.contains(&SymbolKind::Module)
+                    && object
+                        .id
+                        .as_ref()
+                        .is_some_and(|identity| identity.as_str().ends_with(suffix))
+            })
+            .expect("file module");
+        assert_eq!(object.origin.source_kind, SourceKind::Authored);
+        let module = object.id.as_ref().expect("module identity");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol == *module)
+            .expect("physical module");
+        assert_eq!(row.unit, unit.unit);
+        assert_eq!(row.range.start, 0);
+        assert_eq!(
+            row.range.end,
+            u64::try_from(source.len()).expect("source length")
+        );
+        assert_eq!(row.source, source);
+        assert!(row.source_complete);
     }
 }
 
