@@ -75,6 +75,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_receiver_start: Option<usize>,
     /// First variadic parameter read, after the earlier parameter reads.
     pub(crate) python_variadic_start: Option<usize>,
+    /// First generated initializer keyword reference, after earlier references.
+    pub(crate) python_initializer_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -249,6 +251,9 @@ struct DeferredImports<'source> {
     python_qualifiers: Vec<python_edges::PythonImportQualifier<'source>>,
     rust_macros: Vec<ByteRange>,
 }
+
+type PendingInitializers<'index, 'source> =
+    BTreeMap<&'index str, (&'index File<'source>, usize, python_edges::InitializerCalls)>;
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
 ///
@@ -1496,6 +1501,10 @@ impl<'source> Index<'source> {
         let mut pending = files.as_slice();
         let mut deferred_references = Vec::new();
         let mut rust_qualifiers = Vec::new();
+        let mut pending_initializers = PendingInitializers::new();
+        let has_initializers = files
+            .iter()
+            .any(|file| !file.facts.python_initializers().is_empty());
         while !pending.is_empty() && !work.exhausted {
             let run = file_work.run(pending, work.budget.remaining());
             let (run, rest) = pending.split_at(run.max(1));
@@ -1532,8 +1541,15 @@ impl<'source> Index<'source> {
                 work.exhausted = apart.exhausted && left < file_work.max(file);
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+                let remaining = file_work.max(file).saturating_sub(apart.used);
+                if has_initializers
+                    && let Some(calls) =
+                        python_edges::InitializerCalls::capture(file, &apart.resolution)
+                {
+                    pending_initializers
+                        .insert(file.document.path.as_str(), (*file, remaining, calls));
+                }
                 if let Some(sites) = apart.deferred_references {
-                    let remaining = file_work.max(file).saturating_sub(apart.used);
                     let queue = match sites {
                         DeferredReferences::Python { .. }
                         | DeferredReferences::PythonQualifiers { .. }
@@ -1553,7 +1569,13 @@ impl<'source> Index<'source> {
         }
         if !work.exhausted {
             deferred_references.extend(rust_qualifiers);
-            self.resolve_deferred_references(deferred_references, work, resolution);
+            self.resolve_deferred_references(
+                deferred_references,
+                work,
+                resolution,
+                &mut pending_initializers,
+            );
+            self.resolve_python_initializers(pending_initializers, work, resolution);
         }
     }
 
@@ -1564,6 +1586,7 @@ impl<'source> Index<'source> {
         references: Vec<(&File<'source>, usize, DeferredReferences<'source>)>,
         work: &mut Work,
         resolution: &mut StaticResolution,
+        pending_initializers: &mut PendingInitializers<'_, 'source>,
     ) {
         if !references.is_empty() {
             resolution.supplemental_start =
@@ -1604,6 +1627,11 @@ impl<'source> Index<'source> {
                 .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
             work.budget = LoopBudget::new(left.saturating_sub(used));
             resolution.ended |= deferred.exhausted;
+            if let Some((_, remaining, _)) =
+                pending_initializers.get_mut(file.document.path.as_str())
+            {
+                *remaining = remaining.saturating_sub(used);
+            }
             if let Some(next) = next {
                 let queue = match next {
                     DeferredReferences::PythonLocals => &mut python_local_sites,
@@ -1623,6 +1651,30 @@ impl<'source> Index<'source> {
                 };
                 queue.push_back((file, remaining.saturating_sub(used), next));
             }
+        }
+    }
+
+    fn resolve_python_initializers(
+        &self,
+        pending: PendingInitializers<'_, 'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        resolution.python_initializer_start = Some(resolution.occurrences.len());
+        for (file, remaining, calls) in pending.into_values() {
+            let left = work.budget.remaining();
+            let budget = left.min(remaining);
+            let mut keyword_work = Work::new(budget);
+            self.python_initializer_keywords(file, &calls, &mut keyword_work, resolution);
+            let used = budget.saturating_sub(keyword_work.budget.remaining());
+            #[cfg(test)]
+            self.performed
+                .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+            work.budget = LoopBudget::new(left.saturating_sub(used));
+            resolution.ended |= keyword_work.exhausted;
         }
     }
 

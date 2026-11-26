@@ -4,6 +4,7 @@ mod aliases;
 mod annotations;
 mod classes;
 mod elements;
+mod initializers;
 mod names;
 mod overloads;
 mod rebinding;
@@ -13,6 +14,7 @@ mod slots;
 
 pub(super) use aliases::{ClassAliases, ModuleAliases};
 pub(super) use classes::{ClassOrders, MemberOwners};
+pub(super) use initializers::InitializerCalls;
 pub(super) use names::ReassignedLocalRead;
 pub(super) use references::PythonNameSites;
 

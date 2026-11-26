@@ -12,6 +12,7 @@ mod commonjs_literals;
 mod facts;
 mod forwarded_names;
 mod graph;
+mod initializers;
 mod internal_modules;
 mod module_imports;
 mod returned_callables;

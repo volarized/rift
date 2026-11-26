@@ -1,6 +1,7 @@
 //! Captured Python call sites and lexical import bindings.
 
 mod guards;
+mod initializers;
 mod lists;
 mod names;
 
@@ -182,9 +183,9 @@ impl EdgePythonKinds {
         }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
-                facts
-                    .calls
-                    .push(call(syntax_element, callee, self.edge_callee(callee)?)?);
+                let call = call(syntax_element, callee, self.edge_callee(callee)?)?;
+                self.edge_initializer_keywords(syntax_element, call, source, facts)?;
+                facts.calls.push(call);
             }
         } else if id == self.decorator {
             // A decorator written without arguments is called with the decorated definition.
@@ -202,6 +203,7 @@ impl EdgePythonKinds {
         } else if self.definitions.contains(&id) {
             if id == self.definitions[1] {
                 names.class(byte_range(syntax_element)?);
+                self.edge_initializer(visited, source, facts)?;
             }
             self.edge_definition(visited, facts)?;
         } else if self.imports.contains(&id) {
