@@ -720,6 +720,7 @@ fn binding_capacity(
         shorthand_slots,
         method_slots,
         signature_slots,
+        scoped_slots,
     ] = reserve_scoped_parameters(
         documents,
         [
@@ -729,6 +730,7 @@ fn binding_capacity(
             &demands.rust_shorthand,
             &demands.ecmascript.javascript_methods,
             &demands.ecmascript.typescript_signatures,
+            &demands.ecmascript.javascript_scoped_functions,
         ],
         &mut slots,
         &mut bytes,
@@ -757,7 +759,8 @@ fn binding_capacity(
         .with_rust_module_sources(module_slots)
         .with_rust_shorthand(shorthand_slots)
         .with_javascript_method_parameters(method_slots)
-        .with_typescript_signature_parameters(signature_slots),
+        .with_typescript_signature_parameters(signature_slots)
+        .with_javascript_scoped_function_parameters(scoped_slots),
     )
 }
 
@@ -770,6 +773,7 @@ struct EcmaScriptBindingDemand {
     typescript_overloads: BindingDemand,
     javascript_methods: BindingDemand,
     typescript_signatures: BindingDemand,
+    javascript_scoped_functions: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -787,6 +791,8 @@ impl EcmaScriptBindingDemand {
             &mut self.javascript_methods
         } else if symbol.is_typescript_signature_parameter() {
             &mut self.typescript_signatures
+        } else if symbol.is_javascript_scoped_function_parameter() {
+            &mut self.javascript_scoped_functions
         } else if javascript {
             &mut self.javascript_functions
         } else if symbol
@@ -808,6 +814,7 @@ impl EcmaScriptBindingDemand {
             + self.typescript_overloads.count
             + self.javascript_methods.count
             + self.typescript_signatures.count
+            + self.javascript_scoped_functions.count
     }
 }
 

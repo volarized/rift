@@ -85,6 +85,7 @@ mod commonjs;
 mod members;
 mod overload_parameters;
 pub(crate) mod recovery;
+mod scoped_function_parameters;
 mod variance;
 
 use tree_sitter::{Node, Parser};
@@ -238,6 +239,7 @@ pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
 pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
 pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
+pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -2338,10 +2340,13 @@ fn append_value_parameters(
     parameters: Vec<crate::SyntaxSymbol>,
     facts: &crate::StaticFacts,
 ) {
-    let overloads = (language.name == "typescript")
-        .then(|| overload_parameters::capture(symbols, &parameters, facts, root));
+    let scoped = if language.name == "typescript" {
+        overload_parameters::capture(symbols, &parameters, facts, root)
+    } else {
+        scoped_function_parameters::capture(symbols, &parameters, facts)
+    };
     append_parameters(symbols, parameters, facts);
-    symbols.extend(overloads.into_iter().flatten());
+    symbols.extend(scoped);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
 }
 
@@ -2481,6 +2486,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == SIGNATURE_PARAMETER_KIND {
         return Some(SIGNATURE_PARAMETER_KIND);
+    }
+    if name == SCOPED_FUNCTION_PARAMETER_KIND {
+        return Some(SCOPED_FUNCTION_PARAMETER_KIND);
     }
     kinds
         .declarations

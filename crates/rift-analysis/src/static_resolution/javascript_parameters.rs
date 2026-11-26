@@ -22,6 +22,7 @@ pub(super) enum ScopedParameterReads {
     Callback,
     Overload,
     JavaScriptMethod,
+    JavaScriptScopedFunction,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -83,6 +84,10 @@ impl<'source> Index<'source> {
                 &file.javascript_method_parameters,
                 &mut result.deferred_javascript_method_parameters,
             ),
+            ScopedParameterReads::JavaScriptScopedFunction => (
+                &file.scoped_javascript_parameters,
+                &mut result.deferred_scoped_javascript_parameters,
+            ),
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -121,6 +126,7 @@ impl<'source> Index<'source> {
         }
         if parameter.symbol.is_ecmascript_overload_parameter()
             || parameter.symbol.is_javascript_method_parameter()
+            || parameter.symbol.is_javascript_scoped_function_parameter()
         {
             let owner = file.target_at(parameter.site.owner?)?;
             if owner.symbol.item_range != binding.scope || !owner.symbol.body_range?.encloses(range)

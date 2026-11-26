@@ -34,6 +34,7 @@ pub struct PackageBindingSlots {
     typescript_overload_parameter: usize,
     javascript_method_parameter: usize,
     typescript_signature_parameter: usize,
+    javascript_scoped_function_parameter: usize,
     typescript_method_parameter: usize,
     rust_library_root: usize,
     rust_module_source: usize,
@@ -66,6 +67,7 @@ impl PackageBindingSlots {
             typescript_overload_parameter: 0,
             javascript_method_parameter: 0,
             typescript_signature_parameter: 0,
+            javascript_scoped_function_parameter: 0,
             typescript_method_parameter: 0,
             rust_library_root: 0,
             rust_module_source: 0,
@@ -186,6 +188,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for parameters of separately anchored JavaScript functions.
+    #[must_use]
+    pub const fn with_javascript_scoped_function_parameters(mut self, count: usize) -> Self {
+        self.javascript_scoped_function_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -209,6 +218,7 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_shorthand)
             .saturating_add(self.javascript_method_parameter)
             .saturating_add(self.typescript_signature_parameter)
+            .saturating_add(self.javascript_scoped_function_parameter)
     }
 
     fn admit(
@@ -226,6 +236,8 @@ impl PackageBindingSlots {
             &mut self.javascript_method_parameter
         } else if symbol.is_typescript_signature_parameter() {
             &mut self.typescript_signature_parameter
+        } else if symbol.is_javascript_scoped_function_parameter() {
+            &mut self.javascript_scoped_function_parameter
         } else if matches!(language, "javascript" | "typescript")
             && symbol.is_ecmascript_parameter()
         {

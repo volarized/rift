@@ -124,6 +124,10 @@ pub(crate) struct StaticResolution {
     pub(crate) javascript_method_parameter_start: Option<usize>,
     /// JavaScript method parameter reads awaiting capacity after earlier facts.
     pub(crate) deferred_javascript_method_parameters: Vec<StaticOccurrence>,
+    /// First parameter read from a separately anchored JavaScript function.
+    pub(crate) scoped_javascript_function_start: Option<usize>,
+    /// Reads of scoped JavaScript parameters awaiting capacity after earlier facts.
+    pub(crate) deferred_scoped_javascript_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -268,6 +272,10 @@ fn resolve_by<'source>(
     resolution.javascript_method_parameter_start = append_late_occurrences(
         &mut resolution.occurrences,
         &mut resolution.deferred_javascript_method_parameters,
+    );
+    resolution.scoped_javascript_function_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_scoped_javascript_parameters,
     );
     external::admit_declared(namespace, &mut resolution.external, work_max);
     index.resolve_rust_extern_aliases(&mut work, &mut resolution);
@@ -677,6 +685,7 @@ struct File<'source> {
     javascript_callback_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     typescript_overload_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     javascript_method_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -852,6 +861,7 @@ impl<'source> File<'source> {
             javascript_callback_parameters: BTreeMap::new(),
             typescript_overload_parameters: BTreeMap::new(),
             javascript_method_parameters: BTreeMap::new(),
+            scoped_javascript_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -1175,6 +1185,10 @@ impl<'source> File<'source> {
                     self.javascript_method_parameters.insert(name, parameter);
                     return;
                 }
+                if symbol.is_javascript_scoped_function_parameter() {
+                    self.scoped_javascript_parameters.insert(name, parameter);
+                    return;
+                }
                 let parameters = if symbol
                     .container
                     .as_deref()
@@ -1293,7 +1307,10 @@ impl<'source> File<'source> {
         .fold(0, usize::saturating_add)
     }
 
-    fn scoped_parameter_pass(&self) -> Option<ScopedParameterReads> {
+    fn scoped_parameter_pass(
+        &self,
+        earlier: Option<ScopedParameterReads>,
+    ) -> Option<ScopedParameterReads> {
         [
             (
                 ScopedParameterReads::Callback,
@@ -1307,8 +1324,13 @@ impl<'source> File<'source> {
                 ScopedParameterReads::JavaScriptMethod,
                 &self.javascript_method_parameters,
             ),
+            (
+                ScopedParameterReads::JavaScriptScopedFunction,
+                &self.scoped_javascript_parameters,
+            ),
         ]
         .into_iter()
+        .skip(earlier.map_or(0, |class| class as usize + 1))
         .find_map(|(class, parameters)| (!parameters.is_empty()).then_some(class))
     }
 
@@ -1883,9 +1905,7 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
-        let mut callback_parameters = VecDeque::new();
-        let mut overload_parameters = VecDeque::new();
-        let mut javascript_method_parameters = VecDeque::new();
+        let mut scoped_parameters = std::array::from_fn::<_, 4, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1905,9 +1925,7 @@ impl<'source> Index<'source> {
             })
             .or_else(|| module_specifiers.pop_front())
             .or_else(|| module_qualifiers.pop_front())
-            .or_else(|| callback_parameters.pop_front())
-            .or_else(|| overload_parameters.pop_front())
-            .or_else(|| javascript_method_parameters.pop_front())
+            .or_else(|| scoped_parameters.iter_mut().find_map(VecDeque::pop_front))
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
@@ -1944,11 +1962,9 @@ impl<'source> Index<'source> {
                     }
                     DeferredReferences::EcmaScriptModuleSpecifiers => &mut module_specifiers,
                     DeferredReferences::EcmaScriptModuleQualifiers => &mut module_qualifiers,
-                    DeferredReferences::ScopedParameters(class) => match class {
-                        ScopedParameterReads::Callback => &mut callback_parameters,
-                        ScopedParameterReads::Overload => &mut overload_parameters,
-                        ScopedParameterReads::JavaScriptMethod => &mut javascript_method_parameters,
-                    },
+                    DeferredReferences::ScopedParameters(class) => {
+                        &mut scoped_parameters[class as usize]
+                    }
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
                     DeferredReferences::Rust {
@@ -2109,16 +2125,13 @@ impl<'source> Index<'source> {
                     .file_module_qualifier_start
                     .get_or_insert(resolution.occurrences.len());
                 self.javascript_module_qualifiers(file, work, resolution);
-                file.scoped_parameter_pass()
+                file.scoped_parameter_pass(None)
                     .map(DeferredReferences::ScopedParameters)
             }
             DeferredReferences::ScopedParameters(class) => {
                 self.ecmascript_scoped_parameter_reads(file, class, work, resolution);
-                (matches!(class, ScopedParameterReads::Callback)
-                    && !file.javascript_method_parameters.is_empty())
-                .then_some(DeferredReferences::ScopedParameters(
-                    ScopedParameterReads::JavaScriptMethod,
-                ))
+                file.scoped_parameter_pass(Some(class))
+                    .map(DeferredReferences::ScopedParameters)
             }
             DeferredReferences::Rust {
                 pass,

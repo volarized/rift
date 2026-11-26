@@ -2224,3 +2224,81 @@ fn standalone_typescript_signatures_keep_their_written_value_parameters() {
         );
     }
 }
+
+#[test]
+fn javascript_scoped_function_parameters_use_their_established_owner() {
+    const SOURCE: &str = concat!(
+        "const values = [];\n",
+        "{ function visit(key) { return key; } values.push(visit(1)); }\n",
+        "{ function visit(key) { return key; } values.push(visit(2)); }\n",
+        "export { values };\n",
+    );
+    let mut package = fixture::identity();
+    package.manager = "npm".to_owned();
+    package.registry = "registry.npmjs.org".to_owned();
+    let owner = package.owner().expect("owned package");
+    let origin = fixture::origin(&package);
+    let language = ShippedLanguage::JavaScript.language();
+    let file = ProjectPath::new("index.mjs").expect("entry");
+    let manifest = ProjectPath::new("package.json").expect("manifest");
+    let sources = [PackageSource::new(&file, SOURCE)];
+    let manifests = [PackageSource::new(
+        &manifest,
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+    )];
+    let collect = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("bound");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("checked source")
+            .with_framework_context(&manifests, &[])
+            .expect("package manifest");
+        PackageAnalyzer::analyze(input, 1)
+            .expect("publication")
+            .into_parts()
+            .0
+    };
+    let bounded = collect(4);
+    let found = collect(8);
+    assert_eq!(bounded.declarations.len(), 4);
+    assert_eq!(found.declarations.len() - bounded.declarations.len(), 2);
+    assert!(bounded.declarations.iter().any(|row| row.source == SOURCE));
+    assert!(
+        bounded
+            .declarations
+            .iter()
+            .all(|row| found.declarations.contains(row))
+    );
+    assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
+    found.validate_facts().expect("physical scoped parameters");
+    let names = SOURCE
+        .match_indices("visit(key)")
+        .map(|(start, _)| start + 6);
+    let reads = SOURCE
+        .match_indices("return key")
+        .map(|(start, _)| start + 7);
+    for ((declaration_start, read_start), owner) in names.zip(reads).zip(["visit", "visit%231"]) {
+        let suffix = format!("/{owner}/key");
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with(&suffix)
+                    && row.range == module_runtime_range(declaration_start, "key")
+            })
+            .expect("written scoped parameter");
+        let parameter_reads = found
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .collect::<Vec<_>>();
+        let [read] = parameter_reads.as_slice() else {
+            panic!("one read in {owner}")
+        };
+        assert!(read.from.as_str().ends_with(&format!("/{owner}")));
+        let site = read.occurrence.as_ref().expect("written read");
+        assert_eq!(site.unit, declaration.unit);
+        assert_eq!(site.range, module_runtime_range(read_start, "key"));
+    }
+}

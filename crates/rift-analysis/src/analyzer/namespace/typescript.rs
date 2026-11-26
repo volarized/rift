@@ -224,15 +224,23 @@ fn prepare_anchors(
     input: &NamespaceInput<'_>,
     file: &SelectedFile<'_>,
     module: &str,
-    anchors: BTreeMap<String, SymbolId>,
+    mut anchors: BTreeMap<String, SymbolId>,
     prepared: &mut PreparedNamespace,
 ) -> bool {
+    let scoped = internal_modules::private_local_identities(file, &anchors);
+    if input.release_version().is_some()
+        && matches!(
+            input.owner(),
+            rift_protocol::identity::SymbolOwner::Package { .. }
+        )
+    {
+        place_scoped_function_parameters(file, &mut anchors, &scoped);
+    }
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;
     }
     let (exports, unresolved) = export_bindings(input, file, module, &anchors);
-    let scoped = internal_modules::private_local_identities(file, &anchors);
     if !scoped.is_empty() {
         prepared
             .scoped_anchors
@@ -244,6 +252,74 @@ fn prepare_anchors(
         .anchors
         .insert(file.path.as_str().to_owned(), anchors);
     true
+}
+
+fn place_scoped_function_parameters(
+    file: &SelectedFile<'_>,
+    anchors: &mut BTreeMap<String, SymbolId>,
+    scopes: &rift_syntax::ScopedIdentityAnchors,
+) {
+    if scopes.is_empty() || file.syntax.language().name != "javascript" {
+        return;
+    }
+    let Some(facts) = file.syntax.static_facts() else {
+        return;
+    };
+    let owners = file
+        .syntax
+        .symbols()
+        .iter()
+        .filter_map(|symbol| {
+            let placements = scopes.get(&symbol.qualified_name)?;
+            let name = symbol.name_range?;
+            let identity = placements
+                .get(&symbol.declaration_ordinal)
+                .or_else(|| anchors.get(&symbol.qualified_name))?;
+            Some((name, (symbol.item_range, identity.clone())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut owner_count = BTreeMap::<&SymbolId, usize>::new();
+    for (_, identity) in owners.values() {
+        *owner_count.entry(identity).or_default() += 1;
+    }
+    let sites = facts
+        .parameters()
+        .iter()
+        .map(|site| (site.name, site))
+        .collect::<BTreeMap<_, _>>();
+    let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+    for parameter in file
+        .syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.is_javascript_scoped_function_parameter())
+    {
+        let Some(site) = parameter.name_range.and_then(|name| sites.get(&name)) else {
+            continue;
+        };
+        let Some((function, identity)) = site.owner.and_then(|name| owners.get(&name)) else {
+            continue;
+        };
+        if *function != site.function || owner_count.get(identity) != Some(&1) {
+            continue;
+        }
+        let Ok(owner) = SymbolIdentity::parse(identity.as_str()) else {
+            continue;
+        };
+        let mut path = owner.qualified_path().to_vec();
+        path.push(parameter.name.clone());
+        let Ok(identity) =
+            SymbolIdentity::new(owner.owner().clone(), owner.language().clone(), path)
+        else {
+            continue;
+        };
+        let Ok(identity) = SymbolId::new(identity.wire_identity()) else {
+            continue;
+        };
+        if occupied.insert(identity.clone()) {
+            anchors.insert(parameter.qualified_name.clone(), identity);
+        }
+    }
 }
 
 /// Resolves same-module aliases through recorded declaration and export facts.
