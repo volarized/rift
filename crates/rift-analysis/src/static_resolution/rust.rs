@@ -2,6 +2,7 @@
 
 mod deref;
 mod field_sites;
+mod macro_calls;
 mod receivers;
 mod references;
 mod value_reads;
@@ -32,6 +33,7 @@ pub(super) struct Namespaces<'source> {
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
     fields: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    exported_macros: BTreeMap<Vec<String>, Option<Target<'source>>>,
     member_calls: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
@@ -54,6 +56,8 @@ struct Export<'source> {
     module: Vec<String>,
     target: Vec<String>,
     visibility: Option<&'source str>,
+    file: &'source str,
+    written: ByteRange,
 }
 
 struct FileNamespace<'source> {
@@ -398,6 +402,8 @@ impl<'source> Namespaces<'source> {
                         module,
                         target,
                         visibility,
+                        file: file.document.path.as_str(),
+                        written: imported.range,
                     },
                 );
             }
@@ -830,6 +836,18 @@ impl<'source> Namespaces<'source> {
                 &mut self.members
             };
             insert(members, path.clone(), target);
+        }
+        if symbol.kind == "macro"
+            && symbol.visibility.as_deref() == Some("pub")
+            && let Some(crate_name) = path.first()
+        {
+            // Exported macro_rules definitions are visible at the crate root; their
+            // retained declaration keeps its physical source and module.
+            insert(
+                &mut self.exported_macros,
+                vec![crate_name.clone(), symbol.name.clone()],
+                target,
+            );
         }
         if matches!(symbol.kind, "constant" | "static") && file.is_module_item(symbol) {
             insert(&mut self.constants_and_statics, path, target);
@@ -1448,23 +1466,8 @@ impl<'source> Namespaces<'source> {
         let Some(source) = self.module(file, position, work) else {
             return false;
         };
-        for length in 1..=target_namespace.len() {
-            let module = &target_namespace[..length];
-            if !work.charge() || self.module_unavailable(module) {
-                return false;
-            }
-            if let Some(target) = self.modules.get(module) {
-                let Some(target) = target else {
-                    return false;
-                };
-                if !namespace_visible(
-                    source,
-                    &module[..length - 1],
-                    target.symbol.visibility.as_deref(),
-                ) {
-                    return false;
-                }
-            }
+        if !self.module_path_visible(source, target_namespace, work) {
+            return false;
         }
         let visibility = target.symbol.visibility.as_deref();
         let within_crate = source.first() == target_namespace.first();
@@ -1484,6 +1487,33 @@ impl<'source> Namespaces<'source> {
                 && target_namespace
                     .split_last()
                     .is_some_and(|(_, module)| source == module))
+    }
+
+    fn module_path_visible(
+        &self,
+        source: &[String],
+        target_namespace: &[String],
+        work: &mut Work,
+    ) -> bool {
+        for length in 1..=target_namespace.len() {
+            let module = &target_namespace[..length];
+            if !work.charge() || self.module_unavailable(module) {
+                return false;
+            }
+            if let Some(target) = self.modules.get(module) {
+                let Some(target) = target else {
+                    return false;
+                };
+                if !namespace_visible(
+                    source,
+                    &module[..length - 1],
+                    target.symbol.visibility.as_deref(),
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn resolved_path(

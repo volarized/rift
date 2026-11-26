@@ -41,6 +41,26 @@ pub struct StaticRustValueRead {
     pub pattern: bool,
 }
 
+/// One written Rust macro invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticRustMacroCall {
+    /// Complete authored invocation.
+    pub range: ByteRange,
+    /// Written macro name.
+    pub name: ByteRange,
+}
+
+/// A Rust macro declaration's name, item and textual scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticRustMacroDefinition {
+    /// Written name of the declaration.
+    pub name: ByteRange,
+    /// Complete declaration. It becomes visible after this range.
+    pub item: ByteRange,
+    /// Source region that inherits the declaration.
+    pub scope: ByteRange,
+}
+
 /// One named field in a Rust struct literal or pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticRustFieldSite {
@@ -482,6 +502,14 @@ pub struct StaticFactsParts {
     pub rust_local_types: Vec<(ByteRange, ByteRange)>,
     /// Rust field labels in struct literals and patterns.
     pub rust_field_sites: Vec<StaticRustFieldSite>,
+    /// Rust macro calls with a written crate-root qualifier.
+    pub rust_root_macro_calls: Vec<StaticRustMacroCall>,
+    /// Rust macro calls with a single unqualified name.
+    pub rust_textual_macro_calls: Vec<StaticRustMacroCall>,
+    /// Rust macro declarations with their textual scopes.
+    pub rust_macro_definitions: Vec<StaticRustMacroDefinition>,
+    /// Items and scopes where expansion or module loading may introduce macros.
+    pub rust_macro_barriers: Vec<(ByteRange, ByteRange)>,
     /// Authored Rust implementations.
     pub inherent_impls: Vec<StaticInherentImpl>,
     /// Items whose admission depends on Rust configuration.
@@ -783,6 +811,30 @@ impl StaticFacts {
         &self.0.rust_field_sites
     }
 
+    /// Authored Rust macro calls with a crate-root qualifier.
+    #[must_use]
+    pub fn rust_root_macro_calls(&self) -> &[StaticRustMacroCall] {
+        &self.0.rust_root_macro_calls
+    }
+
+    /// Authored Rust macro calls with a bare name.
+    #[must_use]
+    pub fn rust_textual_macro_calls(&self) -> &[StaticRustMacroCall] {
+        &self.0.rust_textual_macro_calls
+    }
+
+    /// Macro declarations with their textual scopes.
+    #[must_use]
+    pub fn rust_macro_definitions(&self) -> &[StaticRustMacroDefinition] {
+        &self.0.rust_macro_definitions
+    }
+
+    /// Items and scopes with potentially new macro bindings.
+    #[must_use]
+    pub fn rust_macro_barriers(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.rust_macro_barriers
+    }
+
     /// Hoisted block-local value names and their scopes.
     #[must_use]
     pub fn rust_local_values(&self) -> &[(ByteRange, ByteRange)] {
@@ -877,6 +929,10 @@ impl StaticFacts {
             vector_capacity(&self.0.rust_local_values),
             vector_capacity(&self.0.rust_local_types),
             vector_capacity(&self.0.rust_field_sites),
+            vector_capacity(&self.0.rust_root_macro_calls),
+            vector_capacity(&self.0.rust_textual_macro_calls),
+            vector_capacity(&self.0.rust_macro_definitions),
+            vector_capacity(&self.0.rust_macro_barriers),
             vector_capacity(&self.0.conditional_items),
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
@@ -946,6 +1002,10 @@ impl StaticFacts {
             self.rust_local_values().len(),
             self.rust_local_types().len(),
             self.rust_field_sites().len(),
+            self.rust_root_macro_calls().len(),
+            self.rust_textual_macro_calls().len(),
+            self.rust_macro_definitions().len(),
+            self.rust_macro_barriers().len(),
             self.conditional_items().len(),
             self.receiver_arguments().len(),
             self.loops().len(),
@@ -1013,6 +1073,7 @@ impl StaticFacts {
                 .rust_local_types()
                 .iter()
                 .all(|(item, scope)| valid(*item) && valid(*scope) && scope.encloses(*item))
+            && self.rust_macro_ranges_valid(valid)
             && self.rust_field_sites().iter().all(|site| {
                 valid(site.owner)
                     && valid(site.field)
@@ -1023,6 +1084,24 @@ impl StaticFacts {
                             && literal.encloses(site.field)
                     })
             })
+    }
+
+    fn rust_macro_ranges_valid(&self, valid: &impl Fn(ByteRange) -> bool) -> bool {
+        self.rust_root_macro_calls()
+            .iter()
+            .chain(self.rust_textual_macro_calls())
+            .all(|call| valid(call.range) && valid(call.name) && call.range.encloses(call.name))
+            && self.rust_macro_definitions().iter().all(|definition| {
+                valid(definition.name)
+                    && valid(definition.item)
+                    && valid(definition.scope)
+                    && definition.item.encloses(definition.name)
+                    && definition.scope.encloses(definition.item)
+            })
+            && self
+                .rust_macro_barriers()
+                .iter()
+                .all(|(item, scope)| valid(*item) && valid(*scope) && scope.encloses(*item))
     }
 
     /// Whether the facts that connect function values and bound names to written types
