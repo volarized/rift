@@ -49,12 +49,14 @@ function Stop({
   children,
   id,
   alternate = false,
-  illustration,
+  hero = false,
+  finale = false,
 }: {
   children: React.ReactNode;
   id: string;
   alternate?: boolean;
-  illustration?: React.ReactNode;
+  hero?: boolean;
+  finale?: boolean;
 }) {
   return (
     <section
@@ -63,13 +65,15 @@ function Stop({
       className={cn(
         "landing-stop",
         alternate && "landing-stop--alternate",
-        illustration && "landing-stop--hero",
+        finale && "landing-stop--finale",
       )}
     >
-      {illustration}
-      <LandingPanel className="landing-stop__panel">
-        <div className="grid gap-4 p-5 sm:gap-5 sm:p-7 lg:p-9">{children}</div>
+      <LandingPanel className={cn("landing-stop__panel", hero && "landing-stop__panel--hero")}>
+        <div className={cn("grid gap-4 p-5 sm:gap-5 sm:p-7 lg:p-9", hero && "landing-stop__intro")}>
+          {children}
+        </div>
       </LandingPanel>
+      {finale && <div className="landing-stop__sphere" aria-hidden="true" />}
     </section>
   );
 }
@@ -78,24 +82,21 @@ export default function HomePage() {
   return (
     <div className="landing-page">
       <LandingMap />
-      <Stop
-        id="overview"
-        illustration={
-          <LandingPanel className="landing-stop__mark">
-            <Logo
-              aria-hidden="true"
-              strokeWidth={0.37}
-              className="w-full p-6 text-primary-text sm:p-9 lg:p-12"
-            />
-          </LandingPanel>
-        }
-      >
-        <h1 className="m-0 font-mono text-[clamp(3.5rem,8.5vw,7rem)] leading-[0.88] font-bold tracking-[-0.075em] dark:text-white">
-          rift
-        </h1>
-        <Body>
-          Rift is an agentic development toolkit for reading, discovering, and exploring codebases.
-        </Body>
+      <Stop id="overview" hero>
+        <div className="grid max-w-100 gap-4 md:gap-5">
+          <h1 className="m-0 font-mono text-[clamp(3.5rem,8.5vw,7rem)] leading-[0.88] font-bold tracking-[-0.075em] dark:text-white">
+            rift
+          </h1>
+          <Body>
+            Rift is an agentic development toolkit for reading, discovering, and exploring
+            codebases.
+          </Body>
+        </div>
+        <Logo
+          aria-hidden="true"
+          strokeWidth={0.37}
+          className="landing-stop__mark text-primary-text"
+        />
       </Stop>
 
       <Stop id="context" alternate>
@@ -115,7 +116,7 @@ export default function HomePage() {
         </Stop>
       ))}
 
-      <Stop id="get-started" alternate>
+      <Stop id="get-started" finale>
         <Statement>Bring understanding and cohesiveness to your agentic workflow</Statement>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <Link

@@ -1,3 +1,10 @@
+html:has(.landing-page) {
+  --landing-header-space: 5.5rem;
+  --landing-footer-space: 3.35rem;
+  scroll-padding-block-start: var(--landing-header-space);
+  scroll-snap-type: y mandatory;
+}
+
 .landing-page {
   position: relative;
   flex: 1;
@@ -30,16 +37,21 @@
   position: relative;
   z-index: 1;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   max-inline-size: 94rem;
-  min-block-size: 86svh;
+  min-block-size: calc(100svh - var(--landing-header-space));
   margin-inline: auto;
-  padding: 6rem 1rem 2.75rem;
-  scroll-margin-top: 5rem;
+  padding: 1rem;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
 }
 
 .landing-stop:first-of-type {
   min-block-size: calc(100svh - 4.5rem);
+}
+
+.landing-stop:last-of-type {
+  min-block-size: calc(100svh - var(--landing-header-space) - var(--landing-footer-space));
 }
 
 .landing-stop__panel {
@@ -145,15 +157,36 @@
   height: 1.45rem;
 }
 
-.landing-stop--hero {
-  flex-direction: column;
-  justify-content: flex-end;
-  gap: 1rem;
+.landing-stop__panel--hero {
+  inline-size: 100%;
+}
+
+.landing-stop__intro {
+  align-items: center;
+  gap: clamp(1.5rem, 5svh, 3rem);
 }
 
 .landing-stop__mark {
-  align-self: center;
-  inline-size: min(73%, 14rem);
+  justify-self: center;
+  inline-size: min(68%, 11rem);
+}
+
+.landing-stop--finale {
+  display: grid;
+  grid-template-areas: "panel" "sphere";
+  align-content: center;
+  place-items: center;
+  gap: clamp(1rem, 3svh, 2.5rem);
+}
+
+.landing-stop--finale .landing-stop__panel {
+  grid-area: panel;
+}
+
+.landing-stop__sphere {
+  grid-area: sphere;
+  inline-size: min(76vw, 34svh, 17rem);
+  aspect-ratio: 1;
 }
 
 .landing-footer {
@@ -187,24 +220,37 @@
 
 @media (min-width: 48rem) {
   .landing-stop {
-    align-items: center;
-    padding: 5rem clamp(2rem, 6vw, 6rem);
+    padding-inline: clamp(2rem, 6vw, 6rem);
   }
 
-  .landing-stop--hero {
-    flex-direction: row-reverse;
-    justify-content: space-between;
+  .landing-stop__intro {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 39%);
+    min-block-size: min(21rem, 60svh);
+    padding-inline-end: clamp(1rem, 4.4vw, 4.5rem);
   }
 
   .landing-stop__mark {
-    inline-size: min(38%, 24rem);
+    inline-size: min(100%, 16rem);
   }
 
   .landing-stop--alternate {
     justify-content: flex-end;
   }
 
-  .landing-stop__panel {
+  .landing-stop__panel:not(.landing-stop__panel--hero) {
     inline-size: min(45%, 30rem);
+  }
+
+  .landing-stop--finale {
+    grid-template-areas: "sphere panel";
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .landing-stop--finale .landing-stop__panel {
+    inline-size: min(100%, 30rem);
+  }
+
+  .landing-stop__sphere {
+    inline-size: min(100%, 38svh, 24rem);
   }
 }

@@ -1,7 +1,7 @@
 import { CubicBezierCurve, Float32BufferAttribute, MathUtils, PlaneGeometry, Vector2 } from "three";
 import { ImprovedNoise } from "three/addons/math/ImprovedNoise.js";
 
-const STOP_SPACING = 22;
+export const STOP_SPACING = 22;
 const noise = new ImprovedNoise();
 
 export type RoadStop = { across: number; lift: number };
@@ -133,6 +133,7 @@ export const terrainShaders = {
     uniform vec3 ink;
     uniform vec3 ruby;
     uniform float lightMode;
+    uniform vec2 animation;
 
     float contour(float level) {
       float distanceToLine = abs(fract(level + 0.5) - 0.5);
@@ -161,7 +162,7 @@ export const terrainShaders = {
         (0.13 + spotlight * 0.87) * (0.35 + facing * 0.65);
       vec3 color = mix(ground, lineColor, strength);
 
-      float haze = exp(-fromTrace * fromTrace * 1.5);
+      float haze = exp(-fromTrace * fromTrace * 1.5) * (1.0 - animation.y);
       color = mix(color, mix(ink, ruby, 0.55), haze * spotlight * 0.022);
 
       gl_FragColor = vec4(color, 1.0);
