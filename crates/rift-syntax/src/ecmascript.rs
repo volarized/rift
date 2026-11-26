@@ -80,6 +80,7 @@ use std::num::NonZeroU16;
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
+mod callable_type_parameters;
 mod callback_parameters;
 mod commonjs;
 mod members;
@@ -243,6 +244,7 @@ pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
@@ -1623,6 +1625,48 @@ impl EcmaScriptRules<'_> {
         text.get(name.byte_range()).map(Into::into)
     }
 
+    fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let (name, kind) = type_parameters::declared_name(visited)
+            .map(|name| (name, TYPE_PARAMETER_KIND))
+            .or_else(|| {
+                callable_type_parameters::declared_name(visited)
+                    .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
+                self.kinds
+                    .ordinary_parameter(visited)
+                    .map(|(name, method)| {
+                        let kind = if method {
+                            METHOD_PARAMETER_KIND
+                        } else {
+                            PARAMETER_KIND
+                        };
+                        (name, kind)
+                    })
+            })?;
+        let name = text.get(name.byte_range())?;
+        if !name.is_ascii()
+            || name.contains('\\')
+            || (kind != TYPE_PARAMETER_KIND && name == "this")
+        {
+            return None;
+        }
+        let kinds = if kind == TYPE_PARAMETER_KIND {
+            vec![SymbolKind::Type, SymbolKind::TypeParameter]
+        } else {
+            vec![SymbolKind::Value, SymbolKind::Parameter]
+        };
+        Some(Declaration {
+            name: name.to_owned(),
+            kind,
+            kinds,
+            visibility: None,
+            body_range: None,
+            documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
+        })
+    }
+
     /// One declaration the walk reaches through a syntax element outside the kind
     /// table: a name a destructuring pattern binds, a constructor parameter
     /// property, an enum member without a value, or the anonymous class a
@@ -1633,39 +1677,8 @@ impl EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let syntax_element = visited.syntax_element();
-        if let Some(name) = type_parameters::declared_name(visited)
-            .and_then(|name| text.get(name.byte_range()))
-            .filter(|name| name.is_ascii() && !name.contains('\\'))
-        {
-            return Ok(Some(Declaration {
-                name: name.to_owned(),
-                kind: TYPE_PARAMETER_KIND,
-                kinds: vec![SymbolKind::Type, SymbolKind::TypeParameter],
-                visibility: None,
-                body_range: None,
-                documentation: Vec::new(),
-                documentation_ranges: Vec::new(),
-            }));
-        }
-        if let Some((name, method)) = self
-            .kinds
-            .ordinary_parameter(visited)
-            .and_then(|(name, method)| text.get(name.byte_range()).map(|name| (name, method)))
-            .filter(|(name, _)| *name != "this" && name.is_ascii() && !name.contains('\\'))
-        {
-            return Ok(Some(Declaration {
-                name: name.to_owned(),
-                kind: if method {
-                    METHOD_PARAMETER_KIND
-                } else {
-                    PARAMETER_KIND
-                },
-                kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
-                visibility: None,
-                body_range: None,
-                documentation: Vec::new(),
-                documentation_ranges: Vec::new(),
-            }));
+        if let Some(parameter) = self.parameter_declaration(visited, text) {
+            return Ok(Some(parameter));
         }
         let parent = visited.parent().map(Visited::syntax_element);
         let (name, kind, kinds) = if let Some(declarator) = self.kinds.pattern_declarator(visited) {
@@ -2115,6 +2128,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .ordinary_parameter(visited)
             .map(|(name, _)| name)
             .or_else(|| type_parameters::declared_name(visited))
+            .or_else(|| callable_type_parameters::declared_name(visited))
             .unwrap_or_else(|| visited.syntax_element())
     }
 
@@ -2126,6 +2140,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .ordinary_parameter(visited)
             .map(|(name, _)| name)
             .or_else(|| type_parameters::declared_name(visited))
+            .or_else(|| callable_type_parameters::declared_name(visited))
         {
             return name.start_byte();
         }
@@ -2362,9 +2377,14 @@ fn append_package_parameters(
     root: Node<'_>,
     source: &str,
     symbols: &mut Vec<crate::SyntaxSymbol>,
-    (parameters, type_parameters): (Vec<crate::SyntaxSymbol>, Vec<crate::SyntaxSymbol>),
+    candidates: ParameterDeclarations,
     facts: &crate::StaticFacts,
 ) {
+    let ParameterDeclarations {
+        values: parameters,
+        types: type_parameters,
+        callable_types,
+    } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
     } else {
@@ -2380,15 +2400,30 @@ fn append_package_parameters(
     symbols.extend(shorthand);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
     type_parameters::append(symbols, type_parameters, facts);
+    callable_type_parameters::append(root, symbols, callable_types, facts);
+}
+
+#[derive(Default)]
+struct ParameterDeclarations {
+    values: Vec<crate::SyntaxSymbol>,
+    types: Vec<crate::SyntaxSymbol>,
+    callable_types: Vec<crate::SyntaxSymbol>,
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
-fn take_parameters(
-    symbols: &mut Vec<crate::SyntaxSymbol>,
-) -> (Vec<crate::SyntaxSymbol>, Vec<crate::SyntaxSymbol>) {
-    symbols
-        .extract_if(.., |symbol| symbol.is_ecmascript_package_binding())
-        .partition(crate::SyntaxSymbol::is_ecmascript_parameter)
+fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarations {
+    let mut candidates = ParameterDeclarations::default();
+    for symbol in symbols.extract_if(.., |symbol| symbol.is_ecmascript_package_binding()) {
+        let class = if symbol.is_typescript_type_parameter() {
+            &mut candidates.types
+        } else if symbol.is_typescript_callable_type_parameter() {
+            &mut candidates.callable_types
+        } else {
+            &mut candidates.values
+        };
+        class.push(symbol);
+    }
+    candidates
 }
 
 /// An ordinary parameter adds no competing facet of an existing lexical declaration.
@@ -2526,6 +2561,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == SHORTHAND_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(SHORTHAND_PARAMETER_KIND);
+    }
+    if name == CALLABLE_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(CALLABLE_TYPE_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

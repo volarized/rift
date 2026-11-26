@@ -1199,7 +1199,9 @@ impl<'source> File<'source> {
             } else if admitted && symbol.is_typescript_type_parameter() {
                 self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && let Some(site) = site {
-                if symbol.is_typescript_signature_parameter() {
+                if symbol.is_typescript_signature_parameter()
+                    || symbol.is_typescript_callable_type_parameter()
+                {
                     return;
                 }
                 let parameter = EcmaScriptParameter { symbol, site };

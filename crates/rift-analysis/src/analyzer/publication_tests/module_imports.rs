@@ -2568,3 +2568,53 @@ fn javascript_shorthand_property_preserves_both_the_key_and_parameter() {
     );
     assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
 }
+
+#[test]
+fn typescript_callable_type_signatures_keep_distinct_parameter_ranges() {
+    const SOURCE: &str = concat!(
+        "export type Reader = (value: string) => number;\n",
+        "export interface Service { (value: string): Reader; new (value: number): Service; }\n",
+        "export function run(initial: string) { return initial; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked callable type scopes");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical callable type parameters");
+    let mut identities = BTreeSet::new();
+    for (position, _) in SOURCE.match_indices("value:") {
+        let declaration = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.range == module_runtime_range(position, "value") && row.source == "value"
+            })
+            .expect("written callable type parameter");
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&declaration.symbol)
+                && row
+                    .kinds
+                    .contains(&rift_protocol::read::SymbolKind::Parameter)
+        }));
+        assert!(identities.insert(&declaration.symbol));
+        assert!(
+            !found
+                .edges
+                .iter()
+                .any(|edge| { edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads] })
+        );
+    }
+    assert_eq!(identities.len(), 3);
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/run/initial") && edge.kinds == [EdgeKind::Reads]
+    }));
+}

@@ -723,6 +723,7 @@ fn binding_capacity(
         scoped_slots,
         type_slots,
         javascript_shorthand_slots,
+        callable_type_slots,
     ] = reserve_scoped_parameters(
         documents,
         [
@@ -735,6 +736,7 @@ fn binding_capacity(
             &demands.ecmascript.javascript_scoped_functions,
             &demands.ecmascript.typescript_types,
             &demands.ecmascript.javascript_shorthand,
+            &demands.ecmascript.typescript_callable_types,
         ],
         &mut slots,
         &mut bytes,
@@ -766,7 +768,8 @@ fn binding_capacity(
         .with_typescript_signature_parameters(signature_slots)
         .with_javascript_scoped_function_parameters(scoped_slots)
         .with_typescript_type_parameters(type_slots)
-        .with_javascript_shorthand_parameters(javascript_shorthand_slots),
+        .with_javascript_shorthand_parameters(javascript_shorthand_slots)
+        .with_typescript_callable_type_parameters(callable_type_slots),
     )
 }
 
@@ -782,6 +785,7 @@ struct EcmaScriptBindingDemand {
     javascript_scoped_functions: BindingDemand,
     typescript_types: BindingDemand,
     javascript_shorthand: BindingDemand,
+    typescript_callable_types: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -805,6 +809,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_types
         } else if symbol.is_javascript_shorthand_parameter() {
             &mut self.javascript_shorthand
+        } else if symbol.is_typescript_callable_type_parameter() {
+            &mut self.typescript_callable_types
         } else if javascript {
             &mut self.javascript_functions
         } else if symbol
@@ -829,6 +835,7 @@ impl EcmaScriptBindingDemand {
             + self.javascript_scoped_functions.count
             + self.typescript_types.count
             + self.javascript_shorthand.count
+            + self.typescript_callable_types.count
     }
 }
 

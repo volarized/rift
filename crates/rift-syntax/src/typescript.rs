@@ -211,14 +211,39 @@ mod tests {
                 ),
                 ("Array.map.callbackfn", "value_parameter", None),
                 (
+                    "Array.map.$signature#0.value",
+                    "typescript_callable_type_parameter",
+                    None
+                ),
+                (
                     "Array.reduce",
                     "method",
                     Some("reduce(callbackfn: (a: T, b: T) => T): T")
                 ),
                 (
+                    "Array.reduce.$signature#0.a",
+                    "typescript_callable_type_parameter",
+                    None
+                ),
+                (
+                    "Array.reduce.$signature#0.b",
+                    "typescript_callable_type_parameter",
+                    None
+                ),
+                (
                     "Array.reduce",
                     "method",
                     Some("reduce<U>(callbackfn: (a: U, b: T) => U, initial: U): U")
+                ),
+                (
+                    "Array.reduce.$signature#1.a",
+                    "typescript_callable_type_parameter",
+                    None
+                ),
+                (
+                    "Array.reduce.$signature#1.b",
+                    "typescript_callable_type_parameter",
+                    None
                 ),
                 ("Reader", "class", None),
                 ("Reader.read", "method", Some("read(size?: number): string")),

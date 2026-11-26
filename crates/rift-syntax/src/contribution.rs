@@ -42,6 +42,7 @@ pub struct PackageBindingSlots {
     rust_shorthand: usize,
     typescript_type_parameter: usize,
     javascript_shorthand_parameter: usize,
+    typescript_callable_type_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -77,6 +78,7 @@ impl PackageBindingSlots {
             rust_shorthand: 0,
             typescript_type_parameter: 0,
             javascript_shorthand_parameter: 0,
+            typescript_callable_type_parameter: 0,
         }
     }
 
@@ -213,6 +215,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for declared parameters of TypeScript callable types.
+    #[must_use]
+    pub const fn with_typescript_callable_type_parameters(mut self, count: usize) -> Self {
+        self.typescript_callable_type_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -239,6 +248,7 @@ impl PackageBindingSlots {
             .saturating_add(self.javascript_scoped_function_parameter)
             .saturating_add(self.typescript_type_parameter)
             .saturating_add(self.javascript_shorthand_parameter)
+            .saturating_add(self.typescript_callable_type_parameter)
     }
 
     fn admit(
@@ -262,6 +272,8 @@ impl PackageBindingSlots {
             &mut self.typescript_type_parameter
         } else if symbol.is_javascript_shorthand_parameter() {
             &mut self.javascript_shorthand_parameter
+        } else if symbol.is_typescript_callable_type_parameter() {
+            &mut self.typescript_callable_type_parameter
         } else if matches!(language, "javascript" | "typescript")
             && symbol.is_ecmascript_parameter()
         {
