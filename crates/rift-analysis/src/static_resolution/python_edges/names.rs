@@ -131,6 +131,23 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Resolves direct receiver uses after the earlier function-local passes.
+    pub(in crate::static_resolution) fn python_receiver_reads(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for &(read, name) in file.facts.python_receiver_reads() {
+            if !work.charge() {
+                return;
+            }
+            if let Some(target) = file.python_receiver_read_target(read, name, work) {
+                self.record_python_local_read(file, read, target, result);
+            }
+        }
+    }
+
     fn record_python_local_read(
         &self,
         file: &File<'source>,
@@ -540,6 +557,35 @@ fn shares(kind: StaticBindingKind) -> bool {
 }
 
 impl<'source> File<'source> {
+    fn python_receiver_read_target(
+        &self,
+        read: ByteRange,
+        name: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let caller = self.enclosing_callable(read)?;
+        let [receiver] = self
+            .python_receivers
+            .get(&caller.symbol.item_range)?
+            .as_slice()
+        else {
+            return None;
+        };
+        if receiver.name != name {
+            return None;
+        }
+        let symbol = self.python_parameters.get(&name).copied().flatten()?;
+        let target = Target {
+            file: self.document,
+            symbol,
+        };
+        matches!(
+            self.python_local_read_scope(read, name, target, work),
+            Some(LocalReadScope::Single)
+        )
+        .then_some(target)
+    }
+
     /// The authored local initialization available to this read in its own function.
     fn python_local_read_scope(
         &self,

@@ -94,12 +94,17 @@ pub(in crate::static_analysis) struct Names<'source> {
     classes: BTreeSet<ByteRange>,
     reads: Vec<ByteRange>,
     direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
+    receivers: BTreeMap<ByteRange, ByteRange>,
     /// Written names with the scope that holds the target.
     writes: Vec<(ByteRange, ByteRange, NameUse)>,
     pub(in crate::static_analysis) invalid_type_parameter_default: bool,
 }
 
 impl<'source> Names<'source> {
+    pub(super) fn receiver_binding(&mut self, scope: ByteRange, name: ByteRange) {
+        self.receivers.insert(scope, name);
+    }
+
     pub(super) fn direct_binding(
         &mut self,
         source: &'source str,
@@ -292,6 +297,10 @@ impl EdgePythonKinds {
             }
             break;
         }
+        self.function_body_scope(visited)
+    }
+
+    fn function_body_scope<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let scope = edge_enclosing(visited, &self.scopes)?;
         let body = scope.child_by_field_id(self.body)?;
         (scope.kind_id() == self.definitions[0]
@@ -342,6 +351,26 @@ impl EdgePythonKinds {
         Ok(())
     }
 
+    fn edge_receiver_read(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        read: ByteRange,
+        facts: &mut StaticFactsParts,
+        names: &Names<'_>,
+    ) -> Result<(), RiftError> {
+        if names.receivers.is_empty() {
+            return Ok(());
+        }
+        if let Some(scope) = self.function_body_scope(visited)
+            && let Some(&name) = names.receivers.get(&byte_range(scope)?)
+            && text(source, read) == text(source, name)
+        {
+            facts.python_receiver_reads.push((read, name));
+        }
+        Ok(())
+    }
+
     /// Records what a name outside annotations does.
     pub(super) fn edge_name(
         &self,
@@ -353,6 +382,15 @@ impl EdgePythonKinds {
         let name = visited.syntax_element();
         let range = byte_range(name)?;
         let name_use = self.name_use(visited);
+        let callee = name_use == NameUse::Stated
+            && visited.parent().is_some_and(|parent| {
+                let parent = parent.syntax_element();
+                parent.kind_id() == self.call
+                    && parent.child_by_field_id(self.function) == Some(name)
+            });
+        if name_use == NameUse::Read || callee {
+            self.edge_receiver_read(visited, source, range, facts, names)?;
+        }
         match name_use {
             NameUse::Stated => return Ok(()),
             NameUse::Read => {

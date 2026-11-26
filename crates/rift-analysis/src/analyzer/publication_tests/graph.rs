@@ -320,13 +320,19 @@ const PYTHON_RECEIVER_SOURCE: &str = concat!(
     "        return self.current()\n",
     "    @classmethod\n",
     "    def factory(cls):\n",
-    "        return cls, cls()\n",
+    "        return cls()\n",
     "    @staticmethod\n",
     "    def identity(self):\n",
     "        return self\n",
     "def free(value):\n",
     "    return value\n",
 );
+
+fn is_python_receiver_fixture_name(symbol: &str) -> bool {
+    ["/current/self", "/call_current/self", "/factory/cls"]
+        .iter()
+        .any(|suffix| symbol.ends_with(suffix))
+}
 
 #[test]
 fn package_retains_python_method_receiver_declarations() {
@@ -372,17 +378,12 @@ fn package_retains_python_method_receiver_declarations() {
             ..rift_protocol::configuration::PackageConfiguration::default()
         },
     );
-    let is_receiver = |symbol: &str| {
-        ["/current/self", "/call_current/self", "/factory/cls"]
-            .iter()
-            .any(|suffix| symbol.ends_with(suffix))
-    };
     assert_eq!(
         prior.declarations,
         complete
             .declarations
             .iter()
-            .filter(|entry| !is_receiver(entry.symbol.as_str()))
+            .filter(|entry| !is_python_receiver_fixture_name(entry.symbol.as_str()))
             .cloned()
             .collect::<Vec<_>>()
     );
@@ -391,7 +392,7 @@ fn package_retains_python_method_receiver_declarations() {
         complete
             .edges
             .iter()
-            .filter(|entry| !is_receiver(entry.to.as_str()))
+            .filter(|entry| !is_python_receiver_fixture_name(entry.to.as_str()))
             .cloned()
             .collect::<Vec<_>>()
     );
@@ -408,6 +409,47 @@ fn package_retains_python_method_receiver_declarations() {
             "{caller}"
         );
     }
+}
+
+#[test]
+fn package_python_method_receiver_reads_follow_earlier_edges() {
+    let files = [("click.py", PYTHON_RECEIVER_SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    for (owner, token, written) in [
+        ("/Counter/current", "self", "return self\n"),
+        ("/Counter/call_current", "self", "return self.current()"),
+        ("/Counter/factory", "cls", "return cls()"),
+    ] {
+        let target = format!("{owner}/{token}");
+        let start = PYTHON_RECEIVER_SOURCE.find(written).expect("authored use") + "return ".len();
+        assert!(
+            complete.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.from.as_str().ends_with(owner)
+                    && edge.to.as_str().ends_with(&target)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == u64::try_from(start).expect("start")
+                            && site.range.end == u64::try_from(start + token.len()).expect("end")
+                    })
+            }),
+            "{target}"
+        );
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| !is_python_receiver_fixture_name(edge.to.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let tight = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    assert_eq!(tight.declarations, complete.declarations);
+    assert_eq!(tight.edges, prior);
 }
 
 #[test]

@@ -455,10 +455,14 @@ impl EdgeStore {
         edges_max: usize,
     ) {
         let supplemental_start = resolution.supplemental_start.take();
+        let receiver_start = resolution
+            .python_receiver_start
+            .take()
+            .unwrap_or(resolution.occurrences.len());
         let capture_start = resolution
             .python_capture_start
             .take()
-            .unwrap_or(resolution.occurrences.len());
+            .unwrap_or(receiver_start);
         let python_reassignment_start = resolution
             .python_reassignment_start
             .take()
@@ -472,7 +476,8 @@ impl EdgeStore {
         }
         let (internal, external) =
             supplemental_start.unwrap_or((late_start, resolution.external.len()));
-        let (earlier, captured_reads) = resolution.occurrences.split_at(capture_start);
+        let (earlier, receiver_reads) = resolution.occurrences.split_at(receiver_start);
+        let (earlier, captured_reads) = earlier.split_at(capture_start);
         let (earlier, reassigned_reads) = earlier.split_at(python_reassignment_start);
         let (earlier, late_supplemental) = earlier.split_at(late_start);
         let (occurrences, supplemental) = earlier.split_at(internal);
@@ -485,6 +490,7 @@ impl EdgeStore {
         let mut late = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         let mut reassigned = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         let mut captured = BTreeMap::<&SymbolId, Vec<Edge>>::new();
+        let mut receivers = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         admit_occurrences(occurrences, spans, &self.edge_modules, &mut primary);
         admit_external(external, spans, &self.edge_modules, &mut primary);
         admit_occurrences(supplemental, spans, &self.edge_modules, &mut additional);
@@ -497,7 +503,8 @@ impl EdgeStore {
         admit_occurrences(late_supplemental, spans, &self.edge_modules, &mut late);
         admit_occurrences(reassigned_reads, spans, &self.edge_modules, &mut reassigned);
         admit_occurrences(captured_reads, spans, &self.edge_modules, &mut captured);
-        let mut batches = [primary, additional, late, reassigned, captured];
+        admit_occurrences(receiver_reads, spans, &self.edge_modules, &mut receivers);
+        let mut batches = [primary, additional, late, reassigned, captured, receivers];
         for position in 0..batches.len() {
             let (prior, next) = batches.split_at_mut(position);
             for (from, edges) in &mut next[0] {

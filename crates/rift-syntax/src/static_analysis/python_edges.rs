@@ -565,17 +565,15 @@ impl EdgePythonKinds {
                     .transpose()?;
                 let receiver = class_name.filter(|_| first && !collects);
                 if scope.kind_id() == self.definitions[0]
-                    && receiver.is_none()
                     && crate::python::parameter_name(parameter) == Some(name)
                 {
                     let scope_range = self.scope_range(scope)?;
-                    names.direct_binding(
-                        source,
-                        byte_range(name)?,
-                        scope_range,
-                        scope_range.start,
-                        false,
-                    );
+                    let name = byte_range(name)?;
+                    if receiver.is_some() {
+                        names.receiver_binding(scope_range, name);
+                    } else {
+                        names.direct_binding(source, name, scope_range, scope_range.start, false);
+                    }
                 }
                 facts.bindings.push(self.scoped_binding(
                     name,
