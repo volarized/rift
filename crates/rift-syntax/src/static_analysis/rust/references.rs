@@ -21,7 +21,7 @@ impl Kinds {
             && element
                 .child_by_field_id(self.body)
                 .is_none_or(|body| body.kind_id() == self.ordered_value_fields);
-        if self.local_value_items.contains(&id) || constructor {
+        if self.value_items.contains(&id) || constructor {
             self.record_local_value(visited, facts)?;
         } else if [
             self.identifier,

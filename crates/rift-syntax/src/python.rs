@@ -175,10 +175,13 @@ const FORMATTED_PREFIXES: [char; 2] = ['f', 'F'];
 const FUNCTION_KIND_WORD: &str = "function";
 /// Provider kind for an ordinary function parameter at its name token.
 pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
+pub(crate) const VARIADIC_PARAMETER_KIND_WORD: &str = "variadic_parameter";
+pub(crate) const OVERLOAD_PARAMETER_KIND_WORD: &str = "overload_parameter";
 /// The kind word a Python class carries on the wire.
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
 const VARIABLE_KIND_WORD: &str = "variable";
+pub(crate) const LOOP_BINDING_KIND_WORD: &str = "loop_binding";
 /// The kind word a function declared in a class body carries on the wire.
 const METHOD_KIND_WORD: &str = "method";
 /// The kind word a `type` statement carries on the wire.
@@ -211,6 +214,7 @@ struct PythonKinds {
     call: u16,
     typed_parameter: u16,
     default_parameter: [u16; 2],
+    variadic_parameters: [u16; 2],
     string_start: u16,
     import_from: u16,
     aliased_import: u16,
@@ -269,6 +273,10 @@ impl PythonKinds {
                 kind_id(language, "default_parameter"),
                 kind_id(language, "typed_default_parameter"),
             ],
+            variadic_parameters: [
+                kind_id(language, "list_splat_pattern"),
+                kind_id(language, "dictionary_splat_pattern"),
+            ],
             string_start: kind_id(language, STRING_START_KIND),
             import_from: kind_id(language, IMPORT_FROM_KIND),
             aliased_import: kind_id(language, ALIASED_IMPORT_KIND),
@@ -302,7 +310,7 @@ impl PythonKinds {
     }
 }
 
-/// The written identifier of an ordinary non-variadic function parameter.
+/// The written identifier of a function parameter.
 pub(crate) fn parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
     let kinds = python_kinds();
     if parameter.has_error() {
@@ -317,10 +325,19 @@ pub(crate) fn parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
             .find(|child| !child.is_extra())
     } else if kinds.default_parameter.contains(&kind) {
         parameter.child_by_field_id(kinds.name.get())
+    } else if kinds.variadic_parameters.contains(&kind) {
+        Some(parameter)
     } else {
         None
     };
-    name.filter(|name| name.kind_id() == kinds.identifier)
+    let name = name?;
+    let name = if kinds.variadic_parameters.contains(&name.kind_id()) {
+        name.named_children(&mut name.walk())
+            .find(|child| !child.is_extra())?
+    } else {
+        name
+    };
+    (name.kind_id() == kinds.identifier).then_some(name)
 }
 
 /// Resolves one syntax element kind id, proving the pinned grammar defines it.
@@ -648,12 +665,21 @@ impl PythonRules {
         target: Visited<'walk, 'tree>,
         through_pattern: bool,
     ) -> Option<Visited<'walk, 'tree>> {
+        self.target_statement(target, self.kinds.assignment, through_pattern)
+    }
+
+    fn target_statement<'walk, 'tree>(
+        &self,
+        target: Visited<'walk, 'tree>,
+        statement: u16,
+        through_pattern: bool,
+    ) -> Option<Visited<'walk, 'tree>> {
         let mut child = target;
         let mut patterned = false;
         loop {
             let parent = child.parent()?;
             let id = parent.syntax_element().kind_id();
-            if id == self.kinds.assignment {
+            if id == statement {
                 let binds = parent
                     .syntax_element()
                     .child_by_field_id(self.kinds.left.get())
@@ -698,9 +724,16 @@ impl PythonRules {
     fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
         let name = visited.syntax_element();
         let parent = visited.parent()?;
-        let kind = parent.syntax_element().kind_id();
+        let variadic = self
+            .kinds
+            .variadic_parameters
+            .contains(&parent.syntax_element().kind_id());
+        let holder = if variadic { parent.parent()? } else { parent };
+        let kind = holder.syntax_element().kind_id();
         let parameter =
             if kind == self.kinds.typed_parameter || self.kinds.default_parameter.contains(&kind) {
+                holder
+            } else if variadic {
                 parent
             } else {
                 visited
@@ -715,7 +748,11 @@ impl PythonRules {
             return None;
         }
         Some(Declaration {
-            kind: PARAMETER_KIND_WORD,
+            kind: if variadic {
+                VARIADIC_PARAMETER_KIND_WORD
+            } else {
+                PARAMETER_KIND_WORD
+            },
             kinds: vec![SymbolKind::Value, SymbolKind::Parameter],
             ..Self::variable(text.get(name.byte_range())?, DeclarationScope::Local)
         })
@@ -729,6 +766,21 @@ impl PythonRules {
             text.get(visited.syntax_element().byte_range())?,
             scope,
         ))
+    }
+
+    /// The name an authored for statement binds inside a named function.
+    fn loop_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let statement = self.target_statement(visited, self.kinds.loop_kinds[0], false)?;
+        if statement.syntax_element().has_error()
+            || self.statement_scope(statement)? != DeclarationScope::Local
+        {
+            return None;
+        }
+        let name = text.get(visited.syntax_element().byte_range())?;
+        Some(Declaration {
+            kind: LOOP_BINDING_KIND_WORD,
+            ..Self::variable(name, DeclarationScope::Local)
+        })
     }
 
     /// The method an instance attribute target belongs to: the visited
@@ -1166,7 +1218,8 @@ impl GrammarRules for PythonRules {
         if id == self.kinds.identifier {
             return Ok(self
                 .parameter_declaration(visited, text)
-                .or_else(|| self.pattern_declaration(visited, text)));
+                .or_else(|| self.pattern_declaration(visited, text))
+                .or_else(|| self.loop_declaration(visited, text)));
         }
         if id == self.kinds.attribute {
             let Some(_) = self.attribute_method(visited, text) else {
@@ -1333,6 +1386,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         export_bindings.sort_by_key(|binding| binding.range.start);
         let (mut static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
+        retain_loop_bindings(&mut symbols, &static_facts, source.text);
         retain_parameters(&mut symbols, &mut static_facts);
         Ok(SyntaxDocument::new(
             self.language.clone(),
@@ -1368,8 +1422,66 @@ impl SyntaxProvider for PythonSyntaxProvider {
     }
 }
 
-/// Keeps the parameter candidates with exact non-receiver bindings and no other
-/// declaration of the same Python name. An assignment may already own that name.
+/// Withholds loop targets redirected to another scope or already declared there.
+fn retain_loop_bindings(
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+    facts: &crate::StaticFacts,
+    source: &str,
+) {
+    use std::collections::BTreeSet;
+
+    if !symbols
+        .iter()
+        .any(crate::SyntaxSymbol::is_python_loop_binding)
+    {
+        return;
+    }
+    let text = |range: crate::ByteRange| {
+        source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+    };
+    let redirects = facts
+        .bindings()
+        .iter()
+        .filter_map(|binding| match binding.kind {
+            crate::StaticBindingKind::PythonGlobal | crate::StaticBindingKind::PythonNonlocal => {
+                Some((binding.scope, text(binding.name)?))
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let bindings = facts
+        .bindings()
+        .iter()
+        .map(|binding| (binding.name, binding.scope))
+        .collect::<BTreeMap<_, _>>();
+    let incumbent = symbols
+        .iter()
+        .filter(|symbol| !symbol.is_python_loop_binding())
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let withheld = symbols
+        .iter()
+        .filter(|symbol| symbol.is_python_loop_binding())
+        .filter_map(|symbol| {
+            let name = symbol.name_range?;
+            let admitted = bindings
+                .get(&name)
+                .is_some_and(|scope| !redirects.contains(&(*scope, symbol.name.as_str())))
+                && !incumbent.contains(symbol.qualified_name.as_str())
+                && rift_core::is_portable_name(&symbol.qualified_name);
+            (!admitted).then_some(name)
+        })
+        .collect::<BTreeSet<_>>();
+    symbols.retain(|symbol| {
+        !symbol.is_python_loop_binding()
+            || symbol
+                .name_range
+                .is_some_and(|name| !withheld.contains(&name))
+    });
+}
+
+/// Keeps parameter declarations with exact bindings, including repeated names
+/// from a proved overload family. An assignment may already own a name.
 fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::StaticFacts) {
     use std::collections::BTreeSet;
 
@@ -1385,32 +1497,42 @@ fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::
                     binding.kind,
                     crate::StaticBindingKind::Shadow
                         | crate::StaticBindingKind::PythonAnnotation { .. }
+                        | crate::StaticBindingKind::PythonReceiver { .. }
                 )
         })
-        .map(|binding| binding.name)
-        .collect::<BTreeSet<_>>();
+        .map(|binding| (binding.name, binding.scope))
+        .collect::<BTreeMap<_, _>>();
     let mut names = BTreeMap::new();
     for symbol in symbols.iter() {
         *names
             .entry(symbol.qualified_name.as_str())
             .or_insert(0_usize) += 1;
     }
-    let mut withheld = BTreeSet::new();
-    for symbol in symbols.iter().filter(|symbol| symbol.is_python_parameter()) {
-        if let Some(range) = symbol.name_range
-            && (names.get(symbol.qualified_name.as_str()) != Some(&1)
-                || !eligible.contains(&range)
-                || !rift_core::is_portable_name(&symbol.name)
-                || !rift_core::is_portable_name(&symbol.qualified_name))
-        {
-            withheld.insert(range);
+    let overload_parameters = overload::repeated_parameters(symbols, facts, &names, &eligible);
+    let withheld = symbols
+        .iter()
+        .filter(|symbol| symbol.is_python_parameter())
+        .filter_map(|symbol| {
+            let range = symbol.name_range?;
+            let admitted = eligible.contains_key(&range)
+                && (names.get(symbol.qualified_name.as_str()) == Some(&1)
+                    || overload_parameters.contains(&range))
+                && rift_core::is_portable_name(&symbol.name)
+                && rift_core::is_portable_name(&symbol.qualified_name);
+            (!admitted).then_some(range)
+        })
+        .collect::<BTreeSet<_>>();
+    symbols.retain_mut(|symbol| {
+        if !symbol.is_python_parameter() {
+            return true;
         }
-    }
-    symbols.retain(|symbol| {
-        !symbol.is_python_parameter()
-            || symbol
-                .name_range
-                .is_some_and(|range| !withheld.contains(&range))
+        let Some(range) = symbol.name_range else {
+            return false;
+        };
+        if overload_parameters.contains(&range) {
+            symbol.kind = OVERLOAD_PARAMETER_KIND_WORD;
+        }
+        !withheld.contains(&range)
     });
     facts.retain_python_local_reads(|name| !withheld.contains(&name));
 }
@@ -1419,8 +1541,11 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
     [
         FUNCTION_KIND_WORD,
         PARAMETER_KIND_WORD,
+        VARIADIC_PARAMETER_KIND_WORD,
+        OVERLOAD_PARAMETER_KIND_WORD,
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
+        LOOP_BINDING_KIND_WORD,
         METHOD_KIND_WORD,
         TYPE_ALIAS_KIND_WORD,
         MODULE_KIND,

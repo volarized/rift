@@ -67,6 +67,23 @@ pub(crate) struct StaticResolution {
     pub(crate) supplemental_start: Option<(usize, usize)>,
     /// First internal occurrence added after the earlier supplemental passes.
     pub(crate) late_supplemental_start: Option<usize>,
+    /// First reassigned local read, after all earlier reference passes.
+    pub(crate) python_reassignment_start: Option<usize>,
+    /// First captured local read, after the same-function reads.
+    pub(crate) python_capture_start: Option<usize>,
+    /// First method receiver read, after earlier local and captured reads.
+    pub(crate) python_receiver_start: Option<usize>,
+    /// First variadic parameter read, after the earlier parameter reads.
+    pub(crate) python_variadic_start: Option<usize>,
+    /// First generated initializer keyword reference, after earlier references.
+    pub(crate) python_initializer_start: Option<usize>,
+    /// First reference inside a compound Python string annotation.
+    pub(crate) python_quoted_type_start: Option<usize>,
+    pub(crate) python_overload_parameter_start: Option<usize>,
+    /// First internal and external occurrence resolved through authored Rust extern crate aliases.
+    pub(crate) rust_extern_alias_start: Option<(usize, usize)>,
+    /// Existing call sites left unresolved in files with authored extern bindings.
+    pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -192,6 +209,7 @@ fn resolve_by<'source>(
     };
     files(&index, &mut work, &mut resolution);
     external::admit_declared(namespace, &mut resolution.external, work_max);
+    index.resolve_rust_extern_aliases(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -217,7 +235,11 @@ enum DeferredReferences<'source> {
         names: Vec<ByteRange>,
     },
     PythonLocals,
-    PythonParameters,
+    PythonParameters(Vec<python_edges::ReassignedLocalRead<'source>>),
+    PythonReassignments(Vec<python_edges::ReassignedLocalRead<'source>>),
+    PythonCaptures,
+    PythonReceivers,
+    PythonVariadics,
     TypeScriptParameters(Vec<ByteRange>),
     Rust {
         pass: RustReferencePass,
@@ -237,6 +259,17 @@ struct DeferredImports<'source> {
     python_qualifiers: Vec<python_edges::PythonImportQualifier<'source>>,
     rust_macros: Vec<ByteRange>,
 }
+
+struct PendingPythonReferences<'index, 'source> {
+    file: &'index File<'source>,
+    remaining: usize,
+    initializers: Option<python_edges::InitializerCalls>,
+    quoted_types: bool,
+    overload_reads: bool,
+}
+
+type PendingPythonFiles<'index, 'source> =
+    BTreeMap<&'index str, PendingPythonReferences<'index, 'source>>;
 
 /// Budget one file's pass may spend: a floor and an amount for each captured element.
 ///
@@ -485,6 +518,10 @@ struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
+    /// Extern crate aliases are resolved after existing name, call and publication work.
+    rust_extern_aliases: Vec<&'source StaticBinding>,
+    /// Authored bindings that can shadow an implicit runtime spelling.
+    rust_runtime_aliases: BTreeMap<&'source str, EnclosingDefinitions<&'source StaticBinding>>,
     /// Exact class initializer bodies, by the stable variable's physical name.
     javascript_class_bodies: BTreeMap<ByteRange, ByteRange>,
     /// The names with more than [`SCANNED_BINDINGS_MAX`] bindings whose scopes nest.
@@ -654,6 +691,8 @@ impl<'source> File<'source> {
             document,
             facts,
             by_name: BTreeMap::new(),
+            rust_extern_aliases: Vec::new(),
+            rust_runtime_aliases: BTreeMap::new(),
             javascript_class_bodies: BTreeMap::new(),
             by_scope: BTreeMap::new(),
             by_range: BTreeMap::new(),
@@ -777,7 +816,17 @@ impl<'source> File<'source> {
 
     fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
         self.index_python_flow(work)?;
+        let mut runtime_aliases = Bindings::new();
         for binding in self.facts.bindings() {
+            if matches!(binding.kind, StaticBindingKind::RustExternCrate { .. }) {
+                self.rust_extern_aliases.push(binding);
+                if let Some(name) = self.text(binding.name)
+                    && external::RUST_RUNTIME_CRATES.contains(&name)
+                {
+                    runtime_aliases.entry(name).or_default().push(binding);
+                }
+                continue;
+            }
             if !work.charge() {
                 return None;
             }
@@ -816,6 +865,7 @@ impl<'source> File<'source> {
                     .insert(annotation.start, annotation.end);
             }
         }
+        self.index_rust_runtime_aliases(runtime_aliases);
         self.index_python_globals(work)?;
         for (name, bindings) in &self.by_name {
             if bindings.len() <= SCANNED_BINDINGS_MAX {
@@ -1034,7 +1084,7 @@ impl<'source> File<'source> {
         [
             self.facts.calls().len(),
             self.primary_reference_count,
-            self.facts.bindings().len(),
+            self.facts.bindings().len() - self.rust_extern_aliases.len(),
             self.facts.python_deletions().len(),
             self.facts.heritage_edges().len(),
             self.document.facts.symbols().len() - self.package_binding_count,
@@ -1044,10 +1094,42 @@ impl<'source> File<'source> {
     }
 
     fn has_python_local_reads(&self) -> bool {
+        self.facts.python_local_reads().iter().any(|(_, name)| {
+            match self.python_parameters.get(name) {
+                Some(Some(symbol)) => !symbol.is_python_overload_parameter(),
+                Some(None) => false,
+                None => true,
+            }
+        })
+    }
+
+    fn python_local_pass(&self) -> Option<DeferredReferences<'source>> {
+        self.has_python_local_reads()
+            .then_some(DeferredReferences::PythonLocals)
+            .or_else(|| self.python_after_local_pass())
+    }
+
+    fn python_after_local_pass(&self) -> Option<DeferredReferences<'source>> {
+        (!self.facts.python_captured_local_reads().is_empty())
+            .then_some(DeferredReferences::PythonCaptures)
+            .or_else(|| self.python_after_captures_pass())
+    }
+
+    fn python_after_captures_pass(&self) -> Option<DeferredReferences<'source>> {
         self.facts
-            .python_local_reads()
+            .python_receiver_reads()
             .iter()
-            .any(|(_, name)| !matches!(self.python_parameters.get(name), Some(None)))
+            .any(|(_, name)| matches!(self.python_parameters.get(name), Some(Some(_))))
+            .then_some(DeferredReferences::PythonReceivers)
+            .or_else(|| self.python_variadic_pass())
+    }
+
+    fn python_variadic_pass(&self) -> Option<DeferredReferences<'source>> {
+        self.facts
+            .python_variadic_reads()
+            .iter()
+            .any(|(_, name)| matches!(self.python_parameters.get(name), Some(Some(_))))
+            .then_some(DeferredReferences::PythonVariadics)
     }
 
     fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
@@ -1295,6 +1377,7 @@ struct Index<'source> {
     graph: &'source NormalizedGraph,
     provider: ProviderId,
     files: Arc<BTreeMap<&'source str, File<'source>>>,
+    rust_extern_files: Vec<&'source str>,
     rust: rust::Namespaces<'source>,
     javascript: javascript::PackageModes<'source>,
     owners: external::Owners,
@@ -1326,21 +1409,11 @@ impl<'source> Index<'source> {
             .and_then(|provider| graph.publications().provider(provider))
             .map(rift_provider::ProviderPublication::revision);
         let admitted_binding = |target| {
-            provider
-                .as_ref()
-                .zip(syntax_publication)
-                .is_some_and(|(provider, publication)| {
-                    syntax_target(graph, provider, publication, target).is_some_and(
-                        |(reference, _)| {
-                            graph.record_for(&reference).is_some_and(|record| {
-                                record.resolution() == rift_core::SymbolResolution::Established
-                            })
-                        },
-                    )
-                })
+            Self::admitted_binding(graph, provider.as_ref().zip(syntax_publication), target)
         };
         let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
+        let mut rust_extern_files = Vec::new();
         for document in documents {
             if !work.charge() {
                 return None;
@@ -1366,7 +1439,11 @@ impl<'source> Index<'source> {
                 &admitted_binding,
                 work,
             )?;
-            if files.insert(document.path.as_str(), file).is_some() {
+            let path = document.path.as_str();
+            if !file.rust_extern_aliases.is_empty() {
+                rust_extern_files.push(path);
+            }
+            if files.insert(path, file).is_some() {
                 return None;
             }
         }
@@ -1388,6 +1465,7 @@ impl<'source> Index<'source> {
                 }
             }
         }
+        rust_extern_files.sort_unstable();
         let files = Arc::new(files);
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
@@ -1396,6 +1474,7 @@ impl<'source> Index<'source> {
             graph,
             provider: provider?,
             files,
+            rust_extern_files,
             rust,
             javascript,
             owners,
@@ -1416,6 +1495,17 @@ impl<'source> Index<'source> {
         index.edge_python_classes = index.python_class_orders(FileWork::CLASS_ORDERS, work);
         index.python_aliases = index.python_class_alias_targets(aliases, work);
         Some(index)
+    }
+
+    fn admitted_binding(
+        graph: &NormalizedGraph,
+        syntax: Option<(&ProviderId, rift_core::ProviderRevision)>,
+        target: Target<'_>,
+    ) -> bool {
+        syntax
+            .and_then(|(provider, publication)| syntax_target(graph, provider, publication, target))
+            .and_then(|(reference, _)| graph.record_for(&reference))
+            .is_some_and(|record| record.resolution() == rift_core::SymbolResolution::Established)
     }
 
     /// The site of an import whose declaration a dependency or the standard library owns.
@@ -1455,6 +1545,10 @@ impl<'source> Index<'source> {
         let mut pending = files.as_slice();
         let mut deferred_references = Vec::new();
         let mut rust_qualifiers = Vec::new();
+        let mut pending_python = PendingPythonFiles::new();
+        let has_initializers = files
+            .iter()
+            .any(|file| !file.facts.python_initializers().is_empty());
         while !pending.is_empty() && !work.exhausted {
             let run = file_work.run(pending, work.budget.remaining());
             let (run, rest) = pending.split_at(run.max(1));
@@ -1491,13 +1585,44 @@ impl<'source> Index<'source> {
                 work.exhausted = apart.exhausted && left < file_work.max(file);
                 let over_share = apart.exhausted && !work.exhausted;
                 work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+                let remaining = file_work.max(file).saturating_sub(apart.used);
+                let initializers = if has_initializers {
+                    python_edges::InitializerCalls::capture(file, &apart.resolution)
+                } else {
+                    None
+                };
+                let quoted_types = file.document.facts.language().name == "python"
+                    && file.facts.references().iter().any(|reference| {
+                        reference.role == ReferenceRole::Type
+                            && python_edges::quoted_type_text(file, reference.target).is_some()
+                    });
+                let overload_reads = file.facts.python_local_reads().iter().any(|(_, name)| {
+                    file.python_parameters.get(name).is_some_and(|symbol| {
+                        symbol.is_some_and(rift_syntax::SyntaxSymbol::is_python_overload_parameter)
+                    })
+                });
+                if initializers.is_some() || quoted_types || overload_reads {
+                    pending_python.insert(
+                        file.document.path.as_str(),
+                        PendingPythonReferences {
+                            file,
+                            remaining,
+                            initializers,
+                            quoted_types,
+                            overload_reads,
+                        },
+                    );
+                }
                 if let Some(sites) = apart.deferred_references {
-                    let remaining = file_work.max(file).saturating_sub(apart.used);
                     let queue = match sites {
                         DeferredReferences::Python { .. }
                         | DeferredReferences::PythonQualifiers { .. }
                         | DeferredReferences::PythonLocals
-                        | DeferredReferences::PythonParameters
+                        | DeferredReferences::PythonParameters(_)
+                        | DeferredReferences::PythonReassignments(_)
+                        | DeferredReferences::PythonCaptures
+                        | DeferredReferences::PythonReceivers
+                        | DeferredReferences::PythonVariadics
                         | DeferredReferences::TypeScriptParameters(_) => &mut deferred_references,
                         DeferredReferences::Rust { .. } => &mut rust_qualifiers,
                     };
@@ -1508,7 +1633,13 @@ impl<'source> Index<'source> {
         }
         if !work.exhausted {
             deferred_references.extend(rust_qualifiers);
-            self.resolve_deferred_references(deferred_references, work, resolution);
+            self.resolve_deferred_references(
+                deferred_references,
+                work,
+                resolution,
+                &mut pending_python,
+            );
+            self.resolve_python_tail(pending_python, work, resolution);
         }
     }
 
@@ -1519,6 +1650,7 @@ impl<'source> Index<'source> {
         references: Vec<(&File<'source>, usize, DeferredReferences<'source>)>,
         work: &mut Work,
         resolution: &mut StaticResolution,
+        pending_python: &mut PendingPythonFiles<'_, 'source>,
     ) {
         if !references.is_empty() {
             resolution.supplemental_start =
@@ -1532,6 +1664,10 @@ impl<'source> Index<'source> {
         let mut rust_local_sites = VecDeque::new();
         let mut python_local_sites = VecDeque::new();
         let mut python_parameter_sites = VecDeque::new();
+        let mut python_reassigned_sites = VecDeque::new();
+        let mut python_captured_sites = VecDeque::new();
+        let mut python_receiver_sites = VecDeque::new();
+        let mut python_variadic_sites = VecDeque::new();
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())
@@ -1539,62 +1675,33 @@ impl<'source> Index<'source> {
             .or_else(|| python_local_sites.pop_front())
             .or_else(|| python_parameter_sites.pop_front())
             .or_else(|| typescript_parameter_sites.pop_front())
+            .or_else(|| python_reassigned_sites.pop_front())
+            .or_else(|| python_captured_sites.pop_front())
+            .or_else(|| python_receiver_sites.pop_front())
+            .or_else(|| python_variadic_sites.pop_front())
         {
             resolution.mark_late_admission(&sites);
             let left = work.budget.remaining();
             let budget = left.min(remaining);
             let mut deferred = Work::new(budget);
-            let locals = file
-                .has_python_local_reads()
-                .then_some(DeferredReferences::PythonLocals);
-            let next = match sites {
-                DeferredReferences::Python { names, imports } => {
-                    let names = names.map_or_else(Vec::new, |sites| {
-                        self.python_name_references(file, sites, &mut deferred, resolution)
-                    });
-                    (!names.is_empty() || !imports.is_empty())
-                        .then_some(DeferredReferences::PythonQualifiers { imports, names })
-                        .or(locals)
-                }
-                DeferredReferences::PythonQualifiers { imports, names } => {
-                    self.python_module_qualifiers(file, imports, names, &mut deferred, resolution);
-                    locals
-                }
-                DeferredReferences::PythonLocals => {
-                    self.python_local_reads(file, &mut deferred, resolution, false);
-                    file.python_parameters
-                        .values()
-                        .any(Option::is_some)
-                        .then_some(DeferredReferences::PythonParameters)
-                }
-                DeferredReferences::PythonParameters => {
-                    self.python_local_reads(file, &mut deferred, resolution, true);
-                    None
-                }
-                DeferredReferences::TypeScriptParameters(sites) => {
-                    self.typescript_parameter_reads(file, sites, &mut deferred, resolution);
-                    None
-                }
-                DeferredReferences::Rust {
-                    pass,
-                    macro_imports,
-                } => self
-                    .resolve_deferred_rust(file, &pass, &macro_imports, &mut deferred, resolution)
-                    .map(|pass| DeferredReferences::Rust {
-                        pass,
-                        macro_imports,
-                    }),
-            };
+            let next = self.resolve_deferred_sites(file, sites, &mut deferred, resolution);
             let used = budget.saturating_sub(deferred.budget.remaining());
             #[cfg(test)]
             self.performed
                 .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
             work.budget = LoopBudget::new(left.saturating_sub(used));
             resolution.ended |= deferred.exhausted;
+            if let Some(pending) = pending_python.get_mut(file.document.path.as_str()) {
+                pending.remaining = pending.remaining.saturating_sub(used);
+            }
             if let Some(next) = next {
                 let queue = match next {
                     DeferredReferences::PythonLocals => &mut python_local_sites,
-                    DeferredReferences::PythonParameters => &mut python_parameter_sites,
+                    DeferredReferences::PythonParameters(_) => &mut python_parameter_sites,
+                    DeferredReferences::PythonReassignments(_) => &mut python_reassigned_sites,
+                    DeferredReferences::PythonCaptures => &mut python_captured_sites,
+                    DeferredReferences::PythonReceivers => &mut python_receiver_sites,
+                    DeferredReferences::PythonVariadics => &mut python_variadic_sites,
                     DeferredReferences::TypeScriptParameters(_) => &mut typescript_parameter_sites,
                     DeferredReferences::Python { .. }
                     | DeferredReferences::PythonQualifiers { .. } => &mut existing,
@@ -1606,6 +1713,162 @@ impl<'source> Index<'source> {
                 };
                 queue.push_back((file, remaining.saturating_sub(used), next));
             }
+        }
+    }
+
+    fn resolve_python_tail(
+        &self,
+        mut pending: PendingPythonFiles<'_, 'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        let initial_work = work.budget.remaining();
+        resolution.python_initializer_start = Some(resolution.occurrences.len());
+        for site in pending.values_mut() {
+            let Some(calls) = site.initializers.take() else {
+                continue;
+            };
+            Self::resolve_python_shared_file_work(
+                site,
+                work,
+                resolution,
+                |file, work, resolution| {
+                    self.python_initializer_keywords(file, &calls, work, resolution);
+                },
+            );
+        }
+        resolution.python_quoted_type_start = Some(resolution.occurrences.len());
+        for site in pending.values_mut().filter(|site| site.quoted_types) {
+            Self::resolve_python_shared_file_work(
+                site,
+                work,
+                resolution,
+                |file, work, resolution| {
+                    self.python_quoted_type_references(file, work, resolution);
+                },
+            );
+        }
+        resolution.python_overload_parameter_start = Some(resolution.occurrences.len());
+        for site in pending.values_mut().filter(|site| site.overload_reads) {
+            Self::resolve_python_shared_file_work(
+                site,
+                work,
+                resolution,
+                |file, work, resolution| {
+                    self.python_overload_parameter_reads(file, work, resolution);
+                },
+            );
+        }
+        #[cfg(test)]
+        self.performed.fetch_add(
+            initial_work.saturating_sub(work.budget.remaining()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn resolve_python_shared_file_work(
+        site: &mut PendingPythonReferences<'_, 'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+        resolve: impl FnOnce(&File<'source>, &mut Work, &mut StaticResolution),
+    ) {
+        let left = work.budget.remaining();
+        let budget = left.min(site.remaining);
+        let mut pending_work = Work::new(budget);
+        resolve(site.file, &mut pending_work, resolution);
+        let used = budget.saturating_sub(pending_work.budget.remaining());
+        work.budget = LoopBudget::new(left.saturating_sub(used));
+        site.remaining = site.remaining.saturating_sub(used);
+        resolution.ended |= pending_work.exhausted;
+    }
+
+    fn resolve_deferred_sites(
+        &self,
+        file: &File<'source>,
+        sites: DeferredReferences<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) -> Option<DeferredReferences<'source>> {
+        match sites {
+            DeferredReferences::Python { names, imports } => {
+                self.resolve_python_names(file, names, imports, work, resolution)
+            }
+            DeferredReferences::PythonQualifiers { imports, names } => {
+                self.python_module_qualifiers(file, imports, names, work, resolution);
+                file.python_local_pass()
+            }
+            DeferredReferences::PythonLocals => self.resolve_python_locals(file, work, resolution),
+            DeferredReferences::PythonParameters(reassigned) => {
+                let _ = self.python_local_reads(file, work, resolution, true);
+                (!reassigned.is_empty())
+                    .then_some(DeferredReferences::PythonReassignments(reassigned))
+                    .or_else(|| file.python_after_local_pass())
+            }
+            DeferredReferences::PythonReassignments(reassigned) => {
+                self.python_reassigned_local_reads(file, reassigned, work, resolution);
+                file.python_after_local_pass()
+            }
+            DeferredReferences::PythonCaptures => {
+                self.python_captured_local_reads(file, work, resolution);
+                file.python_after_captures_pass()
+            }
+            DeferredReferences::PythonReceivers => {
+                self.python_receiver_reads(file, work, resolution);
+                file.python_variadic_pass()
+            }
+            DeferredReferences::PythonVariadics => {
+                self.python_variadic_reads(file, work, resolution);
+                None
+            }
+            DeferredReferences::TypeScriptParameters(sites) => {
+                self.typescript_parameter_reads(file, sites, work, resolution);
+                None
+            }
+            DeferredReferences::Rust {
+                pass,
+                macro_imports,
+            } => self
+                .resolve_deferred_rust(file, &pass, &macro_imports, work, resolution)
+                .map(|pass| DeferredReferences::Rust {
+                    pass,
+                    macro_imports,
+                }),
+        }
+    }
+
+    fn resolve_python_names(
+        &self,
+        file: &File<'source>,
+        names: Option<python_edges::PythonNameSites>,
+        imports: Vec<python_edges::PythonImportQualifier<'source>>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) -> Option<DeferredReferences<'source>> {
+        let names = names.map_or_else(Vec::new, |sites| {
+            self.python_name_references(file, sites, work, resolution)
+        });
+        (!names.is_empty() || !imports.is_empty())
+            .then_some(DeferredReferences::PythonQualifiers { imports, names })
+            .or_else(|| file.python_local_pass())
+    }
+
+    fn resolve_python_locals(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) -> Option<DeferredReferences<'source>> {
+        let reassigned = self.python_local_reads(file, work, resolution, false);
+        if file.python_parameters.values().any(Option::is_some) {
+            Some(DeferredReferences::PythonParameters(reassigned))
+        } else {
+            (!reassigned.is_empty())
+                .then_some(DeferredReferences::PythonReassignments(reassigned))
+                .or_else(|| file.python_after_local_pass())
         }
     }
 
@@ -1722,6 +1985,16 @@ impl<'source> Index<'source> {
                 result.external.push(external);
                 continue;
             }
+            if occurrence.is_none()
+                && !file.rust_extern_aliases.is_empty()
+                && call.callee == rift_syntax::StaticCallee::Qualified
+            {
+                result
+                    .rust_extern_candidates
+                    .entry(file.document.placement.unit().clone())
+                    .or_default()
+                    .push(*call);
+            }
             if occurrence
                 .as_ref()
                 .is_none_or(|occurrence| !matches!(occurrence.target, NormalizedTarget::Symbol(_)))
@@ -1787,7 +2060,10 @@ impl<'source> Index<'source> {
             "python" => {
                 let names = self.python_references(file, work, result);
                 (!work.exhausted
-                    && (names.is_some() || !imports.is_empty() || file.has_python_local_reads()))
+                    && (names.is_some()
+                        || !imports.is_empty()
+                        || file.has_python_local_reads()
+                        || file.python_after_local_pass().is_some()))
                 .then_some(DeferredReferences::Python { names, imports })
             }
             "rust" => {
@@ -1822,6 +2098,9 @@ impl<'source> Index<'source> {
         let mut qualifiers = Vec::new();
         let mut rust_macros = Vec::new();
         for binding in file.facts.bindings() {
+            if matches!(binding.kind, StaticBindingKind::RustExternCrate { .. }) {
+                continue;
+            }
             if file.inactive(binding.name, work) {
                 continue;
             }
@@ -2134,13 +2413,29 @@ impl<'source> Index<'source> {
 
 impl StaticResolution {
     fn mark_late_admission(&mut self, sites: &DeferredReferences<'_>) {
+        if matches!(sites, DeferredReferences::PythonReassignments(_)) {
+            self.python_reassignment_start
+                .get_or_insert(self.occurrences.len());
+        }
+        if matches!(sites, DeferredReferences::PythonCaptures) {
+            self.python_capture_start
+                .get_or_insert(self.occurrences.len());
+        }
+        if matches!(sites, DeferredReferences::PythonReceivers) {
+            self.python_receiver_start
+                .get_or_insert(self.occurrences.len());
+        }
+        if matches!(sites, DeferredReferences::PythonVariadics) {
+            self.python_variadic_start
+                .get_or_insert(self.occurrences.len());
+        }
         if matches!(
             sites,
             DeferredReferences::Rust {
                 pass: RustReferencePass::LocalBindings,
                 ..
             } | DeferredReferences::PythonLocals
-                | DeferredReferences::PythonParameters
+                | DeferredReferences::PythonParameters(_)
                 | DeferredReferences::TypeScriptParameters(_)
         ) {
             self.late_supplemental_start
@@ -2154,6 +2449,8 @@ impl StaticResolution {
     fn join(&mut self, file: &File<'_>, mut apart: Self, over_share: bool) {
         self.occurrences.append(&mut apart.occurrences);
         self.external.append(&mut apart.external);
+        self.rust_extern_candidates
+            .append(&mut apart.rust_extern_candidates);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);

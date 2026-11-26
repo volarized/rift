@@ -228,14 +228,34 @@ fn test_class_bodies_declare_methods_with_member_categories() {
                 method(&[SymbolKind::Constructor])
             ),
             (
+                "Model.__init__.self",
+                "parameter",
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            ),
+            (
                 "Model.__init__.name",
                 "parameter",
                 vec![SymbolKind::Value, SymbolKind::Parameter]
             ),
             ("Model.label", "method", method(&[SymbolKind::Property])),
+            (
+                "Model.label.self",
+                "parameter",
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            ),
             ("Model.make", "method", method(&[SymbolKind::Static])),
             ("Model.build", "method", method(&[SymbolKind::Static])),
+            (
+                "Model.build.cls",
+                "parameter",
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            ),
             ("Model.save", "method", method(&[])),
+            (
+                "Model.save.self",
+                "parameter",
+                vec![SymbolKind::Value, SymbolKind::Parameter]
+            ),
             (
                 "Model.save.step",
                 "function",
@@ -328,6 +348,7 @@ fn test_instance_attributes_assigned_in_methods_declare_class_members() {
             ("Model", None, "class"),
             ("Model.kind", Some("Model"), "variable"),
             ("Model.__init__", Some("Model"), "method"),
+            ("Model.__init__.self", Some("Model.__init__"), "parameter"),
             ("Model.__init__.name", Some("Model.__init__"), "parameter"),
             ("Model.name", Some("Model"), "variable"),
             ("Model.a", Some("Model"), "variable"),
@@ -335,6 +356,7 @@ fn test_instance_attributes_assigned_in_methods_declare_class_members() {
             ("Model.c", Some("Model"), "variable"),
             ("Model.__init__.inner", Some("Model.__init__"), "function"),
             ("Model.reset", Some("Model"), "method"),
+            ("Model.reset.this", Some("Model.reset"), "parameter"),
             ("Model.name", Some("Model"), "variable"),
         ]
     );

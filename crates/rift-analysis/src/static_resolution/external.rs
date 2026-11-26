@@ -595,7 +595,15 @@ impl<'source> Index<'source> {
         let text = file.text(range)?;
         let text = without_generic_arguments(text, work)?;
         let parts = self.rust.spelled_path(file, position, &text, value, work)?;
-        let (owner, spelled) = self.owners.rust(file.document.path.as_str(), &parts)?;
+        self.rust_external_path(file, &parts)
+    }
+
+    pub(super) fn rust_external_path(
+        &self,
+        file: &File<'source>,
+        parts: &[String],
+    ) -> Option<rift_core::SymbolId> {
+        let (owner, spelled) = self.owners.rust(file.document.path.as_str(), parts)?;
         self.owners
             .identity(owner, file.document.facts.language(), spelled)
     }

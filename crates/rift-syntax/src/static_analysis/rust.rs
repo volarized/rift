@@ -49,11 +49,11 @@ pub(super) struct Kinds {
     field_initializers: [u16; 2],
     struct_pattern: u16,
     use_declaration: u16,
+    extern_crate: u16,
     use_alias: u16,
     use_list: [u16; 3],
     let_declaration: u16,
     value_path_statements: [u16; 2],
-    local_value_items: [u16; 2],
     local_value_struct: u16,
     ordered_value_fields: u16,
     local_type_items: [u16; 3],
@@ -131,11 +131,11 @@ pub(super) fn kinds() -> &'static Kinds {
             field_initializers: [id("field_initializer"), id("shorthand_field_initializer")],
             struct_pattern: id("struct_pattern"),
             use_declaration: id("use_declaration"),
+            extern_crate: id("extern_crate_declaration"),
             use_alias: id("use_as_clause"),
             use_list: [id("use_list"), id("scoped_use_list"), id("use_wildcard")],
             let_declaration: id("let_declaration"),
             value_path_statements: [id("return_expression"), id("expression_statement")],
-            local_value_items: [id("const_item"), id("static_item")],
             local_value_struct: id("struct_item"),
             ordered_value_fields: id("ordered_field_declaration_list"),
             local_type_items: [id("enum_item"), id("union_item"), id("mod_item")],
@@ -246,6 +246,8 @@ impl Kinds {
             }
         } else if id == self.use_declaration {
             self.record_import(visited, facts, budget)?;
+        } else if id == self.extern_crate {
+            self.record_extern_crate(visited, facts)?;
         } else if id == self.self_parameter
             || (id == self.parameter
                 && syntax_element

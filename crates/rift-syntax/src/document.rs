@@ -1,6 +1,6 @@
 //! Generic syntax facts one provider emits for one source file.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use rift_core::{FileDigest, ProjectPath, is_portable_name};
@@ -139,10 +139,30 @@ pub struct SyntaxSymbol {
 }
 
 impl SyntaxSymbol {
-    /// Whether this is the physical name of an ordinary Python parameter.
+    /// Whether this is the physical name of a Python parameter.
     #[must_use]
     pub fn is_python_parameter(&self) -> bool {
         self.kind == crate::python::PARAMETER_KIND_WORD
+            || self.is_python_variadic_parameter()
+            || self.is_python_overload_parameter()
+    }
+
+    /// Whether this parameter captures an argument list or a keyword dictionary.
+    #[must_use]
+    pub fn is_python_variadic_parameter(&self) -> bool {
+        self.kind == crate::python::VARIADIC_PARAMETER_KIND_WORD
+    }
+
+    /// Whether this parameter belongs to one declaration of an overload family.
+    #[must_use]
+    pub fn is_python_overload_parameter(&self) -> bool {
+        self.kind == crate::python::OVERLOAD_PARAMETER_KIND_WORD
+    }
+
+    /// Whether this is the physical name of an authored Python loop target.
+    #[must_use]
+    pub fn is_python_loop_binding(&self) -> bool {
+        self.kind == crate::python::LOOP_BINDING_KIND_WORD
     }
 
     /// Whether this is an ordinary TypeScript function parameter candidate.
@@ -154,7 +174,10 @@ impl SyntaxSymbol {
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
-        self.is_rust_local_binding() || self.is_python_parameter() || self.is_typescript_parameter()
+        self.is_rust_local_binding()
+            || self.is_python_parameter()
+            || self.is_python_loop_binding()
+            || self.is_typescript_parameter()
     }
 }
 
@@ -703,6 +726,25 @@ impl SyntaxFacts {
     #[must_use]
     pub const fn static_facts(&self) -> Option<&crate::StaticFacts> {
         self.static_facts.as_ref()
+    }
+
+    /// Returns the names with a captured Python method receiver binding.
+    #[must_use]
+    pub fn python_receiver_names(&self) -> BTreeSet<ByteRange> {
+        if self.language().name != "python" {
+            return BTreeSet::new();
+        }
+        self.static_facts()
+            .into_iter()
+            .flat_map(crate::StaticFacts::bindings)
+            .filter_map(|binding| {
+                matches!(
+                    binding.kind,
+                    crate::StaticBindingKind::PythonReceiver { .. }
+                )
+                .then_some(binding.name)
+            })
+            .collect()
     }
 
     /// Returns the complete named tree in pre-order, or `None` when these facts hold none.

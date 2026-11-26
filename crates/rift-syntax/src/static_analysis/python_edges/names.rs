@@ -94,25 +94,31 @@ pub(in crate::static_analysis) struct Names<'source> {
     classes: BTreeSet<ByteRange>,
     reads: Vec<ByteRange>,
     direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
+    receivers: BTreeMap<ByteRange, ByteRange>,
     /// Written names with the scope that holds the target.
     writes: Vec<(ByteRange, ByteRange, NameUse)>,
     pub(in crate::static_analysis) invalid_type_parameter_default: bool,
 }
 
 impl<'source> Names<'source> {
+    pub(super) fn receiver_binding(&mut self, scope: ByteRange, name: ByteRange) {
+        self.receivers.insert(scope, name);
+    }
+
     pub(super) fn direct_binding(
         &mut self,
         source: &'source str,
         name: ByteRange,
         scope: ByteRange,
         end: u64,
+        kind: DirectBindingKind,
     ) {
         if let Some(spelling) = text(source, name) {
             self.direct_locals
                 .entry(spelling)
                 .or_default()
                 .entry(scope)
-                .or_insert(DirectLocal { name, end });
+                .or_insert(DirectLocal { name, end, kind });
         }
     }
 }
@@ -121,6 +127,15 @@ impl<'source> Names<'source> {
 struct DirectLocal {
     name: ByteRange,
     end: u64,
+    kind: DirectBindingKind,
+}
+
+/// The written binding a function-local read could select.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirectBindingKind {
+    Local,
+    Parameter,
+    VariadicParameter,
 }
 
 /// What one name does where it is written.
@@ -264,6 +279,7 @@ impl EdgePythonKinds {
                 byte_range(target)?,
                 self.scope_range(owner.syntax_element())?,
                 byte_range(assignment)?.end,
+                DirectBindingKind::Local,
             );
         }
         Ok(())
@@ -285,6 +301,10 @@ impl EdgePythonKinds {
             }
             break;
         }
+        self.function_body_scope(visited)
+    }
+
+    fn function_body_scope<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let scope = edge_enclosing(visited, &self.scopes)?;
         let body = scope.child_by_field_id(self.body)?;
         (scope.kind_id() == self.definitions[0]
@@ -292,6 +312,72 @@ impl EdgePythonKinds {
                 .ok()?
                 .encloses(byte_range(visited.syntax_element()).ok()?))
         .then_some(scope)
+    }
+
+    /// A named function declared directly in another function's authored body.
+    fn enclosing_local_function<'tree>(&self, scope: Node<'tree>) -> Option<Node<'tree>> {
+        let block = scope
+            .parent()
+            .filter(|parent| parent.kind_id() == self.block)?;
+        let outer = block.parent()?;
+        (outer.kind_id() == self.definitions[0]
+            && outer.child_by_field_id(self.body) == Some(block))
+        .then_some(outer)
+    }
+
+    fn edge_local_read(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        range: ByteRange,
+        facts: &mut StaticFactsParts,
+        names: &Names<'_>,
+    ) -> Result<(), RiftError> {
+        let Some(assignments) = text(source, range).and_then(|name| names.direct_locals.get(name))
+        else {
+            return Ok(());
+        };
+        let Some(scope) = self.direct_local_read_scope(visited) else {
+            return Ok(());
+        };
+        let inner = byte_range(scope)?;
+        if let Some(local) = assignments.get(&inner) {
+            if local.end <= range.start {
+                let reads = if local.kind == DirectBindingKind::VariadicParameter {
+                    &mut facts.python_variadic_reads
+                } else {
+                    &mut facts.python_local_reads
+                };
+                reads.push((range, local.name));
+            }
+        } else if let Some(outer) = self.enclosing_local_function(scope)
+            && let Some(local) = assignments.get(&byte_range(outer)?)
+            && local.kind == DirectBindingKind::Local
+            && local.end <= inner.start
+        {
+            facts.python_captured_local_reads.push((range, local.name));
+        }
+        Ok(())
+    }
+
+    fn edge_receiver_read(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        read: ByteRange,
+        facts: &mut StaticFactsParts,
+        names: &Names<'_>,
+    ) -> Result<(), RiftError> {
+        if names.receivers.is_empty() {
+            return Ok(());
+        }
+        if let Some(scope) = self.function_body_scope(visited)
+            && let Some(&name) = names.receivers.get(&byte_range(scope)?)
+            && text(source, read) == text(source, name)
+        {
+            facts.python_receiver_reads.push((read, name));
+        }
+        Ok(())
     }
 
     /// Records what a name outside annotations does.
@@ -305,19 +391,20 @@ impl EdgePythonKinds {
         let name = visited.syntax_element();
         let range = byte_range(name)?;
         let name_use = self.name_use(visited);
+        let callee = name_use == NameUse::Stated
+            && visited.parent().is_some_and(|parent| {
+                let parent = parent.syntax_element();
+                parent.kind_id() == self.call
+                    && parent.child_by_field_id(self.function) == Some(name)
+            });
+        if name_use == NameUse::Read || callee {
+            self.edge_receiver_read(visited, source, range, facts, names)?;
+        }
         match name_use {
             NameUse::Stated => return Ok(()),
             NameUse::Read => {
                 names.reads.push(range);
-                if let Some(assignments) =
-                    text(source, range).and_then(|name| names.direct_locals.get(name))
-                    && let Some(scope) = self.direct_local_read_scope(visited)
-                    && let Some(local) = assignments.get(&byte_range(scope)?)
-                    && local.end <= range.start
-                {
-                    facts.python_local_reads.push((range, local.name));
-                }
-                return Ok(());
+                return self.edge_local_read(visited, source, range, facts, names);
             }
             NameUse::Assigned | NameUse::Bound | NameUse::Augmented | NameUse::Deleted => {}
         }

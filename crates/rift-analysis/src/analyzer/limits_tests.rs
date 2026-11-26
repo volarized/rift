@@ -619,3 +619,144 @@ fn supplemental_rust_macro_import_keeps_prior_edges_at_the_cap() {
     );
     assert_eq!(limited.semantics.edges().dropped_edges(), 1);
 }
+
+#[test]
+fn supplemental_rust_extern_crate_aliases_keep_prior_edges_at_the_cap() {
+    use rift_protocol::read::EdgeKind;
+
+    const ROOT: &str = "rift://symbol/cargo/crates.io/beacon/rust/beacon";
+    let body = format!(
+        "use std::fmt::Debug;\npub fn leaf() {{}}\n\
+         pub fn alpha() {{ facade::leaf(); platform::thread::yield_now(); }}\n\
+         pub fn zeta(later: fn()) {{ {}{} }}",
+        "leaf(); ".repeat(128),
+        "later(); ".repeat(8),
+    );
+    let (baseline, candidate) = rust_extern_capacity_sources(&body);
+    let before = collect_rust_extern_capacity(&baseline, None);
+    let incumbents = before.semantics.edges().edges().collect::<Vec<_>>();
+    assert_eq!(
+        incumbents
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Calls)
+            .count(),
+        128
+    );
+    let capacity = incumbents.len();
+    let bounded_before = collect_rust_extern_capacity(&baseline, Some(capacity));
+    assert_eq!(
+        bounded_before.semantics.edges().edges().collect::<Vec<_>>(),
+        incumbents
+    );
+
+    let bounded_after = collect_rust_extern_capacity(&candidate, Some(capacity));
+    assert_eq!(
+        bounded_after.semantics.edges().edges().collect::<Vec<_>>(),
+        incumbents
+    );
+    assert_eq!(bounded_after.semantics.edges().dropped_edges(), 3);
+
+    let surplus = collect_rust_extern_capacity(&candidate, Some(capacity + 3));
+    let edges = surplus.semantics.edges();
+    assert_eq!(edges.dropped_edges(), 0);
+    assert_eq!(edges.edges().count(), capacity + 3);
+    assert!(
+        incumbents
+            .iter()
+            .all(|edge| edges.edges().any(|row| row == *edge))
+    );
+    let alpha = format!("{ROOT}/alpha");
+    let leaf = format!("{ROOT}/leaf");
+    for (kind, from, to, authored) in [
+        (
+            EdgeKind::Imports,
+            ROOT,
+            "rift://symbol/stdlib/rust/rust/std",
+            "std",
+        ),
+        (EdgeKind::Calls, &alpha, &leaf, "facade::leaf()"),
+        (
+            EdgeKind::Calls,
+            &alpha,
+            "rift://symbol/stdlib/rust/rust/std/thread/yield_now",
+            "platform::thread::yield_now()",
+        ),
+    ] {
+        let start = u64::try_from(candidate.find(authored).expect("written token"))
+            .expect("written token offset");
+        let end = start + u64::try_from(authored.len()).expect("written token length");
+        assert!(edges.edges().any(|edge| {
+            edge.kind() == kind
+                && edge.from().as_str() == from
+                && edge.to().as_str() == to
+                && edge.occurrence().unit().key().as_str() == "src/lib.rs"
+                && (
+                    edge.occurrence().range().start(),
+                    edge.occurrence().range().end(),
+                ) == (start, end)
+        }));
+    }
+}
+
+#[test]
+fn supplemental_rust_extern_crate_aliases_keep_prior_rows_at_the_work_cut() {
+    use rift_protocol::read::EdgeKind;
+
+    let body = format!(
+        "use std::fmt::Debug;\npub mod nested {{ pub fn leaf() {{}} }}\n\
+         pub fn alpha() {{ facade::nested::leaf(); platform::thread::yield_now(); }}\n\
+         pub fn zeta(later: fn()) {{ {}{} }}",
+        "nested::leaf(); ".repeat(128),
+        "later(); ".repeat(8),
+    );
+    let (ordinary, authored) = rust_extern_capacity_sources(&body);
+    let full = collect_rust_extern_capacity(&ordinary, None);
+    let capacity = full.semantics.edges().edges().count();
+    let before = collect_rust_extern_capacity(&ordinary, Some(capacity));
+    let incumbent = before.semantics.edges().edges().collect::<Vec<_>>();
+    assert!(incumbent.len() < capacity);
+    assert_eq!(
+        incumbent
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Calls)
+            .count(),
+        128
+    );
+
+    let after = collect_rust_extern_capacity(&authored, Some(capacity));
+    assert_eq!(
+        after.semantics.edges().edges().collect::<Vec<_>>(),
+        incumbent
+    );
+}
+
+fn rust_extern_capacity_sources(body: &str) -> (String, String) {
+    const ALIASES: &str = "pub extern crate self as facade;\npub extern crate std as platform;\n";
+    (
+        format!("{}{body}", " ".repeat(ALIASES.len())),
+        format!("{ALIASES}{body}"),
+    )
+}
+
+fn collect_rust_extern_capacity(source: &str, capacity: Option<usize>) -> PackageAnalysis {
+    let package = identity();
+    let owner = package.owner().expect("fixture owner");
+    let language = language(ShippedLanguage::Rust);
+    let origin = origin(&package);
+    let root = ProjectPath::new("src/lib.rs").expect("library path");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let files = [PackageSource::new(&root, source)];
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname = 'beacon'\nversion = '1.0.0'\nedition = '2024'\n",
+    )];
+    let limits = ExactPackageLimits::new(2, 1 << 20);
+    let limits = capacity.map_or(limits, |maximum| {
+        limits.with_edges(maximum).expect("exact edge cap")
+    });
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+        .expect("bounded package input")
+        .with_framework_context(&metadata, &[])
+        .expect("captured Cargo manifest");
+    PackageAnalyzer::analyze(input, 1).expect("bounded package")
+}

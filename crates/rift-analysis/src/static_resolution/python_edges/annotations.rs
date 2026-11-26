@@ -1,9 +1,11 @@
 //! Named Python annotations used for static receiver lookup.
 
+use rift_core::ReferenceRole;
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::SymbolKind;
 use rift_syntax::ByteRange;
 
-use super::super::{File, Index, Target, Work};
+use super::super::{File, Index, StaticResolution, Target, Work};
 use super::{Value, edge_python_binding};
 
 impl<'source> Index<'source> {
@@ -96,6 +98,165 @@ impl<'source> Index<'source> {
         };
         slice_range(annotation, written, member.trim())
     }
+
+    /// Resolves the written types inside compound string annotations.
+    pub(in crate::static_resolution) fn python_quoted_type_references(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return;
+            }
+            if reference.role != ReferenceRole::Type {
+                continue;
+            }
+            let range = reference.target;
+            let Some(written) = quoted_type_text(file, range) else {
+                continue;
+            };
+            let Some(names) = quoted_type_names(written, work, |head, work| {
+                slice_range(range, written, head)
+                    .is_some_and(|head| self.python_quoted_generic(file, head, work))
+            }) else {
+                continue;
+            };
+            for name in names {
+                if !work.charge() {
+                    return;
+                }
+                if let Some(range) = slice_range(range, written, name)
+                    && let Some(target) = self.python_type(file, range, work)
+                {
+                    resolution.record(self.python_access(file, range, ReferenceRole::Type, target));
+                }
+            }
+        }
+    }
+
+    fn python_quoted_generic(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        let Some(name) = file.text(range) else {
+            return false;
+        };
+        if matches!(
+            name,
+            "dict" | "frozenset" | "list" | "set" | "tuple" | "type"
+        ) {
+            return self.external_type(file, range, work)
+                .and_then(|target| SymbolIdentity::parse(target.as_str()).ok())
+                .is_some_and(|identity| {
+                    matches!(identity.owner(), SymbolOwner::Runtime { runtime } if runtime == "cpython")
+                        && identity.qualified_path().iter().map(String::as_str).eq(["builtins", name])
+                });
+        }
+        self.python_library_name(file, range, work)
+            .is_some_and(|qualified| {
+                qualified.rsplit_once('.').is_some_and(|(module, name)| {
+                    matches!(module, "typing" | "typing_extensions" | "collections.abc")
+                        && matches!(
+                            name,
+                            "Dict"
+                                | "FrozenSet"
+                                | "Iterable"
+                                | "Iterator"
+                                | "List"
+                                | "Mapping"
+                                | "MutableMapping"
+                                | "Optional"
+                                | "Sequence"
+                                | "Set"
+                                | "Tuple"
+                                | "Type"
+                                | "Union"
+                        )
+                })
+            })
+    }
+}
+
+/// Longest quoted type text and deepest generic nesting this pass reads.
+const QUOTED_TYPE_BYTES_MAX: usize = 4096;
+const QUOTED_TYPE_DEPTH_MAX: u8 = 16;
+
+pub(in crate::static_resolution) fn quoted_type_text<'file>(
+    file: &'file File<'_>,
+    range: ByteRange,
+) -> Option<&'file str> {
+    let written = file.text(range)?;
+    if written.len() > QUOTED_TYPE_BYTES_MAX || !written.contains(['[', '|']) {
+        return None;
+    }
+    let delimited = file.text(ByteRange {
+        start: range.start.checked_sub(1)?,
+        end: range.end.checked_add(1)?,
+    })?;
+    let bytes = delimited.as_bytes();
+    let first = *bytes.first()?;
+    (matches!(first, b'\'' | b'"') && bytes.last() == Some(&first)).then_some(written)
+}
+
+fn quoted_type_names<'text>(
+    written: &'text str,
+    work: &mut Work,
+    mut generic: impl FnMut(&str, &mut Work) -> bool,
+) -> Option<Vec<&'text str>> {
+    let mut depth = 0_u8;
+    for byte in written.bytes() {
+        match byte {
+            b'[' if depth < QUOTED_TYPE_DEPTH_MAX => depth += 1,
+            b']' if depth != 0 => depth -= 1,
+            b'.' | b',' | b'|' | b'_' | b' ' | b'\t' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {}
+            _ => return None,
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let mut pending = vec![written];
+    let mut names = Vec::new();
+    while let Some(text) = pending.pop() {
+        if !work.charge() || text.trim_end().ends_with('|') {
+            return None;
+        }
+        let alternatives = top_level_parts(text, '|', work)?;
+        if alternatives.len() > 1 {
+            pending.extend(alternatives.into_iter().rev());
+            continue;
+        }
+        let part = alternatives.first().copied()?;
+        if let Some((head, args)) = part.split_once('[') {
+            let head = head.trim_end();
+            let args = top_level_parts(args.strip_suffix(']')?, ',', work)?;
+            if !quoted_type_path(head) || args.is_empty() || !generic(head, work) {
+                return None;
+            }
+            names.push(head);
+            pending.extend(args.into_iter().rev());
+        } else if !matches!(part, "None" | "...") {
+            if !quoted_type_path(part) {
+                return None;
+            }
+            names.push(part);
+        }
+    }
+    Some(names)
+}
+
+fn quoted_type_path(path: &str) -> bool {
+    path.split('.').all(|name| {
+        let mut bytes = name.bytes();
+        bytes
+            .next()
+            .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
+            && bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+    })
 }
 
 /// A written annotation without the quotes of a string annotation.

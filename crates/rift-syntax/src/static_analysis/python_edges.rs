@@ -1,6 +1,7 @@
 //! Captured Python call sites and lexical import bindings.
 
 mod guards;
+mod initializers;
 mod lists;
 mod names;
 
@@ -182,9 +183,9 @@ impl EdgePythonKinds {
         }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
-                facts
-                    .calls
-                    .push(call(syntax_element, callee, self.edge_callee(callee)?)?);
+                let call = call(syntax_element, callee, self.edge_callee(callee)?)?;
+                self.edge_initializer_keywords(syntax_element, call, source, facts)?;
+                facts.calls.push(call);
             }
         } else if id == self.decorator {
             // A decorator written without arguments is called with the decorated definition.
@@ -202,6 +203,7 @@ impl EdgePythonKinds {
         } else if self.definitions.contains(&id) {
             if id == self.definitions[1] {
                 names.class(byte_range(syntax_element)?);
+                self.edge_initializer(visited, source, facts)?;
             }
             self.edge_definition(visited, facts)?;
         } else if self.imports.contains(&id) {
@@ -565,11 +567,20 @@ impl EdgePythonKinds {
                     .transpose()?;
                 let receiver = class_name.filter(|_| first && !collects);
                 if scope.kind_id() == self.definitions[0]
-                    && receiver.is_none()
                     && crate::python::parameter_name(parameter) == Some(name)
                 {
                     let scope_range = self.scope_range(scope)?;
-                    names.direct_binding(source, byte_range(name)?, scope_range, scope_range.start);
+                    let name = byte_range(name)?;
+                    if receiver.is_some() {
+                        names.receiver_binding(scope_range, name);
+                    } else {
+                        let kind = if collects {
+                            names::DirectBindingKind::VariadicParameter
+                        } else {
+                            names::DirectBindingKind::Parameter
+                        };
+                        names.direct_binding(source, name, scope_range, scope_range.start, kind);
+                    }
                 }
                 facts.bindings.push(self.scoped_binding(
                     name,

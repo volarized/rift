@@ -43,6 +43,153 @@ fn package_stores_python_direct_function_local_reads() {
     }
 }
 
+const PYTHON_REASSIGNED_LOCAL_SOURCE: &str = concat!(
+    "def reassigned() -> int:\n",
+    "    local = 1\n",
+    "    local = 2\n",
+    "    return local\n",
+    "def outer() -> int:\n",
+    "    local = 9\n",
+    "    def read() -> int:\n",
+    "        return local\n",
+    "    return read()\n",
+    "def nested_scope():\n",
+    "    local = 3\n",
+    "    local = 4\n",
+    "    def read():\n",
+    "        local = 5\n",
+    "        return local\n",
+    "    return local + read()\n",
+    "def removed():\n",
+    "    local = 6\n",
+    "    local = 7\n",
+    "    del local\n",
+    "    return local\n",
+    "def expired():\n",
+    "    local = 8\n",
+    "    local = 9\n",
+    "    try:\n",
+    "        raise ValueError()\n",
+    "    except ValueError as local:\n",
+    "        pass\n",
+    "    return local\n",
+);
+
+#[test]
+fn package_stores_python_reassigned_local_reads_in_their_own_scope() {
+    let source = PYTHON_REASSIGNED_LOCAL_SOURCE;
+    let result = publication(&[("click.py", source)], None, &["click"]);
+    let module = "rift://symbol/pypi/pypi.org/click/python/click";
+    let id = |scope| format!("{module}/{scope}");
+    let declarations: Vec<_> = result
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.symbol.as_str() == id("reassigned/local"))
+        .map(|declaration| declaration.range.start)
+        .collect();
+    let start = |anchor| {
+        u64::try_from(source.find(anchor).expect("authored assignment")).expect("byte offset")
+    };
+    assert_eq!(declarations, [start("local = 1"), start("local = 2")]);
+
+    let reads: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local"))
+        .collect();
+    assert_eq!(reads.len(), 4);
+    for (from, to, context) in [
+        ("reassigned", "reassigned", "local = 2\n    return local"),
+        (
+            "outer/read",
+            "outer",
+            "def read() -> int:\n        return local",
+        ),
+        ("nested_scope", "nested_scope", "return local +"),
+        (
+            "nested_scope/read",
+            "nested_scope/read",
+            "local = 5\n        return local",
+        ),
+    ] {
+        let offset = start(context)
+            + u64::try_from(context.rfind("local").expect("written name")).expect("local offset");
+        assert!(
+            reads.iter().any(|edge| {
+                edge.from.as_str() == id(from)
+                    && edge.to.as_str() == format!("{}/local", id(to))
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == offset && site.range.end == offset + 5
+                    })
+            }),
+            "{from} to {to} at {offset}"
+        );
+    }
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str() == id("outer")
+            && edge.to.as_str() == id("outer/read")
+    }));
+}
+
+const PYTHON_CAPTURE_REFUSALS: &str = concat!(
+    "def shadowed():\n",
+    "    local = 1\n",
+    "    def pick():\n",
+    "        return local\n",
+    "        local = 2\n",
+    "    return pick()\n",
+    "def redirected():\n",
+    "    local = 1\n",
+    "    def rewrite():\n",
+    "        nonlocal local\n",
+    "        local = 3\n",
+    "        return local\n",
+    "    def pick():\n",
+    "        return local\n",
+    "    return rewrite() + pick()\n",
+    "def removed_nonlocal():\n",
+    "    local = 1\n",
+    "    local = 2\n",
+    "    def erase():\n",
+    "        nonlocal local\n",
+    "        del local\n",
+    "    erase()\n",
+    "    return local\n",
+    "def removed_outer():\n",
+    "    local = 1\n",
+    "    def pick():\n",
+    "        return local\n",
+    "    del local\n",
+    "    return pick()\n",
+);
+
+#[test]
+fn package_refuses_shadowed_redirected_or_deleted_python_captures() {
+    let result = publication(&[("click.py", PYTHON_CAPTURE_REFUSALS)], None, &["click"]);
+    assert!(
+        !result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/local")
+        })
+    );
+    for (from, to) in [
+        ("/shadowed", "/shadowed/pick"),
+        ("/redirected", "/redirected/rewrite"),
+        ("/redirected", "/redirected/pick"),
+        ("/removed_nonlocal", "/removed_nonlocal/erase"),
+        ("/removed_outer", "/removed_outer/pick"),
+    ] {
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with(from)
+                    && edge.to.as_str().ends_with(to)
+            }),
+            "{from} to {to}"
+        );
+    }
+}
+
 const PYTHON_PARAMETER_SOURCE: &str = concat!(
     "parameter = 9\n",
     "def choose(parameter: int) -> int:\n",
@@ -154,15 +301,307 @@ fn package_stores_python_function_parameter_names_and_reads() {
         object.kinds.contains(&SymbolKind::Parameter)
             && object.id.as_ref().is_some_and(|id| id.as_str() == rebind)
     }));
-    for name in ["self", "args", "kwargs"] {
-        let target = id(&format!("Receiver/run/{name}"));
+}
+
+const PYTHON_RECEIVER_SOURCE: &str = concat!(
+    "class Counter:\n",
+    "    def current(self):\n",
+    "        return self\n",
+    "    def call_current(self):\n",
+    "        return self.current()\n",
+    "    @classmethod\n",
+    "    def factory(cls):\n",
+    "        return cls()\n",
+    "    @staticmethod\n",
+    "    def identity(self):\n",
+    "        return self\n",
+    "def free(value):\n",
+    "    return value\n",
+);
+
+fn is_python_receiver_fixture_name(symbol: &str) -> bool {
+    ["/current/self", "/call_current/self", "/factory/cls"]
+        .iter()
+        .any(|suffix| symbol.ends_with(suffix))
+}
+
+#[test]
+fn package_retains_python_method_receiver_declarations() {
+    let source = PYTHON_RECEIVER_SOURCE;
+    let files = [("click.py", source)];
+    let complete = publication(&files, None, &["click"]);
+    let parameter =
+        |owner, name| format!("rift://symbol/pypi/pypi.org/click/python/click/{owner}/{name}");
+    for (owner, written, name) in [
+        ("Counter/current", "def current(self)", "self"),
+        ("Counter/call_current", "def call_current(self)", "self"),
+        ("Counter/factory", "def factory(cls)", "cls"),
+        ("Counter/identity", "def identity(self)", "self"),
+        ("free", "def free(value)", "value"),
+    ] {
+        let symbol = parameter(owner, name);
+        let start = source.find(written).expect("authored method")
+            + written.find(name).expect("parameter name");
+        let range = rift_protocol::read::TextRange {
+            start: u64::try_from(start).expect("start"),
+            end: u64::try_from(start + name.len()).expect("end"),
+        };
         assert!(
-            !result
-                .declarations
-                .iter()
-                .any(|declaration| declaration.symbol.as_str() == target)
+            complete.declarations.iter().any(|entry| {
+                entry.symbol.as_str() == symbol && entry.range == range && entry.source == name
+            }),
+            "{symbol}"
+        );
+        assert!(
+            complete.objects.iter().any(|object| {
+                object.id.as_ref().is_some_and(|id| id.as_str() == symbol)
+                    && object.kinds.contains(&SymbolKind::Parameter)
+            }),
+            "{symbol}"
         );
     }
+    let prior = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 9,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    assert_eq!(
+        prior.declarations,
+        complete
+            .declarations
+            .iter()
+            .filter(|entry| !is_python_receiver_fixture_name(entry.symbol.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        prior.edges,
+        complete
+            .edges
+            .iter()
+            .filter(|entry| !is_python_receiver_fixture_name(entry.to.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    for (caller, target) in [
+        ("/Counter/call_current", "/Counter/current"),
+        ("/Counter/factory", "/Counter"),
+    ] {
+        assert!(
+            prior.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with(caller)
+                    && edge.to.as_str().ends_with(target)
+            }),
+            "{caller}"
+        );
+    }
+}
+
+#[test]
+fn package_python_method_receiver_reads_follow_earlier_edges() {
+    let files = [("click.py", PYTHON_RECEIVER_SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    for (owner, token, written) in [
+        ("/Counter/current", "self", "return self\n"),
+        ("/Counter/call_current", "self", "return self.current()"),
+        ("/Counter/factory", "cls", "return cls()"),
+    ] {
+        let target = format!("{owner}/{token}");
+        let start = PYTHON_RECEIVER_SOURCE.find(written).expect("authored use") + "return ".len();
+        assert!(
+            complete.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.from.as_str().ends_with(owner)
+                    && edge.to.as_str().ends_with(&target)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == u64::try_from(start).expect("start")
+                            && site.range.end == u64::try_from(start + token.len()).expect("end")
+                    })
+            }),
+            "{target}"
+        );
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| !is_python_receiver_fixture_name(edge.to.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let tight = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    assert_eq!(tight.declarations, complete.declarations);
+    assert_eq!(tight.edges, prior);
+}
+
+#[test]
+fn package_python_loop_targets_keep_authored_declarations() {
+    const SOURCE: &str = concat!(
+        "def collect(items):\n",
+        "    value = []\n",
+        "    for item in items:\n",
+        "        value.append(item)\n",
+        "    return value\n",
+        "def pairs(items):\n",
+        "    value = []\n",
+        "    for key, amount in items:\n",
+        "        value.append((key, amount))\n",
+        "    return value\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    for (owner, name, written) in [
+        ("collect", "item", "for item in"),
+        ("pairs", "key", "for key, amount in"),
+        ("pairs", "amount", "for key, amount in"),
+    ] {
+        let symbol = format!("rift://symbol/pypi/pypi.org/click/python/click/{owner}/{name}");
+        let start =
+            SOURCE.find(written).expect("written loop") + written.find(name).expect("target name");
+        assert!(
+            complete.declarations.iter().any(|entry| {
+                entry.symbol.as_str() == symbol
+                    && entry.source == name
+                    && entry.range.start == u64::try_from(start).expect("start")
+                    && entry.range.end == u64::try_from(start + name.len()).expect("end")
+            }),
+            "{symbol}"
+        );
+    }
+    let limited = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 7,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    assert_eq!(
+        limited.declarations,
+        complete
+            .declarations
+            .iter()
+            .filter(|entry| {
+                !["/collect/item", "/pairs/key", "/pairs/amount"]
+                    .iter()
+                    .any(|suffix| entry.symbol.as_str().ends_with(suffix))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(limited.edges, complete.edges);
+}
+
+#[test]
+fn package_python_loop_targets_respect_existing_names_and_scope_redirects() {
+    const SOURCE: &str = concat!(
+        "global_item = 1\n",
+        "def outer(items):\n",
+        "    prior = 1\n",
+        "    def nested():\n",
+        "        global global_item\n",
+        "        nonlocal prior\n",
+        "        for global_item, prior in items:\n",
+        "            pass\n",
+        "    for prior in items:\n",
+        "        pass\n",
+        "    return nested\n",
+        "async def receive(items):\n",
+        "    async for item in items:\n",
+        "        return item\n",
+    );
+    let result = publication(&[("click.py", SOURCE)], None, &["click"]);
+    assert_eq!(
+        result
+            .declarations
+            .iter()
+            .filter(|entry| entry.symbol.as_str().ends_with("/outer/prior"))
+            .map(|entry| entry.source.as_str())
+            .collect::<Vec<_>>(),
+        ["prior = 1"]
+    );
+    assert!(!result.declarations.iter().any(|entry| {
+        ["/nested/global_item", "/nested/prior"]
+            .iter()
+            .any(|suffix| entry.symbol.as_str().ends_with(suffix))
+    }));
+    assert!(result.declarations.iter().any(|entry| {
+        entry.symbol.as_str().ends_with("/receive/item") && entry.source == "item"
+    }));
+}
+
+#[test]
+fn package_python_variadic_parameters_keep_names_and_reads() {
+    const SOURCE: &str = concat!(
+        "def collect(*values: int, **options: str):\n",
+        "    return values, options\n",
+        "class Control:\n",
+        "    def existing(self, value):\n",
+        "        return self, value\n"
+    );
+    let files = [("click.py", SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    for (name, signature) in [("values", "*values"), ("options", "**options")] {
+        let symbol = format!("rift://symbol/pypi/pypi.org/click/python/click/collect/{name}");
+        let declaration_start = SOURCE.find(signature).expect("written parameter")
+            + signature.find(name).expect("parameter name");
+        let read_start = SOURCE.rfind(name).expect("written read");
+        assert!(
+            complete.declarations.iter().any(|entry| {
+                entry.symbol.as_str() == symbol
+                    && entry.source == name
+                    && entry.range.start == u64::try_from(declaration_start).expect("start")
+                    && entry.range.end
+                        == u64::try_from(declaration_start + name.len()).expect("end")
+            }),
+            "{symbol}"
+        );
+        assert!(
+            complete.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.from.as_str().ends_with("/collect")
+                    && edge.to.as_str() == symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == u64::try_from(read_start).expect("start")
+                            && site.range.end
+                                == u64::try_from(read_start + name.len()).expect("end")
+                    })
+            }),
+            "{symbol}"
+        );
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            !["/collect/values", "/collect/options"]
+                .iter()
+                .any(|suffix| edge.to.as_str().ends_with(suffix))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    assert_eq!(limited.declarations, complete.declarations);
+    assert_eq!(limited.edges, prior);
+    assert!(limited.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/existing/self")
+    }));
 }
 
 #[test]

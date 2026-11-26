@@ -23,6 +23,447 @@ fn analyze_rust_root(files: Vec<(&str, &str)>, manifest: &str) -> PackageAnalysi
     .expect("captured Rust package")
 }
 
+const SELF_CRATE_ALIAS_SOURCE: &str = r"
+pub extern crate self as facade;
+pub fn leaf() -> u8 { 7 }
+pub fn call_root() -> u8 { facade::leaf() }
+
+pub mod inherited {
+    pub fn call_child() -> u8 { facade::leaf() }
+}
+
+pub mod shadowed {
+    mod facade {
+        pub fn leaf() -> u16 { 120 }
+    }
+    pub fn call_shadow() -> u16 { facade::leaf() }
+}
+
+pub mod nested_alias {
+    extern crate self as local_facade;
+    pub fn call_nested() -> u8 { local_facade::leaf() }
+    pub fn leaf() -> u32 { 92 }
+    pub fn call_relative() -> u32 { self::leaf() }
+}
+
+pub mod inactive_alias {
+    #[cfg(any())]
+    extern crate self as disabled;
+    mod disabled {
+        pub fn leaf() -> i16 { -3 }
+    }
+    pub fn call_active() -> i16 { disabled::leaf() }
+}
+
+pub mod imports {
+    pub mod facade {
+        pub fn leaf() -> u64 { 12 }
+    }
+}
+pub mod glob_shadowed {
+    use crate::imports::*;
+    pub fn call_glob() -> u64 { facade::leaf() }
+}
+
+pub mod thread {
+    pub fn yield_now() {}
+}
+pub mod external_shadowed {
+    extern crate std as facade;
+    pub fn call_external() { facade::thread::yield_now(); }
+}
+";
+
+#[test]
+fn package_resolves_rust_self_crate_aliases_with_written_module_precedence() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = SELF_CRATE_ALIAS_SOURCE;
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    let [unit] = publication.units.as_slice() else {
+        panic!("one authored library unit");
+    };
+    for (owner, target, invocation) in [
+        ("call_root", "leaf", "facade::leaf()"),
+        ("inherited/call_child", "leaf", "facade::leaf()"),
+        (
+            "shadowed/call_shadow",
+            "shadowed/facade/leaf",
+            "facade::leaf()",
+        ),
+        ("nested_alias/call_nested", "leaf", "local_facade::leaf()"),
+        (
+            "nested_alias/call_relative",
+            "nested_alias/leaf",
+            "self::leaf()",
+        ),
+        (
+            "inactive_alias/call_active",
+            "inactive_alias/disabled/leaf",
+            "disabled::leaf()",
+        ),
+        (
+            "glob_shadowed/call_glob",
+            "imports/facade/leaf",
+            "facade::leaf()",
+        ),
+    ] {
+        let function = owner.rsplit('/').next().expect("authored function");
+        let function_start = source
+            .find(&format!("fn {function}("))
+            .expect("function source");
+        let invocation_start = source[function_start..]
+            .find(invocation)
+            .expect("invocation");
+        let start = u64::try_from(function_start + invocation_start).expect("source offset");
+        let end = start + u64::try_from(invocation.len()).expect("invocation length");
+        let calls = publication
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Calls] && edge.from.as_str() == format!("{ROOT}/{owner}")
+            })
+            .collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            panic!("one authored call for {owner}");
+        };
+        assert_eq!(call.to.as_str(), format!("{ROOT}/{target}"));
+        let site = call.occurrence.as_ref().expect("authored invocation");
+        assert_eq!(site.unit, unit.unit);
+        assert_eq!((site.range.start, site.range.end), (start, end));
+    }
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge
+                .from
+                .as_str()
+                .ends_with("/external_shadowed/call_external")
+            && edge.to.as_str() == format!("{ROOT}/thread/yield_now")
+    }));
+}
+
+#[test]
+fn a_nested_rust_extern_crate_binding_does_not_enter_the_crate_prelude() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = r"
+pub fn leaf() -> u8 { 7 }
+pub mod enclosing {
+    extern crate self as private_facade;
+    pub mod child {
+        pub fn caller() -> u8 { private_facade::leaf() }
+    }
+}";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    assert!(publication.declarations.iter().any(|declaration| {
+        declaration.symbol.as_str() == format!("{ROOT}/enclosing/child/caller")
+    }));
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls] && edge.from.as_str().ends_with("/enclosing/child/caller")
+    }));
+}
+
+const RUST_RUNTIME_ALIAS_SOURCE: &str = r"
+pub extern crate std as platform;
+pub fn caller() { platform::thread::yield_now(); }
+
+pub mod shadowed {
+    mod platform {
+        pub mod thread {
+            pub fn yield_now() -> u16 { 42 }
+        }
+    }
+    pub fn caller() -> u16 { platform::thread::yield_now() }
+}
+";
+const RUST_NO_STD_RUNTIME_ALIAS_SOURCE: &str = r"
+#![no_std]
+extern crate core as platform;
+pub fn caller() -> u8 { platform::hint::black_box(1u8) }
+";
+
+#[test]
+fn package_publishes_stdlib_imports_and_calls_through_rust_extern_crate_aliases() {
+    use rift_protocol::read::EdgeKind;
+
+    const RUNTIME: &str = "rift://symbol/stdlib/rust/rust";
+    for (source, runtime, written_call, target) in [
+        (
+            RUST_RUNTIME_ALIAS_SOURCE,
+            "std",
+            "platform::thread::yield_now()",
+            "thread/yield_now",
+        ),
+        (
+            RUST_NO_STD_RUNTIME_ALIAS_SOURCE,
+            "core",
+            "platform::hint::black_box(1u8)",
+            "hint/black_box",
+        ),
+    ] {
+        let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+        let publication = analysis.publication();
+        let [unit] = publication.units.as_slice() else {
+            panic!("one authored library unit");
+        };
+        let root_caller = format!("{ROOT}/caller");
+        let runtime_target = format!("{RUNTIME}/{runtime}/{target}");
+        for (kind, from, to, authored) in [
+            (
+                EdgeKind::Imports,
+                ROOT,
+                format!("{RUNTIME}/{runtime}"),
+                runtime,
+            ),
+            (
+                EdgeKind::Calls,
+                root_caller.as_str(),
+                runtime_target,
+                written_call,
+            ),
+        ] {
+            let written = if kind == EdgeKind::Imports {
+                source.find("extern crate ").expect("authored crate") + "extern crate ".len()
+            } else {
+                source.find(authored).expect("authored invocation")
+            };
+            let start = u64::try_from(written).expect("source offset");
+            let end = start + u64::try_from(authored.len()).expect("source length");
+            assert!(
+                publication.edges.iter().any(|edge| {
+                    edge.kinds == [kind]
+                        && edge.from.as_str() == from
+                        && edge.to.as_str() == to
+                        && edge.occurrence.as_ref().is_some_and(|site| {
+                            site.unit == unit.unit
+                                && site.range.start == start
+                                && site.range.end == end
+                        })
+                }),
+                "{from} to {to} at {start}"
+            );
+        }
+        if runtime == "std" {
+            let call = publication
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.kinds == [EdgeKind::Calls]
+                        && edge.from.as_str().ends_with("/shadowed/caller")
+                })
+                .expect("local call");
+            assert_eq!(
+                call.to.as_str(),
+                format!("{ROOT}/shadowed/platform/thread/yield_now")
+            );
+        }
+    }
+}
+
+#[test]
+fn package_refuses_unobserved_rust_extern_crate_aliases() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = r"
+#![no_std]
+#[cfg(any())]
+extern crate std as disabled;
+extern crate untracked as platform;
+pub fn inactive() { disabled::thread::yield_now(); }
+pub fn unknown() { platform::thread::yield_now(); }
+";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    for caller in ["/inactive", "/unknown"] {
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with(caller))
+        );
+        assert!(!publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls] && edge.from.as_str().ends_with(caller)
+        }));
+    }
+    assert!(
+        !publication
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Imports])
+    );
+}
+
+#[test]
+fn package_prefers_written_extern_bindings_to_implicit_runtime_paths() {
+    use rift_protocol::read::EdgeKind;
+
+    const SELF_AS_CORE: &str = r"
+pub extern crate self as core;
+pub mod beacon { pub fn run() -> u8 { 42 } }
+pub fn caller() -> u8 { core::beacon::run() }
+";
+    const CORE_AS_STD: &str = r"
+#![no_std]
+pub extern crate core as std;
+pub fn caller() { std::hint::spin_loop(); }
+";
+    const LOCAL_SHADOW: &str = r"
+pub mod core { pub mod beacon { pub fn run() -> u8 { 42 } } }
+pub fn caller() -> u8 { core::beacon::run() }
+";
+    const INACTIVE_OR_OUTSIDE: &str = r"
+#[cfg(any())]
+pub extern crate self as core;
+pub mod other { extern crate self as core; }
+pub fn caller() { core::hint::spin_loop(); }
+";
+    const NESTED_CHILD_RUNTIME: &str = r"
+pub mod outer {
+    extern crate self as core;
+    pub mod child { pub fn caller() { core::hint::spin_loop(); } }
+}
+";
+    const NESTED_CHILD_ROOT_ALIAS: &str = r"
+pub extern crate self as core;
+pub mod beacon { pub fn run() -> u8 { 42 } }
+pub mod outer {
+    extern crate std as core;
+    pub mod child { pub fn caller() -> u8 { core::beacon::run() } }
+}
+";
+    const RUNTIME: &str = "rift://symbol/stdlib/rust/rust/core/hint/spin_loop";
+    let package_target = format!("{ROOT}/beacon/run");
+    let shadow_target = format!("{ROOT}/core/beacon/run");
+    for (source, caller, target, invocation) in [
+        (
+            SELF_AS_CORE,
+            "caller",
+            package_target.as_str(),
+            "core::beacon::run()",
+        ),
+        (CORE_AS_STD, "caller", RUNTIME, "std::hint::spin_loop()"),
+        (
+            LOCAL_SHADOW,
+            "caller",
+            shadow_target.as_str(),
+            "core::beacon::run()",
+        ),
+        (
+            INACTIVE_OR_OUTSIDE,
+            "caller",
+            RUNTIME,
+            "core::hint::spin_loop()",
+        ),
+        (
+            NESTED_CHILD_RUNTIME,
+            "outer/child/caller",
+            RUNTIME,
+            "core::hint::spin_loop()",
+        ),
+        (
+            NESTED_CHILD_ROOT_ALIAS,
+            "outer/child/caller",
+            package_target.as_str(),
+            "core::beacon::run()",
+        ),
+    ] {
+        let caller = format!("{ROOT}/{caller}");
+        let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+        let publication = analysis.publication();
+        let [unit] = publication.units.as_slice() else {
+            panic!("one authored library unit");
+        };
+        let calls = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Calls] && edge.from.as_str() == caller)
+            .collect::<Vec<_>>();
+        let [edge] = calls.as_slice() else {
+            panic!("one captured Call for {invocation}");
+        };
+        assert_eq!(edge.to.as_str(), target);
+        let start = source.find(invocation).expect("written call");
+        let site = edge.occurrence.as_ref().expect("physical call range");
+        assert_eq!(site.unit, unit.unit);
+        assert_eq!(
+            site.range.start,
+            u64::try_from(start).expect("start offset")
+        );
+        assert_eq!(
+            site.range.end,
+            u64::try_from(start + invocation.len()).expect("end offset")
+        );
+    }
+}
+
+#[test]
+fn package_refuses_a_runtime_spelling_owned_by_an_unobserved_extern_crate() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = "extern crate untracked as alloc;\npub fn caller() { alloc::vec::Vec::new(); }";
+    let analysis = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = analysis.publication();
+    let caller = format!("{ROOT}/caller");
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str() == caller)
+    );
+    assert!(
+        !publication
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Calls] && edge.from.as_str() == caller)
+    );
+}
+
+#[test]
+fn disjoint_same_name_extern_bindings_keep_the_ordinary_runtime_call() {
+    use std::fmt::Write as _;
+
+    use rift_protocol::read::EdgeKind;
+
+    const CALLER: &str = "pub fn caller() { core::hint::spin_loop(); }";
+    let mut source = String::new();
+    for ordinal in 0..48 {
+        writeln!(
+            source,
+            "pub mod sibling{ordinal} {{ extern crate self as core; }}"
+        )
+        .expect("authored sibling module");
+    }
+    let caller_start = source.len();
+    source.push_str(CALLER);
+    let analysis = analyze_rust_root(vec![("src/lib.rs", &source)], MANIFEST);
+    let publication = analysis.publication();
+    let caller = format!("{ROOT}/caller");
+    let calls = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls] && edge.from.as_str() == caller)
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("one ordinary runtime Call");
+    };
+    assert_eq!(
+        call.to.as_str(),
+        "rift://symbol/stdlib/rust/rust/core/hint/spin_loop"
+    );
+    let site = call.occurrence.as_ref().expect("physical call range");
+    let start = caller_start + CALLER.find("core::").expect("written path");
+    let end = start + "core::hint::spin_loop()".len();
+    assert_eq!(
+        (site.range.start, site.range.end),
+        (
+            u64::try_from(start).expect("start offset"),
+            u64::try_from(end).expect("end offset")
+        )
+    );
+}
+
 #[test]
 fn package_publishes_direct_macro_export_visibility() {
     let source = "#[macro_export]\nmacro_rules! plain_export { () => { 8u8 }; }\n\

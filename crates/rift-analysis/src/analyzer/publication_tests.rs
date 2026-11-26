@@ -8,12 +8,15 @@ use crate::{
 use rift_core::ProjectPath;
 
 mod aliases;
+mod annotations;
 mod commonjs_literals;
 mod facts;
 mod forwarded_names;
 mod graph;
+mod initializers;
 mod internal_modules;
 mod module_imports;
+mod overload_parameters;
 mod returned_callables;
 mod rust_guard;
 mod rust_implementations;
@@ -39,6 +42,16 @@ fn publication_with_configuration(
     prefix: Option<&str>,
     modules: &[&str],
     configuration: rift_protocol::configuration::PackageConfiguration,
+) -> PackagePublication {
+    python_publication_with_limits(files, prefix, modules, configuration, None)
+}
+
+fn python_publication_with_limits(
+    files: &[(&str, &str)],
+    prefix: Option<&str>,
+    modules: &[&str],
+    configuration: rift_protocol::configuration::PackageConfiguration,
+    edges_max: Option<usize>,
 ) -> PackagePublication {
     let package = rift_protocol::read::PackageIdentity {
         manager: "pypi".to_owned(),
@@ -81,24 +94,22 @@ fn publication_with_configuration(
         name: "python".to_owned(),
         dialect: None,
     };
-    let input = ExactPackageInput::new(
-        &owner,
-        &language,
-        &origin,
-        &sources,
-        ExactPackageLimits::new(
-            u32::try_from(sources.len()).expect("file count"),
-            files
-                .iter()
-                .map(|(_, text)| u64::try_from(text.len()).expect("source length"))
-                .sum(),
-        )
-        .with_publication(configuration)
-        .expect("validated publication bounds"),
+    let limits = ExactPackageLimits::new(
+        u32::try_from(sources.len()).expect("file count"),
+        files
+            .iter()
+            .map(|(_, text)| u64::try_from(text.len()).expect("source length"))
+            .sum(),
     )
-    .expect("bounded input")
-    .with_import_roots(&roots)
-    .expect("accepted placement");
+    .with_publication(configuration)
+    .expect("validated publication bounds");
+    let limits = edges_max.map_or(limits, |edges| {
+        limits.with_edges(edges).expect("validated edge bound")
+    });
+    let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+        .expect("bounded input")
+        .with_import_roots(&roots)
+        .expect("accepted placement");
     PackageAnalyzer::analyze(input, 1)
         .expect("normalized publication")
         .publication()

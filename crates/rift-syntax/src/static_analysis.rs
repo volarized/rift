@@ -23,6 +23,28 @@ pub struct StaticCall {
     pub callee: StaticCallee,
 }
 
+/// Source evidence for an initializer generated from a decorated Python class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticPythonInitializer {
+    /// The complete authored class declaration.
+    pub class: ByteRange,
+    /// The decorator expression naming the initializer generator.
+    pub decorator: ByteRange,
+    /// The single authored base class, when present.
+    pub base: Option<ByteRange>,
+    /// The annotated fields the class writes.
+    pub fields: Vec<StaticPythonInitializerField>,
+}
+
+/// The authored name and annotation of one initializer field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticPythonInitializerField {
+    /// The field's identifier.
+    pub name: ByteRange,
+    /// The field's type annotation.
+    pub annotation: ByteRange,
+}
+
 /// One authored value access or type reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticReference {
@@ -275,6 +297,11 @@ pub enum StaticBindingKind {
     RustUse {
         /// Imported path before a local alias.
         path: ByteRange,
+    },
+    /// Authored Rust crate binding.
+    RustExternCrate {
+        /// Authored crate name, or `self` for the current crate.
+        crate_name: ByteRange,
     },
     /// Local Rust binding with an authored receiver type.
     RustReceiver {
@@ -534,6 +561,16 @@ pub struct StaticFactsParts {
     pub python_deletions: Vec<PythonDeletion>,
     /// Plain Python reads paired with their earlier binding name in the same function.
     pub python_local_reads: Vec<(ByteRange, ByteRange)>,
+    /// Plain reads in a nested Python function paired with an earlier outer local name.
+    pub python_captured_local_reads: Vec<(ByteRange, ByteRange)>,
+    /// Reads of a Python method receiver paired with its parameter name.
+    pub python_receiver_reads: Vec<(ByteRange, ByteRange)>,
+    /// Reads of Python variadic parameters paired with their declared names.
+    pub python_variadic_reads: Vec<(ByteRange, ByteRange)>,
+    /// Authored class fields for a possible generated Python initializer.
+    pub python_initializers: Vec<StaticPythonInitializer>,
+    /// The call and keyword name ranges of Python keyword arguments.
+    pub python_keyword_arguments: Vec<(ByteRange, ByteRange)>,
     /// Python names checked for a non-`None` value and the bodies the checks admit.
     pub non_none_guards: Vec<(ByteRange, ByteRange)>,
     /// Rust calls with a closure argument and the range of every argument in order, which
@@ -917,8 +954,40 @@ impl StaticFacts {
         &self.0.python_local_reads
     }
 
+    /// Plain Python reads and their candidate binding in the enclosing function.
+    #[must_use]
+    pub fn python_captured_local_reads(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_captured_local_reads
+    }
+
+    /// Reads of a Python method receiver and the available parameter name.
+    #[must_use]
+    pub fn python_receiver_reads(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_receiver_reads
+    }
+
+    /// Python variadic parameter reads and the names their bindings select.
+    #[must_use]
+    pub fn python_variadic_reads(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_variadic_reads
+    }
+
+    /// The authored fields an initializer may expose as keyword arguments.
+    #[must_use]
+    pub fn python_initializers(&self) -> &[StaticPythonInitializer] {
+        &self.0.python_initializers
+    }
+
+    /// The call and name ranges for Python keyword arguments.
+    #[must_use]
+    pub fn python_keyword_arguments(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.python_keyword_arguments
+    }
+
     pub(crate) fn retain_python_local_reads(&mut self, keep: impl Fn(ByteRange) -> bool) {
         self.0.python_local_reads.retain(|&(_, name)| keep(name));
+        self.0.python_receiver_reads.retain(|&(_, name)| keep(name));
+        self.0.python_variadic_reads.retain(|&(_, name)| keep(name));
     }
 
     /// Python names checked for a non-`None` value and the bodies the checks admit.
@@ -978,6 +1047,11 @@ impl StaticFacts {
             vector_capacity(&self.0.evaluated_outside),
             vector_capacity(&self.0.python_deletions),
             vector_capacity(&self.0.python_local_reads),
+            vector_capacity(&self.0.python_captured_local_reads),
+            vector_capacity(&self.0.python_receiver_reads),
+            vector_capacity(&self.0.python_variadic_reads),
+            vector_capacity(&self.0.python_initializers),
+            vector_capacity(&self.0.python_keyword_arguments),
             vector_capacity(&self.0.non_none_guards),
             vector_capacity(&self.0.commonjs_writes),
             vector_capacity(&self.0.skippable),
@@ -985,6 +1059,13 @@ impl StaticFacts {
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
+        .saturating_add(
+            self.python_initializers()
+                .iter()
+                .fold(0_usize, |bytes, initializer| {
+                    bytes.saturating_add(vector_capacity(&initializer.fields))
+                }),
+        )
         .saturating_add(
             self.0
                 .rust_uses
@@ -1052,6 +1133,11 @@ impl StaticFacts {
             self.evaluated_outside().len(),
             self.python_deletions().len(),
             self.python_local_reads().len(),
+            self.python_captured_local_reads().len(),
+            self.python_receiver_reads().len(),
+            self.python_variadic_reads().len(),
+            self.python_initializers().len(),
+            self.python_keyword_arguments().len(),
             self.non_none_guards().len(),
             self.commonjs_writes().len(),
             self.skippable().len(),
@@ -1294,7 +1380,9 @@ impl StaticFacts {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
         let rust = self.rust_rows_valid(&valid, limits);
-        let flow = self.python_flow_valid(valid) && self.python_local_reads_valid(source, valid);
+        let flow = self.python_flow_valid(valid)
+            && self.python_local_reads_valid(source, valid)
+            && self.python_initializers_valid(valid, limits);
         if !(edges
             && references
             && declared_types
@@ -1321,19 +1409,54 @@ impl StaticFacts {
         Ok(())
     }
 
+    fn python_initializers_valid(
+        &self,
+        valid: impl Fn(ByteRange) -> bool,
+        limits: SyntaxLimits,
+    ) -> bool {
+        self.python_initializers().iter().all(|initializer| {
+            valid(initializer.class)
+                && valid(initializer.decorator)
+                && initializer.decorator.end <= initializer.class.start
+                && initializer
+                    .base
+                    .is_none_or(|base| valid(base) && initializer.class.encloses(base))
+                && initializer.fields.len() <= limits.syntax_elements_max()
+                && initializer.fields.iter().all(|field| {
+                    valid(field.name)
+                        && valid(field.annotation)
+                        && initializer.class.encloses(field.name)
+                        && initializer.class.encloses(field.annotation)
+                        && field.name.end <= field.annotation.start
+                })
+        }) && self
+            .python_keyword_arguments()
+            .iter()
+            .all(|&(call, name)| valid(call) && valid(name) && call.encloses(name))
+    }
+
     fn python_local_reads_valid(&self, source: &str, valid: impl Fn(ByteRange) -> bool) -> bool {
         let spelling = |range: ByteRange| {
             source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
         };
-        self.python_local_reads()
-            .windows(2)
-            .all(|pair| pair[0].0.end <= pair[1].0.start)
-            && self.python_local_reads().iter().all(|&(read, name)| {
-                valid(read)
-                    && valid(name)
-                    && name.end <= read.start
-                    && spelling(read) == spelling(name)
-            })
+        [
+            self.python_local_reads(),
+            self.python_captured_local_reads(),
+            self.python_receiver_reads(),
+            self.python_variadic_reads(),
+        ]
+        .into_iter()
+        .all(|reads| {
+            reads
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start)
+                && reads.iter().all(|&(read, name)| {
+                    valid(read)
+                        && valid(name)
+                        && name.end <= read.start
+                        && spelling(read) == spelling(name)
+                })
+        })
     }
 
     fn python_flow_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
@@ -1416,6 +1539,11 @@ impl StaticBinding {
             }
             StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
+            StaticBindingKind::RustExternCrate { crate_name } => {
+                valid(crate_name)
+                    && self.scope.encloses(crate_name)
+                    && (crate_name == self.name || crate_name.end <= self.name.start)
+            }
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
@@ -1737,6 +1865,42 @@ mod python_local_read_tests {
         let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), original.0.clone())
             .expect("restored read/name pair");
         assert_eq!(&restored, original);
+    }
+
+    #[test]
+    fn test_python_captured_local_read_restores_separately_from_direct_reads() {
+        let source = "def outer(parameter):\n    local = 1\n    def nested():\n        return local + parameter\n    return local\n";
+        let local: Vec<_> = source
+            .match_indices("local")
+            .map(|(start, _)| {
+                let start = u64::try_from(start).expect("source offset");
+                ByteRange {
+                    start,
+                    end: start + 5,
+                }
+            })
+            .collect();
+        let captured = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &rift_core::ProjectPath::new("pick.py").expect("path"),
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("authored Python source");
+        let original = captured.facts().static_facts().expect("captured facts");
+        assert_eq!(original.python_local_reads(), [(local[2], local[0])]);
+        assert_eq!(
+            original.python_captured_local_reads(),
+            [(local[1], local[0])]
+        );
+        let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), original.0.clone())
+            .expect("restored captured and direct read/name pairs");
+        assert_eq!(&restored, original);
+        let mut inverted = original.0.clone();
+        inverted.python_captured_local_reads[0] = (local[0], local[1]);
+        assert!(StaticFacts::from_parts(source, SyntaxLimits::default(), inverted).is_err());
     }
 
     #[test]

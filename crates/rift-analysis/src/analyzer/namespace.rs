@@ -355,7 +355,7 @@ fn identity_anchors_with_roots(
     };
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols() {
-        if symbol.is_python_parameter()
+        if (symbol.is_python_parameter() || symbol.is_python_loop_binding())
             && (input.release_version().is_none()
                 || !matches!(
                     input.owner(),

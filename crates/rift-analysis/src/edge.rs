@@ -455,77 +455,84 @@ impl EdgeStore {
         edges_max: usize,
     ) {
         let supplemental_start = resolution.supplemental_start.take();
-        let late_start = resolution
-            .late_supplemental_start
-            .take()
-            .unwrap_or(resolution.occurrences.len());
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
-        let (internal, external) =
-            supplemental_start.unwrap_or((late_start, resolution.external.len()));
-        let (earlier, late_supplemental) = resolution.occurrences.split_at(late_start);
-        let (occurrences, supplemental) = earlier.split_at(internal);
-        let (external, supplemental_external) = resolution.external.split_at(external);
+        let (alias, alias_external) = resolution
+            .rust_extern_alias_start
+            .take()
+            .unwrap_or((resolution.occurrences.len(), resolution.external.len()));
+        let (incumbent_external, alias_external_rows) =
+            resolution.external.split_at(alias_external);
+        let mut next_start = alias;
+        let [
+            overload,
+            quoted_type,
+            initializer,
+            variadic,
+            receiver,
+            capture,
+            reassigned,
+            late,
+        ] = [
+            resolution.python_overload_parameter_start.take(),
+            resolution.python_quoted_type_start.take(),
+            resolution.python_initializer_start.take(),
+            resolution.python_variadic_start.take(),
+            resolution.python_receiver_start.take(),
+            resolution.python_capture_start.take(),
+            resolution.python_reassignment_start.take(),
+            resolution.late_supplemental_start.take(),
+        ]
+        .map(|start| {
+            next_start = start.unwrap_or(next_start);
+            next_start
+        });
+        let (internal, external) = supplemental_start.unwrap_or((late, alias_external));
+        let boundaries = [
+            0,
+            internal,
+            late,
+            reassigned,
+            capture,
+            receiver,
+            variadic,
+            initializer,
+            quoted_type,
+            overload,
+            alias,
+            resolution.occurrences.len(),
+        ];
+        let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
-        let mut remaining = edges_max.saturating_sub(existing);
-        let mut changed = false;
-        let mut primary = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut additional = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        let mut late = BTreeMap::<&SymbolId, Vec<Edge>>::new();
-        admit_occurrences(occurrences, spans, &self.edge_modules, &mut primary);
-        admit_external(external, spans, &self.edge_modules, &mut primary);
-        admit_occurrences(supplemental, spans, &self.edge_modules, &mut additional);
+        let capacity = edges_max.saturating_sub(existing);
+        let mut remaining = capacity;
+        let mut batches: [BTreeMap<_, _>; 11] = std::array::from_fn(|index| {
+            let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
+            let mut edges = BTreeMap::new();
+            admit_occurrences(rows, spans, &self.edge_modules, &mut edges);
+            edges
+        });
+        admit_external(external, spans, &self.edge_modules, &mut batches[0]);
         admit_external(
             supplemental_external,
             spans,
             &self.edge_modules,
-            &mut additional,
+            &mut batches[1],
         );
-        admit_occurrences(late_supplemental, spans, &self.edge_modules, &mut late);
-        for (from, edges) in primary
-            .iter_mut()
-            .chain(additional.iter_mut())
-            .chain(late.iter_mut())
-        {
-            edges.sort_by(edge_order);
-            edges.dedup();
-            let existing = self.outgoing(from);
-            edges.retain(|edge| {
-                existing
-                    .binary_search_by(|other| edge_order(other, edge))
-                    .is_err()
-            });
-        }
-        for (from, edges) in &mut additional {
-            if let Some(primary) = primary.get(from) {
-                // Count a shared primary row once, even when the cap drops both copies.
-                edges.retain(|edge| {
-                    primary
-                        .binary_search_by(|other| edge_order(other, edge))
-                        .is_err()
-                });
-            }
-        }
-        for (from, edges) in &mut late {
-            edges.retain(|edge| {
-                [primary.get(from), additional.get(from)]
-                    .into_iter()
-                    .flatten()
-                    .all(|earlier| {
-                        earlier
-                            .binary_search_by(|other| edge_order(other, edge))
-                            .is_err()
-                    })
-            });
-        }
-        for (from, mut edges) in primary.into_iter().chain(additional).chain(late) {
+        admit_external(
+            alias_external_rows,
+            spans,
+            &self.edge_modules,
+            &mut batches[10],
+        );
+        self.deduplicate_static_batches(&mut batches);
+        for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);
             self.dropped_edges = self
                 .dropped_edges
                 .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
             remaining -= fits;
-            changed |= fits > 0;
             edges.truncate(fits);
             if edges.is_empty() {
                 continue;
@@ -542,10 +549,35 @@ impl EdgeStore {
                 .or_default()
                 .append(&mut edges);
         }
-        if changed {
+        if remaining < capacity {
             for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
                 edges.sort_by(edge_order);
                 edges.dedup();
+            }
+        }
+    }
+
+    fn deduplicate_static_batches(&self, batches: &mut [BTreeMap<&SymbolId, Vec<Edge>>]) {
+        for position in 0..batches.len() {
+            let (prior, next) = batches.split_at_mut(position);
+            for (from, edges) in &mut next[0] {
+                edges.sort_by(edge_order);
+                edges.dedup();
+                let existing = self.outgoing(from);
+                // A shared row counts in the first batch even when the cap drops it.
+                edges.retain(|edge| {
+                    std::iter::once(existing)
+                        .chain(
+                            prior
+                                .iter()
+                                .filter_map(|batch| batch.get(from).map(Vec::as_slice)),
+                        )
+                        .all(|earlier| {
+                            earlier
+                                .binary_search_by(|other| edge_order(other, edge))
+                                .is_err()
+                        })
+                });
             }
         }
     }
@@ -1148,58 +1180,81 @@ mod tests {
             edge_from: Some(from.clone()),
             edge_kind: None,
         };
-        let resolution = |additional, late: bool| {
+        let resolution = |batch_count| {
             let mut occurrences = vec![
                 occurrence(&alpha, 5, ReferenceRole::Call),
                 occurrence(&zeta, 25, ReferenceRole::Call),
             ];
-            if additional {
+            if batch_count >= 2 {
                 occurrences.push(occurrence(&alpha, 3, ReferenceRole::Read));
                 occurrences.push(occurrence(&zeta, 25, ReferenceRole::Call));
             }
-            let late_start = late.then_some(occurrences.len());
-            if late {
+            let late_start = (batch_count >= 3).then_some(occurrences.len());
+            if late_start.is_some() {
                 occurrences.push(occurrence(&alpha, 2, ReferenceRole::Read));
                 occurrences.push(occurrence(&alpha, 3, ReferenceRole::Read));
             }
+            let python_reassignment_start = (batch_count >= 4).then_some(occurrences.len());
+            if python_reassignment_start.is_some() {
+                occurrences.push(occurrence(&alpha, 1, ReferenceRole::Read));
+                occurrences.push(occurrence(&alpha, 2, ReferenceRole::Read));
+            }
+            let python_capture_start = (batch_count >= 5).then_some(occurrences.len());
+            if python_capture_start.is_some() {
+                occurrences.push(occurrence(&alpha, 0, ReferenceRole::Read));
+                occurrences.push(occurrence(&alpha, 1, ReferenceRole::Read));
+            }
             StaticResolution {
                 occurrences,
-                supplemental_start: additional.then_some((2, 0)),
+                supplemental_start: (batch_count >= 2).then_some((2, 0)),
                 late_supplemental_start: late_start,
+                python_reassignment_start,
+                python_capture_start,
                 ..StaticResolution::default()
             }
         };
-        let build = |cap, additional, late| {
+        let build = |cap, batch_count| {
             EdgeStore::build_resolving(&graph, super::BTreeMap::new(), cap, || {
-                resolution(additional, late)
+                resolution(batch_count)
             })
             .0
         };
-        let baseline = build(2, false, false);
+        let baseline = build(2, 1);
         assert!(baseline.is_complete());
         assert_eq!(baseline.edges().count(), 2);
 
-        let expanded = build(2, true, false);
+        let expanded = build(2, 2);
         assert_eq!(expanded.dropped_edges(), 1);
         assert!(!expanded.is_complete());
         assert_eq!(expanded.outgoing(&zeta), baseline.outgoing(&zeta));
         assert_eq!(expanded.outgoing(&alpha), baseline.outgoing(&alpha));
         assert_eq!(expanded.incoming(&callee), baseline.incoming(&callee));
-        assert_eq!(build(1, true, false).dropped_edges(), 2);
+        assert_eq!(build(1, 2).dropped_edges(), 2);
 
-        let room = build(3, true, false);
+        let room = build(3, 2);
         assert!(room.is_complete());
         assert_eq!(room.edges().count(), 3);
         assert_eq!(room.outgoing(&alpha).len(), 2);
         assert_eq!(room.outgoing(&zeta), baseline.outgoing(&zeta));
 
-        let late = build(3, true, true);
+        let late = build(3, 3);
         assert_eq!(late.dropped_edges(), 1);
         assert_eq!(late.outgoing(&alpha), room.outgoing(&alpha));
         assert_eq!(late.outgoing(&zeta), room.outgoing(&zeta));
-        let all = build(4, true, true);
+        let all = build(4, 3);
         assert!(all.is_complete());
         assert_eq!(all.edges().count(), 4);
+        let reassigned = build(4, 4);
+        assert_eq!(reassigned.dropped_edges(), 1);
+        assert_eq!(reassigned.outgoing(&alpha), all.outgoing(&alpha));
+        assert_eq!(reassigned.outgoing(&zeta), all.outgoing(&zeta));
+        let all = build(5, 4);
+        assert!(all.is_complete());
+        let captured = build(5, 5);
+        assert_eq!(captured.dropped_edges(), 1);
+        assert_eq!(captured.outgoing(&alpha), all.outgoing(&alpha));
+        assert_eq!(captured.outgoing(&zeta), all.outgoing(&zeta));
+        assert!(build(6, 5).is_complete());
     }
 
     #[test]

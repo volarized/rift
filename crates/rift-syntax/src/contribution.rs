@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rift_core::{
@@ -23,6 +23,10 @@ pub struct PackageBindingSlots {
     rust_parameter: usize,
     python_parameter: usize,
     typescript_parameter: usize,
+    python_receiver: usize,
+    python_loop_binding: usize,
+    python_variadic_parameter: usize,
+    python_overload_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -39,7 +43,39 @@ impl PackageBindingSlots {
             rust_parameter,
             python_parameter,
             typescript_parameter,
+            python_receiver: 0,
+            python_loop_binding: 0,
+            python_variadic_parameter: 0,
+            python_overload_parameter: 0,
         }
+    }
+
+    /// Reserves separate slots for Python method receivers after other bindings.
+    #[must_use]
+    pub const fn with_python_receiver_slots(mut self, slots: usize) -> Self {
+        self.python_receiver = slots;
+        self
+    }
+
+    /// Reserves separate slots for Python loop binding declarations.
+    #[must_use]
+    pub const fn with_python_loop_binding_slots(mut self, slots: usize) -> Self {
+        self.python_loop_binding = slots;
+        self
+    }
+
+    /// Reserves separate slots for Python variadic parameter declarations.
+    #[must_use]
+    pub const fn with_python_variadic_parameter_slots(mut self, slots: usize) -> Self {
+        self.python_variadic_parameter = slots;
+        self
+    }
+
+    /// Reserves separate slots for parameters in Python overload families.
+    #[must_use]
+    pub const fn with_python_overload_parameter_slots(mut self, slots: usize) -> Self {
+        self.python_overload_parameter = slots;
+        self
     }
 
     /// The total number of reserved slots.
@@ -49,15 +85,36 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_parameter)
             .saturating_add(self.python_parameter)
             .saturating_add(self.typescript_parameter)
+            .saturating_add(self.python_receiver)
+            .saturating_add(self.python_loop_binding)
+            .saturating_add(self.python_variadic_parameter)
+            .saturating_add(self.python_overload_parameter)
     }
 
-    fn admit(&mut self, symbol: &crate::SyntaxSymbol) -> bool {
+    fn admit(
+        &mut self,
+        symbol: &crate::SyntaxSymbol,
+        python_receivers: &BTreeSet<crate::ByteRange>,
+    ) -> bool {
         let available = if symbol.is_typescript_parameter() {
             &mut self.typescript_parameter
+        } else if symbol.is_python_variadic_parameter() {
+            &mut self.python_variadic_parameter
+        } else if symbol.is_python_overload_parameter() {
+            &mut self.python_overload_parameter
         } else if symbol.is_python_parameter() {
-            &mut self.python_parameter
+            if symbol
+                .name_range
+                .is_some_and(|name| python_receivers.contains(&name))
+            {
+                &mut self.python_receiver
+            } else {
+                &mut self.python_parameter
+            }
         } else if symbol.is_rust_parameter_binding() {
             &mut self.rust_parameter
+        } else if symbol.is_python_loop_binding() {
+            &mut self.python_loop_binding
         } else {
             &mut self.rust_local
         };
@@ -453,10 +510,11 @@ impl SyntaxPublicationBuilder {
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
         let mut remaining = *binding_slots;
+        let python_receivers = syntax.python_receiver_names();
         for symbol in syntax.symbols() {
             if symbol.is_package_binding()
                 && (placement.logical_identity(&symbol.qualified_name).is_none()
-                    || !remaining.admit(symbol))
+                    || !remaining.admit(symbol, &python_receivers))
             {
                 continue;
             }
