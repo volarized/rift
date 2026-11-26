@@ -1280,7 +1280,7 @@ pub mod left;
 pub mod right;
 pub fn call() { left::one(); right::one(); }
 "#;
-    let shared = "#[cfg(test)] mod tests; pub fn one() {}";
+    let shared = "#[cfg(test)] mod tests; pub trait Borrowed: where for<'a> &'a Self: IntoIterator {} pub fn one() {}";
     let analysis = fixture::package_result(
         ShippedLanguage::Rust,
         vec![("src/lib.rs", root), ("src/shared.rs", shared)],

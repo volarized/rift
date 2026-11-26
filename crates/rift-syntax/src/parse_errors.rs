@@ -41,6 +41,8 @@ pub(crate) fn invalid_declarations(
     .any(|shipped| shipped.language() == *language);
     let tree = if ecmascript {
         crate::ecmascript::recovery::parse(&mut parser, source.text).map(|(tree, _)| tree)
+    } else if ShippedLanguage::Rust.language() == *language {
+        crate::rust::parse_tree(&mut parser, source.text, limits)
     } else {
         parser.parse(source.text, None)
     }

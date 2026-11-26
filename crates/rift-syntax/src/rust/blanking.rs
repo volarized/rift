@@ -41,6 +41,54 @@ pub(super) fn blank_const_trait_keywords(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// The pinned grammar parses the empty supertrait list in `trait T: where ...`
+/// as a bounds error. Blank its checked colon and preserve authored byte offsets.
+pub(super) fn blank_empty_trait_bounds(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    nodes_max: usize,
+) -> Option<String> {
+    if !root.has_error() || !text.contains("where") {
+        return None;
+    }
+    let mut pending = vec![root];
+    let mut budget = nodes_max;
+    let mut result = None;
+    while let Some(node) = pending.pop() {
+        budget = budget.checked_sub(1)?;
+        if node.is_error()
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "trait_item")
+            && let Some(colon) = empty_supertrait_colon(node, text)
+        {
+            result
+                .get_or_insert_with(|| text.to_owned())
+                .replace_range(colon, " ");
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            budget = budget.checked_sub(1)?;
+            if child.has_error() {
+                pending.push(child);
+            }
+        }
+    }
+    result
+}
+
+fn empty_supertrait_colon(node: tree_sitter::Node<'_>, text: &str) -> Option<Range<usize>> {
+    let bounds = node
+        .child(0)
+        .filter(|child| child.kind() == "trait_bounds")?;
+    let colon = bounds.child(0).filter(|child| child.kind() == ":")?;
+    let keyword = bounds.child(1).filter(tree_sitter::Node::is_error)?;
+    (colon.start_byte() == node.start_byte()
+        && text.get(colon.byte_range()) == Some(":")
+        && text.get(keyword.byte_range()) == Some("where"))
+    .then_some(colon.byte_range())
+}
+
 /// The bytes to blank for the `const` spelled at `start`; `None` when it is
 /// no const-trait form: a `const` item, `const fn`, `const` block, or part
 /// of a longer identifier. Every returned boundary sits on an ASCII byte.

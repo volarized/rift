@@ -438,9 +438,7 @@ impl RustQuery {
                 .fail();
         }
         let mut parser = rust_parser()?;
-        let parsed = blanking::blank_const_trait_keywords(source);
-        let tree = parser
-            .parse(parsed.as_ref(), None)
+        let tree = parse_tree(&mut parser, source, SyntaxLimits::DEFAULT)
             .ok_or_else(|| errors::syntax::parse_cancelled().error())?;
         let mut cursor = QueryCursor::new();
         let mut query_captures = cursor.captures(&self.inner, tree.root_node(), source.as_bytes());
@@ -490,9 +488,7 @@ impl SyntaxProvider for RustSyntaxProvider {
     ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let mut parser = rust_parser()?;
-        let parsed = blanking::blank_const_trait_keywords(source.text);
-        let tree = parser
-            .parse(parsed.as_ref(), None)
+        let tree = parse_tree(&mut parser, source.text, limits)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let mut capture = crate::static_analysis::Capture::for_rust(source.text, limits);
         let rules = RustGrammarRules {
@@ -821,6 +817,23 @@ impl GrammarRules for RustGrammarRules {
 
 pub(crate) fn rust_grammar() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+pub(crate) fn parse_tree(
+    parser: &mut Parser,
+    text: &str,
+    limits: SyntaxLimits,
+) -> Option<tree_sitter::Tree> {
+    let prepared = blanking::blank_const_trait_keywords(text);
+    let tree = parser.parse(prepared.as_ref(), None)?;
+    let Some(repaired) = blanking::blank_empty_trait_bounds(
+        prepared.as_ref(),
+        tree.root_node(),
+        limits.syntax_elements_max(),
+    ) else {
+        return Some(tree);
+    };
+    parser.parse(repaired, None).or(Some(tree))
 }
 
 fn rust_parser() -> Result<Parser, RiftError> {
@@ -1229,6 +1242,69 @@ mod tests {
                 SyntaxLimits::default(),
             )
             .expect("Rust fixture must parse")
+    }
+
+    #[test]
+    fn empty_supertrait_bound_preserves_original_rust_source() {
+        let path = rift_core::ProjectPath::new("src/payload.rs").expect("Rust source path");
+        let source = "pub trait Café: where for<'a> &'a Self: IntoIterator { fn open(&self); }";
+        let provider = RustSyntaxProvider::default();
+        let parsed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: source,
+                },
+                SyntaxLimits::DEFAULT,
+            )
+            .expect("complete authored trait");
+        assert!(!parsed.has_errors());
+        assert_eq!(
+            parsed.facts().source_digest(),
+            Some(&rift_core::FileDigest::of(source.as_bytes()))
+        );
+        let trait_symbol = parsed
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "Café")
+            .expect("authored trait");
+        assert_eq!(trait_symbol.item_range.start, 0);
+        assert_eq!(
+            trait_symbol.item_range.end,
+            u64::try_from(source.len()).expect("source bytes")
+        );
+        assert!(
+            parsed
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.qualified_name == "Café::open")
+        );
+        let query =
+            RustQuery::new("(trait_item name: (type_identifier) @name)").expect("trait query");
+        let captures = query.captures(source, 2).expect("one trait name capture");
+        assert_eq!(captures.len(), 1);
+        let name = source.find("Café").expect("written name");
+        let from = u64::try_from(name).expect("name offset");
+        let to = u64::try_from(name + "Café".len()).expect("name end");
+        assert_eq!(
+            captures[0].range,
+            crate::ByteRange {
+                start: from,
+                end: to
+            }
+        );
+
+        let malformed = "pub trait Broken: where for<'a> &'a Self: { fn open(&self); }";
+        let parsed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: malformed,
+                },
+                SyntaxLimits::DEFAULT,
+            )
+            .expect("retains a typed parse error");
+        assert!(parsed.has_errors());
     }
 
     #[test]
