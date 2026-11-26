@@ -648,6 +648,26 @@ impl BindingDemands {
         }
         demands
     }
+
+    fn count(&self) -> usize {
+        self.rust_locals.count
+            + self.rust_parameters.count
+            + self.python_parameters.count
+            + self.typescript_parameters.count
+            + self.python_receivers.count
+            + self.python_loop_bindings.count
+            + self.python_variadic_parameters.count
+            + self.python_overload_parameters.count
+            + self.javascript_parameters.count
+            + self.typescript_method_parameters.count
+            + self.callback_parameters.count
+            + self.overload_parameters.count
+            + self.rust_receivers.count
+            + self.rust_generics.count
+            + self.rust_library.count
+            + self.rust_explicit.count
+            + self.rust_shorthand.count
+    }
 }
 
 fn binding_capacity(
@@ -664,24 +684,7 @@ fn binding_capacity(
             .saturating_add(demands.unnamed)
             .saturating_add(synthetic_objects),
     );
-    let count = demands.rust_locals.count
-        + demands.rust_parameters.count
-        + demands.python_parameters.count
-        + demands.typescript_parameters.count
-        + demands.python_receivers.count
-        + demands.python_loop_bindings.count
-        + demands.python_variadic_parameters.count
-        + demands.python_overload_parameters.count
-        + demands.javascript_parameters.count
-        + demands.typescript_method_parameters.count
-        + demands.callback_parameters.count
-        + demands.overload_parameters.count
-        + demands.rust_receivers.count
-        + demands.rust_generics.count
-        + demands.rust_library.count
-        + demands.rust_explicit.count
-        + rust_module_sources.count
-        + demands.rust_shorthand.count;
+    let count = demands.count() + rust_module_sources.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = demands.rust_locals.reserve(&mut slots, &mut bytes, record);
