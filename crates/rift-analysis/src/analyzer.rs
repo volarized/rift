@@ -96,6 +96,7 @@ pub struct AnalyzedFile {
     /// A Cargo library declaration belongs to this placement, outside cached syntax.
     placed_syntax: Option<Box<SyntaxFacts>>,
     placement: DocumentPlacement,
+    shared_rust_placements: Vec<DocumentPlacement>,
     public_names: BTreeSet<String>,
     /// Whether a consumer can import the file's own module.
     reached: bool,
@@ -305,6 +306,7 @@ fn analyzed_file(
         file: parsed,
         placed_syntax: None,
         placement,
+        shared_rust_placements: Vec::new(),
         public_names,
         reached: true,
         item_kinds,
@@ -442,10 +444,28 @@ fn assemble_package_graph(
     namespace: &namespace::PreparedNamespace,
     revision: u64,
 ) -> Result<(WorkspaceSemantics, Option<usize>), RiftError> {
-    let placed = analyzed
+    let mut placed = analyzed
         .iter()
+        .filter(|held| held.shared_rust_placements.is_empty())
         .map(AnalyzedFile::placed_facts)
         .collect::<Vec<_>>();
+    let shared = analyzed
+        .iter()
+        .flat_map(|held| {
+            held.shared_rust_placements.iter().map(|placement| {
+                crate::static_resolution::StaticSource {
+                    placement,
+                    ..held.static_source()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    placed.extend(shared.iter().map(|source| PlacedFacts {
+        facts: source.facts,
+        path: source.path,
+        // The source unit has no single module owner; only its declarations do.
+        placement: source.placement.clone().with_module(None),
+    }));
     let (bindings, mut binding_slots) = binding_capacity(
         analyzed,
         input.limits(),
@@ -485,7 +505,7 @@ fn assemble_package_graph(
                 (reference.symbol() == &target).then(|| export.target.clone())
             })
         },
-        (&static_sources, &input.namespace_input()),
+        (&static_sources, &shared, &input.namespace_input()),
         &mut binding_slots,
     )
     .map_err(|error| {
@@ -531,14 +551,21 @@ impl BindingDemands {
         let mut demands = Self::default();
         for document in documents {
             let facts = document.placed_syntax();
-            let receiver_names = facts.python_receiver_names();
             demands.primary = demands
                 .primary
-                .saturating_add(facts.primary_symbols_len())
+                .saturating_add(
+                    facts
+                        .primary_symbols_len()
+                        .saturating_mul(document.shared_rust_placements.len().max(1)),
+                )
                 .saturating_add(document.placement.aliases_count());
             demands.unnamed = demands
                 .unnamed
                 .saturating_add(facts.left_out_symbols().len());
+            if !document.shared_rust_placements.is_empty() {
+                continue;
+            }
+            let receiver_names = facts.python_receiver_names();
             let methods = facts.typescript_method_names();
             for symbol in facts.symbols().iter().filter(|symbol| {
                 symbol.is_package_binding()
@@ -851,6 +878,13 @@ fn place_namespace(
             assigned.insert(".".to_owned(), root.clone());
             place_rust_library_root(held, root);
         }
+        held.shared_rust_placements = namespace
+            .shared_rust_modules
+            .remove(held.file.path().as_str())
+            .into_iter()
+            .flatten()
+            .map(|scope| scope.placement(&held.placement))
+            .collect();
         held.placement = held
             .placement
             .clone()

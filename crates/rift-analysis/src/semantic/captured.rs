@@ -146,7 +146,7 @@ impl PreparedProjectSemantics<'_> {
         } else {
             Vec::new()
         };
-        let static_inputs = resolve_static.then_some((sources.as_slice(), &self.input));
+        let static_inputs = resolve_static.then_some((sources.as_slice(), &[][..], &self.input));
         let mut built =
             self.prepared
                 .build_with_external(edges_max, previous, None, static_inputs)?;

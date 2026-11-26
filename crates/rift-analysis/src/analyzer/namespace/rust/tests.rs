@@ -2114,7 +2114,7 @@ fn literal_module_paths_refuse_missing_unknown_and_conflicting_sources() {
         &[
             (
                 "src/lib.rs",
-                "#[path = \"to.rs\"] mod first; #[path = \"to.rs\"] mod second;",
+                "#[path = \"to.rs\"] mod first; #[cfg(unknown)] #[path = \"to.rs\"] mod second;",
             ),
             ("src/to.rs", "pub fn refused() {}"),
         ],
@@ -2123,7 +2123,7 @@ fn literal_module_paths_refuse_missing_unknown_and_conflicting_sources() {
     );
     assert!(
         conflict.is_empty(),
-        "one physical source cannot acquire two module identities"
+        "an unknown route cannot establish a second logical owner"
     );
     let ambiguous = selected_anchors(
         &[("Cargo.toml", MANIFEST)],

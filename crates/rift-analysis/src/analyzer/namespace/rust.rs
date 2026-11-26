@@ -15,6 +15,9 @@ use crate::NamespaceInput;
 pub(super) mod configuration;
 mod implementations;
 mod macros;
+mod shared;
+
+pub(crate) use shared::SharedRustModule;
 
 pub(crate) use implementations::file_scope;
 
@@ -73,6 +76,7 @@ pub(super) fn prepare(
     };
     let mut anchors = BTreeMap::new();
     let mut requested = Vec::new();
+    let mut routes = shared::Routes::default();
     let configurations = configuration::Configurations::new(input);
     let mut declaring = BTreeMap::<String, Vec<(String, Declaring)>>::new();
     while let Some((path, namespace, directory, scope, library)) = pending.pop_front() {
@@ -90,6 +94,7 @@ pub(super) fn prepare(
         let configuration = configurations.file(path.as_str());
         let ordinary =
             module_children(file, &directory, &inventory, input.syntax(), &configuration);
+        routes.record(file, &namespace, &ordinary);
         let children = macros::children(
             file,
             &directory,
@@ -104,18 +109,7 @@ pub(super) fn prepare(
                 .into_iter()
                 .map(|export| (namespace.clone(), export)),
         );
-        for (child, _, item) in ordinary {
-            declaring
-                .entry(child)
-                .or_default()
-                .push((path.clone(), Declaring::Item(item)));
-        }
-        for (child, condition) in conditioned {
-            declaring.entry(child).or_default().push((
-                path.clone(),
-                Declaring::Known(configuration.condition(&condition)),
-            ));
-        }
+        record_module_declarations(&mut declaring, &path, ordinary, conditioned, &configuration);
         let declared = file_anchors(input, file.syntax, &namespace, &admitted);
         anchors.insert(
             path.clone(),
@@ -127,26 +121,34 @@ pub(super) fn prepare(
             &namespace,
             library,
             children,
-            &mut assigned,
+            (&mut assigned, &mut routes),
             &mut pending,
         ) {
             return super::PreparedNamespace::default();
         }
     }
     let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
-    let modules = Modules {
-        configurations: &configurations,
-        admitted: &admitted,
+    let Some(shared_rust_modules) = routes.projections(
+        input,
+        (&inventory, &originals, &assigned),
+        &configurations,
+        &admitted,
+    ) else {
+        return super::PreparedNamespace::default();
     };
-    implementations::place(input, selected, &assigned, &modules, &mut anchors);
-    let rust_modules = assigned
-        .iter()
-        .filter(|(path, _)| anchors.contains_key(*path))
-        .filter_map(|(path, module)| Some((path.clone(), module_identity(input, module)?)))
-        .collect();
+    let rust_modules = place_implementations(
+        input,
+        selected,
+        &assigned,
+        &configurations,
+        &admitted,
+        &shared_rust_modules,
+        &mut anchors,
+    );
     let mut prepared = super::PreparedNamespace {
         anchors,
         rust_modules,
+        shared_rust_modules,
         outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
@@ -155,16 +157,62 @@ pub(super) fn prepare(
     prepared
 }
 
-/// Queues children with valid namespaces. A competing assignment refuses the inventory.
+fn record_module_declarations(
+    declaring: &mut BTreeMap<String, Vec<(String, Declaring)>>,
+    path: &str,
+    ordinary: Vec<ChildModulePath>,
+    conditioned: Vec<macros::Conditioned<'_>>,
+    configuration: &configuration::Configuration<'_>,
+) {
+    for (child, _, item) in ordinary {
+        declaring
+            .entry(child)
+            .or_default()
+            .push((path.to_owned(), Declaring::Item(item)));
+    }
+    for (child, condition) in conditioned {
+        declaring.entry(child).or_default().push((
+            path.to_owned(),
+            Declaring::Known(configuration.condition(&condition)),
+        ));
+    }
+}
+
+fn place_implementations(
+    input: &NamespaceInput<'_>,
+    selected: &[super::SelectedFile<'_>],
+    assigned: &BTreeMap<String, Vec<String>>,
+    configurations: &configuration::Configurations<'_>,
+    admitted: &BTreeMap<String, Option<bool>>,
+    shared: &BTreeMap<String, Vec<SharedRustModule>>,
+    anchors: &mut super::Anchors,
+) -> BTreeMap<String, SymbolId> {
+    let modules = Modules {
+        configurations,
+        admitted,
+    };
+    for path in shared.keys() {
+        anchors.remove(path);
+    }
+    implementations::place(input, selected, assigned, &modules, anchors);
+    assigned
+        .iter()
+        .filter(|(path, _)| anchors.contains_key(*path))
+        .filter_map(|(path, module)| Some((path.clone(), module_identity(input, module)?)))
+        .collect()
+}
+
+/// Queues children with valid namespaces and records checked literal assignments for later validation.
 fn queue_module_children(
     owner: &SymbolOwner,
     language: &Language,
     parent: &[String],
     library: bool,
     children: Vec<(String, Vec<String>, macros::Scope)>,
-    assigned: &mut BTreeMap<String, Vec<String>>,
+    assignments: (&mut BTreeMap<String, Vec<String>>, &mut shared::Routes),
     pending: &mut Pending,
 ) -> bool {
+    let (assigned, routes) = assignments;
     for (child, local, child_scope) in children {
         let mut child_namespace = parent.to_vec();
         child_namespace.extend(local);
@@ -172,7 +220,9 @@ fn queue_module_children(
             continue;
         }
         if let Some(previous) = assigned.get(&child) {
-            if previous != &child_namespace {
+            if previous != &child_namespace
+                && !routes.record_shared(&child, previous, &child_namespace)
+            {
                 return false;
             }
             continue;

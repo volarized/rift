@@ -1204,6 +1204,71 @@ fn package_stores_typescript_imported_type_uses_at_each_written_site() {
 }
 
 #[test]
+fn package_rust_shared_literal_modules_keep_distinct_owners_and_one_source() {
+    let root = r#"
+#[path = "shared.rs"]
+pub mod left;
+#[path = "shared.rs"]
+pub mod right;
+pub fn call() { left::one(); right::one(); }
+"#;
+    let shared = "#[cfg(test)] mod tests; pub fn one() {}";
+    let analysis = fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![("src/lib.rs", root), ("src/shared.rs", shared)],
+        None,
+    )
+    .expect("checked literal modules");
+    let (publication, _, _, _) = analysis.into_parts();
+    assert_eq!(publication.units.len(), 2);
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0.as_str() == "src/shared.rs")
+        .expect("one physical unit")
+        .unit;
+    let call_site = |needle: &str| {
+        u64::try_from(root.find(needle).expect("written call")).expect("call offset")
+    };
+    let one = u64::try_from(shared.find("one").expect("authored name")).expect("name offset");
+    for module in ["left", "right"] {
+        let suffix = format!("/beacon/{module}/one");
+        assert_eq!(
+            publication
+                .declarations
+                .iter()
+                .filter(|entry| {
+                    entry.symbol.as_str().ends_with(&suffix)
+                        && &entry.unit == unit
+                        && entry.range.start <= one
+                        && entry.range.end >= one + 3
+                        && entry.source == "pub fn one() {}"
+                })
+                .count(),
+            1,
+            "{module}: {:?}",
+            publication.declarations,
+        );
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.from.as_str().ends_with("/beacon/call")
+                    && edge.to.as_str().ends_with(&suffix)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        let call = format!("{module}::one()");
+                        let start = call_site(call.as_str());
+                        site.range.start == start
+                            && site.range.end
+                                == start + u64::try_from(call.len()).expect("call length")
+                    })
+            }),
+            "{module}: {:?}",
+            publication.edges
+        );
+    }
+}
+
+#[test]
 fn package_rust_constructors_and_fields_use_their_block_owner() {
     use rift_core::ReferenceRole;
     use rift_provider::NormalizedTarget;

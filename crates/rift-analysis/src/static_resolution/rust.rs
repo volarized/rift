@@ -19,7 +19,7 @@ use rift_syntax::{
     ByteRange, StaticBindingKind, StaticCall, StaticCallee, StaticRustUse, SyntaxSymbol,
 };
 
-use super::{Binding, File, Target, Work};
+use super::{Binding, File, StaticSource, Target, Work};
 
 pub(super) enum ExternCallee<'source> {
     Local(Target<'source>),
@@ -295,6 +295,8 @@ impl<'source> Namespaces<'source> {
 
     pub(super) fn new(
         files: &Arc<BTreeMap<&'source str, File<'source>>>,
+        shared: &'source [StaticSource<'source>],
+        admitted_binding: &impl Fn(Target<'source>) -> bool,
         work: &mut Work,
     ) -> Option<Self> {
         let mut namespaces = Self {
@@ -312,6 +314,11 @@ impl<'source> Namespaces<'source> {
                 continue;
             }
             namespaces.index_file(file, work)?;
+        }
+        for document in shared {
+            if let Some(file) = files.get(document.path.as_str()) {
+                namespaces.index_shared(document, file, admitted_binding, work)?;
+            }
         }
         namespaces.index_exports(files, work)?;
         namespaces.index_aliases(files, work)?;
@@ -824,6 +831,46 @@ impl<'source> Namespaces<'source> {
         }
         self.bases.insert(namespace.base.clone());
         self.files.insert(file.document.path.as_str(), namespace);
+        Some(())
+    }
+
+    fn index_shared(
+        &mut self,
+        document: &'source StaticSource<'source>,
+        physical: &File<'source>,
+        admitted_binding: &impl Fn(Target<'source>) -> bool,
+        work: &mut Work,
+    ) -> Option<()> {
+        let base = document.placement.module_path();
+        self.bases.insert(base.to_vec());
+        for symbol in document.facts.symbols() {
+            if !work.charge() {
+                return None;
+            }
+            if symbol.container.is_some()
+                || !physical.is_module_item(symbol)
+                || physical.conditional(symbol.item_range, work)
+            {
+                continue;
+            }
+            let target = Target {
+                file: document,
+                symbol,
+            };
+            let Some(path) = target.admitted_path() else {
+                continue;
+            };
+            if !admitted_binding(target) {
+                continue;
+            }
+            if matches!(symbol.kind, "constant" | "static") {
+                insert(&mut self.constants_and_statics, path, target);
+            } else if symbol.kinds.contains(&SymbolKind::Type) && symbol.kind != "module" {
+                insert(&mut self.types, path, target);
+            } else if symbol.kind == "function" {
+                insert(&mut self.values, path, target);
+            }
+        }
         Some(())
     }
 

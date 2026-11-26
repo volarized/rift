@@ -192,12 +192,13 @@ pub(crate) fn deferred(documents: &[StaticSource<'_>]) -> StaticResolution {
 pub(crate) fn resolve(
     graph: &NormalizedGraph,
     documents: &[StaticSource<'_>],
+    shared: &[StaticSource<'_>],
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
     resolve_by(
         graph,
-        documents,
+        (documents, shared),
         namespace,
         work_max,
         |index, work, resolution| index.resolve_files(FileWork::CAPTURED, work, resolution),
@@ -207,12 +208,16 @@ pub(crate) fn resolve(
 /// Runs one static pass whose files `files` resolves against the built index.
 fn resolve_by<'source>(
     graph: &'source NormalizedGraph,
-    documents: &'source [StaticSource<'source>],
+    documents: (
+        &'source [StaticSource<'source>],
+        &'source [StaticSource<'source>],
+    ),
     namespace: &NamespaceInput<'_>,
     work_max: usize,
     files: impl FnOnce(&Index<'source>, &mut Work, &mut StaticResolution),
 ) -> StaticResolution {
     let mut edge_calls: BTreeMap<_, _> = documents
+        .0
         .iter()
         .filter(|document| supported_language(document.facts))
         .map(|document| {
@@ -1558,7 +1563,10 @@ struct Index<'source> {
 impl<'source> Index<'source> {
     fn new(
         graph: &'source NormalizedGraph,
-        documents: &'source [StaticSource<'source>],
+        documents: (
+            &'source [StaticSource<'source>],
+            &'source [StaticSource<'source>],
+        ),
         namespace: &NamespaceInput<'_>,
         work: &mut Work,
     ) -> Option<Self> {
@@ -1574,7 +1582,7 @@ impl<'source> Index<'source> {
         let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
         let mut rust_extern_files = Vec::new();
-        for document in documents {
+        for document in documents.0 {
             if !work.charge() {
                 return None;
             }
@@ -1627,7 +1635,7 @@ impl<'source> Index<'source> {
         }
         rust_extern_files.sort_unstable();
         let files = Arc::new(files);
-        let rust = rust::Namespaces::new(&files, work)?;
+        let rust = rust::Namespaces::new(&files, documents.1, &admitted_binding, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let owners = external::Owners::new(namespace, work)?;
         let mut index = Self {

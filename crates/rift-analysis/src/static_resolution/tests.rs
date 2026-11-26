@@ -1481,13 +1481,22 @@ fn syntax(path: &str, text: &str) -> SyntaxDocument {
         .expect("fixture syntax")
 }
 
+fn resolve_unshared(
+    graph: &rift_provider::NormalizedGraph,
+    documents: &[StaticSource<'_>],
+    namespace: &NamespaceInput<'_>,
+    work_max: usize,
+) -> StaticResolution {
+    resolve(graph, documents, &[], namespace, work_max)
+}
+
 fn resolution(
     language: &str,
     sources: &[(&str, &str)],
     metadata: &[(&str, &str)],
     work_max: usize,
 ) -> StaticResolution {
-    resolution_by(language, sources, metadata, work_max, &resolve)
+    resolution_by(language, sources, metadata, work_max, &resolve_unshared)
 }
 
 /// A static pass over one fixture: what [`resolve`] receives and answers.
@@ -1947,7 +1956,7 @@ fn resolved_in_one_pass(
 ) -> StaticResolution {
     super::resolve_by(
         graph,
-        documents,
+        (documents, &[]),
         input,
         work_max,
         |index, work, resolution| {
@@ -1980,7 +1989,7 @@ fn resolved_apart(
 ) -> StaticResolution {
     super::resolve_by(
         graph,
-        documents,
+        (documents, &[]),
         input,
         work_max,
         |index, work, resolution| index.resolve_files(file_work, work, resolution),
@@ -2017,7 +2026,7 @@ fn files_resolved_apart_equal_one_pass_under_every_budget() {
     for work_max in 0..WORK_MAX {
         let (exhausted, expected) = printed(work_max, one_pass);
         assert_eq!(
-            printed(work_max, &resolve).1,
+            printed(work_max, &resolve_unshared).1,
             expected,
             "work_max={work_max}"
         );
@@ -2030,7 +2039,7 @@ fn files_resolved_apart_equal_one_pass_under_every_budget() {
     assert!(budgets > APART_SOURCES.len(), "budgets={budgets}");
     let (exhausted, complete) = printed(WORK_MAX, one_pass);
     assert!(!exhausted);
-    assert_eq!(printed(WORK_MAX, &resolve).1, complete);
+    assert_eq!(printed(WORK_MAX, &resolve_unshared).1, complete);
     assert!(complete.contains("role: Call"), "{complete}");
 }
 
@@ -2123,7 +2132,7 @@ fn work_done_once_the_budget_ends_stays_inside_the_budget() {
             &|graph, documents, input, work_max| {
                 super::resolve_by(
                     graph,
-                    documents,
+                    (documents, &[]),
                     input,
                     work_max,
                     |index, work, resolution| {
@@ -3129,7 +3138,7 @@ fn test_python_cross_module_aliases_reuse_the_class_terminal() {
             &[],
             1_000_000,
             &|graph, documents, input, budget| {
-                super::resolve_by(graph, documents, input, budget, |index, work, resolution| {
+                super::resolve_by(graph, (documents, &[]), input, budget, |index, work, resolution| {
                     const LOOKUP_WORK: usize = 4096;
                     let file = index.files.get(final_path.as_str()).expect("final module");
                     let call = file
@@ -4374,7 +4383,7 @@ fn export_member_writes_charge_the_budget_in_proportion_to_their_file() {
             &|graph, documents, input, work_max| {
                 super::resolve_by(
                     graph,
-                    documents,
+                    (documents, &[]),
                     input,
                     work_max,
                     |index, work, resolution| {
