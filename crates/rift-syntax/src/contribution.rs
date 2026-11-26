@@ -43,6 +43,7 @@ pub struct PackageBindingSlots {
     typescript_type_parameter: usize,
     javascript_shorthand_parameter: usize,
     typescript_callable_type_parameter: usize,
+    typescript_index_signature_parameter: usize,
 }
 
 impl PackageBindingSlots {
@@ -79,6 +80,7 @@ impl PackageBindingSlots {
             typescript_type_parameter: 0,
             javascript_shorthand_parameter: 0,
             typescript_callable_type_parameter: 0,
+            typescript_index_signature_parameter: 0,
         }
     }
 
@@ -222,6 +224,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Holds the slots left for TypeScript index signature parameter declarations.
+    #[must_use]
+    pub const fn with_typescript_index_signature_parameters(mut self, count: usize) -> Self {
+        self.typescript_index_signature_parameter = count;
+        self
+    }
+
     /// The total number of reserved slots.
     #[must_use]
     pub const fn remaining(self) -> usize {
@@ -249,6 +258,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_type_parameter)
             .saturating_add(self.javascript_shorthand_parameter)
             .saturating_add(self.typescript_callable_type_parameter)
+            .saturating_add(self.typescript_index_signature_parameter)
     }
 
     fn admit(
@@ -274,6 +284,8 @@ impl PackageBindingSlots {
             &mut self.javascript_shorthand_parameter
         } else if symbol.is_typescript_callable_type_parameter() {
             &mut self.typescript_callable_type_parameter
+        } else if symbol.is_typescript_index_signature_parameter() {
+            &mut self.typescript_index_signature_parameter
         } else if matches!(language, "javascript" | "typescript")
             && symbol.is_ecmascript_parameter()
         {

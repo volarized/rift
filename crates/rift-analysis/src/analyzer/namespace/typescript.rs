@@ -1434,6 +1434,7 @@ fn supplemental_parameter_scope(symbol: &SyntaxSymbol) -> Option<&str> {
     } else if symbol.is_ecmascript_overload_parameter()
         || symbol.is_javascript_shorthand_parameter()
         || symbol.is_typescript_callable_type_parameter()
+        || symbol.is_typescript_index_signature_parameter()
     {
         symbol
             .qualified_name

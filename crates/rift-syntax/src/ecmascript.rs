@@ -80,7 +80,7 @@ use std::num::NonZeroU16;
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
-mod callable_type_parameters;
+
 mod callback_parameters;
 mod commonjs;
 mod members;
@@ -89,6 +89,7 @@ pub(crate) mod recovery;
 mod scoped_function_parameters;
 mod shorthand_parameters;
 mod type_parameters;
+mod type_signature_parameters;
 mod variance;
 
 use tree_sitter::{Node, Parser};
@@ -245,6 +246,7 @@ pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_paramete
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
+pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
@@ -1625,12 +1627,19 @@ impl EcmaScriptRules<'_> {
         text.get(name.byte_range()).map(Into::into)
     }
 
-    fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
-        let (name, kind) = type_parameters::declared_name(visited)
+    fn parameter_syntax<'tree>(
+        &self,
+        visited: Visited<'_, 'tree>,
+    ) -> Option<(Node<'tree>, &'static str)> {
+        type_parameters::declared_name(visited)
             .map(|name| (name, TYPE_PARAMETER_KIND))
             .or_else(|| {
-                callable_type_parameters::declared_name(visited)
+                type_signature_parameters::callable_parameter_name(visited)
                     .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
+                type_signature_parameters::index_parameter_name(visited)
+                    .map(|name| (name, INDEX_SIGNATURE_PARAMETER_KIND))
             })
             .or_else(|| {
                 self.kinds
@@ -1643,7 +1652,11 @@ impl EcmaScriptRules<'_> {
                         };
                         (name, kind)
                     })
-            })?;
+            })
+    }
+
+    fn parameter_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let (name, kind) = self.parameter_syntax(visited)?;
         let name = text.get(name.byte_range())?;
         if !name.is_ascii()
             || name.contains('\\')
@@ -2124,24 +2137,14 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
-        self.kinds
-            .ordinary_parameter(visited)
-            .map(|(name, _)| name)
-            .or_else(|| type_parameters::declared_name(visited))
-            .or_else(|| callable_type_parameters::declared_name(visited))
-            .unwrap_or_else(|| visited.syntax_element())
+        self.parameter_syntax(visited)
+            .map_or_else(|| visited.syntax_element(), |(name, _)| name)
     }
 
     /// Starts the declaration at the statement carrying it, extended over the
     /// `JSDoc` comments attached before that statement.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
-        if let Some(name) = self
-            .kinds
-            .ordinary_parameter(visited)
-            .map(|(name, _)| name)
-            .or_else(|| type_parameters::declared_name(visited))
-            .or_else(|| callable_type_parameters::declared_name(visited))
-        {
+        if let Some((name, _)) = self.parameter_syntax(visited) {
             return name.start_byte();
         }
         let statement = self.statement(visited);
@@ -2384,6 +2387,7 @@ fn append_package_parameters(
         values: parameters,
         types: type_parameters,
         callable_types,
+        index_signatures,
     } = candidates;
     let scoped = if language.name == "typescript" {
         overload_parameters::capture(symbols, &parameters, facts, root)
@@ -2400,7 +2404,8 @@ fn append_package_parameters(
     symbols.extend(shorthand);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
     type_parameters::append(symbols, type_parameters, facts);
-    callable_type_parameters::append(root, symbols, callable_types, facts);
+    type_signature_parameters::append_callable_types(root, symbols, callable_types, facts);
+    type_signature_parameters::append_indexes(root, symbols, index_signatures);
 }
 
 #[derive(Default)]
@@ -2408,6 +2413,7 @@ struct ParameterDeclarations {
     values: Vec<crate::SyntaxSymbol>,
     types: Vec<crate::SyntaxSymbol>,
     callable_types: Vec<crate::SyntaxSymbol>,
+    index_signatures: Vec<crate::SyntaxSymbol>,
 }
 
 /// Holds optional parameters aside while existing member facts are resolved.
@@ -2418,6 +2424,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.types
         } else if symbol.is_typescript_callable_type_parameter() {
             &mut candidates.callable_types
+        } else if symbol.is_typescript_index_signature_parameter() {
+            &mut candidates.index_signatures
         } else {
             &mut candidates.values
         };
@@ -2564,6 +2572,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == CALLABLE_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(CALLABLE_TYPE_PARAMETER_KIND);
+    }
+    if name == INDEX_SIGNATURE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(INDEX_SIGNATURE_PARAMETER_KIND);
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);

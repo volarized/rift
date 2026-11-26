@@ -176,6 +176,7 @@ impl SyntaxSymbol {
             || self.is_javascript_scoped_function_parameter()
             || self.is_javascript_shorthand_parameter()
             || self.is_typescript_callable_type_parameter()
+            || self.is_typescript_index_signature_parameter()
     }
 
     /// Whether this is the physical parameter of a JavaScript function value.
@@ -234,6 +235,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_typescript_callable_type_parameter(&self) -> bool {
         self.kind == crate::ecmascript::CALLABLE_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this value parameter is written in a TypeScript index signature.
+    #[must_use]
+    pub fn is_typescript_index_signature_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::INDEX_SIGNATURE_PARAMETER_KIND
     }
 
     /// Whether this is the written type parameter of a TypeScript declaration.

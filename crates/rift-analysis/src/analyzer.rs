@@ -713,63 +713,31 @@ fn binding_capacity(
     let explicit_slots = demands
         .rust_explicit
         .reserve(&mut slots, &mut bytes, record);
-    let [
-        callback_slots,
-        overload_slots,
-        module_slots,
-        shorthand_slots,
-        method_slots,
-        signature_slots,
-        scoped_slots,
-        type_slots,
-        javascript_shorthand_slots,
-        callable_type_slots,
-    ] = reserve_scoped_parameters(
-        documents,
-        [
-            &demands.ecmascript.javascript_callbacks,
-            &demands.ecmascript.typescript_overloads,
-            &rust_module_sources,
-            &demands.rust_shorthand,
-            &demands.ecmascript.javascript_methods,
-            &demands.ecmascript.typescript_signatures,
-            &demands.ecmascript.javascript_scoped_functions,
-            &demands.ecmascript.typescript_types,
-            &demands.ecmascript.javascript_shorthand,
-            &demands.ecmascript.typescript_callable_types,
-        ],
-        &mut slots,
-        &mut bytes,
-        record,
-    );
+    let established = rift_syntax::PackageBindingSlots::new(
+        local_slots,
+        rust_parameter_slots,
+        python_parameter_slots,
+        typescript_parameter_slots,
+    )
+    .with_rust_receivers(rust_receiver_slots)
+    .with_rust_generics(rust_generic_slots)
+    .with_rust_library_root(root_slot)
+    .with_rust_explicit_locals(explicit_slots)
+    .with_python_receiver_slots(python_receiver_slots)
+    .with_python_loop_binding_slots(python_loop_binding_slots)
+    .with_python_variadic_parameter_slots(python_variadic_slots)
+    .with_python_overload_parameter_slots(python_overload_slots)
+    .with_javascript_parameters(javascript_parameter_slots)
+    .with_typescript_method_parameters(typescript_method_slots);
     (
         count,
-        rift_syntax::PackageBindingSlots::new(
-            local_slots,
-            rust_parameter_slots,
-            python_parameter_slots,
-            typescript_parameter_slots,
-        )
-        .with_rust_receivers(rust_receiver_slots)
-        .with_rust_generics(rust_generic_slots)
-        .with_rust_library_root(root_slot)
-        .with_rust_explicit_locals(explicit_slots)
-        .with_python_receiver_slots(python_receiver_slots)
-        .with_python_loop_binding_slots(python_loop_binding_slots)
-        .with_python_variadic_parameter_slots(python_variadic_slots)
-        .with_python_overload_parameter_slots(python_overload_slots)
-        .with_javascript_parameters(javascript_parameter_slots)
-        .with_typescript_method_parameters(typescript_method_slots)
-        .with_javascript_callback_parameters(callback_slots)
-        .with_typescript_overload_parameters(overload_slots)
-        .with_rust_module_sources(module_slots)
-        .with_rust_shorthand(shorthand_slots)
-        .with_javascript_method_parameters(method_slots)
-        .with_typescript_signature_parameters(signature_slots)
-        .with_javascript_scoped_function_parameters(scoped_slots)
-        .with_typescript_type_parameters(type_slots)
-        .with_javascript_shorthand_parameters(javascript_shorthand_slots)
-        .with_typescript_callable_type_parameters(callable_type_slots),
+        demands.ecmascript.reserve_later_parameters(
+            documents,
+            (&rust_module_sources, &demands.rust_shorthand),
+            (slots, bytes),
+            record,
+            established,
+        ),
     )
 }
 
@@ -786,9 +754,64 @@ struct EcmaScriptBindingDemand {
     typescript_types: BindingDemand,
     javascript_shorthand: BindingDemand,
     typescript_callable_types: BindingDemand,
+    typescript_index_signatures: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
+    fn reserve_later_parameters(
+        &self,
+        documents: &[AnalyzedFile],
+        rust: (&BindingDemand, &BindingDemand),
+        capacity: (usize, u64),
+        record: u64,
+        established: rift_syntax::PackageBindingSlots,
+    ) -> rift_syntax::PackageBindingSlots {
+        let (mut slots, mut bytes) = capacity;
+        let [
+            callback_slots,
+            overload_slots,
+            rust_module_slots,
+            rust_shorthand_slots,
+            method_slots,
+            signature_slots,
+            scoped_slots,
+            type_slots,
+            shorthand_slots,
+            callable_type_slots,
+            index_signature_slots,
+        ] = reserve_scoped_parameters(
+            documents,
+            [
+                &self.javascript_callbacks,
+                &self.typescript_overloads,
+                rust.0,
+                rust.1,
+                &self.javascript_methods,
+                &self.typescript_signatures,
+                &self.javascript_scoped_functions,
+                &self.typescript_types,
+                &self.javascript_shorthand,
+                &self.typescript_callable_types,
+                &self.typescript_index_signatures,
+            ],
+            &mut slots,
+            &mut bytes,
+            record,
+        );
+        established
+            .with_javascript_callback_parameters(callback_slots)
+            .with_typescript_overload_parameters(overload_slots)
+            .with_rust_module_sources(rust_module_slots)
+            .with_rust_shorthand(rust_shorthand_slots)
+            .with_javascript_method_parameters(method_slots)
+            .with_typescript_signature_parameters(signature_slots)
+            .with_javascript_scoped_function_parameters(scoped_slots)
+            .with_typescript_type_parameters(type_slots)
+            .with_javascript_shorthand_parameters(shorthand_slots)
+            .with_typescript_callable_type_parameters(callable_type_slots)
+            .with_typescript_index_signature_parameters(index_signature_slots)
+    }
+
     fn classify(
         &mut self,
         symbol: &SyntaxSymbol,
@@ -811,6 +834,8 @@ impl EcmaScriptBindingDemand {
             &mut self.javascript_shorthand
         } else if symbol.is_typescript_callable_type_parameter() {
             &mut self.typescript_callable_types
+        } else if symbol.is_typescript_index_signature_parameter() {
+            &mut self.typescript_index_signatures
         } else if javascript {
             &mut self.javascript_functions
         } else if symbol
@@ -836,6 +861,7 @@ impl EcmaScriptBindingDemand {
             + self.typescript_types.count
             + self.javascript_shorthand.count
             + self.typescript_callable_types.count
+            + self.typescript_index_signatures.count
     }
 }
 

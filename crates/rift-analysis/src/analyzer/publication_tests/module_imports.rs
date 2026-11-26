@@ -2618,3 +2618,51 @@ fn typescript_callable_type_signatures_keep_distinct_parameter_ranges() {
         edge.to.as_str().ends_with("/run/initial") && edge.kinds == [EdgeKind::Reads]
     }));
 }
+
+#[test]
+fn typescript_index_signature_parameters_keep_separate_non_runtime_scopes() {
+    const SOURCE: &str = concat!(
+        "export interface Inventory { readonly [key: string]: number; [key: number]: number; }\n",
+        "export type Table = { readonly [name: string]: Inventory };\n",
+        "export function read(key: string) { return key; }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked signature scopes");
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical index signature parameters");
+    let mut identities = BTreeSet::new();
+    for (signature, name, owner) in [
+        ("[key: string]", "key", "Inventory"),
+        ("[key: number]", "key", "Inventory"),
+        ("[name: string]", "name", "Table"),
+    ] {
+        let position = SOURCE.find(signature).expect("written signature") + 1;
+        let parameter = found
+            .declarations
+            .iter()
+            .find(|row| row.range == module_runtime_range(position, name) && row.source == name)
+            .expect("written index signature parameter");
+        assert!(parameter.symbol.as_str().contains(&format!("/{owner}/")));
+        assert!(identities.insert(&parameter.symbol));
+        assert!(
+            !found
+                .edges
+                .iter()
+                .any(|edge| { edge.to == parameter.symbol && edge.kinds == [EdgeKind::Reads] })
+        );
+    }
+    assert_eq!(identities.len(), 3);
+    assert!(found.edges.iter().any(|edge| {
+        edge.to.as_str().ends_with("/read/key") && edge.kinds == [EdgeKind::Reads]
+    }));
+}

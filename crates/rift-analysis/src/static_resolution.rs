@@ -1201,6 +1201,7 @@ impl<'source> File<'source> {
             } else if admitted && let Some(site) = site {
                 if symbol.is_typescript_signature_parameter()
                     || symbol.is_typescript_callable_type_parameter()
+                    || symbol.is_typescript_index_signature_parameter()
                 {
                     return;
                 }

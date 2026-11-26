@@ -1,4 +1,4 @@
-//! Value parameter declarations inside written TypeScript callable types.
+//! Value parameter declarations inside written TypeScript type signatures.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -7,7 +7,7 @@ use tree_sitter::Node;
 use crate::extract::{self, Visited};
 use crate::{ByteRange, StaticFacts, SyntaxSymbol};
 
-pub(super) fn declared_name<'tree>(visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+pub(super) fn callable_parameter_name<'tree>(visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
     let parameter = visited.syntax_element();
     let scope = callable_type_scope(parameter)?;
     let list = visited.parent()?.syntax_element();
@@ -37,11 +37,61 @@ fn callable_type_scope(parameter: Node<'_>) -> Option<Node<'_>> {
     .then_some(scope)
 }
 
-pub(super) fn append(
+pub(super) fn append_callable_types(
     root: Node<'_>,
     symbols: &mut Vec<SyntaxSymbol>,
-    mut parameters: Vec<SyntaxSymbol>,
+    parameters: Vec<SyntaxSymbol>,
     facts: &StaticFacts,
+) {
+    if parameters.is_empty() {
+        return;
+    }
+    let sites = facts
+        .parameters()
+        .iter()
+        .map(|site| (site.name, site.function))
+        .collect::<BTreeMap<_, _>>();
+    append_scoped(symbols, parameters, "$signature", |name| {
+        let written = written_name(root, name)?;
+        let scope = extract::byte_range(callable_type_scope(written.parent()?)?).ok()?;
+        (sites.get(&name) == Some(&scope)).then_some(scope)
+    });
+}
+
+/// Name written in an index signature. A mapped type names its parameter in a separate rule.
+pub(super) fn index_parameter_name<'tree>(visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+    index_name(visited.syntax_element())
+}
+
+fn index_name(scope: Node<'_>) -> Option<Node<'_>> {
+    if scope.kind() != "index_signature" || scope.has_error() {
+        return None;
+    }
+    scope
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "identifier" && !name.is_missing())
+}
+
+pub(super) fn append_indexes(
+    root: Node<'_>,
+    symbols: &mut Vec<SyntaxSymbol>,
+    parameters: Vec<SyntaxSymbol>,
+) {
+    append_scoped(symbols, parameters, "$index", |name| {
+        let written = written_name(root, name)?;
+        let scope = written.parent()?;
+        if index_name(scope) != Some(written) {
+            return None;
+        }
+        extract::byte_range(scope).ok()
+    });
+}
+
+fn append_scoped(
+    symbols: &mut Vec<SyntaxSymbol>,
+    mut parameters: Vec<SyntaxSymbol>,
+    label: &str,
+    scope_of: impl Fn(ByteRange) -> Option<ByteRange>,
 ) {
     if parameters.is_empty() {
         return;
@@ -55,11 +105,6 @@ pub(super) fn append(
                 .push(symbol.item_range);
         }
     }
-    let sites = facts
-        .parameters()
-        .iter()
-        .map(|site| (site.name, site.function))
-        .collect::<BTreeMap<_, _>>();
     let names = symbols
         .iter()
         .map(|symbol| symbol.qualified_name.as_str())
@@ -75,13 +120,12 @@ pub(super) fn append(
         let Some(container) = parameter.container.as_deref() else {
             continue;
         };
-        let Some(scope) = written_scope(root, name) else {
+        let Some(scope) = scope_of(name) else {
             continue;
         };
         if owners
             .get(container)
             .is_none_or(|items| items.iter().filter(|item| item.encloses(scope)).count() != 1)
-            || sites.get(&name) != Some(&scope)
         {
             continue;
         }
@@ -91,7 +135,7 @@ pub(super) fn append(
             *ordinal += 1;
             current
         });
-        let qualified = format!("{container}.$signature#{ordinal}.{}", parameter.name);
+        let qualified = format!("{container}.{label}#{ordinal}.{}", parameter.name);
         if names.contains(qualified.as_str()) || !rift_core::is_portable_name(&qualified) {
             continue;
         }
@@ -104,13 +148,12 @@ pub(super) fn append(
     symbols.extend(retained.into_values().flatten());
 }
 
-fn written_scope(root: Node<'_>, name: ByteRange) -> Option<ByteRange> {
+fn written_name(root: Node<'_>, name: ByteRange) -> Option<Node<'_>> {
     let start = usize::try_from(name.start).ok()?;
     let end = usize::try_from(name.end).ok()?;
     let written = root.descendant_for_byte_range(start, end)?;
     if written.byte_range() != (start..end) {
         return None;
     }
-    let scope = callable_type_scope(written.parent()?)?;
-    extract::byte_range(scope).ok()
+    Some(written)
 }
