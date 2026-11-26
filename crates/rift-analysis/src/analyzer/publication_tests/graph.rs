@@ -453,6 +453,103 @@ fn package_python_method_receiver_reads_follow_earlier_edges() {
 }
 
 #[test]
+fn package_python_loop_targets_keep_authored_declarations() {
+    const SOURCE: &str = concat!(
+        "def collect(items):\n",
+        "    value = []\n",
+        "    for item in items:\n",
+        "        value.append(item)\n",
+        "    return value\n",
+        "def pairs(items):\n",
+        "    value = []\n",
+        "    for key, amount in items:\n",
+        "        value.append((key, amount))\n",
+        "    return value\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    for (owner, name, written) in [
+        ("collect", "item", "for item in"),
+        ("pairs", "key", "for key, amount in"),
+        ("pairs", "amount", "for key, amount in"),
+    ] {
+        let symbol = format!("rift://symbol/pypi/pypi.org/click/python/click/{owner}/{name}");
+        let start =
+            SOURCE.find(written).expect("written loop") + written.find(name).expect("target name");
+        assert!(
+            complete.declarations.iter().any(|entry| {
+                entry.symbol.as_str() == symbol
+                    && entry.source == name
+                    && entry.range.start == u64::try_from(start).expect("start")
+                    && entry.range.end == u64::try_from(start + name.len()).expect("end")
+            }),
+            "{symbol}"
+        );
+    }
+    let limited = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 7,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    assert_eq!(
+        limited.declarations,
+        complete
+            .declarations
+            .iter()
+            .filter(|entry| {
+                !["/collect/item", "/pairs/key", "/pairs/amount"]
+                    .iter()
+                    .any(|suffix| entry.symbol.as_str().ends_with(suffix))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(limited.edges, complete.edges);
+}
+
+#[test]
+fn package_python_loop_targets_respect_existing_names_and_scope_redirects() {
+    const SOURCE: &str = concat!(
+        "global_item = 1\n",
+        "def outer(items):\n",
+        "    prior = 1\n",
+        "    def nested():\n",
+        "        global global_item\n",
+        "        nonlocal prior\n",
+        "        for global_item, prior in items:\n",
+        "            pass\n",
+        "    for prior in items:\n",
+        "        pass\n",
+        "    return nested\n",
+        "async def receive(items):\n",
+        "    async for item in items:\n",
+        "        return item\n",
+    );
+    let result = publication(&[("click.py", SOURCE)], None, &["click"]);
+    assert_eq!(
+        result
+            .declarations
+            .iter()
+            .filter(|entry| entry.symbol.as_str().ends_with("/outer/prior"))
+            .map(|entry| entry.source.as_str())
+            .collect::<Vec<_>>(),
+        ["prior = 1"]
+    );
+    assert!(!result.declarations.iter().any(|entry| {
+        ["/nested/global_item", "/nested/prior"]
+            .iter()
+            .any(|suffix| entry.symbol.as_str().ends_with(suffix))
+    }));
+    assert!(result.declarations.iter().any(|entry| {
+        entry.symbol.as_str().ends_with("/receive/item") && entry.source == "item"
+    }));
+}
+
+#[test]
 fn package_python_parameter_keeps_original_symbols_and_local_reads_under_caps() {
     const SOURCE: &str = concat!(
         "def helper(): return 1\n",

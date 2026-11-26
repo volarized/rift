@@ -145,6 +145,12 @@ impl SyntaxSymbol {
         self.kind == crate::python::PARAMETER_KIND_WORD
     }
 
+    /// Whether this is the physical name of an authored Python loop target.
+    #[must_use]
+    pub fn is_python_loop_binding(&self) -> bool {
+        self.kind == crate::python::LOOP_BINDING_KIND_WORD
+    }
+
     /// Whether this is an ordinary TypeScript function parameter candidate.
     #[must_use]
     pub fn is_typescript_parameter(&self) -> bool {
@@ -154,7 +160,10 @@ impl SyntaxSymbol {
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
-        self.is_rust_local_binding() || self.is_python_parameter() || self.is_typescript_parameter()
+        self.is_rust_local_binding()
+            || self.is_python_parameter()
+            || self.is_python_loop_binding()
+            || self.is_typescript_parameter()
     }
 }
 

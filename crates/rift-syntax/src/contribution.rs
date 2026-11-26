@@ -24,6 +24,7 @@ pub struct PackageBindingSlots {
     python_parameter: usize,
     typescript_parameter: usize,
     python_receiver: usize,
+    python_loop_binding: usize,
 }
 
 impl PackageBindingSlots {
@@ -41,6 +42,7 @@ impl PackageBindingSlots {
             python_parameter,
             typescript_parameter,
             python_receiver: 0,
+            python_loop_binding: 0,
         }
     }
 
@@ -48,6 +50,13 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_python_receiver_slots(mut self, slots: usize) -> Self {
         self.python_receiver = slots;
+        self
+    }
+
+    /// Reserves separate slots for Python loop binding declarations.
+    #[must_use]
+    pub const fn with_python_loop_binding_slots(mut self, slots: usize) -> Self {
+        self.python_loop_binding = slots;
         self
     }
 
@@ -59,6 +68,7 @@ impl PackageBindingSlots {
             .saturating_add(self.python_parameter)
             .saturating_add(self.typescript_parameter)
             .saturating_add(self.python_receiver)
+            .saturating_add(self.python_loop_binding)
     }
 
     fn admit(
@@ -79,6 +89,8 @@ impl PackageBindingSlots {
             }
         } else if symbol.is_rust_parameter_binding() {
             &mut self.rust_parameter
+        } else if symbol.is_python_loop_binding() {
+            &mut self.python_loop_binding
         } else {
             &mut self.rust_local
         };

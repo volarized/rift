@@ -179,6 +179,7 @@ pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
 const VARIABLE_KIND_WORD: &str = "variable";
+pub(crate) const LOOP_BINDING_KIND_WORD: &str = "loop_binding";
 /// The kind word a function declared in a class body carries on the wire.
 const METHOD_KIND_WORD: &str = "method";
 /// The kind word a `type` statement carries on the wire.
@@ -648,12 +649,21 @@ impl PythonRules {
         target: Visited<'walk, 'tree>,
         through_pattern: bool,
     ) -> Option<Visited<'walk, 'tree>> {
+        self.target_statement(target, self.kinds.assignment, through_pattern)
+    }
+
+    fn target_statement<'walk, 'tree>(
+        &self,
+        target: Visited<'walk, 'tree>,
+        statement: u16,
+        through_pattern: bool,
+    ) -> Option<Visited<'walk, 'tree>> {
         let mut child = target;
         let mut patterned = false;
         loop {
             let parent = child.parent()?;
             let id = parent.syntax_element().kind_id();
-            if id == self.kinds.assignment {
+            if id == statement {
                 let binds = parent
                     .syntax_element()
                     .child_by_field_id(self.kinds.left.get())
@@ -729,6 +739,21 @@ impl PythonRules {
             text.get(visited.syntax_element().byte_range())?,
             scope,
         ))
+    }
+
+    /// The name an authored for statement binds inside a named function.
+    fn loop_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let statement = self.target_statement(visited, self.kinds.loop_kinds[0], false)?;
+        if statement.syntax_element().has_error()
+            || self.statement_scope(statement)? != DeclarationScope::Local
+        {
+            return None;
+        }
+        let name = text.get(visited.syntax_element().byte_range())?;
+        Some(Declaration {
+            kind: LOOP_BINDING_KIND_WORD,
+            ..Self::variable(name, DeclarationScope::Local)
+        })
     }
 
     /// The method an instance attribute target belongs to: the visited
@@ -1166,7 +1191,8 @@ impl GrammarRules for PythonRules {
         if id == self.kinds.identifier {
             return Ok(self
                 .parameter_declaration(visited, text)
-                .or_else(|| self.pattern_declaration(visited, text)));
+                .or_else(|| self.pattern_declaration(visited, text))
+                .or_else(|| self.loop_declaration(visited, text)));
         }
         if id == self.kinds.attribute {
             let Some(_) = self.attribute_method(visited, text) else {
@@ -1333,6 +1359,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         export_bindings.sort_by_key(|binding| binding.range.start);
         let (mut static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
+        retain_loop_bindings(&mut symbols, &static_facts, source.text);
         retain_parameters(&mut symbols, &mut static_facts);
         Ok(SyntaxDocument::new(
             self.language.clone(),
@@ -1366,6 +1393,64 @@ impl SyntaxProvider for PythonSyntaxProvider {
         }
         kinds
     }
+}
+
+/// Withholds loop targets redirected to another scope or already declared there.
+fn retain_loop_bindings(
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+    facts: &crate::StaticFacts,
+    source: &str,
+) {
+    use std::collections::BTreeSet;
+
+    if !symbols
+        .iter()
+        .any(crate::SyntaxSymbol::is_python_loop_binding)
+    {
+        return;
+    }
+    let text = |range: crate::ByteRange| {
+        source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+    };
+    let redirects = facts
+        .bindings()
+        .iter()
+        .filter_map(|binding| match binding.kind {
+            crate::StaticBindingKind::PythonGlobal | crate::StaticBindingKind::PythonNonlocal => {
+                Some((binding.scope, text(binding.name)?))
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let bindings = facts
+        .bindings()
+        .iter()
+        .map(|binding| (binding.name, binding.scope))
+        .collect::<BTreeMap<_, _>>();
+    let incumbent = symbols
+        .iter()
+        .filter(|symbol| !symbol.is_python_loop_binding())
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let withheld = symbols
+        .iter()
+        .filter(|symbol| symbol.is_python_loop_binding())
+        .filter_map(|symbol| {
+            let name = symbol.name_range?;
+            let admitted = bindings
+                .get(&name)
+                .is_some_and(|scope| !redirects.contains(&(*scope, symbol.name.as_str())))
+                && !incumbent.contains(symbol.qualified_name.as_str())
+                && rift_core::is_portable_name(&symbol.qualified_name);
+            (!admitted).then_some(name)
+        })
+        .collect::<BTreeSet<_>>();
+    symbols.retain(|symbol| {
+        !symbol.is_python_loop_binding()
+            || symbol
+                .name_range
+                .is_some_and(|name| !withheld.contains(&name))
+    });
 }
 
 /// Keeps the parameter candidates with exact parameter bindings and no other
@@ -1422,6 +1507,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         PARAMETER_KIND_WORD,
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
+        LOOP_BINDING_KIND_WORD,
         METHOD_KIND_WORD,
         TYPE_ALIAS_KIND_WORD,
         MODULE_KIND,

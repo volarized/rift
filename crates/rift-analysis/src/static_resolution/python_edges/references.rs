@@ -64,7 +64,7 @@ impl<'source> Index<'source> {
             }
         }
         for symbol in file.document.facts.symbols() {
-            if symbol.is_python_parameter() {
+            if symbol.is_package_binding() {
                 continue;
             }
             if !work.charge() {
