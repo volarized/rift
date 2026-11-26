@@ -3,7 +3,10 @@
 mod context;
 mod environment;
 
-pub use environment::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages};
+pub use environment::{
+    PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages, dist_info_name,
+    wheel_record_paths,
+};
 
 use serde::Deserialize;
 
@@ -92,7 +95,8 @@ struct LockedSource {
 }
 
 /// The PEP 503 normalized form of a distribution name: lowercase, every separator run one `-`.
-fn normalized_name(name: &str) -> String {
+#[must_use]
+pub fn normalized_name(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
     let mut separator_pending = false;
     for character in name.to_lowercase().chars() {

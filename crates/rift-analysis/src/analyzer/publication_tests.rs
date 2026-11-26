@@ -18,6 +18,7 @@ mod returned_callables;
 mod rust_guard;
 mod rust_implementations;
 mod rust_root_imports;
+mod stub_wheels;
 
 fn publication(
     files: &[(&str, &str)],

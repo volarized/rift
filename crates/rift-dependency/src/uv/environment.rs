@@ -144,9 +144,7 @@ impl SitePackages {
 /// distribution may share. Scripts under `..`, bytecode, and the metadata directory name
 /// no module.
 fn record_import_roots(record: &str, dist_info: &str) -> BTreeSet<String> {
-    let modules: Vec<&str> = lines_inclusive(record)
-        .map(without_ending)
-        .filter_map(record_path)
+    let modules: Vec<&str> = wheel_record_paths(record)
         .filter(|path| is_module(path, dist_info))
         .collect();
     let packages: BTreeSet<&str> = modules
@@ -193,6 +191,13 @@ fn is_module(path: &str, dist_info: &str) -> bool {
     module && !outside && !metadata && !bytecode
 }
 
+/// Yields the physical paths written in a captured Python wheel RECORD.
+pub fn wheel_record_paths(record: &str) -> impl Iterator<Item = &str> {
+    lines_inclusive(record)
+        .map(without_ending)
+        .filter_map(record_path)
+}
+
 /// The path field of one `RECORD` line: the text before the first comma, or a quoted
 /// field up to its closing quote, as CSV writes a path holding a comma. Absent for a
 /// blank line.
@@ -207,7 +212,8 @@ fn record_path(line: &str) -> Option<&str> {
 /// The metadata directory name of a distribution, escaped as a wheel spells it.
 ///
 /// `markdown-it-py` 4.2.0 installs `markdown_it_py-4.2.0.dist-info`.
-fn dist_info_name(normalized: &str, version: &str) -> String {
+#[must_use]
+pub fn dist_info_name(normalized: &str, version: &str) -> String {
     let escaped = normalized.replace(NORMALIZED_SEPARATOR, MODULE_SEPARATOR);
     format!("{escaped}-{version}{DIST_INFO_SUFFIX}")
 }

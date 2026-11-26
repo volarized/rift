@@ -60,7 +60,14 @@ fn anchors(text: &str, parsed: &str, captured: bool) -> BTreeMap<String, SymbolI
         ),
     )
     .expect("captured namespace");
-    identity_anchors_with_roots(&input, &syntax, path.as_str(), source, &roots)
+    identity_anchors_with_roots(
+        &input,
+        &syntax,
+        path.as_str(),
+        source,
+        &roots,
+        &BTreeSet::new(),
+    )
 }
 
 #[test]

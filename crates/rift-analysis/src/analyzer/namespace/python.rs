@@ -2,6 +2,9 @@ pub(super) mod exports;
 pub(super) use exports::prepare as prepare_exports;
 pub(crate) use exports::python_import_target;
 
+mod wheel;
+pub(super) use wheel::stub_wheel_root;
+
 use crate::ArchiveMemberKind;
 use std::collections::{BTreeMap, BTreeSet};
 

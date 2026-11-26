@@ -1,6 +1,9 @@
 //! Logical Python placement from accepted import roots, preserving original source paths.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Bound::{Included, Unbounded},
+};
 
 use rift_core::SymbolId;
 use rift_protocol::identity::SymbolIdentity;
@@ -217,6 +220,11 @@ pub(crate) fn prepare_context(
             roots.push(root);
         }
     }
+    if roots.is_empty()
+        && let Some(root) = python::stub_wheel_root(input)
+    {
+        roots.push(root);
+    }
     let roots_accepted = crate::input::validate_roots(&roots)
         .and_then(|()| {
             crate::input::validate_runtime_roots(
@@ -232,6 +240,17 @@ pub(crate) fn prepare_context(
         .iter()
         .map(|source| (source.path().as_str(), *source))
         .collect::<BTreeMap<_, _>>();
+    let mut ordinary_python_paths = BTreeSet::new();
+    if roots_accepted
+        && roots
+            .iter()
+            .any(|root| root.origin() == PackageImportRootOrigin::Wheel)
+    {
+        ordinary_python_paths.extend(captured.keys().filter_map(|path| {
+            let (base, extension) = path.rsplit_once('.')?;
+            matches!(extension, "py" | "pyi").then_some(base)
+        }));
+    }
     for file in selected {
         if file.syntax.language().name == "python" {
             prepared.anchors.insert(
@@ -246,6 +265,7 @@ pub(crate) fn prepare_context(
                             file.path.as_str(),
                             *source,
                             &roots,
+                            &ordinary_python_paths,
                         )
                     }),
             );
@@ -309,6 +329,7 @@ fn identity_anchors_with_roots(
     path: &str,
     source: crate::PackageSource<'_>,
     roots: &[PackageImportRoot],
+    ordinary_python_paths: &BTreeSet<&str>,
 ) -> BTreeMap<String, SymbolId> {
     if syntax.language().name != "python" || syntax.language().dialect.is_some() {
         return BTreeMap::new();
@@ -318,11 +339,13 @@ fn identity_anchors_with_roots(
         return BTreeMap::new();
     }
     let local_fallback = input.owner().is_local() && input.import_roots().is_empty();
-    let Some(module) = python_module(path, roots).or_else(|| {
-        local_fallback
-            .then(|| python::local_module(input, path))
-            .flatten()
-    }) else {
+    let Some(module) =
+        python_module_with_inventory(path, roots, ordinary_python_paths).or_else(|| {
+            local_fallback
+                .then(|| python::local_module(input, path))
+                .flatten()
+        })
+    else {
         return BTreeMap::new();
     };
     let mut anchors = BTreeMap::new();
@@ -376,7 +399,16 @@ fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String>
     }
 }
 
+#[cfg(test)]
 fn python_module(path: &str, roots: &[PackageImportRoot]) -> Option<Vec<String>> {
+    python_module_with_inventory(path, roots, &BTreeSet::new())
+}
+
+fn python_module_with_inventory(
+    path: &str,
+    roots: &[PackageImportRoot],
+    ordinary_python_paths: &BTreeSet<&str>,
+) -> Option<Vec<String>> {
     let mut modules = BTreeSet::new();
     for root in roots {
         let relative = match root.prefix() {
@@ -398,6 +430,19 @@ fn python_module(path: &str, roots: &[PackageImportRoot]) -> Option<Vec<String>>
             continue;
         }
         let mut parts = base.split('/').collect::<Vec<_>>();
+        // A stub-only wheel uses a physical -stubs directory for the admitted module.
+        // Its declarations keep their original stub source paths.
+        if root.origin() == PackageImportRootOrigin::Wheel
+            && extension == "pyi"
+            && let Some((first, nested)) = parts.split_first_mut()
+            && !nested.is_empty()
+            && let Some(module) = (*first).strip_suffix("-stubs")
+        {
+            if has_ordinary_python_root(root, module, ordinary_python_paths) {
+                continue;
+            }
+            *first = module;
+        }
         if parts.last() == Some(&"__init__") {
             parts.pop();
         }
@@ -421,6 +466,25 @@ fn python_module(path: &str, roots: &[PackageImportRoot]) -> Option<Vec<String>>
     (modules.len() == 1)
         .then(|| modules.into_iter().next())
         .flatten()
+}
+
+/// Selected ordinary source under this import root makes the layout non-stub-only.
+fn has_ordinary_python_root(
+    root: &PackageImportRoot,
+    module: &str,
+    paths: &BTreeSet<&str>,
+) -> bool {
+    let base = root
+        .prefix()
+        .map_or_else(|| module.to_owned(), |prefix| format!("{prefix}/{module}"));
+    if paths.contains(base.as_str()) {
+        return true;
+    }
+    let directory = base + "/";
+    paths
+        .range::<str, _>((Included(directory.as_str()), Unbounded))
+        .next()
+        .is_some_and(|path| path.starts_with(&directory))
 }
 
 #[cfg(test)]
