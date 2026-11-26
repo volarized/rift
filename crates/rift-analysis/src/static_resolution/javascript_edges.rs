@@ -936,10 +936,8 @@ impl<'source> Index<'source> {
 
 impl Target<'_> {
     /// A lexical variable added by the package's file module scope pass.
-    fn is_scoped_javascript_lexical_binding(self) -> bool {
-        self.symbol.kind == "variable"
-            && self.symbol.syntax_element_kind == Some("variable_declarator")
-            && self.is_physical_only_javascript_package_symbol()
+    pub(super) fn is_scoped_javascript_lexical_binding(self) -> bool {
+        self.symbol.kind == "variable" && self.is_physical_only_javascript_package_symbol()
     }
 
     /// Package declarations admitted through a physical scope with no shared name anchor.

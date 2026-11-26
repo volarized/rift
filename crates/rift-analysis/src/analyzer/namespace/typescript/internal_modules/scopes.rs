@@ -483,7 +483,14 @@ impl<'source> FileScopes<'source> {
             .filter_map(|(name, declarations)| {
                 if !declarations.iter().all(|symbol| {
                     symbol.kind == "variable"
-                        && symbol.syntax_element_kind == Some("variable_declarator")
+                        && matches!(
+                            symbol.syntax_element_kind,
+                            Some(
+                                "variable_declarator"
+                                    | "identifier"
+                                    | "shorthand_property_identifier_pattern"
+                            )
+                        )
                         && !symbol.kinds.contains(&SymbolKind::Public)
                         && !symbol.kinds.contains(&SymbolKind::Callable)
                         && symbol.container.as_deref().is_none_or(|container| {

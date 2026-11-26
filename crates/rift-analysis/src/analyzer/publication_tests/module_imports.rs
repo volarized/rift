@@ -3012,3 +3012,54 @@ fn typescript_named_function_type_parameters_link_only_their_own_types() {
         assert_eq!(actual, expected);
     }
 }
+
+#[test]
+fn non_entry_javascript_patterns_keep_their_written_lexical_bindings() {
+    const SOURCE: &str = concat!(
+        "export function choose(flag, source) {\n",
+        "  if (flag) { const { value } = source; return value; }\n",
+        "  { const [value] = source; return value; }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical local pattern facts");
+    let bindings =
+        [("{ value }", 2), ("[value]", 1)].map(|(header, offset)| {
+            let position = SOURCE.find(header).expect("written pattern") + offset;
+            let binding = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.range == module_runtime_range(position, "value") && row.source == "value"
+                })
+                .expect("written local pattern binding");
+            assert!(!binding.public);
+            assert!(found.objects.iter().any(|row| {
+                row.id.as_ref() == Some(&binding.symbol) && row.kind.0 == "variable"
+            }));
+            let read_position = SOURCE[position..]
+                .find("return value")
+                .expect("written read")
+                + position
+                + "return ".len();
+            let reads = found
+                .edges
+                .iter()
+                .filter(|edge| edge.to == binding.symbol && edge.kinds == [EdgeKind::Reads])
+                .collect::<Vec<_>>();
+            let [read] = reads.as_slice() else {
+                panic!("one read for each locally bound name");
+            };
+            let occurrence = read.occurrence.as_ref().expect("physical read");
+            assert_eq!(occurrence.unit, binding.unit);
+            assert_eq!(
+                occurrence.range,
+                module_runtime_range(read_position, "value")
+            );
+            binding.symbol.clone()
+        });
+    assert_ne!(bindings[0], bindings[1]);
+}

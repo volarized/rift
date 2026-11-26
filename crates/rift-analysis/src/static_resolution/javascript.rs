@@ -614,6 +614,15 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         match binding.kind {
+            StaticBindingKind::Shadow
+                if matches!(
+                    role,
+                    rift_core::ReferenceRole::Read | rift_core::ReferenceRole::Write
+                ) =>
+            {
+                file.target_at(binding.name)
+                    .filter(|target| target.is_scoped_javascript_lexical_binding())
+            }
             StaticBindingKind::Local => file.target_at(binding.name).or_else(|| {
                 let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
                 let symbol = scopes.values.get(&binding.scope).copied().flatten()?;
