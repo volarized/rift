@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::documentation::{
     DocumentationDeclaration, DocumentationInput, DocumentationSourceSet, collect_documentation,
@@ -95,6 +96,7 @@ pub struct AnalyzedFile {
     file: IndexedFile,
     /// A Cargo library declaration belongs to this placement, outside cached syntax.
     placed_syntax: Option<Box<SyntaxFacts>>,
+    rust_module_source: Option<Arc<SyntaxFacts>>,
     placement: DocumentPlacement,
     shared_rust_placements: Vec<DocumentPlacement>,
     public_names: BTreeSet<String>,
@@ -136,7 +138,7 @@ impl AnalyzedFile {
     /// The grammar kind of the item syntax element of the declaration bound at `range`; absent when
     /// the syntax provider names none.
     fn item_kind(&self, range: rift_core::SourceRange, qualified_name: &str) -> Option<String> {
-        if qualified_name == "." && self.file.syntax().language().name == "rust" {
+        if matches!(qualified_name, "." | "..") && self.file.syntax().language().name == "rust" {
             return Some("source_file".to_owned());
         }
         let key = (range.start(), range.end());
@@ -305,6 +307,7 @@ fn analyzed_file(
     Ok(AnalyzedFile {
         file: parsed,
         placed_syntax: None,
+        rust_module_source: None,
         placement,
         shared_rust_placements: Vec::new(),
         public_names,
@@ -449,6 +452,21 @@ fn assemble_package_graph(
         .filter(|held| held.shared_rust_placements.is_empty())
         .map(AnalyzedFile::placed_facts)
         .collect::<Vec<_>>();
+    placed.extend(analyzed.iter().filter_map(|held| {
+        let facts = held.rust_module_source.as_deref()?;
+        let facet = facts.symbols().first()?;
+        let module = held.placement.module()?.clone();
+        Some(PlacedFacts {
+            facts,
+            path: held.file.path(),
+            placement: DocumentPlacement::new(
+                held.placement.origin().clone(),
+                held.placement.unit().clone(),
+                held.placement.identity_path(),
+            )
+            .with_identity_anchors(BTreeMap::from([(facet.qualified_name.clone(), module)])),
+        })
+    }));
     let shared = analyzed
         .iter()
         .flat_map(|held| {
@@ -635,6 +653,7 @@ fn binding_capacity(
     synthetic_objects: usize,
 ) -> (usize, rift_syntax::PackageBindingSlots) {
     let demands = BindingDemands::collect(documents);
+    let rust_module_sources = BindingDemand::module_sources(documents);
     let provider = limits.declarations_max().saturating_sub(demands.primary);
     let publication = bound(limits.publication().symbols).saturating_sub(
         demands
@@ -657,7 +676,8 @@ fn binding_capacity(
         + demands.rust_receivers.count
         + demands.rust_generics.count
         + demands.rust_library.count
-        + demands.rust_explicit.count;
+        + demands.rust_explicit.count
+        + rust_module_sources.count;
     let (mut bytes, record) = binding_source_capacity(documents, limits, count);
     let mut slots = provider.min(publication);
     let local_slots = demands.rust_locals.reserve(&mut slots, &mut bytes, record);
@@ -702,10 +722,11 @@ fn binding_capacity(
         documents,
         &demands.callback_parameters,
         &demands.overload_parameters,
-        slots,
-        bytes,
+        &mut slots,
+        &mut bytes,
         record,
     );
+    let module_slots = rust_module_sources.reserve(&mut slots, &mut bytes, record);
     (
         count,
         rift_syntax::PackageBindingSlots::new(
@@ -725,7 +746,8 @@ fn binding_capacity(
         .with_javascript_parameters(javascript_parameter_slots)
         .with_typescript_method_parameters(typescript_method_slots)
         .with_javascript_callback_parameters(callback_slots)
-        .with_typescript_overload_parameters(overload_slots),
+        .with_typescript_overload_parameters(overload_slots)
+        .with_rust_module_sources(module_slots),
     )
 }
 
@@ -753,8 +775,8 @@ fn reserve_scoped_parameters(
     documents: &[AnalyzedFile],
     callbacks: &BindingDemand,
     overloads: &BindingDemand,
-    mut slots: usize,
-    mut bytes: u64,
+    slots: &mut usize,
+    bytes: &mut u64,
     record: u64,
 ) -> (usize, usize) {
     if callbacks.count == 0 && overloads.count == 0 {
@@ -762,13 +784,13 @@ fn reserve_scoped_parameters(
     }
     for file in documents {
         if let Some(source) = complete_module_bytes(file, record) {
-            slots = slots.saturating_sub(1);
-            bytes = bytes.saturating_sub(source);
+            *slots = slots.saturating_sub(1);
+            *bytes = bytes.saturating_sub(source);
         }
     }
     (
-        callbacks.reserve(&mut slots, &mut bytes, record),
-        overloads.reserve(&mut slots, &mut bytes, record),
+        callbacks.reserve(slots, bytes, record),
+        overloads.reserve(slots, bytes, record),
     )
 }
 
@@ -780,6 +802,18 @@ struct BindingDemand {
 }
 
 impl BindingDemand {
+    fn module_sources(documents: &[AnalyzedFile]) -> Self {
+        let mut demand = Self::default();
+        for facet in documents
+            .iter()
+            .filter_map(|file| file.rust_module_source.as_ref()?.symbols().first())
+        {
+            demand.count += 1;
+            demand.largest = demand.largest.max(facet.item_range.end);
+        }
+        demand
+    }
+
     fn reserve(&self, slots: &mut usize, bytes: &mut u64, record: u64) -> usize {
         let each = self.largest.min(record).max(1);
         let fits = usize::try_from(*bytes / each).unwrap_or(usize::MAX);
@@ -877,6 +911,11 @@ fn place_namespace(
         {
             assigned.insert(".".to_owned(), root.clone());
             place_rust_library_root(held, root);
+        }
+        if namespace.rust_module_sources.remove(path.as_str())
+            && let Some(module) = namespace.rust_modules.get(path.as_str())
+        {
+            place_rust_module_source(held, module);
         }
         held.shared_rust_placements = namespace
             .shared_rust_modules
@@ -996,6 +1035,19 @@ fn place_rust_library_root(held: &mut AnalyzedFile, root: &CoreSymbolId) {
         return;
     };
     held.placed_syntax = Some(Box::new(syntax));
+}
+
+fn place_rust_module_source(held: &mut AnalyzedFile, module: &CoreSymbolId) {
+    let Ok(identity) = SymbolIdentity::parse(module.as_str()) else {
+        return;
+    };
+    let Some(name) = identity.qualified_path().last() else {
+        return;
+    };
+    held.rust_module_source =
+        held.file
+            .syntax()
+            .rust_module_source(name, held.file.path(), held.file.source());
 }
 
 /// Renders the canonical publication over the analyzed files.
@@ -4383,7 +4435,10 @@ class _Private:
             .collect();
         assert_eq!(
             changed_symbols,
-            ["rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"]
+            [
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha",
+            ]
         );
         let added = after
             .declarations
@@ -4482,6 +4537,7 @@ class _Private:
             added,
             [
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/b",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/b",
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/b/beta"
             ]
         );
@@ -4494,9 +4550,10 @@ class _Private:
             unchanged,
             [
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
                 "rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"
             ],
-            "an untouched declaration keeps its digest"
+            "an untouched declaration and source facet keep their digests"
         );
     }
 

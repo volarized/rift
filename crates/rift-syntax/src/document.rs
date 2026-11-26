@@ -193,11 +193,20 @@ impl SyntaxSymbol {
             && self.syntax_element_kind == Some("source_file")
     }
 
+    /// Whether this is the checked source file of an out-of-line Rust module.
+    #[must_use]
+    pub fn is_rust_module_source(&self) -> bool {
+        self.kind == "module"
+            && self.qualified_name == ".."
+            && self.syntax_element_kind == Some("source_file")
+    }
+
     /// Whether this binding uses a package-only declaration reservation.
     #[must_use]
     pub fn is_package_binding(&self) -> bool {
         self.is_rust_local_binding()
             || self.is_rust_library_root()
+            || self.is_rust_module_source()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
             || self.is_ecmascript_parameter()
@@ -756,6 +765,32 @@ impl SyntaxFacts {
     /// the complete source bytes and hold no parse error or omitted declaration.
     #[must_use]
     pub fn with_rust_library_root(mut self, name: &str, source: &str) -> Option<Self> {
+        let root = self.rust_source_module(name, source, ".")?;
+        self.symbols.insert(0, root);
+        Some(self)
+    }
+
+    /// Captures a separate whole-file declaration for an out-of-line Rust module.
+    /// The caller establishes the authored module path and package owner.
+    #[must_use]
+    pub fn rust_module_source(
+        &self,
+        name: &str,
+        path: &ProjectPath,
+        source: &str,
+    ) -> Option<Arc<Self>> {
+        let symbol = self.rust_source_module(name, source, "..")?;
+        let mut facts = SyntaxDocument::empty(self.language.clone(), path.clone()).into_facts();
+        Arc::get_mut(&mut facts)?.symbols.push(symbol);
+        Some(facts)
+    }
+
+    fn rust_source_module(
+        &self,
+        name: &str,
+        source: &str,
+        qualified: &str,
+    ) -> Option<SyntaxSymbol> {
         if self.language.name != "rust"
             || self.has_errors
             || self.left_out_declaration_count() != 0
@@ -768,29 +803,25 @@ impl SyntaxFacts {
             start: 0,
             end: u64::try_from(source.len()).ok()?,
         };
-        self.symbols.insert(
-            0,
-            SyntaxSymbol {
-                declaration_ordinal: 0,
-                qualified_name: ".".to_owned(),
-                container: None,
-                name: name.to_owned(),
-                kind: "module",
-                syntax_element_kind: Some("source_file"),
-                kinds: vec![SymbolKind::Module],
-                visibility: None,
-                range,
-                item_range: range,
-                name_range: None,
-                body_range: Some(range),
-                signatures: Arc::from([]),
-                documentation: Arc::from([]),
-                documentation_ranges: Vec::new(),
-                module_path: None,
-                python_overload: None,
-            },
-        );
-        Some(self)
+        Some(SyntaxSymbol {
+            declaration_ordinal: 0,
+            qualified_name: qualified.to_owned(),
+            container: None,
+            name: name.to_owned(),
+            kind: "module",
+            syntax_element_kind: Some("source_file"),
+            kinds: vec![SymbolKind::Module],
+            visibility: None,
+            range,
+            item_range: range,
+            name_range: None,
+            body_range: Some(range),
+            signatures: Arc::from([]),
+            documentation: Arc::from([]),
+            documentation_ranges: Vec::new(),
+            module_path: None,
+            python_overload: None,
+        })
     }
 
     /// Returns captured source-based name-resolution evidence, when recorded.

@@ -1204,6 +1204,74 @@ fn package_stores_typescript_imported_type_uses_at_each_written_site() {
 }
 
 #[test]
+fn package_rust_module_source_facet_keeps_written_declaration_and_existing_caps() {
+    let root = "pub mod child; pub fn call() { child::run(); }";
+    let child = "// é\npub fn run() {}\n";
+    let path = ProjectPath::new("src/lib.rs").expect("library root");
+    let child_path = ProjectPath::new("src/child.rs").expect("authored module file");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let package = fixture::identity();
+    let owner = package.owner().expect("cargo owner");
+    let language = fixture::language(ShippedLanguage::Rust);
+    let origin = fixture::origin(&package);
+    let sources = [
+        PackageSource::new(&path, root),
+        PackageSource::new(&child_path, child),
+    ];
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+    )];
+    let analyze = |bound| {
+        let limits = ExactPackageLimits::new(3, 4096)
+            .with_declarations(bound)
+            .expect("package declaration cap");
+        let input = ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+            .expect("exact source inventory")
+            .with_framework_context(&metadata, &[])
+            .expect("checked Cargo manifest");
+        PackageAnalyzer::analyze(input, 1).expect("package analysis")
+    };
+    let baseline = analyze(4);
+    let admitted = analyze(5);
+    let baseline = baseline.publication();
+    let admitted = admitted.publication();
+    let facet = admitted
+        .declarations
+        .iter()
+        .find(|row| {
+            row.symbol.as_str().ends_with("/beacon/child")
+                && row.unit.as_str().ends_with("/src/child.rs")
+        })
+        .expect("whole-file facet of the accepted module");
+    assert_eq!(facet.syntax_element_kind.as_deref(), Some("source_file"));
+    assert_eq!(facet.range.start, 0);
+    assert_eq!(
+        facet.range.end,
+        u64::try_from(child.len()).expect("file byte length")
+    );
+    assert_eq!(facet.source, child);
+    assert!(facet.source_complete);
+    assert!(admitted.declarations.iter().any(|row| {
+        row.symbol == facet.symbol
+            && row.unit.as_str().ends_with("/src/lib.rs")
+            && row.source == "pub mod child;"
+    }));
+    assert_eq!(baseline.declarations.len() + 1, admitted.declarations.len());
+    assert!(
+        baseline
+            .declarations
+            .iter()
+            .all(|row| admitted.declarations.contains(row))
+    );
+    assert_eq!(baseline.units, admitted.units);
+    assert_eq!(baseline.edges, admitted.edges);
+    assert!(admitted.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/beacon/child/run")
+    }));
+}
+
+#[test]
 fn package_rust_shared_literal_modules_keep_distinct_owners_and_one_source() {
     let root = r#"
 #[path = "shared.rs"]

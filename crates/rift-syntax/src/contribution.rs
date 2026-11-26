@@ -34,6 +34,7 @@ pub struct PackageBindingSlots {
     typescript_overload_parameter: usize,
     typescript_method_parameter: usize,
     rust_library_root: usize,
+    rust_module_source: usize,
     rust_explicit: usize,
 }
 
@@ -62,6 +63,7 @@ impl PackageBindingSlots {
             typescript_overload_parameter: 0,
             typescript_method_parameter: 0,
             rust_library_root: 0,
+            rust_module_source: 0,
             rust_explicit: 0,
         }
     }
@@ -143,6 +145,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves slots for checked Rust module source declarations.
+    #[must_use]
+    pub const fn with_rust_module_sources(mut self, slots: usize) -> Self {
+        self.rust_module_source = slots;
+        self
+    }
+
     /// Reserves slots for explicitly written local bindings in opaque Rust scopes.
     #[must_use]
     pub const fn with_rust_explicit_locals(mut self, rust_explicit: usize) -> Self {
@@ -168,6 +177,7 @@ impl PackageBindingSlots {
             .saturating_add(self.javascript_callback_parameter)
             .saturating_add(self.typescript_overload_parameter)
             .saturating_add(self.rust_library_root)
+            .saturating_add(self.rust_module_source)
             .saturating_add(self.rust_explicit)
     }
 
@@ -211,6 +221,8 @@ impl PackageBindingSlots {
             &mut self.rust_receiver
         } else if symbol.is_rust_explicit_local_binding() {
             &mut self.rust_explicit
+        } else if symbol.is_rust_module_source() {
+            &mut self.rust_module_source
         } else if symbol.is_rust_library_root() {
             &mut self.rust_library_root
         } else if symbol.is_rust_generic_parameter() {

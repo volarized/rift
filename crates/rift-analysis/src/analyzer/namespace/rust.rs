@@ -15,6 +15,7 @@ use crate::NamespaceInput;
 pub(super) mod configuration;
 mod implementations;
 mod macros;
+mod module_sources;
 mod shared;
 
 pub(crate) use shared::SharedRustModule;
@@ -152,6 +153,7 @@ pub(super) fn prepare(
         outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
+    module_sources::retain(input, &inventory, &declaring, &admitted, &mut prepared);
     local_exports(input, selected, &requested, &admitted, &mut prepared);
     retain_root_anchor(input, root, &inventory, &assigned, &mut prepared);
     prepared

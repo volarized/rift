@@ -55,6 +55,8 @@ pub(crate) struct PreparedNamespace {
     pub(crate) rust_package_root: Option<(String, SymbolId)>,
     /// The module of each Rust file a captured library's module tree reaches.
     pub(crate) rust_modules: BTreeMap<String, SymbolId>,
+    /// Rust units with an authored module declaration and a unique checked source.
+    pub(crate) rust_module_sources: BTreeSet<String>,
     /// Separate logical Rust owners of the same checked physical source.
     pub(crate) shared_rust_modules: BTreeMap<String, Vec<rust::SharedRustModule>>,
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
@@ -211,6 +213,7 @@ pub(crate) fn prepare_context(
     prepared.anchors.extend(rust.anchors);
     prepared.rust_package_root = rust.rust_package_root;
     prepared.rust_modules = rust.rust_modules;
+    prepared.rust_module_sources = rust.rust_module_sources;
     prepared.shared_rust_modules = rust.shared_rust_modules;
     prepared.exports.extend(rust.exports);
     prepared.alias_visibilities.extend(rust.alias_visibilities);
