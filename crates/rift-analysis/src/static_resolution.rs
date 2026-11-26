@@ -98,6 +98,10 @@ pub(crate) struct StaticResolution {
     pub(crate) overload_parameter_start: Option<usize>,
     /// Overload parameter reads awaiting capacity after earlier package edges.
     pub(crate) deferred_overload_parameters: Vec<StaticOccurrence>,
+    /// First internal and external occurrence resolved through authored Rust extern crate aliases.
+    pub(crate) rust_extern_alias_start: Option<(usize, usize)>,
+    /// Existing call sites left unresolved in files with authored extern bindings.
+    pub(crate) rust_extern_candidates: BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -238,6 +242,7 @@ fn resolve_by<'source>(
         resolution.occurrences.extend(deferred);
     }
     external::admit_declared(namespace, &mut resolution.external, work_max);
+    index.resolve_rust_extern_aliases(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -560,6 +565,10 @@ struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
+    /// Extern crate aliases are resolved after existing name, call and publication work.
+    rust_extern_aliases: Vec<&'source StaticBinding>,
+    /// Authored bindings that can shadow an implicit runtime spelling.
+    rust_runtime_aliases: BTreeMap<&'source str, EnclosingDefinitions<&'source StaticBinding>>,
     /// Exact class initializer bodies, by the stable variable's physical name.
     javascript_class_bodies: BTreeMap<ByteRange, ByteRange>,
     /// The names with more than [`SCANNED_BINDINGS_MAX`] bindings whose scopes nest.
@@ -731,6 +740,8 @@ impl<'source> File<'source> {
             document,
             facts,
             by_name: BTreeMap::new(),
+            rust_extern_aliases: Vec::new(),
+            rust_runtime_aliases: BTreeMap::new(),
             javascript_class_bodies: BTreeMap::new(),
             by_scope: BTreeMap::new(),
             by_range: BTreeMap::new(),
@@ -857,7 +868,17 @@ impl<'source> File<'source> {
 
     fn index_bindings(&mut self, work: &mut Work) -> Option<()> {
         self.index_python_flow(work)?;
+        let mut runtime_aliases = Bindings::new();
         for binding in self.facts.bindings() {
+            if matches!(binding.kind, StaticBindingKind::RustExternCrate { .. }) {
+                self.rust_extern_aliases.push(binding);
+                if let Some(name) = self.text(binding.name)
+                    && external::RUST_RUNTIME_CRATES.contains(&name)
+                {
+                    runtime_aliases.entry(name).or_default().push(binding);
+                }
+                continue;
+            }
             if !work.charge() {
                 return None;
             }
@@ -896,6 +917,7 @@ impl<'source> File<'source> {
                     .insert(annotation.start, annotation.end);
             }
         }
+        self.index_rust_runtime_aliases(runtime_aliases);
         self.index_python_globals(work)?;
         for (name, bindings) in &self.by_name {
             if bindings.len() <= SCANNED_BINDINGS_MAX {
@@ -1146,7 +1168,7 @@ impl<'source> File<'source> {
         [
             self.facts.calls().len(),
             self.primary_reference_count,
-            self.facts.bindings().len(),
+            self.facts.bindings().len() - self.rust_extern_aliases.len(),
             self.facts.python_deletions().len(),
             self.facts.heritage_edges().len(),
             self.document.facts.symbols().len() - self.package_binding_count,
@@ -1439,6 +1461,7 @@ struct Index<'source> {
     graph: &'source NormalizedGraph,
     provider: ProviderId,
     files: Arc<BTreeMap<&'source str, File<'source>>>,
+    rust_extern_files: Vec<&'source str>,
     rust: rust::Namespaces<'source>,
     javascript: javascript::PackageModes<'source>,
     owners: external::Owners,
@@ -1470,21 +1493,11 @@ impl<'source> Index<'source> {
             .and_then(|provider| graph.publications().provider(provider))
             .map(rift_provider::ProviderPublication::revision);
         let admitted_binding = |target| {
-            provider
-                .as_ref()
-                .zip(syntax_publication)
-                .is_some_and(|(provider, publication)| {
-                    syntax_target(graph, provider, publication, target).is_some_and(
-                        |(reference, _)| {
-                            graph.record_for(&reference).is_some_and(|record| {
-                                record.resolution() == rift_core::SymbolResolution::Established
-                            })
-                        },
-                    )
-                })
+            Self::admitted_binding(graph, provider.as_ref().zip(syntax_publication), target)
         };
         let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
+        let mut rust_extern_files = Vec::new();
         for document in documents {
             if !work.charge() {
                 return None;
@@ -1510,7 +1523,11 @@ impl<'source> Index<'source> {
                 &admitted_binding,
                 work,
             )?;
-            if files.insert(document.path.as_str(), file).is_some() {
+            let path = document.path.as_str();
+            if !file.rust_extern_aliases.is_empty() {
+                rust_extern_files.push(path);
+            }
+            if files.insert(path, file).is_some() {
                 return None;
             }
         }
@@ -1532,6 +1549,7 @@ impl<'source> Index<'source> {
                 }
             }
         }
+        rust_extern_files.sort_unstable();
         let files = Arc::new(files);
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
@@ -1540,6 +1558,7 @@ impl<'source> Index<'source> {
             graph,
             provider: provider?,
             files,
+            rust_extern_files,
             rust,
             javascript,
             owners,
@@ -1560,6 +1579,17 @@ impl<'source> Index<'source> {
         index.edge_python_classes = index.python_class_orders(FileWork::CLASS_ORDERS, work);
         index.python_aliases = index.python_class_alias_targets(aliases, work);
         Some(index)
+    }
+
+    fn admitted_binding(
+        graph: &NormalizedGraph,
+        syntax: Option<(&ProviderId, rift_core::ProviderRevision)>,
+        target: Target<'_>,
+    ) -> bool {
+        syntax
+            .and_then(|(provider, publication)| syntax_target(graph, provider, publication, target))
+            .and_then(|(reference, _)| graph.record_for(&reference))
+            .is_some_and(|record| record.resolution() == rift_core::SymbolResolution::Established)
     }
 
     /// The site of an import whose declaration a dependency or the standard library owns.
@@ -2130,6 +2160,16 @@ impl<'source> Index<'source> {
                 result.external.push(external);
                 continue;
             }
+            if occurrence.is_none()
+                && !file.rust_extern_aliases.is_empty()
+                && call.callee == rift_syntax::StaticCallee::Qualified
+            {
+                result
+                    .rust_extern_candidates
+                    .entry(file.document.placement.unit().clone())
+                    .or_default()
+                    .push(*call);
+            }
             if occurrence
                 .as_ref()
                 .is_none_or(|occurrence| !matches!(occurrence.target, NormalizedTarget::Symbol(_)))
@@ -2242,6 +2282,9 @@ impl<'source> Index<'source> {
         let mut qualifiers = Vec::new();
         let mut rust_macros = Vec::new();
         for binding in file.facts.bindings() {
+            if matches!(binding.kind, StaticBindingKind::RustExternCrate { .. }) {
+                continue;
+            }
             if file.inactive(binding.name, work) {
                 continue;
             }
@@ -2594,6 +2637,8 @@ impl StaticResolution {
         self.deferred_literal_containment
             .append(&mut apart.deferred_literal_containment);
         self.external.append(&mut apart.external);
+        self.rust_extern_candidates
+            .append(&mut apart.rust_extern_candidates);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);

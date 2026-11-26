@@ -468,7 +468,12 @@ impl EdgeStore {
         if resolution.occurrences.is_empty() && resolution.external.is_empty() {
             return;
         }
-        let mut next_start = resolution.occurrences.len();
+        let (alias, alias_external) = resolution
+            .rust_extern_alias_start
+            .take()
+            .unwrap_or((resolution.occurrences.len(), resolution.external.len()));
+        let (incumbent_external, alias_external_rows) = resolution.external.split_at(alias_external);
+        let mut next_start = alias;
         let [
             typescript_overload,
             callback,
@@ -502,7 +507,7 @@ impl EdgeStore {
             next_start = start.unwrap_or(next_start);
             next_start
         });
-        let (internal, external) = supplemental_start.unwrap_or((late, resolution.external.len()));
+        let (internal, external) = supplemental_start.unwrap_or((late, alias_external));
         let boundaries = [
             0,
             internal,
@@ -519,13 +524,14 @@ impl EdgeStore {
             literal,
             callback,
             typescript_overload,
+            alias,
             resolution.occurrences.len(),
         ];
-        let (external, supplemental_external) = resolution.external.split_at(external);
+        let (external, supplemental_external) = incumbent_external.split_at(external);
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut batches: [BTreeMap<_, _>; 15] = std::array::from_fn(|index| {
+        let mut batches: [BTreeMap<_, _>; 16] = std::array::from_fn(|index| {
             let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
             let mut edges = BTreeMap::new();
             admit_occurrences(
@@ -544,6 +550,9 @@ impl EdgeStore {
             &self.edge_modules,
             &mut batches[1],
         );
+        admit_external(alias_external_rows, spans, &self.edge_modules, &mut batches[15]);
+        // Rust's later resolution still precedes the additional ECMAScript rows at admission.
+        batches[10..].rotate_left(5);
         self.deduplicate_static_batches(&mut batches);
         for (from, mut edges) in batches.into_iter().flatten() {
             let fits = edges.len().min(remaining);

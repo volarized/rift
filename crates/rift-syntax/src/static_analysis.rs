@@ -298,6 +298,11 @@ pub enum StaticBindingKind {
         /// Imported path before a local alias.
         path: ByteRange,
     },
+    /// Authored Rust crate binding.
+    RustExternCrate {
+        /// Authored crate name, or `self` for the current crate.
+        crate_name: ByteRange,
+    },
     /// Local Rust binding with an authored receiver type.
     RustReceiver {
         /// Authored type or constructor path.
@@ -1534,6 +1539,11 @@ impl StaticBinding {
             }
             StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
+            StaticBindingKind::RustExternCrate { crate_name } => {
+                valid(crate_name)
+                    && self.scope.encloses(crate_name)
+                    && (crate_name == self.name || crate_name.end <= self.name.start)
+            }
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
