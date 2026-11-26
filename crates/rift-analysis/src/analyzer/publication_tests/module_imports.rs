@@ -3187,6 +3187,83 @@ fn non_entry_class_methods_keep_properties_of_returned_call_arguments() {
 }
 
 #[test]
+fn non_entry_named_class_methods_keep_properties_in_separate_return_literals() {
+    const SOURCE: &str = concat!(
+        "function selectName() { return 'runtime'; }\n",
+        "export class Builder {\n",
+        "  convert(first) {\n",
+        "    if (first) return { state: 'first' };\n",
+        "    return { state: 'last' };\n",
+        "  }\n",
+        "  static prepare(first) {\n",
+        "    if (first) return { ready: 1 };\n",
+        "    return { ready: 2 };\n",
+        "  }\n",
+        "  [selectName()](first) {\n",
+        "    if (first) return { unknown: 3 };\n",
+        "    return { unknown: 4 };\n",
+        "  }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("authored method return properties");
+    for (method, properties) in [
+        ("convert", ["state: 'first'", "state: 'last'"]),
+        ("prepare", ["ready: 1", "ready: 2"]),
+    ] {
+        let suffix = format!("/Builder/{method}");
+        let owner = found
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(&suffix))
+            .expect("named class method");
+        let rows = properties.map(|written| {
+            let start = SOURCE.find(written).expect("written property");
+            let row = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == owner.unit
+                        && row.source == written
+                        && row.range == module_runtime_range(start, written)
+                })
+                .expect("physical method return property");
+            assert!(!row.public);
+            assert!(found.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&row.symbol)
+                    && object.container.as_ref() == Some(&owner.symbol)
+            }));
+            &row.symbol
+        });
+        assert_ne!(rows[0], rows[1]);
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| { row.source.starts_with("[selectName()](first)") })
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| { !matches!(row.source.as_str(), "unknown: 3" | "unknown: 4") })
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
 fn non_entry_conditional_returns_keep_distinct_literal_branch_properties() {
     const SOURCE: &str = concat!(
         "export function build(first) {\n",

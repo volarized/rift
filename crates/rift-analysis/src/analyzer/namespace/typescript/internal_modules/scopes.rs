@@ -1193,7 +1193,7 @@ fn literal_callable_owners<'source>(
         .collect()
 }
 
-/// Selects returned literal ranges from one admitted, physically named function declaration.
+/// Selects returned literal ranges from one admitted, physically named function or class method.
 fn returned_literal_owners<'source>(
     declarations: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
     facts: &StaticFacts,
@@ -1209,9 +1209,12 @@ fn returned_literal_owners<'source>(
         let Some((owner, body)) = declarations.get(&name).zip(object) else {
             continue;
         };
-        if owner.syntax_element_kind != Some("function_declaration")
-            || !owner.item_range.encloses(body)
-        {
+        let named = match owner.syntax_element_kind {
+            Some("function_declaration") => true,
+            Some("method_definition") => !owner.name.starts_with('['),
+            _ => false,
+        };
+        if !named || !owner.item_range.encloses(body) {
             continue;
         }
         let name = owner.qualified_name.as_str();
