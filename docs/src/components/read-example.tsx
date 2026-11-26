@@ -1,27 +1,35 @@
-import { Tab } from "fumadocs-ui/components/tabs";
+import { CodeBlock, Pre } from "fumadocs-ui/components/codeblock";
 import { ExampleTabs } from "@/components/example-tabs";
-import examples from "./read-examples.json";
+import recorded from "./read-examples.json";
+import generated from "./workspace-examples.generated.json";
 
-/** Request and both response forms from one recorded tool call. */
-export function ReadExample({ name }: { name: keyof typeof examples }) {
-  const example = examples[name];
+const examples = { ...recorded, ...generated.queries, map: generated.map };
+
+function ExampleCode({ source }: { source: string }) {
   return (
-    <ExampleTabs items={["call", "text", "json"]}>
-      <Tab value="call">
-        <pre>
-          <code>{JSON.stringify(example.arguments, null, 2)}</code>
-        </pre>
-      </Tab>
-      <Tab value="text">
-        <pre>
-          <code>{example.text}</code>
-        </pre>
-      </Tab>
-      <Tab value="json">
-        <pre>
-          <code>{JSON.stringify(example.json, null, 2)}</code>
-        </pre>
-      </Tab>
-    </ExampleTabs>
+    <CodeBlock allowCopy={false} className="m-0 rounded-none border-0 bg-transparent">
+      <Pre className="px-4">
+        <code>{source}</code>
+      </Pre>
+    </CodeBlock>
+  );
+}
+
+/** Request and both response forms from one MCP capture. */
+export function ReadExample({ name }: { name: keyof typeof examples }) {
+  const example: {
+    arguments: object;
+    text: string;
+    json: unknown;
+    query?: string;
+  } = examples[name];
+
+  return (
+    <ExampleTabs
+      sparql={example.query && <ExampleCode source={example.query} />}
+      mcp={<ExampleCode source={JSON.stringify(example.arguments, null, 2)} />}
+      text={<ExampleCode source={example.text} />}
+      json={<ExampleCode source={JSON.stringify(example.json, null, 2)} />}
+    />
   );
 }

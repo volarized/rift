@@ -5,7 +5,7 @@ import { type ReactNode, useEffect, useState } from "react";
 
 import { ApiReference } from "@/components/global/api-reference";
 import { McpInspector } from "@/components/global/mcp-inspector";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
@@ -22,13 +22,10 @@ function tabFromHash(hash: string): ConsoleTab | null {
   return TABS.find((tab) => tab.id === id)?.id ?? null;
 }
 
-// One outlined control of two segments, in the label style of the site. The
-// active segment is marked by a hairline that sits on the control's bottom
-// rule. Focus uses the 1px ring the buttons use.
-const TRIGGER_CLASS =
-  "h-9 flex-none gap-2 px-3.5 font-mono text-[0.6875rem] font-normal uppercase tracking-[0.16em] " +
-  "not-first:border-l-border focus-visible:ring-1 focus-visible:outline-0 " +
-  "group-data-horizontal/tabs:after:-inset-x-px group-data-horizontal/tabs:after:-bottom-0.5 group-data-horizontal/tabs:after:h-px";
+const MODE_BUTTON =
+  "h-10 flex-none font-mono text-xs font-medium tracking-wide after:hidden focus-visible:ring-1 focus-visible:outline-0";
+const ACTIVE_MODE =
+  "data-active:border-primary data-active:bg-primary data-active:text-primary-foreground dark:data-active:border-primary dark:data-active:bg-primary dark:data-active:text-primary-foreground dark:shadow-[0_0_18px] dark:shadow-primary/25";
 
 const LABEL = "font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground";
 
@@ -97,18 +94,16 @@ export function GlobalConsole({
                     variant="outline"
                     size="icon"
                     aria-label="Endpoints and access"
-                    className="size-9.5 bg-transparent text-muted-foreground hover:text-foreground aria-expanded:text-foreground dark:bg-transparent"
+                    className="size-10 text-primary-text"
                   />
                 }
               >
                 <InfoIcon aria-hidden="true" weight="light" />
               </PopoverTrigger>
-              {/* An outlined region on the void, like every other box of the
-                  site: no fill, no shadow. */}
               <PopoverContent
                 align="end"
                 sideOffset={8}
-                className="w-[min(32rem,calc(100vw-2rem))] gap-4 border border-border bg-background p-4 text-sm shadow-none ring-0"
+                className="w-[min(32rem,calc(100vw-2rem))] gap-4 border border-border bg-card p-4 text-sm shadow-none ring-0"
               >
                 <PopoverTitle className={cn(LABEL, "font-normal")}>
                   Endpoints and access
@@ -117,12 +112,19 @@ export function GlobalConsole({
               </PopoverContent>
             </Popover>
             <TabsList
-              variant="line"
               aria-label="Console"
-              className="gap-0 border border-border p-0 group-data-horizontal/tabs:h-auto"
+              className="gap-2 bg-transparent p-0 group-data-horizontal/tabs:h-auto"
             >
               {TABS.map(({ id, label, Icon }) => (
-                <TabsTrigger key={id} value={id} className={TRIGGER_CLASS}>
+                <TabsTrigger
+                  key={id}
+                  value={id}
+                  className={cn(
+                    buttonVariants({ variant: tab === id ? "default" : "outline", size: "lg" }),
+                    MODE_BUTTON,
+                    tab === id && ACTIVE_MODE,
+                  )}
+                >
                   <Icon aria-hidden="true" weight="light" className="size-3.5" />
                   {label}
                 </TabsTrigger>

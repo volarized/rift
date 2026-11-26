@@ -1,0 +1,8 @@
+[search.vector]
+disabled = true
+
+[dependencies]
+resolution = "static"
+
+[global]
+enabled = false

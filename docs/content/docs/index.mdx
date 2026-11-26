@@ -48,9 +48,8 @@ The agent uses the [`search`](/docs/mcp#tool-search) MCP tool to search project 
 
 ### Symbols [#symbol-retrieval]
 
-When an agent precisely knows which symbol to look up (usually found via search), it can "zoom in"
-on a certain specific symbol. A symbol is practically a class or a function from a certain library
-(local or remote); retrieving it returns precise information about it, such as source code,
-documentation and signature.
+Once an agent knows which symbol to look up, usually from search, it can retrieve that symbol.
+A symbol can be a class or function from a local or remote library. Looking it up returns
+details such as its source code, documentation, and signature.
 
 The agent retrieves this information through the [`get_symbol`](/docs/mcp#tool-get_symbol) MCP tool.

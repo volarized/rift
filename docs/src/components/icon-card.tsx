@@ -13,10 +13,19 @@ export function IconCard({ icon: CardIcon, title, className, ...props }: IconCar
   return (
     <Card
       {...props}
-      className={cn("min-w-0 rounded-none bg-background shadow-none", className)}
+      className={cn(
+        "min-w-0 rounded-none border-border bg-card p-3 shadow-none",
+        props.href && "hover:border-primary-text/40 hover:bg-secondary",
+        className,
+      )}
       title={
         <span className="flex items-start gap-2">
-          <CardIcon size={20} weight="light" aria-hidden="true" className="shrink-0" />
+          <CardIcon
+            size={20}
+            weight="light"
+            aria-hidden="true"
+            className="shrink-0 text-primary-text"
+          />
           <span className="min-w-0 flex-1 leading-5">{title}</span>
         </span>
       }

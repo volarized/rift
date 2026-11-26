@@ -31,23 +31,22 @@ export function baseOptions(): BaseLayoutProps {
       title: (
         // Own the wordmark weight here: home and docs links inherit different weights.
         <span className="flex items-center justify-items-center gap-2 font-mono text-[15px] font-medium leading-none tracking-[0.04em]">
-          <Logo stitches={40} strokeWidth={0.5} className="h-8 w-auto" />
+          <Logo stitches={40} strokeWidth={0.5} className="h-8 w-auto text-primary-text" />
           <span className="text-foreground">rift</span>
         </span>
       ),
       transparentMode: "top",
     },
     // Replaces fumadocs' built-in switch with the animate-ui one, which wipes
-    // the new theme across the page via a View Transition instead of swapping
-    // it instantly. Ghost variant so it reads as a bare icon in the nav.
+    // the new theme across the page via a View Transition.
     themeSwitch: {
       component: (
         <ThemeTogglerButton
-          variant="ghost"
+          variant="outline"
           size="sm"
           direction="ltr"
           modes={["light", "dark", "system"]}
-          className="text-muted-foreground hover:text-foreground"
+          className="text-muted-foreground"
         />
       ),
     },

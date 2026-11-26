@@ -35,7 +35,7 @@ current user. To install a specific version, set the `RIFT_VERSION` environment 
 release tag.
 
 The download service counts archive requests by day, country, release, platform, and agent category.
-These counts measure download requests, including retries; they do not confirm successful
+These counts measure download requests, including retries. They do not confirm successful
 installation. Set `RIFT_TELEMETRY_DISABLED=true` in the installer's environment to exclude
 its requests from counters. Standalone installers do not read project or user TOML files.
 After installation, run
@@ -66,7 +66,7 @@ The `command` names the installed executable, and `args` selects its MCP mode. Y
 `rift mcp` from the project folder, so rift builds its local index from that project's codebase.
 
 Tools return compact text by default. To include structured results, set `args` to
-`["mcp", "--output=all"]`; [Reading results](/docs/mcp#reads) explains the difference.
+`["mcp", "--output=all"]`. [Reading results](/docs/mcp#reads) explains the difference.
 
 For another MCP client, configure it to launch the same command from your project folder.
 If you're using Claude Code, [Usage](/docs/agentic-usage) explains how to install the Rift

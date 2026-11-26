@@ -53,7 +53,7 @@ same layers of intelligence outlined below.
 On a surface level, Rift is an MCP server that follows the standard MCP specification. It comes
 in two modes:
 
-1. <VersionBadge version="planned" inline /> Global server at `https://api.volar.sh/rift/mcp/`.
+1. Global server at `https://api.volar.sh/rift/mcp/`.
    An agent can connect to it directly to search and inspect symbols across collected OSS
    packages.
 2. Local server launched in place with your project. It provides the same layers of intelligence
@@ -68,7 +68,7 @@ based on source code facts and derived from them by logically aligned algorithms
 ## Symbols, facets, and edges
 
 We consider the whole codebase a collection of symbols. Symbols are logical objects, represented
-by several facets. Symbols can logically relate to one another; each such logical relation is an
+by several facets. Symbols can logically relate to one another. Each such logical relation is an
 edge. Edges can be different in terms of their source and contribution - some of them are
 collected via static analysis, some of them use language-specific engines, and some of them are
 retrieved via the standard LSP protocol.
@@ -195,7 +195,7 @@ Static analysis captured into the index is `static`, an embedded language engine
 is `engine`, and a language server reached through LSP is `lsp`. Rift retains those analyses
 in storage and merges their equal edges in read answers. The requested
 [`providers`](/docs/developer/protocol/core#edge-provider) set names the analyses that found
-an edge; answers omit it by default. [Edge queries](/docs/mcp#edge-provider) can filter the
+an edge. Answers omit it by default. [Edge queries](/docs/mcp#edge-provider) can filter the
 stored facts by `:provider`.
 
 ### Documentation
@@ -244,7 +244,7 @@ A [symbol lookup with history](/docs/mcp#tool-get_symbol) follows a declaration 
 revisions the history store holds, newest first. It shows changes to the declaration's body,
 signature, or decorators, as well as its introduction, removal, or move, and each version names
 the commit's author. A file renamed without a changed byte keeps its timeline, and so does a
-declaration moved unchanged into another file; a move that also edits the declaration ends it.
+declaration moved unchanged into another file. A move that also edits the declaration ends it.
 
 A [change comparison](/docs/mcp#search-change) compares a committed revision with another
 revision, or with the working tree and its uncommitted edits. Rift parses the files on each side
@@ -300,7 +300,7 @@ packages, the local server requests them from the global index through an API, c
 of the current project. The local server analyzes no package source itself. When the global index
 is unavailable or holds no release of a dependency, the read still answers from project source.
 
-### Global <VersionBadge version="planned" inline />
+### Global
 
 The global index is a cached continuation of the local index. Rift populates it by applying the
 same layers of intelligence to collected OSS package versions. It holds facts about those packages
@@ -313,8 +313,8 @@ and the global server answers using the package context supplied by that project
 ## Search
 
 The local server processes and indexes project source on the user's machine. The global service
-does not process or index that source. <VersionBadge version="planned" inline /> Global search
-uses a separate index of collected OSS package versions.
+does not process or index that source. Global search uses a separate index of collected OSS package
+versions.
 
 ### Local ranking
 
