@@ -450,8 +450,8 @@ fn entry_modules(
     let modules = candidates
         .into_iter()
         .map(|(path, candidates)| {
-            let module = file_module(candidates);
-            unresolved |= module.is_none();
+            let (module, unresolved_aliases) = file_module(candidates);
+            unresolved |= unresolved_aliases || module.is_none();
             (path, module)
         })
         .collect();
@@ -465,16 +465,20 @@ struct EntryCandidate<'metadata> {
     unconditional: bool,
 }
 
-/// The one module a file is published under. An unconditional subpath keeps the file before
-/// a conditional one, and two of them leave it unresolved. Among conditional subpaths the
-/// package entry holds it, else the first key in order; the others are aliases.
-fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> Option<String> {
+/// The module of the selected file and whether competing unconditional aliases remain.
+/// Among unconditional routes only the authored package root can settle a shared file.
+/// Otherwise preserve the existing precedence of unconditional routes and ordered keys.
+fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> (Option<String>, bool) {
     let unconditional = candidates
         .iter()
         .filter(|candidate| candidate.unconditional)
         .count();
     if unconditional > 1 {
-        return None;
+        let root = candidates
+            .into_iter()
+            .find(|candidate| candidate.unconditional && candidate.key == ".")
+            .map(|candidate| candidate.module);
+        return (root, true);
     }
     candidates.sort_by_key(|candidate| {
         (
@@ -483,10 +487,11 @@ fn file_module(mut candidates: Vec<EntryCandidate<'_>>) -> Option<String> {
             candidate.key,
         )
     });
-    candidates
+    let module = candidates
         .into_iter()
         .next()
-        .map(|candidate| candidate.module)
+        .map(|candidate| candidate.module);
+    (module, false)
 }
 
 fn export_subpath_is_valid(path: &str) -> bool {
@@ -726,6 +731,7 @@ struct PackageMetadata {
 enum CapturedExports {
     Direct(String),
     Entries(OrderedConditions),
+    Alternatives(Vec<ExportTarget>),
 }
 
 #[derive(Deserialize)]
@@ -749,6 +755,12 @@ impl From<CapturedExports> for Exports {
                 ".".to_owned(),
                 ExportTarget::Conditions(conditions),
             )])),
+            CapturedExports::Alternatives(alternatives) => {
+                Self::Subpaths(OrderedConditions(vec![(
+                    ".".to_owned(),
+                    ExportTarget::Alternatives(alternatives),
+                )]))
+            }
         }
     }
 }
@@ -856,6 +868,7 @@ fn consumer_conditions(language: &str, loader: Loader) -> &'static [&'static str
 enum ExportTarget {
     Direct(String),
     Conditions(OrderedConditions),
+    Alternatives(Vec<ExportTarget>),
     Unresolved(UnresolvedTarget),
 }
 
@@ -864,7 +877,7 @@ enum ExportTarget {
 enum UnresolvedTarget {
     /// `null`, which excludes the subpath for the conditions it is written under.
     Excluded,
-    /// A target list, which names no single file without reading the file system.
+    /// A target list with an unsupported element.
     List,
 }
 
@@ -879,11 +892,16 @@ impl From<Option<Vec<de::IgnoredAny>>> for UnresolvedTarget {
 
 /// What one export target gives a consumer.
 enum SelectedTarget<'metadata> {
-    Path(&'metadata str),
+    Path {
+        path: &'metadata str,
+        declared: bool,
+    },
     /// The written target gives this consumer no file.
     Excluded,
     /// Which file the written target gives this consumer is not established.
     Refused,
+    /// The earlier array choice is unresolved even if another loader could select a file.
+    RefusedAlternative,
     /// No condition of the consumer is written: a later condition can still match.
     Unmatched,
 }
@@ -892,14 +910,18 @@ impl ExportTarget {
     /// The target that holds the module identity for `language`: the one an ECMAScript
     /// module consumer selects in the declared order, else the one a `require` selects.
     fn target(&self, language: &str) -> Option<&str> {
-        [Loader::Module, Loader::CommonJs]
-            .into_iter()
-            .find_map(|loader| {
-                self.selected_target(
-                    language == "typescript",
-                    consumer_conditions(language, loader),
-                )
-            })
+        for loader in [Loader::Module, Loader::CommonJs] {
+            match self.select(
+                language == "typescript",
+                consumer_conditions(language, loader),
+                false,
+            ) {
+                SelectedTarget::Path { path, .. } => return Some(path),
+                SelectedTarget::RefusedAlternative => return None,
+                SelectedTarget::Excluded | SelectedTarget::Refused | SelectedTarget::Unmatched => {}
+            }
+        }
+        None
     }
 
     /// Whether the target was resolved by its first condition alone: a direct file, a first
@@ -909,6 +931,9 @@ impl ExportTarget {
         match self {
             Self::Direct(_) => true,
             Self::Unresolved(_) => false,
+            Self::Alternatives(targets) => targets
+                .first()
+                .is_some_and(|target| target.is_unconditional(language)),
             Self::Conditions(conditions) => {
                 conditions.0.first().is_some_and(|(condition, target)| {
                     (condition == DEFAULT_CONDITION
@@ -929,11 +954,13 @@ impl ExportTarget {
         let mut unmatched = true;
         for loader in [Loader::Module, Loader::CommonJs] {
             let conditions = consumer_conditions(language, loader);
-            match self.select(language == "typescript", conditions) {
+            match self.select(language == "typescript", conditions, false) {
                 SelectedTarget::Unmatched => continue,
                 SelectedTarget::Excluded => {}
-                SelectedTarget::Path(path) if is_file(path) => {}
-                SelectedTarget::Path(_) | SelectedTarget::Refused => return true,
+                SelectedTarget::Path { path, .. } if is_file(path) => {}
+                SelectedTarget::Path { .. }
+                | SelectedTarget::Refused
+                | SelectedTarget::RefusedAlternative => return true,
             }
             unmatched = false;
         }
@@ -943,6 +970,7 @@ impl ExportTarget {
                 Self::Direct(path) if is_file(path) => {}
                 Self::Unresolved(UnresolvedTarget::Excluded) => {}
                 Self::Direct(_) | Self::Unresolved(UnresolvedTarget::List) => return true,
+                Self::Alternatives(targets) => pending.extend(targets),
                 Self::Conditions(conditions) => {
                     pending.extend(conditions.0.iter().map(|(_, target)| target));
                 }
@@ -952,18 +980,24 @@ impl ExportTarget {
     }
 
     fn selected_target(&self, types: bool, selected: &[&str]) -> Option<&str> {
-        match self.select(types, selected) {
-            SelectedTarget::Path(path) => Some(path),
-            SelectedTarget::Excluded | SelectedTarget::Refused | SelectedTarget::Unmatched => None,
+        match self.select(types, selected, false) {
+            SelectedTarget::Path { path, .. } => Some(path),
+            SelectedTarget::Excluded
+            | SelectedTarget::Refused
+            | SelectedTarget::RefusedAlternative
+            | SelectedTarget::Unmatched => None,
         }
     }
 
     /// The JSON reader that captured the metadata refuses nesting past its recursion limit.
-    fn select(&self, types: bool, selected: &[&str]) -> SelectedTarget<'_> {
+    fn select(&self, types: bool, selected: &[&str], declared: bool) -> SelectedTarget<'_> {
         let conditions = match self {
-            Self::Direct(path) => return SelectedTarget::Path(path),
+            Self::Direct(path) => return SelectedTarget::Path { path, declared },
             Self::Unresolved(UnresolvedTarget::Excluded) => return SelectedTarget::Excluded,
             Self::Unresolved(UnresolvedTarget::List) => return SelectedTarget::Refused,
+            Self::Alternatives(targets) => {
+                return Self::select_alternative(targets, types, selected, declared);
+            }
             Self::Conditions(conditions) => conditions,
         };
         for (name, target) in &conditions.0 {
@@ -980,8 +1014,47 @@ impl ExportTarget {
             {
                 continue;
             }
-            match target.select(types, selected) {
+            match target.select(types, selected, declared || name == TYPES_CONDITION) {
                 SelectedTarget::Unmatched => {}
+                found => return found,
+            }
+        }
+        SelectedTarget::Unmatched
+    }
+
+    /// Use an exact declaration target selected under a written `types` condition.
+    /// A runtime path can redirect to types through extension substitution, which this
+    /// metadata walk does not prove.
+    /// Only a nonmatching condition lets the next array member decide the entry.
+    fn select_alternative<'metadata>(
+        targets: &'metadata [Self],
+        types: bool,
+        selected: &[&str],
+        declared: bool,
+    ) -> SelectedTarget<'metadata> {
+        if targets.is_empty() {
+            return SelectedTarget::Excluded;
+        }
+        for target in targets {
+            match target.select(types, selected, declared) {
+                SelectedTarget::Unmatched => {}
+                SelectedTarget::Refused => return SelectedTarget::RefusedAlternative,
+                SelectedTarget::Path { path, declared } => {
+                    let Some(relative) = path.strip_prefix("./") else {
+                        return SelectedTarget::RefusedAlternative;
+                    };
+                    if !export_subpath_is_valid(relative)
+                        || relative
+                            .split('/')
+                            .any(|part| part.eq_ignore_ascii_case("node_modules"))
+                        || (types
+                            && (!declared
+                                || !crate::static_resolution::is_declaration_file(relative)))
+                    {
+                        return SelectedTarget::RefusedAlternative;
+                    }
+                    return SelectedTarget::Path { path, declared };
+                }
                 found => return found,
             }
         }
@@ -1004,6 +1077,7 @@ impl ExportTarget {
                         .filter(|(name, _)| name != TYPES_CONDITION)
                         .map(|(_, target)| target),
                 ),
+                Self::Alternatives(targets) => pending.extend(targets),
                 Self::Unresolved(_) => {}
             }
         }

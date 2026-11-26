@@ -2142,6 +2142,117 @@ fn conditional_exports_hold_one_file_for_each_module() {
     }
 }
 
+#[test]
+fn export_arrays_keep_the_first_proven_entry_owner() {
+    let files = [
+        (
+            "index.js",
+            "export function select(options) { return options.label; }",
+        ),
+        (
+            "other.js",
+            "export function select(options) { return options.label; }",
+        ),
+        (
+            "types/index.d.ts",
+            "export declare function select(options: { label: string }): string;",
+        ),
+        (
+            "types/other.d.ts",
+            "export declare function select(options: { label: string }): string;",
+        ),
+    ];
+    let sources = [
+        ShippedLanguage::JavaScript,
+        ShippedLanguage::JavaScript,
+        ShippedLanguage::TypeScript,
+        ShippedLanguage::TypeScript,
+    ];
+    for (exports, script, declared) in [
+        (
+            r#"{".":[{"types":"./types/index.d.ts","default":"./index.js"},"./index.js"]}"#,
+            "index.js",
+            "types/index.d.ts",
+        ),
+        (
+            r#"{".":[{"types":"./types/index.d.ts","default":"./index.js"},"./other.js"]}"#,
+            "index.js",
+            "types/index.d.ts",
+        ),
+        (
+            r#"[{"custom":"./types/other.d.ts"},{"types":"./types/index.d.ts","default":"./index.js"}]"#,
+            "index.js",
+            "types/index.d.ts",
+        ),
+        (
+            r#"{".":[{"types":"./types/other.d.ts","default":"./other.js"},{"types":"./types/index.d.ts","default":"./index.js"}]}"#,
+            "other.js",
+            "types/other.d.ts",
+        ),
+    ] {
+        let metadata = format!(r#"{{"name":"prettier","version":"3.8.5","exports":{exports}}}"#);
+        let found = prepared_languages(
+            ShippedLanguage::TypeScript,
+            &[("package.json", &metadata)],
+            &files,
+            Some(&sources),
+        );
+        for (path, declaration, qualified) in [
+            (script, "select", vec!["prettier", "select"]),
+            (
+                declared,
+                "select.label",
+                vec!["prettier", "select", "label"],
+            ),
+        ] {
+            let identity = SymbolIdentity::parse(found.anchors[path][declaration].as_str())
+                .expect("published entry identity");
+            assert_eq!(identity.qualified_path(), qualified, "{exports} {path}");
+        }
+        for (path, _) in files {
+            if path == script || path == declared {
+                continue;
+            }
+            assert!(
+                in_path_module(&found.anchors[path], &format!("prettier/{path}")),
+                "{exports} {path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn export_arrays_do_not_skip_unknown_or_excluded_targets() {
+    let files = [
+        ("index.js", "export function select() {}"),
+        (
+            "types/index.d.ts",
+            "export declare function select(): void;",
+        ),
+    ];
+    for alternatives in [
+        r#"[{"types@>=5":"./types/versioned.d.ts"},{"types":"./types/index.d.ts"}]"#,
+        r#"[{"import":{"types@>=5":"./types/versioned.d.ts"},"require":{"types":"./types/index.d.ts"}}]"#,
+        r#"[null,{"types":"./types/index.d.ts"}]"#,
+        r#"[12,{"types":"./types/index.d.ts"}]"#,
+        r#"["./types/index.d.ts"]"#,
+        r#"["./index.js",{"types":"./types/index.d.ts"}]"#,
+        r#"["./missing.d.ts",{"types":"./types/index.d.ts"}]"#,
+        r#"["./Node_Modules/illegal.d.ts",{"types":"./types/index.d.ts"}]"#,
+        r#"[[],{"types":"./types/index.d.ts"}]"#,
+    ] {
+        let exports = format!(r#"{{".":{alternatives}}}"#);
+        let (modules, unresolved) = published_modules(&exports, &files);
+        assert!(unresolved, "{exports}");
+        assert!(
+            !modules
+                .keys()
+                .any(|module| module.ends_with("/typescript/prettier")),
+            "{exports} {modules:?}"
+        );
+    }
+}
+
 /// A file reached by several subpaths is published under one module.
 #[test]
 fn export_subpaths_of_one_file_keep_one_module() {
@@ -2165,7 +2276,18 @@ fn export_subpaths_of_one_file_keep_one_module() {
             Some("prettier%2Fa"),
             false,
         ),
-        (r#"{".":"./a.js","./a":"./a.js"}"#, "a.js", None, true),
+        (
+            r#"{".":"./a.js","./a":"./a.js"}"#,
+            "a.js",
+            Some("prettier"),
+            true,
+        ),
+        (
+            r#"{"./a":{"default":"./a.js"},".":{"default":"./a.js"}}"#,
+            "a.js",
+            Some("prettier"),
+            true,
+        ),
         (
             r#"{"./sub":{"require":"./s.cjs","import":"./s.mjs"}}"#,
             "s.mjs",

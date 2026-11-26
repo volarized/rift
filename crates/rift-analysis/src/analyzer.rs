@@ -1609,6 +1609,36 @@ struct Records {
     documentation: crate::documentation::DocumentationLimits,
 }
 
+fn javascript_module_source(owner: &SymbolOwner, held: &AnalyzedFile) -> bool {
+    matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm")
+        && held.file.syntax().static_facts().is_some_and(|facts| {
+            let suffix = held.file.path().as_str().rsplit_once('.');
+            matches!(suffix, Some((_, "mjs" | "cjs")))
+                || facts.has_javascript_module_statement()
+                || facts.commonjs_export().is_some()
+        })
+}
+
+fn javascript_declaration_scopes(syntax: &SyntaxFacts) -> Option<crate::EnclosingDefinitions<()>> {
+    let expressions = syntax
+        .static_facts()?
+        .function_values()
+        .iter()
+        .filter(|(range, value)| range == value)
+        .map(|(range, _)| *range);
+    // The module fallback also covers missing owners inside authored declarations.
+    let declarations = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| matches!(symbol.kind, "function" | "method" | "class"))
+        .map(|symbol| symbol.range);
+    Some(crate::EnclosingDefinitions::new(
+        expressions
+            .chain(declarations)
+            .map(|range| (range.start, range.end, ())),
+    ))
+}
+
 impl Records {
     fn static_occurrences(
         &mut self,
@@ -1763,23 +1793,26 @@ impl Records {
             .iter()
             .map(|unit| (unit.unit.0.clone(), unit.source_complete))
             .collect::<BTreeMap<_, _>>();
-        let mut importers = BTreeMap::new();
+        let mut modules = BTreeMap::new();
         let sources = analyzed
             .iter()
             .map(|held| {
                 let unit = held.placement.unit().to_string();
                 let syntax = held.file.syntax();
+                let language = syntax.language().name.as_str();
                 if !self.symbols_truncated
-                    && matches!(syntax.language().name.as_str(), "typescript" | "rust")
+                    && matches!(language, "javascript" | "typescript" | "rust")
                     && let Some(module) = held.placement.logical_identity(".")
                     && !objects.contains(module.as_str())
                     && !semantics.edges().outgoing(module).is_empty()
                 {
-                    let proven = units.get(&unit) == Some(&true)
+                    let proven = (language != "javascript"
+                        || javascript_module_source(owner, held))
+                        && units.get(&unit) == Some(&true)
                         && !syntax.has_errors()
                         && syntax.left_out_declaration_count() == 0
                         && semantics.edges().edge_module(held.placement.unit()) == Some(module);
-                    importers
+                    modules
                         .entry(module)
                         .and_modify(|held| *held = None)
                         .or_insert(proven.then_some(held));
@@ -1791,9 +1824,9 @@ impl Records {
             let Some(id) = record.identity() else {
                 continue;
             };
-            if !importers.is_empty() {
+            if !modules.is_empty() {
                 // Even a graph record refused by object publication owns this identity.
-                importers.remove(id);
+                modules.remove(id);
             }
             if !objects.contains(id.as_str()) {
                 continue;
@@ -1837,7 +1870,8 @@ impl Records {
             }
         }
         self.graph_edges(owner, semantics, &objects, &units, &sources, limit)?;
-        self.module_imports(owner, semantics, &objects, importers, limit);
+        self.module_edges(owner, semantics, &objects, &modules, limit);
+        self.publish_empty_file_modules(owner, semantics, analyzed, &objects, &units);
         if semantics.edges().dropped_edges() > 0 {
             self.warn(truncation(
                 "edges",
@@ -1847,19 +1881,39 @@ impl Records {
         Ok(())
     }
 
-    /// A checked file-module can own an import without a written module declaration.
-    fn module_imports(
+    /// A checked file module can own an import without a written declaration.
+    /// Direct runtime references of admitted JavaScript and TypeScript modules follow the
+    /// prior module imports and JavaScript calls under the package publication bounds.
+    fn module_edges(
         &mut self,
         owner: &SymbolOwner,
         semantics: &WorkspaceSemantics,
         objects: &BTreeSet<String>,
-        importers: BTreeMap<&CoreSymbolId, Option<&AnalyzedFile>>,
+        modules: &BTreeMap<&CoreSymbolId, Option<&AnalyzedFile>>,
         limit: usize,
     ) {
-        for (module, held) in importers {
-            let Some(held) = held else {
-                continue;
-            };
+        let checked = modules
+            .iter()
+            .filter_map(|(&module, &held)| Some((module, held?)));
+        let javascript = |(_, held): &(&CoreSymbolId, &AnalyzedFile)| {
+            held.file.syntax().language().name == "javascript"
+        };
+        // Existing TypeScript and Rust imports retain their place under the package caps.
+        let existing = checked
+            .clone()
+            .filter(|entry| !javascript(entry))
+            .chain(checked.clone().filter(javascript));
+        let runtime = checked.filter(|(_, held)| {
+            let site = held.file.syntax().language().name.as_str();
+            matches!(site, "javascript" | "typescript")
+                && !crate::static_resolution::is_declaration_file(held.file.path().as_str())
+                && javascript_module_source(owner, held)
+        });
+        let passes = existing
+            .map(|entry| (entry, false))
+            .chain(runtime.map(|entry| (entry, true)));
+        let mut published = BTreeSet::new();
+        for ((module, held), supplemental) in passes {
             let language = held.file.syntax().language();
             let Ok(identity) = SymbolIdentity::parse(module.as_str()) else {
                 continue;
@@ -1870,12 +1924,25 @@ impl Records {
             if identity.owner() != owner || identity.language() != language {
                 continue;
             }
-            let mut published = false;
+            let direct_roles: &[EdgeKind] = match (language.name.as_str(), supplemental) {
+                ("javascript", false) => &[EdgeKind::Calls],
+                ("javascript", true) => &[EdgeKind::Reads, EdgeKind::Writes],
+                ("typescript", true) => &[EdgeKind::Calls, EdgeKind::Reads, EdgeKind::Writes],
+                _ => &[],
+            };
+            let declarations = (!direct_roles.is_empty())
+                .then(|| javascript_declaration_scopes(held.file.syntax()))
+                .flatten();
             for edge in semantics.edges().outgoing(module) {
                 let occurrence = edge.occurrence();
                 let range = occurrence.range();
+                let import = !supplemental && edge.kind() == EdgeKind::Imports;
+                let direct = direct_roles.contains(&edge.kind())
+                    && declarations
+                        .as_ref()
+                        .is_some_and(|scopes| scopes.resolve(range.start(), range.end()).is_none());
                 if edge.is_graph_edge()
-                    || edge.kind() != EdgeKind::Imports
+                    || !(import || direct)
                     || occurrence.unit() != held.placement.unit()
                     || held
                         .file
@@ -1886,6 +1953,9 @@ impl Records {
                     continue;
                 }
                 let local = objects.contains(edge.to().as_str());
+                if !local && !import {
+                    continue;
+                }
                 let external = !local
                     && SymbolIdentity::parse(edge.to().as_str()).is_ok_and(|target| {
                         target.owner() != owner
@@ -1909,30 +1979,109 @@ impl Records {
                     ));
                     return;
                 }
-                if !published {
-                    if self.objects.len() >= bound(self.publication.symbols) {
-                        self.symbols_truncated = true;
-                        self.warn(truncation("objects", u64::from(self.publication.symbols)));
+                if !published.contains(module) {
+                    if !self.publish_file_module(language, name, module) {
                         return;
                     }
-                    let facts = PortableSymbolFacts::new(
-                        language.clone(),
-                        name.as_str(),
-                        name.as_str(),
-                        ExactKind("module".to_owned()),
-                    )
-                    .kinds(vec![SymbolKind::Module]);
-                    let origin = ContributionOrigin::new(None, SourceKind::Synthetic)
-                        .expect("source-less module origin");
-                    let mut object = rift_provider::AssembledSymbol::wire_facts(&facts, &origin);
-                    object.id = Some(SymbolId(module.as_str().to_owned()));
-                    self.object_unavailable(&object, name, None);
-                    self.objects.push(object);
-                    published = true;
+                    published.insert(module);
                 }
                 self.edges.push(edge.to_protocol());
             }
         }
+    }
+
+    /// Retains complete explicit file modules that declare nothing and own no stored edge.
+    /// Their optional objects follow every earlier declaration and module-edge owner.
+    fn publish_empty_file_modules(
+        &mut self,
+        owner: &SymbolOwner,
+        semantics: &WorkspaceSemantics,
+        analyzed: &[AnalyzedFile],
+        objects: &BTreeSet<String>,
+        units: &BTreeMap<String, bool>,
+    ) {
+        if self.symbols_truncated
+            || !matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm")
+        {
+            return;
+        }
+        let mut candidates = BTreeMap::new();
+        for held in analyzed {
+            let Some(module) = held.placement.logical_identity(".") else {
+                continue;
+            };
+            if objects.contains(module.as_str()) || !semantics.edges().outgoing(module).is_empty() {
+                continue;
+            }
+            let syntax = held.file.syntax();
+            let language = syntax.language();
+            let path = held.file.path().as_str();
+            let module_extension = matches!(
+                (language.name.as_str(), path.rsplit_once('.')),
+                ("javascript", Some((_, "mjs" | "cjs"))) | ("typescript", Some((_, "mts" | "cts")))
+            );
+            let proven = matches!(language.name.as_str(), "javascript" | "typescript")
+                && (module_extension || javascript_module_source(owner, held))
+                && !crate::static_resolution::is_declaration_file(path)
+                && units.get(&held.placement.unit().to_string()) == Some(&true)
+                && !syntax.has_errors()
+                && syntax.left_out_declaration_count() == 0
+                && syntax.symbols().is_empty();
+            candidates
+                .entry(module)
+                .and_modify(|held| *held = None)
+                .or_insert(proven.then_some(language));
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        for identity in semantics
+            .graph()
+            .records()
+            .iter()
+            .filter_map(|row| row.identity())
+        {
+            // Refused graph records still own their established identities.
+            candidates.remove(identity);
+        }
+        for (module, language) in candidates {
+            let (Some(language), Ok(identity)) = (language, SymbolIdentity::parse(module.as_str()))
+            else {
+                continue;
+            };
+            let [name] = identity.qualified_path() else {
+                continue;
+            };
+            if identity.owner() == owner
+                && identity.language() == language
+                && !self.publish_file_module(language, name, module)
+            {
+                return;
+            }
+        }
+    }
+
+    fn publish_file_module(
+        &mut self,
+        language: &Language,
+        name: &str,
+        module: &CoreSymbolId,
+    ) -> bool {
+        if self.objects.len() >= bound(self.publication.symbols) {
+            self.symbols_truncated = true;
+            self.warn(truncation("objects", u64::from(self.publication.symbols)));
+            return false;
+        }
+        let facts =
+            PortableSymbolFacts::new(language.clone(), name, name, ExactKind("module".to_owned()))
+                .kinds(vec![SymbolKind::Module]);
+        let origin = ContributionOrigin::new(None, SourceKind::Synthetic)
+            .expect("source-less module origin");
+        let mut object = rift_provider::AssembledSymbol::wire_facts(&facts, &origin);
+        object.id = Some(SymbolId(module.as_str().to_owned()));
+        self.object_unavailable(&object, name, None);
+        self.objects.push(object);
+        true
     }
 
     fn graph_edges(
