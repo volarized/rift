@@ -147,3 +147,85 @@ fn package_python_overload_parameters_refuse_competing_declarations() {
         ["value = 1"]
     );
 }
+
+#[test]
+fn package_python_stub_overloads_keep_each_written_parameter() {
+    const STUB: &str = concat!(
+        "from typing import overload\n",
+        "@overload\n",
+        "def parse(value: int) -> int: ...\n",
+        "@overload\n",
+        "def parse(value: str) -> str: pass\n",
+        "class Item:\n",
+        "    @overload\n",
+        "    def choose(self, value: int) -> int: ...\n",
+        "    @overload\n",
+        "    def choose(self, value: str) -> str: ...\n",
+        "    def control(self, checked: int) -> int: ...\n",
+        "@overload\n",
+        "def executable(argument: int) -> int: ...\n",
+        "@overload\n",
+        "def executable(argument: str) -> str: return argument\n",
+        "from another_module import overload as unrelated\n",
+        "@unrelated\n",
+        "def ambiguous(binding: int) -> int: ...\n",
+        "@unrelated\n",
+        "def ambiguous(binding: str) -> str: ...\n",
+    );
+
+    let published = publication(&[("click/__init__.pyi", STUB)], None, &["click"]);
+    let control = published
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/Item/control/checked"))
+        .expect("ordinary parameter in the same stub");
+    assert_eq!(control.source, "checked");
+
+    let mut expected = Vec::new();
+    for (prefix, owner) in [("def parse(", "parse"), ("def choose(", "Item/choose")] {
+        for (start, matched) in STUB.match_indices(prefix) {
+            let start = start + matched.len();
+            if owner == "Item/choose" {
+                expected.push((format!("{owner}/self"), start, start + 4));
+            }
+            let value = start + STUB[start..].find("value:").expect("value parameter");
+            expected.push((format!("{owner}/value"), value, value + 5));
+        }
+    }
+    for (owner, start, end) in &expected {
+        let range = TextRange {
+            start: u64::try_from(*start).expect("source start"),
+            end: u64::try_from(*end).expect("source end"),
+        };
+        let row = published
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(owner) && row.range == range)
+            .unwrap_or_else(|| panic!("written {owner} parameter at {range:?}"));
+        assert_eq!(row.unit, control.unit);
+        assert_eq!(row.source, STUB[*start..*end]);
+    }
+    assert_eq!(
+        published
+            .declarations
+            .iter()
+            .filter(|row| {
+                expected
+                    .iter()
+                    .any(|(owner, _, _)| row.symbol.as_str().ends_with(owner))
+            })
+            .count(),
+        expected.len()
+    );
+
+    assert!(!published.declarations.iter().any(|row| {
+        row.symbol.as_str().ends_with("/executable/argument")
+            || row.symbol.as_str().ends_with("/ambiguous/binding")
+    }));
+    let runtime = publication(&[("click/__init__.py", STUB)], None, &["click"]);
+    assert!(!runtime.declarations.iter().any(|row| {
+        expected
+            .iter()
+            .any(|(owner, _, _)| row.symbol.as_str().ends_with(owner))
+    }));
+}

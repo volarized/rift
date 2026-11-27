@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_core::ProjectPath;
 use rift_protocol::read::ProjectPath as ObservationPath;
 
-use super::{PackageMetadata, entry_path};
-use crate::static_resolution::is_declaration_file;
+use super::{PackageMetadata, entry_path, export_subpath_is_valid};
+use crate::static_resolution::{declared_extensions, is_declaration_file};
 use crate::{ArchiveMemberKind, NamespaceInput, PackageSource};
 
 /// Extensions Node tries after an exact file name, in its order.
@@ -146,6 +146,53 @@ impl<'input> PackageFiles<'input> {
         (!unknown).then_some(false)
     }
 
+    /// Whether captured paths establish a TypeScript file for a runtime spelling.
+    pub(super) fn has_type_substitution(&self, runtime: &str) -> bool {
+        type_substitutions(runtime).is_some_and(|mut candidates| {
+            candidates.any(|path| self.presence(&path) == Presence::File)
+        })
+    }
+
+    /// A written relative module confirms only one captured declaration path. A typed
+    /// source or another possible declaration with captured file evidence takes precedence
+    /// over this proof.
+    pub(super) fn relative_declaration(
+        &self,
+        from: &ProjectPath,
+        specifier: &str,
+    ) -> Option<ProjectPath> {
+        if !(specifier.starts_with("./") || specifier.starts_with("../"))
+            || specifier.contains(['%', '?', '#'])
+            || specifier.contains("//")
+            || specifier.ends_with('/')
+        {
+            return None;
+        }
+        let folder = from
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(folder, _)| folder);
+        let path = folder_path(folder, specifier)?;
+        if !export_subpath_is_valid(&path) {
+            return None;
+        }
+        let candidates = if let Some(siblings) = type_substitutions(&path) {
+            siblings.collect::<Vec<_>>()
+        } else {
+            if self.presence(&format!("{path}/package.json")) == Presence::File {
+                return None;
+            }
+            types_candidates(&path)?
+        };
+        let mut existing = candidates
+            .into_iter()
+            .filter(|path| self.presence(path) == Presence::File);
+        let first = existing.next()?;
+        (is_declaration_file(&first) && existing.next().is_none())
+            .then(|| ProjectPath::new(first).ok())
+            .flatten()
+    }
+
     pub(super) fn types(&self, metadata: &PackageMetadata) -> Entry {
         if metadata.types_versions.is_some() {
             return Entry::Absent;
@@ -196,6 +243,16 @@ pub(super) fn resolve(
         "javascript" => files.runtime(metadata.main.as_deref(), metadata.module.as_deref()),
         _ => Entry::Absent,
     }
+}
+
+fn type_substitutions(path: &str) -> Option<impl Iterator<Item = String> + '_> {
+    let (stem, sources, declarations) = declared_extensions(path)?;
+    Some(
+        sources
+            .iter()
+            .chain(declarations)
+            .map(move |extension| format!("{stem}{extension}")),
+    )
 }
 
 /// Node's `LOAD_AS_DIRECTORY` order for a written `main`, or the package's index without

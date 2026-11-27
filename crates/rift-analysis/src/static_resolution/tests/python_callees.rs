@@ -64,6 +64,8 @@ fn test_python_established_member_callees_are_calls_alone() {
     read.sort_unstable();
     let member = |name| format!("rift://symbol/local/python/{name}");
     let expected = [
+        ("Item", member("main/Item")),
+        ("Item", member("main/Item")),
         ("Item.value", member("main/Item/value")),
         ("item.m", member("main/Item/m")),
         ("item.p", member("main/Item/p")),
@@ -81,13 +83,23 @@ fn test_python_established_member_callees_are_calls_alone() {
 fn test_python_callees_of_a_dependency_are_calls_alone() {
     let source = "import os\ndef f(): os.getcwd()\n";
     let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
-    assert_eq!(result.external.len(), 2, "{:?}", result.external);
-    assert!(
-        result
-            .external
-            .iter()
-            .all(|external| external.role != ReferenceRole::Read)
+    assert_eq!(result.external.len(), 3, "{:?}", result.external);
+    let read = result
+        .external
+        .iter()
+        .find(|external| external.role == ReferenceRole::Read)
+        .expect("written module qualifier");
+    assert_eq!(
+        read.target.as_str(),
+        "rift://symbol/stdlib/cpython/python/os"
     );
+    assert_eq!(
+        (read.binding.range().start(), read.binding.range().end()),
+        (19, 21)
+    );
+    assert!(result.external.iter().any(|call| {
+        call.role == ReferenceRole::Call && call.target.as_str().ends_with("/os/getcwd")
+    }));
 }
 
 #[test]

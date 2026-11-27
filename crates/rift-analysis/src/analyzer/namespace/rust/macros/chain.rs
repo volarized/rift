@@ -12,6 +12,8 @@ use rift_syntax::{ByteRange, SyntaxLimits};
 
 use super::{consume, group};
 
+pub(super) type ModuleBranches<'a> = Vec<(&'a str, Vec<&'a str>)>;
+
 /// The conditional item chain definition without comments and attributes.
 const DEFINITION: &str = "macro_rules! cfg_if {
     ($(if #[cfg($($meta:meta),*)] { $($it:item)* }) else * else { $($it2:item)* }) => {
@@ -91,28 +93,8 @@ fn rename<'a>(
 
 /// The `mod` names of one conditional item chain invocation, each with the condition under
 /// which its branch's items exist. `None` when the invocation is not a complete chain.
-pub(crate) fn modules<'a>(
-    tokens: &[&'a str],
-    depth: usize,
-) -> Option<Vec<(&'a str, Vec<&'a str>)>> {
-    let mut input = tokens;
-    super::super::source_identifier(input.first()?)?;
-    input = &input[1..];
-    if !consume(&mut input, &["!"]) {
-        return None;
-    }
-    let close = match *input.first()? {
-        "(" => ")",
-        "[" => "]",
-        "{" => "}",
-        _ => return None,
-    };
-    let open = *input.first()?;
-    let mut body = group(&mut input, open, close)?;
-    let _ = consume(&mut input, &[";"]);
-    if !input.is_empty() {
-        return None;
-    }
+pub(crate) fn modules<'a>(tokens: &[&'a str], depth: usize) -> Option<ModuleBranches<'a>> {
+    let mut body = invocation_body(tokens)?;
     let mut previous: Vec<&[&'a str]> = Vec::new();
     let mut modules = Vec::new();
     loop {
@@ -141,6 +123,103 @@ pub(crate) fn modules<'a>(
             return body.is_empty().then_some(modules);
         }
     }
+}
+
+/// Checks one local arm that applies its written metadata capture to each unchanged item.
+pub(super) fn is_captured_predicate_definition(tokens: &[&str], name: &str) -> bool {
+    let Some(input) =
+        tokens.strip_prefix(&["macro_rules", "!", name, "{", "(", "#", "!", "[", "$"])
+    else {
+        return false;
+    };
+    let [
+        predicate,
+        ":",
+        "meta",
+        "]",
+        "$",
+        "(",
+        "$",
+        item,
+        ":",
+        "item",
+        ")",
+        "*",
+        ")",
+        "=",
+        ">",
+        "{",
+        body @ ..,
+    ] = input
+    else {
+        return false;
+    };
+    let Some(body) = body.strip_prefix(&["$", "(", "#", "[", "cfg", "(", "$", predicate, ")", "]"])
+    else {
+        return false;
+    };
+    // This exact documentation attribute leaves the emitted item and its guard unchanged.
+    let body = body
+        .strip_prefix(&[
+            "#", "[", "cfg_attr", "(", "docsrs", ",", "doc", "(", "cfg", "(", "$", predicate, ")",
+            ")", ")", "]",
+        ])
+        .unwrap_or(body);
+    predicate != item
+        && super::super::crate_name_is_valid(predicate)
+        && super::super::crate_name_is_valid(item)
+        && body
+            .strip_prefix(&["$", item, ")", "*", "}"])
+            .is_some_and(|rest| matches!(rest, ["}"] | [";", "}"]))
+}
+
+/// Places only the original outline items of a matched captured-predicate invocation.
+pub(super) fn captured_predicate_modules<'a>(
+    tokens: &[&'a str],
+    depth: usize,
+    selected: impl FnOnce(&[&str]) -> Option<bool>,
+) -> Option<(ModuleBranches<'a>, bool)> {
+    let mut body = invocation_body(tokens)?;
+    if !consume(&mut body, &["#", "!"]) {
+        return None;
+    }
+    let predicate = group(&mut body, "[", "]")?;
+    if predicate.last() == Some(&",") || metas(predicate)?.len() != 1 {
+        return None;
+    }
+    let selection = selected(predicate);
+    let mut modules = Vec::new();
+    let only_outlines = branch_modules(body, depth, |name| {
+        if selection == Some(true) {
+            modules.push((name, predicate.to_vec()));
+        }
+    })?;
+    let scope_unchanged = match selection {
+        Some(true) => only_outlines,
+        Some(false) => true,
+        None => false,
+    };
+    Some((modules, scope_unchanged))
+}
+
+fn invocation_body<'tokens, 'source>(
+    mut input: &'tokens [&'source str],
+) -> Option<&'tokens [&'source str]> {
+    super::super::source_identifier(input.first()?)?;
+    input = &input[1..];
+    if !consume(&mut input, &["!"]) {
+        return None;
+    }
+    let close = match *input.first()? {
+        "(" => ")",
+        "[" => "]",
+        "{" => "}",
+        _ => return None,
+    };
+    let open = *input.first()?;
+    let body = group(&mut input, open, close)?;
+    let _ = consume(&mut input, &[";"]);
+    input.is_empty().then_some(body)
 }
 
 /// The comma-separated predicates of `cfg(..)`; an empty predicate refuses the chain.
@@ -189,13 +268,15 @@ fn condition<'a>(metas: &[&[&'a str]], previous: &[&[&'a str]]) -> Vec<&'a str> 
     condition
 }
 
-/// Names of the plain `[visibility] mod name;` items of one branch. Any other item is
-/// allowed and declares no module; a branch whose items do not split refuses the chain.
+/// Names of the plain `[visibility] mod name;` items of one branch. Reports whether
+/// every item is an outline module with a distinct name. Incomplete item lists refuse.
 fn branch_modules<'a>(
     items: &[&'a str],
     depth: usize,
     mut module: impl FnMut(&'a str),
-) -> Option<()> {
+) -> Option<bool> {
+    let mut distinct = std::collections::BTreeSet::new();
+    let mut only_outlines = true;
     super::scope::items(items, depth, |item| {
         let mut input = item;
         if super::scope::visibility(&mut input).is_some()
@@ -203,10 +284,14 @@ fn branch_modules<'a>(
             && let [name, ";"] = input
             && super::super::source_identifier(name).as_deref() == Some(*name)
         {
+            only_outlines &= distinct.insert(*name);
             module(name);
+        } else {
+            only_outlines = false;
         }
         Some(())
-    })
+    })?;
+    Some(only_outlines)
 }
 
 #[cfg(test)]

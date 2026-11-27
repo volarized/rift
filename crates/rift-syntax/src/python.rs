@@ -1377,7 +1377,16 @@ impl SyntaxProvider for PythonSyntaxProvider {
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let mut rules = PythonRules {
             kinds: python_kinds(),
-            overloads: overload::OverloadContext::new(tree.root_node(), source.text, limits)?,
+            overloads: overload::OverloadContext::new(
+                tree.root_node(),
+                source.text,
+                limits,
+                source
+                    .path
+                    .as_ref()
+                    .extension()
+                    .is_some_and(|ext| ext == "pyi"),
+            )?,
             assigned_docs: BTreeMap::new(),
         };
         rules.assigned_docs = assigned_docs(&rules, tree.root_node(), source.text)?;
@@ -1419,7 +1428,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         retain_comprehension_bindings(&mut symbols, &static_facts);
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         retain_loop_bindings(&mut symbols, &static_facts, source.text);
-        retain_parameters(&mut symbols, &mut static_facts);
+        retain_parameters(&mut symbols, &mut static_facts, &rules.overloads);
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -1558,7 +1567,11 @@ fn retain_loop_bindings(
 
 /// Keeps parameter declarations with exact bindings, including repeated names
 /// from a proved overload family. An assignment may already own a name.
-fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::StaticFacts) {
+fn retain_parameters(
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+    facts: &mut crate::StaticFacts,
+    overloads: &overload::OverloadContext,
+) {
     use std::collections::BTreeSet;
 
     if !symbols.iter().any(crate::SyntaxSymbol::is_python_parameter) {
@@ -1584,7 +1597,8 @@ fn retain_parameters(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &mut crate::
             .entry(symbol.qualified_name.as_str())
             .or_insert(0_usize) += 1;
     }
-    let overload_parameters = overload::repeated_parameters(symbols, facts, &names, &eligible);
+    let overload_parameters =
+        overload::repeated_parameters(symbols, facts, &names, &eligible, overloads);
     let withheld = symbols
         .iter()
         .filter(|symbol| symbol.is_python_parameter())

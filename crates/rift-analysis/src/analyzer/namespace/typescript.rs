@@ -910,12 +910,37 @@ impl Exports {
     /// `language`. The exact key decides, else the pattern with the longest prefix, as Node
     /// matches them.
     fn spells_other_file(&self, path: &str, language: &str) -> bool {
-        let Self::Subpaths(paths) = self else {
+        let spelled = format!("./{path}");
+        self.subpath_claim(&spelled)
+            .is_some_and(|(target, matched)| target.names_other(&spelled, matched, language))
+    }
+
+    /// A direct runtime pattern may append a runtime extension to a physical declaration
+    /// path. A relative module can keep its source identity when no recorded type of that
+    /// expanded runtime path competes for it.
+    fn permits_relative_declaration(&self, path: &str, files: &PackageFiles<'_>) -> bool {
+        let spelled = format!("./{path}");
+        let Some((ExportTarget::Direct(target), Some(matched))) = self.subpath_claim(&spelled)
+        else {
             return false;
         };
-        let spelled = format!("./{path}");
-        if let Some((_, target)) = paths.0.iter().find(|(key, _)| *key == spelled) {
-            return target.names_other(&spelled, None, language);
+        let expanded = target.replace('*', matched);
+        let Some(expanded) = expanded.strip_prefix("./") else {
+            return false;
+        };
+        crate::static_resolution::declared_extensions(expanded)
+            .is_some_and(|(stem, _, _)| stem == path && !files.has_type_substitution(expanded))
+    }
+
+    fn subpath_claim<'path>(
+        &self,
+        spelled: &'path str,
+    ) -> Option<(&ExportTarget, Option<&'path str>)> {
+        let Self::Subpaths(paths) = self else {
+            return None;
+        };
+        if let Some((_, target)) = paths.0.iter().find(|(key, _)| key == spelled) {
+            return Some((target, None));
         }
         paths
             .0
@@ -926,9 +951,7 @@ impl Exports {
                 (!matched.is_empty()).then_some((prefix.len(), key.len(), matched, target))
             })
             .max_by_key(|(prefix, key, ..)| (*prefix, *key))
-            .is_some_and(|(.., matched, target)| {
-                target.names_other(&spelled, Some(matched), language)
-            })
+            .map(|(.., matched, target)| (target, Some(matched)))
     }
 
     fn target(&self, language: &str) -> Option<&str> {

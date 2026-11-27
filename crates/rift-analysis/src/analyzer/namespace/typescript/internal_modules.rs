@@ -2,9 +2,9 @@
 
 use super::entry::{Entry, PackageFiles};
 use super::{
-    BTreeMap, BTreeSet, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SymbolIdentity, SymbolOwner, binding_name, declaration_anchors, prepare_anchors,
-    selected_source_is_valid,
+    BTreeMap, BTreeSet, Exports, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
+    SelectedFile, SymbolIdentity, SymbolOwner, binding_name, declaration_anchors, observations,
+    prepare_anchors, selected_source_is_valid,
 };
 use crate::static_resolution::is_declaration_file;
 use serde::Deserialize;
@@ -32,6 +32,13 @@ pub(super) fn prepare(
     }
     let foreign = foreign_directories(input, &metadata.name);
     let mut modules = held_modules(prepared);
+    let relative_types = metadata
+        .exports
+        .as_ref()
+        .map(|exports| {
+            relative_type_modules(input, files, exports, entries, selected, prepared, &foreign)
+        })
+        .unwrap_or_default();
     // The declaration script's path is known before a compiler version selects an entry.
     let versioned_script = if metadata.types_versions.is_some() && metadata.exports.is_none() {
         match files.unversioned_types(metadata) {
@@ -71,7 +78,7 @@ pub(super) fn prepare(
             .exports
             .as_ref()
             .is_some_and(|exports| exports.spells_other_file(path, &language.name));
-        if exported
+        if (exported && !relative_types.contains(file.path))
             || modules
                 .get(&(language.name.clone(), module.clone()))
                 .is_some_and(|holder| holder.as_deref() != Some(path))
@@ -110,6 +117,87 @@ pub(super) fn prepare(
             }
         }
     }
+}
+
+/// Follow relative reexports from prepared declaration entries. A physical path can
+/// be reached once, and a named export list shares a single module source range.
+fn relative_type_modules(
+    input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
+    exports: &Exports,
+    entries: &BTreeSet<(&str, ProjectPath)>,
+    selected: &[SelectedFile<'_>],
+    prepared: &PreparedNamespace,
+    foreign: &BTreeSet<String>,
+) -> BTreeSet<ProjectPath> {
+    let Exports::Subpaths(routes) = exports else {
+        return BTreeSet::new();
+    };
+    if !routes.0.iter().any(|(key, _)| key.contains('*')) {
+        return BTreeSet::new();
+    }
+    let declarations = selected
+        .iter()
+        .filter(|file| {
+            file.syntax.language().name == "typescript"
+                && is_declaration_file(file.path.as_str())
+                && selected_source_is_valid(input, file)
+                && !is_foreign(file.path.as_str(), foreign)
+                && !is_script(file)
+        })
+        .map(|file| (file.path, file))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = declarations
+        .values()
+        .copied()
+        .filter(|file| {
+            entries.contains(&("typescript", file.path.clone()))
+                && prepared
+                    .anchors
+                    .get(file.path.as_str())
+                    .is_some_and(|anchors| {
+                        anchors.is_empty() || *anchors != declaration_anchors(input, file, None)
+                    })
+        })
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut relative = BTreeSet::new();
+    while let Some(file) = pending.pop() {
+        if !visited.insert(file.path) {
+            continue;
+        }
+        let ranges = file
+            .syntax
+            .export_bindings()
+            .unwrap_or_default()
+            .iter()
+            .filter(|binding| binding.container.is_none())
+            .filter_map(|binding| binding.source)
+            .collect::<BTreeSet<_>>();
+        for range in ranges {
+            let Some(specifier) = observations::literal_module_name(file.source, range) else {
+                continue;
+            };
+            let Some(path) = files.relative_declaration(file.path, &specifier) else {
+                continue;
+            };
+            let Some(next) = declarations.get(&path).copied() else {
+                continue;
+            };
+            if entries.contains(&("typescript", path.clone())) {
+                continue;
+            }
+            if exports.spells_other_file(path.as_str(), "typescript")
+                && !exports.permits_relative_declaration(path.as_str(), files)
+            {
+                continue;
+            }
+            if relative.insert(path) {
+                pending.push(next);
+            }
+        }
+    }
+    relative
 }
 
 /// Whether a TypeScript file is no module: what it declares belongs to the global scope and

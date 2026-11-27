@@ -771,7 +771,7 @@ const SOURCES: &[&str] = &[".ts", ".tsx"];
 const DECLARATIONS: &[&str] = &[".d.ts"];
 
 /// The stem of a written runtime path, with the extensions of its sources and declarations.
-fn declared_extensions(
+pub(crate) fn declared_extensions(
     path: &str,
 ) -> Option<(&str, &'static [&'static str], &'static [&'static str])> {
     [

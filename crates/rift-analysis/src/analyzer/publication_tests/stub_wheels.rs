@@ -85,6 +85,7 @@ fn captured_wheel_metadata_establishes_the_original_stub_paths() {
 
     const MATCHED: &str = "Metadata-Version: 2.4\nName: types-widget\nVersion: 1.0.0\n\n";
     const DECLARED: &str = "widget-stubs/__init__.pyi,,\ntypes_widget-1.0.0.dist-info/RECORD,,\n";
+    const WHEEL: &str = "Wheel-Version: 1.0\nTag: py3-none-any\n";
 
     let package = PackageIdentity {
         manager: "pypi".to_owned(),
@@ -102,30 +103,55 @@ fn captured_wheel_metadata_establishes_the_original_stub_paths() {
     let stub = ProjectPath::new("widget-stubs/__init__.pyi").expect("physical stub path");
     let metadata = ProjectPath::new("types_widget-1.0.0.dist-info/METADATA").expect("METADATA");
     let record = ProjectPath::new("types_widget-1.0.0.dist-info/RECORD").expect("RECORD");
+    let wheel = ProjectPath::new("types_widget-1.0.0.dist-info/WHEEL").expect("WHEEL");
     let top =
         ProjectPath::new("types_widget-1.0.0.dist-info/top_level.txt").expect("top-level file");
     let source = [PackageSource::new(&stub, "def run() -> int: ...\n")];
-    for (metadata_text, recorded, listed, establishes) in [
-        (MATCHED, DECLARED, "widget-stubs\n", true),
+    for (metadata_text, recorded, listed, wheel_text, establishes) in [
+        (MATCHED, DECLARED, Some("widget-stubs\n"), None, true),
+        (MATCHED, DECLARED, None, Some(WHEEL), true),
         (
             "Metadata-Version: 2.4\nName: types-other\nVersion: 1.0.0\n\n",
             DECLARED,
-            "widget-stubs\n",
+            Some("widget-stubs\n"),
+            None,
             false,
         ),
         (
             MATCHED,
             "other-stubs/__init__.pyi,,\n",
-            "widget-stubs\n",
+            Some("widget-stubs\n"),
+            None,
             false,
         ),
-        (MATCHED, DECLARED, "other-stubs\n", false),
+        (
+            MATCHED,
+            "other-stubs/__init__.pyi,,\n",
+            None,
+            Some(WHEEL),
+            false,
+        ),
+        (MATCHED, DECLARED, Some("other-stubs\n"), Some(WHEEL), false),
+        (MATCHED, DECLARED, None, None, false),
+        (MATCHED, DECLARED, None, Some("Wheel-Version: 2.0\n"), false),
+        (
+            MATCHED,
+            "widget-stubs/__init__.pyi,,\nother-stubs/parser.pyi,,\n",
+            None,
+            Some(WHEEL),
+            false,
+        ),
     ] {
-        let context = [
+        let mut context = vec![
             PackageSource::new(&metadata, metadata_text),
             PackageSource::new(&record, recorded),
-            PackageSource::new(&top, listed),
         ];
+        if let Some(wheel_text) = wheel_text {
+            context.push(PackageSource::new(&wheel, wheel_text));
+        }
+        if let Some(listed) = listed {
+            context.push(PackageSource::new(&top, listed));
+        }
         let input = ExactPackageInput::new(
             &owner,
             &language,
@@ -148,7 +174,10 @@ fn captured_wheel_metadata_establishes_the_original_stub_paths() {
                 == "rift://symbol/pypi/pypi.org/types-widget/python/widget/run"
                 && declaration.unit == unit.unit
         });
-        assert_eq!(declared, establishes);
+        assert_eq!(
+            declared, establishes,
+            "{recorded:?}, {listed:?}, {wheel_text:?}"
+        );
     }
 }
 

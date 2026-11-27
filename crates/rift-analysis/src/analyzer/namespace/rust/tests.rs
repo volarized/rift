@@ -4279,3 +4279,287 @@ fn registry_conditional_chain_analysis(
     }
     crate::PackageAnalyzer::analyze(input, 1).expect("published package")
 }
+
+const GUARDED_MACRO: &str = r"
+macro_rules! select {
+    (#![$condition:meta] $($item:item)*) => {
+        $(#[cfg($condition)] $item)*
+    };
+}
+";
+
+const GUARDED_INVOCATION: &str = r#"
+select! {
+    #![feature = "checked"]
+    pub mod chosen;
+}
+"#;
+
+const GUARDED_CHILD: &str = "pub fn used() -> u8 { leaf() }\nfn leaf() -> u8 { 1 }\n";
+const GUARDED_FEATURE: &[&str] = &["feature=\"checked\""];
+
+#[test]
+fn rust_captured_macro_predicate_places_only_selected_outline_modules() {
+    const FIXED: &str = r#"
+macro_rules! select {
+    ($($item:item)*) => { $(#[cfg(feature = "checked")] $item)* };
+}
+select! { pub mod chosen; }
+"#;
+    let source = format!("{GUARDED_MACRO}{GUARDED_INVOCATION}");
+    let direct = "#[cfg(feature = \"checked\")] pub mod chosen;";
+    let ambiguous = source.replace("    (#![", "    ($($other:tt)*) => {};\n    (#![");
+    let transformed = source.replace(
+        "#[cfg($condition)] $item",
+        "#[cfg($condition)] mod hidden {} $item",
+    );
+    let unknown = source.replace("feature = \"checked\"", "unknown_predicate");
+    let inactive_invocation = source.replace("select! {", "#[cfg(any())]\nselect! {");
+    let inactive_definition = source.replace("macro_rules!", "#[cfg(any())]\nmacro_rules!");
+    let unknown_attribute = source.replace(
+        "#[cfg($condition)] $item",
+        "#[cfg($condition)] #[forged] $item",
+    );
+    let cases = [
+        ("direct attribute", direct, GUARDED_FEATURE, true),
+        ("fixed macro predicate", FIXED, GUARDED_FEATURE, true),
+        ("captured predicate", source.as_str(), GUARDED_FEATURE, true),
+        (
+            "unselected feature",
+            source.as_str(),
+            &["feature=\"other\""][..],
+            false,
+        ),
+        (
+            "inactive invocation",
+            inactive_invocation.as_str(),
+            GUARDED_FEATURE,
+            false,
+        ),
+        (
+            "inactive definition",
+            inactive_definition.as_str(),
+            GUARDED_FEATURE,
+            false,
+        ),
+        ("unknown predicate", unknown.as_str(), &[], false),
+        (
+            "unknown attribute",
+            unknown_attribute.as_str(),
+            GUARDED_FEATURE,
+            false,
+        ),
+        ("multiple arms", ambiguous.as_str(), GUARDED_FEATURE, false),
+        (
+            "transformed items",
+            transformed.as_str(),
+            GUARDED_FEATURE,
+            false,
+        ),
+    ];
+    for (name, root, flags, expected) in cases {
+        let root = format!("{root}\npub mod direct;\n");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/chosen.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            flags,
+        );
+        assert_guarded_module(&publication, "src/chosen.rs", name, expected);
+    }
+}
+
+#[test]
+fn rust_captured_macro_predicate_keeps_checked_imported_definitions_with_docs() {
+    let documented = GUARDED_MACRO.replace(
+        "#[cfg($condition)] $item",
+        "#[cfg($condition)] #[cfg_attr(docsrs, doc(cfg($condition)))] $item",
+    );
+    for (guard, expected) in [("", true), ("#[cfg(any())]\n", false)] {
+        let root = format!("{guard}#[macro_use] mod macros;\npub mod branch;\npub mod direct;");
+        let inactive = GUARDED_INVOCATION
+            .replace("checked", "other")
+            .replace("chosen", "inactive");
+        let branch = format!("{inactive}{GUARDED_INVOCATION}");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/macros.rs", &documented),
+                ("src/branch.rs", &branch),
+                ("src/branch/inactive.rs", GUARDED_CHILD),
+                ("src/branch/chosen.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/branch/inactive.rs", guard, false);
+        assert_guarded_module(&publication, "src/branch/chosen.rs", guard, expected);
+    }
+}
+
+#[test]
+fn rust_captured_macro_predicate_keeps_scope_after_checked_plain_outlines() {
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let shadowed = GUARDED_INVOCATION.replace(
+        "pub mod chosen;",
+        "pub mod chosen; macro_rules! select { ($($rest:tt)*) => {} }",
+    );
+    let opaque = format!("{GUARDED_INVOCATION} opaque! {{}}");
+    let ambiguous = GUARDED_INVOCATION.replace("pub mod chosen;", "pub mod chosen; mod chosen;");
+    let inner = format!("#![macro_use]\n{GUARDED_CHILD}");
+    let guarded_inner = format!(
+        r#"#![cfg_attr(feature = "checked", macro_use)]
+{GUARDED_CHILD}"#
+    );
+    for (label, first, child, expected) in [
+        (
+            "two selected outlines",
+            GUARDED_INVOCATION,
+            GUARDED_CHILD,
+            true,
+        ),
+        (
+            "selected macro declaration",
+            shadowed.as_str(),
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "opaque intervening macro",
+            opaque.as_str(),
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "duplicate outline names",
+            ambiguous.as_str(),
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "inner macro import",
+            GUARDED_INVOCATION,
+            inner.as_str(),
+            false,
+        ),
+        (
+            "conditional inner macro import",
+            GUARDED_INVOCATION,
+            guarded_inner.as_str(),
+            false,
+        ),
+    ] {
+        let root = format!("{GUARDED_MACRO}{first}{next} pub mod direct;");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/chosen.rs", child),
+                ("src/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/later.rs", label, expected);
+    }
+}
+
+fn assert_guarded_module(
+    publication: &rift_protocol::index::PackagePublication,
+    path: &str,
+    control: &str,
+    expected: bool,
+) {
+    let call = "leaf()";
+    let call_start = u64::try_from(GUARDED_CHILD.find(call).expect("written invocation"))
+        .expect("source offset");
+    let call_end = call_start + u64::try_from(call.len()).expect("call length");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == path)
+        .expect("retained original module bytes");
+    assert_eq!(unit.source, GUARDED_CHILD);
+    assert!(unit.source_complete);
+    assert!(publication.declarations.iter().any(|row| {
+        row.symbol.as_str().ends_with("/direct/preserved") && row.unit.0.ends_with("/src/direct.rs")
+    }));
+    let module = path
+        .rsplit('/')
+        .next()
+        .and_then(|file| file.strip_suffix(".rs"))
+        .expect("module name");
+    let caller = format!("/{module}/used");
+    let target = format!("/{module}/leaf");
+    let used = publication.declarations.iter().any(|row| {
+        row.symbol.as_str().ends_with(&caller)
+            && row.unit == unit.unit
+            && row.source == "pub fn used() -> u8 { leaf() }"
+    });
+    assert_eq!(used, expected, "{control}");
+    let calls_leaf = publication.edges.iter().any(|edge| {
+        edge.kinds == [rift_protocol::read::EdgeKind::Calls]
+            && edge.from.as_str().ends_with(&caller)
+            && edge.to.as_str().ends_with(&target)
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == unit.unit
+                    && site.range.start == call_start
+                    && site.range.end == call_end
+            })
+    });
+    assert_eq!(calls_leaf, expected, "{control}");
+}
+
+fn guarded_macro_publication(
+    files: &[(&str, &str)],
+    flags: &[&str],
+) -> rift_protocol::index::PackagePublication {
+    const MANIFEST: &str =
+        "[package]\nname = 'crate-root'\nversion = '1.0.0'\n[features]\nchecked = []\nother = []\n";
+    let package = PackageIdentity {
+        manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
+        name: "crate-root".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let owner = package.owner().expect("fixture package owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("fixture source origin");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(&manifest, MANIFEST)];
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let paths = files
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("fixture path"))
+        .collect::<Vec<_>>();
+    let sources = paths
+        .iter()
+        .zip(files)
+        .map(|(path, (_, source))| PackageSource::new(path, source))
+        .collect::<Vec<_>>();
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(16, 16_384),
+    )
+    .expect("authored package")
+    .with_framework_context(&metadata, &[])
+    .expect("captured manifest");
+    let input = if flags.is_empty() {
+        input
+    } else {
+        input
+            .with_rust_configuration(&manifest, flags)
+            .expect("selected Cargo flags")
+    };
+    crate::PackageAnalyzer::analyze(input, 1)
+        .expect("published package")
+        .into_parts()
+        .0
+}

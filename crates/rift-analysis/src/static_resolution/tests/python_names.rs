@@ -660,7 +660,7 @@ fn test_python_first_names_are_read_where_the_path_is_not_established_further() 
         ("N.append(f.x)\n", &["0  reads N", "0  reads f"]),
         ("class D:\n    m = 1\nx = D.m\n", &[]),
         ("class D:\n    m = 1\nx = D.m.real\n", &[]),
-        ("class D:\n    def m(self): pass\nD.m()\n", &[]),
+        ("class D:\n    def m(self): pass\nD.m()\n", &["2  reads D"]),
         ("class D:\n    m = 1\nD.n = D.m\n", &["2  reads D"]),
         ("x = N[0].y\n", &["0  reads N"]),
         ("x = (N\n     .real)\n", &["0  reads N"]),
@@ -691,7 +691,7 @@ fn test_python_first_names_of_imported_modules_are_read_once() {
             0,
         ),
         ("from pkg import leaf\nleaf.g()\n", "1  reads pkg/leaf", 0),
-        ("import os\nos.getcwd()\n", "", 0),
+        ("import os\nos.getcwd()\n", "os", 0),
         ("import os\nx = os.environ\n", "os", 0),
         ("from pkg.leaf import two\nx = two.y\n", "", 1),
     ] {

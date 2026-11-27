@@ -24,29 +24,41 @@ pub(in crate::analyzer::namespace) fn stub_wheel_root(
     let version = input.release_version()?;
     let distribution = normalized_python_distribution_name(name);
     let directory = wheel_dist_info_name(&distribution, version);
-    let metadata = captured_metadata(input, &directory, "METADATA")?;
+    let metadata = captured_metadata(input, &directory, "METADATA").ok()??;
     let metadata_name = field(metadata, "Name")?;
     if normalized_python_distribution_name(metadata_name) != distribution
         || field(metadata, "Version")? != version
     {
         return None;
     }
-    let record = captured_metadata(input, &directory, "RECORD")?;
-    let top_level = captured_metadata(input, &directory, "top_level.txt")?;
+    let record = captured_metadata(input, &directory, "RECORD").ok()??;
+    let top_level = captured_metadata(input, &directory, "top_level.txt").ok()?;
     let recorded = wheel_record_paths(record).collect::<BTreeSet<_>>();
     let mut roots = BTreeSet::new();
-    for physical in top_level
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        let logical = physical.strip_suffix(STUB_SUFFIX)?;
-        if !python_identifier_is_valid(logical)
-            || !roots.insert(logical)
-            || roots.len() > crate::PACKAGE_IMPORT_ENTRIES_MAX
+    if let Some(top_level) = top_level {
+        for physical in top_level
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let logical = physical.strip_suffix(STUB_SUFFIX)?;
+            if !python_identifier_is_valid(logical)
+                || !roots.insert(logical)
+                || roots.len() > crate::PACKAGE_IMPORT_ENTRIES_MAX
+            {
+                return None;
+            }
+        }
+    } else {
+        let wheel = captured_metadata(input, &directory, "WHEEL").ok()??;
+        let (major, minor) = field(wheel, "Wheel-Version")?.split_once('.')?;
+        if !matches!(major, "0" | "1")
+            || minor.is_empty()
+            || !minor.bytes().all(|byte| byte.is_ascii_digit())
         {
             return None;
         }
+        roots.insert(recorded_stub_module(&recorded)?);
     }
     let mut witnessed = BTreeSet::new();
     for captured in input.files() {
@@ -85,11 +97,25 @@ pub(in crate::analyzer::namespace) fn stub_wheel_root(
     .ok()
 }
 
+/// One unambiguous stub directory written in the wheel RECORD.
+fn recorded_stub_module<'record>(recorded: &BTreeSet<&'record str>) -> Option<&'record str> {
+    let mut modules = recorded.iter().filter_map(|path| {
+        let (folder, module_path) = path.strip_suffix(".pyi")?.split_once('/')?;
+        let module = folder.strip_suffix(STUB_SUFFIX)?;
+        (python_identifier_is_valid(module)
+            && module_path.split('/').all(python_identifier_is_valid))
+        .then_some(module)
+    });
+    let first = modules.next()?;
+    modules.all(|module| module == first).then_some(first)
+}
+
+/// An absent file allows fallback. Duplicate or oversized metadata refuses it.
 fn captured_metadata<'input>(
     input: &NamespaceInput<'input>,
     directory: &str,
     name: &str,
-) -> Option<&'input str> {
+) -> Result<Option<&'input str>, ()> {
     let mut matches = input
         .files()
         .iter()
@@ -103,9 +129,12 @@ fn captured_metadata<'input>(
                     parent.eq_ignore_ascii_case(directory) && child == name
                 })
         });
-    let source = matches.next()?;
+    let Some(source) = matches.next() else {
+        return Ok(None);
+    };
     (matches.next().is_none() && source.text().len() <= input.syntax().source_bytes_max())
-        .then_some(source.text())
+        .then_some(Some(source.text()))
+        .ok_or(())
 }
 
 fn field<'text>(metadata: &'text str, name: &str) -> Option<&'text str> {

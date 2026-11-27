@@ -32,7 +32,7 @@ use rift_syntax::{
 };
 
 pub(crate) use external::ExternalOccurrence;
-pub(crate) use javascript_exports::is_declaration_file;
+pub(crate) use javascript_exports::{declared_extensions, is_declaration_file};
 
 use crate::{EnclosingDefinitions, NamespaceInput};
 
@@ -136,6 +136,12 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_parent_module_start: Option<usize>,
     /// First reference from a written TypeScript export selector to a local declaration.
     pub(crate) typescript_local_export_start: Option<usize>,
+    /// First internal and external Read of an established Python call receiver.
+    pub(crate) python_value_qualifier_start: Option<(usize, usize)>,
+    /// Class qualifier Reads awaiting remaining edge capacity.
+    pub(crate) deferred_python_class_qualifiers: Vec<StaticOccurrence>,
+    /// Imported qualifier Reads awaiting remaining edge capacity.
+    pub(crate) deferred_python_import_qualifiers: Vec<ExternalOccurrence>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -351,6 +357,7 @@ fn resolve_by<'source>(
         &mut resolution.deferred_typescript_signature_type_parameters,
     );
     index.resolve_typescript_local_exports(&mut work, &mut resolution);
+    resolution.append_python_value_qualifiers();
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -444,7 +451,7 @@ enum DeferredReferences<'source> {
     },
     PythonQualifiers {
         imports: Vec<python_edges::PythonImportQualifier<'source>>,
-        names: Vec<ByteRange>,
+        names: Vec<(ByteRange, bool)>,
     },
     PythonLocals,
     PythonParameters(Vec<python_edges::ReassignedLocalRead<'source>>),
@@ -2995,6 +3002,19 @@ impl<'source> Index<'source> {
 }
 
 impl StaticResolution {
+    fn append_python_value_qualifiers(&mut self) {
+        if self.deferred_python_class_qualifiers.is_empty()
+            && self.deferred_python_import_qualifiers.is_empty()
+        {
+            return;
+        }
+        self.python_value_qualifier_start = Some((self.occurrences.len(), self.external.len()));
+        self.occurrences
+            .append(&mut self.deferred_python_class_qualifiers);
+        self.external
+            .append(&mut self.deferred_python_import_qualifiers);
+    }
+
     fn mark_late_admission(&mut self, sites: &DeferredReferences<'_>) {
         if matches!(sites, DeferredReferences::PythonReassignments(_)) {
             self.python_reassignment_start
@@ -3042,6 +3062,10 @@ impl StaticResolution {
         self.rust_call_parent_sites
             .append(&mut apart.rust_call_parent_sites);
         self.external.append(&mut apart.external);
+        self.deferred_python_class_qualifiers
+            .append(&mut apart.deferred_python_class_qualifiers);
+        self.deferred_python_import_qualifiers
+            .append(&mut apart.deferred_python_import_qualifiers);
         self.rust_extern_candidates
             .append(&mut apart.rust_extern_candidates);
         self.javascript_lexical_alias_candidates

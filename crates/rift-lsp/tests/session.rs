@@ -2737,20 +2737,26 @@ async fn workspace_root_without_a_name_still_initializes() {
     session.shutdown().await;
 }
 
-const BAD_RUST_DECLARATION_TOKENS: [[u32; 5]; 13] = [
-    [0, 3, 4, 1, 2],  // Overlap with the preceding declaration.
-    [1, 0, 0, 1, 2],  // Empty declaration.
-    [1, 0, 0, 2, 2],  // Empty string marked as a declaration.
-    [5, 0, 0, 2, 0],  // Empty unmarked string on a nonempty line.
-    [6, 0, 0, 2, 0],  // Empty string outside the source.
-    [0, 5, 0, 2, 1],  // Macro string before the line end.
-    [1, 0, 0, 2, 3],  // Macro string marked as a declaration.
-    [0, 7, 0, 2, 8],  // Attribute string before the line end.
-    [1, 0, 0, 2, 9],  // String with both attribute and macro modifiers.
-    [1, 0, 0, 2, 12], // Attribute string marked as a declaration.
-    [1, 0, 0, 1, 8],  // Empty variable with the attribute modifier.
-    [6, 0, 0, 2, 8],  // Attribute string outside the source.
-    [1, 0, 0, 2, 16], // String with a modifier outside the legend.
+const BAD_RUST_DECLARATION_TOKENS: [[u32; 5]; 19] = [
+    [0, 3, 4, 1, 2],   // Overlap with the preceding declaration.
+    [1, 0, 0, 1, 2],   // Empty declaration.
+    [1, 0, 0, 2, 2],   // Empty string marked as a declaration.
+    [5, 0, 0, 2, 0],   // Empty unmarked string on a nonempty line.
+    [10, 0, 0, 2, 0],  // Empty string outside the source.
+    [0, 5, 0, 2, 1],   // Macro string before the line end.
+    [1, 0, 0, 2, 3],   // Macro string marked as a declaration.
+    [0, 7, 0, 2, 8],   // Attribute string before the line end.
+    [1, 0, 0, 2, 9],   // String with both attribute and macro modifiers.
+    [1, 0, 0, 2, 12],  // Attribute string marked as a declaration.
+    [1, 0, 0, 1, 8],   // Empty variable with the attribute modifier.
+    [10, 0, 0, 2, 8],  // Attribute string outside the source.
+    [1, 0, 0, 2, 32],  // String with a modifier outside the legend.
+    [5, 2, 0, 3, 16],  // Documentation comment before the line end.
+    [5, 0, 0, 3, 0],   // Empty ordinary comment on a nonempty line.
+    [6, 1, 0, 3, 16],  // Documentation comment past an empty line.
+    [1, 0, 0, 3, 17],  // Comment marked as documentation and macro.
+    [1, 0, 0, 3, 18],  // Documentation comment marked as a definition.
+    [10, 0, 0, 3, 16], // Documentation comment outside the source.
 ];
 
 async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStream>) {
@@ -2759,8 +2765,8 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             "semanticTokensProvider": {
                 "full": true,
                 "legend": {
-                    "tokenTypes": ["parameter", "variable", "string"],
-                    "tokenModifiers": ["macro", "definition", "declaration", "attribute"]
+                    "tokenTypes": ["parameter", "variable", "string", "comment"],
+                    "tokenModifiers": ["macro", "definition", "declaration", "attribute", "documentation"]
                 }
             }
         }))
@@ -2790,7 +2796,12 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
                 1, 0, 0, 2, 8,
                 1, 1, 4, 2, 8,
                 0, 4, 0, 2, 8,
-                1, 1, 5, 1, 2
+                1, 1, 5, 1, 2,
+                1, 0, 0, 3, 0,
+                1, 0, 0, 3, 16,
+                1, 1, 6, 3, 16,
+                0, 6, 0, 3, 16,
+                1, 1, 5, 1, 2,
             ]}),
         )
         .await;
@@ -2815,7 +2826,8 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
 
 #[tokio::test]
 async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
-    const SOURCE: &str = "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma";
+    const SOURCE: &str =
+        "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma\r\n\r\n\r\n fenced\r\n after";
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
     let file = path("lib.rs");
@@ -2861,6 +2873,7 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
         [
             ("alpha", rift_lsp::RustDeclarationKind::Parameter),
             ("gamma", rift_lsp::RustDeclarationKind::Local),
+            ("after", rift_lsp::RustDeclarationKind::Local),
         ]
     );
     for _ in BAD_RUST_DECLARATION_TOKENS {

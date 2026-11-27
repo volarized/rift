@@ -24,6 +24,7 @@ pub(super) struct OverloadContext {
     imports: BTreeMap<String, ImportedOverload>,
     shadowed: BTreeSet<String>,
     unknown: bool,
+    stub_signatures: BTreeSet<ByteRange>,
 }
 
 impl OverloadContext {
@@ -31,8 +32,10 @@ impl OverloadContext {
         root: Node<'_>,
         source: &str,
         limits: SyntaxLimits,
+        stub: bool,
     ) -> Result<Self, RiftError> {
         let mut context = Self::default();
+        let stub = stub && !root.has_error();
         let mut cursor = root.walk();
         for statement in root
             .named_children(&mut cursor)
@@ -55,6 +58,12 @@ impl OverloadContext {
                     }
                 }
                 "function_definition" | "class_definition" => {
+                    if stub
+                        && syntax_element.kind() == "function_definition"
+                        && written_stub_signature(syntax_element)
+                    {
+                        context.stub_signatures.insert(byte_range(syntax_element)?);
+                    }
                     if let Some(name) = syntax_element.child_by_field_name("name") {
                         context.shadow(name, source);
                     }
@@ -252,8 +261,9 @@ pub(super) fn repeated_parameters(
     facts: &StaticFacts,
     counts: &BTreeMap<&str, usize>,
     eligible: &BTreeMap<ByteRange, ByteRange>,
+    overloads: &OverloadContext,
 ) -> BTreeSet<ByteRange> {
-    let owners = overload_members(symbols, facts, counts);
+    let owners = overload_members(symbols, facts, counts, &overloads.stub_signatures);
     if owners.is_empty() {
         return BTreeSet::new();
     }
@@ -286,6 +296,7 @@ fn overload_members<'symbols>(
     symbols: &'symbols [SyntaxSymbol],
     facts: &StaticFacts,
     counts: &BTreeMap<&str, usize>,
+    stub_signatures: &BTreeSet<ByteRange>,
 ) -> BTreeMap<ByteRange, &'symbols str> {
     let mut families: BTreeMap<&str, Vec<&SyntaxSymbol>> = BTreeMap::new();
     for callable in symbols.iter().filter(|symbol| {
@@ -313,32 +324,40 @@ fn overload_members<'symbols>(
             continue;
         }
         family.sort_by_key(|callable| callable.item_range);
-        let Some((implementation, signatures)) = family.split_last() else {
+        let Some((last, earlier)) = family.split_last() else {
             continue;
         };
-        let Some(binding) = implementation
-            .name_range
-            .and_then(|name| bindings.get(&name))
-        else {
+        let Some(binding) = last.name_range.and_then(|name| bindings.get(&name)) else {
             continue;
         };
-        if implementation.python_overload != Some(PythonOverload::Ordinary)
+        let signatures = match last.python_overload {
+            Some(PythonOverload::Ordinary) => earlier,
+            Some(PythonOverload::Overload { .. })
+                if family
+                    .iter()
+                    .all(|signature| stub_signatures.contains(&signature.item_range)) =>
+            {
+                family.as_slice()
+            }
+            _ => continue,
+        };
+        if earlier
+            .iter()
+            .any(|signature| signature.item_range.end > last.item_range.start)
             || !signatures.iter().all(|signature| {
                 matches!(
                     signature.python_overload,
                     Some(PythonOverload::Overload { .. })
-                ) && signature.item_range.end <= implementation.item_range.start
-                    && signature
-                        .name_range
-                        .and_then(|name| bindings.get(&name))
-                        .is_some_and(|signature_binding| {
-                            signature_binding.scope == binding.scope
-                                && matches!(
-                                    signature_binding.kind,
-                                    StaticBindingKind::Local
-                                        | StaticBindingKind::PythonFunction { .. }
-                                )
-                        })
+                ) && signature
+                    .name_range
+                    .and_then(|name| bindings.get(&name))
+                    .is_some_and(|signature_binding| {
+                        signature_binding.scope == binding.scope
+                            && matches!(
+                                signature_binding.kind,
+                                StaticBindingKind::Local | StaticBindingKind::PythonFunction { .. }
+                            )
+                    })
             })
         {
             continue;
@@ -350,4 +369,24 @@ fn overload_members<'symbols>(
         );
     }
     owners
+}
+
+/// A stub family can consist wholly of written placeholders in one selected file.
+fn written_stub_signature(function: Node<'_>) -> bool {
+    let Some(body) = function.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    let mut statements = body
+        .named_children(&mut cursor)
+        .filter(|statement| statement.kind() != "comment");
+    let (Some(statement), None) = (statements.next(), statements.next()) else {
+        return false;
+    };
+    statement.kind() == "pass_statement"
+        || (statement.kind() == "expression_statement"
+            && statement.named_child_count() == 1
+            && statement
+                .named_child(0)
+                .is_some_and(|value| value.kind() == "ellipsis"))
 }

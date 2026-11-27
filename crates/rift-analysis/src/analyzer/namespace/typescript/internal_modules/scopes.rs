@@ -10,6 +10,7 @@ use rift_syntax::{
     StaticCallee, StaticFacts, StaticFunctionContext, SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
 };
 
+use super::super::conflicting_assignment_name;
 use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
@@ -333,15 +334,16 @@ impl<'source> FileScopes<'source> {
             &mut occupied,
             &mut scoped,
         );
-        self.scope_nested_properties(file, repeated, &mut occupied, &mut scoped);
+        self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
         scoped
     }
 
-    /// A placed property can hold one literal. Its direct members have that physical owner.
+    /// A placed property can hold a literal or an array of literal slots.
     fn scope_nested_properties(
         &self,
         file: &SelectedFile<'source>,
         repeated: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
         occupied: &mut BTreeSet<SymbolId>,
         scoped: &mut ScopedIdentityAnchors,
     ) {
@@ -355,13 +357,29 @@ impl<'source> FileScopes<'source> {
             .filter(|symbol| symbol.syntax_element_kind == Some("pair"))
             .map(|symbol| (symbol.item_range, symbol))
             .collect::<BTreeMap<_, _>>();
+        let arrays = parents
+            .values()
+            .filter_map(|&parent| {
+                let body = parent.body_range?;
+                let name = parent.name_range?;
+                (parent.item_range.encloses(body)
+                    && name.start == parent.item_range.start
+                    && !parent.name.starts_with('[')
+                    && written_array(file.source, body))
+                .then_some((body, parent))
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut members = BTreeMap::new();
         let mut counts = BTreeMap::new();
         for child in properties {
             let Some(member) = self.body_members.get(&child.item_range) else {
                 continue;
             };
-            let Some(parent) = parents.get(&member.holder) else {
+            let parent = parents
+                .get(&member.holder)
+                .map(|&parent| (parent, false))
+                .or_else(|| arrays.get(&member.holder).map(|&parent| (parent, true)));
+            let Some((parent, array)) = parent else {
                 continue;
             };
             if child.container.as_deref() != Some(parent.qualified_name.as_str())
@@ -372,10 +390,10 @@ impl<'source> FileScopes<'source> {
             *counts
                 .entry((member.body, child.name.as_str()))
                 .or_insert(0_usize) += 1;
-            members.insert(child.item_range, (*parent, child, member.body));
+            members.insert(child.item_range, (parent, child, member.body, array));
         }
         // Parent pairs start before their literal's members.
-        for (parent, child, body) in members.into_values() {
+        for (parent, child, body, array) in members.into_values() {
             if counts.get(&(body, child.name.as_str())) != Some(&1)
                 || scoped
                     .get(&child.qualified_name)
@@ -383,14 +401,26 @@ impl<'source> FileScopes<'source> {
             {
                 continue;
             }
-            let Some(owner) = scoped
+            let identity = scoped
                 .get(&parent.qualified_name)
                 .and_then(|group| group.get(&parent.declaration_ordinal))
-                .and_then(|id| SymbolIdentity::parse(id.as_str()).ok())
+                .or_else(|| {
+                    (array && !conflicting_assignment_name(&parent.qualified_name, repeated))
+                        .then(|| anchors.get(&parent.qualified_name))
+                        .flatten()
+                });
+            let Some(owner) = identity.and_then(|id| SymbolIdentity::parse(id.as_str()).ok())
             else {
                 continue;
             };
-            let Some(id) = literal_property_identity(&owner, &child.name) else {
+            let id = literal_property_identity(&owner, &child.name).and_then(|id| {
+                if array {
+                    local_group_identity(&id, child.declaration_ordinal)
+                } else {
+                    Some(id)
+                }
+            });
+            let Some(id) = id else {
                 continue;
             };
             if occupied.insert(id.clone()) {
@@ -1210,9 +1240,6 @@ fn array_literal_owners<'source>(
         .filter_map(|(&name, &declaration)| {
             let declaration = declaration?;
             let value = declaration.body_range?;
-            let written = file
-                .source
-                .get(usize::try_from(value.start).ok()?..usize::try_from(value.end).ok()?)?;
             let initializer = match declaration.syntax_element_kind {
                 Some("variable_declarator") => true,
                 Some("assignment_expression") => {
@@ -1227,11 +1254,18 @@ fn array_literal_owners<'source>(
                 && declaration.kind == "variable"
                 && declaration.item_range.encloses(value)
                 && anchors.contains_key(name)
-                && written.starts_with('[')
-                && written.ends_with(']'))
+                && written_array(file.source, value))
             .then_some((name, value))
         })
         .collect()
+}
+
+fn written_array(source: &str, range: ByteRange) -> bool {
+    usize::try_from(range.start)
+        .ok()
+        .zip(usize::try_from(range.end).ok())
+        .and_then(|(start, end)| source.get(start..end))
+        .is_some_and(|value| value.starts_with('[') && value.ends_with(']'))
 }
 
 /// Names callables with one authored and placed declaration.

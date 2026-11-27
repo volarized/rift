@@ -86,6 +86,7 @@ pub(crate) struct RustTokenLegend<'legend> {
     declarations: u32,
     macro_expansion: u32,
     attribute: u32,
+    documentation: u32,
     all_modifiers: u32,
 }
 
@@ -96,12 +97,15 @@ impl<'legend> RustTokenLegend<'legend> {
         let mut declarations = 0;
         let mut macro_expansion = 0;
         let mut attribute = 0;
+        let mut documentation = 0;
         for (index, modifier) in legend.token_modifiers.iter().enumerate() {
             let bit = 1_u32.checked_shl(u32::try_from(index).ok()?)?;
             if *modifier == MACRO {
                 macro_expansion |= bit;
             } else if *modifier == ATTRIBUTE {
                 attribute |= bit;
+            } else if *modifier == SemanticTokenModifier::DOCUMENTATION {
+                documentation |= bit;
             } else if *modifier == SemanticTokenModifier::DECLARATION
                 || *modifier == SemanticTokenModifier::DEFINITION
             {
@@ -113,8 +117,29 @@ impl<'legend> RustTokenLegend<'legend> {
             declarations,
             macro_expansion,
             attribute,
+            documentation,
             all_modifiers,
         })
+    }
+
+    fn line_end_placeholder(
+        &self,
+        token_type: &SemanticTokenType,
+        modifiers: u32,
+    ) -> Option<LineEndPlaceholder> {
+        match (token_type.as_str(), modifiers) {
+            ("string" | "comment", 0) => Some(LineEndPlaceholder::BlankLine),
+            ("string", mask)
+                if mask.is_power_of_two()
+                    && (mask == self.macro_expansion || mask == self.attribute) =>
+            {
+                Some(LineEndPlaceholder::TaggedLineEnd)
+            }
+            ("comment", mask) if mask.is_power_of_two() && mask == self.documentation => {
+                Some(LineEndPlaceholder::TaggedLineEnd)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn convert(
@@ -137,16 +162,8 @@ impl<'legend> RustTokenLegend<'legend> {
             if modifiers & !self.all_modifiers != 0 {
                 return None;
             }
-            let placeholder = if token.length == 0 && token_type == &SemanticTokenType::STRING {
-                match modifiers {
-                    0 => Some(StringPlaceholder::BlankLine),
-                    mask if mask.is_power_of_two()
-                        && (mask == self.macro_expansion || mask == self.attribute) =>
-                    {
-                        Some(StringPlaceholder::TaggedLineEnd)
-                    }
-                    _ => None,
-                }
+            let placeholder = if token.length == 0 {
+                self.line_end_placeholder(token_type, modifiers)
             } else {
                 None
             };
@@ -177,7 +194,7 @@ enum TokenSpan {
     Placeholder,
 }
 
-enum StringPlaceholder {
+enum LineEndPlaceholder {
     BlankLine,
     TaggedLineEnd,
 }
@@ -196,7 +213,7 @@ impl TokenLines {
         index: &LineIndex<'_>,
         encoding: PositionEncoding,
         token: &SemanticToken,
-        placeholder: Option<StringPlaceholder>,
+        placeholder: Option<LineEndPlaceholder>,
     ) -> Option<TokenSpan> {
         // Token starts are delta-encoded from the previous start, while the index
         // converts from the previous end so every source character is scanned once.
@@ -209,8 +226,8 @@ impl TokenLines {
             token.delta_start
         };
         if let Some(placeholder) = placeholder {
-            // Empty string fragments retain their exact position in the token deltas.
-            if matches!(placeholder, StringPlaceholder::BlankLine) && column != 0 {
+            // Empty line fragments retain their exact position in the token deltas.
+            if matches!(placeholder, LineEndPlaceholder::BlankLine) && column != 0 {
                 return None;
             }
             self.end_byte = index.ordered_line_end(

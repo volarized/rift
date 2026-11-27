@@ -461,12 +461,18 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 43] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 44] {
     let supplemental_start = resolution.supplemental_start.take();
+    let (value_qualifier, value_qualifier_external) = resolution
+        .python_value_qualifier_start
+        .take()
+        .map_or((None, resolution.external.len()), |(internal, external)| {
+            (Some(internal), external)
+        });
     let (alias, alias_external) = resolution
         .rust_extern_alias_start
         .take()
-        .map_or((None, resolution.external.len()), |(internal, external)| {
+        .map_or((None, value_qualifier_external), |(internal, external)| {
             (Some(internal), external)
         });
     let tail_starts = [
@@ -511,17 +517,20 @@ fn static_admission_batches<'a>(
         resolution.javascript_assigned_member_start.take(),
         resolution.typescript_signature_type_parameter_start.take(),
         resolution.typescript_local_export_start.take(),
+        value_qualifier,
     ];
-    let mut boundaries = [0; 44];
+    let mut boundaries = [0; 45];
     let mut next = resolution.occurrences.len();
-    boundaries[43] = next;
-    for (boundary, start) in boundaries[2..43].iter_mut().zip(tail_starts).rev() {
+    boundaries[44] = next;
+    for (boundary, start) in boundaries[2..44].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }
     let (internal, external) = supplemental_start.unwrap_or((boundaries[2], alias_external));
     boundaries[1] = internal;
-    let (incumbent_external, alias_external_rows) = resolution.external.split_at(alias_external);
+    let (ordinary_external, qualifier_external_rows) =
+        resolution.external.split_at(value_qualifier_external);
+    let (incumbent_external, alias_external_rows) = ordinary_external.split_at(alias_external);
     let (primary_external, supplemental_external) = incumbent_external.split_at(external);
     let mut batches = std::array::from_fn(|index| {
         let rows = &resolution.occurrences[boundaries[index]..boundaries[index + 1]];
@@ -538,6 +547,12 @@ fn static_admission_batches<'a>(
     admit_external(primary_external, spans, edge_modules, &mut batches[0]);
     admit_external(supplemental_external, spans, edge_modules, &mut batches[1]);
     admit_external(alias_external_rows, spans, edge_modules, &mut batches[26]);
+    admit_external(
+        qualifier_external_rows,
+        spans,
+        edge_modules,
+        &mut batches[43],
+    );
     // New ECMAScript references use the capacity left by the earlier stages.
     batches[15..36].rotate_left(11);
     // Preserve the established Rust and ECMAScript order ahead of newer Rust sites.

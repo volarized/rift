@@ -355,6 +355,7 @@ fn identity_anchors_with_roots(
     let Some(module) = python_script_origin(input, source)
         .map(|original| vec![format!("./{original}")])
         .or_else(|| python_module_with_inventory(path, roots, ordinary_python_paths))
+        .or_else(|| selected_python_script(input, source, roots).then(|| vec![format!("./{path}")]))
         .or_else(|| {
             local_fallback
                 .then(|| python::local_module(input, path))
@@ -438,6 +439,43 @@ fn python_script_origin<'source>(
         .then_some(original)
 }
 
+/// A selected Python script with a hyphenated filename under an established package.
+fn selected_python_script(
+    input: &NamespaceInput<'_>,
+    source: crate::PackageSource<'_>,
+    roots: &[PackageImportRoot],
+) -> bool {
+    let SymbolOwner::Package { manager, .. } = input.owner() else {
+        return false;
+    };
+    let path = source.path().as_str();
+    let Some((directory, stem)) = path
+        .strip_suffix(".py")
+        .and_then(|path| path.rsplit_once('/'))
+    else {
+        return false;
+    };
+    manager == "pypi"
+        && stem.contains('-')
+        && stem.split(['-', '.']).all(python_identifier_is_valid)
+        && source.source_unit().is_none_or(|unit| {
+            unit.source_owner() == Some(input.owner())
+                && unit.key().as_str() == path
+                && source.origin().is_some_and(|origin| {
+                    origin.source_kind() == rift_protocol::read::SourceKind::Authored
+                })
+        })
+        && roots.iter().any(|root| {
+            !matches!(
+                root.origin(),
+                PackageImportRootOrigin::PyModules | PackageImportRootOrigin::Runtime
+            ) && python_path_under_root(root, directory).is_some_and(|relative| {
+                relative.split('/').all(python_identifier_is_valid)
+                    && python_root_contains_module(root, &relative.replace('/', "."))
+            })
+        })
+}
+
 fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String> {
     if !python_identifier_is_valid(&symbol.name) {
         return None;
@@ -481,17 +519,8 @@ fn python_module_with_inventory(
 ) -> Option<Vec<String>> {
     let mut modules = BTreeSet::new();
     for root in roots {
-        let relative = match root.prefix() {
-            Some(prefix) => {
-                let Some(relative) = path
-                    .strip_prefix(prefix.as_str())
-                    .and_then(|tail| tail.strip_prefix('/'))
-                else {
-                    continue;
-                };
-                relative
-            }
-            None => path,
+        let Some(relative) = python_path_under_root(root, path) else {
+            continue;
         };
         let Some((base, extension)) = relative.rsplit_once('.') else {
             continue;
@@ -520,15 +549,7 @@ fn python_module_with_inventory(
             continue;
         }
         let spelling = parts.join(".");
-        if root.origin() != PackageImportRootOrigin::Runtime
-            && !root.modules().iter().any(|module| {
-                spelling == *module
-                    || (root.origin() != PackageImportRootOrigin::PyModules
-                        && spelling
-                            .strip_prefix(module.as_str())
-                            .is_some_and(|tail| tail.starts_with('.')))
-            })
-        {
+        if !python_root_contains_module(root, &spelling) {
             continue;
         }
         modules.insert(parts.into_iter().map(str::to_owned).collect::<Vec<_>>());
@@ -536,6 +557,24 @@ fn python_module_with_inventory(
     (modules.len() == 1)
         .then(|| modules.into_iter().next())
         .flatten()
+}
+
+fn python_path_under_root<'path>(root: &PackageImportRoot, path: &'path str) -> Option<&'path str> {
+    match root.prefix() {
+        Some(prefix) => path.strip_prefix(prefix.as_str())?.strip_prefix('/'),
+        None => Some(path),
+    }
+}
+
+fn python_root_contains_module(root: &PackageImportRoot, spelling: &str) -> bool {
+    root.origin() == PackageImportRootOrigin::Runtime
+        || root.modules().iter().any(|module| {
+            spelling == module
+                || (root.origin() != PackageImportRootOrigin::PyModules
+                    && spelling
+                        .strip_prefix(module.as_str())
+                        .is_some_and(|tail| tail.starts_with('.')))
+        })
 }
 
 /// Selected ordinary source under this import root makes the layout non-stub-only.
