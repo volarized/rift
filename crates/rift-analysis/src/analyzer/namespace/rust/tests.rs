@@ -4836,6 +4836,50 @@ fn rust_captured_predicate_keeps_scope_across_inert_cfg_attribute_lists() {
     }
 }
 
+#[test]
+fn rust_captured_predicate_keeps_scope_across_inactive_outer_globs() {
+    let root = format!("{GUARDED_MACRO} pub mod branch; pub mod direct;");
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    for (label, import, expected) in [
+        ("no import", "", true),
+        (
+            "inactive import",
+            "#[cfg(not(feature = \"checked\"))] pub use self::fallback::*;",
+            true,
+        ),
+        (
+            "active import",
+            "#[cfg(feature = \"checked\")] pub use self::fallback::*;",
+            false,
+        ),
+        (
+            "unknown import",
+            "#[cfg(version(\"1.88\"))] pub use self::fallback::*;",
+            false,
+        ),
+        (
+            "unknown attribute",
+            "#[cfg(not(feature = \"checked\"))] #[custom] pub use self::fallback::*;",
+            false,
+        ),
+        ("unguarded import", "pub use self::fallback::*;", false),
+    ] {
+        let branch =
+            format!("{GUARDED_INVOCATION} {import} {next} mod fallback {{ pub fn marker() {{}} }}");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", GUARDED_CHILD),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,

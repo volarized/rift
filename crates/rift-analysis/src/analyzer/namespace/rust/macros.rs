@@ -1338,6 +1338,9 @@ impl Context<'_, '_> {
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
+        if tokens.is_some_and(|tokens| tokens.inert_item(range)) {
+            return;
+        }
         // Original explicit imports remain declarations when macro effects are unknown.
         // Their own attributes and paths are checked before recording an alias.
         if let Some(tokens) = tokens

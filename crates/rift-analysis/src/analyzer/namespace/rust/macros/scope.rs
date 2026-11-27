@@ -13,7 +13,7 @@ type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> 
 pub(super) struct Tokens<'a> {
     rows: Vec<(ByteRange, &'a str)>,
     facts: Option<&'a rift_syntax::StaticFacts>,
-    ordinary_externs: BTreeSet<ByteRange>,
+    inert_items: BTreeSet<ByteRange>,
     bindings: BTreeSet<String>,
     pub(super) complete: bool,
     depth: usize,
@@ -52,7 +52,7 @@ impl<'a> Tokens<'a> {
         let mut result = Self {
             rows,
             facts: file.syntax.static_facts(),
-            ordinary_externs: BTreeSet::new(),
+            inert_items: BTreeSet::new(),
             bindings: BTreeSet::new(),
             complete: true,
             depth: limits.syntax_depth_max(),
@@ -75,20 +75,23 @@ impl<'a> Tokens<'a> {
             }
             _ => Vec::new(),
         };
-        for (range, children) in scopes {
-            if within_module(&isolated, *range) {
+        for (scope_range, children) in scopes {
+            if within_module(&isolated, *scope_range) {
                 continue;
             }
             let Some(children) = children else {
                 result.complete = false;
                 continue;
             };
+            let top_level = *scope_range == range
+                && !file.syntax.has_errors()
+                && file.syntax.left_out_declaration_count() == 0;
             for child in children {
                 if super::macro_export_attribute(file, *child) {
                     result.charge(file.syntax.symbols().len())?;
                     continue;
                 }
-                result.names(*child, configuration)?;
+                result.names(*child, configuration, top_level)?;
             }
         }
         for (range, _, children) in file.syntax.macro_invocations()? {
@@ -260,7 +263,7 @@ impl<'a> Tokens<'a> {
                 continue;
             }
             let input = self.range(range)?;
-            if self.ordinary_externs.contains(&range) {
+            if self.inert_item(range) {
                 continue;
             }
             if super::invocation_name(child.source, range) == Some(name) {
@@ -327,13 +330,37 @@ impl<'a> Tokens<'a> {
         Some(())
     }
 
-    fn names(&mut self, range: ByteRange, configuration: Option<&Configuration<'_>>) -> Option<()> {
+    fn names(
+        &mut self,
+        range: ByteRange,
+        configuration: Option<&Configuration<'_>>,
+        top_level: bool,
+    ) -> Option<()> {
         let tokens = self.range(range)?;
-        if self.ordinary_extern_crate(range, &tokens, configuration) {
-            self.ordinary_externs.insert(range);
+        if self.ordinary_extern_crate(range, &tokens, configuration)
+            || (top_level && self.inactive_glob(range, &tokens, configuration))
+        {
+            self.inert_items.insert(range);
             return Some(());
         }
         self.names_tokens(&tokens)
+    }
+
+    pub(super) fn inert_item(&self, range: ByteRange) -> bool {
+        self.inert_items.contains(&range)
+    }
+
+    fn inactive_glob(
+        &self,
+        range: ByteRange,
+        mut input: &[&str],
+        configuration: Option<&Configuration<'_>>,
+    ) -> bool {
+        visibility(&mut input).is_some()
+            && input.first() == Some(&"use")
+            && input.last() == Some(&";")
+            && input.contains(&"*")
+            && self.configured_item(range, configuration) == Some(false)
     }
 
     fn ordinary_extern_crate(
@@ -566,7 +593,7 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
-        if self.ordinary_externs.contains(&range) {
+        if self.inert_item(range) {
             return Some(());
         }
         self.item_tokens(&tokens, scope, library, self.depth, true, &mut None)
@@ -882,7 +909,7 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn effects(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
-        if self.ordinary_externs.contains(&range) {
+        if self.inert_item(range) {
             return Some(());
         }
         self.item_tokens(&tokens, scope, library, self.depth, false, &mut None)
