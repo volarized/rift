@@ -42,6 +42,7 @@ impl Records {
         if super::namespace::typescript::checked_commonjs_package(&input.namespace_input()) {
             self.retain_commonjs_expression_entry(owner, analyzed, semantics, limits)?;
         }
+        self.retain_written_callback_argument_properties(owner, analyzed, limits)?;
         Ok(())
     }
 

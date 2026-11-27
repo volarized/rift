@@ -6887,3 +6887,99 @@ fn checked_commonjs_default_function_keeps_the_physical_entry_module() {
         );
     }
 }
+
+#[test]
+fn written_argument_properties_keep_the_same_callback_without_a_call_target() {
+    const SOURCE: &str = concat!(
+        "var check = require('checks');\n",
+        "var load = require('../');\n",
+        "check('first', function (observer) {\n",
+        "  var directory = 'first';\n",
+        "  load(directory, { path: directory }, function (error, value) { observer.equal(value, directory); });\n",
+        "  load(directory, { path: directory, flag: true }, function (error, value) { observer.equal(value, directory); });\n",
+        "});\n",
+        "check('second', function (observer) {\n",
+        "  var directory = 'second';\n",
+        "  load(directory, { path: directory }, function (error, value) { observer.equal(value, directory); });\n",
+        "  load(directory, { path: directory, flag: false }, function (error, value) { observer.equal(value, directory); });\n",
+        "});\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#;
+    let check = |implementation, expected_calls| {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", implementation), ("test/options.cjs", SOURCE)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected CommonJS source");
+        let found = result.publication();
+        found.validate_facts().expect("valid physical ownership");
+        let unit = found
+            .units
+            .iter()
+            .find(|file| file.path.0 == "test/options.cjs")
+            .expect("complete written source");
+        assert_eq!(unit.source, SOURCE);
+        let mut properties = BTreeMap::new();
+        for (start, written) in SOURCE.match_indices("path: directory") {
+            let start = u64::try_from(start).expect("small source");
+            let insert = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == unit.unit
+                        && row.source_complete
+                        && row.source == written
+                        && row.range.start == start
+                })
+                .expect("written property");
+            let property = found
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&insert.symbol))
+                .expect("property object");
+            let callback = property.container.as_ref().expect("physical callback");
+            let owner = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.symbol == *callback
+                        && row.unit == unit.unit
+                        && row.source_complete
+                        && row.range.start < start
+                        && start < row.range.end
+                })
+                .expect("complete callable containing literal");
+            assert_eq!(
+                owner.syntax_element_kind.as_deref(),
+                Some("function_expression")
+            );
+            properties.insert(start, insert.symbol.clone());
+        }
+        assert_eq!(properties.len(), 4);
+        assert_eq!(properties.values().collect::<BTreeSet<_>>().len(), 4);
+        let calls = found
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.unit == unit.unit)
+            })
+            .count();
+        assert_eq!(calls, expected_calls);
+        properties
+    };
+    let resolved = check(
+        "function load(path, options, callback) { return options; } module.exports = load;",
+        4,
+    );
+    let unresolved = check(
+        "function retained() { return 1; } exports.marker = retained; module.exports = unknown();",
+        0,
+    );
+    assert_eq!(resolved, unresolved);
+}
