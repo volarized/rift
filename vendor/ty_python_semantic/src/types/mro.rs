@@ -19,7 +19,7 @@ use itertools::Itertools;
 ///
 /// An MRO cannot contain non-specialized generic classes. (This is why [`ClassBase`] contains a
 /// [`ClassType`], not a [`StaticClassLiteral`].) Any generic classes in a base class list are always
-/// specialized — either because the class is explicitly specialized if there is a subscript
+/// specialized - either because the class is explicitly specialized if there is a subscript
 /// expression, or because we create the default specialization if there isn't.
 ///
 /// The MRO of a non-specialized generic class can contain generic classes that are specialized

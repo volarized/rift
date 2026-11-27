@@ -8,16 +8,16 @@
 //! `get_symbol` answers:
 //!
 //! ```text
-//! 2 results · page 1/3
+//! 2 results | page 1/3
 //!   [1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-//!       src/config.rs:10 · name
+//!       src/config.rs:10 | name
 //!       rift://symbol/rust/src/config.rs/load_config
 //!       Loads the workspace configuration from `rift.toml`.
 //!
 //!       pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
 //!           parse_config(&text)
 //!       }
-//!   [2] src/lib.rs:7 · content
+//!   [2] src/lib.rs:7 | content
 //!           let config = load_config(&arguments.path)?;
 //! ```
 //!
@@ -48,7 +48,7 @@ use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
 
 use super::text::{OUTPUT_TEXT_BYTES_MAX, TextError, TextWriter};
-use super::warnings::{log_warnings, record_documentation, record_warnings};
+use super::warnings::{record_documentation, record_warnings};
 use layout::Page;
 
 pub(crate) use error::RegisteredFailure;
@@ -84,18 +84,6 @@ impl Render for rift_protocol::feedback::FeedbackResult {
     }
 }
 
-/// Logs the warnings of an unavailable answer and keeps the ones its opening line reports.
-///
-/// A preparing index keeps its progress counts for the caller. Every other warning stays an
-/// operator diagnostic and leaves the answer.
-fn record_unavailable_warnings(
-    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
-    warnings: &mut Vec<rift_protocol::read::ReadWarning>,
-) {
-    log_warnings(warnings);
-    warnings.retain(|warning| unavailable::reports(reason, warning));
-}
-
 /// Renders `answer` as text under the output byte limit.
 ///
 /// # Errors
@@ -126,7 +114,7 @@ impl Render for SearchResult {
         if let Some(view) = view {
             out.raw_line(
                 0,
-                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+                &format!("view {} | expires {}", view.id.as_str(), view.expires_at),
             )?;
         }
         Ok(())
@@ -151,23 +139,17 @@ impl Render for rift_protocol::search_read::SearchReadResult {
 
 impl Render for rift_protocol::search_read::SearchUnavailable {
     fn log_warnings(&mut self) {
-        let Self::Unavailable {
-            reason, warnings, ..
-        } = self;
-        record_unavailable_warnings(*reason, warnings);
+        let Self::Unavailable { warnings, .. } = self;
+        record_warnings(warnings);
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        let Self::Unavailable {
-            reason,
-            view,
-            warnings,
-        } = self;
-        out.raw_line(0, &unavailable::line(*reason, warnings))?;
+        let Self::Unavailable { reason, view, .. } = self;
+        out.raw_line(0, &unavailable::line(*reason))?;
         if let Some(view) = view {
             out.raw_line(
                 0,
-                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+                &format!("view {} | expires {}", view.id.as_str(), view.expires_at),
             )?;
         }
         Ok(())
@@ -244,10 +226,9 @@ impl Render for rift_protocol::symbol_read::GetSymbolResult {
                 record_warnings(warnings);
                 record_documentation(documentation);
             }
-            Self::Missing { warnings, .. } => record_warnings(warnings),
-            Self::Unavailable {
-                reason, warnings, ..
-            } => record_unavailable_warnings(*reason, warnings),
+            Self::Missing { warnings, .. } | Self::Unavailable { warnings, .. } => {
+                record_warnings(warnings);
+            }
         }
     }
 

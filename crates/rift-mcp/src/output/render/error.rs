@@ -2,12 +2,12 @@
 //!
 //! ```text
 //! 2 errors
-//!   limit_exceeded · retry never
+//!   limit_exceeded | retry never
 //!     the request crosses a limit; narrow the request
 //!     limit source.files: 11 over 10
 //!     error[E0308] src/lib.rs:3:9: mismatched types
 //!     rift.index.workspace_too_many_files
-//!   storage_failure · retry same_request
+//!   storage_failure | retry same_request
 //!     the store refused
 //! ```
 //!
@@ -107,7 +107,7 @@ fn failure(
     Ok(())
 }
 
-/// Writes the head of one entry: `<code> · retry <directive>`.
+/// Writes the head of one entry: `<code> | retry <directive>`.
 fn head_line(
     out: &mut TextWriter,
     code: ErrorCode,

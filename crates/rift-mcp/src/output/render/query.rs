@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult, RdfTerm, RdfTriple};
-use rift_protocol::read::ReadWarning;
 use rift_protocol::search_read::SearchUnavailable;
 use rift_search::sparql::{QueryField, QueryPresentation, VOCABULARY_NAMESPACE};
 use rmcp::model::MetaObject;
@@ -145,37 +144,20 @@ impl Render for QueryOutput {
     }
 
     fn log_warnings(&mut self) {
-        match &mut self.result {
-            QueryReadResult::Results(result) => {
-                crate::output::log_warnings(&result.warnings);
-                result
-                    .warnings
-                    .retain(|warning| query_warning_text(warning).is_some());
+        let warnings = match &mut self.result {
+            QueryReadResult::Results(result) => &mut result.warnings,
+            QueryReadResult::Unavailable(SearchUnavailable::Unavailable { warnings, .. }) => {
+                warnings
             }
-            QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                reason,
-                warnings,
-                ..
-            }) => {
-                crate::output::log_warnings(warnings);
-                warnings.retain(|warning| {
-                    query_warning_text(warning).is_some()
-                        || super::unavailable::reports(*reason, warning)
-                });
-            }
-        }
+        };
+        crate::output::record_warnings(warnings);
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match &self.result {
             QueryReadResult::Results(result) => render_result(out, result, &self.display),
-            QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                reason,
-                warnings,
-                ..
-            }) => {
-                out.raw_line(0, &super::unavailable::line(*reason, warnings))?;
-                write_query_warnings(out, warnings)
+            QueryReadResult::Unavailable(SearchUnavailable::Unavailable { reason, .. }) => {
+                out.raw_line(0, &super::unavailable::line(*reason))
             }
         }
     }
@@ -222,7 +204,7 @@ fn render_result(
     if let Some(page) = page.and_then(super::layout::page_fact) {
         out.raw_line(0, &page)?;
     }
-    write_query_warnings(out, &result.warnings)
+    Ok(())
 }
 
 fn graph(
@@ -471,45 +453,6 @@ fn other_fields(
         }
     }
     Ok(())
-}
-
-fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Result<(), TextError> {
-    for detail in warnings.iter().filter_map(query_warning_text) {
-        out.raw_line(0, &format!("warning · {detail}"))?;
-    }
-    if warnings
-        .iter()
-        .any(|warning| matches!(warning, ReadWarning::TraversalTruncated { .. }))
-    {
-        out.raw_line(
-            0,
-            "Narrow the flow query to search again. A page continues the retained result.",
-        )?;
-    }
-    Ok(())
-}
-
-/// The text of a warning a query answer carries: the coverage and discovery conditions that
-/// name what is missing from it. Every other warning is logged and left out of the answer.
-fn query_warning_text(warning: &ReadWarning) -> Option<String> {
-    match warning {
-        ReadWarning::LocalSymbolInventoryUnavailable => Some(
-            "The local symbol inventory is unavailable. Use `SERVICE :search` to select package facts."
-                .to_owned(),
-        ),
-        ReadWarning::EdgeCoverageMissing { detail, .. }
-        | ReadWarning::TraversalTruncated { detail, .. }
-        | ReadWarning::EngineAnalysisUnavailable { detail, .. }
-        | ReadWarning::EngineReadinessUnconfirmed { detail, .. }
-        | ReadWarning::CalleesDropped { detail, .. }
-        | ReadWarning::SourceUnavailable { detail, .. }
-        | ReadWarning::LargeFileUnparsed { detail, .. } => Some(detail.clone()),
-        ReadWarning::FrameworkContextUnresolved { unit, detail, .. } => Some(
-            unit.project_path()
-                .map_or_else(|| detail.clone(), |path| format!("{path}: {detail}")),
-        ),
-        _ => None,
-    }
 }
 
 struct Terms {

@@ -441,7 +441,7 @@ fn a_timestamp_outside_the_range_of_jiff_prints_the_count() {
     }
 }
 
-/// A message or a field value holding ` · ` or `: ` prints as a JSON string; `a:b` holds
+/// A message or a field value holding ` | ` or `: ` prints as a JSON string; `a:b` holds
 /// neither and prints as it is. Fields that are not a JSON object follow the same rule.
 #[test]
 fn a_message_or_value_that_holds_a_delimiter_prints_quoted() {
@@ -449,10 +449,10 @@ fn a_message_or_value_that_holds_a_delimiter_prints_quoted() {
         0,
         "warn",
         ("mcp", "mcp.read"),
-        "read failed: a \"b\" · c\\d",
-        &json!({"note": "k: v", "path": "a · b", "plain": "a:b"}),
+        "read failed: a \"b\" | c\\d",
+        &json!({"note": "k: v", "path": "a | b", "plain": "a:b"}),
     );
-    let text = LogRecord::new(SAMPLE_MS, "warn", "rift", "mcp", "", "plain", "x · y");
+    let text = LogRecord::new(SAMPLE_MS, "warn", "rift", "mcp", "", "plain", "x | y");
     let inside = record(
         0,
         "info",
@@ -464,11 +464,11 @@ fn a_message_or_value_that_holds_a_delimiter_prints_quoted() {
     assert_eq!(
         page(&[quoted]),
         "2026-10-04 20:42:58.787Z WARN  rift_mcp::server   component=mcp operation=mcp.read \
-         note=\"k: v\" path=\"a · b\" plain=a:b  \"read failed: a \\\"b\\\" · c\\\\d\"\n"
+         note=\"k: v\" path=\"a | b\" plain=a:b  \"read failed: a \\\"b\\\" | c\\\\d\"\n"
     );
     assert_eq!(
         page(&[text]),
-        "2026-10-04 20:42:58.787Z WARN  rift   component=mcp  plain \"x · y\"\n"
+        "2026-10-04 20:42:58.787Z WARN  rift   component=mcp  plain \"x | y\"\n"
     );
     let inside = page(&[inside]);
     assert!(

@@ -47,7 +47,7 @@ async fn the_map_resource_answers_compact_text_then_json() -> TestResult {
     };
     assert_eq!(uri, "rift://map");
     assert_eq!(mime_type.as_deref(), Some("text/plain"));
-    assert!(text.contains("rust · 1 file"), "{text}");
+    assert!(text.contains("rust | 1 file"), "{text}");
     let body = resource_json(&answer, "rift://map")?;
     assert!(body.is_object(), "{body}");
 

@@ -349,7 +349,7 @@ fn retrieval_coverage(warnings: &[ReadWarning], current: bool) -> Option<SymbolU
     retrieval_coverage_for(warnings.iter(), current)
 }
 
-fn retrieval_coverage_for<'warning>(
+pub(crate) fn retrieval_coverage_for<'warning>(
     warnings: impl Iterator<Item = &'warning ReadWarning>,
     current: bool,
 ) -> Option<SymbolUnavailableReason> {

@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::output::text::{TextError, quoted};
 
 /// Separates the facts of one line.
-pub(super) const FACT_SEPARATOR: &str = " · ";
+pub(super) const FACT_SEPARATOR: &str = " | ";
 /// Separates the facts of a line from the prose after them.
 pub(super) const DETAIL_SEPARATOR: &str = ": ";
 /// Text a value holding it is quoted for, so the value stays one value of its line.

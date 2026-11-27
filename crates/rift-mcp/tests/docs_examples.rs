@@ -189,6 +189,29 @@ ORDER BY ?message ?revision"#,
     ),
 ];
 
+fn carries_warnings(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.contains_key("warnings") || fields.values().any(carries_warnings)
+        }
+        Value::Array(items) => items.iter().any(carries_warnings),
+        _ => false,
+    }
+}
+
+fn check_capture(text: &str, answer: &Value) {
+    assert!(
+        !carries_warnings(answer),
+        "MCP capture carries warnings: {answer}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("warning | ")),
+        "MCP capture carries a warning line: {text}"
+    );
+}
+
 /// Captures both MCP response forms and drops the process-local view.
 async fn capture_tool(
     client: &RunningService<RoleClient, ()>,
@@ -212,6 +235,7 @@ async fn capture_tool(
         Some(answer) => answer.clone(),
         None => serde_json::to_value(&response)?,
     };
+    check_capture(text, &answer);
     if let Some(fields) = answer.as_object_mut() {
         fields.remove("view");
     }
@@ -233,10 +257,13 @@ async fn capture_resource(client: &RunningService<RoleClient, ()>, uri: &str) ->
     let response = client
         .read_resource(ReadResourceRequestParams::new(uri.to_owned()))
         .await?;
+    let text = resource_text(&response, uri)?;
+    let answer = resource_json(&response, uri)?;
+    check_capture(text, &answer);
     Ok(json!({
         "arguments": { "uri": uri },
-        "text": resource_text(&response, uri)?,
-        "json": resource_json(&response, uri)?,
+        "text": text,
+        "json": answer,
     }))
 }
 
@@ -471,6 +498,12 @@ async fn capture_docs_examples() -> TestResult {
     let generated =
         serde_json::to_string_pretty(&json!({ "map": map, "queries": queries, "files": files }))?
             + "\n";
+    assert!(
+        !generated
+            .chars()
+            .any(|character| matches!(u32::from(character), 0x00B7 | 0x2013 | 0x2014)),
+        "a docs capture uses a non-ASCII separator"
+    );
     match mode.as_str() {
         "generate" => fs::write(&artifact, generated)?,
         "check" => {

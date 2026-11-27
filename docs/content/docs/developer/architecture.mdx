@@ -131,10 +131,10 @@ A change to the file takes effect for later requests once the server accepts it 
 invalid file keeps the workspace unusable until you fix it.
 
 A rebuild that fails - the tree crossed a configured bound, a file could not be read - leaves the
-last published snapshot served. A read answers from that snapshot and carries a `stale_index`
-warning naming the failure. The next filesystem
-event or background validation retries the rebuild. A successful rebuild clears the warning,
-including recovery after the tree returns to the publication's exact bytes.
+last published snapshot served. A read answers from that snapshot and the server logs
+`stale_index` with the failure. The next filesystem event or background validation retries the
+rebuild. The server clears that state after a successful rebuild or when the tree returns to
+the publication's exact bytes.
 
 The server stops itself once no request remains active and the
 [`idle_timeout`](/docs/developer/configuration#server) span passes after the last response completes.
@@ -188,10 +188,9 @@ paths carrying its manifest file name. Selecting the top-level manifests compare
 pair, so that work grows with the square of the manifest count.
 
 A workspace holding more manifests names the packages those 256 declare, and the resolver
-reports the rest as a degradation. A read whose `scope` reaches packages carries it as a
-`package_context_degraded` warning: the next.js repository holds 876 `package.json` files, so
-the warning reads `620 of 876 package.json manifests were not read: at most 256 are read per
-workspace`.
+reports the rest as a degradation. For a read whose `scope` reaches packages, the server logs
+`package_context_degraded`. The next.js repository holds 876 `package.json` files, so the log
+records `620 of 876 package.json manifests were not read: at most 256 are read per workspace`.
 
 Each readable project file becomes a source unit in the source catalog, named by a
 [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) such as
@@ -281,9 +280,9 @@ source names.
 `rustc --version` and `node --version` run under
 [`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"` alone, each
 bounded by `command_timeout`, and neither installs a toolchain a pin names but the machine lacks.
-A probe that answers nothing leaves the static reading and a `package_context_degraded` warning
-naming the entry. When `rust-toolchain.toml` pins `1.80.0` and the machine lacks that
-toolchain, the entry goes out as `stdlib/rust@1.80.0`, and the warning carries
+A probe that answers nothing leaves the static reading. The server logs `package_context_degraded`
+with the entry. When `rust-toolchain.toml` pins `1.80.0` and the machine lacks that
+toolchain, the entry goes out as `stdlib/rust@1.80.0`, and the record carries
 `rustc --version: error: toolchain '1.80.0-aarch64-apple-darwin' is not installed`.
 
 The [`[languages.<name>] stdlib`](/docs/developer/configuration#languages-and-lsp) key turns a
@@ -306,12 +305,11 @@ The local server analyzes no package source itself.
 [Package analysis](/docs/developer/implementation#package-analysis) describes how one package's
 files become the declarations the global index answers from.
 
-When global access is disabled or the global API cannot answer, the read answers the project hits
-it has, and one typed warning names why package facts are missing. A package the global
-publication holds no release of answers `package_absent` or `package_requirement_absent`, a
-version it lacks answers from the nearest collected release under `package_substituted`, and an
-entry no public registry serves answers `package_unavailable`. The
-[MCP reference](/docs/developer/protocol/mcp#reads) states each warning.
+When global access is disabled or the global API cannot answer, the server logs why package facts
+are missing. It logs `package_absent` or `package_requirement_absent` when the publication holds
+no matching release, `package_substituted` when the nearest release answers, and
+`package_unavailable` for an entry no public registry serves. The
+[MCP reference](/docs/developer/protocol/mcp#reads) lists these records.
 
 ## Providers
 
@@ -320,8 +318,7 @@ records in provider-owned symbol spaces. Rift normalizes applicable Contribution
 workspace-local `SymbolRecord` values, then assembles readable `Symbol` values for one captured
 index revision.
 
-A condition the caller must weigh before relying on the answer - a stale index, an absent
-capability - arrives as a typed entry in the result's `warnings`.
+Use `rift server logs` to inspect a stale index or an unavailable provider.
 
 ### Syntax
 
@@ -393,8 +390,8 @@ outside every worktree's newest `max_revisions` commits.
 
 No request waits for the task. A symbol history and a
 [commit search](/docs/mcp#search-commits) answer from what the store holds: a history whose
-served revision the store has not analyzed yet answers `complete: false`, and a commit search
-answered before the fill lands carries a `history_store_filling` warning naming how far it has got.
+served revision the store has not analyzed yet answers `complete: false`. For a commit search
+before the fill lands, the server logs `history_store_filling` with the analyzed and total counts.
 
 The task follows a declaration across files as it analyzes each commit. A deletion and an
 addition carrying one blob id are a rename, and a declaration an added file holds with the exact
@@ -405,9 +402,8 @@ nothing, since no evidence says which addition answers which deletion.
 
 Custom integrations implement a [source resolver](/docs/developer/protocol/core#source-discovery), a
 [fact provider](/docs/developer/protocol/core#semantic-facts), or both. The contracts stay separate even
-when one integration implements both capabilities. A family with no serving provider surfaces
-as a typed entry in `warnings`, which keeps an empty answer distinct from a complete answer with
-no facts.
+when one integration implements both capabilities. A read that needs a family with no serving
+provider can return `unavailable`.
 
 One integration can connect several cooperating pieces through a **provider composition**. Like a
 [scikit-learn pipeline](https://scikit-learn.org/stable/modules/compose.html), the composition gives
@@ -445,9 +441,9 @@ The workspace resource assigns each provider a stable
 provider derives an immutable Contribution collection from one tree revision, then publishes the
 collection atomically.
 
-While a provider catches up after a change, requests may serve its previous revision, and the
-result carries a `stale_index` entry in `warnings` naming the two tree revision digests. A
-provider with no usable revision contributes nothing, and the result's `warnings` say so.
+While a provider catches up after a change, requests may serve its previous revision. The server
+logs `stale_index` with the two tree revision digests. A provider with no usable revision
+contributes no facts.
 
 A read captures one tree revision, one index revision where it searches, and the provider
 revisions it uses. Later writes create new revisions. They do not alter the captured result. A
@@ -472,9 +468,9 @@ declarations and syntax elements from the files the workspace's source policy in
 <VersionBadge version="v0.0.47" />
 
 The server starts with an empty publication, then publishes discovered paths, the first bounded
-batch of prepared files, and the complete index. Reads answer from prepared source and carry
-[`local_index_preparing`](/docs/developer/protocol/mcp#reads) while their selected local scope is
-incomplete. A `facets` request refuses while source preparation is incomplete. Static edges are
+batch of prepared files, and the complete index. Reads answer from prepared source. The server
+logs [`local_index_preparing`](/docs/developer/protocol/mcp#reads) while the selected local scope
+is incomplete. A `facets` request refuses while source preparation is incomplete. Static edges are
 resolved by the publication that completes preparation: an earlier publication holds none and
 reports its static call coverage as unavailable.
 
@@ -487,9 +483,8 @@ so an answer never combines state from two index revisions. The
 [implementation](/docs/developer/implementation#rift-server) page describes the
 watcher, the rebuild lane, and the swap that keep this true.
 
-When the published index lags the tree a read captured, the result says so: a `stale_index`
-entry in `warnings` carries the digests of the tree revision the index covers and the revision
-the read captured, so the caller knows the answer may miss the newest writes.
+When the published index lags the tree a read captured, the server logs `stale_index` with the
+digests of the indexed tree and the captured tree.
 
 <VersionBadge
   version="v0.0.9"
@@ -513,8 +508,8 @@ write, startup's included, touches only the files that moved. The first load of 
 still runs for longer than a read is willing to wait, so the publication never waits for it.
 
 A search that captures the publication before its transaction lands is ranked by identifier
-matching alone and carries a `lexical_ranking_unavailable` warning naming the tree revision the
-store is still committing. The store's ranking joins the answer once the transaction ends. A
+matching alone. The server logs `lexical_ranking_unavailable` with the tree revision the store
+is still committing. The store's ranking joins the answer once the transaction ends. A
 transaction that refuses leaves the previous rows and stamp intact and is recorded in
 [`rift server logs`](/docs/developer/implementation#server-logs), and the next publication compares every file with
 what the store recorded rather than applying its change on top of rows the store missed.
@@ -522,8 +517,8 @@ what the store recorded rather than applying its change on top of rows the store
 The vector ranking's vectors live in the vectors database and are not part of that transaction.
 Embedding one declaration can cost
 more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
-search whose vectors are still being written ranks lexically and reports the tier's readiness in
-`warnings`.
+search whose vectors are still being written ranks lexically. The server logs
+`vector_index_preparing` with progress.
 
 Both tiers answer under one tree revision: the full-text store reads its stamp and its rows in
 one transaction, and the vectors a pass published carry the tree they were described for. A store
@@ -554,8 +549,8 @@ Under the default [`[search.text]`](/docs/developer/configuration#search)
 chunks, its declarations are absent, and the index build records it in `rift server logs`.
 Symbol enumeration answers over the declarations the index holds, as if the source policy had
 excluded the file. Under `skip` the per-file byte bound is `max_file`, so such a file is left out as above,
-and a file past `max_chunk` keeps no text in search, which a search whose `paths` reach it counts
-in a `large_file_skipped` warning.
+and a file past `max_chunk` keeps no text in search. When a read's `paths` reach a skipped file,
+the server counts it in a `large_file_skipped` record.
 
 ### Search
 
@@ -634,7 +629,7 @@ For example, a guide containing the inline code `Compass` can contribute context
 `get_symbol` with its established `id` and `include: {"documentation": true}`. The reference resolves only
 when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
-page, with typed warnings for missing bytes or reached bounds.
+page. The server logs missing bytes and reached bounds.
 
 A package's documentation comes from the global index. Global documentation requests use the
 package REST client only after the service advertises the corresponding capability. Workspace
@@ -709,7 +704,7 @@ published index holds, line by line as ripgrep reads it.
 
 The trigram index is filled in the background after the rows it covers are written, so no search
 waits for it. A row it doesn't hold yet is verified beside the rows it selects, and when those rows
-pass the search's bounds, the answer covers the rows the index holds and warns
+pass the search's bounds, the answer covers the rows the index holds. The server logs
 [`pattern_index_preparing`](/docs/developer/protocol/mcp#search-pattern).
 
 The plan never rules out a row that could hold a match: a class too large to expand, a
@@ -756,8 +751,8 @@ query text while a caller searches. The configuration page states both transfers
 default sends nothing: it starts without a key and makes no request once the weights are
 acquired.
 
-Preparation runs behind the answers. A search issued before the vectors are in is answered by
-the other two inputs and says so, rather than waiting for a model to load.
+Preparation runs behind the answers. A search before the vectors are ready uses the other two
+ranking inputs, and the server logs preparation progress.
 
 ### Retrieve symbol
 
@@ -767,8 +762,8 @@ reads a declaration's source. The answer names the `revision` it was read at, an
 `page` selects declarations at that revision.
 
 A Symbol carries `id` when the index established one identity for the declaration. A symbol
-the providers could not settle answers without an `id`, and a retained provider disagreement
-lands as a `symbol_disagreement` entry in the result's `warnings`.
+the providers could not settle answers without an `id`. The server logs a retained provider
+disagreement as `symbol_disagreement`.
 
 Asking for history attaches the symbol's history edges to the same answer: the commits that
 introduced, changed, renamed, or removed it, and the symbols those commits changed beside it.

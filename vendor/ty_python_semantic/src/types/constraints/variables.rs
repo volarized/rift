@@ -17,11 +17,11 @@ use crate::{Db, ProgramEnvironment};
 
 /// The _provenance_ of a BDD constraint.
 ///
-/// Most bounds come from specific relationships found at the call site — for instance, the
+/// Most bounds come from specific relationships found at the call site - for instance, the
 /// relationship between the argument type and parameter annotation when invoking a generic
 /// function. These bounds express actual user intent, and are called _evidence_ bounds.
 ///
-/// Other bounds are background limitations on which specializations are valid — for instance, a
+/// Other bounds are background limitations on which specializations are valid - for instance, a
 /// typevar's declared `bound_or_constraints`. These are called _validity_ bounds. Importantly, we
 /// don't want to choose a validity bound as a solution unless we have no other choice. There is
 /// often an evidence bound that is a better choice.

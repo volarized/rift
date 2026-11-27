@@ -1521,11 +1521,11 @@ pub(crate) use todo_type;
 /// The role a function definition plays in a property's descriptor protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyAccessorRole {
-    /// `@property def x(self)` — runs on read.
+    /// `@property def x(self)` - runs on read.
     Getter,
-    /// `@x.setter def x(self, value)` — runs on write.
+    /// `@x.setter def x(self, value)` - runs on write.
     Setter,
-    /// `@x.deleter def x(self)` — runs on `del`.
+    /// `@x.deleter def x(self)` - runs on `del`.
     Deleter,
 }
 
@@ -6993,7 +6993,7 @@ impl<'db> Type<'db> {
     ///
     /// Note that we return a [`Bindings`] for all types, even if the type is not callable.
     /// "Callable" can be subtle for a union type, since some union elements might be callable and
-    /// some not. A union is callable if every element type is callable — but even then, the
+    /// some not. A union is callable if every element type is callable - but even then, the
     /// elements might be inconsistent, such that there's no argument list that's valid for all
     /// elements. It's usually best to only worry about "callability" relative to a particular
     /// argument list, via [`try_call`][Self::try_call] and [`CallErrorKind::NotCallable`].

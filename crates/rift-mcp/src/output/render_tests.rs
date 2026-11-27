@@ -379,7 +379,7 @@ fn the_owner_search_example_with_two_hits_on_the_first_of_three_pages() {
         &[
             "2 results",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-            "\t\tsrc/config.rs:10 · name",
+            "\t\tsrc/config.rs:10 | name",
             "\t\trift://symbol/local/rust/app/config/load_config",
             "\t\tLoads the workspace configuration from `rift.toml`.",
             "",
@@ -387,7 +387,7 @@ fn the_owner_search_example_with_two_hits_on_the_first_of_three_pages() {
             "\t\t    let text = std::fs::read_to_string(path)?;",
             "\t\t    parse_config(&text)",
             "\t\t}",
-            "\t[2] src/lib.rs:7 · content",
+            "\t[2] src/lib.rs:7 | content",
             "\t\t    let config = load_config(&arguments.path)?;",
         ],
     );
@@ -399,7 +399,7 @@ fn the_owner_search_example_with_one_commit_hit() {
         &owner_commit_answer(),
         &[
             "1 result",
-            "\t9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00",
+            "\t9c1d4e7a | Alice <alice@example.com> | 2026-09-22 14:03 +02:00",
             "\tBound comparisons at 512 changed paths",
             "",
             "\tA comparison that reaches the bound answers from the paths that fit and warns `change_truncated`.",
@@ -418,7 +418,7 @@ fn the_authored_search_examples_render_as_the_layout_shows() {
         &[
             "2 results",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-            "\t\tsrc/config.rs:10 · name",
+            "\t\tsrc/config.rs:10 | name",
             "\t\trift://symbol/local/rust/app/config/load_config",
             "\t\tLoads the workspace configuration from `rift.toml`.",
             "",
@@ -427,7 +427,7 @@ fn the_authored_search_examples_render_as_the_layout_shows() {
             "\t\t    let text = std::fs::read_to_string(path)?;",
             "\t\t    parse_config(&text)",
             "\t\t}",
-            "\t[2] src/lib.rs:7 · content",
+            "\t[2] src/lib.rs:7 | content",
             "\t\t    let config = load_config(&arguments.path)?;",
         ],
     );
@@ -435,7 +435,7 @@ fn the_authored_search_examples_render_as_the_layout_shows() {
         &example::<SearchResult>(1),
         &[
             "1 result",
-            "\t9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00",
+            "\t9c1d4e7a | Alice <alice@example.com> | 2026-09-22 14:03 +02:00",
             "\tBound comparisons at 512 changed paths",
             "",
             "\tA comparison that reaches the bound answers from the paths that fit and warns change_truncated.",
@@ -466,7 +466,7 @@ fn one_result_has_no_marker_and_an_indent_of_two_spaces() {
         &[
             "1 result",
             "\tstruct A",
-            "\ta.rs:1 · name",
+            "\ta.rs:1 | name",
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\tstruct A;",
@@ -486,7 +486,7 @@ fn several_results_on_one_page_have_markers_and_indent_and_no_page() {
         &[
             "2 results",
             "\t[1] struct A",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
             "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tstruct A {",
@@ -494,7 +494,7 @@ fn several_results_on_one_page_have_markers_and_indent_and_no_page() {
             "\t\t    x: u8,",
             "\t\t}",
             "\t[2] struct B",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
             "\t\trift://symbol/local/rust/app/a/B",
         ],
     );
@@ -505,7 +505,7 @@ fn the_page_follows_the_page() {
     let item = || placed_symbol_hit(symbol(Some(A_ID), "A"));
     let body = [
         "\tstruct A",
-        "\ta.rs:1 · name",
+        "\ta.rs:1 | name",
         "\trift://symbol/local/rust/app/a/A",
     ];
     let page =
@@ -517,15 +517,15 @@ fn the_page_follows_the_page() {
     };
     golden(
         &page(0, 3),
-        &expect("1 result · page 1/3, total 30 results"),
+        &expect("1 result | page 1/3, total 30 results"),
     );
     golden(
         &page(1, 3),
-        &expect("1 result · page 2/3, total 30 results"),
+        &expect("1 result | page 2/3, total 30 results"),
     );
     golden(
         &page(2, 3),
-        &expect("1 result · page 3/3, total 30 results"),
+        &expect("1 result | page 3/3, total 30 results"),
     );
     golden(&page(0, 1), &expect("1 result"));
 }
@@ -534,15 +534,15 @@ fn the_page_follows_the_page() {
 fn a_page_past_the_end_names_the_page() {
     golden(
         &search_result(Vec::new(), pagination(5, 3), Vec::new()),
-        &["0 results · page 6/3, total 30 results"],
+        &["0 results | page 6/3, total 30 results"],
     );
     golden(
         &search_result(Vec::new(), pagination(3, 3), Vec::new()),
-        &["0 results · page 4/3, total 30 results"],
+        &["0 results | page 4/3, total 30 results"],
     );
     golden(
         &search_result(Vec::new(), pagination(4, 0), Vec::new()),
-        &["0 results · page 5/0, total 0 results"],
+        &["0 results | page 5/0, total 0 results"],
     );
 }
 
@@ -552,7 +552,7 @@ fn the_largest_page_renders_without_overflow() {
     assert_eq!(
         rendered(&answer),
         format!(
-            "0 results · page {}/{}, total {} results\n",
+            "0 results | page {}/{}, total {} results\n",
             u64::MAX,
             u64::MAX,
             u64::MAX
@@ -586,7 +586,7 @@ fn a_symbol_hit_names_its_declaration_place_identity_and_summary() {
         &[
             "1 result",
             "\tpub fn load_config(path: &Path)",
-            "\tsrc/config.rs:10 · name, signature",
+            "\tsrc/config.rs:10 | name, signature",
             "\trift://symbol/local/rust/app/config/load_config",
             "\tLoads the configuration.",
         ],
@@ -637,10 +637,10 @@ fn a_symbol_without_a_signature_is_visibility_kind_and_name() {
         &[
             "2 results",
             "\t[1] pub struct A",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
             "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct B",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
             "\t\trift://symbol/local/rust/app/a/B",
         ],
     );
@@ -658,10 +658,10 @@ fn a_symbol_without_an_identity_shows_its_byte_range_when_the_hit_has_one() {
         &[
             "2 results",
             "\t[1] struct A",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
             "\t\t162..355",
             "\t[2] struct B",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
         ],
     );
 }
@@ -707,7 +707,7 @@ fn a_dependency_hit_is_placed_by_its_unit() {
         &[
             "2 results",
             "\t[1] struct A",
-            "\t\trift://source/cargo/crates.io/serde/lib.rs:3 · name",
+            "\t\trift://source/cargo/crates.io/serde/lib.rs:3 | name",
             "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct B",
             "\t\trift://source/cargo/crates.io/serde/lib.rs",
@@ -732,10 +732,10 @@ fn the_score_follows_the_matched_fields_and_the_distance_is_not_written() {
         &[
             "2 results",
             "\t[1] struct A",
-            "\t\ta.rs:1 · name · score 0.8125",
+            "\t\ta.rs:1 | name | score 0.8125",
             "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct A",
-            "\t\ta.rs:1 · name · score 2",
+            "\t\ta.rs:1 | name | score 2",
             "\t\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -801,7 +801,7 @@ fn every_exceptional_fact_is_written_in_order() {
         &[
             "1 result",
             "\tstruct A",
-            "\trift://source/cargo/crates.io/serde/lib.rs:3 · edge · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
+            "\trift://source/cargo/crates.io/serde/lib.rs:3 | edge | score 1.5 | dependency rift://revision/cargo/crates.io/serde@1.0.0 | generated | deprecated | test | document local",
             "\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -830,10 +830,10 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
     assert_eq!(
         facts(origin(
             project,
-            Some(package("serde · core", "1.0.0")),
+            Some(package("serde | core", "1.0.0")),
             SourceKind::Authored
         )),
-        "project \"serde · core@1.0.0\""
+        "project \"serde | core@1.0.0\""
     );
     assert_eq!(
         facts(origin(
@@ -865,7 +865,7 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
             None,
             SourceKind::Generated
         )),
-        "external · generated"
+        "external | generated"
     );
     assert_eq!(
         facts(origin(project, None, SourceKind::Generated)),
@@ -913,9 +913,9 @@ fn deprecated_test_and_document_local_are_written_only_when_they_hold() {
     symbol.kinds.push(SymbolKind::Test);
     assert_eq!(facts_line(symbol.clone()), "test");
     symbol.kinds.push(SymbolKind::Deprecated);
-    assert_eq!(facts_line(symbol.clone()), "deprecated · test");
+    assert_eq!(facts_line(symbol.clone()), "deprecated | test");
     symbol.document_local = true;
-    assert_eq!(facts_line(symbol), "deprecated · test · document local");
+    assert_eq!(facts_line(symbol), "deprecated | test | document local");
 }
 
 fn fixture_symbol_id(at: &str) -> String {
@@ -1152,7 +1152,7 @@ fn one_hit_outside_the_walk_has_no_marker_and_a_blank_line_separates_it_from_the
         &only_page(vec![run_hit(), readme_hit()]),
         &[
             "2 results",
-            "\tREADME.md:3 · content",
+            "\tREADME.md:3 | content",
             "\tReads configuration",
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
@@ -1172,10 +1172,10 @@ fn several_hits_outside_the_walk_have_markers_that_count_only_them() {
         &only_page(vec![readme_hit(), run_hit(), loose, main_hit()]),
         &[
             "4 results",
-            "\t[1] README.md:3 · content",
+            "\t[1] README.md:3 | content",
             "\t\tReads configuration",
             "\t[2] struct A",
-            "\t\ta.rs:1 · name",
+            "\t\ta.rs:1 | name",
             "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
@@ -1200,7 +1200,7 @@ fn a_hit_outside_the_walk_that_is_the_starting_symbol_becomes_the_root_and_is_no
         &[
             "2 results",
             "\tpub fn load_config()",
-            "\tin src/config.rs:10 · name",
+            "\tin src/config.rs:10 | name",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced (providers: static)",
@@ -1213,11 +1213,11 @@ fn a_hit_outside_the_walk_that_is_the_starting_symbol_becomes_the_root_and_is_no
         &only_page(vec![readme_hit(), run_hit(), load_config_hit()]),
         &[
             "3 results",
-            "\tREADME.md:3 · content",
+            "\tREADME.md:3 | content",
             "\tReads configuration",
             "",
             "\tpub fn load_config()",
-            "\tin src/config.rs:10 · name",
+            "\tin src/config.rs:10 | name",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced (providers: static)",
@@ -1236,11 +1236,11 @@ fn a_root_that_is_a_hit_carries_in_and_at_and_an_item_symbol_hit_carries_neither
         &[
             "3 results",
             "\tstruct A",
-            "\ta.rs:1 · name",
+            "\ta.rs:1 | name",
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\tpub fn load_config()",
-            "\tin src/config.rs:10 · name",
+            "\tin src/config.rs:10 | name",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced (providers: static)",
@@ -1421,7 +1421,7 @@ fn a_hop_an_external_producer_emitted_names_that_producer_after_its_edge() {
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ called (providers: static) · demo-indexer 0.6.1",
+            "\t\t↳ called (providers: static) | demo-indexer 0.6.1",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1593,7 +1593,7 @@ fn copied_source_keeps_its_own_leading_spaces_and_empty_lines_after_the_indent()
         &[
             "1 result",
             "\tstruct A",
-            "\ta.rs:1 · name",
+            "\ta.rs:1 | name",
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\t  two spaces",
@@ -1712,10 +1712,10 @@ fn a_symbol_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
             "",
             "\t\t↳ constructs (providers: static)",
             "\t\t\tstruct Config",
-            "\t\t\tin rift://source/cargo/crates.io/serde/lib.rs:3 · name · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
+            "\t\t\tin rift://source/cargo/crates.io/serde/lib.rs:3 | name | score 1.5 | dependency rift://revision/cargo/crates.io/serde@1.0.0 | generated | deprecated | test | document local",
             "\t\t\tat rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config",
             "\t\t\tSettings of a run.",
-            "\t\t\tmoved · old/lib.rs → new/lib.rs",
+            "\t\t\tmoved | old/lib.rs → new/lib.rs",
             "",
             "\t\t\tstruct Config {",
             "",
@@ -1748,7 +1748,7 @@ fn the_edge_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
             "",
             "\t\t↳ referenced (providers: static)",
             "\t\t\tby fn run()",
-            "\t\t\tin src/app.rs:20 · score 2",
+            "\t\t\tin src/app.rs:20 | score 2",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t↳ referenced (providers: static)",
@@ -1757,7 +1757,7 @@ fn the_edge_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
             "",
             "\t\t↳ called (providers: static)",
             "\t\t\tby fn reload_config()",
-            "\t\t\tin src/watch.rs:41 · name",
+            "\t\t\tin src/watch.rs:41 | name",
             "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
         ],
     );
@@ -1774,7 +1774,7 @@ fn an_item_keeps_the_edge_field_among_its_matched_fields() {
         &[
             "1 result",
             "\tfn run()",
-            "\tsrc/app.rs:20 · edge",
+            "\tsrc/app.rs:20 | edge",
             "\trift://symbol/local/rust/app/app/run",
         ],
     );
@@ -1790,7 +1790,7 @@ fn a_hit_of_another_target_with_a_traversal_path_stays_an_item() {
         &only_page(vec![file, run_hit()]),
         &[
             "2 results",
-            "\tREADME.md:3 · content",
+            "\tREADME.md:3 | content",
             "\tReads configuration",
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
@@ -1814,7 +1814,7 @@ fn a_traversal_without_hops_is_an_item() {
         &[
             "1 result",
             "\tstruct A",
-            "\ta.rs:1 · name",
+            "\ta.rs:1 | name",
             "\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -1831,7 +1831,7 @@ fn warnings_leave_the_edge_tree_text_unchanged() {
         &answer,
         &[
             "2 results",
-            "\tREADME.md:3 · content",
+            "\tREADME.md:3 | content",
             "\tReads configuration",
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
@@ -1881,12 +1881,12 @@ fn a_change_writes_its_kind_and_the_path_when_the_declaration_moved() {
     assert_eq!(
         changes,
         [
-            "\t\tmoved · old/a.rs → new/a.rs",
+            "\t\tmoved | old/a.rs → new/a.rs",
             "\t\tsignature changed",
             "\t\tintroduced",
-            "\t\tremoved · gone/a.rs",
+            "\t\tremoved | gone/a.rs",
             "\t\tbody changed",
-            "\t\tintroduced · new/a.rs",
+            "\t\tintroduced | new/a.rs",
         ]
     );
 }
@@ -1902,9 +1902,9 @@ fn source_follows_a_blank_line_after_the_last_fact_of_a_symbol_hit() {
         &[
             "1 result",
             "\tstruct A",
-            "\ta.rs:1 · name",
+            "\ta.rs:1 | name",
             "\trift://symbol/local/rust/app/a/A",
-            "\tmoved · old/a.rs → a.rs",
+            "\tmoved | old/a.rs → a.rs",
             "",
             "\tstruct A;",
         ],
@@ -1955,10 +1955,10 @@ fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
         &only_page(vec![by_path, by_unit, bare]),
         &[
             "3 results",
-            "\t[1] src/lib.rs:7 · content · score 3",
+            "\t[1] src/lib.rs:7 | content | score 3",
             "\t\tline one",
             "\t\tline two",
-            "\t[2] rift://source/cargo/crates.io/serde/lib.rs · path",
+            "\t[2] rift://source/cargo/crates.io/serde/lib.rs | path",
             "\t[3]",
         ],
     );
@@ -1990,13 +1990,13 @@ fn a_documentation_hit_is_headed_by_its_heading_path() {
         &[
             "2 results",
             "\t[1] Guide > Install > Linux",
-            "\t\tdocs/guide.md:12 · documentation · score 1.5",
+            "\t\tdocs/guide.md:12 | documentation | score 1.5",
             "\t\trift://symbol/local/rust/app/a/A",
             "\t\tbody",
             "",
             "\t\tmore",
             "\t[2] documentation",
-            "\t\tREADME.md:1 · documentation",
+            "\t\tREADME.md:1 | documentation",
         ],
     );
 }
@@ -2018,7 +2018,7 @@ fn a_documentation_hit_in_a_package_is_placed_by_its_source_unit() {
         &[
             "1 result",
             "\tGuide",
-            "\trift://source/cargo/crates.io/serde/README.md:1 · documentation",
+            "\trift://source/cargo/crates.io/serde/README.md:1 | documentation",
         ],
     );
 }
@@ -2040,7 +2040,7 @@ fn a_commit_with_a_subject_alone_and_no_paths_is_one_line_and_the_subject() {
         &commit_answer(commit),
         &[
             "1 result",
-            "\t1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\tFix the cache",
         ],
     );
@@ -2052,7 +2052,7 @@ fn a_commit_with_a_body_writes_it_after_a_blank_line_and_the_paths_after_another
         &commit_answer(commit_hit()),
         &[
             "1 result",
-            "\t1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\tFix the cache",
             "",
             "\tBody line",
@@ -2080,7 +2080,7 @@ fn a_commit_among_several_hits_has_marker_indent_and_empty_blank_lines() {
         &only_page(vec![commit_target(first), commit_target(second)]),
         &[
             "2 results",
-            "\t[1] 1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t[1] 1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\t\tFix the cache",
             "",
             "\t\tBody line",
@@ -2091,7 +2091,7 @@ fn a_commit_among_several_hits_has_marker_indent_and_empty_blank_lines() {
             "\t\t2 paths:",
             "\t\t\tsrc/a.rs",
             "\t\t\tsrc/b.rs",
-            "\t[2] 2e3f4a5b · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t[2] 2e3f4a5b | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\t\tOther",
         ],
     );
@@ -2114,12 +2114,12 @@ fn a_truncated_message_ends_with_the_truncation_line_directly_after_it() {
         &only_page(vec![commit_target(with_body), commit_target(subject_only)]),
         &[
             "2 results",
-            "\t[1] 1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t[1] 1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\t\tFix the cache",
             "",
             "\t\tBody line",
             "\t\tmessage truncated",
-            "\t[2] 1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t[2] 1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\t\tFix the cache",
             "\t\tmessage truncated",
         ],
@@ -2137,10 +2137,10 @@ fn truncated_paths_are_labelled_and_missing_paths_write_no_label() {
         &commit_answer(truncated),
         &[
             "1 result",
-            "\t1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\tFix",
             "",
-            "\t2+ paths · truncated",
+            "\t2+ paths | truncated",
             "\t\tsrc/a.rs",
             "\t\tsrc/b.rs",
             "\t\t...",
@@ -2203,9 +2203,9 @@ fn a_commit_timestamp_with_z_or_with_a_malformed_shape_renders_as_the_rule_says(
         &only_page(vec![commit_target(zulu), commit_target(malformed)]),
         &[
             "2 results",
-            "\t[1] 1f2080e4 · Alice <alice@example.com> · 2026-09-22 14:03 Z",
+            "\t[1] 1f2080e4 | Alice <alice@example.com> | 2026-09-22 14:03 Z",
             "\t\tFix",
-            "\t[2] 1f2080e4 · Alice <alice@example.com> · last tuesday",
+            "\t[2] 1f2080e4 | Alice <alice@example.com> | last tuesday",
             "\t\tFix",
         ],
     );
@@ -2243,8 +2243,8 @@ fn a_revision_that_is_not_hex_is_written_unchanged_and_a_hex_one_is_cut() {
         ..branch.clone()
     };
     let output = rendered(&only_page(vec![commit_target(branch), commit_target(hex)]));
-    assert!(output.contains("[1] release/v1.2 · "), "{output}");
-    assert!(output.contains("[2] 01234567 · "), "{output}");
+    assert!(output.contains("[1] release/v1.2 | "), "{output}");
+    assert!(output.contains("[2] 01234567 | "), "{output}");
 }
 
 #[test]
@@ -2261,7 +2261,7 @@ fn the_score_of_a_commit_hit_ends_its_first_line() {
         &only_page(vec![hit]),
         &[
             "1 result",
-            "\t1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00 · score 0.5",
+            "\t1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00 | score 0.5",
             "\tFix",
         ],
     );
@@ -2297,7 +2297,7 @@ fn control_characters_in_single_line_facts_are_written_as_escapes() {
         "{output}"
     );
     assert!(
-        output.contains("\n\t\tdir\\ttab/a.rs:1 · name\n"),
+        output.contains("\n\t\tdir\\ttab/a.rs:1 | name\n"),
         "{output}"
     );
     assert!(output.contains("\n\t\t\\u{0}first\\u{8}\n"), "{output}");
@@ -2318,7 +2318,7 @@ fn multi_line_source_keeps_its_bytes() {
         ..placed_symbol_hit(symbol(Some(A_ID), "A"))
     };
     let output = rendered(&only_page(vec![hit]));
-    let prefix = "1 result\n\tstruct A\n\ta.rs:1 · name\n\trift://symbol/local/rust/app/a/A\n\n";
+    let prefix = "1 result\n\tstruct A\n\ta.rs:1 | name\n\trift://symbol/local/rust/app/a/A\n\n";
     let written = output
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_suffix('\n'))
@@ -2418,7 +2418,7 @@ fn one_path_is_counted_in_the_singular() {
         &commit_answer(commit),
         &[
             "1 result",
-            "\t1f2080e4 · Alice <alice@example.com> · 2026-08-21 14:03 +00:00",
+            "\t1f2080e4 | Alice <alice@example.com> | 2026-08-21 14:03 +00:00",
             "\tFix",
             "",
             "\t1 path:",
@@ -2448,11 +2448,11 @@ fn the_owner_get_symbol_example_with_documentation_and_history() {
             "\tLoads the workspace configuration from `rift.toml`.",
             "",
             "\thistory:",
-            "\t\t2026-08-21 · 1f2080e4 · changed in · signature changed · Alice <alice@example.com>",
+            "\t\t2026-08-21 | 1f2080e4 | changed in | signature changed | Alice <alice@example.com>",
             "\t\t\tReturn ConfigError from load_config",
-            "\t\t2026-08-17 · 82590265 · introduced in · Alice <alice@example.com>",
+            "\t\t2026-08-17 | 82590265 | introduced in | Alice <alice@example.com>",
             "\t\t\tAdd workspace configuration loading",
-            "\t\tco changes · rift://symbol/local/rust/app/config/Config · 2 commits",
+            "\t\tco changes | rift://symbol/local/rust/app/config/Config | 2 commits",
         ],
     );
 }
@@ -2477,7 +2477,7 @@ fn warnings_leave_symbol_page_text_unchanged() {
     golden(
         &answer,
         &[
-            "1 result · page 2/4, total 40 results",
+            "1 result | page 2/4, total 40 results",
             "\tstruct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
@@ -2525,7 +2525,7 @@ fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distan
             "\tpub struct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
-            "\tdependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
+            "\tdependency rift://revision/cargo/crates.io/serde@1.0.0 | generated | deprecated | test | document local",
         ],
     );
 }
@@ -2602,7 +2602,7 @@ fn the_documentation_context_lists_each_reference_with_its_excerpt() {
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation:",
-            "\t\tdocs/guide.md:12 · Guide > Install",
+            "\t\tdocs/guide.md:12 | Guide > Install",
             "\t\t\tUse `A`.",
             "",
             "\t\t\tThen run it.",
@@ -2659,7 +2659,7 @@ fn documentation_context_warnings_leave_reference_text_unchanged() {
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation:",
-            "\t\tdocs/guide.md:2 · Guide",
+            "\t\tdocs/guide.md:2 | Guide",
         ],
     );
 }
@@ -2690,10 +2690,10 @@ fn an_empty_documentation_context_with_a_warning_preserves_its_truncation_label(
 
 #[test]
 fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
-    let guide = documentation_hit_at("docs/guide.md", 2, &["Step 1: Install", "a · b"], None);
+    let guide = documentation_hit_at("docs/guide.md", 2, &["Step 1: Install", "a | b"], None);
     let mut hit = symbol_hit();
     hit.documentation = Some(context(&json!([reference(&guide, None)]), false));
-    let mut moved = history_commit("aaaaaaaa11", "src/a · b.rs", None);
+    let mut moved = history_commit("aaaaaaaa11", "src/a | b.rs", None);
     moved.author = CommitAuthor {
         name: "Ops: \"bot\" \\ team".to_owned(),
         email: "ops@example.com".to_owned(),
@@ -2715,11 +2715,11 @@ fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation:",
-            "\t\tdocs/guide.md:2 · \"Step 1: Install > a · b\"",
+            "\t\tdocs/guide.md:2 | \"Step 1: Install > a | b\"",
             "",
             "\thistory:",
-            "\t\t2026-08-21 · aaaaaaaa · renamed from · \"old: a.rs\" · \"Ops: \\\"bot\\\" \\\\ team <ops@example.com>\" · \"src/a · b.rs\"",
-            "\t\t\"day 1: noon\" · bbbbbbbb · introduced in · Alice <alice@example.com>",
+            "\t\t2026-08-21 | aaaaaaaa | renamed from | \"old: a.rs\" | \"Ops: \\\"bot\\\" \\\\ team <ops@example.com>\" | \"src/a | b.rs\"",
+            "\t\t\"day 1: noon\" | bbbbbbbb | introduced in | Alice <alice@example.com>",
         ],
     );
 }
@@ -2729,18 +2729,18 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let mut moved = changed(
         SymbolVersionKind::Moved,
         Some("old: a.rs"),
-        Some("new · a.rs"),
+        Some("new | a.rs"),
     );
-    moved.path = Some(project_path("src/a · b.rs"));
+    moved.path = Some(project_path("src/a | b.rs"));
     let mut bare = placed_symbol_hit(symbol(Some(A_ID), "A"));
-    bare.path = Some(project_path("src/a:b·c.rs"));
+    bare.path = Some(project_path("src/a:b|c.rs"));
     let commit = CommitHit {
         message: "Fix".to_owned(),
         author: CommitAuthor {
             name: "Ops: bot".to_owned(),
             email: "ops@example.com".to_owned(),
         },
-        timestamp: "day 1 · noon".to_owned(),
+        timestamp: "day 1 | noon".to_owned(),
         paths: Vec::new(),
         ..commit_hit()
     };
@@ -2749,13 +2749,13 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
         &[
             "3 results",
             "\t[1] struct A",
-            "\t\t\"src/a · b.rs:1\" · name",
+            "\t\t\"src/a | b.rs:1\" | name",
             "\t\trift://symbol/local/rust/app/a/A",
-            "\t\tmoved · \"old: a.rs\" → \"new · a.rs\"",
+            "\t\tmoved | \"old: a.rs\" → \"new | a.rs\"",
             "\t[2] struct A",
-            "\t\tsrc/a:b·c.rs:1 · name",
+            "\t\tsrc/a:b|c.rs:1 | name",
             "\t\trift://symbol/local/rust/app/a/A",
-            "\t[3] 1f2080e4 · \"Ops: bot <ops@example.com>\" · \"day 1 · noon\"",
+            "\t[3] 1f2080e4 | \"Ops: bot <ops@example.com>\" | \"day 1 | noon\"",
             "\t\tFix",
         ],
     );
@@ -2774,11 +2774,11 @@ fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let page: WorkspaceResourcePage = serde_json::from_value(json!({
         "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [{"language": "python", "enabled": true, "execution": false,
-            "syntax": false, "include": ["src/a · b/**"], "exclude": ["docs: old/**", "a:b·c/**"]}],
+            "syntax": false, "include": ["src/a | b/**"], "exclude": ["docs: old/**", "a:b|c/**"]}],
         "source": [
-            {"path": "src/a · b.py", "digest": "8a4d20bc", "language": "python"},
+            {"path": "src/a | b.py", "digest": "8a4d20bc", "language": "python"},
             {"path": "x: y.py", "digest": "8a4d20bc"},
-            {"path": "a:b·c.py", "digest": "8a4d20bc"}
+            {"path": "a:b|c.py", "digest": "8a4d20bc"}
         ],
         "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }))
@@ -2789,12 +2789,12 @@ fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "workspace",
             "languages:",
             "\tpython",
-            "\t\tinclude \"src/a · b/**\"",
-            "\t\texclude \"docs: old/**\", a:b·c/**",
+            "\t\tinclude \"src/a | b/**\"",
+            "\t\texclude \"docs: old/**\", a:b|c/**",
             "source:",
-            "\t\"src/a · b.py\" · python",
+            "\t\"src/a | b.py\" | python",
             "\t\"x: y.py\"",
-            "\ta:b·c.py",
+            "\ta:b|c.py",
         ],
     );
 }
@@ -2871,9 +2871,9 @@ fn history_lists_edges_and_marks_an_incomplete_history() {
             "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\thistory:",
-            "\t\t\t2026-08-21 · 1f2080e4 · changed in · body changed · Alice <alice@example.com>",
+            "\t\t\t2026-08-21 | 1f2080e4 | changed in | body changed | Alice <alice@example.com>",
             "\t\t\t\tFix\\nit",
-            "\t\t\t2026-08-21 · 2b000000 · introduced in · Alice <alice@example.com>",
+            "\t\t\t2026-08-21 | 2b000000 | introduced in | Alice <alice@example.com>",
             "\t[2] struct A",
             "\t\ta.rs:1",
             "\t\trift://symbol/local/rust/app/a/A",
@@ -2914,9 +2914,9 @@ fn a_release_history_lists_each_release_version_with_its_edge() {
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\thistory (incomplete):",
-            "\t\t2.0.0 · removed in release",
-            "\t\t1.1.0 · changed in release · signature changed",
-            "\t\t1.0.0 · introduced in release",
+            "\t\t2.0.0 | removed in release",
+            "\t\t1.1.0 | changed in release | signature changed",
+            "\t\t1.0.0 | introduced in release",
         ],
     );
 }
@@ -2945,7 +2945,7 @@ fn a_truncated_co_change_count_writes_one_line_after_the_edges() {
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\thistory:",
-            "\t\tco changes · rift://symbol/local/rust/app/b/B · 3 commits",
+            "\t\tco changes | rift://symbol/local/rust/app/b/B | 3 commits",
             "\t\tco-changes truncated: 1 commits past bound, 4 symbols past bound",
         ],
     );
@@ -2976,15 +2976,15 @@ fn a_commit_edge_names_its_path_only_when_it_differs_from_the_hit() {
     let output = rendered(&symbol_result(vec![hit, dependency], pagination(0, 1)));
     assert_no_trailing_space(&output);
     assert!(
-        output.contains("aaaaaaaa · renamed from · old.rs · Alice <alice@example.com> · b/a.rs\n"),
+        output.contains("aaaaaaaa | renamed from | old.rs | Alice <alice@example.com> | b/a.rs\n"),
         "{output}"
     );
     assert!(
-        output.contains("bbbbbbbb · introduced in · Alice <alice@example.com>\n"),
+        output.contains("bbbbbbbb | introduced in | Alice <alice@example.com>\n"),
         "{output}"
     );
     assert!(
-        output.contains("cccccccc · removed in · Alice <alice@example.com> · a.rs\n"),
+        output.contains("cccccccc | removed in | Alice <alice@example.com> | a.rs\n"),
         "{output}"
     );
 }
@@ -3017,10 +3017,10 @@ fn sections_come_in_order_documentation_text_context_history() {
             "\tText.",
             "",
             "\tdocumentation:",
-            "\t\tdocs/guide.md:2 · Guide",
+            "\t\tdocs/guide.md:2 | Guide",
             "",
             "\thistory:",
-            "\t\t2026-08-21 · 1f2080e4 · introduced in · Alice <alice@example.com>",
+            "\t\t2026-08-21 | 1f2080e4 | introduced in | Alice <alice@example.com>",
         ])
     );
 }
@@ -3100,7 +3100,7 @@ fn a_failure_without_limit_or_causes_is_one_entry_with_its_message() {
         &error,
         &[
             "1 error",
-            "\tinvalid_request · retry never",
+            "\tinvalid_request | retry never",
             "\t\texpected `limit` of at least 1",
         ],
     );
@@ -3145,16 +3145,16 @@ fn a_failure_writes_the_limit_and_each_cause_as_an_entry_with_its_code_and_direc
         &error,
         &[
             "5 errors",
-            "\tlimit_exceeded · retry never",
+            "\tlimit_exceeded | retry never",
             "\t\tthe request crosses a limit",
             "\t\tlimit source.files: 11 over 10",
-            "\tlimit_exceeded · retry never",
+            "\tlimit_exceeded | retry never",
             "\t\tthe index build crossed it",
-            "\tlimit_exceeded · retry same_request",
+            "\tlimit_exceeded | retry same_request",
             "\t\ta retry may pass",
-            "\tstorage_failure · retry never",
+            "\tstorage_failure | retry never",
             "\t\tthe store refused",
-            "\tinternal_error · retry operator_action",
+            "\tinternal_error | retry operator_action",
             "\t\ttask failed",
         ],
     );
@@ -3173,9 +3173,9 @@ fn a_failure_with_one_cause_and_no_limit_writes_two_entries_and_no_limit_line() 
         &error,
         &[
             "2 errors",
-            "\tstorage_failure · retry same_request",
+            "\tstorage_failure | retry same_request",
             "\t\tthe store refused",
-            "\tstorage_failure · retry same_request",
+            "\tstorage_failure | retry same_request",
             "\t\tdisk full",
         ],
     );
@@ -3188,7 +3188,7 @@ fn a_failure_message_with_a_line_feed_stays_on_one_line() {
         &error,
         &[
             "1 error",
-            "\tinternal_error · retry never",
+            "\tinternal_error | retry never",
             "\t\tfirst\\nerror cancelled\\t \\u{1b}",
         ],
     );
@@ -3198,7 +3198,7 @@ fn a_failure_message_with_a_line_feed_stays_on_one_line() {
 fn a_failure_with_an_empty_message_writes_its_head_and_no_message_entry() {
     golden(
         &error_data(ErrorCode::InternalError, ""),
-        &["1 error", "\tinternal_error · retry never"],
+        &["1 error", "\tinternal_error | retry never"],
     );
 }
 
@@ -3225,11 +3225,11 @@ fn a_registered_failure_writes_its_identity_after_its_limit_and_before_its_cause
         },
         &[
             "2 errors",
-            "\tlimit_exceeded · retry never",
+            "\tlimit_exceeded | retry never",
             "\t\tthe request crosses a limit; narrow the request",
             "\t\tlimit source.files: 11 over 10",
             "\t\trift.index.workspace_too_many_files",
-            "\tstorage_failure · retry same_request",
+            "\tstorage_failure | retry same_request",
             "\t\tthe store refused",
         ],
     );
@@ -3245,7 +3245,7 @@ fn a_registered_failure_without_limit_or_causes_writes_its_identity_under_its_me
         },
         &[
             "1 error",
-            "\tinvalid_request · retry never",
+            "\tinvalid_request | retry never",
             "\t\tquery is empty",
             "\t\trift.ranking.query_empty",
         ],
@@ -3262,7 +3262,7 @@ fn a_registered_identity_with_a_control_character_stays_on_one_line() {
         },
         &[
             "1 error",
-            "\tinternal_error · retry never",
+            "\tinternal_error | retry never",
             "\t\tfirst",
             "\t\trift.test\\nsplit",
         ],
@@ -3337,14 +3337,14 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
         &error,
         &[
             "2 errors",
-            "\tcapability_unavailable · retry never",
+            "\tcapability_unavailable | retry never",
             "\t\tthe provider reported findings",
             "\t\tlimit diagnostics: 5 over 4",
             "\t\terror[E0308] src/lib.rs:3:9: mismatched types\\nexpected `u8`",
             "\t\twarning src/a%20b.rs:7: mismatched types\\nexpected `u8`",
             "\t\thint src/lib.rs: mismatched types\\nexpected `u8`",
             "\t\tinfo[W1]: mismatched types\\nexpected `u8`",
-            "\tcapability_unavailable · retry never",
+            "\tcapability_unavailable | retry never",
             "\t\tno engine",
         ],
     );
@@ -3385,7 +3385,7 @@ fn identities_are_written_whole_and_hashes_are_cut() {
     let mut commit = commit_hit();
     commit.revision = RevisionId("main^2".to_owned());
     let by_branch = rendered(&commit_answer(commit));
-    assert!(by_branch.contains("\n\tmain^2 · "), "{by_branch}");
+    assert!(by_branch.contains("\n\tmain^2 | "), "{by_branch}");
 }
 
 // Limits.
@@ -3657,7 +3657,7 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
     assert!(missing.contains("symbol_not_found"));
     assert!(!missing.contains("revision rift://revision/tree/"));
     let text = rendered(&unavailable);
-    assert!(text.contains("unavailable · indexing is in progress"));
+    assert!(text.contains("unavailable | indexing is in progress"));
     assert!(!text.contains("symbol_not_found"));
     assert!(!text.contains("revision "));
 }
@@ -3691,43 +3691,37 @@ fn unavailable_search(
 }
 
 #[test]
-fn a_preparing_symbol_read_reports_prepared_and_total_files() {
+fn a_preparing_symbol_read_keeps_the_reason_and_clears_progress_warnings() {
     use rift_protocol::symbol_read::{GetSymbolResult, SymbolUnavailableReason};
     let progress = local_preparation(2048, Some(3951));
     let mut unavailable = GetSymbolResult::Unavailable {
         id: SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity"),
         revision: None,
         reason: SymbolUnavailableReason::IndexPreparing,
-        warnings: vec![ReadWarning::GlobalAccessDisabled, progress.clone()],
+        warnings: vec![ReadWarning::GlobalAccessDisabled, progress],
     };
     unavailable.log_warnings();
     let text = rendered(&unavailable);
     let first = text.lines().next();
-    assert_eq!(
-        first,
-        Some("\tunavailable · indexing is in progress (2048 of 3951 files)")
-    );
+    assert_eq!(first, Some("\tunavailable | indexing is in progress"));
     let GetSymbolResult::Unavailable { warnings, .. } = unavailable else {
         unreachable!("the answer stays unavailable");
     };
-    assert_eq!(warnings, [progress]);
+    assert!(warnings.is_empty());
 }
 
 #[test]
-fn a_preparing_search_reports_prepared_files_before_discovery_ends() {
+fn a_preparing_search_renders_the_typed_outcome() {
     use rift_protocol::symbol_read::SymbolUnavailableReason;
     let reason = SymbolUnavailableReason::IndexPreparing;
     let mut unavailable = unavailable_search(reason, vec![local_preparation(17, None)]);
     unavailable.log_warnings();
     let text = rendered(&unavailable);
-    assert_eq!(
-        text,
-        "unavailable · indexing is in progress (17 files so far)\n"
-    );
+    assert_eq!(text, "unavailable | indexing is in progress\n");
 }
 
 #[test]
-fn a_preparing_query_reports_every_progress_count_it_carries() {
+fn a_preparing_query_leaves_progress_in_the_logs() {
     use rift_protocol::query::QueryReadResult;
     use rift_protocol::symbol_read::SymbolUnavailableReason;
     let reason = SymbolUnavailableReason::IndexPreparing;
@@ -3739,8 +3733,7 @@ fn a_preparing_query_reports_every_progress_count_it_carries() {
     let mut output = super::QueryOutput::from(answer);
     output.log_warnings();
     let text = rendered(&output);
-    let expected = "unavailable · indexing is in progress \
-                    (9 of 12 files, 12000 of 17500 rows of file text)\n";
+    let expected = "unavailable | indexing is in progress\n";
     assert_eq!(text, expected);
 }
 
@@ -3752,7 +3745,7 @@ fn a_preparing_read_without_counts_still_says_indexing_is_in_progress() {
     unavailable.log_warnings();
     assert_eq!(
         rendered(&unavailable),
-        "unavailable · indexing is in progress\n"
+        "unavailable | indexing is in progress\n"
     );
 }
 
@@ -3765,7 +3758,7 @@ fn another_unavailable_reason_keeps_its_name_and_no_progress() {
     unavailable.log_warnings();
     assert_eq!(
         rendered(&unavailable),
-        "unavailable · InsufficientCoverage\n"
+        "unavailable | InsufficientCoverage\n"
     );
     let SearchUnavailable::Unavailable { warnings, .. } = unavailable;
     assert!(

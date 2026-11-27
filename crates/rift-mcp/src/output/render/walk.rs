@@ -34,7 +34,7 @@
 //! underscores as spaces (`calls`, `depends on`). An incoming hop writes the kind read from the
 //! other end (`called by`, `dependency of`). Several kinds are joined by `, `, and a
 //! edge whose derivation is `heuristic` starts with `probably`. An edge an external
-//! producer emitted ends with ` · ` and the producer's name and revision (`↳ called ·
+//! producer emitted ends with ` | ` and the producer's name and revision (`↳ called |
 //! demo-indexer 0.6.1`). When every kind ends in `by`, the head line leaves that word out and the
 //! declaration line starts with it.
 
@@ -59,7 +59,7 @@ const IDENTITY: &str = "at";
 /// Word written before the edge of a heuristic hop.
 const HEURISTIC: &str = "probably ";
 /// Separates an edge from the external producer that emitted it.
-const PRODUCER_SEPARATOR: &str = " · ";
+const PRODUCER_SEPARATOR: &str = " | ";
 /// Text between two kinds of one edge.
 const KIND_SEPARATOR: &str = ", ";
 

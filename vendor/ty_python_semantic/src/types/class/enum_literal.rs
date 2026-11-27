@@ -231,7 +231,7 @@ impl<'db> DynamicEnumLiteral<'db> {
     /// Look up an own class member (not inherited) by name.
     ///
     /// For known members, returns the `EnumLiteralType` if `name` matches.
-    /// For unknown members, returns `Member::unbound()` — the unknown-member
+    /// For unknown members, returns `Member::unbound()` - the unknown-member
     /// fallback is handled in `class_member` as a last resort after checking
     /// the full MRO (matching the `NamedTuple` pattern).
     pub(super) fn own_class_member(self, db: &'db dyn Db, name: &str) -> Member<'db> {
@@ -318,7 +318,7 @@ impl<'db> DynamicEnumLiteral<'db> {
         self.with_unknown_member_fallback(db, result)
     }
 
-    /// Functional enums don't define own instance attributes — `.name`, `.value`
+    /// Functional enums don't define own instance attributes - `.name`, `.value`
     /// etc. come from the `Enum` base class, not from the dynamic enum itself.
     #[expect(clippy::unused_self)]
     pub(super) fn own_instance_member(self, _db: &'db dyn Db, _name: &str) -> Member<'db> {

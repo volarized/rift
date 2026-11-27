@@ -160,8 +160,8 @@ export type IsoRoute = (
  * The isometric basis, as scale factors rather than vectors.
  *
  * An orthographic camera on the (1,1,1) diagonal projects a ground-plane point
- * to `RIGHT·(x − z)` across the page and `−RISE·(x + z)` down it, and a height
- * `y` to `LIFT·y` up it. That is the whole of the projection, and the only
+ * to `RIGHT * (x - z)` across the page and `-RISE * (x + z)` down it, and a height
+ * `y` to `LIFT * y` up it. That is the whole of the projection, and the only
  * reason this module knows it is `frameSpan` - a caller has to reserve the
  * right amount of page before three.js has drawn anything.
  */

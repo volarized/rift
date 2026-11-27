@@ -160,18 +160,18 @@ fn visible_escapes_control_characters_and_keeps_everything_else() {
 }
 
 /// The delimiters of a fact line: the fact separator and the detail separator.
-const DELIMITERS: [&str; 2] = [" · ", ": "];
+const DELIMITERS: [&str; 2] = [" | ", ": "];
 
 #[test]
 fn quoted_keeps_a_value_without_a_delimiter_bare() {
     for bare in [
         "plain",
         "",
-        "a·b",
+        "a|b",
         "a:b",
         "path:12",
         "back \\ slash \" quote",
-        "a ·b",
+        "a |b",
         "a :b",
     ] {
         assert!(
@@ -183,15 +183,15 @@ fn quoted_keeps_a_value_without_a_delimiter_bare() {
 
 #[test]
 fn quoted_wraps_a_value_holding_a_delimiter_and_escapes_quote_and_backslash() {
-    assert_eq!(quoted("a · b", &DELIMITERS), "\"a · b\"");
+    assert_eq!(quoted("a | b", &DELIMITERS), "\"a | b\"");
     assert_eq!(quoted("key: value", &DELIMITERS), "\"key: value\"");
-    assert_eq!(quoted(" · ", &DELIMITERS), "\" · \"");
+    assert_eq!(quoted(" | ", &DELIMITERS), "\" | \"");
     assert_eq!(quoted(": ", &DELIMITERS), "\": \"");
     assert_eq!(
         quoted("say \"hi\": C:\\dir", &DELIMITERS),
         "\"say \\\"hi\\\": C:\\\\dir\""
     );
-    assert_eq!(quoted("日本 · 語", &DELIMITERS), "\"日本 · 語\"");
+    assert_eq!(quoted("日本 | 語", &DELIMITERS), "\"日本 | 語\"");
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn a_quoted_value_unescapes_to_the_original_text() {
         assert!(!escaped, "a lone backslash ends {text:?}");
         out
     };
-    for original in ["a · b", "a: b", "\\ · \"", "x\\: \"\"", "\" · \\"] {
+    for original in ["a | b", "a: b", "\\ | \"", "x\\: \"\"", "\" | \\"] {
         let text = quoted(original, &DELIMITERS);
         assert_eq!(unquote(&text), original, "{text}");
     }
@@ -222,11 +222,11 @@ fn a_quoted_value_unescapes_to_the_original_text() {
 
 #[test]
 fn quoted_with_no_delimiters_keeps_every_value_bare() {
-    assert_eq!(quoted("a · b: c", &[]), "a · b: c");
+    assert_eq!(quoted("a | b: c", &[]), "a | b: c");
 }
 
 #[test]
 fn a_quoted_value_with_a_control_character_stays_on_one_line_after_visible() {
-    let text = quoted("a · b\nc", &DELIMITERS);
-    assert_eq!(visible(&text), "\"a · b\\nc\"");
+    let text = quoted("a | b\nc", &DELIMITERS);
+    assert_eq!(visible(&text), "\"a | b\\nc\"");
 }

@@ -336,7 +336,7 @@ fn path_lines(
     }
     lines.blank()?;
     let label = match (truncated, count) {
-        (true, _) => format!("{count}+ paths · truncated"),
+        (true, _) => format!("{count}+ paths | truncated"),
         (false, 1) => "1 path:".to_owned(),
         (false, _) => format!("{count} paths:"),
     };

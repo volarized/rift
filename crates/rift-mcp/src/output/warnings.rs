@@ -24,7 +24,7 @@ fn log_warning(warning: &ReadWarning) {
     );
 }
 
-pub(super) fn record_warnings(warnings: &mut Vec<ReadWarning>) {
+pub(crate) fn record_warnings(warnings: &mut Vec<ReadWarning>) {
     log_warnings(warnings);
     warnings.clear();
 }

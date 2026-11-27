@@ -1251,7 +1251,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                     &|this, storage, path| {
                         // Check which declared constraints are compatible with this complete
                         // solution for the remaining constrained typevars. Note that we _don't_
-                        // update the candidate solution for those declared constraints — we want
+                        // update the candidate solution for those declared constraints - we want
                         // to return the family solution, after all. We just want to make sure that
                         // the individual declared constraints don't _invalidate_ that solution.
                         let mut satisfied_constraint_count = 0;

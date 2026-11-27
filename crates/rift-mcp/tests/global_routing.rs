@@ -1,6 +1,6 @@
 //! Global package routing through served `get_symbol` and `search` reads: the project hits
 //! come from the served snapshot, the package hits from a fixture global API, and every
-//! context entry no public registry serves answers with its typed warning.
+//! context entry no public registry serves has a typed warning in the server log.
 
 #[allow(
     dead_code,
@@ -30,8 +30,8 @@ use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use workspace_client::{
-    ServedWorkspace, TestResult, call_retrying_acceptance, failed_call, served_workspace,
-    tool_request,
+    ReadDiagnostics, ServedWorkspace, TestResult, call_retrying_acceptance, failed_call,
+    served_workspace, tool_request,
 };
 
 const LOCK_WITH_HELPER: &str = "version = 4\n\n[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",\n]\n";
@@ -135,14 +135,12 @@ async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> Test
         Some(configuration),
     )
     .await?;
-    let answer = search_symbols(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
-    )
+    ))
     .await?;
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("warnings are an array")?;
+    let warnings = logged_warnings;
     let warning = warnings
         .iter()
         .find(|warning| warning["code"] == "global_api_unavailable")
@@ -192,20 +190,18 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     )
     .await?;
     let started = tokio::time::Instant::now();
-    let answer = search_symbols(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
-    )
+    ))
     .await?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < RESOLUTION_DELAY,
         "the request deadline must end the resolution wait: elapsed={elapsed:?}"
     );
-    let warning = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let warning = logged_warnings
+        .iter()
         .find(|warning| warning["code"] == "global_api_unavailable")
         .ok_or_else(|| format!("missing deadline warning: {answer:#}"))?;
     assert_eq!(warning["failure_class"], "timeout");
@@ -248,16 +244,15 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     ];
     for (tool, member, args) in reads {
         let started = tokio::time::Instant::now();
-        let answer = call_tool(&client, tool, args).await?;
+        let (answer, logged_warnings) =
+            ReadDiagnostics::observe(call_tool(&client, tool, args)).await?;
         let elapsed = started.elapsed();
         assert!(
             elapsed < READ_DELAY,
             "{tool}: the request deadline must end the read wait: elapsed={elapsed:?}"
         );
-        let warning = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let warning = logged_warnings
+            .iter()
             .find(|warning| warning["code"] == "global_api_unavailable")
             .ok_or_else(|| format!("{tool}: missing deadline warning: {answer:#}"))?;
         assert_eq!(warning["failure_class"], "timeout", "{tool}");
@@ -321,8 +316,11 @@ async fn await_local_caller(
     let incoming = json!({
         "traversal": { "seed": "rift://symbol/local/rust/walk/beacon", "direction": "incoming" }
     });
-    let answer =
-        call_retrying_acceptance(client, tool_request("search_retrieval", &incoming)).await?;
+    let (answer, logged_warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
+        client,
+        tool_request("search_retrieval", &incoming),
+    ))
+    .await?;
     let results = answer["results"]
         .as_array()
         .ok_or("the local caller walk returns results")?;
@@ -331,15 +329,12 @@ async fn await_local_caller(
         results[0]["hit"]["symbol"]["id"], "rift://symbol/local/rust/walk/caller",
         "{answer:#}"
     );
-    if let Some(warnings) = answer.get("warnings") {
-        let warnings = warnings.as_array().ok_or("warnings are an array")?;
-        assert!(
-            warnings.iter().all(|warning| !warning["code"]
-                .as_str()
-                .is_some_and(|code| code.starts_with("engine_"))),
-            "the local engine answers without warnings: {answer:#}"
-        );
-    }
+    assert!(
+        logged_warnings.iter().all(|warning| !warning["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("engine_"))),
+        "the local engine answers without warnings: {logged_warnings:#?}"
+    );
     assert!(
         fixture.requests().await.is_empty(),
         "the local caller walk makes no global request"
@@ -349,7 +344,7 @@ async fn await_local_caller(
 
 /// An outgoing walk from `caller` against a fixture holding `hold` past the request
 /// deadline: the walk answers well before the held answer would have arrived, the
-/// standard library callee drops, and the answer carries the timeout warning.
+/// standard library callee drops, and the read logs the timeout warning.
 async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         hold: Some(hold),
@@ -412,13 +407,16 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         "traversal": { "seed": "rift://symbol/local/rust/walk/caller", "direction": "outgoing" }
     });
     let started = tokio::time::Instant::now();
-    let answer = call_retrying_acceptance(&client, tool_request("search_retrieval", &walk)).await?;
+    let (answer, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &walk),
+    ))
+    .await?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < CALLEE_HOLD,
         "the request deadline must end the wait: elapsed={elapsed:?}"
     );
-    let warnings = answer["warnings"].clone();
     assert_eq!(warnings[0]["code"], "callees_dropped", "{answer:#}");
     assert_eq!(warnings[0]["callees"], 1, "{answer:#}");
     assert_eq!(
@@ -510,16 +508,15 @@ async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
     let walk = json!({
         "traversal": {"seed": "rift://symbol/local/python/app/counted", "direction": "outgoing"}
     });
-    let answer = call_retrying_acceptance(&client, tool_request("search_retrieval", &walk)).await?;
-    assert_eq!(
-        answer["warnings"][0]["code"], "callees_dropped",
-        "{answer:#}"
-    );
-    assert_eq!(answer["warnings"][0]["callees"], 1, "{answer:#}");
+    let (answer, logged_warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &walk),
+    ))
+    .await?;
+    assert_eq!(logged_warnings[0]["code"], "callees_dropped", "{answer:#}");
+    assert_eq!(logged_warnings[0]["callees"], 1, "{answer:#}");
     assert!(
-        answer["warnings"]
-            .as_array()
-            .is_some_and(|warnings| warnings.len() == 1),
+        logged_warnings.len() == 1,
         "an unproved runtime owner does not become a global service failure: {answer:#}"
     );
     assert!(
@@ -545,10 +542,10 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = search_symbols(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"\"helper_beacon\"","scope":"all"}),
-    )
+    ))
     .await?;
     let hits = answer["results"].as_array().ok_or("hits are an array")?;
     assert_eq!(
@@ -558,10 +555,8 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         [json!(COLLECTED_UNIT)],
         "the helper outside the workspace is analyzed nowhere: {answer:#}"
     );
-    let (warnings, page_warnings): (Vec<&Value>, Vec<&Value>) = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let (warnings, page_warnings): (Vec<&Value>, Vec<&Value>) = logged_warnings
+        .iter()
         .filter(|warning| warning["code"] != "lexical_ranking_unavailable")
         .partition(|warning| warning["code"] != "global_page_warning");
     let codes: Vec<&str> = warnings
@@ -661,10 +656,10 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             Some(configuration),
         )
         .await?;
-        let answer = search_symbols(
+        let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
             &client,
             json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
-        )
+        ))
         .await?;
         assert_eq!(
             answer["results"]
@@ -676,10 +671,8 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             [&json!(COLLECTED_UNIT)],
             "{answer:#}"
         );
-        let substituted: Vec<&Value> = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let substituted: Vec<&Value> = logged_warnings
+            .iter()
             .filter(|warning| warning["code"] == "package_substituted")
             .collect();
         assert_eq!(
@@ -708,11 +701,11 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = call_tool(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(call_tool(
         &client,
         "search",
         json!({"query":"helper_beacon demo","scope":"global"}),
-    )
+    ))
     .await?;
     assert!(
         answer["results"]
@@ -720,10 +713,8 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
             .is_some_and(|results| { results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT) }),
         "{answer:#}"
     );
-    assert!(answer["warnings"].as_array().is_some_and(|warnings| {
-        warnings.iter().any(|warning| {
-            warning["code"] == "global_page_warning" && warning["warning_code"] == "query_narrowed"
-        })
+    assert!(logged_warnings.iter().any(|warning| {
+        warning["code"] == "global_page_warning" && warning["warning_code"] == "query_narrowed"
     }));
 
     let requests = fixture.requests().await;
@@ -1152,11 +1143,11 @@ async fn a_page_warning_preserves_the_answer() -> TestResult {
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = call_tool(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(call_tool(
         &client,
         "search",
         json!({"query":"helper_beacon demo","scope":"global","include":{"source": true}}),
-    )
+    ))
     .await?;
     assert!(
         answer["results"]
@@ -1164,10 +1155,8 @@ async fn a_page_warning_preserves_the_answer() -> TestResult {
             .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
         "{answer:#}"
     );
-    let truncated: Vec<&Value> = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let truncated: Vec<&Value> = logged_warnings
+        .iter()
         .filter(|warning| {
             warning["code"] == "global_page_warning"
                 && warning["warning_code"] == "result_truncated"
@@ -1421,15 +1410,13 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = search_symbols(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"beacon","scope":"all"}),
-    )
+    ))
     .await?;
-    let warning = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let warning = logged_warnings
+        .iter()
         .find(|warning| warning["code"] == "global_response_invalid")
         .ok_or_else(|| format!("missing invalid-response warning: {answer:#}"))?;
     assert_eq!(
@@ -1459,11 +1446,14 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     // invalid page.
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = call_tool(&client, "search", json!({"query":"beacon","scope":"all"})).await?;
-    let warning = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let (answer, logged_warnings) = ReadDiagnostics::observe(call_tool(
+        &client,
+        "search",
+        json!({"query":"beacon","scope":"all"}),
+    ))
+    .await?;
+    let warning = logged_warnings
+        .iter()
         .find(|warning| warning["code"] == "global_response_invalid")
         .ok_or_else(|| format!("missing invalid-response warning: {answer:#}"))?;
     assert_eq!(warning["failure_class"], "invalid_response");
@@ -1494,39 +1484,36 @@ async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult 
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let expected = json!({"code": "global_response_invalid", "failure_class": "invalid_response"});
-    let global_warnings = |answer: &Value| -> Vec<Value> {
-        answer["warnings"]
-            .as_array()
+    let global_warnings = |warnings: Vec<Value>| -> Vec<Value> {
+        warnings
             .into_iter()
-            .flatten()
             .filter(|warning| {
                 warning["code"]
                     .as_str()
                     .is_some_and(|code| code.starts_with("global_"))
             })
-            .cloned()
             .collect()
     };
 
-    let first = search_symbols(
+    let (first, first_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"beacon","scope":"all"}),
-    )
+    ))
     .await?;
     assert_eq!(
-        global_warnings(&first),
+        global_warnings(first_warnings),
         std::slice::from_ref(&expected),
         "{first:#}"
     );
     let sent = fixture.requests().await.len();
 
-    let later = call_tool(
+    let (later, later_warnings) = ReadDiagnostics::observe(call_tool(
         &client,
         "search",
         json!({"query": "beacon", "scope": "all", "target": "symbol"}),
-    )
+    ))
     .await?;
-    assert_eq!(global_warnings(&later), [expected], "{later:#}");
+    assert_eq!(global_warnings(later_warnings), [expected], "{later:#}");
     assert_eq!(
         fixture.requests().await.len(),
         sent,
@@ -1568,15 +1555,13 @@ async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> T
         Some(configuration),
     )
     .await?;
-    let answer = search_symbols(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query": "local_beacon", "scope": "all"}),
-    )
+    ))
     .await?;
-    let warning = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let warning = logged_warnings
+        .iter()
         .find(|warning| warning["code"] == "global_api_unavailable")
         .ok_or_else(|| format!("missing global API warning: {answer:#}"))?;
     assert_eq!(
@@ -1683,27 +1668,24 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     )
     .await?;
 
-    let answer = search_symbols(
+    let (answer, logged_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"local_beacon","scope":"all"}),
-    )
+    ))
     .await?;
 
     assert_eq!(
         answer["results"][0]["hit"]["symbol"]["name"],
         "local_beacon"
     );
-    assert_unserved_dependency_warnings(&answer)?;
+    assert_unserved_dependency_warnings(&answer, &logged_warnings);
     drop(directory);
     client.cancel().await?;
     server_task.await?;
     Ok(())
 }
 
-fn assert_unserved_dependency_warnings(answer: &Value) -> TestResult {
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("warnings are an array")?;
+fn assert_unserved_dependency_warnings(answer: &Value, warnings: &[Value]) {
     let disabled: Vec<&Value> = warnings
         .iter()
         .filter(|warning| warning["code"] == "global_access_disabled")
@@ -1779,10 +1761,11 @@ fn assert_unserved_dependency_warnings(answer: &Value) -> TestResult {
     assert_eq!(unavailable, expected, "{answer:#}");
     assert_distinct_registry_observations(warnings, answer);
     assert!(
-        !answer.to_string().contains("\"inner\""),
-        "a path dependency inside the workspace is project source: {answer:#}"
+        warnings
+            .iter()
+            .all(|warning| warning["entry"]["name"] != "inner"),
+        "a path dependency inside the workspace is project source: {warnings:#?}"
     );
-    Ok(())
 }
 
 fn assert_distinct_registry_observations(warnings: &[Value], answer: &Value) {
@@ -1859,11 +1842,9 @@ fn demo_entries(entries: &[Value]) -> Vec<&Value> {
 }
 
 /// The versions of the `package_substituted` entries `answer` warns about.
-fn substituted_versions(answer: &Value) -> Vec<&Value> {
-    answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+fn substituted_versions(warnings: &[Value]) -> Vec<&Value> {
+    warnings
+        .iter()
         .filter(|warning| warning["code"] == "package_substituted")
         .map(|warning| &warning["entry"]["version"])
         .collect()
@@ -1885,18 +1866,18 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     );
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let pinned = search_symbols(
+    let (pinned, pinned_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
-    )
+    ))
     .await?;
     assert_eq!(
-        substituted_versions(&pinned),
+        substituted_versions(&pinned_warnings),
         [&json!("0.9.0")],
         "{pinned:#}"
     );
 
-    let replaced = search_symbols(
+    let (replaced, replaced_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({
             "target": "symbol",
@@ -1904,8 +1885,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
             "scope": "global",
             "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
-    )
-    .await?;
+    )).await?;
     let units: Vec<&Value> = replaced["results"]
         .as_array()
         .into_iter()
@@ -1914,7 +1894,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         .collect();
     assert_eq!(units, [&json!(COLLECTED_UNIT)], "{replaced:#}");
     assert!(
-        substituted_versions(&replaced).is_empty(),
+        substituted_versions(&replaced_warnings).is_empty(),
         "the requested release answers exactly: {replaced:#}"
     );
 
@@ -1944,13 +1924,13 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         "the entries the request names nothing about stand: {resolutions:#?}"
     );
 
-    let again = search_symbols(
+    let (again, again_warnings) = ReadDiagnostics::observe(search_symbols(
         &client,
         json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
-    )
+    ))
     .await?;
     assert_eq!(
-        substituted_versions(&again),
+        substituted_versions(&again_warnings),
         [&json!("0.9.0")],
         "the next read resolves the workspace's own version: {again:#}"
     );
@@ -2132,7 +2112,8 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
         "scope": "global",
         "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
-    let answer = call_tool(&client, "search", request).await?;
+    let (answer, logged_warnings) =
+        ReadDiagnostics::observe(call_tool(&client, "search", request)).await?;
     assert!(
         answer["results"]
             .as_array()
@@ -2143,9 +2124,7 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
     assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
     assert_eq!(sent[0].len(), usize::try_from(advertised)?, "{sent:#?}");
     assert_eq!(demo_entries(&sent[0]).len(), 1, "{sent:#?}");
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("warnings are an array")?;
+    let warnings = logged_warnings;
     let degraded: Vec<&Value> = warnings
         .iter()
         .filter(|warning| {
@@ -2226,7 +2205,8 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
             {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}
         ]
     });
-    let answer = call_tool(&client, "search", request).await?;
+    let (answer, logged_warnings) =
+        ReadDiagnostics::observe(call_tool(&client, "search", request)).await?;
     assert!(
         answer["results"]
             .as_array()
@@ -2245,9 +2225,7 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
         })],
         "{sent:#?}"
     );
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("warnings are an array")?;
+    let warnings = logged_warnings;
     let degraded: Vec<&Value> = warnings
         .iter()
         .filter(|warning| {
@@ -2331,16 +2309,15 @@ async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() ->
         "scope": "global",
         "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
-    let answer = call_tool(&client, "search", request).await?;
+    let (answer, logged_warnings) =
+        ReadDiagnostics::observe(call_tool(&client, "search", request)).await?;
     assert!(
         answer["results"]
             .as_array()
             .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
         "{answer:#}"
     );
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("warnings are an array")?;
+    let warnings = logged_warnings;
     let degraded: Vec<&Value> = warnings
         .iter()
         .filter(|warning| warning["code"] == "package_context_degraded")
@@ -2423,16 +2400,15 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
         ),
     ];
     for (tool, request, hits, feature) in reads {
-        let answer = call_tool(&client, tool, request.clone()).await?;
+        let (answer, logged_warnings) =
+            ReadDiagnostics::observe(call_tool(&client, tool, request.clone())).await?;
         let project_hits = answer[hits].as_array().ok_or("hits are an array")?;
         assert!(!project_hits.is_empty(), "{request}: {answer:#}");
         assert!(
             project_hits.iter().all(|hit| hit.get("unit").is_none()),
             "no package answers: {answer:#}"
         );
-        let warnings = answer["warnings"]
-            .as_array()
-            .ok_or("warnings are an array")?;
+        let warnings = logged_warnings;
         let capability: Vec<&Value> = warnings
             .iter()
             .filter(|warning| warning["code"] == "global_page_warning")
@@ -2450,7 +2426,9 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
             "{request}: {answer:#}"
         );
         assert!(
-            !answer.to_string().contains("global_response_invalid"),
+            warnings
+                .iter()
+                .all(|warning| warning["code"] != "global_response_invalid"),
             "{request}: {answer:#}"
         );
     }

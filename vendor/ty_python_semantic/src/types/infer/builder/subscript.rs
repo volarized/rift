@@ -773,7 +773,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let provided_type = if typevars_len == 0 {
                 // If there are no typevars at all, this is not a generic type,
                 // so we should not infer excess arguments as type expressions.
-                // For example, `list[int][0]` — the `0` is not a type expression.
+                // For example, `list[int][0]` - the `0` is not a type expression.
                 self.infer_expression(expr, TypeContext::default())
             } else {
                 let previously_in_valid_unpack_context = self

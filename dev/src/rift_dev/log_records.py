@@ -50,7 +50,7 @@ NESTED_MARK = "↳ "
 # The marks a span close or a lifecycle record prints before its message.
 MARKS = "→✓✗"
 # Values containing these separators print as JSON strings in `LogLines`.
-QUOTED_VALUE_SEPARATORS = (" · ", ": ")
+QUOTED_VALUE_SEPARATORS = (" | ", ": ")
 # A span close: `close`, then its mark when the record states one.
 CLOSE = re.compile(r"^close(?: [✓✗])?(?:\s|$)")
 

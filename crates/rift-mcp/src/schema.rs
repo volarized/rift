@@ -35,10 +35,7 @@ impl RiftMcp {
             if let Some(output) = tool.output_schema.as_mut() {
                 let output = Arc::make_mut(output);
                 rift_protocol::schema::strip_optional_null_arms(output);
-                // Query callers use coverage warnings to interpret a partial answer.
-                if tool.name != "search" {
-                    rift_protocol::schema::strip_response_warnings(output);
-                }
+                rift_protocol::schema::strip_response_warnings(output);
                 if matches!(tool.name.as_ref(), "get_symbol" | "search") {
                     // These result unions contain only objects. Keep their union constraints
                     // while declaring the root type required by earlier MCP clients.
@@ -203,14 +200,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_schemas_exclude_operator_diagnostics_outside_queries() {
+    fn tool_output_schemas_exclude_operator_diagnostics() {
         let document: serde_json::Value =
             serde_json::from_str(&schema_document()).expect("exported MCP document");
         for tool in document["tools"].as_array().expect("tool listing") {
-            if tool["name"] == "search" {
-                continue;
+            let schema = &tool["output_schema"];
+            for definition in [
+                "ReadWarning",
+                "DocumentationWarning",
+                "GlobalPageWarningCode",
+            ] {
+                assert!(schema["$defs"].get(definition).is_none(), "{definition}");
             }
-            let mut pending = vec![&tool["output_schema"]];
+            let mut pending = vec![schema];
             while let Some(syntax_element) = pending.pop() {
                 match syntax_element {
                     serde_json::Value::Object(object) => {
@@ -244,9 +246,7 @@ mod tests {
                 .expect("declared output")
                 .clone();
             rift_protocol::schema::strip_optional_null_arms(&mut expected);
-            if name != "search" {
-                rift_protocol::schema::strip_response_warnings(&mut expected);
-            }
+            rift_protocol::schema::strip_response_warnings(&mut expected);
             expected.entry("type").or_insert(json!("object"));
             let actual = current
                 .output_schema

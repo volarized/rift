@@ -27,7 +27,7 @@ use ty_python_semantic::{ImportAliasResolution, ResolvedDefinition, SemanticMode
 
 /// Resolve the symbol at `offset` to a list of [`CallHierarchyItem`]s.
 ///
-/// Returns `None` when the cursor is not on a function, method, or class — only
+/// Returns `None` when the cursor is not on a function, method, or class - only
 /// callable definitions can anchor a call hierarchy. Returns one item per
 /// resolved definition; the cursor on an overload implementation or a call site
 /// of an overloaded function yields one item per overload candidate, while the
@@ -62,7 +62,7 @@ pub fn prepare_call_hierarchy(
 
 /// One node in a call hierarchy.
 ///
-/// Mirrors `lsp_types::CallHierarchyItem` but in ty's domain types — the LSP-layer
+/// Mirrors `lsp_types::CallHierarchyItem` but in ty's domain types - the LSP-layer
 /// conversion happens in `ty_server`.
 #[derive(Debug, Clone)]
 pub struct CallHierarchyItem {
@@ -74,7 +74,7 @@ pub struct CallHierarchyItem {
     pub file: File,
     /// Full range of the definition (or full file range for `Module`).
     pub full_range: TextRange,
-    /// Selection range — the symbol name. Used as the stateless key when the
+    /// Selection range - the symbol name. Used as the stateless key when the
     /// LSP client re-sends this item to `incomingCalls` / `outgoingCalls`.
     pub selection_range: TextRange,
 }

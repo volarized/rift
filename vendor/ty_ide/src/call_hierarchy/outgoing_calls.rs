@@ -65,7 +65,7 @@ pub fn outgoing_calls(db: &dyn Db, file: ProgramFile<'_>, offset: TextSize) -> V
 
         // Walk the queried symbol's signature parts (everything evaluated when
         // its `def`/`class` statement runs) and then its body. Inside the body
-        // the visitor stops at nested callables — see `OutgoingCallsFinder`.
+        // the visitor stops at nested callables - see `OutgoingCallsFinder`.
         match def.kind(db) {
             DefinitionKind::Function(fn_ref) => {
                 let func = fn_ref.node(&parsed);
@@ -175,7 +175,7 @@ impl<'a> OutgoingCallsFinder<'a, '_> {
         }
     }
 
-    /// Visit the definition-time parts of a function / lambda — everything
+    /// Visit the definition-time parts of a function / lambda - everything
     /// evaluated when the `def` (or `lambda` expression) is reached at runtime
     /// in the *enclosing* scope: decorators, type parameters, parameter defaults
     /// and annotations, return-type annotation.
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn lambda_default_attributed_to_enclosing_scope() {
         // A lambda's parameter defaults are evaluated when the surrounding
-        // scope reaches the lambda expression — they belong to the enclosing
+        // scope reaches the lambda expression - they belong to the enclosing
         // scope's outgoing, not to the lambda. The lambda's own body call is
         // NOT included.
         let test = cursor_test(

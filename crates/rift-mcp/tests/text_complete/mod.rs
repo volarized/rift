@@ -191,7 +191,7 @@ fn source_lines(text: &str, value: &serde_json::Value, indent: &str) -> Result<(
 fn query_continuation_text(text: &str, _structured: &serde_json::Value) -> Result<(), String> {
     let continuations: Vec<_> = text
         .lines()
-        .filter_map(|line| line.strip_prefix("next query · "))
+        .filter_map(|line| line.strip_prefix("next query | "))
         .collect();
     if !continuations.is_empty() {
         return Err("query continuation differs".into());
@@ -332,8 +332,10 @@ fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), S
     if text.lines().any(|line| line.starts_with("view ")) {
         return Err("routine view in query text".into());
     }
-    for warning in structured["warnings"].as_array().into_iter().flatten() {
-        token(text, &warning["detail"], "$.warnings.detail")?;
+    if structured.get("warnings").is_some()
+        || text.lines().any(|line| line.starts_with("warning | "))
+    {
+        return Err("read warnings belong in the logs".into());
     }
     Ok(())
 }
@@ -420,8 +422,7 @@ mod tests {
             "true\n",
             json!({
                 "answer": { "result": "boolean", "value": true },
-                "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
-                "warnings": []
+                "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
             }),
         );
         assert!(text_states(FACETS_TOOL, &answer).is_err());
@@ -439,22 +440,24 @@ mod tests {
             text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())),
             Ok(())
         );
-        let with_view = "true\nview claims.syntax_elements · expires 2030-01-01T00:15:00Z\n";
+        let with_view = "true\nview claims.syntax_elements | expires 2030-01-01T00:15:00Z\n";
         assert!(text_states(SEARCH_TOOL, &result_of(with_view, structured)).is_err());
     }
 
     #[test]
-    fn query_text_keeps_discovery_warnings() {
+    fn query_answers_refuse_diagnostics_in_either_representation() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
             "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
             "warnings": [{ "code": "traversal_truncated", "detail": "flow discovery reached the provider request bound" }]
         });
         assert!(text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())).is_err());
-        let complete = "true\nwarning · flow discovery reached the provider request bound\n";
-        assert_eq!(
-            text_states(SEARCH_TOOL, &result_of(complete, structured)),
-            Ok(())
-        );
+        let mut without_warnings = structured;
+        without_warnings
+            .as_object_mut()
+            .expect("query result")
+            .remove("warnings");
+        let warned = "true\nwarning | flow discovery reached the provider request bound\n";
+        assert!(text_states(SEARCH_TOOL, &result_of(warned, without_warnings)).is_err());
     }
 }

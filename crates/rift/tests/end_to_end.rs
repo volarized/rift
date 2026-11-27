@@ -2,7 +2,7 @@
 //! found, each driven through the real `rift` binary over stdio against a
 //! real elected server and a real temp-directory workspace, asserting an
 //! outcome a caller could observe - the bytes on disk, the exact refusal,
-//! the hits an answer carries, the warning it names.
+//! or the hits an answer carries.
 //!
 //! Every case reaches the shared harness in `harness.rs` - `laid_out_workspace`,
 //! `proxy_client`, `proxied_call` - the same entry points `mcp_proxy.rs` uses.
@@ -26,11 +26,11 @@ use harness::{
 use serde_json::json;
 use std::time::Duration;
 
-/// Calls `search` until the lexical population pass has landed.
+/// Calls `search` until the expected content hit appears.
 ///
 /// Workspace map readiness covers local file preparation. The lexical lane commits its
-/// initial write behind that publication, so a search can return `index_preparing` or
-/// identifier matches with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
+/// initial write behind that publication. The expected content hit proves that the
+/// store has indexed the file.
 ///
 /// # Errors
 ///
@@ -41,6 +41,7 @@ use std::time::Duration;
 async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     arguments: &serde_json::Value,
+    expected_path: &str,
 ) -> TestResult<serde_json::Value> {
     const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
     const SEARCH_TIER_POLL: Duration = Duration::from_millis(50);
@@ -48,25 +49,20 @@ async fn search_after_population(
     let query = arguments["query"].as_str().unwrap_or("<missing query>");
     let mut answer = proxied_call(client, "search", arguments).await?;
     for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-        let population_pending = answer["reason"] == "index_preparing"
-            || answer["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|warning| {
-                    matches!(
-                        warning["code"].as_str(),
-                        Some("lexical_ranking_unavailable" | "stale_index")
-                    )
-                });
-        if !population_pending {
+        let bindings = answer["answer"]["bindings"].as_array();
+        let found = bindings.is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["path"]["value"] == expected_path && row["matched_by"]["value"] == "content"
+            })
+        });
+        if found || (bindings.is_none() && answer["reason"] != "index_preparing") {
             return Ok(answer);
         }
         tokio::time::sleep(SEARCH_TIER_POLL).await;
         answer = proxied_call(client, "search", arguments).await?;
     }
     Err(format!(
-        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+        "search did not return a content hit for {expected_path} from query {query}. Last answer: {answer:#}"
     )
     .into())
 }
@@ -129,7 +125,7 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
             "justfile",
         ),
     ] {
-        let answer = search_after_population(&client, &json!({"query":query})).await?;
+        let answer = search_after_population(&client, &json!({"query":query}), path).await?;
         let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } =
             serde_json::from_value(answer["answer"].clone())?
         else {

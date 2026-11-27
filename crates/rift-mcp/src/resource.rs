@@ -354,7 +354,7 @@ mod tests {
 
         assert_eq!(
             contents(&rendered, uri).0,
-            "workspace · page 2/4, total 40 results\nnext · rift://workspace?page=3&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "workspace | page 2/4, total 40 results\nnext | rift://workspace?page=3&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         );
     }
 
@@ -381,7 +381,7 @@ mod tests {
         let (compact, body) = contents(&answer, MAP_URI);
         assert_eq!(
             compact,
-            "workspace map\nNo indexed files.\nsource catalog · rift://workspace\n"
+            "workspace map\nNo indexed files.\nsource catalog | rift://workspace\n"
         );
         assert_eq!(body, serde_json::to_string(&map).expect("map serializes"));
     }
@@ -416,8 +416,8 @@ mod tests {
         let (compact, _) = contents(&answer, MAP_URI);
         assert_eq!(
             compact,
-            "workspace map\npackages:\n\ttokio ^1.53.1 (cargo)\n\tlocal 0.4 (cargo · path)\n\
-             \trust@1.98.1 (stdlib)\nNo indexed files.\nsource catalog · rift://workspace\n"
+            "workspace map\npackages:\n\ttokio ^1.53.1 (cargo)\n\tlocal 0.4 (cargo | path)\n\
+             \trust@1.98.1 (stdlib)\nNo indexed files.\nsource catalog | rift://workspace\n"
         );
     }
 

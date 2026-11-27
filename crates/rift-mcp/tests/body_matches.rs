@@ -16,7 +16,7 @@ use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use workspace_client::{await_workspace_ready, search_after_population};
+use workspace_client::{await_workspace_ready, populated_answer, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -70,7 +70,7 @@ fn workspace() -> TestResult<tempfile::TempDir> {
     Ok(directory)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() -> TestResult {
     let directory = workspace()?;
     let client = client_for(directory.path()).await?;
@@ -93,16 +93,14 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
     );
 
     let selected_arguments = json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } });
-    let selected = search_after_population(&client, &selected_arguments).await?;
+    let (selected, diagnostics) =
+        populated_answer(&client, "search_retrieval", &selected_arguments).await?;
     assert!(named(&selected).is_empty(), "{selected:#}");
-    let warning = selected["warnings"]
-        .as_array()
-        .and_then(|warnings| {
-            warnings
-                .iter()
-                .find(|warning| warning["code"] == json!("lockfile_excluded"))
-        })
-        .ok_or("selecting an excluded lockfile warns")?;
+    assert!(selected.get("warnings").is_none(), "{selected:#}");
+    let warning = diagnostics
+        .iter()
+        .find(|warning| warning["code"] == "lockfile_excluded")
+        .ok_or("selecting an excluded lockfile logs a warning")?;
     assert_eq!(
         warning["files"],
         json!(["rift://source/project/Cargo.lock"]),

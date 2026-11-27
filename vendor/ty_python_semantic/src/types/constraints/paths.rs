@@ -413,7 +413,7 @@ impl PathAssignments {
     /// constraint that the BDD node checks, and whether we are following the `if_true` or
     /// `if_false` edge.
     ///
-    /// This new assignment might cause this path to become impossible — for instance, if we were
+    /// This new assignment might cause this path to become impossible - for instance, if we were
     /// already assuming (from an earlier edge in the path) a constraint that is disjoint with this
     /// one. We might also be able to infer _other_ assignments that do not appear in the BDD
     /// directly, but which are implied from a combination of constraints that we _have_ seen.
@@ -439,7 +439,7 @@ impl PathAssignments {
         assignment: Assignment<AtomicConstraintId>,
         f: impl FnOnce(&mut ConstraintSetStorage<'db>, &mut Self, Range<usize>, bool) -> R,
     ) -> R {
-        // Record a snapshot of the assignments that we already knew held — both so that we can
+        // Record a snapshot of the assignments that we already knew held - both so that we can
         // pass along the range of which assignments are new, and so that we can reset back to this
         // point before returning.
         let start = self.assignments.len();
@@ -481,7 +481,7 @@ impl PathAssignments {
         // Otherwise invoke the callback to keep traversing the BDD. The callback will likely
         // traverse additional edges, which might add more to our `assignments` set. But even
         // if that happens, `start..end` will mark the assignments that were added by the
-        // `add_assignment` call above — that is, the new assignment for this edge along with
+        // `add_assignment` call above - that is, the new assignment for this edge along with
         // the derived information we inferred from it.
         let end = self.assignments.len();
         let result = f(storage, self, start..end, found_conflict);

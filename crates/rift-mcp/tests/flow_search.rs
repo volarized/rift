@@ -287,14 +287,15 @@ async fn static_rust_reports_partial_coverage_for_an_inferred_receiver() -> Test
     let (_fixture, client, task) = served_workspace(&files, None).await?;
     let entry = captured_seed(&client, "entry", RUST_PATH).await?;
     let middle = captured_seed(&client, "middle", RUST_PATH).await?;
-    let partial = query_after_population(&client, &flows("")).await?;
+    let (partial, warnings) =
+        workspace_client::populated_answer(&client, "search", &serde_json::to_value(flows(""))?)
+            .await?;
+    assert!(partial.get("warnings").is_none());
     assert_steps(&partial, &[(0, entry.as_str()), (1, middle.as_str())])?;
     assert!(
-        partial["warnings"]
-            .as_array()
-            .is_some_and(|warnings| warnings
-                .iter()
-                .any(|warning| { warning["code"] == "edge_coverage_missing" })),
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "edge_coverage_missing"),
         "partial flow must report unavailable call coverage: {partial}"
     );
 

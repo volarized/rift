@@ -303,7 +303,7 @@ pub(super) fn canonical(
             for alternative in &symbol_not_found.alternatives {
                 lines.line(
                     1,
-                    &format!("{} · {}", alternative.id.as_str(), alternative.name),
+                    &format!("{} | {}", alternative.id.as_str(), alternative.name),
                 )?;
                 lines.line(2, &format!("{:?}", alternative.match_context))?;
             }
@@ -316,10 +316,10 @@ pub(super) fn canonical(
             id,
             revision,
             reason,
-            warnings,
+            ..
         } => {
             let mut lines = Lines::new(out, 0, 1);
-            lines.head(&super::unavailable::line(*reason, warnings))?;
+            lines.head(&super::unavailable::line(*reason))?;
             lines.line(0, id.as_str())?;
             revision.as_ref()
         }

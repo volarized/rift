@@ -79,7 +79,10 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
-    assert_fixture_warnings(name, request, structured);
+    assert!(
+        structured.get("warnings").is_none(),
+        "{context}: {structured:#}"
+    );
     assert!(
         structured["documentation"].get("warnings").is_none(),
         "{context}: {structured:#}"
@@ -132,43 +135,6 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             }
         }
     }
-}
-
-fn assert_fixture_warnings(name: &str, request: &Value, structured: &Value) {
-    use rift_protocol::read::ReadWarning;
-
-    let Some(warnings) = structured.get("warnings") else {
-        return;
-    };
-    assert_eq!(name, "search", "{structured:#}");
-    let query = request["query"].as_str().expect("query statement");
-    assert!(
-        [":calls", ":references", ":usages"]
-            .iter()
-            .any(|predicate| query.contains(predicate)),
-        "only edge reads omit the fixture's unlinked declarations: {request:#}"
-    );
-    let warnings: Vec<rift_protocol::read::ReadWarning> =
-        serde_json::from_value(warnings.clone()).expect("typed read warnings");
-    // The unlinked change_witness.rs holds two declarations without identities.
-    assert_eq!(
-        warnings
-            .iter()
-            .filter(|warning| matches!(warning,
-        ReadWarning::EdgeCoverageMissing { kinds, detail }
-            if kinds.is_empty() && detail.contains("identities: 2;")))
-            .count(),
-        1,
-        "{warnings:?}"
-    );
-    // Mixed-language reads retain their captured and engine coverage warnings too.
-    assert!(
-        warnings.iter().all(|warning| matches!(
-            warning,
-            ReadWarning::EdgeCoverageMissing { .. } | ReadWarning::EngineAnalysisUnavailable { .. }
-        )),
-        "{warnings:?}"
-    );
 }
 
 /// Exact retrieval reaches the released owner its canonical identity names.
@@ -1273,6 +1239,7 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     let caller = workspace_client::captured_seed(&client, "caller", "lib.rs").await?;
     let unconfirmed = serde_json::to_value(workspace_client::query::path(&caller, ":calls")?)?;
     assert_validates(input_validator, &unconfirmed, "an outgoing walk");
+    let mut diagnostics = workspace_client::ReadDiagnostics::capture()?;
     let structured = workspace_client::call_retrying_acceptance(
         &client,
         workspace_client::tool_request("search", &unconfirmed),
@@ -1287,19 +1254,18 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         !workspace_client::query::rows(&structured)?.is_empty(),
         "{structured}"
     );
+    assert!(structured.get("warnings").is_none(), "{structured}");
     assert!(
-        structured["warnings"]
-            .as_array()
-            .is_some_and(|warnings| warnings
-                .iter()
-                .any(|warning| warning["code"] == "engine_readiness_unconfirmed")),
-        "{structured}"
+        diagnostics
+            .take()?
+            .iter()
+            .any(|warning| warning["code"] == "engine_readiness_unconfirmed")
     );
     client.cancel().await?;
     Ok(())
 }
 
-/// A named runtime call remains schema-valid beside a warning for missing edge coverage.
+/// A named runtime call validates against the schema and establishes edge coverage.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> TestResult {
@@ -1330,6 +1296,7 @@ async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> Tes
     let caller = workspace_client::captured_seed(&client, "caller", "caller.py").await?;
     let walk = json!({"query":format!("SELECT ?symbol {{ <{caller}> :calls ?symbol }}")});
     assert_validates(input_validator, &walk, "an outgoing walk");
+    let mut diagnostics = workspace_client::ReadDiagnostics::capture()?;
     let structured = workspace_client::call_retrying_acceptance(
         &client,
         workspace_client::tool_request("search", &walk),
@@ -1347,13 +1314,12 @@ async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> Tes
         "rift://symbol/stdlib/cpython/python/builtins/len",
         "{structured}"
     );
+    assert!(structured.get("warnings").is_none(), "{structured}");
     assert!(
-        structured["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .all(|warning| warning["code"] != "edge_coverage_missing"),
-        "{structured}"
+        diagnostics
+            .take()?
+            .iter()
+            .all(|warning| warning["code"] != "edge_coverage_missing")
     );
     client.cancel().await?;
     Ok(())

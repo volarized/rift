@@ -97,18 +97,53 @@ fn an_answer_records_warnings_and_serves_only_result_facts() {
 }
 
 #[test]
-fn retrieval_retains_warning_evidence_for_peer_coverage_checks() {
-    let Ok(CallToolResponse::Complete(result)) = Json(search_answer()).retrieval_result() else {
-        panic!("internal retrieval completes");
+fn query_diagnostics_are_logged_and_absent_from_both_representations() {
+    use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult};
+
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .install()
+        .expect("capture MCP logs");
+    let details = [
+        "static analysis left 16 sites without a target",
+        "captured objects without established identities: 2",
+    ];
+    let query = QueryReadResult::Results(Box::new(QueryResult {
+        answer: QueryAnswer::Boolean { value: true },
+        view: None,
+        pagination: None,
+        revision: None,
+        warnings: details
+            .iter()
+            .map(|detail| ReadWarning::EdgeCoverageMissing {
+                kinds: Vec::new(),
+                detail: (*detail).to_owned(),
+            })
+            .collect(),
+    }));
+    let Ok(CallToolResponse::Complete(result)) =
+        Json(super::QueryOutput::from(query)).into_call_tool_result()
+    else {
+        panic!("the query completes the call");
     };
-    assert_eq!(
-        result.structured_content.expect("structured result")["warnings"][0]["code"],
-        "global_access_disabled"
-    );
-    assert_eq!(
-        result.content[0].as_text().expect("text").text,
-        "0 results\n"
-    );
+    let structured = result.structured_content.expect("structured result");
+    assert!(structured.get("warnings").is_none());
+    assert_eq!(result.content[0].as_text().expect("text").text, "true\n");
+    let evidence: Vec<serde_json::Value> = drain
+        .queued_records()
+        .iter()
+        .filter(|record| record.message() == "read warning")
+        .map(|record| {
+            let fields: serde_json::Value =
+                serde_json::from_str(record.fields()).expect("log fields");
+            let evidence = fields["evidence"].as_str().expect("warning evidence");
+            serde_json::from_str(evidence).expect("typed warning")
+        })
+        .collect();
+    assert_eq!(evidence.len(), details.len());
+    for (warning, detail) in evidence.iter().zip(details) {
+        assert_eq!(warning["code"], "edge_coverage_missing");
+        assert_eq!(warning["detail"], detail);
+    }
 }
 
 #[test]
@@ -117,7 +152,7 @@ fn overflow_is_limit_exceeded_with_retry_never_and_names_the_limit() {
     let result = failure_of(RefusedText(overflow));
     assert_eq!(
         text_of_failure(&result),
-        "1 error\n\tlimit_exceeded · retry never\n\t\tanswer text exceeds its accepted limit of 64 \
+        "1 error\n\tlimit_exceeded | retry never\n\t\tanswer text exceeds its accepted limit of 64 \
          bytes; narrow the request or lower `limit`, then resend the request\n\t\t\
          rift.mcp.answer_text_limit\n",
         "the writer does not know the required size, so no limit line or causes"
@@ -129,9 +164,9 @@ fn another_render_failure_is_internal_error_with_the_writer_error_as_cause() {
     let result = failure_of(RefusedText(TextError::Unsupported("bytes")));
     assert_eq!(
         text_of_failure(&result),
-        "2 errors\n\tinternal_error · retry same_request\n\t\tanswer text could not be written: \
+        "2 errors\n\tinternal_error | retry same_request\n\t\tanswer text could not be written: \
          unsupported shape in text: bytes; report this internal failure with its full context\n\t\t\
-         rift.mcp.answer_text_failed\n\tinternal_error · retry same_request\n\t\tunsupported shape in text: bytes\n"
+         rift.mcp.answer_text_failed\n\tinternal_error | retry same_request\n\t\tunsupported shape in text: bytes\n"
     );
 }
 
@@ -140,9 +175,9 @@ fn a_serialization_failure_is_internal_error_with_the_serde_error_as_cause() {
     let result = failure_of(RefusedStructure);
     assert_eq!(
         text_of_failure(&result),
-        "2 errors\n\tinternal_error · retry same_request\n\t\tanswer could not be serialized into \
+        "2 errors\n\tinternal_error | retry same_request\n\t\tanswer could not be serialized into \
          structured content: no structured form; report this internal failure with its full \
-         context\n\t\trift.mcp.answer_structure_failed\n\tinternal_error · retry same_request\n\t\t\
+         context\n\t\trift.mcp.answer_structure_failed\n\tinternal_error | retry same_request\n\t\t\
          no structured form\n"
     );
 }

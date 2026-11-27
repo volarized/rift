@@ -2,7 +2,7 @@ mod graph_query;
 pub(crate) use graph_query::EngineInventoryCache;
 pub(crate) use graph_query::{
     QueryPageOptions, query_page,
-    retrieval::{bound_combined_rows, collect_retrieval},
+    retrieval::{bound_combined_rows, collect_retrieval, retrieval_coverage_for},
 };
 mod symbol;
 use std::sync::{Arc, Mutex};
@@ -10,10 +10,10 @@ use std::time::SystemTime;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::read::{ReadWarning, SearchParams};
-use rift_protocol::symbol_read::CapturedView;
+use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_server::SearchCandidateInputs;
 use rmcp::handler::server::tool::IntoCallToolResult as _;
-use rmcp::model::{CallToolRequestParams, CallToolResponse};
+use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, MetaObject};
 
 use crate::failure::{McpErrorExt as _, WireFailure as _};
 use serde::{Deserialize, Serialize};
@@ -21,10 +21,26 @@ use serde::{Deserialize, Serialize};
 use super::{ReadAnswer, RiftMcp, ToolFailure, wire};
 
 const BYTES_MAX: usize = crate::global::candidates::CANDIDATE_BYTES_MAX;
+/// The producer's typed coverage outcome on a peer read.
+pub(crate) const RETRIEVAL_COVERAGE_KEY: &str = "rift/retrieval-coverage";
 // The default `[search.query] retained_views`, the rows' initial capacity.
 const SLOTS_DEFAULT: usize = 256;
 // The largest `[search.query] retained_views`, `QUERY_RETAINED_VIEWS_MAX`; a test pins it.
 const RELEASED_KEYS_MAX: usize = 4096;
+
+pub(super) fn set_retrieval_coverage(
+    result: &mut CallToolResult,
+    reason: Option<SymbolUnavailableReason>,
+) {
+    if let Some(reason) = reason {
+        let value = serde_json::to_value(reason)
+            .unwrap_or_else(|error| unreachable!("a retrieval outcome serializes: {error}"));
+        result
+            .meta
+            .get_or_insert_with(MetaObject::new)
+            .insert(RETRIEVAL_COVERAGE_KEY.to_owned(), value);
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -300,24 +316,46 @@ impl RiftMcp {
         request: CallToolRequestParams,
         operation: &rift_tracing::Span,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let current = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("view"))
+            .is_none_or(serde_json::Value::is_null);
         let result = self.search_candidates_request(request).await;
         match result {
-            Ok(answer) => {
+            Ok(mut answer) => {
                 use rift_protocol::search_read::SearchUnavailable;
-                let warnings = match &answer {
-                    SearchCandidateResult::Captured(response) => &response.inputs.warnings,
+                let coverage = match &mut answer {
+                    SearchCandidateResult::Captured(response) => {
+                        let warnings = response.inputs.warnings.iter().chain(
+                            response
+                                .global
+                                .iter()
+                                .flat_map(|pool| &pool.inputs.warnings),
+                        );
+                        let coverage = retrieval_coverage_for(warnings, current);
+                        crate::output::record_warnings(&mut response.inputs.warnings);
+                        if let Some(pool) = &mut response.global {
+                            crate::output::record_warnings(&mut pool.inputs.warnings);
+                        }
+                        coverage
+                    }
                     SearchCandidateResult::Unavailable(SearchUnavailable::Unavailable {
                         warnings,
                         ..
-                    }) => warnings,
+                    }) => {
+                        crate::output::record_warnings(warnings);
+                        None
+                    }
                 };
-                crate::output::log_warnings(warnings);
                 let value = serde_json::to_value(answer).map_err(|source| {
                     let error = errors::mcp::forward_failed().source(source).error();
                     operation.record("error.type", error.slug().as_str());
                     error.mcp().tool_error(wire::ErrorPhase::Read)
                 })?;
-                Ok(rmcp::model::CallToolResult::structured(value).into())
+                let mut result = CallToolResult::structured(value);
+                set_retrieval_coverage(&mut result, coverage);
+                Ok(result.into())
             }
             Err(failure) => {
                 if let ToolFailure::Registered(error, _) = &failure {

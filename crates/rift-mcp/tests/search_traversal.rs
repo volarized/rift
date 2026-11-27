@@ -1,7 +1,7 @@
 //! Drives `search`'s `traversal` block through a live rmcp client over a fixture workspace:
 //! a callers walk, an indirect-caller walk, a path query, a hit reached both lexically and
 //! by the walk, outgoing walks through call hierarchy, the refusals a walk with no edge
-//! source draws, the warnings a walk carries when an engine could not answer in full, and
+//! source draws, the warnings a walk logs when an engine could not answer in full, and
 //! the changed files a publication hands the engines.
 //!
 //! A configured language engine resolves the references and calls the walk follows. Most
@@ -38,8 +38,8 @@ mod workspace_client;
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, captured_seed, failed_call, search_after_population,
-    served_workspace, tool_request,
+    ReadDiagnostics, TestResult, call_retrying_acceptance, captured_seed, failed_call,
+    populated_answer, served_workspace, tool_request,
 };
 
 /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`:
@@ -230,14 +230,13 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
 }
 
 /// The engine lane resolves references alone, so an `implements` asked for beside them has
-/// no lane and the served answer says so instead of leaving the caller to read the walk's
-/// hits as the whole coverage.
+/// no lane. The server logs the missing coverage and serves the available hits.
 #[tokio::test]
 async fn search_traversal_over_an_unproduced_kind_serves_the_coverage_warning() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
 
-    let structured = call_retrying_acceptance(
+    let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -248,13 +247,11 @@ async fn search_traversal_over_an_unproduced_kind_serves_the_coverage_warning() 
                 }
             }),
         ),
-    )
+    ))
     .await?;
 
     assert_eq!(symbol_names(&structured), ["branch_a", "branch_b"]);
-    let warnings = structured["warnings"]
-        .as_array()
-        .ok_or("the answer must carry warnings")?;
+
     assert_eq!(warnings.len(), 1, "{structured}");
     assert_eq!(
         warnings[0]["code"],
@@ -286,14 +283,13 @@ async fn search_traversal_over_only_unproduced_kinds_refuses() -> TestResult {
     Ok(())
 }
 
-/// The same walk narrowed to the produced kind carries no warning, so the code keeps
-/// naming an absent lane rather than an empty answer.
+/// The same walk narrowed to the produced kind logs no coverage warning.
 #[tokio::test]
 async fn search_traversal_over_a_produced_kind_serves_no_coverage_warning() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
 
-    let structured = call_retrying_acceptance(
+    let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -304,12 +300,12 @@ async fn search_traversal_over_a_produced_kind_serves_no_coverage_warning() -> T
                 }
             }),
         ),
-    )
+    ))
     .await?;
 
     assert_eq!(symbol_names(&structured), ["branch_a", "branch_b"]);
     assert!(
-        structured["warnings"].is_null(),
+        warnings.is_empty(),
         "a walk the engine lane covers carries no warning: {structured}"
     );
 
@@ -520,17 +516,17 @@ async fn incoming_walks_past_the_readiness_timeout(
     };
     let mut starts_after = Vec::new();
     for _walk in 0..3 {
-        let structured = call_retrying_acceptance(
+        let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
             &client,
             tool_request(
                 "search_retrieval",
                 &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
             ),
-        )
+        ))
         .await?;
         eprintln!("incoming walk: answer={structured}");
         assert_eq!(symbol_names(&structured), ["caller"], "{structured}");
-        let warning = &structured["warnings"][0];
+        let warning = &warnings[0];
         assert_eq!(
             warning["code"],
             json!("engine_analysis_unavailable"),
@@ -708,7 +704,7 @@ const LIVE_INCOMING_KINDS: &[&str] = &["references"];
 
 /// Walks from `seed` in `direction` under `kinds` until the reached names equal
 /// `expected`, at most [`LIVE_WALK_ATTEMPTS_MAX`] times, printing each answer with its wall
-/// time. Returns the attempt that matched and its answer.
+/// time. Returns the attempt that matched, its answer, and its logged warnings.
 async fn live_walk(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     label: &str,
@@ -716,7 +712,8 @@ async fn live_walk(
     direction: &str,
     kinds: &[&str],
     expected: &[&str],
-) -> TestResult<(usize, Value)> {
+) -> TestResult<(usize, Value, Vec<Value>)> {
+    let mut diagnostics = ReadDiagnostics::capture()?;
     for attempt in 1..=LIVE_WALK_ATTEMPTS_MAX {
         let started = std::time::Instant::now();
         let structured = call_retrying_acceptance(
@@ -730,14 +727,15 @@ async fn live_walk(
             ),
         )
         .await?;
+        assert!(structured.get("warnings").is_none(), "{structured}");
+        let warnings = diagnostics.take()?;
         let reached = symbol_names(&structured);
         eprintln!(
-            "live {label} attempt {attempt}: elapsed={:?} reached={reached:?} warnings={}",
-            started.elapsed(),
-            structured["warnings"]
+            "live {label} attempt {attempt}: elapsed={:?} reached={reached:?} warnings={warnings:?}",
+            started.elapsed()
         );
         if reached == expected {
-            return Ok((attempt, structured));
+            return Ok((attempt, structured, warnings));
         }
     }
     Err(format!("{label} never answered {expected:?}").into())
@@ -834,19 +832,15 @@ const TYPESCRIPT_STATIC_INCOMING: &[(&str, &str)] =
 /// rust-analyzer answered the outgoing walk from `larger`: static analysis names `beacon`
 /// too, but only the language server names `max` and `len`, which sit in the standard
 /// library, so the walk drops them and counts them.
-fn assert_standard_callees_dropped(answer: &Value) -> TestResult {
-    let dropped = answer["warnings"]
-        .as_array()
-        .and_then(|warnings| {
-            warnings
-                .iter()
-                .find(|warning| warning["code"] == json!("callees_dropped"))
-        })
+fn assert_standard_callees_dropped(warnings: &[Value]) -> TestResult {
+    let dropped = warnings
+        .iter()
+        .find(|warning| warning["code"] == json!("callees_dropped"))
         .ok_or("the walk counts the callees it dropped")?;
     assert_eq!(
         dropped["callees"],
         json!(2),
-        "`max` and `len` sit in the standard library: {answer}"
+        "`max` and `len` sit in the standard library: {warnings:?}"
     );
     Ok(())
 }
@@ -912,7 +906,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     .await?;
     let larger = live_seed(&client, "larger", "rust").await?;
     let beacon = live_seed(&client, "beacon", "rust").await?;
-    let (cold, answer) = live_walk(
+    let (cold, _answer, warnings) = live_walk(
         &client,
         "outgoing before",
         &larger,
@@ -926,8 +920,8 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         "the first walk waits out rust-analyzer's load instead of taking the empty prepare \
          it answers while loading as final"
     );
-    assert_standard_callees_dropped(&answer)?;
-    let (_, incoming) = live_walk(
+    assert_standard_callees_dropped(&warnings)?;
+    let (_, incoming, _warnings) = live_walk(
         &client,
         "incoming before",
         &beacon,
@@ -958,7 +952,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         published_holds(&client, name, present, edited).await?;
     }
     eprintln!("live: published after {:?}", edited.elapsed());
-    let (outgoing, answer) = live_walk(
+    let (outgoing, _answer, warnings) = live_walk(
         &client,
         "outgoing after",
         &larger,
@@ -967,10 +961,10 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         &["beacon2"],
     )
     .await?;
-    assert_standard_callees_dropped(&answer)?;
+    assert_standard_callees_dropped(&warnings)?;
     eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
     let beacon2 = live_seed(&client, "beacon2", "rust").await?;
-    let (incoming, answer) = live_walk(
+    let (incoming, answer, _warnings) = live_walk(
         &client,
         "incoming after",
         &beacon2,
@@ -1084,7 +1078,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     .await?;
     let larger = live_seed(&client, "larger", "typescript").await?;
     let beacon = live_seed(&client, "beacon", "typescript").await?;
-    let (outgoing, answer) = live_walk(
+    let (outgoing, answer, warnings) = live_walk(
         &client,
         "typescript outgoing",
         &larger,
@@ -1097,9 +1091,6 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     let hop = &results(&answer)[0]["traversal_path"][0];
     assert_eq!(hop["direction"], json!("outgoing"), "{answer}");
     assert_eq!(hop["edge"]["kinds"], json!(["calls"]), "{answer}");
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("the walk counts the callee it dropped")?;
     assert_eq!(warnings.len(), 2, "{answer}");
     assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{answer}");
     assert_eq!(
@@ -1112,7 +1103,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
         json!({"code": "global_access_disabled"}),
         "the lib is a package file the global API names: {answer}"
     );
-    let (incoming, answer) = live_walk(
+    let (incoming, answer, warnings) = live_walk(
         &client,
         "typescript incoming",
         &beacon,
@@ -1123,7 +1114,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     .await?;
     eprintln!("live typescript: incoming after {:?}", started.elapsed());
     assert_direct_incoming(&answer, &beacon)?;
-    assert!(answer["warnings"].is_null(), "{answer}");
+    assert!(warnings.is_empty(), "{answer}");
     assert_static_incoming(&client, &beacon, TYPESCRIPT_STATIC_INCOMING).await?;
     assert_eq!(
         (outgoing, incoming),
@@ -1141,8 +1132,13 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
 async fn search_traversal_incoming_reaches_every_static_rust_edge_kind() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(LIVE_RUST_FILES, None).await?;
     let beacon = captured_seed(&client, "beacon", "hub.rs").await?;
-    let answer = assert_static_incoming(&client, &beacon, RUST_STATIC_INCOMING).await?;
-    assert!(answer["warnings"].is_null(), "{answer}");
+    let (answer, warnings) = ReadDiagnostics::observe(assert_static_incoming(
+        &client,
+        &beacon,
+        RUST_STATIC_INCOMING,
+    ))
+    .await?;
+    assert!(warnings.is_empty(), "{answer}");
     client.cancel().await?;
     Ok(())
 }
@@ -1156,8 +1152,13 @@ async fn search_traversal_incoming_reaches_static_typescript_calls() -> TestResu
     files.extend_from_slice(LIVE_TYPESCRIPT_FILES);
     let (_directory, client, _server_task) = served_workspace(&files, None).await?;
     let beacon = captured_seed(&client, "beacon", "hub.ts").await?;
-    let answer = assert_static_incoming(&client, &beacon, TYPESCRIPT_STATIC_INCOMING).await?;
-    assert!(answer["warnings"].is_null(), "{answer}");
+    let (answer, warnings) = ReadDiagnostics::observe(assert_static_incoming(
+        &client,
+        &beacon,
+        TYPESCRIPT_STATIC_INCOMING,
+    ))
+    .await?;
+    assert!(warnings.is_empty(), "{answer}");
     client.cancel().await?;
     Ok(())
 }
@@ -1228,14 +1229,13 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
         served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
 
     let started = std::time::Instant::now();
-    let structured = call_retrying_acceptance(
+    let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
             &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing" } }),
         ),
-    )
-    .await?;
+    )).await?;
     eprintln!("outgoing depth 1: {:?}", started.elapsed());
 
     assert_eq!(
@@ -1254,7 +1254,7 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
         );
         assert_eq!(hop["edge"]["kinds"], json!(["calls"]), "{hit}");
     }
-    assert!(structured["warnings"].is_null(), "{structured}");
+    assert!(warnings.is_empty(), "{structured}");
 
     client.cancel().await?;
     Ok(())
@@ -1316,8 +1316,9 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
 
-    let merged = search_after_population(
+    let (merged, merged_warnings) = populated_answer(
         &client,
+        "search_retrieval",
         &json!({
             "query": "branch_a",
             "target": "symbol",
@@ -1332,10 +1333,11 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     let matched_by = hit["matched_by"].as_array().ok_or("matched_by")?;
     assert!(matched_by.contains(&json!("name")), "{hit}");
     assert!(matched_by.contains(&json!("edge")), "{hit}");
-    assert!(merged["warnings"].is_null(), "{merged}");
+    assert!(merged_warnings.is_empty(), "{merged}");
 
-    let warned = search_after_population(
+    let (warned, warned_warnings) = populated_answer(
         &client,
+        "search_retrieval",
         &json!({
             "traversal": {
                 "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "kinds": ["references", "calls"]
@@ -1344,11 +1346,8 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     )
     .await?;
     assert_eq!(symbol_names(&warned), ["branch_a", "branch_b"], "{warned}");
-    assert_eq!(
-        warned["warnings"][0]["code"],
-        json!("edge_coverage_missing")
-    );
-    assert_eq!(warned["warnings"][0]["kinds"], json!(["references"]));
+    assert_eq!(warned_warnings[0]["code"], json!("edge_coverage_missing"));
+    assert_eq!(warned_warnings[0]["kinds"], json!(["references"]));
 
     let code = refusal_code(
         &client,
@@ -1372,7 +1371,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
     let (_directory, client, _server_task) =
         served_workspace(OUTGOING_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
 
-    let counted = call_retrying_acceptance(
+    let (counted, counted_warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -1382,12 +1381,10 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
                 }
             }),
         ),
-    )
-    .await?;
+    )).await?;
     assert_eq!(symbol_names(&counted), ["LIMIT", "leaf"], "{counted}");
-    let warnings = counted["warnings"]
-        .as_array()
-        .ok_or("a dropped callee warns")?;
+
+    let warnings = counted_warnings;
     assert_eq!(warnings.len(), 2, "{counted}");
     assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
     assert_eq!(warnings[0]["callees"], json!(1), "{counted}");
@@ -1397,7 +1394,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
         "{counted}"
     );
 
-    let holder = call_retrying_acceptance(
+    let (holder, holder_warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -1407,11 +1404,10 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
                 }
             }),
         ),
-    )
-    .await?;
+    )).await?;
     assert_eq!(symbol_names(&holder), ["counted"], "{holder}");
     assert!(
-        holder["warnings"].is_null(),
+        holder_warnings.is_empty(),
         "every callee the class body names is in the project: {holder}"
     );
 
@@ -1507,18 +1503,16 @@ async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_
             "caller",
         ),
     ] {
-        let structured = call_retrying_acceptance(
+        let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
             &client,
             tool_request(
                 "search_retrieval",
                 &json!({"traversal": {"seed": seed, "direction": direction}}),
             ),
-        )
+        ))
         .await?;
         assert_eq!(symbol_names(&structured), [reached], "{structured}");
-        let warnings = structured["warnings"]
-            .as_array()
-            .ok_or("an unconfirmed engine warns")?;
+
         assert_eq!(warnings.len(), 1, "{structured}");
         assert_eq!(
             warnings[0]["code"],
@@ -1550,13 +1544,13 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
             "incoming",
         ),
     ] {
-        let structured = call_retrying_acceptance(
+        let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
             &client,
             tool_request(
                 "search_retrieval",
                 &json!({"traversal": {"seed": seed, "direction": direction}}),
             ),
-        )
+        ))
         .await?;
         let expected = if direction == "outgoing" {
             "beacon"
@@ -1564,9 +1558,7 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
             "caller"
         };
         assert_eq!(symbol_names(&structured), [expected], "{structured}");
-        let warnings = structured["warnings"]
-            .as_array()
-            .ok_or("the dropped contribution warns")?;
+
         assert_eq!(warnings.len(), 1, "{structured}");
         assert_eq!(
             warnings[0]["code"],
@@ -1690,21 +1682,25 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     );
 
+    let mut diagnostics = ReadDiagnostics::capture()?;
     let first = client.call_tool(walk.clone()).await?;
     assert_ne!(first.is_error, Some(true), "{first:?}");
     let first = first
         .structured_content
         .ok_or("the cut walk answers with structured content")?;
+    assert!(first.get("warnings").is_none(), "{first}");
+    let first_warnings = diagnostics.take()?;
     assert_eq!(symbol_names(&first), ["caller"], "{first}");
     assert_eq!(
-        first["warnings"][0]["code"],
+        first_warnings[0]["code"],
         json!("engine_analysis_unavailable"),
         "{first}"
     );
 
-    let structured = call_retrying_acceptance(&client, walk).await?;
+    let (structured, warnings) =
+        ReadDiagnostics::observe(call_retrying_acceptance(&client, walk)).await?;
     assert_eq!(
-        structured["warnings"][0]["code"],
+        warnings[0]["code"],
         json!("engine_analysis_unavailable"),
         "{structured}"
     );
@@ -1800,16 +1796,18 @@ async fn search_traversal_waiting_on_announced_work_keeps_the_engine() -> TestRe
         "search_retrieval",
         &json!({"traversal": {"seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"}}),
     );
-    let first = call_retrying_acceptance(&client, walk.clone()).await?;
+    let (first, first_warnings) =
+        ReadDiagnostics::observe(call_retrying_acceptance(&client, walk.clone())).await?;
     assert_eq!(
-        first["warnings"][0]["code"],
+        first_warnings[0]["code"],
         json!("engine_analysis_unavailable"),
         "{first}"
     );
     let mut answered = None;
     for _walk in 0..20 {
-        let structured = call_retrying_acceptance(&client, walk.clone()).await?;
-        if structured["warnings"].as_array().is_none_or(Vec::is_empty) {
+        let (structured, warnings) =
+            ReadDiagnostics::observe(call_retrying_acceptance(&client, walk.clone())).await?;
+        if warnings.is_empty() {
             answered = Some(structured);
             break;
         }
@@ -1892,9 +1890,10 @@ async fn search_traversal_refused_while_the_engine_starts_keeps_the_start() -> T
     );
     assert_eq!(refused.retry, RetryDirective::SameRequest, "{refused:?}");
 
-    let structured = call_retrying_acceptance(&client, walk).await?;
+    let (structured, warnings) =
+        ReadDiagnostics::observe(call_retrying_acceptance(&client, walk)).await?;
     assert_eq!(
-        structured["warnings"][0]["code"],
+        warnings[0]["code"],
         json!("engine_analysis_unavailable"),
         "{structured}"
     );
@@ -1963,7 +1962,7 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
     let mut starts_after = Vec::new();
     for _walk in 0..2 {
         let started = std::time::Instant::now();
-        let structured = call_retrying_acceptance(
+        let (structured, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
             &client,
             tool_request(
                 "search_retrieval",
@@ -1971,12 +1970,11 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
                     "seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"
                 }}),
             ),
-        )
-        .await?;
+        )).await?;
         let elapsed = started.elapsed();
         eprintln!("outgoing walk: elapsed={elapsed:?} answer={structured}");
         assert_eq!(symbol_names(&structured), ["beacon"], "{structured}");
-        let warning = &structured["warnings"][0];
+        let warning = &warnings[0];
         assert_eq!(
             warning["code"],
             json!("engine_analysis_unavailable"),
@@ -2108,7 +2106,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     )
     .await?;
 
-    let counted = call_retrying_acceptance(
+    let (counted, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -2118,8 +2116,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
                 }
             }),
         ),
-    )
-    .await?;
+    )).await?;
     assert_eq!(
         symbol_names(&counted),
         ["LIMIT", "leaf", "len"],
@@ -2151,7 +2148,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     );
     assert_eq!(hop["to"], json!(id), "{len}");
     assert_eq!(hop["kinds"], json!(["calls"]), "{len}");
-    assert!(counted["warnings"].is_null(), "{counted}");
+    assert!(warnings.is_empty(), "{counted}");
 
     let requests = declaration_requests(&fixture).await;
     assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
@@ -2240,8 +2237,11 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     let request = json!({"include":{"source": true}, "max_results":1,
         "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
-    let hello =
-        call_retrying_acceptance(&client, tool_request("search_retrieval", &request)).await?;
+    let (hello, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &request),
+    ))
+    .await?;
     assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
     let greet = callee_hit(&hello, "greet")?;
     read_dependency_hit(&client, &greet).await?;
@@ -2265,9 +2265,7 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
         json!(global_api::named_unit(&global_api::NAMED_POSITIONS[1])),
         "{greet}"
     );
-    let warnings = hello["warnings"]
-        .as_array()
-        .ok_or("a dropped callee warns")?;
+
     assert_eq!(
         warnings.as_slice(),
         [json!({
@@ -2387,7 +2385,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     )
     .await?;
 
-    let counted = call_retrying_acceptance(
+    let (counted, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -2397,15 +2395,9 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
                 }
             }),
         ),
-    )
-    .await?;
+    )).await?;
     assert_eq!(symbol_names(&counted), ["LIMIT", "leaf"], "{counted}");
-    let codes: Vec<&Value> = counted["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|warning| &warning["code"])
-        .collect();
+    let codes: Vec<&Value> = warnings.iter().map(|warning| &warning["code"]).collect();
     assert_eq!(
         codes,
         [&json!("callees_dropped"), &json!("global_api_unavailable")],
@@ -2506,7 +2498,7 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
     )
     .await?;
 
-    let counted = call_retrying_acceptance(
+    let (counted, warnings) = ReadDiagnostics::observe(call_retrying_acceptance(
         &client,
         tool_request(
             "search_retrieval",
@@ -2516,10 +2508,9 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
                 }
             }),
         ),
-    )
-    .await?;
+    )).await?;
     assert_eq!(symbol_names(&counted), ["LIMIT", "leaf"], "{counted}");
-    let warnings = &counted["warnings"];
+
     assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
     assert_eq!(
         warnings[1]["warning_code"],

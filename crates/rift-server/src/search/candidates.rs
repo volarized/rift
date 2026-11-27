@@ -40,6 +40,7 @@ pub struct SearchCandidateInputs {
     /// Widened query input orders.
     pub broad: Vec<SearchCandidateInput>,
     /// Refusals and cuts recorded by this publication.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
 

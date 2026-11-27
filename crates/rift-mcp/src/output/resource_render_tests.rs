@@ -48,11 +48,11 @@ fn one_workspace_page_renders_languages_and_source() {
         &[
             "workspace",
             "languages:",
-            "\ttypescript:tsx · syntax · lsp typescript:tsx ready",
+            "\ttypescript:tsx | syntax | lsp typescript:tsx ready",
             "\t\tinclude src/**/*.tsx",
             "\t\texclude src/generated/**",
             "source:",
-            "\tsrc/view.tsx · typescript:tsx",
+            "\tsrc/view.tsx | typescript:tsx",
         ],
     );
 }
@@ -68,12 +68,12 @@ fn several_workspace_pages_name_the_page_in_the_header() {
     golden(
         &page,
         &[
-            "workspace · page 1/3, total 30 results",
+            "workspace | page 1/3, total 30 results",
             "languages:",
-            "\tpython · disabled",
+            "\tpython | disabled",
             "source:",
             "\tsrc/view.tsx",
-            "next · rift://workspace?page=2&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "next | rift://workspace?page=2&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ],
     );
 }
@@ -88,7 +88,7 @@ fn a_page_past_the_end_names_itself_and_holds_no_source() {
     golden(
         &page,
         &[
-            "workspace · page 4/3, total 30 results",
+            "workspace | page 4/3, total 30 results",
             "No source files on this page.",
         ],
     );
@@ -126,11 +126,11 @@ fn a_language_writes_each_capability_and_every_lsp_state() {
         &[
             "workspace",
             "languages:",
-            "\tlang-stopped · syntax · execution · lsp server stopped",
-            "\tlang-starting · syntax · execution · lsp server starting",
-            "\tlang-analyzing · syntax · execution · lsp server analyzing",
-            "\tlang-ready · syntax · execution · lsp server ready",
-            "\tlang-failed · syntax · execution · lsp server failed",
+            "\tlang-stopped | syntax | execution | lsp server stopped",
+            "\tlang-starting | syntax | execution | lsp server starting",
+            "\tlang-analyzing | syntax | execution | lsp server analyzing",
+            "\tlang-ready | syntax | execution | lsp server ready",
+            "\tlang-failed | syntax | execution | lsp server failed",
         ],
     );
 }
@@ -153,7 +153,7 @@ fn patterns_join_by_comma_and_an_empty_list_writes_no_line() {
         &[
             "workspace",
             "languages:",
-            "\trust · syntax",
+            "\trust | syntax",
             "\t\tinclude a/**, b/**",
             "\tgo",
             "\t\texclude vendor/**",
@@ -177,11 +177,11 @@ fn warnings_leave_workspace_resource_text_unchanged() {
     golden(
         &page,
         &[
-            "workspace · page 1/2, total 20 results",
+            "workspace | page 1/2, total 20 results",
             "source:",
-            "\ta.rs · rust",
+            "\ta.rs | rust",
             "\tnotes.txt",
-            "next · rift://workspace?page=2&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "next | rift://workspace?page=2&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ],
     );
 }

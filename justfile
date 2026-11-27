@@ -10,6 +10,7 @@ generate:
 
 generate-check:
     {{ rift_dev }} generate --check
+    {{ rift_dev }} dashes docs/public docs/src/components/workspace-examples.generated.json
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null

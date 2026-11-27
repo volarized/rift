@@ -196,8 +196,8 @@ Local reference and call questions use the configured
 [language engine](/docs/developer/configuration#languages-and-lsp) when required facts
 are absent from the captured publication. Acquisition preserves physical locations and
 continues through admitted dependency sources. These facts belong to the request and do
-not enter global collection. Captured static calls and references answer first, and an
-`engine_analysis_unavailable` warning names a language whose engine analysis is missing.
+not enter global collection. Captured static calls and references answer first. The server logs
+`engine_analysis_unavailable` for a language whose engine analysis is missing.
 
 ### Changes and commits [#search-change]
 
@@ -386,11 +386,10 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 RDF triples for a graph query. `page` and `max_results` select answer rows. Exact `get_symbol`
 and `facets` reads select declarations with the same pair at the reported revision.
 
-A query over the captured inventory answers from partly covered facts, and its `warnings` name
-the files, languages, or engines left out. A query whose answer needs every fact returns
-`outcome: "unavailable"` with `insufficient_coverage`: an empty result, a false `ASK`, a count,
-a negation, or an `OPTIONAL`. Run `rift server logs` to inspect missing facts or preparation
-still in progress.
+A query over the captured inventory answers from partly covered facts. An empty result, a false
+`ASK`, a count, a negation, or an `OPTIONAL` requires complete coverage. The server returns
+`outcome: "unavailable"` with `insufficient_coverage` when that coverage is missing. Run
+`rift server logs` to inspect missing facts or preparation still in progress.
 
 The proxy returns compact text by default. Start `rift mcp --output=all` for structured
 results and output schemas. The map and workspace resources then carry both compact text

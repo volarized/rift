@@ -9,7 +9,7 @@
 //! those.
 //!
 //! The description of which elements can appear in a `tuple` is called a [`TupleSpec`]. Other
-//! things besides `tuple` instances can be described by a tuple spec — for instance, the targets
+//! things besides `tuple` instances can be described by a tuple spec - for instance, the targets
 //! of an unpacking assignment. A `tuple` specialization can include `Never` as a fixed-length
 //! element because a user-defined tuple subclass can inhabit that type.
 
@@ -2121,8 +2121,8 @@ impl<'db> VariableLengthTuple<Type<'db>, VariableSegment<'db>> {
     /// suffix, which are equivalent to the variable-length portion, to the end of the prefix.
     ///
     /// Complicating matters is that we don't always want to compare with _this_ tuple's
-    /// variable-length portion. (When this tuple's variable-length portion is gradual —
-    /// `tuple[Any, ...]` — we compare with the assumption that the `Any` materializes to the other
+    /// variable-length portion. (When this tuple's variable-length portion is gradual -
+    /// `tuple[Any, ...]` - we compare with the assumption that the `Any` materializes to the other
     /// tuple's variable-length portion.)
     fn prenormalized_prefix_elements<'a>(
         &'a self,
@@ -2157,8 +2157,8 @@ impl<'db> VariableLengthTuple<Type<'db>, VariableSegment<'db>> {
     /// suffix, which are equivalent to the variable-length portion, to the end of the prefix.
     ///
     /// Complicating matters is that we don't always want to compare with _this_ tuple's
-    /// variable-length portion. (When this tuple's variable-length portion is gradual —
-    /// `tuple[Any, ...]` — we compare with the assumption that the `Any` materializes to the other
+    /// variable-length portion. (When this tuple's variable-length portion is gradual -
+    /// `tuple[Any, ...]` - we compare with the assumption that the `Any` materializes to the other
     /// tuple's variable-length portion.)
     fn prenormalized_suffix_elements<'a>(
         &'a self,

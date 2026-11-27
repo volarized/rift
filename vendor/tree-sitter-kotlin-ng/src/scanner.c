@@ -430,7 +430,7 @@ bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, con
                 }
                 // `where` continues a declaration only as a type-constraints
                 // clause; followed by `?` `.` `=` `(` it is an ordinary
-                // identifier (`where?.let { ... }`) — close the statement.
+                // identifier (`where?.let { ... }`) - close the statement.
                 else if (index == 8) {
                     while (iswspace(lexer->lookahead)) {
                         skip(lexer);

@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::global_api::{FixtureOptions, GlobalFixture};
-use crate::workspace_client::{TestResult, query, query_after_population, served_workspace};
+use crate::workspace_client::{
+    TestResult, populated_answer, query, query_after_population, served_workspace,
+};
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use serde_json::{Value, json};
 
@@ -56,7 +58,14 @@ async fn statement(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     text: impl Into<String>,
 ) -> TestResult<Value> {
-    query_after_population(
+    Ok(statement_with_diagnostics(client, text).await?.0)
+}
+
+async fn statement_with_diagnostics(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    text: impl Into<String>,
+) -> TestResult<(Value, Vec<Value>)> {
+    populated_query(
         client,
         &QueryParams {
             include: rift_protocol::query::QueryInclude::default(),
@@ -67,6 +76,13 @@ async fn statement(
         },
     )
     .await
+}
+
+async fn populated_query(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    params: &QueryParams,
+) -> TestResult<(Value, Vec<Value>)> {
+    populated_answer(client, "search", &serde_json::to_value(params)?).await
 }
 
 async fn identity(
@@ -95,17 +111,14 @@ async fn an_anchored_call_read_keeps_local_edges_beside_unaddressed_callees() ->
     .await?;
     let root = identity(&client, "root").await?;
     let query = format!("SELECT ?to {{ <{root}> :calls ?target . ?target :name ?to }}");
-    let answer = statement(&client, query).await?;
+    let (answer, diagnostics) = statement_with_diagnostics(&client, query).await?;
     assert!(
         query::rows(&answer)?
             .iter()
             .any(|row| query::literal(row, "to").is_ok_and(|name| name == "leaf")),
         "{answer}"
     );
-    assert!(
-        warning_codes(&answer).contains("edge_coverage_missing"),
-        "{answer}"
-    );
+    assert_logged_warning(&answer, &diagnostics, "edge_coverage_missing");
     let count = statement(
         &client,
         format!("SELECT (COUNT(?t) AS ?n) {{ <{root}> :calls ?t }}"),
@@ -609,13 +622,12 @@ async fn assert_edge_provider(
     Ok(())
 }
 
-fn warning_codes(answer: &Value) -> BTreeSet<&str> {
-    answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|warning| warning["code"].as_str())
-        .collect()
+fn assert_logged_warning(answer: &Value, diagnostics: &[Value], code: &str) {
+    assert!(answer.get("warnings").is_none(), "{answer}");
+    assert!(
+        diagnostics.iter().any(|warning| warning["code"] == code),
+        "expected {code} in {diagnostics:?}"
+    );
 }
 
 fn named_pairs<'a>(
@@ -653,7 +665,7 @@ async fn an_unresolved_framework_reports_a_warning_beside_the_symbol_inventory()
         None,
     )
     .await?;
-    let inventory = query_after_population(
+    let (inventory, diagnostics) = populated_query(
         &client,
         &QueryParams {
             query: "SELECT ?name WHERE { ?s a :Symbol; :name ?name }".to_owned(),
@@ -670,10 +682,7 @@ async fn an_unresolved_framework_reports_a_warning_beside_the_symbol_inventory()
         names.contains("construct_core") && names.contains("DocsLayout"),
         "{inventory}"
     );
-    assert!(
-        warning_codes(&inventory).contains("framework_context_unresolved"),
-        "{inventory}"
-    );
+    assert_logged_warning(&inventory, &diagnostics, "framework_context_unresolved");
     client.cancel().await?;
     Ok(())
 }
@@ -747,7 +756,7 @@ async fn captured_calls_answer_an_inventory_when_the_engine_is_unavailable() -> 
         Some("[languages.python.lsp]\ncommand = ['rift-test-missing-engine']\n".to_owned()),
     )
     .await?;
-    let answer = query_after_population(
+    let (answer, diagnostics) = populated_query(
         &client,
         &QueryParams {
             query: "SELECT ?from ?to WHERE { ?s :calls ?t . ?s :name ?from . ?t :name ?to }"
@@ -763,17 +772,13 @@ async fn captured_calls_answer_an_inventory_when_the_engine_is_unavailable() -> 
         pairs.contains(&("bound_caller_79", "bound_leaf")),
         "{answer}"
     );
-    assert!(
-        warning_codes(&answer).contains("engine_analysis_unavailable"),
-        "{answer}"
-    );
-    let count = statement(&client, "SELECT (COUNT(?t) AS ?n) WHERE { ?s :calls ?t }").await?;
+    assert_logged_warning(&answer, &diagnostics, "engine_analysis_unavailable");
+    let (count, diagnostics) =
+        statement_with_diagnostics(&client, "SELECT (COUNT(?t) AS ?n) WHERE { ?s :calls ?t }")
+            .await?;
     assert_eq!(count["outcome"], "unavailable", "{count}");
     assert_eq!(count["reason"], "insufficient_coverage", "{count}");
-    assert!(
-        warning_codes(&count).contains("engine_analysis_unavailable"),
-        "{count}"
-    );
+    assert_logged_warning(&count, &diagnostics, "engine_analysis_unavailable");
     client.cancel().await?;
     Ok(())
 }
@@ -806,16 +811,13 @@ async fn disabled_local_symbol_inventory_refuses_absence_and_keeps_package_reads
         "SELECT ?element { ?element a :SyntaxElement; :of ?s . ?s :name 'beacon' }",
         "SELECT ?revision { ?s :introducedIn ?revision . ?revision a :Commit }",
     ] {
-        let answer = statement(&client, text).await?;
+        let (answer, diagnostics) = statement_with_diagnostics(&client, text).await?;
         assert_eq!(answer["outcome"], "unavailable", "{text}: {answer}");
         assert_eq!(
             answer["reason"], "insufficient_coverage",
             "{text}: {answer}"
         );
-        assert!(
-            warning_codes(&answer).contains("local_symbol_inventory_unavailable"),
-            "{text}: {answer}"
-        );
+        assert_logged_warning(&answer, &diagnostics, "local_symbol_inventory_unavailable");
         assert!(answer.get("answer").is_none(), "{text}: {answer}");
         assert!(answer.get("pagination").is_none(), "{text}: {answer}");
         assert!(answer.get("view").is_none(), "{text}: {answer}");
@@ -888,8 +890,7 @@ async fn default_local_symbol_inventory_answers_complete_empty_and_populated_cap
 }
 
 /// A file left out of the index makes the symbol inventory partial: the captured symbols
-/// answer with the warning that names the file, and a question whose answer claims an
-/// absence refuses with the same warning.
+/// answer and the server logs the missing file. A query that claims absence is unavailable.
 #[tokio::test]
 async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(
@@ -901,7 +902,7 @@ async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> Te
         None,
     )
     .await?;
-    let inventory = statement(
+    let (inventory, diagnostics) = statement_with_diagnostics(
         &client,
         "SELECT ?name WHERE { ?s a :Symbol; :name ?name } ORDER BY ?name",
     )
@@ -913,24 +914,18 @@ async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> Te
         Some(true),
         "{inventory}"
     );
-    assert!(
-        warning_codes(&inventory).contains("source_unavailable"),
-        "{inventory}"
-    );
+    assert_logged_warning(&inventory, &diagnostics, "source_unavailable");
     for absent in [
         "SELECT ?s WHERE { ?s a :Symbol; :name 'held' }",
         "ASK { ?s a :Symbol; :name 'held' }",
         "SELECT (COUNT(?s) AS ?n) WHERE { ?s a :Symbol }",
     ] {
-        let answer = statement(&client, absent).await?;
+        let (answer, diagnostics) = statement_with_diagnostics(&client, absent).await?;
         assert_eq!(
             answer["reason"], "insufficient_coverage",
             "{absent}: {answer}"
         );
-        assert!(
-            warning_codes(&answer).contains("source_unavailable"),
-            "{absent}: {answer}"
-        );
+        assert_logged_warning(&answer, &diagnostics, "source_unavailable");
     }
     let witness = statement(&client, "ASK { ?s a :Symbol; :name 'graph_leaf' }").await?;
     assert_eq!(
@@ -989,7 +984,6 @@ async fn an_oversized_file_leaves_symbol_enumeration_counts_and_groups_answering
         Some(configuration),
     )
     .await?;
-    let omission = ["source_unavailable", "large_file_unparsed"];
     let enumeration = statement_page(
         &client,
         "SELECT ?name WHERE { ?s a :Symbol; :name ?name } ORDER BY ?name",
@@ -1055,11 +1049,7 @@ async fn an_oversized_file_leaves_symbol_enumeration_counts_and_groups_answering
 
     for answer in &answers {
         assert_ne!(answer["outcome"], "unavailable", "{answer}");
-        let codes = warning_codes(answer);
-        assert!(
-            omission.iter().all(|code| !codes.contains(code)),
-            "no answer carries the left-out file: {answer}"
-        );
+        assert!(answer.get("warnings").is_none(), "{answer}");
     }
     client.cancel().await?;
     Ok(())
@@ -1118,10 +1108,7 @@ async fn a_walk_past_the_request_budget_answers_the_acquired_part() -> TestResul
             "functions={functions}: {walk}"
         );
         assert_eq!(walk["pagination"]["pages"], json!(acquired.div_ceil(10)));
-        assert!(
-            !warning_codes(&walk).contains("edge_coverage_missing"),
-            "the budget reaches the log, not the answer: {walk}"
-        );
+        assert!(walk.get("warnings").is_none(), "{walk}");
         let limited = statement_page(
             &client,
             &format!("SELECT DISTINCT ?t {{ <{entry}> :calls+ ?t }} LIMIT 5"),

@@ -149,7 +149,7 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     assert!(
         refused
             .text
-            .starts_with("1 error\n\tconfiguration_invalid · retry ")
+            .starts_with("1 error\n\tconfiguration_invalid | retry ")
             && !refused.text.contains("phase"),
         "{}",
         refused.text

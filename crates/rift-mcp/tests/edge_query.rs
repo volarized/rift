@@ -297,10 +297,10 @@ async fn test_edge_readiness_budget_reports_a_typed_warning_for_calls_and_struct
             max_results: 10,
             revision: None,
         };
-        let answer = query_after_population(&client, &params).await?;
-        let warnings = answer["warnings"]
-            .as_array()
-            .ok_or_else(|| format!("typed readiness warning: {answer}"))?;
+        let (answer, warnings) =
+            workspace_client::populated_answer(&client, "search", &serde_json::to_value(&params)?)
+                .await?;
+        assert!(answer.get("warnings").is_none());
         assert!(
             warnings
                 .iter()
@@ -391,12 +391,13 @@ async fn test_edge_inventory_reads_cut_at_their_deadline_keep_the_engine() -> Te
     }
     let mut settled = None;
     for _read in 0..20 {
-        let answer = query_after_population(&client, &params).await?;
-        let unavailable = answer["warnings"].as_array().is_some_and(|warnings| {
-            warnings
-                .iter()
-                .any(|warning| warning["code"] == "engine_analysis_unavailable")
-        });
+        let (answer, warnings) =
+            workspace_client::populated_answer(&client, "search", &serde_json::to_value(&params)?)
+                .await?;
+        assert!(answer.get("warnings").is_none());
+        let unavailable = warnings
+            .iter()
+            .any(|warning| warning["code"] == "engine_analysis_unavailable");
         if !unavailable {
             settled = Some(answer);
             break;
@@ -487,12 +488,13 @@ async fn test_edge_inventory_reads_dropped_mid_write_do_not_spend_the_restart_bu
     }
     let mut settled = None;
     for _read in 0..10 {
-        let answer = query_after_population(&client, &params).await?;
-        let unavailable = answer["warnings"].as_array().is_some_and(|warnings| {
-            warnings
-                .iter()
-                .any(|warning| warning["code"] == "engine_analysis_unavailable")
-        });
+        let (answer, warnings) =
+            workspace_client::populated_answer(&client, "search", &serde_json::to_value(&params)?)
+                .await?;
+        assert!(answer.get("warnings").is_none());
+        let unavailable = warnings
+            .iter()
+            .any(|warning| warning["code"] == "engine_analysis_unavailable");
         if !unavailable {
             settled = Some(answer);
             break;
@@ -579,22 +581,21 @@ async fn test_edge_reference_locations_in_unopened_documents_are_resolved() -> T
     let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
     let beacon = captured_seed(&client, "beacon", "lib.rs").await?;
     let user = captured_seed(&client, "user", "user.rs").await?;
-    let answer = query_after_population(
-        &client,
-        &QueryParams {
-            query: format!(
-                "SELECT ?s ?p {{ ?s :references <{beacon}> . ?e a :Edge; :from ?s; :to <{beacon}>; \
+    let params = QueryParams {
+        query: format!(
+            "SELECT ?s ?p {{ ?s :references <{beacon}> . ?e a :Edge; :from ?s; :to <{beacon}>; \
                  :kinds :references; :provider ?p }}"
-            ),
-            language: QueryLanguage::Sparql,
-            page: 1,
-            max_results: 100,
-            revision: None,
-            include: rift_protocol::query::QueryInclude::default(),
-        },
-    )
-    .await?;
-    let warnings = answer["warnings"].as_array().cloned().unwrap_or_default();
+        ),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 100,
+        revision: None,
+        include: rift_protocol::query::QueryInclude::default(),
+    };
+    let (answer, warnings) =
+        workspace_client::populated_answer(&client, "search", &serde_json::to_value(&params)?)
+            .await?;
+    assert!(answer.get("warnings").is_none());
     assert!(
         !warnings
             .iter()

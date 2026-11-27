@@ -55,7 +55,7 @@ pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Resu
         out.raw_line(
             0,
             &format!(
-                "next · {}",
+                "next | {}",
                 workspace_page_uri(next, pagination.max_results, revision)
             ),
         )?;
@@ -117,7 +117,7 @@ fn patterns_line<'a>(
     sections.entry(PATTERN_DEPTH, &format!("{label} {}", patterns.join(", ")))
 }
 
-/// `path · language`, with only the path when no language matched.
+/// `path | language`, with only the path when no language matched.
 fn unit_line(unit: &WorkspaceSourceUnit) -> String {
     let WorkspaceSourceUnit { path, language, .. } = unit;
     let mut facts = Facts::default();
