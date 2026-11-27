@@ -4146,3 +4146,99 @@ fn javascript_array_records_keep_separate_written_properties() {
             .all(|edge| found.edges.contains(edge))
     );
 }
+
+#[test]
+fn commonjs_named_export_arrays_keep_properties_under_their_written_slots() {
+    const SOURCE: &str = concat!(
+        "const control = { preserved: 1 };\n",
+        "exports.control = control;\n",
+        "exports.rows = [\n",
+        "  { direct: 1, branch: { inner: 11 } },\n",
+        "  { direct: 2, branch: { inner: 22 } },\n",
+        "];\n",
+        "module.exports.more = [{ checked: 3 }, { checked: 4 }];\n",
+        "exports.read = function (index) { return exports.rows[index].direct; };\n",
+    );
+    const INDIRECT: &str = concat!(
+        "const alias = choose(exports);\n",
+        "alias.rows = [{ opaque: 1 }, { opaque: 2 }];\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.cjs", "exports.data = require('./array.cjs'); exports.indirect = require('./indirect.cjs');"),
+            ("array.cjs", SOURCE),
+            ("indirect.cjs", INDIRECT),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.cjs"}"#,
+        )),
+    )
+    .expect("checked CommonJS sources");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid array property facts");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "array.cjs")
+        .expect("array source");
+    let property = |written: &str| {
+        let start = SOURCE.find(written).expect("written property");
+        found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == unit.unit
+                    && row.source == written
+                    && row.range == module_runtime_range(start, written)
+            })
+            .unwrap_or_else(|| panic!("missing written property {written}"))
+    };
+    for (owner, first, second) in [
+        ("rows", "direct: 1", "direct: 2"),
+        ("rows", "branch: { inner: 11 }", "branch: { inner: 22 }"),
+        ("more", "checked: 3", "checked: 4"),
+    ] {
+        let left = property(first);
+        let right = property(second);
+        assert_ne!(left.symbol, right.symbol);
+        for row in [left, right] {
+            assert!(row.symbol.as_str().contains(&format!("/{owner}/")));
+        }
+    }
+    for (parent, child) in [
+        ("branch: { inner: 11 }", "inner: 11"),
+        ("branch: { inner: 22 }", "inner: 22"),
+    ] {
+        let parent = property(parent);
+        let child = property(child);
+        assert!(
+            found
+                .objects
+                .iter()
+                .any(|row| row.id.as_ref() == Some(&child.symbol)
+                    && row.container.as_ref() == Some(&parent.symbol))
+        );
+    }
+    assert!(
+        property("preserved: 1")
+            .symbol
+            .as_str()
+            .ends_with("/control/preserved")
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.source.starts_with("opaque: "))
+    );
+    assert!(
+        found
+            .edges
+            .iter()
+            .all(|edge| !edge.kinds.contains(&EdgeKind::Reads)
+                || !edge.to.as_str().contains("/rows/direct"))
+    );
+}

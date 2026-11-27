@@ -7,7 +7,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
-    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxFacts, SyntaxSymbol,
+    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::{SelectedFile, binding_name};
@@ -282,7 +282,7 @@ impl<'source> FileScopes<'source> {
         else {
             return BTreeMap::new();
         };
-        let owners = LiteralOwners::new(symbols, facts, anchors, file.source);
+        let owners = LiteralOwners::new(file, facts, anchors);
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
         let mut scoped = BTreeMap::new();
         for (name, declarations) in candidates {
@@ -1034,11 +1034,12 @@ struct LiteralOwners<'source> {
 
 impl<'source> LiteralOwners<'source> {
     fn new(
-        symbols: &'source [SyntaxSymbol],
+        file: &SelectedFile<'source>,
         facts: &'source StaticFacts,
         anchors: &BTreeMap<String, SymbolId>,
-        source: &str,
     ) -> Self {
+        let symbols = file.syntax.symbols();
+        let source = file.source;
         let receiver_scopes = facts
             .function_scopes()
             .iter()
@@ -1058,22 +1059,7 @@ impl<'source> LiteralOwners<'source> {
                 .or_insert(Some(symbol));
         }
         let functions = literal_callable_owners(&unique, facts, anchors, &values);
-        let array_initializers = unique
-            .into_iter()
-            .filter_map(|(name, symbol)| {
-                let declaration = symbol?;
-                let value = declaration.body_range?;
-                let written = source
-                    .get(usize::try_from(value.start).ok()?..usize::try_from(value.end).ok()?)?;
-                (declaration.kind == "variable"
-                    && declaration.syntax_element_kind == Some("variable_declarator")
-                    && declaration.item_range.encloses(value)
-                    && anchors.contains_key(name)
-                    && written.starts_with('[')
-                    && written.ends_with(']'))
-                .then_some((name, value))
-            })
-            .collect();
+        let array_initializers = array_literal_owners(file, &unique, anchors);
         let mut initializers = BTreeMap::new();
         for function in functions
             .values()
@@ -1195,6 +1181,56 @@ impl<'source> LiteralOwners<'source> {
             None | Some((_, None)) => false,
         }
     }
+}
+
+/// Selects placed declarations whose initializer is the written array itself.
+fn array_literal_owners<'source>(
+    file: &SelectedFile<'source>,
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<&'source str, ByteRange> {
+    let assigned_exports = file
+        .syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|binding| {
+            let name = binding.exported?;
+            (binding.kind == SyntaxExportKind::Named
+                && binding.local == Some(name)
+                && binding.source.is_none()
+                && binding.container.is_none()
+                && !binding.type_only)
+                .then_some((binding.range, name))
+        })
+        .collect::<BTreeSet<_>>();
+    unique
+        .iter()
+        .filter_map(|(&name, &declaration)| {
+            let declaration = declaration?;
+            let value = declaration.body_range?;
+            let written = file
+                .source
+                .get(usize::try_from(value.start).ok()?..usize::try_from(value.end).ok()?)?;
+            let initializer = match declaration.syntax_element_kind {
+                Some("variable_declarator") => true,
+                Some("assignment_expression") => {
+                    declaration.container.is_none()
+                        && declaration.kinds.contains(&SymbolKind::Public)
+                        && assigned_exports
+                            .contains(&(declaration.item_range, declaration.name_range?))
+                }
+                _ => false,
+            };
+            (initializer
+                && declaration.kind == "variable"
+                && declaration.item_range.encloses(value)
+                && anchors.contains_key(name)
+                && written.starts_with('[')
+                && written.ends_with(']'))
+            .then_some((name, value))
+        })
+        .collect()
 }
 
 /// Names callables with one authored and placed declaration.
