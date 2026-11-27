@@ -495,6 +495,8 @@ pub struct StaticFactsParts {
     pub skippable: Vec<ByteRange>,
     /// Whether an ECMAScript import or export statement stands directly in the source file.
     pub javascript_module_statement: bool,
+    /// Quoted relative specifiers of TypeScript imports with a clause in the source file.
+    pub typescript_module_imports: Vec<ByteRange>,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
@@ -666,6 +668,12 @@ impl StaticFacts {
     #[must_use]
     pub fn has_javascript_module_statement(&self) -> bool {
         self.0.javascript_module_statement
+    }
+
+    /// Quoted relative specifiers of TypeScript imports outside every ambient module and namespace.
+    #[must_use]
+    pub fn typescript_module_imports(&self) -> &[ByteRange] {
+        &self.0.typescript_module_imports
     }
 
     /// Assignments to `module.exports` or a computed key of `module` that run while the file
@@ -1135,6 +1143,7 @@ impl StaticFacts {
         [
             self.commonjs_export()
                 .map_or(0, |export| vector_capacity(&export.initialized)),
+            vector_capacity(&self.0.typescript_module_imports),
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
             vector_capacity(&self.0.member_aliases),
@@ -1232,6 +1241,7 @@ impl StaticFacts {
         let lengths = [
             self.commonjs_export()
                 .map_or(0, |export| export.initialized.len()),
+            self.typescript_module_imports().len(),
             self.references().len(),
             self.members().len(),
             self.member_aliases().len(),
@@ -1537,11 +1547,13 @@ impl StaticFacts {
                 .zip(end)
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
-        if self.commonjs_export().is_some_and(|export| {
-            !valid(export.assignment)
-                || !export.initialized.iter().copied().all(valid)
-                || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
-        }) {
+        if !self.typescript_module_imports().iter().copied().all(valid)
+            || self.commonjs_export().is_some_and(|export| {
+                !valid(export.assignment)
+                    || !export.initialized.iter().copied().all(valid)
+                    || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
+            })
+        {
             return errors::syntax::facts_range_invalid().fail();
         }
         let edges = self.heritage_edges().iter().all(|edge| {

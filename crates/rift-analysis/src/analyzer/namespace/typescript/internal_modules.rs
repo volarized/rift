@@ -182,8 +182,8 @@ fn module_scoped_anchors(
     physical
 }
 
-/// Follow relative reexports from prepared declaration entries. A physical path can
-/// be reached once, and a named export list shares a single module source range.
+/// Follow relative imports and re-exports from prepared declaration entries.
+/// A physical path is reached once, even when several bindings name it.
 fn relative_type_modules(
     input: &NamespaceInput<'_>,
     files: &PackageFiles<'_>,
@@ -229,15 +229,20 @@ fn relative_type_modules(
         if !visited.insert(file.path) {
             continue;
         }
-        let ranges = file
+        let reexports = file
             .syntax
             .export_bindings()
             .unwrap_or_default()
             .iter()
             .filter(|binding| binding.container.is_none())
-            .filter_map(|binding| binding.source)
-            .collect::<BTreeSet<_>>();
-        for range in ranges {
+            .filter_map(|binding| binding.source);
+        let imports = file
+            .syntax
+            .static_facts()
+            .into_iter()
+            .flat_map(rift_syntax::StaticFacts::typescript_module_imports)
+            .copied();
+        for range in reexports.chain(imports).collect::<BTreeSet<_>>() {
             let Some(specifier) = observations::literal_module_name(file.source, range) else {
                 continue;
             };

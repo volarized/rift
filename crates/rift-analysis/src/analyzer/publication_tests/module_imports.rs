@@ -5940,6 +5940,133 @@ fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildca
 }
 
 #[test]
+fn typescript_relative_imports_keep_checked_declarations_beside_runtime_wildcards() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"},"./*.js":"./*.js","./*":"./*.js"}}"#;
+    const ROOT: &str = concat!(
+        "import type { Chosen } from './detail.js';\n",
+        "import type * as settings from './options.js';\n",
+        "import type { Missing } from './missing.js';\n",
+        "import type { Collision } from './collision.js';\n",
+        "export interface Box { item: Chosen; options: settings.Options }\n",
+        "declare module 'ambient' { import type { Unreached } from './unreached.js'; }\n",
+    );
+    const DETAIL: &str =
+        "import type { Leaf } from './leaf.js';\nexport interface Chosen { value: Leaf }";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.d.ts", ROOT),
+            ("index.js", "export const kept = 1;"),
+            ("detail.d.ts", DETAIL),
+            ("detail.js", "export const kept = 2;"),
+            ("options.d.ts", "export interface Options { value: number }"),
+            ("leaf.d.ts", "export interface Leaf { value: number }"),
+            (
+                "collision.d.ts",
+                "export interface Collision { value: number }",
+            ),
+            (
+                "collision.ts",
+                "export interface Collision { value: string }",
+            ),
+            (
+                "unreached.d.ts",
+                "export interface Unreached { value: number }",
+            ),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = |path| {
+        publication
+            .units
+            .iter()
+            .find(|row| row.path.0 == path && row.source_complete)
+            .expect("retained source")
+    };
+    let edge = |path, source: &str, spelling: &str, from: &str, to: &str, kind| {
+        let start = source.rfind(spelling).expect("written use");
+        let range = module_runtime_range(start, spelling);
+        publication.edges.iter().any(|row| {
+            row.kinds == [kind]
+                && row.from.as_str().ends_with(from)
+                && row.to.as_str().ends_with(to)
+                && row
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit(path).unit && site.range == range)
+        })
+    };
+    for (path, source, specifier, from, to) in [
+        (
+            "index.d.ts",
+            ROOT,
+            "'./detail.js'",
+            "/beacon",
+            "%2Fdetail.d.ts",
+        ),
+        (
+            "index.d.ts",
+            ROOT,
+            "'./options.js'",
+            "/beacon",
+            "%2Foptions.d.ts",
+        ),
+        (
+            "detail.d.ts",
+            DETAIL,
+            "'./leaf.js'",
+            "%2Fdetail.d.ts",
+            "%2Fleaf.d.ts",
+        ),
+    ] {
+        assert!(
+            edge(path, source, specifier, from, to, EdgeKind::Imports),
+            "{path}: {specifier}"
+        );
+    }
+    assert!(edge(
+        "index.d.ts",
+        ROOT,
+        "Chosen",
+        "/Box/item",
+        "%2Fdetail.d.ts/Chosen",
+        EdgeKind::HasType
+    ));
+    assert!(edge(
+        "detail.d.ts",
+        DETAIL,
+        "Leaf",
+        "/Chosen/value",
+        "%2Fleaf.d.ts/Leaf",
+        EdgeKind::HasType
+    ));
+    assert!(edge(
+        "index.d.ts",
+        ROOT,
+        "settings.Options",
+        "/Box/options",
+        "%2Foptions.d.ts/Options",
+        EdgeKind::HasType
+    ));
+    for path in ["collision.d.ts", "unreached.d.ts"] {
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit(path).unit),
+            "{path}"
+        );
+    }
+    assert!(publication.declarations.iter().any(|row| {
+        row.unit == unit("index.js").unit && row.symbol.as_str().ends_with("/beacon/kept")
+    }));
+}
+
+#[test]
 fn npm_package_imports_keep_runtime_calls_and_declared_type_ranges() {
     const RUNTIME: &str = "import { Flags, select } from '#items/state';\nexport function run() { return select(Flags.enabled); }\n";
     const TYPES: &str = "import type { State } from '#items/state';\nexport declare function run(state: State): State;\n";
