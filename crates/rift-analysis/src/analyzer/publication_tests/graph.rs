@@ -499,7 +499,16 @@ fn package_python_loop_targets_keep_authored_declarations() {
             .cloned()
             .collect::<Vec<_>>()
     );
-    assert_eq!(limited.edges, complete.edges);
+    let incumbent_edges = complete
+        .edges
+        .into_iter()
+        .filter(|edge| {
+            !["/collect/item", "/pairs/key", "/pairs/amount"]
+                .iter()
+                .any(|suffix| edge.to.as_str().ends_with(suffix))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(limited.edges, incumbent_edges);
 }
 
 #[test]

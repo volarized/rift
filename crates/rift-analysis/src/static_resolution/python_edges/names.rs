@@ -65,6 +65,9 @@ impl<'source> Index<'source> {
     ) -> Vec<ReassignedLocalRead<'source>> {
         let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
+            if file.python_loop_bindings.contains_key(&name) {
+                continue;
+            }
             let target = match file.python_parameters.get(&name) {
                 Some(&Some(symbol))
                     if parameters
@@ -170,6 +173,9 @@ impl<'source> Index<'source> {
                 .python_property_receiver_start
                 .get_or_insert(result.occurrences.len());
             for &(read, name) in file.facts.python_local_reads() {
+                if file.python_loop_bindings.contains_key(&name) {
+                    continue;
+                }
                 if !work.charge() {
                     return;
                 }
@@ -256,6 +262,38 @@ impl<'source> Index<'source> {
                 }
                 if let Some(target) = file.python_comprehension_read_target(read, work) {
                     result.record(self.python_access(file, read, ReferenceRole::Read, target));
+                }
+            }
+        }
+    }
+
+    /// Resolves exact, admitted loop target reads after all established edge work.
+    pub(in crate::static_resolution) fn resolve_python_loop_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_loop_read_start = Some(result.occurrences.len());
+        for file in self
+            .python_files()
+            .filter(|file| !file.python_loop_bindings.is_empty())
+        {
+            for &(read, name) in file.facts.python_local_reads() {
+                let Some(&Some(symbol)) = file.python_loop_bindings.get(&name) else {
+                    continue;
+                };
+                if !work.charge() {
+                    return;
+                }
+                let target = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if matches!(
+                    file.python_local_read_scope(read, name, target, work),
+                    Some(LocalReadScope::Single)
+                ) {
+                    self.record_python_local_read(file, read, target, result);
                 }
             }
         }
@@ -786,7 +824,8 @@ impl<'source> File<'source> {
         let in_scope = if target.symbol.is_python_parameter() {
             caller.symbol.item_range.encloses(item) && item.end <= body.start
         } else {
-            target.symbol.kind == "variable" && body.encloses(item)
+            (target.symbol.kind == "variable" || target.symbol.is_python_loop_binding())
+                && body.encloses(item)
         };
         if !in_scope
             || target.symbol.container.as_deref() != Some(caller.symbol.qualified_name.as_str())

@@ -1180,3 +1180,112 @@ fn python_wildcard_imports_keep_the_written_module_and_star() {
     );
     assert!(prior.iter().all(|edge| limited.edges.contains(edge)));
 }
+
+const LOOP_READ_SOURCE: &str = concat!(
+    "def chosen(): return 0\n",
+    "def direct(source):\n    local = source\n    return local\n",
+    "def via_loop(source):\n    for chosen in source:\n        return chosen\n",
+    "    else:\n        return chosen\n",
+    "def tupled(source):\n    for left, right in source:\n        return left, right\n",
+    "async def async_loop(source):\n    async for item in source:\n        return item\n",
+    "def shadowed(source):\n    for chosen in source:\n",
+    "        def nested(chosen):\n            return chosen\n",
+    "        return nested(1), chosen\n",
+    "def changed(source):\n    for chosen in source:\n",
+    "        chosen = 0\n        return chosen\n",
+    "def iterable():\n    for chosen in chosen:\n        return chosen\n",
+);
+
+#[test]
+fn python_loop_bodies_read_their_written_targets() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = LOOP_READ_SOURCE;
+    let result = publication(&[("demo/__init__.py", source)], None, &["demo"]);
+    let range = |context: &str, name: &str| {
+        let offset = source.find(context).expect("written context")
+            + context.rfind(name).expect("written name");
+        (
+            u64::try_from(offset).expect("source offset"),
+            u64::try_from(offset + name.len()).expect("source offset"),
+        )
+    };
+    let reads_at = |context, name| {
+        let range = range(context, name);
+        result.edges.iter().filter(move |edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| (site.range.start, site.range.end) == range)
+        })
+    };
+    for (suffix, declaration, use_context, name) in [
+        (
+            "/via_loop/chosen",
+            "def via_loop(source):\n    for chosen",
+            "in source:\n        return chosen\n    else:",
+            "chosen",
+        ),
+        (
+            "/tupled/left",
+            "for left, right",
+            "return left, right",
+            "left",
+        ),
+        (
+            "/tupled/right",
+            "for left, right",
+            "return left, right",
+            "right",
+        ),
+        ("/async_loop/item", "async for item", "return item", "item"),
+        (
+            "/shadowed/chosen",
+            "def shadowed(source):\n    for chosen",
+            "return nested(1), chosen",
+            "chosen",
+        ),
+    ] {
+        let declaration = result
+            .declarations
+            .iter()
+            .find(|entry| {
+                entry.symbol.as_str().ends_with(suffix)
+                    && (entry.range.start, entry.range.end) == range(declaration, name)
+            })
+            .expect("exact loop declaration");
+        let [read] = reads_at(use_context, name).collect::<Vec<_>>()[..] else {
+            panic!("one exact Read for {suffix}");
+        };
+        assert_eq!(read.to, declaration.symbol);
+    }
+    for (suffix, context, name) in [
+        ("/direct/local", "return local", "local"),
+        (
+            "/via_loop/source",
+            "def via_loop(source):\n    for chosen in source",
+            "source",
+        ),
+        (
+            "/shadowed/nested/chosen",
+            "def nested(chosen):\n            return chosen",
+            "chosen",
+        ),
+    ] {
+        assert!(
+            reads_at(context, name).any(|edge| edge.to.as_str().ends_with(suffix)),
+            "{suffix}"
+        );
+    }
+    for (suffix, context) in [
+        ("/via_loop/chosen", "else:\n        return chosen"),
+        ("/changed/chosen", "chosen = 0\n        return chosen"),
+        ("/iterable/chosen", "for chosen in chosen"),
+    ] {
+        assert!(
+            reads_at(context, "chosen").all(|edge| !edge.to.as_str().ends_with(suffix)),
+            "{suffix}"
+        );
+    }
+}

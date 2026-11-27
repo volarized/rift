@@ -216,12 +216,12 @@ impl EdgePythonKinds {
             self.edge_parameters(visited, source, facts, names)?;
         } else if self.assignment.contains(&id) {
             if let Some(target) = syntax_element.child_by_field_id(self.left) {
-                self.edge_shadow(target, visited, facts)?;
+                self.edge_shadow(target, visited, source, facts, names)?;
                 self.edge_direct_local(visited, target, source, names)?;
             }
         } else if id == self.named {
             if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
-                self.edge_shadow(name, visited, facts)?;
+                self.edge_shadow(name, visited, source, facts, names)?;
             }
         } else if id == self.names.type_alias {
             self.edge_type_alias(visited, facts)?;
@@ -789,11 +789,13 @@ impl EdgePythonKinds {
         }
     }
 
-    fn edge_shadow(
+    fn edge_shadow<'source>(
         &self,
         target: Node<'_>,
         visited: Visited<'_, '_>,
+        source: &'source str,
         facts: &mut StaticFactsParts,
+        names: &mut Names<'source>,
     ) -> Result<(), RiftError> {
         let scopes = if visited.syntax_element().kind_id() == self.named {
             &self.scopes[..4]
@@ -803,9 +805,21 @@ impl EdgePythonKinds {
         let Some(scope) = edge_enclosing(visited, scopes) else {
             return Ok(());
         };
+        let statement = visited.syntax_element();
+        let loop_body = (statement.kind_id() == self.assignment[2]
+            && !statement.has_error()
+            && scope.kind_id() == self.definitions[0])
+            .then(|| statement.child_by_field_id(self.body))
+            .flatten()
+            .filter(|body| !body.is_missing())
+            .map(byte_range)
+            .transpose()?;
         let mut pending = vec![(target, TargetPlace::Whole)];
         while let Some((target, place)) = pending.pop() {
             if target.kind_id() == self.identifier {
+                if let Some(body) = loop_body {
+                    names.loop_binding(source, byte_range(target)?, self.scope_range(scope)?, body);
+                }
                 let kind = self.edge_assignment_kind(visited, target, place)?;
                 let available = match kind {
                     StaticBindingKind::PythonInstance { .. }
