@@ -14,11 +14,10 @@ import com.sun.source.util.JavacTask;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
@@ -31,20 +30,17 @@ import javax.tools.ToolProvider;
 public final class JavacFacts {
     private JavacFacts() {}
 
-    public static void main(String[] args) throws Exception {
-        Path sourceList = Path.of(args[4]).toAbsolutePath();
-        var paths = Files.readAllLines(sourceList).stream().map(Path::of).toList();
-        var facts = new Facts(Facts.Category.valueOf(args[0]), Integer.parseInt(args[1]), paths);
+    static void collect(Facts facts, List<Path> paths, List<Path> classpath, Path output,
+            String patchModule) throws IOException {
         var compiler = ToolProvider.getSystemJavaCompiler();
         try (var files = compiler.getStandardFileManager(null, null, StandardCharsets.UTF_8)) {
             // A separate source path prevents javac from reading unadmitted neighboring files.
             files.setLocationFromPaths(StandardLocation.SOURCE_PATH, List.of());
-            files.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(sourceList.getParent()));
-            files.setLocationFromPaths(StandardLocation.CLASS_PATH,
-                args[2].isEmpty() ? List.of() : splitPaths(args[2]));
+            files.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(output));
+            files.setLocationFromPaths(StandardLocation.CLASS_PATH, classpath);
             var options = new ArrayList<>(List.of("-proc:none", "-implicit:none"));
-            if (!args[3].isEmpty()) {
-                options.addAll(List.of("--patch-module", args[3]));
+            if (patchModule != null) {
+                options.addAll(List.of("--patch-module", patchModule));
             }
             var task = (JavacTask) compiler.getTask(null, files, diagnostic -> {
                 if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
@@ -65,12 +61,6 @@ public final class JavacFacts {
         } catch (StackOverflowError error) {
             facts.partial = true;
         }
-        facts.write(System.out);
-    }
-
-    private static List<Path> splitPaths(String classpath) {
-        return Arrays.stream(classpath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator)))
-            .map(Path::of).toList();
     }
 
     private static final class Scanner extends TreePathScanner<Void, Facts.Range> {

@@ -1,7 +1,7 @@
 import com.intellij.psi.PsiElement
+import java.io.File
 import java.io.OutputStream
 import java.io.PrintStream
-import java.nio.file.Files
 import java.nio.file.Path
 import org.jetbrains.kotlin.KtFakeSourceElementKind
 import org.jetbrains.kotlin.KtPsiSourceElement
@@ -64,32 +64,33 @@ import org.jetbrains.kotlin.psi.KtPrimaryConstructor
 import org.jetbrains.kotlin.psi.KtTypeReference
 import org.jetbrains.kotlin.psi.KtUserType
 
-object KotlinFacts {
-    @JvmStatic
-    fun main(args: Array<String>) {
-        val files = Files.readAllLines(Path.of(args[6]))
-        val sources = files.map(Path::of)
-        val facts = Facts(Facts.Category.valueOf(args[0]), args[1].toInt(), sources)
+class KotlinFacts : KotlinCompiler {
+    override fun collect(
+        facts: Facts, paths: List<Path>, classpath: List<Path>, home: Path, output: Path, stdlib: Boolean,
+    ) {
         val options = mutableListOf(
-            "-kotlin-home", args[3], "-d", args[4],
+            "-kotlin-home", home.toString(), "-d", output.toString(),
             "-Xuse-fir-lt=false", "-Xdisable-default-scripting-plugin",
             "-Xplugin=${Path.of(KotlinFacts::class.java.protectionDomain.codeSource.location.toURI())}",
         )
-        if (args[2].isNotEmpty()) options.addAll(listOf("-classpath", args[2]))
-        if (args[5].toBooleanStrict()) {
-            val stdlib = Path.of(args[3], "lib", "kotlin-stdlib.jar")
-            options.addAll(listOf("-Xallow-kotlin-package", "-Xfriend-paths=$stdlib"))
+        if (classpath.isNotEmpty()) options.addAll(listOf("-classpath", classpath.joinToString(File.pathSeparator)))
+        if (stdlib) {
+            val library = home.resolve("lib").resolve("kotlin-stdlib.jar")
+            options.addAll(listOf("-Xallow-kotlin-package", "-Xfriend-paths=$library"))
         }
-        options.addAll(files)
+        options.addAll(paths.map(Path::toString))
 
-        // The command accepts one selected source. The compiler loads the registrar from this
-        // collector's own jar and obtains the output sink from the same class loader.
-        KotlinFactsRegistrar.facts = facts
-        PrintStream(OutputStream.nullOutputStream()).use { diagnostics ->
-            val exit = K2JVMCompiler().exec(diagnostics, *options.toTypedArray())
-            facts.partial = facts.partial || exit != ExitCode.OK
+        val active = KotlinFactsRegistrar.facts
+        check(active.get() == null)
+        active.set(facts)
+        try {
+            PrintStream(OutputStream.nullOutputStream()).use { diagnostics ->
+                val exit = K2JVMCompiler().exec(diagnostics, *options.toTypedArray())
+                facts.partial = facts.partial || exit != ExitCode.OK
+            }
+        } finally {
+            active.remove()
         }
-        facts.write(System.out)
     }
 }
 
@@ -98,7 +99,7 @@ class KotlinFactsRegistrar : CompilerPluginRegistrar() {
     override val supportsK2 = true
 
     override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
-        FirExtensionRegistrarAdapter.registerExtension(Registrar(facts))
+        FirExtensionRegistrarAdapter.registerExtension(Registrar(checkNotNull(facts.get())))
     }
 
     private class Registrar(val facts: Facts) : FirExtensionRegistrar() {
@@ -108,7 +109,7 @@ class KotlinFactsRegistrar : CompilerPluginRegistrar() {
     }
 
     companion object {
-        internal lateinit var facts: Facts
+        internal val facts = ThreadLocal<Facts>()
     }
 }
 

@@ -37,7 +37,7 @@ The manifest resolves `path` relative to its own directory. The collector uses `
 
 Repeat the command with the same database. The runner reuses a checkpoint when the producer, context, category, selected source and supporting source witnesses match. A read of a missing unit is also a witness. Adding that unit invalidates the dependent batch. Removing a unit from the selection removes it from subsequent output. Complete batches commit independently. A restart after failure reuses them. A partial batch remains due, and the CLI exits with status 2 after returning its output. Other failures exit with status 1.
 
-Use a separate database for each collection. A new database has a 1 GiB page limit. The runner accepts up to 20,000 sources, 128 MiB of total source text and 1 MiB per source. It admits up to 16,384 observations and 512 supporting units per batch. The CLI gives each request 30 seconds. A complete batch establishes coverage of the selected source and category. A candidate does not establish runtime dispatch.
+Use a separate database for each collection. A new database has a 1 GiB page limit. The runner accepts up to 20,000 sources, 128 MiB of total source text and 1 MiB per source. It admits up to 16,384 observations and 512 supporting units per batch. The stdio runner gives each request 30 seconds. A complete batch establishes coverage of the selected source and category. A candidate does not establish runtime dispatch.
 
 ## Run the Java and Kotlin syntax and LSP collectors
 
@@ -68,13 +68,17 @@ for Maven and Gradle detection and server setup.
 
 The Java collector uses the JDK compiler tree API. The Kotlin collector uses the K2 frontend in Kotlin 2.2.21. Both resolve names and overloads against the admitted source and the compiler classpath. A target has an anchor only when the compiler reports a declaration range in an admitted source.
 
-Set `JAVA_HOME` to a JDK 25 installation and `KOTLIN_HOME` to the root of the Kotlin 2.2.21 command-line distribution. Build the compiler collector from the repository root:
+Set `JAVA_HOME` to a JDK 25 installation, `KOTLIN_HOME` to the Kotlin 2.2.21 command-line
+distribution, and `GSON_JAR` to the Gson 2.13.2 JAR (`com.google.code.gson:gson:2.13.2`).
+[Gson 2.13.2](https://github.com/google/gson/releases/tag/gson-parent-2.13.2).
+
+Run these commands from the repository root to build the collector.
 
 ```sh
-build=$(mktemp -d)
+build=$(mktemp -d "${TMPDIR:-/tmp}/rift-jvm.XXXXXXXX")
 mkdir "$build/classes"
 sources=tools/semantic-collectors/jvm
-"$JAVA_HOME/bin/javac" -proc:none -d "$build/classes" "$sources"/*.java
+"$JAVA_HOME/bin/javac" -proc:none -cp "$GSON_JAR" -d "$build/classes" "$sources"/*.java
 "$KOTLIN_HOME/bin/kotlinc" -Xcontext-parameters \
   -classpath "$KOTLIN_HOME/lib/kotlin-compiler.jar:$build/classes" \
   -d "$build/classes" "$sources/KotlinFacts.kt"
@@ -82,20 +86,35 @@ sources=tools/semantic-collectors/jvm
   -C "$build/classes" . -C "$sources" META-INF
 ```
 
-A Java-only build can omit the Kotlin compiler command and the `META-INF` argument to `jar`. Run the collector with a manifest whose category is `calls`, `references`, or `imports`:
+Pass the JVM command to `rift-collect collect`. The manifest category can be `calls`,
+`references`, or `imports`.
 
 ```sh
 rift-collect collect sources.json checkpoints.sqlite -- \
-  python3 -B -S tools/semantic-collectors/jvm.py \
-  --java "$JAVA_HOME/bin/java" --engine "$build/jvm-facts.jar" \
-  --kotlin-home "$KOTLIN_HOME"
+  "$JAVA_HOME/bin/java" -Xmx768m \
+  -cp "$build/jvm-facts.jar:$GSON_JAR:$KOTLIN_HOME/lib/*" \
+  JvmCollector --kotlin-home "$KOTLIN_HOME"
 ```
 
-Use `--source-unit UNIT` for each supporting source in the manifest. For a build classpath, pass one `--classpath PATH` per classes directory or JAR. The collector reads those paths without invoking Maven or Gradle. Include the JVM collector files in the implementation digest. Include the JDK and Kotlin versions, classpath contents, supporting unit names and compiler options in the context digest.
+The runner starts one JVM on the first cache miss and uses it for later batches. For a Java-only
+build, omit the Kotlin compiler command and the `META-INF` argument to `jar`. Launch
+`JvmCollector` with `"$build/jvm-facts.jar:$GSON_JAR"` as the JVM classpath and omit
+`--kotlin-home`.
+
+Use `--source-unit UNIT` for each supporting source in the manifest. For a build classpath, pass
+one `--classpath PATH` per classes directory or JAR. Include the JVM collector files in the
+implementation digest. Include the Gson JAR, JDK and Kotlin versions, classpath contents,
+supporting unit names and compiler options in the context digest.
 
 For JDK source from `$JAVA_HOME/lib/src.zip`, pass `--java-module java.base` and one `--java-module-source UNIT` per admitted file in that module. For Kotlin standard library source from the matching source JAR, pass `--kotlin-stdlib` and the admitted unit with `--source-unit UNIT`. The option lets the compiler collect declarations in the `kotlin` package against its matching standard library.
 
-The compiler reads only the selected and supporting source units, plus compiler and classpath inputs. Java annotation processing and Kotlin scripting are disabled. The Kotlin compiler writes its output to a temporary directory. The collector reports partial coverage if a compiler reports an error, or a source, observation or time bound interrupts collection. Kotlin scripts (`.kts`) use the static analyzer.
+The compiler reads only the selected and supporting source units, plus compiler and classpath
+inputs. Java annotation processing and Kotlin scripting are disabled. Set the JVM option
+`-Djava.io.tmpdir=PATH` before `JvmCollector` to choose where the collector stages sources and
+compiler output. A forced stop can leave the current request's temporary directory behind.
+
+The collector reports partial coverage if a compiler reports an error or a source or observation
+bound interrupts collection. Kotlin scripts (`.kts`) use the static analyzer.
 
 ## Use a collector from another host
 

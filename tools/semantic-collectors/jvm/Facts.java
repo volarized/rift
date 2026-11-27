@@ -1,4 +1,4 @@
-import java.io.PrintStream;
+import com.google.gson.annotations.SerializedName;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -9,7 +9,11 @@ import java.util.Map;
 import java.util.Set;
 
 public final class Facts {
-    enum Category { CALLS, REFERENCES, IMPORTS }
+    enum Category {
+        @SerializedName("calls") CALLS,
+        @SerializedName("references") REFERENCES,
+        @SerializedName("imports") IMPORTS
+    }
 
     record Range(int start, int end) {
         Range {
@@ -62,25 +66,10 @@ public final class Facts {
         observations.add(fact);
     }
 
-    void write(PrintStream out) {
-        out.println(partial ? "partial" : "complete");
+    List<Observation> observations() {
         observations.sort(Comparator
             .comparingInt((Observation fact) -> fact.occurrence().start())
             .thenComparingInt(fact -> fact.occurrence().end()));
-        for (var fact : observations) {
-            writeRange(out, fact.occurrence());
-            writeRange(out, fact.enclosing());
-            if (fact.target() == null) {
-                out.println("-1\t-1\t-1");
-            } else {
-                out.printf("%d\t%d\t%d%n", fact.target().source(),
-                    fact.target().range().start(), fact.target().range().end());
-            }
-        }
-    }
-
-    private static void writeRange(PrintStream out, Range range) {
-        out.printf("%d\t%d\t", range == null ? -1 : range.start(),
-            range == null ? -1 : range.end());
+        return observations;
     }
 }
