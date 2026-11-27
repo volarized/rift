@@ -4266,6 +4266,94 @@ fn javascript_members_follow_a_single_checked_call_result_assignment() {
 }
 
 #[test]
+fn javascript_nested_property_arrays_keep_separate_written_slots() {
+    const SOURCE: &str = concat!(
+        "export const rows = [\n",
+        "  { direct: 1, expected: [{ field: 1 }, { field: 2 }] },\n",
+        "  { control: 3 },\n",
+        "];\n",
+        "export const cases = [\n",
+        "  { groups: [{ member: 3 }, { member: 4 }] },\n",
+        "  { groups: [{ member: 5 }, { member: 6 }] },\n",
+        "];\n",
+        "const duplicates = [{ expected: [{ repeated: 7, repeated: 8 }] }];\n",
+        "export function withheld(key) {\n",
+        "  const values = [{ [key]: [{ opaque: 9 }, { opaque: 10 }] }];\n",
+        "  return values;\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export { rows } from './data.js';"),
+            ("data.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#,
+        )),
+    )
+    .expect("checked nested arrays");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid property facts");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "data.js")
+        .expect("nested array source")
+        .unit;
+    let mut identities = BTreeSet::new();
+    let mut groups = BTreeSet::new();
+    for (written, owner) in [
+        ("field: 1", "expected"),
+        ("field: 2", "expected"),
+        ("member: 3", "groups"),
+        ("member: 4", "groups"),
+        ("member: 5", "groups"),
+        ("member: 6", "groups"),
+    ] {
+        let start = SOURCE.find(written).expect("written property");
+        let range = module_runtime_range(start, written);
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| &row.unit == unit && row.range == range && row.source == written)
+            .unwrap_or_else(|| panic!("missing written nested array property {written}"));
+        let identity = SymbolIdentity::parse(row.symbol.as_str()).expect("property identity");
+        let path = identity.qualified_path();
+        let parent = &path[path.len() - 2];
+        assert_eq!(parent.split('#').next(), Some(owner));
+        if owner == "groups" {
+            groups.insert(parent.clone());
+        }
+        assert!(identities.insert(row.symbol.clone()));
+    }
+    assert_eq!(groups.len(), 2);
+    for retained in ["direct: 1", "control: 3"] {
+        assert!(
+            found
+                .declarations
+                .iter()
+                .any(|row| &row.unit == unit && row.source == retained)
+        );
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.source.starts_with("opaque: "))
+    );
+    let duplicates = found
+        .declarations
+        .iter()
+        .filter(|row| &row.unit == unit && row.source.starts_with("repeated: "))
+        .map(|row| &row.symbol)
+        .collect::<BTreeSet<_>>();
+    assert!(duplicates.len() <= 1);
+}
+
+#[test]
 fn javascript_array_records_keep_separate_written_properties() {
     const SOURCE: &str = concat!(
         "export const control = { preserved: 1 };\n",
