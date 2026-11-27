@@ -206,6 +206,8 @@ pub(super) struct CommonJsExports<'tree> {
     /// Every assignment of the source, in walk order.
     pub(super) assignments: Vec<Node<'tree>>,
     pub(super) closed_export: Option<StaticCommonJsExport>,
+    /// A single root wrapper assignment with a written callable expression.
+    pub(super) expression_export: bool,
     /// Assignments that declare their own export at module scope.
     pub(super) declared: BTreeSet<usize>,
     /// Identifiers an export names, whose declarations the module exports.
@@ -243,6 +245,7 @@ pub(super) fn record<'tree>(
         synchronized,
     };
     let mut closed_export = None;
+    let mut direct_function = None;
     let mut shadowing = BTreeSet::new();
     for &syntax_element in &captured.assignments {
         if synchronized != Some(syntax_element)
@@ -270,6 +273,11 @@ pub(super) fn record<'tree>(
         }
         if body.is_closed_default(syntax_element, &binding, direct) {
             closed_export = Some((binding.range, synchronized == Some(syntax_element), None));
+        } else if allow_literal
+            && direct
+            && body.is_closed_written_function(syntax_element, &binding)
+        {
+            direct_function = Some(binding.range);
         }
         if declares_taken_name(
             syntax_element,
@@ -302,10 +310,42 @@ pub(super) fn record<'tree>(
         })
         .transpose()?;
     let mut exports = exported(&body, &captured, bindings);
-    exports.closed_export = closed_export;
+    exports.expression_export = allow_literal
+        && (direct_function.is_some()
+            || body.is_closed_callable(&captured, closed_export.is_some()));
+    exports.closed_export = closed_export.or_else(|| {
+        direct_function.map(|assignment| StaticCommonJsExport {
+            assignment,
+            synchronized: false,
+            initialized: Vec::new(),
+            literal: None,
+        })
+    });
     exports.shadowing = shadowing;
     exports.assignments = captured.assignments;
     Ok(exports)
+}
+
+fn written_callable_composite(value: Node<'_>, source: &str, kinds: &EcmaScriptKinds) -> bool {
+    if value.kind() != "call_expression"
+        || value.child_by_field_name("optional_chain").is_some()
+        || value
+            .child_by_field_name("function")
+            .is_none_or(|callee| text(source, callee) != "Object.assign")
+    {
+        return false;
+    }
+    let Some(arguments) = value.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut children = named_children(arguments).filter(|child| !child.is_extra());
+    children
+        .next()
+        .is_some_and(|first| kinds.function_values.contains(&first.kind_id()))
+        && children
+            .next()
+            .is_some_and(|next| next.kind_id() == kinds.object_literal)
+        && children.all(|argument| argument.kind_id() == kinds.object_literal)
 }
 
 /// The module body and the writes that replace or synchronize its exported object.
@@ -346,6 +386,52 @@ impl<'tree> ModuleBody<'_, 'tree> {
             .child(assignment, EcmaScriptGrammarField::Right)
             .filter(|value| value.kind_id() == self.kinds.object_literal)
             .filter(|_| closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds))
+    }
+
+    /// Whether the default assignment has a checked callable value.
+    fn is_closed_callable(&self, captured: &CapturedAssignments<'_>, closed_export: bool) -> bool {
+        let Some(assignment) = captured.direct_default else {
+            return false;
+        };
+        let Some(value) = self.kinds.assigned_value(assignment) else {
+            return false;
+        };
+        if captured.blocked.contains(&self.root.id()) {
+            return false;
+        }
+        if closed_export {
+            let name = text(self.source, value);
+            return value.kind_id() == self.kinds.identifier
+                && captured.bound.get(name) == Some(&1)
+                && !captured.rebound.contains(name)
+                && named_children(self.root).any(|statement| {
+                    statement.kind() == "function_declaration"
+                        && statement
+                            .child_by_field_name("name")
+                            .is_some_and(|written| text(self.source, written) == name)
+                });
+        }
+        !captured.bound.contains_key("Object")
+            && !captured.rebound.contains("Object")
+            && written_callable_composite(value, self.source, self.kinds)
+            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
+    }
+
+    /// The written function that a closed module assigns directly to its default export.
+    fn is_closed_written_function(
+        &self,
+        assignment: Node<'_>,
+        binding: &SyntaxExportBinding,
+    ) -> bool {
+        let Some(value) = self.kinds.child(assignment, EcmaScriptGrammarField::Right) else {
+            return false;
+        };
+        binding.kind == SyntaxExportKind::Default
+            && value.kind() == "function_expression"
+            && value
+                .child_by_field_name("name")
+                .is_some_and(|name| extract::byte_range(name).ok() == binding.local)
+            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
     }
 
     /// Whether the default export names a declaration and the file uses its wrapper names

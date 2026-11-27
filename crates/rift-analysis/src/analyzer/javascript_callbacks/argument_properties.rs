@@ -13,7 +13,7 @@ use rift_protocol::read::{
 use rift_provider::AssembledSymbol;
 use rift_syntax::{ByteRange, StaticCallee, SyntaxSymbol};
 
-use super::{CallbackFile, source_text, stored_callback_edge_key};
+use super::{Callback, CallbackFile, source_text, stored_callback_edge_key};
 use crate::ExactPackageLimits;
 use crate::analyzer::{AnalyzedFile, Records, bound, digest_of, line_of, truncation, wire_path};
 
@@ -113,7 +113,8 @@ impl Records {
         for (unit, calls) in calls {
             let file = files_by_unit[unit];
             if let Some(placed) = placed.get(&file.unit) {
-                for (property, name, callback) in argument_properties(file, &calls, placed) {
+                let caller = |range| calls.get(&range).and_then(Option::as_ref);
+                for (property, name, callback) in argument_properties(file, caller, placed) {
                     candidates.push(ArgumentProperty {
                         file,
                         property,
@@ -123,15 +124,89 @@ impl Records {
                 }
             }
         }
-        self.publish_callback_argument_properties(owner, limits, candidates, occupied)
+        self.publish_callback_argument_properties(owner, limits, candidates, &mut occupied)
     }
 
-    fn publish_callback_argument_properties(
+    /// Retains written literal properties under an exact anonymous function argument.
+    pub(in crate::analyzer) fn retain_written_callback_argument_properties(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        limits: ExactPackageLimits,
+    ) -> Result<(), RiftError> {
+        if self.symbols_truncated
+            || !matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm")
+        {
+            return Ok(());
+        }
+        let files = self.ecmascript_callback_files(analyzed, EdgeKind::Calls);
+        let mut placed = BTreeMap::<_, BTreeSet<_>>::new();
+        for row in &self.declarations {
+            let range = ByteRange {
+                start: row.range.start,
+                end: row.range.end,
+            };
+            placed.entry(row.unit.clone()).or_default().insert(range);
+        }
+        let mut occupied = self
+            .objects
+            .iter()
+            .filter_map(|row| row.id.clone())
+            .collect();
+        let declaration_limit = limits
+            .declarations_max()
+            .min(bound(self.publication.symbols));
+        for file in files
+            .values()
+            .filter(|file| file.file.file.syntax().language().name == "javascript")
+        {
+            let Some(placed) = placed.get(&file.unit) else {
+                continue;
+            };
+            let mut callers = BTreeMap::<_, Option<SymbolId>>::new();
+            let caller = |range| written_callback(file, range);
+            for (property, name, callback) in argument_properties(file, caller, placed) {
+                if self.symbols_truncated {
+                    return Ok(());
+                }
+                let id = match callers.entry(callback.range) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(self.publish_ecmascript_callback(
+                            owner,
+                            file,
+                            callback,
+                            &occupied,
+                            declaration_limit,
+                            false,
+                        )?)
+                    }
+                };
+                if let Some(id) = id {
+                    occupied.insert(id.clone());
+                    self.publish_callback_argument_properties(
+                        owner,
+                        limits,
+                        [ArgumentProperty {
+                            file,
+                            property,
+                            name,
+                            callback: id.clone(),
+                        }],
+                        &mut occupied,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_callback_argument_properties<'file, 'source: 'file>(
         &mut self,
         owner: &SymbolOwner,
         limits: ExactPackageLimits,
-        candidates: Vec<ArgumentProperty<'_, '_>>,
-        mut occupied: BTreeSet<SymbolId>,
+        candidates: impl IntoIterator<Item = ArgumentProperty<'file, 'source>>,
+        occupied: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
         let symbol_limit = bound(self.publication.symbols);
         let declaration_limit = limits.declarations_max().min(symbol_limit);
@@ -233,11 +308,18 @@ impl Records {
     }
 }
 
-fn argument_properties<'file, 'call>(
+fn written_callback(file: &CallbackFile<'_>, range: ByteRange) -> Option<Callback> {
+    let callback = *file.scopes.resolve(range.start, range.end)?.as_ref()?;
+    source_text(file.file.file.source(), callback.range)?
+        .ends_with('}')
+        .then_some(callback)
+}
+
+fn argument_properties<'file, Owner: Copy>(
     file: &'file CallbackFile<'_>,
-    stored: &'call BTreeMap<ByteRange, Option<SymbolId>>,
+    caller: impl Fn(ByteRange) -> Option<Owner>,
     placed: &BTreeSet<ByteRange>,
-) -> Vec<(&'file SyntaxSymbol, ByteRange, &'call SymbolId)> {
+) -> Vec<(&'file SyntaxSymbol, ByteRange, Owner)> {
     let syntax = file.file.file.syntax();
     let Some(facts) = syntax.static_facts() else {
         return Vec::new();
@@ -245,7 +327,7 @@ fn argument_properties<'file, 'call>(
     let source = file.file.file.source();
     let mut calls = BTreeMap::new();
     for call in facts.calls() {
-        if let Some(Some(callback)) = stored.get(&call.range)
+        if let Some(callback) = caller(call.range)
             && matches!(
                 call.callee,
                 StaticCallee::Direct | StaticCallee::Member { .. }

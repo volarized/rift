@@ -2375,7 +2375,7 @@ pub(crate) fn analyze_included(
         && !recovered
         && !tree.root_node().has_error()
     {
-        capture.record_commonjs_export(commonjs.closed_export);
+        capture.record_commonjs_exports(commonjs.closed_export, commonjs.expression_export);
     }
     let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),

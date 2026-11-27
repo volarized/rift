@@ -236,9 +236,18 @@ fn inline_import_module_edges_keep_earlier_edges_and_require_complete_modules() 
 #[test]
 fn checked_inline_import_type_alias_keeps_the_full_written_declaration() {
     const PREFIX: &str = "// declaration\n";
-    const NEIGHBOR: &str = "export type Independent = string;\n";
+    const NEIGHBOR: &str = concat!(
+        "export type Independent = string;\n",
+        "export declare function read(value: Public): Public;\n",
+    );
     const INLINE_ALIAS: &str = "type Public = import('./contract.js').Shape;";
     const UNKNOWN_ALIAS: &str = "type Public = import('./missing.js').Shape;";
+    const INTERSECTION_ALIAS: &str =
+        "type Public = import('./contract.js').Shape & { readonly width: number };";
+    const UNION_ALIAS: &str = "type Public = import('./contract.js').Shape | null;";
+    const BARE_ALIAS: &str = "type Public = import('transport').Shape;";
+    const BARE_INTERSECTION_ALIAS: &str =
+        "type Public = import('transport').Shape & { readonly width: number };";
     const NAMED_ALIAS: &str = "type Public = Input;";
     for (written, resolved, canonical) in [
         (
@@ -252,6 +261,26 @@ fn checked_inline_import_type_alias_keeps_the_full_written_declaration() {
             Some(UNKNOWN_ALIAS),
         ),
         (
+            format!("{PREFIX}export {INTERSECTION_ALIAS}\n{NEIGHBOR}"),
+            true,
+            Some(INTERSECTION_ALIAS),
+        ),
+        (
+            format!("{PREFIX}export {UNION_ALIAS}\n{NEIGHBOR}"),
+            true,
+            Some(UNION_ALIAS),
+        ),
+        (
+            format!("{PREFIX}export {BARE_ALIAS}\n{NEIGHBOR}"),
+            false,
+            Some(BARE_ALIAS),
+        ),
+        (
+            format!("{PREFIX}export {BARE_INTERSECTION_ALIAS}\n{NEIGHBOR}"),
+            false,
+            Some(BARE_INTERSECTION_ALIAS),
+        ),
+        (
             format!(
                 "{PREFIX}import type {{ Shape as Input }} from './contract.js';\nexport {NAMED_ALIAS}\n{NEIGHBOR}"
             ),
@@ -263,58 +292,102 @@ fn checked_inline_import_type_alias_keeps_the_full_written_declaration() {
             false,
             None,
         ),
+        (
+            format!("{PREFIX}export type Public = import('transport').Shape & ;\n{NEIGHBOR}"),
+            false,
+            None,
+        ),
     ] {
-        let (publication, files, _, _) = analyze(&written, CONTRACT).into_parts();
-        publication
-            .validate_facts()
-            .expect("valid declaration publication");
-        let unit = publication
-            .units
-            .iter()
-            .find(|unit| unit.path.0 == "lib/consumer.d.ts")
-            .expect("physically retained declaration source");
-        assert!(unit.source_complete && unit.source == written);
-        let source = files
-            .iter()
-            .find(|file| file.file().path().as_str() == "lib/consumer.d.ts")
-            .expect("syntax source");
-        assert_eq!(
-            source.file().syntax().has_errors(),
-            canonical != Some(NAMED_ALIAS)
-        );
-        let physical = |name: &str| {
-            publication.declarations.iter().find(|row| {
-                row.unit == unit.unit
-                    && row
-                        .symbol
-                        .as_str()
-                        .ends_with(&format!("consumer.d.ts/{name}"))
-            })
-        };
-        let stable = physical("Independent").expect("neighbor declaration");
-        assert_eq!(stable.source, "type Independent = string;");
-        let Some(expected) = canonical else {
-            assert!(physical("Public").is_none());
-            continue;
-        };
-        let declared = physical("Public").expect("checked alias");
-        let start = u64::try_from(written.find(expected).expect("authored item")).expect("offset");
-        let end = start + u64::try_from(expected.len()).expect("length");
-        assert_eq!(declared.range, TextRange { start, end });
-        assert_eq!(declared.source, expected);
-        assert_eq!(
-            declared.syntax_element_kind.as_deref(),
-            Some("type_alias_declaration")
-        );
-        assert_eq!(
-            publication.edges.iter().any(|edge| {
-                edge.kinds == [EdgeKind::HasType]
-                    && edge.from == declared.symbol
-                    && edge.to.as_str().ends_with("contract.d.ts/Shape")
-            }),
-            resolved
+        assert_checked_inline_alias(
+            &written,
+            resolved,
+            canonical,
+            canonical != Some(NAMED_ALIAS),
         );
     }
+}
+
+fn assert_checked_inline_alias(
+    written: &str,
+    resolved: bool,
+    canonical: Option<&str>,
+    needs_syntax_recovery: bool,
+) {
+    let (publication, files, _, _) = analyze(written, CONTRACT).into_parts();
+    publication
+        .validate_facts()
+        .expect("valid declaration publication");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "lib/consumer.d.ts")
+        .expect("physically retained declaration source");
+    assert!(unit.source_complete && unit.source == written);
+    let source = files
+        .iter()
+        .find(|file| file.file().path().as_str() == "lib/consumer.d.ts")
+        .expect("syntax source");
+    assert_eq!(source.file().syntax().has_errors(), needs_syntax_recovery);
+    let physical = |name: &str| {
+        publication.declarations.iter().find(|row| {
+            row.unit == unit.unit
+                && row
+                    .symbol
+                    .as_str()
+                    .ends_with(&format!("consumer.d.ts/{name}"))
+        })
+    };
+    let stable = physical("Independent").expect("neighbor declaration");
+    assert_eq!(stable.source, "type Independent = string;");
+    let Some(expected) = canonical else {
+        assert!(physical("Public").is_none());
+        return;
+    };
+    let declared = physical("Public").expect("checked alias");
+    let start = u64::try_from(written.find(expected).expect("authored item")).expect("offset");
+    let end = start + u64::try_from(expected.len()).expect("length");
+    assert_eq!(declared.range, TextRange { start, end });
+    assert_eq!(declared.source, expected);
+    assert_eq!(
+        declared.syntax_element_kind.as_deref(),
+        Some("type_alias_declaration")
+    );
+    assert_eq!(
+        publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::HasType]
+                && edge.from == declared.symbol
+                && edge.to.as_str().ends_with("contract.d.ts/Shape")
+        }),
+        resolved
+    );
+    let use_text = "export declare function read(value: Public): Public;";
+    let use_start = written.find(use_text).expect("written signature");
+    let written_types = use_text
+        .match_indices("Public")
+        .map(|(offset, token)| {
+            let start = u64::try_from(use_start + offset).expect("written use offset");
+            TextRange {
+                start,
+                end: start + u64::try_from(token.len()).expect("written use length"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut retained = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::HasType]
+                && edge.from.as_str().ends_with("/read")
+                && edge.to == declared.symbol
+        })
+        .map(|edge| {
+            let occurrence = edge.occurrence.as_ref().expect("written type use");
+            assert_eq!(occurrence.unit, unit.unit);
+            occurrence.range.clone()
+        })
+        .collect::<Vec<_>>();
+    retained.sort_by_key(|range| range.start);
+    assert_eq!(retained, written_types);
 }
 
 #[test]

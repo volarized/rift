@@ -831,7 +831,13 @@ fn typescript_local_export_references_follow_existing_package_edges() {
             .with_edges(prior.len() + extra)
             .expect("bounded edge count");
         records
-            .retain_ecmascript_modules(&publication.owner, &files, &semantics, limits)
+            .retain_ecmascript_modules(
+                &publication.owner,
+                &files,
+                &semantics,
+                limits,
+                &BTreeSet::new(),
+            )
             .expect("bounded module references");
         assert_eq!(records.edges.len(), prior.len() + extra);
         assert_eq!(&records.edges[..prior.len()], &prior);
@@ -6733,4 +6739,253 @@ fn checked_commonjs_literals_as_direct_call_arguments_keep_module_imports() {
     let earlier = records.edges.clone();
     records.retain_commonjs_argument_imports(&semantics, earlier.len());
     assert_eq!(records.edges, earlier, "incumbent capacity");
+}
+
+#[test]
+fn checked_commonjs_expression_entries_keep_the_module_and_relative_load() {
+    for (entry, mode, module, loader) in [
+        (
+            "module.exports = Object.assign(function run(value) { return value; }, { flag: true });",
+            "commonjs",
+            "'../'",
+            true,
+        ),
+        (
+            "if (enabled) module.exports = function run(value) { return value; };",
+            "commonjs",
+            "'..'",
+            false,
+        ),
+        (
+            "module.exports = Object.assign(function run(value) { return value; }, { flag: true });",
+            "commonjs",
+            "'../missing'",
+            false,
+        ),
+        (
+            "const Object = { assign: make }; module.exports = Object.assign(function run() {}, {});",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = make();",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+        ("module.exports = make();", "module", "'../'", false),
+        (
+            "if (enabled) module.exports = make();",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "const load = require({module}); function inspect() {{ return load(1); }} inspect();"
+        );
+        let manifest =
+            format!(r#"{{"name":"beacon","version":"1.0.0","type":"{mode}","main":"index.js"}}"#);
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", entry), ("test/check.js", &source)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked CommonJS source");
+        let publication = analysis.publication();
+        publication.validate_facts().expect("complete module facts");
+        let physical = |source| {
+            publication.declarations.iter().find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.range.start == 0
+                    && publication.objects.iter().any(|object| {
+                        object.id.as_ref() == Some(&row.symbol)
+                            && object.kinds.contains(&SymbolKind::Module)
+                    })
+            })
+        };
+        let target = physical(entry);
+        let load = physical(source.as_str());
+        assert_eq!(
+            load.is_some(),
+            loader || mode == "module",
+            "{entry} {mode} {module}"
+        );
+        let expects_entry = loader || module == "'../missing'" || mode == "module";
+        assert_eq!(target.is_some(), expects_entry, "{entry} {mode} {module}");
+        let imported = target.zip(load).is_some_and(|(target, load)| {
+            let start = u64::try_from(source.find(module).expect("written specifier"))
+                .expect("small source");
+            let end = start + u64::try_from(module.len()).expect("small specifier");
+            publication.edges.iter().any(|edge| {
+                edge.from == load.symbol
+                    && edge.to == target.symbol
+                    && edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == load.unit && site.range == TextRange { start, end }
+                    })
+            })
+        });
+        assert_eq!(imported, loader, "{entry} {mode} {module}");
+    }
+}
+
+#[test]
+fn checked_commonjs_default_function_keeps_the_physical_entry_module() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js","exports":{".":[{"default":"./index.js"},"./index.js"]}}"#;
+    const CLIENT: &str =
+        "const base = require('../');\nfunction local() { return base(); }\nlocal();\n";
+    for (entry, complete) in [
+        ("module.exports = function serve() { return 1; };", true),
+        (
+            "function serve() { return 1; } module.exports = serve;",
+            true,
+        ),
+        (
+            "if (flag) module.exports = function serve() { return 1; };",
+            false,
+        ),
+        (
+            "module.exports = function serve() { return 1; }; module.exports = change;",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = function serve() { return 1; };",
+            false,
+        ),
+        (
+            "module.exports = function serve() { return 1; }; expose(module);",
+            false,
+        ),
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", entry), ("sub/client.js", CLIENT)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected package");
+        let publication = analysis.publication();
+        let source = |path: &str, written: &str| {
+            publication.declarations.iter().any(|row| {
+                row.unit.as_str().ends_with(path)
+                    && row.range.start == 0
+                    && row.source_complete
+                    && row.source == written
+            })
+        };
+        assert_eq!(source("/index.js", entry), complete, "{entry}");
+        assert_eq!(source("/client.js", CLIENT), complete, "{entry}");
+        assert_eq!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit.as_str().ends_with("/client.js")
+                            && CLIENT.get(offset_in(site.range.start)..offset_in(site.range.end))
+                                == Some("'../'")
+                    })
+            }),
+            complete,
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+fn written_argument_properties_keep_the_same_callback_without_a_call_target() {
+    const SOURCE: &str = concat!(
+        "var check = require('checks');\n",
+        "var load = require('../');\n",
+        "check('first', function (observer) {\n",
+        "  var directory = 'first';\n",
+        "  load(directory, { path: directory }, function (error, value) { observer.equal(value, directory); });\n",
+        "  load(directory, { path: directory, flag: true }, function (error, value) { observer.equal(value, directory); });\n",
+        "});\n",
+        "check('second', function (observer) {\n",
+        "  var directory = 'second';\n",
+        "  load(directory, { path: directory }, function (error, value) { observer.equal(value, directory); });\n",
+        "  load(directory, { path: directory, flag: false }, function (error, value) { observer.equal(value, directory); });\n",
+        "});\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#;
+    let check = |implementation, expected_calls| {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", implementation), ("test/options.cjs", SOURCE)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected CommonJS source");
+        let found = result.publication();
+        found.validate_facts().expect("valid physical ownership");
+        let unit = found
+            .units
+            .iter()
+            .find(|file| file.path.0 == "test/options.cjs")
+            .expect("complete written source");
+        assert_eq!(unit.source, SOURCE);
+        let mut properties = BTreeMap::new();
+        for (start, written) in SOURCE.match_indices("path: directory") {
+            let start = u64::try_from(start).expect("small source");
+            let insert = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == unit.unit
+                        && row.source_complete
+                        && row.source == written
+                        && row.range.start == start
+                })
+                .expect("written property");
+            let property = found
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&insert.symbol))
+                .expect("property object");
+            let callback = property.container.as_ref().expect("physical callback");
+            let owner = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.symbol == *callback
+                        && row.unit == unit.unit
+                        && row.source_complete
+                        && row.range.start < start
+                        && start < row.range.end
+                })
+                .expect("complete callable containing literal");
+            assert_eq!(
+                owner.syntax_element_kind.as_deref(),
+                Some("function_expression")
+            );
+            properties.insert(start, insert.symbol.clone());
+        }
+        assert_eq!(properties.len(), 4);
+        assert_eq!(properties.values().collect::<BTreeSet<_>>().len(), 4);
+        let calls = found
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.unit == unit.unit)
+            })
+            .count();
+        assert_eq!(calls, expected_calls);
+        properties
+    };
+    let resolved = check(
+        "function load(path, options, callback) { return options; } module.exports = load;",
+        4,
+    );
+    let unresolved = check(
+        "function retained() { return 1; } exports.marker = retained; module.exports = unknown();",
+        0,
+    );
+    assert_eq!(resolved, unresolved);
 }

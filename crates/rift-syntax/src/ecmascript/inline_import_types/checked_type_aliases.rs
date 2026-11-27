@@ -6,7 +6,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::{ByteRange, SyntaxLimits, SyntaxSource, SyntaxSymbol, extract, failure::RiftError};
 
-use super::{Candidate, bounded_candidates, comparison_tree};
+use super::{Candidate, bounded_candidates, checked_owner, comparison_tree};
 
 pub(in crate::ecmascript) fn recover(
     parser: &mut Parser,
@@ -15,14 +15,19 @@ pub(in crate::ecmascript) fn recover(
     limits: SyntaxLimits,
     symbols: &mut [SyntaxSymbol],
 ) -> Result<(), RiftError> {
-    let candidates = bounded_candidates(source, limits)?;
+    let candidates = bounded_candidates(source, limits, |_| true)?;
     let Some((compared, candidates)) = comparison_tree(parser, root, source, candidates)? else {
         return Ok(());
     };
     let aliases = unique_aliases(symbols);
     for candidate in &candidates {
-        let Some(alias) = complete_type_alias(root, compared.root_node(), candidate, source.text)
-        else {
+        let Some(alias) = complete_type_alias(
+            root,
+            compared.root_node(),
+            candidate,
+            source.text,
+            limits.syntax_depth_max(),
+        ) else {
             continue;
         };
         let Some(&position) = aliases.get(&alias.name) else {
@@ -77,6 +82,7 @@ fn complete_type_alias(
     compared: Node<'_>,
     candidate: &Candidate,
     text: &str,
+    depth_max: usize,
 ) -> Option<Alias> {
     let prefix = candidate.prefix.start;
     let keyword_end = prefix.checked_add("import".len())?;
@@ -97,16 +103,18 @@ fn complete_type_alias(
     }
     let qualifier =
         compared.named_descendant_for_byte_range(candidate.qualifier, candidate.qualifier + 1)?;
-    let checked = qualifier.parent()?;
+    let (checked, kind) = checked_owner(qualifier, depth_max)?;
+    let value = checked.child_by_field_name("value")?;
     if qualifier.kind() != "type_identifier"
         || qualifier.start_byte() != candidate.qualifier
-        || checked.kind() != "type_alias_declaration"
-        || checked.child_by_field_name("value") != Some(qualifier)
+        || kind != "type_alias_declaration"
+        || value.start_byte() != qualifier.start_byte()
+        || !(value == qualifier || matches!(value.kind(), "intersection_type" | "union_type"))
         || checked.child_by_field_name("name")?.byte_range() != name.byte_range()
         || checked.start_byte() != original.start_byte()
         || !top_level(checked, compared)
         || checked.has_error()
-        || text.get(qualifier.end_byte()..checked.end_byte())?.trim() != ";"
+        || text.get(value.end_byte()..checked.end_byte())?.trim() != ";"
     {
         return None;
     }
@@ -117,7 +125,7 @@ fn complete_type_alias(
         item,
         value: ByteRange {
             start: u64::try_from(prefix).ok()?,
-            end: u64::try_from(qualifier.end_byte()).ok()?,
+            end: u64::try_from(value.end_byte()).ok()?,
         },
     })
 }

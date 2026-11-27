@@ -1346,7 +1346,7 @@ fn publish(
         semantics,
         &mut records,
     )?;
-    records.retain_selected_ecmascript_facts(package, analyzed, semantics, limits)?;
+    records.retain_selected_ecmascript_facts(input, analyzed, semantics)?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));

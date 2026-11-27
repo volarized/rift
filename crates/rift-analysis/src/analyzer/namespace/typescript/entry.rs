@@ -206,7 +206,7 @@ impl<'input> PackageFiles<'input> {
             return types_candidates(types)
                 .map_or(Entry::Absent, |candidates| self.first(candidates));
         }
-        match default_types(metadata.main.as_deref()).map(|candidates| self.first(candidates)) {
+        match default_types(metadata.main()).map(|candidates| self.first(candidates)) {
             // A source file is no declared types entry.
             Some(Entry::File(path)) if !is_declaration_file(path.as_str()) => Entry::Absent,
             Some(entry) => entry,
@@ -240,7 +240,7 @@ pub(super) fn resolve(
     }
     match language {
         "typescript" => files.types(metadata),
-        "javascript" => files.runtime(metadata.main.as_deref(), metadata.module.as_deref()),
+        "javascript" => files.runtime(metadata.main(), metadata.module.as_deref()),
         _ => Entry::Absent,
     }
 }
@@ -385,17 +385,17 @@ pub(in crate::analyzer) fn build_paths(
                 .chain(runtime_file_candidates(directory)),
         ));
     }
-    let metadata: PackageMetadata = serde_json::from_str(manifest.text()).ok()?;
+    let metadata = PackageMetadata::parse(manifest.text())?;
     if metadata.exports.is_some() {
         return None;
     }
     let types = metadata.types.as_deref().or(metadata.typings.as_deref());
     let declared = match types {
         Some(types) => types_candidates(types).unwrap_or_default(),
-        None => default_types(metadata.main.as_deref()).unwrap_or_default(),
+        None => default_types(metadata.main()).unwrap_or_default(),
     };
     Some(requested_paths(
-        runtime_candidates(metadata.main.as_deref(), "")
+        runtime_candidates(metadata.main(), "")
             .unwrap_or_default()
             .into_iter()
             .chain(declared),
