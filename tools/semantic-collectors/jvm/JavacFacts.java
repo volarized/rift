@@ -19,6 +19,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.VariableElement;
@@ -65,6 +67,12 @@ public final class JavacFacts {
     }
 
     private static final class Scanner extends TreePathScanner<Void, Facts.Range> {
+        private static final String TRIVIA = "(?:[ \t\f\r\n]|//[^\r\n]*|/\\*.*?\\*/)*+";
+        private static final Pattern RECORD_NAME = Pattern.compile(
+            TRIVIA + Tree.Kind.RECORD.name().toLowerCase(Locale.ROOT)
+                + "(?!\\p{javaJavaIdentifierPart})" + TRIVIA
+                + "(\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)", Pattern.DOTALL);
+
         private final Facts facts;
         private final Trees trees;
         private final Elements elements;
@@ -101,13 +109,52 @@ public final class JavacFacts {
                 return null;
             }
             TreePath target = trees.getPath(element);
-            if (target == null || (missingType && !(target.getLeaf() instanceof VariableTree))) {
+            if (target == null) {
+                return implicitRecordName(element);
+            }
+            if (missingType && !(target.getLeaf() instanceof VariableTree)) {
                 return null;
             }
             var source = target.getCompilationUnit();
             Integer number = facts.source(Path.of(source.getSourceFile().toUri()));
             var coordinates = range(source, target.getLeaf());
-            return number == null || coordinates == null ? null : new Facts.Anchor(number, coordinates);
+            if (coordinates == null) {
+                return implicitRecordName(element);
+            }
+            return number == null ? null : new Facts.Anchor(number, coordinates);
+        }
+
+        private Facts.Anchor implicitRecordName(Element constructor) {
+            if (constructor.getKind() != ElementKind.CONSTRUCTOR
+                    || constructor.getEnclosingElement().getKind() != ElementKind.RECORD
+                    || elements.getOrigin(constructor) != Elements.Origin.MANDATED) {
+                return null;
+            }
+            var declaration = trees.getPath(constructor.getEnclosingElement());
+            if (declaration == null || !(declaration.getLeaf() instanceof ClassTree record)) {
+                return null;
+            }
+            var source = declaration.getCompilationUnit();
+            Integer number = facts.source(Path.of(source.getSourceFile().toUri()));
+            var bounds = range(source, record);
+            if (number == null || bounds == null) {
+                return null;
+            }
+            long modifiersEnd = trees.getSourcePositions().getEndPosition(source, record.getModifiers());
+            long start = Math.max(bounds.start(), modifiersEnd);
+            if (start >= bounds.end()) {
+                return null;
+            }
+            try {
+                CharSequence content = source == unit ? text : source.getSourceFile().getCharContent(true);
+                var name = RECORD_NAME.matcher(content).region((int) start, bounds.end());
+                if (name.lookingAt() && record.getSimpleName().contentEquals(name.group(1))) {
+                    return new Facts.Anchor(number, new Facts.Range(name.start(1), name.end(1)));
+                }
+            } catch (IOException error) {
+                facts.partial = true;
+            }
+            return null;
         }
 
         private void record(Tree tree, Facts.Range owner, TreePath targetPath) {
