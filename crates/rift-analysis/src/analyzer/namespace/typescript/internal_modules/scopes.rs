@@ -1224,6 +1224,7 @@ struct LiteralOwners<'source> {
     returned: BTreeMap<ByteRange, Option<&'source str>>,
     array_initializers: BTreeMap<&'source str, ByteRange>,
     assigned_arrays: BTreeMap<ByteRange, &'source str>,
+    assigned_literal_bodies: BTreeMap<ByteRange, &'source str>,
 }
 
 impl<'source> LiteralOwners<'source> {
@@ -1298,6 +1299,8 @@ impl<'source> LiteralOwners<'source> {
         }
         let assigned_arrays =
             assigned_literals::array_owners(file, facts, anchors, &unique, &enclosing);
+        let assigned_literal_bodies =
+            assigned_literals::local_assignment_owners(file, facts, anchors, &unique, &enclosing);
         Self {
             enclosing,
             callbacks: facts
@@ -1322,6 +1325,7 @@ impl<'source> LiteralOwners<'source> {
             returned: returned_literal_owners(&functions, &object_methods, facts),
             array_initializers,
             assigned_arrays,
+            assigned_literal_bodies,
         }
     }
 
@@ -1334,7 +1338,8 @@ impl<'source> LiteralOwners<'source> {
         if let Some(owner) = container
             && (self.returned.get(&member.body) == Some(&Some(owner))
                 || self.array_initializers.get(owner) == Some(&member.holder)
-                || self.assigned_arrays.get(&member.holder) == Some(&owner))
+                || self.assigned_arrays.get(&member.holder) == Some(&owner)
+                || self.assigned_literal_bodies.get(&member.body) == Some(&owner))
         {
             return true;
         }

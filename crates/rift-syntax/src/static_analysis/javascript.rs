@@ -7,10 +7,10 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticAssignedCall, StaticBinding, StaticBindingKind, StaticBodyMember, StaticCallee,
-    StaticDeclaredReturn, StaticFactsParts, StaticFunctionContext, StaticMember, StaticMemberCopy,
-    StaticParameter, StaticReexport, StaticReference, binding, call, enclosing, field, identifier,
-    kind,
+    StaticAssignedCall, StaticAssignedObject, StaticBinding, StaticBindingKind, StaticBodyMember,
+    StaticCallee, StaticDeclaredReturn, StaticFactsParts, StaticFunctionContext, StaticMember,
+    StaticMemberCopy, StaticParameter, StaticReexport, StaticReference, binding, call, enclosing,
+    field, identifier, kind,
 };
 use crate::extract::{Visited, byte_range};
 use crate::{ByteRange, SyntaxLimits};
@@ -2499,8 +2499,8 @@ impl Kinds {
                     facts.function_writes.push(byte_range(left)?);
                 }
                 self.record_member_copy(syntax_element, left, value, source, facts)?;
-                if left.kind_id() == self.identifier && value.kind_id() == self.call {
-                    Self::record_assigned_call(visited, left, value, facts)?;
+                if left.kind_id() == self.identifier {
+                    self.record_direct_local_assignment(visited, left, value, facts)?;
                 }
             }
         } else if id == self.update {
@@ -2536,12 +2536,18 @@ impl Kinds {
         Ok(())
     }
 
-    fn record_assigned_call(
+    fn record_direct_local_assignment(
+        &self,
         visited: Visited<'_, '_>,
         target: Node<'_>,
-        call: Node<'_>,
+        value: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
+        let id = value.kind_id();
+        if (id != self.call && id != self.object_literal[0]) || visited.syntax_element().has_error()
+        {
+            return Ok(());
+        }
         let Some(block) = visited
             .parent()
             .filter(|parent| parent.syntax_element().kind() == "expression_statement")
@@ -2551,11 +2557,20 @@ impl Kinds {
         else {
             return Ok(());
         };
-        if !visited.syntax_element().has_error() {
+        let target = byte_range(target)?;
+        let value = byte_range(value)?;
+        let block = byte_range(block)?;
+        if id == self.call {
             facts.assigned_calls.push(StaticAssignedCall {
-                target: byte_range(target)?,
-                call: byte_range(call)?,
-                block: byte_range(block)?,
+                target,
+                call: value,
+                block,
+            });
+        } else {
+            facts.assigned_objects.push(StaticAssignedObject {
+                target,
+                object: value,
+                block,
             });
         }
         Ok(())

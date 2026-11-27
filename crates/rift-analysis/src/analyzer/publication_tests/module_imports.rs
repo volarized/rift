@@ -5312,6 +5312,93 @@ fn javascript_array_records_keep_separate_written_properties() {
 }
 
 #[test]
+fn checked_local_assignments_keep_exact_literal_properties_under_the_written_function() {
+    const SOURCE: &str = concat!(
+        "export function build(ready) {\n",
+        "  let token;\n",
+        "  if (ready) token = { kind: 'ready', line: 1 };\n",
+        "  else token = { kind: 'pending', line: 2 };\n",
+        "  token = { settled: true };\n",
+        "  token.entries = [{ kind: 'nested', line: 3 }];\n",
+        "  return token;\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("complete authored declarations");
+    let function = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/build"))
+        .expect("named function");
+    let mut identities = BTreeSet::new();
+    for text in [
+        "kind: 'ready'",
+        "line: 1",
+        "kind: 'pending'",
+        "line: 2",
+        "kind: 'nested'",
+        "line: 3",
+    ] {
+        let start = SOURCE.find(text).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == function.unit
+                    && row.range == module_runtime_range(start, text)
+                    && row.source_complete
+                    && row.source == text
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("exact literal property");
+        assert!(identities.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&function.symbol)
+        }));
+    }
+    assert_eq!(
+        found
+            .declarations
+            .iter()
+            .filter(|row| row.source == "token")
+            .count(),
+        1
+    );
+    assert!(
+        !found
+            .declarations
+            .iter()
+            .any(|row| row.source == "token.entries")
+    );
+    for source in [
+        SOURCE.replace("  let token;\n", ""),
+        SOURCE.replace("token.entries =", "token['entries'] ="),
+        SOURCE.replace("token = { settled: true };", "token = ready;"),
+        SOURCE.replace(
+            "token = { settled: true };",
+            "if (ready) { token = { settled: true }; }",
+        ),
+        SOURCE.replace(
+            "  token.entries = [{ kind: 'nested', line: 3 }];",
+            "  { let token; token.entries = [{ kind: 'nested', line: 3 }]; }",
+        ),
+    ] {
+        let control = non_entry_lexical_binding_analysis(&source, 64);
+        assert!(
+            !control
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| row.source == "kind: 'nested'")
+        );
+    }
+}
+
+#[test]
 fn commonjs_named_export_arrays_keep_properties_under_their_written_slots() {
     const SOURCE: &str = concat!(
         "const control = { preserved: 1 };\n",

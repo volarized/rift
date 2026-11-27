@@ -96,6 +96,100 @@ pub(super) fn array_owners<'source>(
         .collect()
 }
 
+/// Keeps literal owners independent of the value or member an assignment writes.
+pub(super) fn local_assignment_owners<'source>(
+    file: &SelectedFile<'source>,
+    facts: &'source StaticFacts,
+    anchors: &BTreeMap<String, SymbolId>,
+    declarations: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    callables: &EnclosingDefinitions<(ByteRange, Option<&'source SyntaxSymbol>)>,
+) -> BTreeMap<ByteRange, &'source str> {
+    let source = file.source;
+    let writes = facts
+        .assignments()
+        .iter()
+        .map(|&target| (target.end, target))
+        .collect::<BTreeMap<_, _>>();
+    if writes.is_empty() {
+        return BTreeMap::new();
+    }
+    let direct_members = facts
+        .members()
+        .iter()
+        .filter(|member| direct_member(source, member))
+        .map(|member| (member.range, member.receiver))
+        .collect::<BTreeMap<_, _>>();
+    let mut bindings = BTreeMap::<&str, Vec<&StaticBinding>>::new();
+    for binding in facts.bindings() {
+        if let Some(name) = text(source, binding.name) {
+            bindings.entry(name).or_default().push(binding);
+        }
+    }
+    let mut local_writes = BTreeMap::<&str, BTreeMap<u64, ByteRange>>::new();
+    for &target in writes.values() {
+        if let Some(name) = text(source, target).filter(|name| bindings.contains_key(name)) {
+            local_writes
+                .entry(name)
+                .or_default()
+                .insert(target.start, target);
+        }
+    }
+    let object_writes = facts
+        .assigned_objects()
+        .iter()
+        .map(|write| (write.target, write))
+        .collect::<BTreeMap<_, _>>();
+    let bodies = facts
+        .body_members()
+        .iter()
+        .map(|member| (member.holder, member.body))
+        .collect::<BTreeSet<_>>();
+    bodies
+        .into_iter()
+        .filter_map(|(holder, body)| {
+            let array = written_array(source, holder);
+            let start = if array { holder.start } else { body.start };
+            let (_, &target) = writes.range(..=start).next_back()?;
+            if (!array && (holder.start != target.start || holder.end != body.end))
+                || text(
+                    source,
+                    ByteRange {
+                        start: target.end,
+                        end: start,
+                    },
+                )?
+                .trim()
+                    != "="
+            {
+                return None;
+            }
+            let receiver = if array {
+                *direct_members.get(&target)?
+            } else {
+                target
+            };
+            let name = text(source, receiver)?;
+            if array {
+                let (_, last) = local_writes.get(name)?.range(..target.start).next_back()?;
+                let written = object_writes.get(last)?;
+                if !written.block.encloses(holder) || written.object.end > target.start {
+                    return None;
+                }
+            }
+            let (_, owner) = callables.resolve(target.start, holder.end)?;
+            let owner =
+                owner.filter(|owner| owner.body_range.is_some_and(|body| body.encloses(holder)))?;
+            let declaration = declarations
+                .get(format!("{}.{name}", owner.qualified_name).as_str())?
+                .as_ref()?;
+            (declaration.syntax_element_kind == Some("variable_declarator")
+                && anchors.contains_key(&declaration.qualified_name)
+                && checked_receiver(declaration, target, bindings.get(name)?, None))
+            .then_some((body, owner.qualified_name.as_str()))
+        })
+        .collect()
+}
+
 fn direct_member(source: &str, member: &StaticMember) -> bool {
     let Some(name) = member.member else {
         return false;
