@@ -19,6 +19,7 @@ use crate::EnclosingDefinitions;
 
 mod conditional_types;
 mod disjoint_properties;
+mod function_arguments;
 mod mixed_shorthand;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
@@ -457,6 +458,14 @@ impl<'source> FileScopes<'source> {
             &mut scoped,
         );
         self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
+        self.scope_named_function_arguments(
+            file,
+            repeated,
+            anchors,
+            &owners,
+            &mut occupied,
+            &mut scoped,
+        );
         scoped
     }
 

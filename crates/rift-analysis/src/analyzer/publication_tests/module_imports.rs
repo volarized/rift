@@ -2021,6 +2021,78 @@ module.exports = Bundle;
 }
 
 #[test]
+fn checked_named_function_initializers_keep_independent_argument_properties() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./main.mjs"}}"#;
+    for (holder, open, close, count) in [
+        ("function named(input)", "", "", 2),
+        ("function (input)", "", "", 0),
+        (
+            "function named(input)",
+            "return remote.combine(function (item) {",
+            "});",
+            2,
+        ),
+        (
+            "function named(input)",
+            "const other = function (item) {",
+            "}; return other;",
+            0,
+        ),
+    ] {
+        let source = format!(
+            "import * as remote from 'external';
+function emit(value) {{ return value; }}
+export const run = {holder} {{
+  {open}
+  return emit([
+    remote.copy(input, {{ key: 1, first: true }}),
+    remote.copy(input, {{ key: 2, second: false }}),
+  ]);
+  {close}
+}};"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("main.mjs", "export const entry = true;"),
+                ("case.mjs", &source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package");
+        let publication = analysis.publication();
+        let owner = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/case.mjs/run")
+                    || row.symbol.as_str().ends_with("%2Fcase.mjs/run")
+            })
+            .expect("the complete variable declaration remains");
+        let mut repeated = BTreeSet::new();
+        for spelling in ["key: 1", "key: 2", "first: true", "second: false"] {
+            let site =
+                module_runtime_range(source.find(spelling).expect("written property"), spelling);
+            let found = publication
+                .declarations
+                .iter()
+                .find(|row| row.unit == owner.unit && row.source == spelling && row.range == site);
+            if spelling.starts_with("key:") {
+                if let Some(property) = found {
+                    assert!(property.symbol.as_str().starts_with(owner.symbol.as_str()));
+                    repeated.insert(property.symbol.as_str());
+                }
+            } else {
+                assert!(found.is_some(), "incumbent property {spelling}");
+            }
+        }
+        assert_eq!(repeated.len(), count, "{holder}");
+    }
+}
+
+#[test]
 fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
     let analysis = fixture::package_result_with_metadata(
         ShippedLanguage::JavaScript,
