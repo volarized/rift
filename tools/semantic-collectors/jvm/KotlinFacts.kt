@@ -24,6 +24,7 @@ import org.jetbrains.kotlin.fir.analysis.checkers.MppCheckerKind
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationCheckers
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirFileChecker
+import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirTypeParameterChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.ExpressionCheckers
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirCallChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirEqualityOperatorCallChecker
@@ -38,6 +39,8 @@ import org.jetbrains.kotlin.fir.analysis.checkers.type.TypeCheckers
 import org.jetbrains.kotlin.fir.analysis.extensions.FirAdditionalCheckersExtension
 import org.jetbrains.kotlin.fir.declarations.FirFile
 import org.jetbrains.kotlin.fir.declarations.FirResolvedImport
+import org.jetbrains.kotlin.fir.declarations.FirTypeParameter
+import org.jetbrains.kotlin.fir.declarations.FirValueParameter
 import org.jetbrains.kotlin.fir.declarations.processAllDeclaredCallables
 import org.jetbrains.kotlin.fir.expressions.FirCall
 import org.jetbrains.kotlin.fir.expressions.FirDesugaredAssignmentValueReferenceExpression
@@ -67,6 +70,7 @@ import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirConstructorSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirPropertySymbol
+import org.jetbrains.kotlin.fir.symbols.impl.FirPropertyAccessorSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirRegularClassSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirReceiverParameterSymbol
@@ -79,7 +83,9 @@ import org.jetbrains.kotlin.fir.types.isBoolean
 import org.jetbrains.kotlin.fir.types.isNullableAny
 import org.jetbrains.kotlin.fir.types.isNullableNothing
 import org.jetbrains.kotlin.name.ClassId
+import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtBinaryExpression
+import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtClassLiteralExpression
 import org.jetbrains.kotlin.psi.KtConstructor
 import org.jetbrains.kotlin.psi.KtThisExpression
@@ -89,6 +95,7 @@ import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtTypeReference
+import org.jetbrains.kotlin.psi.KtTypeConstraint
 import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgument
 import org.jetbrains.kotlin.util.OperatorNameConventions
@@ -191,12 +198,40 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
             canonical is FirConstructorSymbol && declaration is KtConstructor<*> ->
                 declaration.getConstructorKeyword().range()
                     ?: declaration.getContainingClassOrObject().nameIdentifier.range()
-            source.kind == KtFakeSourceElementKind.PropertyFromParameter ->
-                // A property declared with val or var in the constructor shares the parameter's name.
+            canonical is FirNamedFunctionSymbol && declaration is KtClassOrObject -> null
+            source.kind == KtFakeSourceElementKind.PropertyFromParameter ||
+                source.kind == KtFakeSourceElementKind.DataClassGeneratedMembers.CopyFunction.Parameter ->
                 (declaration as? KtParameter)?.takeIf { it.hasValOrVar() }?.nameIdentifier.range()
             else -> source.range()
         }
         return range?.let { Facts.Anchor(id, it) }
+    }
+
+    private fun FirValueParameter.argumentTarget(): Facts.Anchor? {
+        val function = containingDeclarationSymbol as? FirNamedFunctionSymbol
+        val original = function?.unwrapUseSiteSubstitutionOverrides()
+        if (original?.source?.kind == KtFakeSourceElementKind.DataClassGeneratedMembers.CopyFunction) {
+            val index = function.valueParameterSymbols.indexOf(symbol)
+            val parameter = original.valueParameterSymbols.getOrNull(index) ?: return null
+            if (parameter.name != name ||
+                parameter.source?.kind != KtFakeSourceElementKind.DataClassGeneratedMembers.CopyFunction.Parameter) return null
+            return parameter.anchor()
+        }
+        if ((source as? KtPsiSourceElement)?.psi !is KtParameter) return null
+        return symbol.anchor()
+    }
+
+    private fun FirPropertyAccessExpression.propertySymbol(): FirPropertySymbol? {
+        val reference = calleeReference as? FirResolvedNamedReference ?: return null
+        if (reference is FirResolvedErrorReference) return null
+        return reference.resolvedSymbol as? FirPropertySymbol
+    }
+
+    private fun FirPropertyAccessorSymbol?.explicitAccessorAnchor(): Facts.Anchor? {
+        val source = this?.source as? KtPsiSourceElement ?: return null
+        val token = (source.psi as? KtPropertyAccessor)?.namePlaceholder.range() ?: return null
+        val target = anchor() ?: return null
+        return Facts.Anchor(target.source(), token)
     }
 
     private fun CheckerContext.isSelected() =
@@ -273,8 +308,7 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
                         val name = syntax.getArgumentName()?.referenceExpression ?: continue
                         if (name.getReferencedNameAsName() != parameter.name) continue
                         val occurrence = name.getReferencedNameElement().range() ?: continue
-                        if ((parameter.source as? KtPsiSourceElement)?.psi !is KtParameter) continue
-                        val target = parameter.symbol.anchor() ?: continue
+                        val target = parameter.argumentTarget() ?: continue
                         facts.add(occurrence, context.enclosing(), target)
                     }
                 }
@@ -336,7 +370,19 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
             object : FirVariableAssignmentChecker(MppCheckerKind.Common) {
                 context(context: CheckerContext, reporter: DiagnosticReporter)
                 override fun check(expression: FirVariableAssignment) {
-                    if (facts.category != Facts.Category.REFERENCES || !context.isSelected()) return
+                    if (!context.isSelected()) return
+                    if (facts.category == Facts.Category.CALLS) {
+                        val source = expression.source as? KtPsiSourceElement ?: return
+                        if (source.kind != KtRealSourceElementKind ||
+                            (source.psi as? KtBinaryExpression)?.operationToken != KtTokens.EQ) return
+                        val access = expression.lValue as? FirPropertyAccessExpression ?: return
+                        val property = access.propertySymbol() ?: return
+                        val target = property.setterSymbol.explicitAccessorAnchor() ?: return
+                        val occurrence = access.referenceRange() ?: return
+                        facts.add(occurrence, context.enclosing(), target)
+                        return
+                    }
+                    if (facts.category != Facts.Category.REFERENCES) return
                     val wrapper = expression.lValue as? FirDesugaredAssignmentValueReferenceExpression ?: return
                     val access = wrapper.expressionRef.value as? FirQualifiedAccessExpression ?: return
                     val reference = access.calleeReference as? FirResolvedNamedReference ?: return
@@ -352,18 +398,13 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
                 context(context: CheckerContext, reporter: DiagnosticReporter)
                 override fun check(expression: FirPropertyAccessExpression) {
                     if (facts.category != Facts.Category.CALLS || !context.isSelected()) return
-                    val reference = expression.calleeReference as? FirResolvedNamedReference ?: return
-                    if (reference is FirResolvedErrorReference) return
-                    val property = reference.resolvedSymbol as? FirPropertySymbol ?: return
-                    if (property.isVar || context.callsOrAssignments.any {
+                    val property = expression.propertySymbol() ?: return
+                    if (context.callsOrAssignments.any {
                             it is FirVariableAssignment && it.lValue === expression
                         }) return
-                    val getter = property.getterSymbol ?: return
-                    val source = getter.source as? KtPsiSourceElement ?: return
-                    val token = (source.psi as? KtPropertyAccessor)?.namePlaceholder.range() ?: return
-                    val target = getter.anchor() ?: return
+                    val target = property.getterSymbol.explicitAccessorAnchor() ?: return
                     val occurrence = expression.referenceRange() ?: return
-                    facts.add(occurrence, context.enclosing(), Facts.Anchor(target.source(), token))
+                    facts.add(occurrence, context.enclosing(), target)
                 }
             }
         )
@@ -447,6 +488,27 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
     }
 
     override val declarationCheckers = object : DeclarationCheckers() {
+        override val typeParameterCheckers = setOf(
+            object : FirTypeParameterChecker(MppCheckerKind.Common) {
+                context(context: CheckerContext, reporter: DiagnosticReporter)
+                override fun check(declaration: FirTypeParameter) {
+                    if (facts.category != Facts.Category.REFERENCES || !context.isSelected()) return
+                    val target = declaration.symbol.anchor() ?: return
+                    for (bound in declaration.bounds) {
+                        val source = bound.source as? KtPsiSourceElement ?: continue
+                        if (source.kind != KtRealSourceElementKind) continue
+                        val type = source.psi as? KtTypeReference ?: continue
+                        val constraint = type.parent as? KtTypeConstraint ?: continue
+                        val name = constraint.subjectTypeParameterName ?: continue
+                        if (constraint.boundTypeReference !== type ||
+                            name.getReferencedNameAsName() != declaration.symbol.name) continue
+                        val occurrence = name.getReferencedNameElement().range() ?: continue
+                        facts.add(occurrence, context.enclosing(), target)
+                    }
+                }
+            }
+        )
+
         override val fileCheckers = setOf(
             object : FirFileChecker(MppCheckerKind.Common) {
                 context(context: CheckerContext, reporter: DiagnosticReporter)
