@@ -5,6 +5,110 @@ use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
 #[test]
+fn typescript_plain_annotations_use_the_checked_type_facet_of_a_namespace_merge() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const INTERFACE: &str = "export interface Mode { readonly state: string; }\n";
+    const NAMESPACE: &str = "export declare namespace Mode { const Ready: number; }\n";
+    const USE: &str = "export interface Consumer { check(mode: Mode): Mode; }\n";
+    fn collect(source: &str, leaf: &str) -> PackageAnalysis {
+        internal_modules::analyze(MANIFEST, &[("index.d.ts", source), ("leaf.d.ts", leaf)])
+    }
+    for (declaration, namespace_first) in [
+        (INTERFACE, false),
+        (INTERFACE, true),
+        (
+            "export declare class Mode { readonly state: string; }\n",
+            false,
+        ),
+        ("export declare enum Mode { Off = 0 }\n", false),
+        ("export type Mode = { readonly state: string };\n", false),
+    ] {
+        let merged = if namespace_first {
+            format!("{NAMESPACE}{declaration}")
+        } else {
+            format!("{declaration}{NAMESPACE}")
+        };
+        for (source, path) in [
+            (format!("{merged}{USE}"), "index.d.ts"),
+            (
+                format!("import {{ Mode }} from './leaf';\n{USE}"),
+                "leaf.d.ts",
+            ),
+            (
+                format!("import type {{ Mode }} from './leaf';\n{USE}"),
+                "leaf.d.ts",
+            ),
+        ] {
+            let found = collect(&source, &merged);
+            let publication = found.publication();
+            let written_unit = publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == "index.d.ts")
+                .expect("original annotation unit");
+            let target_unit = publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path)
+                .expect("original type unit");
+            let declared = if path == "index.d.ts" {
+                &source
+            } else {
+                &merged
+            };
+            let name_offset = declared.find(declaration).expect("written type item")
+                + declaration.find("Mode").expect("written type name");
+            let name = module_runtime_range(name_offset, "Mode");
+            let type_declaration = publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == target_unit.unit
+                        && row.symbol.as_str().ends_with("/Mode")
+                        && row.range.start <= name.start
+                        && name.end <= row.range.end
+                })
+                .expect("checked type declaration");
+            let annotations = source.find(USE).expect("consumer declaration");
+            let expected = [
+                USE.find("Mode").expect("parameter"),
+                USE.rfind("Mode").expect("return"),
+            ]
+            .map(|offset| module_runtime_range(annotations + offset, "Mode"));
+            let annotation_count = publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::HasType]
+                        && edge.to == type_declaration.symbol
+                        && edge.occurrence.as_ref().is_some_and(|site| {
+                            site.unit == written_unit.unit && expected.contains(&site.range)
+                        })
+                })
+                .count();
+            assert_eq!(annotation_count, 2, "{source}");
+        }
+    }
+
+    let unresolved = format!("import type {{ Mode }} from './missing';\n{USE}");
+    let competing =
+        format!("{INTERFACE}export interface Mode {{ other: number; }}\n{NAMESPACE}{USE}");
+    for source in [unresolved, competing] {
+        let found = collect(&source, "");
+        let start = u64::try_from(source.find(USE).expect("consumer declaration"))
+            .expect("bounded fixture offset");
+        assert!(found.publication().edges.iter().all(|edge| {
+            edge.kinds != [EdgeKind::HasType]
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_none_or(|site| site.range.start < start)
+        }));
+    }
+}
+
+#[test]
 fn checked_commonjs_export_object_values_keep_their_literal_imports() {
     const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.cjs"}"#;
     const SOURCE: &str = concat!(

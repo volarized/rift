@@ -526,7 +526,7 @@ fn static_tail_starts(
     resolution: &mut StaticResolution,
     alias: Option<usize>,
     value_qualifier: Option<usize>,
-) -> [Option<usize>; 56] {
+) -> [Option<usize>; 57] {
     [
         resolution.late_supplemental_start.take(),
         resolution.python_reassignment_start.take(),
@@ -586,6 +586,7 @@ fn static_tail_starts(
         resolution.typescript_inline_import_type_start.take(),
         resolution.commonjs_argument_import_start.take(),
         resolution.typescript_inline_import_module_start.take(),
+        resolution.typescript_namespace_type_start.take(),
     ]
 }
 
@@ -593,7 +594,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 58] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 59] {
     let supplemental_start = resolution.supplemental_start.take();
     let (value_qualifier, value_qualifier_external) = resolution
         .python_value_qualifier_start
@@ -608,10 +609,10 @@ fn static_admission_batches<'a>(
             (Some(internal), external)
         });
     let tail_starts = static_tail_starts(resolution, alias, value_qualifier);
-    let mut boundaries = [0; 59];
+    let mut boundaries = [0; 60];
     let mut next = resolution.occurrences.len();
-    boundaries[58] = next;
-    for (boundary, start) in boundaries[2..58].iter_mut().zip(tail_starts).rev() {
+    boundaries[59] = next;
+    for (boundary, start) in boundaries[2..59].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }

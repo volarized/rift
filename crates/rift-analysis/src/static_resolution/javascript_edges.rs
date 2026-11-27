@@ -429,8 +429,122 @@ impl<'source> Index<'source> {
                         .push(AssignedMemberSite::Read(reference.target));
                 }
             }
+            if occurrence.is_none()
+                && reference.role == ReferenceRole::Type
+                && file.document.facts.language().name == "typescript"
+                && file.document.facts.declaration_syntax_complete()
+                && !file.members.contains_key(&reference.target)
+                && file
+                    .text(reference.target)
+                    .is_some_and(|name| file.by_name.contains_key(name))
+            {
+                result
+                    .typescript_namespace_type_sites
+                    .entry(file.document.placement.unit().clone())
+                    .or_default()
+                    .push(reference.target);
+            }
             result.record(occurrence);
         }
+    }
+
+    /// Resolves a plain type name when a checked type and namespace share its identity.
+    pub(super) fn resolve_typescript_namespace_type_uses(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        let pending = std::mem::take(&mut result.typescript_namespace_type_sites);
+        'files: for file in self.files.values() {
+            let Some(sites) = pending.get(file.document.placement.unit()) else {
+                continue;
+            };
+            for &range in sites {
+                if !work.charge() {
+                    break 'files;
+                }
+                if let Some(occurrence) = self.typescript_namespace_type_use(file, range, work) {
+                    result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
+                    result.record(Some(occurrence));
+                }
+            }
+        }
+        result.typescript_namespace_type_start =
+            (result.occurrences.len() > start).then_some(start);
+    }
+
+    fn typescript_namespace_type_use(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        if file.blocked(range.start, work) {
+            return None;
+        }
+        let name = file.text(range)?;
+        let pair = if let Some(binding) = js_binding(
+            file,
+            &self.javascript,
+            name,
+            range.start,
+            ReferenceRole::Type,
+            work,
+        ) {
+            let StaticBindingKind::JavaScriptImport {
+                module,
+                export: Some(export),
+            } = binding.kind
+            else {
+                return None;
+            };
+            if self.javascript.mode(file.document.path.as_str(), work) == ModuleMode::CommonJs {
+                return None;
+            }
+            let specifier = file.text(module)?;
+            if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+                return None;
+            }
+            self.javascript_specifier_file(file, module, false, work)?
+                .typescript_direct_namespace_export_pair(file.text(export)?, work)?
+        } else {
+            file.typescript_local_namespace_pair(name, range.start, work, |kind| {
+                matches!(
+                    kind,
+                    StaticBindingKind::Local | StaticBindingKind::JavaScriptClassValue { .. }
+                )
+            })?
+        };
+        let [left, right] = pair;
+        let (typed, namespace) = match (
+            left.symbol.syntax_element_kind,
+            right.symbol.syntax_element_kind,
+        ) {
+            (_, Some("internal_module")) => (left, right),
+            (Some("internal_module"), _) => (right, left),
+            _ => return None,
+        };
+        if !matches!(
+            typed.symbol.syntax_element_kind,
+            Some(
+                "interface_declaration"
+                    | "type_alias_declaration"
+                    | "class_declaration"
+                    | "enum_declaration"
+            )
+        ) || !typed.symbol.kinds.contains(&SymbolKind::Type)
+            || typed.symbol.kinds.contains(&SymbolKind::Public)
+                != namespace.symbol.kinds.contains(&SymbolKind::Public)
+            || self.javascript_identity(typed)? != self.javascript_identity(namespace)?
+        {
+            return None;
+        }
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Type, typed)?;
+        occurrence.edge_from = self
+            .javascript_assignment_reference_from(file, range, ReferenceRole::Type, work)
+            .or_else(|| self.javascript_module_from(file, range, work));
+        Some(occurrence)
     }
 
     /// Selects the alias facet for a direct TypeScript reference to an established
@@ -456,37 +570,9 @@ impl<'source> Index<'source> {
             return None;
         }
 
-        let mut pair: [Option<&StaticBinding>; 2] = [None, None];
-        let mut additional = false;
-        file.innermost_bindings(
-            name,
-            position,
-            work,
-            // Keep the fallback limited to an unshadowed pair of written declarations.
-            |_| true,
-            |binding, first| {
-                if first {
-                    pair = [Some(binding), None];
-                    additional = false;
-                } else if pair[1].is_none() {
-                    pair[1] = Some(binding);
-                } else {
-                    additional = true;
-                }
-            },
-        )?;
-
-        let [Some(first), Some(second)] = pair else {
-            return None;
-        };
-        if additional
-            || first.kind != StaticBindingKind::Local
-            || second.kind != StaticBindingKind::Local
-        {
-            return None;
-        }
-        let left = file.target_at(first.name)?;
-        let right = file.target_at(second.name)?;
+        let [left, right] = file.typescript_local_namespace_pair(name, position, work, |kind| {
+            kind == StaticBindingKind::Local
+        })?;
         let (alias, namespace) = match (
             left.symbol.syntax_element_kind,
             right.symbol.syntax_element_kind,
@@ -1321,6 +1407,43 @@ fn commonjs_argument_call(file: &File<'_>, range: ByteRange) -> bool {
     file.text(range)
         .and_then(|text| text.strip_prefix("require"))
         .is_some_and(|tail| tail.trim_ascii_start().starts_with('(') && tail.ends_with(')'))
+}
+
+impl<'source> File<'source> {
+    /// Reads both facets of one name from exactly one lexical scope.
+    fn typescript_local_namespace_pair(
+        &self,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+        admits: impl Fn(StaticBindingKind) -> bool,
+    ) -> Option<[Target<'source>; 2]> {
+        let mut pair: [Option<&StaticBinding>; 2] = [None, None];
+        let mut additional = false;
+        self.innermost_bindings(
+            name,
+            position,
+            work,
+            |_| true,
+            |binding, first| {
+                if first {
+                    pair = [Some(binding), None];
+                    additional = false;
+                } else if pair[1].is_none() {
+                    pair[1] = Some(binding);
+                } else {
+                    additional = true;
+                }
+            },
+        )?;
+        let [Some(left), Some(right)] = pair else {
+            return None;
+        };
+        if additional || left.scope != right.scope || !admits(left.kind) || !admits(right.kind) {
+            return None;
+        }
+        Some([self.target_at(left.name)?, self.target_at(right.name)?])
+    }
 }
 
 impl Target<'_> {

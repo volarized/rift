@@ -93,6 +93,10 @@ pub(crate) struct StaticResolution {
     pub(crate) commonjs_argument_import_start: Option<usize>,
     /// First checked selector reference to a declaration in a relative imported module.
     pub(crate) typescript_imported_export_start: Option<usize>,
+    /// First type use of a declaration merged with a namespace, after established edges.
+    pub(crate) typescript_namespace_type_start: Option<usize>,
+    /// Unresolved plain type names that can have two checked declaration facets.
+    pub(crate) typescript_namespace_type_sites: BTreeMap<rift_core::SourceUnitId, Vec<ByteRange>>,
     /// First containment edge of a physically scoped literal declaration.
     pub(crate) literal_start: Option<usize>,
     /// Containment awaiting the capacity left by existing references.
@@ -411,6 +415,7 @@ fn resolve_by<'source>(
     index.resolve_commonjs_argument_imports(&mut work, &mut resolution);
     resolution.typescript_inline_import_module_start =
         append_late_occurrences(&mut resolution.occurrences, &mut inline_modules);
+    index.resolve_typescript_namespace_type_uses(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -3175,6 +3180,8 @@ impl StaticResolution {
             .append(&mut apart.javascript_lexical_alias_candidates);
         self.javascript_assigned_members
             .append(&mut apart.javascript_assigned_members);
+        self.typescript_namespace_type_sites
+            .append(&mut apart.typescript_namespace_type_sites);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);
