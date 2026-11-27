@@ -7056,10 +7056,10 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-kotlin-ng"
-version = "1.1.0"
-source = "git+https://github.com/lzehrung/tree-sitter-kotlin?rev=5e83fcb8df1b472a2bb69c1b544a74d5cc4df96c#5e83fcb8df1b472a2bb69c1b544a74d5cc4df96c"
+version = "1.1.0+rift.1"
 dependencies = [
  "cc",
+ "flate2",
  "tree-sitter-language",
 ]
 

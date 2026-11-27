@@ -98,6 +98,14 @@ typealias Names = Items<String>
 @Target(AnnotationTarget.CLASS)
 annotation class Scope(val modules: Array<String> = [], val excluded: Array<String> = [])
 
+inline fun <
+    reified C1 : Any,
+    reified C2 : Any,
+> combine(noinline block: context(C1, C2) () -> Unit) {}
+
+val context = 1
+fun keepContext(context: Int): Int = context
+
 fun String.wrap(): String = trim()
 "#;
     let document = analyze("Client.kt", text);
@@ -132,6 +140,11 @@ fun String.wrap(): String = trim()
     assert_eq!(symbol("example.api.Scope").kind, "annotation");
     assert_eq!(symbol("example.api.Scope.modules").kind, "property");
     assert_eq!(symbol("example.api.Scope.excluded").kind, "property");
+    assert_eq!(symbol("example.api.combine").kind, "function");
+    assert_eq!(symbol("example.api.combine.C2").kind, "type_parameter");
+    assert_eq!(symbol("example.api.combine.block").kind, "parameter");
+    assert_eq!(symbol("example.api.context").kind, "property");
+    assert_eq!(symbol("example.api.keepContext.context").kind, "parameter");
     assert_eq!(symbol("example.api.wrap").kind, "function");
     assert_eq!(
         JvmLanguage::from_filename(r"C:\repo\build.gradle.kts"),
