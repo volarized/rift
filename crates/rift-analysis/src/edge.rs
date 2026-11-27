@@ -43,6 +43,7 @@ pub const EDGES_MAX: usize = 10_000_000;
 enum FileModuleReference {
     None,
     Binding,
+    Specifier,
     CommonJsExportImport,
     IncompleteLocalExport,
 }
@@ -70,6 +71,11 @@ impl Edge {
     /// Whether this reference needs two admitted ECMAScript file modules.
     pub(crate) const fn is_file_module_reference(&self) -> bool {
         !matches!(self.file_module_reference, FileModuleReference::None)
+    }
+
+    /// A checked import at the written module specifier.
+    pub(crate) const fn is_written_module_specifier(&self) -> bool {
+        matches!(self.file_module_reference, FileModuleReference::Specifier)
     }
 
     pub(crate) const fn is_deferred_commonjs_export_import(&self) -> bool {
@@ -584,7 +590,8 @@ fn static_admission_batches<'a>(
             edge_modules,
             &mut edges,
             match index {
-                10 | 11 | 42 => FileModuleReference::Binding,
+                10 => FileModuleReference::Specifier,
+                11 | 42 => FileModuleReference::Binding,
                 52 => FileModuleReference::CommonJsExportImport,
                 53 => FileModuleReference::IncompleteLocalExport,
                 _ => FileModuleReference::None,

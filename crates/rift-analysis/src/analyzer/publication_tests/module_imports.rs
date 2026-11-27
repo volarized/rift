@@ -5952,3 +5952,69 @@ fn assert_callback_reads_preserve_prior_records_at_the_cap(
     assert_eq!(records.objects, prior_objects);
     assert_eq!(records.declarations, prior_declarations);
 }
+
+#[test]
+fn typescript_reexport_only_declaration_files_keep_their_module_imports() {
+    const BARREL: &str = "export * from './leaf.js';\nexport * from './absent.js';\n";
+    const LEGACY: &str = "declare interface LocalOnly { value: number }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.js", "export const runtime = true;\n"),
+            ("index.d.ts", "export * from './branch/index.js';\n"),
+            ("branch/index.d.ts", BARREL),
+            ("branch/leaf.d.ts", "export interface Reader { value: number }\n"),
+            ("branch/leaf.js", "export const source = 1;\n"),
+            ("branch/legacy.d.ts", LEGACY),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("written declaration barrel");
+    let found = analysis.publication();
+    found.validate_facts().expect("checked typescript module");
+    let owner_suffix = "/typescript/beacon%2Fbranch%2Findex.d.ts";
+    let module = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with(owner_suffix) && row.source == BARREL)
+        .expect("complete declaration barrel owner");
+    let literal = "'./leaf.js'";
+    let occurrence = module_runtime_range(BARREL.find(literal).expect("specifier"), literal);
+    assert!(found.edges.iter().any(|edge| {
+        edge.from == module.symbol
+            && edge.kinds == [EdgeKind::Imports]
+            && edge
+                .to
+                .as_str()
+                .ends_with("/typescript/beacon%2Fbranch%2Fleaf.d.ts")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == module.unit && site.range == occurrence)
+    }));
+    assert!(found.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Aliases]
+            && edge.from.as_str().ends_with("index.d.ts/Reader")
+            && edge.to.as_str().ends_with("leaf.d.ts/Reader")
+    }));
+    assert!(found.declarations.iter().all(|row| row.source != LEGACY));
+    let missing = "'./absent.js'";
+    let missing = module_runtime_range(BARREL.find(missing).expect("missing specifier"), missing);
+    assert!(
+        found
+            .edges
+            .iter()
+            .filter(|edge| edge.from == module.symbol)
+            .all(|edge| {
+                !edge.to.as_str().ends_with("leaf.js")
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_none_or(|site| site.unit != module.unit || site.range != missing)
+            })
+    );
+}

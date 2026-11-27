@@ -33,6 +33,7 @@ impl Records {
             self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
             self.retain_incomplete_local_export_references(semantics, limits.edges_max());
         }
+        self.retain_checked_declaration_specifiers(owner, analyzed, semantics, limits)?;
         Ok(())
     }
 
@@ -84,6 +85,68 @@ impl Records {
             );
         }
         Ok(())
+    }
+
+    pub(super) fn retain_checked_declaration_specifiers(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+    ) -> Result<(), RiftError> {
+        if !matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
+            return Ok(());
+        }
+        let candidates = self.checked_declaration_source_candidates(analyzed);
+        let before = self.declarations.len();
+        self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
+        let new_modules = self.declarations[before..]
+            .iter()
+            .map(|row| row.symbol.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        if !new_modules.is_empty() {
+            let references = semantics.edges().edges().filter(|edge| {
+                edge.kind() == EdgeKind::Imports
+                    && edge.is_written_module_specifier()
+                    && (new_modules.contains(edge.from().as_str())
+                        || new_modules.contains(edge.to().as_str()))
+            });
+            self.retain_file_module_edge_rows(references, limits.edges_max());
+        }
+        Ok(())
+    }
+
+    fn checked_declaration_source_candidates<'file>(
+        &self,
+        analyzed: &'file [AnalyzedFile],
+    ) -> FileModuleCandidates<'file> {
+        let complete = self
+            .units
+            .iter()
+            .filter(|unit| unit.source_complete)
+            .map(|unit| unit.unit.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut modules = FileModuleCandidates::new();
+        for file in analyzed {
+            let Some(module) = file.placement.logical_identity(".") else {
+                continue;
+            };
+            let syntax = file.file.syntax();
+            let proven = syntax.language().name == "typescript"
+                && crate::static_resolution::is_declaration_file(file.file.path().as_str())
+                && !file.file.source().is_empty()
+                && !syntax.has_errors()
+                && syntax.left_out_declaration_count() == 0
+                && complete.contains(file.placement.unit().to_string().as_str())
+                && syntax
+                    .static_facts()
+                    .is_some_and(rift_syntax::StaticFacts::has_javascript_module_statement);
+            modules
+                .entry(module)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert_with(|| proven.then_some((file, false)));
+        }
+        modules
     }
 
     fn checked_local_export_module_candidates<'file>(
