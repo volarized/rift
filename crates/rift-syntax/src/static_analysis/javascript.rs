@@ -374,6 +374,7 @@ impl Kinds {
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
         self.record_body_member(visited, facts)?;
+        self.record_type_union_branch(syntax_element, facts)?;
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
         self.record_module_statement(visited, facts);
@@ -641,6 +642,70 @@ impl Kinds {
             });
         }
         Ok(())
+    }
+
+    fn record_type_union_branch(
+        &self,
+        branch: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(());
+        };
+        if branch.kind_id() != shapes.signature_holders[1] {
+            return Ok(());
+        }
+        let Some(mut union) = branch
+            .parent()
+            .filter(|node| node.kind_id() == shapes.union)
+        else {
+            return Ok(());
+        };
+        // Nested union nodes represent the written chain of branches.
+        while let Some(outer) = union.parent().filter(|node| node.kind_id() == shapes.union) {
+            union = outer;
+        }
+        if let Some(owner) = self.type_union_owner(union, shapes) {
+            facts
+                .typescript_union_branches
+                .push(crate::StaticTypeUnionBranch {
+                    owner: byte_range(owner)?,
+                    union: byte_range(union)?,
+                    branch: byte_range(branch)?,
+                });
+        }
+        Ok(())
+    }
+
+    fn type_union_owner<'tree>(
+        &self,
+        union: Node<'tree>,
+        shapes: &TypeShapeKinds,
+    ) -> Option<Node<'tree>> {
+        let mut expression = union;
+        loop {
+            let parent = expression.parent()?;
+            match parent.kind() {
+                "parenthesized_type" => expression = parent,
+                "type_arguments" => {
+                    expression = parent
+                        .parent()
+                        .filter(|node| node.kind() == "generic_type")?;
+                }
+                "type_alias_declaration" => {
+                    // Existing direct unions keep their original placement proof.
+                    return (expression != union
+                        && parent.child_by_field_id(self.value) == Some(expression))
+                    .then_some(parent);
+                }
+                "type_annotation" => {
+                    let callable = parent.parent()?;
+                    return (callable.child_by_field_id(shapes.return_type) == Some(parent))
+                        .then_some(callable);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// A written property can hold objects through consecutive array element positions.

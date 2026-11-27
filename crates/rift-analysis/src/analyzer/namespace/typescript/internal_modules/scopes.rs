@@ -16,6 +16,8 @@ use super::super::conflicting_assignment_name;
 use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
+mod mixed_shorthand;
+
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
 /// only when they bind it in the same place: overloads, merged interfaces and namespaces,
 /// an accessor pair and a redeclared `var` do.
@@ -747,24 +749,55 @@ impl<'source> FileScopes<'source> {
                 }
             }
         }
-        let mut checked = BTreeMap::new();
+        let mut captured = BTreeMap::<ByteRange, BTreeMap<ByteRange, BTreeSet<ByteRange>>>::new();
+        for row in file
+            .syntax
+            .static_facts()
+            .map_or(&[][..], StaticFacts::typescript_union_branches)
+        {
+            captured
+                .entry(row.owner)
+                .or_default()
+                .entry(row.union)
+                .or_default()
+                .insert(row.branch);
+        }
+        let mut direct = BTreeMap::new();
         groups
             .into_iter()
             .filter_map(|(name, members)| {
                 let container = members.first()?.container.as_deref()?;
                 let owner = owners.get(container).copied().flatten()?;
-                if owner.syntax_element_kind != Some("type_alias_declaration")
+                let alias = owner.syntax_element_kind == Some("type_alias_declaration");
+                if (!alias && !owner.kinds.contains(&SymbolKind::Callable))
                     || super::super::conflicting_assignment_name(container, withheld)
                 {
                     return None;
                 }
                 let original = anchors.get(name)?;
-                let branches = checked
-                    .entry(container)
-                    .or_insert_with(|| self.checked_union_bodies(file, owner))
-                    .as_ref()?;
-                let identities = self
-                    .checked_union_branches(file, owner, &members, branches)?
+                let old = alias
+                    .then(|| {
+                        direct
+                            .entry(container)
+                            .or_insert_with(|| self.checked_union_bodies(file, owner))
+                            .as_ref()
+                            .and_then(|bodies| {
+                                self.checked_union_branches(file, owner, &members, bodies)
+                            })
+                    })
+                    .flatten();
+                let branches = old.or_else(|| {
+                    let mut complete =
+                        captured
+                            .get(&owner.item_range)?
+                            .values()
+                            .filter_map(|bodies| {
+                                self.checked_union_branches(file, owner, &members, bodies)
+                            });
+                    let first = complete.next()?;
+                    complete.next().is_none().then_some(first)
+                })?;
+                let identities = branches
                     .into_values()
                     .map(|ordinals| {
                         let identity = local_group_identity(original, *ordinals.first()?)?;

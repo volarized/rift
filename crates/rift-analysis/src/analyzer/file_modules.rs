@@ -38,12 +38,25 @@ impl Records {
                 limits.edges_max(),
                 &[EdgeKind::Imports, EdgeKind::Reads],
             );
-            self.retain_ecmascript_callback_calls(owner, analyzed, semantics, limits)?;
+            self.retain_ecmascript_callback_edges(
+                owner,
+                analyzed,
+                semantics,
+                limits,
+                EdgeKind::Calls,
+            )?;
             self.retain_ecmascript_file_module_edges(
                 semantics,
                 limits.edges_max(),
                 &[EdgeKind::References],
             );
+            self.retain_ecmascript_callback_edges(
+                owner,
+                analyzed,
+                semantics,
+                limits,
+                EdgeKind::Reads,
+            )?;
         }
         Ok(())
     }

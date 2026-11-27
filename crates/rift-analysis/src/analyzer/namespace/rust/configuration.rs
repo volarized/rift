@@ -416,7 +416,9 @@ fn and(left: Option<bool>, right: Option<bool>) -> Option<bool> {
     }
 }
 
-fn split<'tokens, 'source>(input: &'tokens [&'source str]) -> Option<Vec<&'tokens [&'source str]>> {
+pub(super) fn split<'tokens, 'source>(
+    input: &'tokens [&'source str],
+) -> Option<Vec<&'tokens [&'source str]>> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;

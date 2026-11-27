@@ -1,16 +1,19 @@
 //! Checks effects in complete original Rust scope ranges.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_syntax::ByteRange;
 
 use super::{Scope, SelectedFile, consume, group};
+use crate::analyzer::namespace::rust::configuration::{Configuration, split};
 
 type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> Option<()>>;
 
 pub(super) struct Tokens<'a> {
     rows: Vec<(ByteRange, &'a str)>,
+    facts: Option<&'a rift_syntax::StaticFacts>,
+    inert_items: BTreeSet<ByteRange>,
     bindings: BTreeSet<String>,
     pub(super) complete: bool,
     depth: usize,
@@ -19,11 +22,18 @@ pub(super) struct Tokens<'a> {
 }
 
 impl<'a> Tokens<'a> {
-    pub(super) fn new(file: &'a SelectedFile<'a>) -> Option<Self> {
-        Self::with_capture(file, None)
+    pub(super) fn new(
+        file: &'a SelectedFile<'a>,
+        configuration: Option<&Configuration<'_>>,
+    ) -> Option<Self> {
+        Self::with_capture(file, None, configuration)
     }
 
-    pub(super) fn with_capture(file: &'a SelectedFile<'a>, selected: Option<&str>) -> Option<Self> {
+    pub(super) fn with_capture(
+        file: &'a SelectedFile<'a>,
+        selected: Option<&str>,
+        configuration: Option<&Configuration<'_>>,
+    ) -> Option<Self> {
         let limits = file.syntax.syntax_limits()?;
         let mut rows = Vec::new();
         let range = ByteRange {
@@ -41,6 +51,8 @@ impl<'a> Tokens<'a> {
         }
         let mut result = Self {
             rows,
+            facts: file.syntax.static_facts(),
+            inert_items: BTreeSet::new(),
             bindings: BTreeSet::new(),
             complete: true,
             depth: limits.syntax_depth_max(),
@@ -53,20 +65,39 @@ impl<'a> Tokens<'a> {
         if scopes.first().map(|(range, _)| *range) != Some(range) {
             return None;
         }
-        for (_, children) in scopes {
+        let isolated = match (selected, configuration) {
+            (Some(_), Some(configuration)) => {
+                let mut isolated = result.inactive_modules(file, configuration)?;
+                isolated.extend(result.local_inline_modules(file, configuration)?);
+                isolated.sort_unstable();
+                isolated.dedup();
+                isolated
+            }
+            _ => Vec::new(),
+        };
+        for (scope_range, children) in scopes {
+            if within_module(&isolated, *scope_range) {
+                continue;
+            }
             let Some(children) = children else {
                 result.complete = false;
                 continue;
             };
+            let top_level = *scope_range == range
+                && !file.syntax.has_errors()
+                && file.syntax.left_out_declaration_count() == 0;
             for child in children {
                 if super::macro_export_attribute(file, *child) {
                     result.charge(file.syntax.symbols().len())?;
                     continue;
                 }
-                result.names(*child)?;
+                result.names(*child, configuration, top_level)?;
             }
         }
         for (range, _, children) in file.syntax.macro_invocations()? {
+            if within_module(&isolated, *range) {
+                continue;
+            }
             if children.is_none() {
                 result.complete = false;
                 continue;
@@ -74,6 +105,131 @@ impl<'a> Tokens<'a> {
             result.invocation_names(*range, selected)?;
         }
         Some(result)
+    }
+
+    fn inactive_modules(
+        &self,
+        file: &SelectedFile<'_>,
+        configuration: &Configuration<'_>,
+    ) -> Option<Vec<ByteRange>> {
+        let Some(facts) = self.facts else {
+            return Some(Vec::new());
+        };
+        let conditions = facts.conditional_items();
+        if conditions.is_empty() {
+            return Some(Vec::new());
+        }
+        let barriers = facts.rust_macro_barriers();
+        let symbols = file.syntax.symbols();
+        self.charge(
+            barriers
+                .len()
+                .checked_add(symbols.len())?
+                .checked_add(conditions.len())?,
+        )?;
+        let blocked = barriers
+            .iter()
+            .map(|(item, _)| *item)
+            .collect::<BTreeSet<_>>();
+        let candidates = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.container.is_none()
+                    && symbol.syntax_element_kind == Some("mod_item")
+                    && symbol.body_range.is_some()
+                    && !blocked.contains(&symbol.item_range)
+            })
+            .map(|symbol| symbol.item_range)
+            .collect::<BTreeSet<_>>();
+        let mut inactive = BTreeSet::new();
+        for item in conditions {
+            if !candidates.contains(&item.range) {
+                continue;
+            }
+            let attribute = self.range(item.attribute)?;
+            if let ["#", "[", "cfg", "(", predicate @ .., ")", "]"] = attribute.as_slice() {
+                self.charge(predicate.len().checked_mul(self.depth)?)?;
+                if configuration.condition(predicate) == Some(false) {
+                    inactive.insert(item.range);
+                }
+            }
+        }
+        Some(inactive.into_iter().collect())
+    }
+
+    fn local_inline_modules(
+        &self,
+        file: &SelectedFile<'_>,
+        configuration: &Configuration<'_>,
+    ) -> Option<Vec<ByteRange>> {
+        let Some(facts) = self.facts else {
+            return Some(Vec::new());
+        };
+        let symbols = file.syntax.symbols();
+        let scopes = file.syntax.scope()?;
+        let barriers = facts.rust_macro_barriers();
+        let definitions = facts.rust_macro_definitions();
+        self.charge(
+            symbols
+                .len()
+                .checked_add(scopes.len())?
+                .checked_add(barriers.len())?
+                .checked_add(definitions.len())?,
+        )?;
+        let complete_scopes = scopes
+            .iter()
+            .filter_map(|(range, children)| children.as_ref().map(|_| *range))
+            .collect::<BTreeSet<_>>();
+        let incomplete_scopes = scopes
+            .iter()
+            .filter_map(|(range, children)| children.is_none().then_some(*range))
+            .collect::<Vec<_>>();
+        let function_prefixes = symbols
+            .iter()
+            .filter(|symbol| symbol.syntax_element_kind == Some("function_item"))
+            .map(|symbol| (symbol.item_range, symbol.range.start))
+            .collect::<BTreeMap<_, _>>();
+        let mut effects = definitions
+            .iter()
+            .map(|definition| definition.item)
+            .collect::<BTreeSet<_>>();
+        for (item, scope) in barriers {
+            if !complete_scopes.contains(scope) {
+                continue;
+            }
+            let test_function = function_prefixes.get(item).is_some_and(|start| {
+                self.range(ByteRange {
+                    start: *start,
+                    end: item.start,
+                })
+                .is_some_and(|attributes| attributes == ["#", "[", "test", "]"])
+            });
+            if !test_function {
+                effects.insert(*item);
+            }
+        }
+        let mut modules = Vec::new();
+        for symbol in symbols.iter().filter(|symbol| {
+            symbol.container.is_none() && symbol.syntax_element_kind == Some("mod_item")
+        }) {
+            let Some(body) = symbol.body_range else {
+                continue;
+            };
+            // A nested inline module has its own import namespace. Only omit
+            // its checked scope from the enclosing derive proof, and keep any
+            // explicit macro declarations or possible module-level effects.
+            if complete_scopes.contains(&body)
+                && self.configured_item(symbol.item_range, Some(configuration)) == Some(true)
+                && self
+                    .charge(effects.len().checked_add(incomplete_scopes.len())?)
+                    .is_some()
+                && !incomplete_scopes.iter().any(|scope| body.encloses(*scope))
+                && !effects.iter().any(|effect| body.encloses(*effect))
+            {
+                modules.push(symbol.item_range);
+            }
+        }
+        Some(modules)
     }
 
     pub(super) fn range(&self, range: ByteRange) -> Option<Vec<&'a str>> {
@@ -95,7 +251,7 @@ impl<'a> Tokens<'a> {
     pub(super) fn outward_bindings(
         &self,
         child: &SelectedFile<'_>,
-        name: &str,
+        name: Option<&str>,
         scope: &Scope,
         library: bool,
     ) -> Option<BTreeSet<String>> {
@@ -107,7 +263,10 @@ impl<'a> Tokens<'a> {
                 continue;
             }
             let input = self.range(range)?;
-            if super::invocation_name(child.source, range) == Some(name) {
+            if self.inert_item(range) {
+                continue;
+            }
+            if name.is_some() && super::invocation_name(child.source, range) == name {
                 let body = super::chain::invocation_body(&input)?;
                 let (predicate, body) = super::chain::captured_predicate_body(body)?;
                 self.charge(predicate.len().checked_mul(self.depth)?)?;
@@ -119,7 +278,7 @@ impl<'a> Tokens<'a> {
                 self.outward_item(&input, scope, library, &mut bindings)?;
             }
         }
-        (!bindings.contains(name)).then_some(bindings)
+        (!name.is_some_and(|name| bindings.contains(name))).then_some(bindings)
     }
 
     fn outward_item(
@@ -162,7 +321,7 @@ impl<'a> Tokens<'a> {
         }
     }
 
-    fn charge(&self, count: usize) -> Option<()> {
+    pub(super) fn charge(&self, count: usize) -> Option<()> {
         let work = self.work.get().checked_add(count)?;
         if work > self.work_max {
             return None;
@@ -171,9 +330,79 @@ impl<'a> Tokens<'a> {
         Some(())
     }
 
-    fn names(&mut self, range: ByteRange) -> Option<()> {
+    fn names(
+        &mut self,
+        range: ByteRange,
+        configuration: Option<&Configuration<'_>>,
+        top_level: bool,
+    ) -> Option<()> {
         let tokens = self.range(range)?;
+        if self.ordinary_extern_crate(range, &tokens, configuration)
+            || (top_level && self.inactive_glob(range, &tokens, configuration))
+        {
+            self.inert_items.insert(range);
+            return Some(());
+        }
         self.names_tokens(&tokens)
+    }
+
+    pub(super) fn inert_item(&self, range: ByteRange) -> bool {
+        self.inert_items.contains(&range)
+    }
+
+    fn inactive_glob(
+        &self,
+        range: ByteRange,
+        mut input: &[&str],
+        configuration: Option<&Configuration<'_>>,
+    ) -> bool {
+        visibility(&mut input).is_some()
+            && input.first() == Some(&"use")
+            && input.last() == Some(&";")
+            && input.contains(&"*")
+            && self.configured_item(range, configuration) == Some(false)
+    }
+
+    fn ordinary_extern_crate(
+        &self,
+        range: ByteRange,
+        mut input: &[&str],
+        configuration: Option<&Configuration<'_>>,
+    ) -> bool {
+        if visibility(&mut input).is_none()
+            || !consume(&mut input, &["extern", "crate"])
+            || identifier(&mut input).is_none()
+            || input != [";"]
+        {
+            return false;
+        }
+        self.configured_item(range, configuration).is_some()
+    }
+
+    pub(super) fn configured_item(
+        &self,
+        range: ByteRange,
+        configuration: Option<&Configuration<'_>>,
+    ) -> Option<bool> {
+        let facts = self.facts?;
+        let barriers = facts.rust_macro_barriers();
+        let conditions = facts.conditional_items();
+        // Outer attributes occupy separate syntax ranges. Check the bound
+        // item ranges before treating the declaration as macro-inert.
+        self.charge(barriers.len().checked_add(conditions.len())?)?;
+        if barriers.iter().any(|(item, _)| *item == range) {
+            return None;
+        }
+        let mut admitted = true;
+        for item in conditions.iter().filter(|item| item.range == range) {
+            let attribute = self.range(item.attribute)?;
+            let ["#", "[", "cfg", "(", predicate @ .., ")", "]"] = attribute.as_slice() else {
+                return None;
+            };
+            self.charge(predicate.len().checked_mul(self.depth)?)?;
+            admitted &= configuration?.condition(predicate)?;
+        }
+        Some(admitted)
     }
 
     fn invocation_names(&mut self, range: ByteRange, captured: Option<&str>) -> Option<()> {
@@ -266,19 +495,38 @@ impl<'a> Tokens<'a> {
         match input {
             ["cfg", "(", predicate @ .., ")"] => super::cfg(predicate, library, depth).is_some(),
             ["cfg_attr", "(", body @ .., ")"] => {
-                let mut nested = 0_usize;
-                let Some(split) = body.iter().position(|token| {
-                    match *token {
-                        "(" => nested += 1,
-                        ")" => nested = nested.saturating_sub(1),
-                        _ => {}
-                    }
-                    *token == "," && nested == 0
-                }) else {
+                if body
+                    .len()
+                    .checked_mul(depth)
+                    .and_then(|work| self.charge(work))
+                    .is_none()
+                {
+                    return false;
+                }
+                let Some(parts) = split(body) else {
                     return false;
                 };
-                super::cfg(&body[..split], library, depth).is_some()
-                    && self.attribute(&body[split + 1..], scope, library, depth - 1, validate)
+                let [predicate, attributes @ ..] = parts.as_slice() else {
+                    return false;
+                };
+                !attributes.is_empty()
+                    && super::cfg(predicate, library, depth).is_some()
+                    && attributes.iter().all(|attribute| {
+                        (attributes.len() == 1
+                            || matches!(
+                                attribute.first(),
+                                Some(
+                                    &("allow"
+                                        | "warn"
+                                        | "deny"
+                                        | "forbid"
+                                        | "expect"
+                                        | "doc"
+                                        | "feature")
+                                )
+                            ))
+                            && self.attribute(attribute, scope, library, depth - 1, validate)
+                    })
             }
             ["derive", "(", names @ .., ")"] => {
                 (!validate || library) && self.derives(names, scope, validate)
@@ -345,6 +593,9 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
+        if self.inert_item(range) {
+            return Some(());
+        }
         self.item_tokens(&tokens, scope, library, self.depth, true, &mut None)
     }
 
@@ -658,6 +909,9 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn effects(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
+        if self.inert_item(range) {
+            return Some(());
+        }
         self.item_tokens(&tokens, scope, library, self.depth, false, &mut None)
     }
 
@@ -1070,6 +1324,13 @@ fn identifier(input: &mut &[&str]) -> Option<String> {
     Some(name)
 }
 
+fn within_module(isolated: &[ByteRange], range: ByteRange) -> bool {
+    let end = isolated.partition_point(|module| module.start <= range.start);
+    isolated[..end]
+        .last()
+        .is_some_and(|module| module.encloses(range))
+}
+
 /// Exact names an ordinary, fully bounded use item can introduce.
 pub(super) fn named_imports(mut input: &[&str], depth: usize) -> Option<BTreeSet<String>> {
     if !consume(&mut input, &["use"]) {
@@ -1167,7 +1428,7 @@ mod tests {
             source,
             syntax: &facts,
         };
-        let tokens = Tokens::new(&file).expect("original complete source ranges");
+        let tokens = Tokens::new(&file, None).expect("original complete source ranges");
         check(&tokens);
     }
 
@@ -1255,7 +1516,8 @@ mod tests {
     fn complete_derive_proof_refuses_glob_unknown_later_and_qualified_names() {
         for source in [
             "use other::*;",
-            "extern crate other;",
+            "#[macro_use] extern crate other;",
+            "extern crate other as alias;",
             "#[custom] struct Neighbor;",
             "#[derive(Debug)] struct Neighbor; use other::Debug;",
         ] {
@@ -1459,7 +1721,7 @@ mod tests {
                 source,
                 syntax: &facts,
             };
-            let allowed = Tokens::new(&file).is_some_and(|tokens| {
+            let allowed = Tokens::new(&file, None).is_some_and(|tokens| {
                 let (range, _, _) = facts
                     .macro_invocations()
                     .expect("captured invocations")

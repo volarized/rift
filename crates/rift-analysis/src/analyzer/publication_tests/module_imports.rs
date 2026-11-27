@@ -3032,6 +3032,85 @@ fn non_entry_typescript_union_properties_keep_their_written_branches() {
 }
 
 #[test]
+fn non_entry_typescript_wrapped_and_return_unions_keep_their_written_branches() {
+    const SOURCE: &str = concat!(
+        "export type Direct = { prior: number } | { prior: string };\n",
+        "export type Wrapped = Promise<{ value: number } | { value: string }>;\n",
+        "export declare class Reader {\n",
+        "    plain(): { code: number } | { code: string };\n",
+        "    wrapped(): Promise<{ rendered: number } | { rendered: string }>;\n",
+        "}\n",
+        "export declare function read(): Promise<{ result: number } | { result: string }>;\n",
+        "export declare function accept(input: { other: number } | { other: string }): void;\n",
+    );
+    let analyze = |entry| {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","types":"./{entry}"}}"#);
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                (
+                    "index.d.ts",
+                    "export { Direct, Reader, Wrapped, read } from './reader.js';",
+                ),
+                ("reader.d.ts", SOURCE),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("written type sources")
+    };
+    let non_entry = analyze("index.d.ts");
+    let entry = analyze("reader.d.ts");
+    let found = non_entry.publication();
+    found.validate_facts().expect("checked branch owners");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "reader.d.ts")
+        .expect("written declaration file");
+    for (owner, name) in [
+        ("Direct", "prior"),
+        ("Wrapped", "value"),
+        ("Reader/plain", "code"),
+        ("Reader/wrapped", "rendered"),
+        ("read", "result"),
+    ] {
+        let mut identities = BTreeSet::new();
+        for ty in ["number", "string"] {
+            let written = format!("{name}: {ty}");
+            let start = SOURCE.find(&written).expect("written property");
+            let range = module_runtime_range(start, &written);
+            let declaration = found
+                .declarations
+                .iter()
+                .find(|row| row.unit == unit.unit && row.range == range && row.source == written)
+                .unwrap_or_else(|| panic!("missing {owner}/{written}"));
+            let suffix = format!("%2Freader.d.ts/{owner}/{name}");
+            assert!(declaration.symbol.as_str().contains(&suffix));
+            assert!(identities.insert(&declaration.symbol));
+            assert!(entry.publication().declarations.iter().any(|row| {
+                row.unit == unit.unit
+                    && row.range == range
+                    && row.source == written
+                    && row.symbol.as_str().ends_with(&format!("/{owner}/{name}"))
+            }));
+        }
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/accept"))
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.symbol.as_str().contains("/accept/other"))
+    );
+}
+
+#[test]
 fn typescript_method_type_parameters_keep_their_own_annotation_targets() {
     const SOURCE: &str = concat!(
         "export interface Reader { read<Value>(value: Value): Value; }\n",
@@ -3685,6 +3764,106 @@ fn non_entry_callbacks_keep_properties_in_distinct_call_arguments() {
             .any(|edge| &edge.from == *callback && edge.kinds == [EdgeKind::Calls])
     }));
     assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
+}
+
+#[test]
+fn admitted_anonymous_callbacks_keep_written_argument_properties() {
+    const SOURCE: &str = concat!(
+        "function take(options) { return options.state; }\n",
+        "function schedule(callback) { return callback(); }\n",
+        "export function stable() { return 0; }\n",
+        "schedule(() => {\n",
+        "  take({ state: 'first', uniqueFirst: true });\n",
+        "  take({ state: 'second', uniqueSecond: false });\n",
+        "  schedule(() => {\n",
+        "    take({ state: 'third' });\n",
+        "    take({ state: 'fourth' });\n",
+        "    take({ duplicate: 1, duplicate: 2 });\n",
+        "    unknown({ state: 'unknown' });\n",
+        "  });\n",
+        "});\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 128);
+    let graph = analysis.publication();
+    graph.validate_facts().expect("argument properties");
+    let callers = anonymous_callback_ids(graph);
+    assert_eq!(callers.len(), 2);
+    let mut properties = BTreeSet::new();
+    for value in ["first", "second", "third", "fourth"] {
+        let written = format!("state: '{value}'");
+        let start = SOURCE.find(&written).expect("written property");
+        let property = graph
+            .declarations
+            .iter()
+            .find(|row| row.range == module_runtime_range(start, &written) && row.source == written)
+            .expect("placed argument property");
+        assert!(property.source_complete && !property.public);
+        assert!(properties.insert(property.symbol.clone()));
+        let object = graph
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&property.symbol))
+            .expect("property identity");
+        assert_eq!(object.name, "state");
+        let caller = object.container.as_ref().expect("argument property owner");
+        assert!(callers.contains(caller));
+        assert!(
+            caller
+                .as_str()
+                .ends_with(if matches!(value, "first" | "second") {
+                    "$callback%230"
+                } else {
+                    "$callback%231"
+                })
+        );
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from == *caller
+                && edge.to.as_str().ends_with("/take")
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == property.unit
+                        && site.range.start <= property.range.start
+                        && property.range.end <= site.range.end
+                })
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Contains]
+                && edge.from == *caller
+                && edge.to == property.symbol
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == property.unit && site.range == module_runtime_range(start, "state")
+                })
+        }));
+    }
+    assert!(
+        graph
+            .declarations
+            .iter()
+            .any(|row| row.source == "uniqueFirst: true")
+    );
+    assert!(
+        graph
+            .declarations
+            .iter()
+            .any(|row| row.source == "uniqueSecond: false")
+    );
+    assert!(graph.objects.iter().all(|object| {
+        !object
+            .container
+            .as_ref()
+            .is_some_and(|id| callers.contains(id))
+            || object.name != "duplicate"
+    }));
+    assert!(
+        !graph
+            .declarations
+            .iter()
+            .any(|row| row.source == "state: 'unknown'")
+    );
+    let capped = non_entry_lexical_binding_analysis(SOURCE, 2);
+    let capped = capped.publication();
+    assert!(capped.edges.len() <= 2);
+    assert!(capped.edges.iter().all(|edge| graph.edges.contains(edge)));
 }
 
 #[test]
@@ -4782,7 +4961,7 @@ fn assert_callback_edge_capacity(
         .with_edges(admitted.len())
         .expect("edge bound");
     records
-        .retain_ecmascript_callback_calls(owner.owner(), files, semantics, limits)
+        .retain_ecmascript_callback_edges(owner.owner(), files, semantics, limits, EdgeKind::Calls)
         .expect("bounded calls");
     assert_eq!(records.edges, admitted);
     assert_eq!(
@@ -5429,4 +5608,152 @@ fn javascript_assignments_keep_distinct_checked_member_literal_owners() {
         row.source.as_str(),
         "additionalProperty: 5" | "withheld: 6" | "withheld: 7"
     )));
+}
+
+#[test]
+fn javascript_callback_arguments_keep_checked_runtime_member_reads() {
+    const SOURCE: &str = concat!(
+        "import { Reader } from './index.js';\n",
+        "function schedule(task) { return task(); }\n",
+        "export function named() { return Reader.tag; }\n",
+        "schedule(() => Reader.tag);\n",
+        "schedule(function () { return Reader.tag; });\n",
+        "schedule(() => (new Reader(), Reader.tag));\n",
+        "export function shadow(Reader) { schedule(() => Reader.tag); }\n",
+        "Reader.tag;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export { Reader } from './reader.js';"),
+            ("index.d.ts", "export { Reader } from './reader.js';"),
+            ("reader.js", "export class Reader { static tag = 1; }"),
+            ("reader.d.ts", "export declare class Reader { static tag: number; }"),
+            ("reader-use.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","import":"./index.js"}}}"#,
+        )),
+    )
+    .expect("checked callback package");
+    let (found, files, semantics, _) = result.into_parts();
+    found.validate_facts().expect("physical callback owners");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "reader-use.js")
+        .expect("written callback source")
+        .unit;
+    let written_pairs = SOURCE.match_indices("Reader.tag").collect::<Vec<_>>();
+    assert_eq!(written_pairs.len(), 6);
+    let read_owner = |position, spelling, target| {
+        let range = module_runtime_range(position, spelling);
+        let mut reads = found.edges.iter().filter(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().ends_with(target)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == *unit && site.range == range)
+        });
+        let first = reads.next();
+        assert!(reads.next().is_none());
+        first.map(|edge| &edge.from)
+    };
+    let runtime_type = "/javascript/beacon%2Freader.js/Reader";
+    let runtime_property = "/javascript/beacon%2Freader.js/Reader/tag";
+    let mut callbacks = BTreeSet::new();
+    for (index, (start, _)) in written_pairs.iter().copied().enumerate() {
+        let qualifier = read_owner(start, "Reader", runtime_type);
+        let member = read_owner(start, "Reader.tag", runtime_property);
+        assert_eq!(qualifier, member);
+        match index {
+            0 => assert!(qualifier.expect("named owner").as_str().ends_with("/named")),
+            4 => assert!(
+                qualifier.is_none(),
+                "the callback parameter shadows the imported class"
+            ),
+            5 => assert!(
+                qualifier
+                    .expect("module owner")
+                    .as_str()
+                    .ends_with("%2Freader-use.js")
+            ),
+            _ => {
+                let id = qualifier.expect("anonymous owner");
+                assert!(callbacks.insert(id));
+                assert!(
+                    found
+                        .objects
+                        .iter()
+                        .any(|row| row.id.as_ref() == Some(id) && row.document_local)
+                );
+            }
+        }
+    }
+    let caller =
+        read_owner(written_pairs[3].0, "Reader", runtime_type).expect("shared callback owner");
+    let call = module_runtime_range(
+        SOURCE.find("new Reader()").expect("written constructor"),
+        "new Reader()",
+    );
+    assert!(found.edges.iter().any(|edge| {
+        &edge.from == caller
+            && edge.kinds == [EdgeKind::Calls]
+            && edge.to.as_str().ends_with(runtime_type)
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == *unit && site.range == call)
+    }));
+    assert_callback_reads_preserve_prior_records_at_the_cap(
+        &found, &files, &semantics, &callbacks, caller,
+    );
+}
+
+fn assert_callback_reads_preserve_prior_records_at_the_cap(
+    found: &PackagePublication,
+    files: &[AnalyzedFile],
+    semantics: &WorkspaceSemantics,
+    callbacks: &BTreeSet<&SymbolId>,
+    existing: &SymbolId,
+) {
+    let prior_owner = |id: &SymbolId| id == existing || !callbacks.contains(id);
+    let prior_objects = found
+        .objects
+        .iter()
+        .filter(|row| row.id.as_ref().is_none_or(prior_owner))
+        .cloned()
+        .collect::<Vec<_>>();
+    let prior_declarations = found
+        .declarations
+        .iter()
+        .filter(|row| prior_owner(&row.symbol))
+        .cloned()
+        .collect::<Vec<_>>();
+    let prior_edges = found
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds != [EdgeKind::Reads] || !callbacks.contains(&edge.from))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut records = Records {
+        units: found.units.clone(),
+        objects: prior_objects.clone(),
+        declarations: prior_declarations.clone(),
+        edges: prior_edges.clone(),
+        ..Records::default()
+    };
+    let owner = SymbolIdentity::parse(existing.as_str()).expect("existing callback identity");
+    let limits = ExactPackageLimits::new(4096, 4096)
+        .with_edges(prior_edges.len())
+        .expect("edge bound");
+    records
+        .retain_ecmascript_callback_edges(owner.owner(), files, semantics, limits, EdgeKind::Reads)
+        .expect("bounded callback reads");
+    assert_eq!(records.edges, prior_edges);
+    assert_eq!(records.objects, prior_objects);
+    assert_eq!(records.declarations, prior_declarations);
 }

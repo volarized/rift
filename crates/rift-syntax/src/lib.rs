@@ -60,7 +60,7 @@ pub use static_analysis::{
     StaticMemberCallback, StaticMemberCopy, StaticParameter, StaticPythonInitializer,
     StaticPythonInitializerField, StaticReexport, StaticReference, StaticRustFieldSite,
     StaticRustGenericReference, StaticRustMacroCall, StaticRustMacroDefinition, StaticRustUse,
-    StaticRustValueRead,
+    StaticRustValueRead, StaticTypeUnionBranch,
 };
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};

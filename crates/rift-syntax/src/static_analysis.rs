@@ -183,6 +183,17 @@ pub struct StaticBodyMember {
     pub holder: ByteRange,
 }
 
+/// A written object type that is one branch of a union owned by an alias or return type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticTypeUnionBranch {
+    /// The written type alias or callable declaration.
+    pub owner: ByteRange,
+    /// The complete union within the alias value or callable return type.
+    pub union: ByteRange,
+    /// The individual object type in that union.
+    pub branch: ByteRange,
+}
+
 /// Syntactic evidence held by one name binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticBindingKind {
@@ -546,6 +557,8 @@ pub struct StaticFactsParts {
     pub object_members: Vec<(ByteRange, ByteRange)>,
     /// Members written in an ECMAScript object literal, type literal or class.
     pub body_members: Vec<StaticBodyMember>,
+    /// Object branches of unions in wrapped aliases and callable return types.
+    pub typescript_union_branches: Vec<StaticTypeUnionBranch>,
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
@@ -922,6 +935,12 @@ impl StaticFacts {
         &self.0.body_members
     }
 
+    /// Returns the authored object branches of wrapped alias and callable return unions.
+    #[must_use]
+    pub fn typescript_union_branches(&self) -> &[StaticTypeUnionBranch] {
+        &self.0.typescript_union_branches
+    }
+
     /// What each `return` of a function returns: the object literal, or none.
     #[must_use]
     pub fn returned_objects(&self) -> &[(ByteRange, Option<ByteRange>)] {
@@ -1135,6 +1154,7 @@ impl StaticFacts {
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
             vector_capacity(&self.0.body_members),
+            vector_capacity(&self.0.typescript_union_branches),
             vector_capacity(&self.0.returned_objects),
             vector_capacity(&self.0.returned_branch_objects),
             vector_capacity(&self.0.spread_values),
@@ -1230,6 +1250,7 @@ impl StaticFacts {
             self.element_returns().len(),
             self.object_members().len(),
             self.body_members().len(),
+            self.typescript_union_branches().len(),
             self.returned_objects().len(),
             self.returned_branch_objects().len(),
             self.spread_values().len(),
@@ -1461,6 +1482,13 @@ impl StaticFacts {
                 valid(row.member)
                     && contains(row.body, row.member)
                     && contains(row.holder, row.body)
+            })
+            && self.typescript_union_branches().iter().all(|row| {
+                valid(row.branch)
+                    && row.owner != row.union
+                    && row.union != row.branch
+                    && contains(row.owner, row.union)
+                    && contains(row.union, row.branch)
             })
             && self
                 .returned_objects()
@@ -1990,6 +2018,78 @@ mod rust_local_read_tests {
             earlier.rust_local_reference_start(source),
             earlier.references().len()
         );
+    }
+}
+
+#[cfg(test)]
+mod typescript_union_branch_tests {
+    use super::{StaticFacts, StaticFactsParts};
+    use crate::{ByteRange, SyntaxLimits, SyntaxProvider, SyntaxSource, TypeScriptDialect};
+
+    #[test]
+    fn test_typescript_union_branch_facts_restore_written_owner_union_and_branch() {
+        const SOURCE: &str = concat!(
+            "type Direct = { prior: number } | { prior: string };\n",
+            "type Wrapped = Promise<{ value: number } | { value: string }>;\n",
+            "declare function read(): { result: number } | { result: string };\n",
+            "declare function accept(input: { other: number } | { other: string }): void;\n",
+        );
+        let path = rift_core::ProjectPath::new("reader.d.ts").expect("source path");
+        let limits = SyntaxLimits::default();
+        let doc = TypeScriptDialect::TypeScript
+            .provider()
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: SOURCE,
+                },
+                limits,
+            )
+            .expect("authored union types");
+        let captured = doc.facts().static_facts().expect("captured branches");
+        let rows = captured.typescript_union_branches();
+        let written = |range: ByteRange| {
+            let start = usize::try_from(range.start).expect("source start");
+            let end = usize::try_from(range.end).expect("source end");
+            SOURCE.get(start..end).expect("written type range")
+        };
+        assert_eq!(rows.len(), 4);
+        for (same_union, prefix, names) in [
+            (
+                &rows[..2],
+                "type Wrapped",
+                ["{ value: number }", "{ value: string }"],
+            ),
+            (
+                &rows[2..],
+                "function read()",
+                ["{ result: number }", "{ result: string }"],
+            ),
+        ] {
+            assert!(written(same_union[0].owner).starts_with(prefix));
+            assert_eq!(same_union[0].owner, same_union[1].owner);
+            assert_eq!(same_union[0].union, same_union[1].union);
+            assert_eq!(
+                written(same_union[0].union),
+                format!("{} | {}", names[0], names[1])
+            );
+            assert_eq!(
+                [written(same_union[0].branch), written(same_union[1].branch)],
+                names
+            );
+        }
+        let restored = StaticFacts::from_parts(SOURCE, limits, captured.0.clone())
+            .expect("restore checked union spans");
+        assert_eq!(&restored, captured);
+        let mut earlier = captured.0.clone();
+        earlier.typescript_union_branches = StaticFactsParts::default().typescript_union_branches;
+        let prior =
+            StaticFacts::from_parts(SOURCE, limits, earlier).expect("earlier facts restore");
+        assert!(prior.typescript_union_branches().is_empty());
+        assert_eq!(prior.body_members(), captured.body_members());
+        let mut invalid = captured.0.clone();
+        invalid.typescript_union_branches[0].owner = invalid.typescript_union_branches[0].branch;
+        assert!(StaticFacts::from_parts(SOURCE, limits, invalid).is_err());
     }
 }
 
