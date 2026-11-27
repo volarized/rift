@@ -4880,6 +4880,102 @@ fn rust_captured_predicate_keeps_scope_across_inactive_outer_globs() {
     }
 }
 
+#[test]
+fn rust_captured_predicate_keeps_scope_after_a_checked_ordinary_sibling_glob() {
+    let root = format!("{GUARDED_MACRO} pub mod branch; pub mod direct;");
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let forwarded = format!(
+        r#"{GUARDED_CHILD}
+        select! {{
+            #![feature = "checked"]
+            use crate::direct::preserved;
+            struct Marker;
+            impl Marker {{}}
+        }}"#
+    );
+    let conflict = format!(
+        "{GUARDED_CHILD} macro_rules! select {{ ($($rest:tt)*) => {{}} }} pub(crate) use select;"
+    );
+    let opaque = format!("{GUARDED_CHILD} unknown! {{}}");
+    let ambiguous = "pub mod chosen; pub mod chosen; pub use self::chosen::*;";
+    for (label, prefix, child, expected) in [
+        (
+            "direct positive",
+            "pub mod chosen; pub use self::chosen::*;",
+            GUARDED_CHILD,
+            true,
+        ),
+        (
+            "checked child invocation",
+            "pub mod chosen; pub use self::chosen::*;",
+            forwarded.as_str(),
+            true,
+        ),
+        (
+            "active selected declaration",
+            "#[cfg(feature=\"checked\")] pub mod chosen; pub use self::chosen::*;",
+            GUARDED_CHILD,
+            true,
+        ),
+        (
+            "inactive target",
+            "#[cfg(feature=\"off\")] pub mod chosen; pub use self::chosen::*;",
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "uncertain target",
+            "#[cfg(version(\"1.88\"))] pub mod chosen; pub use self::chosen::*;",
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "unqualified route",
+            "pub mod chosen; pub use chosen::*;",
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "missing declaration",
+            "pub use self::chosen::*;",
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "later declaration",
+            "pub use self::chosen::*; pub mod chosen;",
+            GUARDED_CHILD,
+            false,
+        ),
+        ("ambiguous declaration", ambiguous, GUARDED_CHILD, false),
+        (
+            "competing macro",
+            "pub mod chosen; pub use self::chosen::*;",
+            conflict.as_str(),
+            false,
+        ),
+        (
+            "opaque child macro",
+            "pub mod chosen; pub use self::chosen::*;",
+            opaque.as_str(),
+            false,
+        ),
+    ] {
+        let branch = format!("{prefix} {next}");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", child),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,

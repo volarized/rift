@@ -251,7 +251,7 @@ impl<'a> Tokens<'a> {
     pub(super) fn outward_bindings(
         &self,
         child: &SelectedFile<'_>,
-        name: &str,
+        name: Option<&str>,
         scope: &Scope,
         library: bool,
     ) -> Option<BTreeSet<String>> {
@@ -266,7 +266,7 @@ impl<'a> Tokens<'a> {
             if self.inert_item(range) {
                 continue;
             }
-            if super::invocation_name(child.source, range) == Some(name) {
+            if name.is_some() && super::invocation_name(child.source, range) == name {
                 let body = super::chain::invocation_body(&input)?;
                 let (predicate, body) = super::chain::captured_predicate_body(body)?;
                 self.charge(predicate.len().checked_mul(self.depth)?)?;
@@ -278,7 +278,7 @@ impl<'a> Tokens<'a> {
                 self.outward_item(&input, scope, library, &mut bindings)?;
             }
         }
-        (!bindings.contains(name)).then_some(bindings)
+        (!name.is_some_and(|name| bindings.contains(name))).then_some(bindings)
     }
 
     fn outward_item(
@@ -321,7 +321,7 @@ impl<'a> Tokens<'a> {
         }
     }
 
-    fn charge(&self, count: usize) -> Option<()> {
+    pub(super) fn charge(&self, count: usize) -> Option<()> {
         let work = self.work.get().checked_add(count)?;
         if work > self.work_max {
             return None;
@@ -379,7 +379,7 @@ impl<'a> Tokens<'a> {
         self.configured_item(range, configuration).is_some()
     }
 
-    fn configured_item(
+    pub(super) fn configured_item(
         &self,
         range: ByteRange,
         configuration: Option<&Configuration<'_>>,

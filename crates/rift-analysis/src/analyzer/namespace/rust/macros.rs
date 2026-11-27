@@ -1064,7 +1064,13 @@ pub(super) fn children<'a>(
                             )
                         })
                     && configuration.admitted(file.syntax, file.source, range) == Some(true);
-                context.item(file, range, tokens.as_ref(), &mut scope, exports);
+                context.item(
+                    (file, &configuration),
+                    range,
+                    (tokens.as_ref(), ordinary),
+                    &mut scope,
+                    exports,
+                );
                 if registry_import && scope.complete {
                     scope.registry_cfg_if = true;
                 }
@@ -1226,7 +1232,7 @@ impl Context<'_, '_> {
             if globs.contains(*module) {
                 let configuration = self.configurations.file(child.path.as_str());
                 let tokens = scope::Tokens::with_capture(child, Some(name), Some(&configuration))?;
-                bindings.extend(tokens.outward_bindings(child, name, scope, self.library)?);
+                bindings.extend(tokens.outward_bindings(child, Some(name), scope, self.library)?);
             }
         }
         if !globs.is_empty() && bindings.contains(name) {
@@ -1237,6 +1243,115 @@ impl Context<'_, '_> {
             inherited.insert(binding, false);
         }
         Some(inherited)
+    }
+
+    fn ordinary_sibling_glob(
+        &self,
+        (file, configuration): (&SelectedFile<'_>, &super::configuration::Configuration<'_>),
+        ordinary: &[super::ChildModulePath],
+        (range, mut input): (ByteRange, &[&str]),
+        tokens: &scope::Tokens<'_>,
+        scope: &mut Scope,
+    ) -> Option<()> {
+        if !scope.complete {
+            return None;
+        }
+        scope::visibility(&mut input)?;
+        let ["use", "self", ":", ":", module, ":", ":", "*", ";"] = input else {
+            return None;
+        };
+        if tokens.configured_item(range, Some(configuration)) != Some(true)
+            || !self.outline_keeps_macro_scope(file)
+        {
+            return None;
+        }
+        let child =
+            self.ordinary_glob_target((file, configuration), ordinary, range, module, tokens)?;
+        let child_configuration = self.configurations.file(child.path.as_str());
+        let invocations = child.syntax.macro_invocations()?;
+        let mut selected = None;
+        for (invocation, _, items) in invocations {
+            items.as_ref()?;
+            let name = invocation_name(child.source, *invocation)?;
+            if selected.is_some_and(|prior| prior != name) {
+                return None;
+            }
+            selected = Some(name);
+        }
+        let child_tokens =
+            scope::Tokens::with_capture(child, selected, Some(&child_configuration))?;
+        if let Some(name) = selected {
+            for (invocation, _, _) in invocations {
+                let original = child_tokens.range(*invocation)?;
+                let body = chain::invocation_body(&original)?;
+                let (predicate, _) = chain::captured_predicate_body(body)?;
+                child_tokens.charge(predicate.len().checked_mul(self.depth_max)?)?;
+                child_configuration.condition(predicate)?;
+                // The definition and original selected predicate must be checked.
+                // The complete outward pass below checks the admitted item effects.
+                self.chain(
+                    *invocation,
+                    name,
+                    scope,
+                    &child_tokens,
+                    (child, &child_configuration),
+                )?;
+            }
+        }
+        let bindings = child_tokens.outward_bindings(child, selected, scope, self.library)?;
+        if bindings.iter().any(|name| {
+            scope.definition(name).is_some()
+                || scope.get(name) == Some(&true)
+                || (name == "cfg_if" && scope.registry_cfg_if)
+        }) {
+            return None;
+        }
+        for name in bindings {
+            scope.insert(name, false);
+        }
+        Some(())
+    }
+
+    fn ordinary_glob_target<'a>(
+        &'a self,
+        (file, configuration): (&SelectedFile<'_>, &super::configuration::Configuration<'_>),
+        ordinary: &[super::ChildModulePath],
+        occurrence: ByteRange,
+        name: &str,
+        tokens: &scope::Tokens<'_>,
+    ) -> Option<&'a SelectedFile<'a>> {
+        let symbols = file.syntax.symbols();
+        tokens.charge(symbols.len().checked_add(ordinary.len())?)?;
+        let mut selected = None;
+        for symbol in symbols.iter().filter(|symbol| {
+            symbol.container.is_none() && symbol.kind == "module" && symbol.name == name
+        }) {
+            match configuration.admitted(file.syntax, file.source, symbol.item_range)? {
+                false => {}
+                true if selected.is_none() && symbol.item_range.end <= occurrence.start => {
+                    selected = Some(symbol);
+                }
+                true => return None,
+            }
+        }
+        let symbol = selected?;
+        if symbol.syntax_element_kind != Some("mod_item")
+            || symbol.body_range.is_some()
+            || !super::module_has_default_path(symbol)
+            || macro_use(tokens, symbol, self.library, self.depth_max) != Some(false)
+        {
+            return None;
+        }
+        let mut targets = ordinary
+            .iter()
+            .filter(|(_, local, item)| *item == symbol.item_range && local.as_slice() == [name]);
+        let (path, _, _) = targets.next()?;
+        if targets.next().is_some() {
+            return None;
+        }
+        let child = self.inventory.get(path.as_str())?;
+        tokens.charge(child.source.len())?;
+        self.outline_keeps_macro_scope(child).then_some(child)
     }
 
     fn outline_keeps_macro_scope(&self, file: &SelectedFile<'_>) -> bool {
@@ -1332,9 +1447,9 @@ impl Context<'_, '_> {
 
     fn item(
         &self,
-        file: &SelectedFile<'_>,
+        (file, configuration): (&SelectedFile<'_>, &super::configuration::Configuration<'_>),
         range: ByteRange,
-        tokens: Option<&scope::Tokens<'_>>,
+        (tokens, ordinary): (Option<&scope::Tokens<'_>>, &[super::ChildModulePath]),
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
@@ -1346,6 +1461,18 @@ impl Context<'_, '_> {
         if let Some(tokens) = tokens
             && let Some(item) = tokens.range(range)
         {
+            if self
+                .ordinary_sibling_glob(
+                    (file, configuration),
+                    ordinary,
+                    (range, &item),
+                    tokens,
+                    scope,
+                )
+                .is_some()
+            {
+                return;
+            }
             let mut requested = Vec::new();
             if tokens
                 .public_imports(&item, true, &mut |range, name, target, visibility| {
