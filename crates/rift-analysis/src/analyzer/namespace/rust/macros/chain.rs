@@ -189,12 +189,17 @@ pub(super) fn captured_predicate_modules<'a>(
     }
     let selection = selected(predicate);
     let mut modules = Vec::new();
-    branch_modules(body, depth, |name| {
+    let only_outlines = branch_modules(body, depth, |name| {
         if selection == Some(true) {
             modules.push((name, predicate.to_vec()));
         }
     })?;
-    Some((modules, selection == Some(false)))
+    let scope_unchanged = match selection {
+        Some(true) => only_outlines,
+        Some(false) => true,
+        None => false,
+    };
+    Some((modules, scope_unchanged))
 }
 
 fn invocation_body<'tokens, 'source>(
@@ -263,13 +268,15 @@ fn condition<'a>(metas: &[&[&'a str]], previous: &[&[&'a str]]) -> Vec<&'a str> 
     condition
 }
 
-/// Names of the plain `[visibility] mod name;` items of one branch. Any other item is
-/// allowed and declares no module; a branch whose items do not split refuses the chain.
+/// Names of the plain `[visibility] mod name;` items of one branch. Reports whether
+/// every item is an outline module with a distinct name. Incomplete item lists refuse.
 fn branch_modules<'a>(
     items: &[&'a str],
     depth: usize,
     mut module: impl FnMut(&'a str),
-) -> Option<()> {
+) -> Option<bool> {
+    let mut distinct = std::collections::BTreeSet::new();
+    let mut only_outlines = true;
     super::scope::items(items, depth, |item| {
         let mut input = item;
         if super::scope::visibility(&mut input).is_some()
@@ -277,10 +284,14 @@ fn branch_modules<'a>(
             && let [name, ";"] = input
             && super::super::source_identifier(name).as_deref() == Some(*name)
         {
+            only_outlines &= distinct.insert(*name);
             module(name);
+        } else {
+            only_outlines = false;
         }
         Some(())
-    })
+    })?;
+    Some(only_outlines)
 }
 
 #[cfg(test)]

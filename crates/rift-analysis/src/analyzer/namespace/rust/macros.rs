@@ -6,7 +6,7 @@ mod scope;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rift_syntax::{ByteRange, SyntaxSymbol};
+use rift_syntax::{ByteRange, RustQuery, SyntaxSymbol};
 
 use super::super::SelectedFile;
 
@@ -1184,15 +1184,53 @@ impl Context<'_, '_> {
         let Some((modules, scope_unchanged)) = modules else {
             return false;
         };
-        let mut incomplete = scope.clone();
-        incomplete.clear();
+        let unchanged = scope_unchanged
+            && modules.iter().all(|(module, _)| {
+                child_path(module, directory, self.inventory)
+                    .and_then(|path| self.inventory.get(path.as_str()))
+                    .is_some_and(|child| self.outline_keeps_macro_scope(child))
+            });
+        let mut inherited = scope.clone();
+        if !unchanged {
+            inherited.clear();
+        }
         for (module, condition) in modules {
             if let Some(path) = child_path(module, directory, self.inventory) {
-                children.push((path.clone(), vec![module.to_owned()], incomplete.clone()));
+                children.push((path.clone(), vec![module.to_owned()], inherited.clone()));
                 conditioned.push((path, condition));
             }
         }
-        scope_unchanged
+        unchanged
+    }
+
+    fn outline_keeps_macro_scope(&self, file: &SelectedFile<'_>) -> bool {
+        if self.originals.get(file.path.as_str()).copied() != Some(file.source)
+            || file.syntax.has_errors()
+            || file.syntax.left_out_declaration_count() != 0
+        {
+            return false;
+        }
+        let Some(limits) = file.syntax.syntax_limits() else {
+            return false;
+        };
+        // The module's own inner attributes can introduce outer macro bindings even
+        // though its written outline has neither an attribute nor a changed path.
+        RustQuery::new("(source_file (inner_attribute_item) @attribute)")
+            .and_then(|query| query.captures(file.source, limits.syntax_elements_max()))
+            .is_ok_and(|attributes| {
+                attributes.into_iter().all(|capture| {
+                    chain::token_texts(file.source, capture.range, limits).is_some_and(|tokens| {
+                        let ["#", "!", "[", attribute @ .., "]"] = tokens.as_slice() else {
+                            return false;
+                        };
+                        cfg_attribute(attribute)
+                            || matches!(
+                                attribute,
+                                ["doc" | "allow" | "warn" | "deny" | "forbid" | "expect", ..]
+                            )
+                    })
+                })
+            })
     }
 
     /// The modules of an invocation of `name` when its definition in scope is the
