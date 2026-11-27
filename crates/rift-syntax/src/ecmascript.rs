@@ -89,7 +89,7 @@ mod overload_parameters;
 pub(crate) mod recovery;
 mod scoped_function_parameters;
 mod shorthand_parameters;
-mod type_parameters;
+pub(crate) mod type_parameters;
 mod type_signature_parameters;
 mod variance;
 mod wrapped_parameters;
@@ -250,6 +250,7 @@ pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_funct
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
 pub(crate) const FUNCTION_TYPE_PARAMETER_KIND: &str = "typescript_function_type_parameter";
 pub(crate) const SIGNATURE_TYPE_PARAMETER_KIND: &str = "typescript_signature_type_parameter";
+pub(crate) const INFERENCE_PARAMETER_KIND: &str = "typescript_inference_type_parameter";
 pub(crate) const DECLARED_SIGNATURE_TYPE_PARAMETER_KIND: &str =
     "typescript_declared_signature_type_parameter";
 pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_parameter";
@@ -1661,6 +1662,10 @@ impl EcmaScriptRules<'_> {
                     .map(|name| (name, DECLARED_SIGNATURE_TYPE_PARAMETER_KIND))
             })
             .or_else(|| {
+                type_parameters::inferred_name_and_branch(visited.syntax_element())
+                    .map(|(name, _)| (name, INFERENCE_PARAMETER_KIND))
+            })
+            .or_else(|| {
                 type_signature_parameters::callable_parameter_name(visited)
                     .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
             })
@@ -1706,6 +1711,7 @@ impl EcmaScriptRules<'_> {
                 | FUNCTION_TYPE_PARAMETER_KIND
                 | SIGNATURE_TYPE_PARAMETER_KIND
                 | DECLARED_SIGNATURE_TYPE_PARAMETER_KIND
+                | INFERENCE_PARAMETER_KIND
         );
         if !name.is_ascii() || name.contains('\\') || (!type_parameter && name == "this") {
             return None;
@@ -1996,6 +2002,9 @@ impl GrammarRules for EcmaScriptRules<'_> {
         let named_by_itself = syntax_element.kind_id() == self.kinds.identifier
             || syntax_element.kind_id() == self.kinds.shorthand_property_identifier_pattern
             || syntax_element.kind_id() == self.kinds.property_identifier;
+        if let Some((name, _)) = type_parameters::inferred_name_and_branch(syntax_element) {
+            return extract::byte_range(name).map(Some);
+        }
         if named_by_itself {
             return extract::byte_range(syntax_element).map(Some);
         }
@@ -2447,6 +2456,7 @@ fn append_package_parameters(
         function_types,
         signature_types,
         declared_signature_types,
+        inferred_types,
         typed_patterns,
     } = candidates;
     let scoped = if language.name == "typescript" {
@@ -2511,6 +2521,7 @@ fn append_package_parameters(
         "$declared-signature",
         type_parameters::declared_signature,
     );
+    type_signature_parameters::append_inferred_parameters(symbols, &inferred_types, facts);
     checked_parameters::append_under_named_owner(
         symbols,
         typed_patterns,
@@ -2530,6 +2541,7 @@ struct ParameterDeclarations {
     function_types: Vec<crate::SyntaxSymbol>,
     signature_types: Vec<crate::SyntaxSymbol>,
     declared_signature_types: Vec<crate::SyntaxSymbol>,
+    inferred_types: Vec<crate::SyntaxSymbol>,
     typed_patterns: Vec<crate::SyntaxSymbol>,
     method_types: Vec<crate::SyntaxSymbol>,
 }
@@ -2556,6 +2568,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.signature_types
         } else if symbol.is_typescript_declared_signature_type_parameter() {
             &mut candidates.declared_signature_types
+        } else if symbol.is_typescript_inference_parameter() {
+            &mut candidates.inferred_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut candidates.typed_patterns
         } else {
@@ -2728,6 +2742,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == DECLARED_SIGNATURE_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(DECLARED_SIGNATURE_TYPE_PARAMETER_KIND);
+    }
+    if name == INFERENCE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(INFERENCE_PARAMETER_KIND);
     }
     if name == TYPED_DESTRUCTURED_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPED_DESTRUCTURED_PARAMETER_KIND);

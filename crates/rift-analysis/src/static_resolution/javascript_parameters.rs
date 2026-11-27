@@ -35,10 +35,11 @@ pub(super) enum ScopedParameterReads {
     JavaScriptCallbackPattern,
     TypeScriptSignatureType,
     TypeScriptDeclaredSignatureType,
+    TypeScriptInference,
 }
 
 impl ScopedParameterReads {
-    pub(super) const COUNT: usize = Self::TypeScriptDeclaredSignatureType as usize + 1;
+    pub(super) const COUNT: usize = Self::TypeScriptInference as usize + 1;
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -120,7 +121,8 @@ impl<'source> Index<'source> {
             | ScopedParameterReads::TypeScriptFunctionType
             | ScopedParameterReads::TypeScriptDestructured
             | ScopedParameterReads::TypeScriptSignatureType
-            | ScopedParameterReads::TypeScriptDeclaredSignatureType => {
+            | ScopedParameterReads::TypeScriptDeclaredSignatureType
+            | ScopedParameterReads::TypeScriptInference => {
                 self.checked_parameter_uses(file, class, work, result);
                 return;
             }
@@ -188,6 +190,11 @@ impl<'source> Index<'source> {
                 &file.typescript_declared_signature_type_parameters,
                 &mut result.deferred_typescript_declared_signature_type_parameters,
             ),
+            ScopedParameterReads::TypeScriptInference => (
+                ReferenceRole::Type,
+                &file.typescript_inference_parameters,
+                &mut result.deferred_typescript_inference_parameters,
+            ),
             _ => return,
         };
         for reference in file.facts.references() {
@@ -239,13 +246,20 @@ impl<'source> Index<'source> {
         } else {
             file.qualified_target(container)?
         };
-        let scope_matches = if symbol.is_typescript_signature_type_parameter() {
+        let inferred = symbol.is_typescript_inference_parameter();
+        let scope_matches = if inferred || symbol.is_typescript_signature_type_parameter() {
             owner.symbol.item_range.encloses(binding.scope)
                 && binding.scope.encloses(symbol.item_range)
         } else {
             binding.scope == owner.symbol.item_range
         };
-        if binding.kind != StaticBindingKind::Shadow
+        let expected = if inferred {
+            StaticBindingKind::TypeScriptInference
+        } else {
+            StaticBindingKind::Shadow
+        };
+        if binding.kind != expected
+            || (inferred && binding.available_from > range.start)
             || !scope_matches
             || !binding.scope.encloses(range)
             || (role == ReferenceRole::Read && !owner.symbol.body_range?.encloses(range))

@@ -1631,6 +1631,9 @@ pub(super) fn js_binding<'source>(
         position,
         work,
         |binding| {
+            if binding.kind == StaticBindingKind::TypeScriptInference {
+                return role == ReferenceRole::Type && binding.available_from <= position;
+            }
             // A type a documentation comment imports names no value.
             if role != rift_core::ReferenceRole::Type
                 && matches!(binding.kind, StaticBindingKind::JavaScriptTypeImport { .. })

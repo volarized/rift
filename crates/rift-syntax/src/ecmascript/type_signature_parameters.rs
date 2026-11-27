@@ -94,6 +94,67 @@ pub(super) fn append_generic_parameters(
     });
 }
 
+pub(super) fn append_inferred_parameters(
+    symbols: &mut Vec<SyntaxSymbol>,
+    parameters: &[SyntaxSymbol],
+    facts: &StaticFacts,
+) {
+    if parameters.is_empty() {
+        return;
+    }
+    let bindings = facts
+        .bindings()
+        .iter()
+        .filter(|binding| binding.kind == StaticBindingKind::TypeScriptInference)
+        .map(|binding| (binding.name, (binding.available_from, binding.scope)))
+        .collect::<BTreeMap<_, _>>();
+    let mut counts = BTreeMap::new();
+    let mut placed = BTreeMap::<&str, Vec<ByteRange>>::new();
+    for symbol in symbols
+        .iter()
+        .filter(|symbol| !symbol.is_ecmascript_package_binding())
+    {
+        placed
+            .entry(&symbol.qualified_name)
+            .or_default()
+            .push(symbol.item_range);
+    }
+    for parameter in parameters {
+        if let Some((branch, _)) = parameter.name_range.and_then(|name| bindings.get(&name)) {
+            *counts
+                .entry((*branch, parameter.name.as_str()))
+                .or_insert(0_usize) += 1;
+        }
+    }
+    let parameters = parameters
+        .iter()
+        .filter_map(|parameter| {
+            let (branch, scope) = bindings.get(&parameter.name_range?)?;
+            if counts.get(&(*branch, parameter.name.as_str())) != Some(&1) {
+                return None;
+            }
+            let mut owner = parameter.container.as_deref()?;
+            loop {
+                if placed.get(owner).is_some_and(|ranges| {
+                    ranges
+                        .iter()
+                        .filter(|region| region.encloses(*scope))
+                        .count()
+                        == 1
+                }) {
+                    let mut placed = parameter.clone();
+                    placed.container = Some(owner.to_owned());
+                    return Some(placed);
+                }
+                owner = owner.rsplit_once('.')?.0;
+            }
+        })
+        .collect();
+    append_scoped(symbols, parameters, "$conditional", |name| {
+        bindings.get(&name).map(|(_, scope)| *scope)
+    });
+}
+
 /// Name written in an index signature. A mapped type names its parameter in a separate rule.
 pub(super) fn index_parameter_name<'tree>(visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
     index_name(visited.syntax_element())

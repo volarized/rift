@@ -292,6 +292,7 @@ impl SyntaxSymbol {
             || self.is_typescript_function_type_parameter()
             || self.is_typescript_signature_type_parameter()
             || self.is_typescript_declared_signature_type_parameter()
+            || self.is_typescript_inference_parameter()
     }
 
     /// Whether this is the written type parameter of a TypeScript method.
@@ -316,6 +317,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_typescript_declared_signature_type_parameter(&self) -> bool {
         self.kind == crate::ecmascript::DECLARED_SIGNATURE_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this is an authored inference name in a TypeScript conditional type.
+    #[must_use]
+    pub fn is_typescript_inference_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::INFERENCE_PARAMETER_KIND
     }
 
     /// Whether a checked local macro emits a method at this written name.

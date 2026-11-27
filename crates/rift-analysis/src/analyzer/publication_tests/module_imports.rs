@@ -5261,3 +5261,97 @@ fn typescript_declared_function_type_parameters_keep_physical_signature_uses() {
             .all(|row| row.source != "U" || row.unit != *index)
     );
 }
+
+#[test]
+fn typescript_inferred_names_only_bind_their_checked_true_branches() {
+    const SOURCE: &str = concat!(
+        "export type Result = string;\n",
+        "export interface Kept<Value> { value: Value }\n",
+        "export type ValueOf<T> = T extends { value: infer Value } ? Value : never;\n",
+        "export type ItemOf<T> = T extends [infer Item, ...unknown[]] ? Item : never;\n",
+        "export type Read<T> = T extends { read(): infer Result } ? Result : Result;\n",
+        "export type Nested<T> = T extends [infer Item] ? (Item extends { value: infer Item } ? Item : Item) : never;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("complete package declaration");
+    let found = result.publication();
+    found.validate_facts().expect("checked conditional types");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("physical declaration")
+        .unit;
+    let declaration = |prefix: &str, name: &str| {
+        let begin = SOURCE.find(prefix).expect("written prefix") + prefix.len();
+        found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == *unit
+                    && row.source == name
+                    && row.range == module_runtime_range(begin, name)
+            })
+            .unwrap_or_else(|| panic!("written inference {prefix}{name} at {begin}"))
+    };
+    let edges = |row: &rift_protocol::index::PackageSymbol| {
+        found
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let site = edge.occurrence.as_ref()?;
+                (edge.to == row.symbol && edge.kinds == [EdgeKind::HasType] && site.unit == *unit)
+                    .then_some((site.range.start, site.range.end))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let written_use = |prefix: &str, name: &str| {
+        let begin = SOURCE.find(prefix).expect("written use") + prefix.len();
+        let range = module_runtime_range(begin, name);
+        (range.start, range.end)
+    };
+    for (decl, usage, name) in [
+        ("value: infer ", "infer Value } ? ", "Value"),
+        ("extends [infer ", "infer Item, ...unknown[]] ? ", "Item"),
+        ("read(): infer ", "infer Result } ? ", "Result"),
+    ] {
+        assert_eq!(
+            edges(declaration(decl, name)),
+            BTreeSet::from([written_use(usage, name)])
+        );
+    }
+    let ordinary = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/beacon/Result"))
+        .expect("outer type alias");
+    assert!(edges(ordinary).contains(&written_use("infer Result } ? Result : ", "Result")));
+    let outer = declaration("export type Nested<T> = T extends [infer ", "Item");
+    let inner = declaration("(Item extends { value: infer ", "Item");
+    assert_ne!(outer.symbol, inner.symbol);
+    assert_eq!(
+        edges(outer),
+        BTreeSet::from([
+            written_use("Nested<T> = T extends [infer Item] ? (", "Item"),
+            written_use("value: infer Item } ? Item : ", "Item"),
+        ])
+    );
+    assert_eq!(
+        edges(inner),
+        BTreeSet::from([written_use("value: infer Item } ? ", "Item")])
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/Kept/Value"))
+    );
+}

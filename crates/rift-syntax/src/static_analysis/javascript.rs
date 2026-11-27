@@ -30,6 +30,7 @@ pub(super) struct Kinds {
     type_identifier: Option<u16>,
     nested_type: Option<u16>,
     type_parameter: Option<u16>,
+    infer: Option<u16>,
     type_shapes: Option<TypeShapeKinds>,
     annotation: Option<u16>,
     asserted: Option<u16>,
@@ -285,6 +286,7 @@ impl Kinds {
             type_identifier: typescript.then(|| id("type_identifier")),
             nested_type: typescript.then(|| id("nested_type_identifier")),
             type_parameter: typescript.then(|| id("type_parameter")),
+            infer: typescript.then(|| id("infer_type")),
             type_shapes: typescript.then(|| TypeShapeKinds::resolve(grammar)),
             annotation: typescript.then(|| id("type_annotation")),
             asserted: typescript.then(|| id("as_expression")),
@@ -397,6 +399,21 @@ impl Kinds {
             self.record_variable(visited, source, facts)?;
         } else if self.type_parameter == Some(id) {
             self.record_type_parameter(visited, facts)?;
+        } else if self.infer == Some(id)
+            && let Some((name, branch)) =
+                crate::ecmascript::type_parameters::inferred_name_and_branch(syntax_element)
+        {
+            let name = byte_range(name)?;
+            let branch = byte_range(branch)?;
+            facts.bindings.push(StaticBinding {
+                name,
+                scope: ByteRange {
+                    start: name.start,
+                    end: branch.end,
+                },
+                available_from: branch.start,
+                kind: StaticBindingKind::TypeScriptInference,
+            });
         } else if self.function.contains(&id) || id == self.class || self.edge_types.contains(&id) {
             self.record_declaration(visited, source, facts)?;
         } else if id == self.import_specifier || self.is_default_import(visited) {
@@ -1556,10 +1573,11 @@ impl Kinds {
         } else if self.type_identifier == Some(id) || self.nested_type == Some(id) {
             let parent = visited.parent().map(Visited::syntax_element);
             let declared = parent.is_some_and(|parent| {
-                parent.child_by_field_id(self.name) == Some(element)
-                    && (self.edge_types.contains(&parent.kind_id())
-                        || parent.kind_id() == self.class
-                        || self.type_parameter == Some(parent.kind_id()))
+                (self.infer == Some(parent.kind_id()) && parent.named_child(0) == Some(element))
+                    || (parent.child_by_field_id(self.name) == Some(element)
+                        && (self.edge_types.contains(&parent.kind_id())
+                            || parent.kind_id() == self.class
+                            || self.type_parameter == Some(parent.kind_id())))
             });
             let nested = parent.is_some_and(|parent| self.nested_type == Some(parent.kind_id()));
             if !declared && !nested {
