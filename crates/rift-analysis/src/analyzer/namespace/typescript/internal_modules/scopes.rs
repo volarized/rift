@@ -1038,7 +1038,30 @@ impl<'source> LiteralOwners<'source> {
         anchors: &BTreeMap<String, SymbolId>,
         source: &str,
     ) -> Self {
-        let functions = literal_callable_owners(symbols, facts, anchors);
+        let receiver_scopes = facts
+            .function_scopes()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let values = facts
+            .function_values()
+            .iter()
+            .filter(|(function, _)| !receiver_scopes.contains(function))
+            .map(|&(function, value)| (value, function))
+            .collect::<BTreeMap<_, _>>();
+        let functions = literal_callable_owners(symbols, facts, anchors, &values);
+        let mut initializers = BTreeMap::new();
+        for function in functions
+            .values()
+            .filter(|owner| owner.syntax_element_kind == Some("variable_declarator"))
+        {
+            if let Some(range) = function.body_range.and_then(|value| values.get(&value)) {
+                initializers
+                    .entry(*range)
+                    .and_modify(|owner| *owner = None)
+                    .or_insert(Some(*function));
+            }
+        }
         let enclosing = EnclosingDefinitions::new(
             symbols
                 .iter()
@@ -1060,7 +1083,10 @@ impl<'source> LiteralOwners<'source> {
                         .copied()
                         .chain(facts.function_values().iter().map(|&(scope, _)| scope))
                         .chain(facts.static_blocks().iter().copied())
-                        .map(|scope| (scope.start, scope.end, (scope, None))),
+                        .map(|scope| {
+                            let owner = initializers.get(&scope).copied().flatten();
+                            (scope.start, scope.end, (scope, owner))
+                        }),
                 ),
         );
         let mut calls = BTreeMap::<u64, Vec<_>>::new();
@@ -1145,11 +1171,12 @@ impl<'source> LiteralOwners<'source> {
     }
 }
 
-/// Names functions and class methods with one authored and placed declaration.
+/// Names callables with one authored and placed declaration.
 fn literal_callable_owners<'source>(
     symbols: &'source [SyntaxSymbol],
     facts: &StaticFacts,
     anchors: &BTreeMap<String, SymbolId>,
+    values: &BTreeMap<ByteRange, ByteRange>,
 ) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
     let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
     for symbol in symbols {
@@ -1179,6 +1206,12 @@ fn literal_callable_owners<'source>(
             anchors.contains_key(&symbol.qualified_name)
                 && match symbol.syntax_element_kind {
                     Some("function_declaration") => true,
+                    Some("variable_declarator") if symbol.kind == "variable" => {
+                        symbol.kinds.contains(&SymbolKind::Callable)
+                            && symbol.body_range.is_some_and(|value| {
+                                symbol.item_range.encloses(value) && values.contains_key(&value)
+                            })
+                    }
                     Some("method_definition") if symbol.kind == "method" => {
                         class_methods.get(&symbol.item_range).copied()
                             == symbol.container.as_deref()

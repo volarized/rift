@@ -3572,6 +3572,73 @@ fn scoped_call_initializers_keep_argument_properties_without_result_reads() {
 }
 
 #[test]
+fn non_entry_callable_initializers_keep_literal_argument_properties() {
+    const SOURCE: &str = concat!(
+        "function wrap(value) { return value; }\n",
+        "export function build(first) {\n",
+        "  const choose = (condition) => {\n",
+        "    wrap(condition ? { state: 'opaque' } : null);\n",
+        "    if (condition) return wrap({ state: 'one' });\n",
+        "    return wrap({ state: 'two' });\n",
+        "  };\n",
+        "  return choose(first);\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("authored argument properties");
+    let properties = ["state: 'one'", "state: 'two'"].map(|written| {
+        let start = SOURCE.find(written).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed callable argument property");
+        assert!(row.symbol.as_str().contains("/build/choose/state"));
+        assert!(!row.public);
+        row.symbol.clone()
+    });
+    assert_ne!(properties[0], properties[1]);
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| row.source != "state: 'opaque'")
+    );
+    for (from, to, written) in [
+        ("/choose", "/wrap", "wrap({ state: 'one' })"),
+        ("/choose", "/wrap", "wrap({ state: 'two' })"),
+        (
+            "/choose",
+            "/wrap",
+            "wrap(condition ? { state: 'opaque' } : null)",
+        ),
+        ("/build", "/choose", "choose(first)"),
+    ] {
+        let start = SOURCE.rfind(written).expect("written call");
+        assert!(found.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with(from)
+                && edge.to.as_str().ends_with(to)
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.range == module_runtime_range(start, written)
+                })
+        }));
+    }
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
 fn javascript_file_modules_keep_local_names_without_an_established_method() {
     const SOURCE: &str = concat!(
         "export const codec = flag\n",
