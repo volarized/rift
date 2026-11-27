@@ -77,6 +77,102 @@ fn checked_commonjs_export_object_values_keep_their_literal_imports() {
     }
 }
 
+#[test]
+fn typescript_selectors_reference_uniquely_imported_declarations() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const LEAF: &str =
+        "export interface Source { mode: string; }\nexport declare function prepare(): Source;\n";
+    const SOURCE: &str = concat!(
+        "import { Source as Local, prepare } from './leaf';\n",
+        "export { Local as Public, prepare };\n",
+        "export type { Local as Typed };\n"
+    );
+    let collect = |source| {
+        internal_modules::analyze(MANIFEST, &[("index.d.ts", source), ("leaf.d.ts", LEAF)])
+    };
+    let found = collect(SOURCE);
+    let publication = found.publication();
+    let source = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("original unit");
+    let complete_owner = publication
+        .declarations
+        .iter()
+        .find(|row| row.unit == source.unit && row.source_complete && row.source == SOURCE)
+        .expect("complete checked type entry");
+    let selectors = [
+        (
+            SOURCE.find("Local as Public").expect("renamed selector"),
+            "Local",
+            "/Source",
+        ),
+        (
+            SOURCE.find("prepare };").expect("value selector"),
+            "prepare",
+            "/prepare",
+        ),
+        (
+            SOURCE.find("Local as Typed").expect("type selector"),
+            "Local",
+            "/Source",
+        ),
+    ];
+    for (offset, name, target) in selectors {
+        let range = module_runtime_range(offset, name);
+        assert!(
+            publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds == [EdgeKind::References]
+                    && edge.from == complete_owner.symbol
+                    && edge.to.as_str().ends_with(target)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|occurrence| occurrence.unit == source.unit
+                            && occurrence.range == range)),
+            "missing imported selector {name}"
+        );
+    }
+    for (offset, name) in [
+        (SOURCE.find("Local").expect("written import"), "Local"),
+        (SOURCE.find("prepare").expect("named import"), "prepare"),
+    ] {
+        let range = module_runtime_range(offset, name);
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == source.unit && site.range == range)
+        }));
+    }
+    assert!(
+        publication
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Aliases]
+                && edge.from.as_str().ends_with("/Public")
+                && edge.to.as_str().ends_with("/Source"))
+    );
+    for source in [
+        "import { Source as Local } from './missing'; export { Local as Public };",
+        "import * as Local from './leaf'; export { Local as Public };",
+    ] {
+        let unresolved = collect(source);
+        assert!(
+            unresolved
+                .publication()
+                .edges
+                .iter()
+                .all(|edge| edge.kinds != [EdgeKind::References])
+        );
+    }
+}
+
 const NON_ENTRY_ARGUMENT_PROPERTIES: &str = r#"
 import { receive } from "../index.mjs";
 receive({ action: "first" });

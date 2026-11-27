@@ -141,6 +141,101 @@ impl<'source> Index<'source> {
         Some((occurrence, target.symbol))
     }
 
+    /// Retains selectors of already resolved relative imports after established edges.
+    pub(super) fn resolve_typescript_imported_export_selectors(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values().filter(|file| {
+            file.document.facts.language().name == "typescript"
+                && file.document.facts.declaration_syntax_complete()
+                && self.javascript_has_file_module(file)
+        }) {
+            for export in file.document.facts.export_bindings().unwrap_or_default() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if let Some(reference) =
+                    self.typescript_imported_export_selector(file, export, work)
+                {
+                    result.record(Some(reference));
+                }
+            }
+        }
+        result.typescript_imported_export_start =
+            (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn typescript_imported_export_selector(
+        &self,
+        file: &File<'source>,
+        export: &SyntaxExportBinding,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let range = export.local?;
+        if export.kind != SyntaxExportKind::Named
+            || export.source.is_some()
+            || export.container.is_some()
+            || !matches_export_form(file.text(export.range)?, ModuleMode::Esm)
+        {
+            return None;
+        }
+        let name = file.text(range)?;
+        let typed = js_binding(
+            file,
+            &self.javascript,
+            name,
+            range.start,
+            ReferenceRole::Type,
+            work,
+        );
+        let read = (!export.type_only)
+            .then(|| {
+                js_binding(
+                    file,
+                    &self.javascript,
+                    name,
+                    range.start,
+                    ReferenceRole::Read,
+                    work,
+                )
+            })
+            .flatten();
+        if typed.zip(read).is_some_and(|(typed, read)| typed != read) {
+            return None;
+        }
+        let binding = typed.or(read)?;
+        let StaticBindingKind::JavaScriptImport { module, .. } = binding.kind else {
+            return None;
+        };
+        let specifier = file.text(module)?;
+        if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+            return None;
+        }
+        let destination = self.javascript_specifier_file(file, module, false, work)?;
+        let type_target =
+            typed.and_then(|_| self.javascript_target(file, range, ReferenceRole::Type, work));
+        let value_target =
+            read.and_then(|_| self.javascript_target(file, range, ReferenceRole::Read, work));
+        if let Some((left, right)) = type_target.zip(value_target)
+            && self.javascript_identity(left)? != self.javascript_identity(right)?
+        {
+            return None;
+        }
+        let target = type_target.or(value_target)?;
+        if target.file.path != destination.document.path
+            || (export.type_only && !target.symbol.kinds.contains(&SymbolKind::Type))
+        {
+            return None;
+        }
+        let owner = self.javascript_module_from(file, range, work)?;
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Unknown, target)?;
+        occurrence.edge_from = Some(owner);
+        Some(occurrence)
+    }
+
     pub(super) fn javascript_call_from(
         &self,
         file: &File<'source>,

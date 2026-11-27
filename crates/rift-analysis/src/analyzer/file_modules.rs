@@ -34,6 +34,7 @@ impl Records {
             self.retain_incomplete_local_export_references(semantics, limits.edges_max());
         }
         self.retain_checked_declaration_specifiers(owner, analyzed, semantics, limits)?;
+        self.retain_imported_export_selectors(semantics, limits.edges_max());
         Ok(())
     }
 
@@ -114,6 +115,18 @@ impl Records {
             self.retain_file_module_edge_rows(references, limits.edges_max());
         }
         Ok(())
+    }
+
+    pub(super) fn retain_imported_export_selectors(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        edge_limit: usize,
+    ) {
+        let references = semantics
+            .edges()
+            .edges()
+            .filter(|edge| edge.is_imported_export_selector());
+        self.retain_file_module_edge_rows(references, edge_limit);
     }
 
     fn checked_declaration_source_candidates<'file>(
@@ -222,6 +235,7 @@ impl Records {
             semantics.edges().edges().filter(move |edge| {
                 edge.is_file_module_reference()
                     && !edge.is_incomplete_local_export_reference()
+                    && !edge.is_imported_export_selector()
                     && edge.kind() == kind
                     && edge.is_deferred_commonjs_export_import() == deferred_exports
             })

@@ -46,6 +46,7 @@ enum FileModuleReference {
     Specifier,
     CommonJsExportImport,
     IncompleteLocalExport,
+    ImportedExportSelector,
 }
 
 /// One resolved reference edge: the enclosing definition a reference occurred in, the
@@ -90,6 +91,14 @@ impl Edge {
         matches!(
             self.file_module_reference,
             FileModuleReference::IncompleteLocalExport
+        )
+    }
+
+    /// A reference at a checked export selector naming an imported declaration.
+    pub(crate) const fn is_imported_export_selector(&self) -> bool {
+        matches!(
+            self.file_module_reference,
+            FileModuleReference::ImportedExportSelector
         )
     }
 
@@ -490,7 +499,7 @@ fn static_tail_starts(
     resolution: &mut StaticResolution,
     alias: Option<usize>,
     value_qualifier: Option<usize>,
-) -> [Option<usize>; 52] {
+) -> [Option<usize>; 53] {
     [
         resolution.late_supplemental_start.take(),
         resolution.python_reassignment_start.take(),
@@ -546,6 +555,7 @@ fn static_tail_starts(
         resolution.python_loop_read_start.take(),
         resolution.commonjs_export_import_start.take(),
         resolution.typescript_incomplete_local_export_start.take(),
+        resolution.typescript_imported_export_start.take(),
     ]
 }
 
@@ -553,7 +563,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 54] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 55] {
     let supplemental_start = resolution.supplemental_start.take();
     let (value_qualifier, value_qualifier_external) = resolution
         .python_value_qualifier_start
@@ -568,10 +578,10 @@ fn static_admission_batches<'a>(
             (Some(internal), external)
         });
     let tail_starts = static_tail_starts(resolution, alias, value_qualifier);
-    let mut boundaries = [0; 55];
+    let mut boundaries = [0; 56];
     let mut next = resolution.occurrences.len();
-    boundaries[54] = next;
-    for (boundary, start) in boundaries[2..54].iter_mut().zip(tail_starts).rev() {
+    boundaries[55] = next;
+    for (boundary, start) in boundaries[2..55].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }
@@ -594,6 +604,7 @@ fn static_admission_batches<'a>(
                 11 | 42 => FileModuleReference::Binding,
                 52 => FileModuleReference::CommonJsExportImport,
                 53 => FileModuleReference::IncompleteLocalExport,
+                54 => FileModuleReference::ImportedExportSelector,
                 _ => FileModuleReference::None,
             },
         );
