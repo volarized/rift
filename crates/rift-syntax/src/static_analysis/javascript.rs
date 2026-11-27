@@ -511,17 +511,39 @@ impl Kinds {
         let Some(owner) = owner else {
             return Ok(());
         };
-        let mut value = value;
-        // Each step descends within the admitted syntax depth.
-        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
-            value = inner.named_child(0);
-        }
+        let owner = byte_range(owner)?;
+        let value = self.written_return_value(value);
         let object = value
             .filter(|node| node.kind_id() == self.object_literal[0])
             .map(byte_range)
             .transpose()?;
-        facts.returned_objects.push((byte_range(owner)?, object));
+        facts.returned_objects.push((owner, object));
+        if self.type_shapes.is_none()
+            && self.function.contains(&function_element.kind_id())
+            && let Some(value) =
+                value.filter(|node| node.kind() == "ternary_expression" && !node.has_error())
+        {
+            let branches = ["consequence", "alternative"].map(|field| {
+                self.written_return_value(value.child_by_field_name(field))
+                    .filter(|node| node.kind_id() == self.object_literal[0])
+            });
+            if let [Some(first), Some(second)] = branches {
+                for branch in [first, second] {
+                    facts
+                        .returned_branch_objects
+                        .push((owner, byte_range(branch)?));
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn written_return_value<'tree>(&self, mut value: Option<Node<'tree>>) -> Option<Node<'tree>> {
+        // Each step descends within the admitted syntax depth.
+        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
+            value = inner.named_child(0);
+        }
+        value
     }
 
     /// Records a function written as a member of an object literal: a method, or a
@@ -2328,7 +2350,29 @@ impl Kinds {
             .filter(|syntax_element| !syntax_element.is_extra())
             .enumerate()
         {
+            let earlier = facts.bindings.len();
             self.record_parameter(parameter, scope, facts)?;
+            if self.type_shapes.is_none()
+                && (scope.kind_id() == self.arrow
+                    || self.named_expression[..2].contains(&scope.kind_id()))
+                && matches!(parameter.kind(), "object_pattern" | "array_pattern")
+                && !parameter.has_error()
+                && let Ok(index) = u32::try_from(index)
+            {
+                let function = byte_range(scope)?;
+                facts
+                    .callback_pattern_parameters
+                    .extend(
+                        facts.bindings[earlier..]
+                            .iter()
+                            .map(|binding| StaticParameter {
+                                function,
+                                owner,
+                                index,
+                                name: binding.name,
+                            }),
+                    );
+            }
             let name = if self.parameter_wrappers.contains(&parameter.kind_id()) {
                 self.pattern
                     .and_then(|field| parameter.child_by_field_id(field))

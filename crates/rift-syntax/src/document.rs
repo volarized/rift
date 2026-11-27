@@ -165,11 +165,18 @@ impl SyntaxSymbol {
         self.kind == crate::python::LOOP_BINDING_KIND_WORD
     }
 
+    /// Whether this is the physical name of a Python comprehension target.
+    #[must_use]
+    pub fn is_python_comprehension_binding(&self) -> bool {
+        self.kind == crate::python::COMPREHENSION_BINDING_KIND
+    }
+
     /// Whether this is an authored ECMAScript value parameter.
     #[must_use]
     pub fn is_ecmascript_parameter(&self) -> bool {
         self.kind == crate::ecmascript::PARAMETER_KIND
             || self.is_ecmascript_callback_parameter()
+            || self.is_javascript_callback_pattern_parameter()
             || self.is_ecmascript_overload_parameter()
             || self.is_javascript_method_parameter()
             || self.is_typescript_signature_parameter()
@@ -186,6 +193,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_ecmascript_callback_parameter(&self) -> bool {
         self.kind == crate::ecmascript::CALLBACK_PARAMETER_KIND
+    }
+
+    /// Whether this is a written binding in a JavaScript function value's parameter pattern.
+    #[must_use]
+    pub fn is_javascript_callback_pattern_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::CALLBACK_PATTERN_PARAMETER_KIND
     }
 
     /// Whether this parameter belongs to one physical TypeScript overload.
@@ -309,6 +322,7 @@ impl SyntaxSymbol {
             || self.is_rust_macro_method()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
+            || self.is_python_comprehension_binding()
             || self.is_ecmascript_package_binding()
     }
 }

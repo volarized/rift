@@ -7,7 +7,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
-    StaticCallee, StaticFacts, SyntaxFacts, SyntaxSymbol,
+    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::{SelectedFile, binding_name};
@@ -282,7 +282,7 @@ impl<'source> FileScopes<'source> {
         else {
             return BTreeMap::new();
         };
-        let owners = LiteralOwners::new(symbols, facts, anchors);
+        let owners = LiteralOwners::new(symbols, facts, anchors, file.source);
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
         let mut scoped = BTreeMap::new();
         for (name, declarations) in candidates {
@@ -335,7 +335,73 @@ impl<'source> FileScopes<'source> {
             &mut occupied,
             &mut scoped,
         );
+        self.scope_nested_properties(file, repeated, &mut occupied, &mut scoped);
         scoped
+    }
+
+    /// A placed property can hold one literal. Its direct members have that physical owner.
+    fn scope_nested_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        repeated: &BTreeSet<&str>,
+        occupied: &mut BTreeSet<SymbolId>,
+        scoped: &mut ScopedIdentityAnchors,
+    ) {
+        let properties = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| ordinary_private_property(symbol, file.source));
+        let parents = properties
+            .clone()
+            .filter(|symbol| symbol.syntax_element_kind == Some("pair"))
+            .map(|symbol| (symbol.item_range, symbol))
+            .collect::<BTreeMap<_, _>>();
+        let mut members = BTreeMap::new();
+        let mut counts = BTreeMap::new();
+        for child in properties {
+            let Some(member) = self.body_members.get(&child.item_range) else {
+                continue;
+            };
+            let Some(parent) = parents.get(&member.holder) else {
+                continue;
+            };
+            if child.container.as_deref() != Some(parent.qualified_name.as_str())
+                || !repeated.contains(child.qualified_name.as_str())
+            {
+                continue;
+            }
+            *counts
+                .entry((member.body, child.name.as_str()))
+                .or_insert(0_usize) += 1;
+            members.insert(child.item_range, (*parent, child, member.body));
+        }
+        // Parent pairs start before their literal's members.
+        for (parent, child, body) in members.into_values() {
+            if counts.get(&(body, child.name.as_str())) != Some(&1)
+                || scoped
+                    .get(&child.qualified_name)
+                    .is_some_and(|group| group.contains_key(&child.declaration_ordinal))
+            {
+                continue;
+            }
+            let Some(owner) = scoped
+                .get(&parent.qualified_name)
+                .and_then(|group| group.get(&parent.declaration_ordinal))
+                .and_then(|id| SymbolIdentity::parse(id.as_str()).ok())
+            else {
+                continue;
+            };
+            let Some(id) = literal_property_identity(&owner, &child.name) else {
+                continue;
+            };
+            if occupied.insert(id.clone()) {
+                scoped
+                    .entry(child.qualified_name.clone())
+                    .or_default()
+                    .insert(child.declaration_ordinal, id);
+            }
+        }
     }
 
     /// The authored variable, initializer and member must share one physical holder.
@@ -459,13 +525,117 @@ impl<'source> FileScopes<'source> {
         let owner = owners
             .enclosing
             .resolve(symbol.item_range.start, symbol.item_range.end)
-            .copied()
-            .flatten()?;
-        (symbol.container.as_deref() == Some(owner.qualified_name.as_str())
+            .and_then(|(_, owner)| *owner)?;
+        (owner.syntax_element_kind == Some("function_declaration")
+            && symbol.container.as_deref() == Some(owner.qualified_name.as_str())
             && owner.body_range?.encloses(scope)
             && scope.encloses(symbol.item_range)
             && captured.contains(&(name, scope)))
         .then_some((scope, body))
+    }
+
+    /// Places literal argument keys beneath an already scoped private initializer.
+    pub(super) fn place_scoped_call_argument_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        withheld: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+        scoped: &mut ScopedIdentityAnchors,
+    ) {
+        let Some(facts) = file.syntax.static_facts().filter(|_| {
+            !scoped.is_empty()
+                && file.syntax.language().name == "javascript"
+                && !file.syntax.has_errors()
+                && file.syntax.left_out_declaration_count() == 0
+        }) else {
+            return;
+        };
+        let calls = facts
+            .calls()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call.callee,
+                    StaticCallee::Direct | StaticCallee::Member { .. }
+                )
+            })
+            .map(|call| (call.range, call.callee_range.end))
+            .collect::<BTreeMap<_, _>>();
+        let parents = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                private_variable_declaration(symbol)
+                    && symbol.syntax_element_kind == Some("variable_declarator")
+            })
+            .filter_map(|symbol| {
+                let scope = self.checked_lexical_scope(file, symbol)?;
+                if !scope.encloses(symbol.item_range) {
+                    return None;
+                }
+                let body = symbol.body_range?;
+                let callee_end = *calls.get(&body)?;
+                let identity = scoped
+                    .get(&symbol.qualified_name)?
+                    .get(&symbol.declaration_ordinal)?;
+                let owner = SymbolIdentity::parse(identity.as_str()).ok()?;
+                Some((
+                    (symbol.qualified_name.as_str(), body.end),
+                    (body, callee_end, owner),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut proposed = BTreeMap::new();
+        for property in file.syntax.symbols() {
+            if !ordinary_private_property(property, file.source)
+                || !withheld.contains(property.qualified_name.as_str())
+                || scoped
+                    .get(&property.qualified_name)
+                    .is_some_and(|group| group.contains_key(&property.declaration_ordinal))
+            {
+                continue;
+            }
+            let Some((container, member)) = property
+                .container
+                .as_deref()
+                .zip(self.body_members.get(&property.item_range))
+            else {
+                continue;
+            };
+            let Some((body, callee_end, owner)) = parents.get(&(container, member.holder.end))
+            else {
+                continue;
+            };
+            if *callee_end > member.holder.start
+                || !body.encloses(member.holder)
+                || !member.holder.encloses(member.body)
+                || !member.body.encloses(property.item_range)
+            {
+                continue;
+            }
+            if let Some(identity) = literal_property_identity(owner, &property.name) {
+                proposed
+                    .entry(identity)
+                    .and_modify(|candidate| *candidate = None)
+                    .or_insert(Some(property));
+            }
+        }
+        let occupied = anchors
+            .values()
+            .chain(scoped.values().flat_map(|group| group.values()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for (identity, property) in proposed {
+            if let Some(property) = property
+                && !occupied.contains(&identity)
+            {
+                scoped
+                    .entry(property.qualified_name.clone())
+                    .or_default()
+                    .insert(property.declaration_ordinal, identity);
+            }
+        }
     }
 
     /// Names distinct private lexical declarations that the file module cannot share.
@@ -856,7 +1026,8 @@ impl<'source> FileScopes<'source> {
 
 /// The physical callable or module that can own one repeated literal property.
 struct LiteralOwners<'source> {
-    enclosing: EnclosingDefinitions<Option<&'source SyntaxSymbol>>,
+    enclosing: EnclosingDefinitions<(ByteRange, Option<&'source SyntaxSymbol>)>,
+    callbacks: BTreeSet<ByteRange>,
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
@@ -867,8 +1038,9 @@ impl<'source> LiteralOwners<'source> {
         symbols: &'source [SyntaxSymbol],
         facts: &'source StaticFacts,
         anchors: &BTreeMap<String, SymbolId>,
+        source: &str,
     ) -> Self {
-        let functions = named_functions(symbols, anchors);
+        let functions = literal_callable_owners(symbols, facts, anchors);
         let enclosing = EnclosingDefinitions::new(
             symbols
                 .iter()
@@ -880,7 +1052,8 @@ impl<'source> LiteralOwners<'source> {
                         .name_range
                         .and_then(|name| functions.get(&name).copied())
                         .filter(|owner| owner.item_range == symbol.item_range);
-                    (symbol.item_range.start, symbol.item_range.end, function)
+                    let scope = symbol.item_range;
+                    (scope.start, scope.end, (scope, function))
                 })
                 .chain(
                     facts
@@ -889,7 +1062,7 @@ impl<'source> LiteralOwners<'source> {
                         .copied()
                         .chain(facts.function_values().iter().map(|&(scope, _)| scope))
                         .chain(facts.static_blocks().iter().copied())
-                        .map(|scope| (scope.start, scope.end, None)),
+                        .map(|scope| (scope.start, scope.end, (scope, None))),
                 ),
         );
         let mut calls = BTreeMap::<u64, Vec<_>>::new();
@@ -898,6 +1071,18 @@ impl<'source> LiteralOwners<'source> {
         }
         Self {
             enclosing,
+            callbacks: facts
+                .function_contexts()
+                .iter()
+                .filter_map(|&(function, context)| {
+                    let last = usize::try_from(function.end.checked_sub(1)?).ok()?;
+                    // A function range ends at its written body. Keep the existing refusal
+                    // for a concise callback whose call is its expression body.
+                    (matches!(context, StaticFunctionContext::Argument { .. })
+                        && source.as_bytes().get(last) == Some(&b'}'))
+                    .then_some(function)
+                })
+                .collect(),
             calls,
             bound_calls: facts
                 .destructured()
@@ -909,7 +1094,10 @@ impl<'source> LiteralOwners<'source> {
     }
 
     fn proves_body(&self, property: &SyntaxSymbol, member: &StaticBodyMember) -> bool {
-        let scope = self.enclosing.resolve(member.body.start, member.body.end);
+        let scope = self
+            .enclosing
+            .resolve(member.body.start, member.body.end)
+            .copied();
         let container = property.container.as_deref();
         if let Some(owner) = container
             && self.returned.get(&member.body) == Some(&Some(owner))
@@ -922,7 +1110,7 @@ impl<'source> LiteralOwners<'source> {
                     && call.range.encloses(member.holder)
                     && match (container, scope) {
                         (None, None) => property.qualified_name == property.name,
-                        (Some(owner), Some(Some(function))) => {
+                        (Some(owner), Some((_, Some(function)))) => {
                             function.qualified_name == owner
                                 && function
                                     .body_range
@@ -933,16 +1121,36 @@ impl<'source> LiteralOwners<'source> {
                                 )
                                 && !self.bound_calls.contains(&call.range)
                         }
+                        (container, Some((scope, None))) if self.callbacks.contains(&scope) => {
+                            scope.encloses(call.range)
+                                && matches!(
+                                    call.callee,
+                                    StaticCallee::Direct | StaticCallee::Member { .. }
+                                )
+                                && !self.bound_calls.contains(&call.range)
+                                && self.callback_literal_container(scope, container)
+                        }
                         _ => false,
                     }
             })
         })
     }
+
+    fn callback_literal_container(&self, scope: ByteRange, container: Option<&str>) -> bool {
+        let Some(mut owners) = self.enclosing.containing(scope.start, scope.end) else {
+            return false;
+        };
+        match owners.find(|(body, _)| *body != scope) {
+            Some((_, Some(owner))) => container == Some(owner.qualified_name.as_str()),
+            None | Some((_, None)) => false,
+        }
+    }
 }
 
-/// Names ordinary functions only where the written declaration has one qualified owner.
-fn named_functions<'source>(
+/// Names functions and class methods with one authored and placed declaration.
+fn literal_callable_owners<'source>(
     symbols: &'source [SyntaxSymbol],
+    facts: &StaticFacts,
     anchors: &BTreeMap<String, SymbolId>,
 ) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
     let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
@@ -952,28 +1160,61 @@ fn named_functions<'source>(
             .and_modify(|owner| *owner = None)
             .or_insert(Some(symbol));
     }
+    let classes = unique
+        .values()
+        .flatten()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("class_declaration")
+                && anchors.contains_key(&symbol.qualified_name)
+        })
+        .map(|symbol| (symbol.item_range, symbol.qualified_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let class_methods = facts
+        .body_members()
+        .iter()
+        .filter_map(|member| Some((member.member, *classes.get(&member.body)?)))
+        .collect::<BTreeMap<_, _>>();
     unique
         .into_values()
         .flatten()
         .filter(|symbol| {
-            symbol.syntax_element_kind == Some("function_declaration")
-                && anchors.contains_key(&symbol.qualified_name)
+            anchors.contains_key(&symbol.qualified_name)
+                && match symbol.syntax_element_kind {
+                    Some("function_declaration") => true,
+                    Some("method_definition") if symbol.kind == "method" => {
+                        class_methods.get(&symbol.item_range).copied()
+                            == symbol.container.as_deref()
+                            && symbol.container.is_some()
+                    }
+                    _ => false,
+                }
         })
         .filter_map(|symbol| Some((symbol.name_range?, symbol)))
         .collect()
 }
 
-/// Selects returned literal ranges from one admitted, physically named function declaration.
+/// Selects returned literal ranges from one admitted, physically named function or class method.
 fn returned_literal_owners<'source>(
     declarations: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
     facts: &StaticFacts,
 ) -> BTreeMap<ByteRange, Option<&'source str>> {
     let mut owners = BTreeMap::new();
-    for &(name, object) in facts.returned_objects() {
+    let bodies = facts.returned_objects().iter().copied().chain(
+        facts
+            .returned_branch_objects()
+            .iter()
+            .map(|&(name, object)| (name, Some(object))),
+    );
+    for (name, object) in bodies {
         let Some((owner, body)) = declarations.get(&name).zip(object) else {
             continue;
         };
-        if !owner.item_range.encloses(body) {
+        let named = match owner.syntax_element_kind {
+            Some("function_declaration") => true,
+            Some("method_definition") => !owner.name.starts_with('['),
+            _ => false,
+        };
+        if !named || !owner.item_range.encloses(body) {
             continue;
         }
         let name = owner.qualified_name.as_str();

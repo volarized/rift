@@ -85,6 +85,7 @@ pub(super) fn prepare(
         let withheld = scopes.repeated_names(file);
         let mut physical = scopes.literal_properties(file, &withheld, &anchors);
         physical.extend(scopes.withheld_lexical_bindings(file, &withheld, &anchors));
+        scopes.place_scoped_call_argument_properties(file, &withheld, &anchors, &mut physical);
         physical.extend(scopes.withheld_union_properties(file, &withheld, &anchors));
         anchors.retain(|name, _| {
             ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)

@@ -32,6 +32,11 @@ pub(super) enum ScopedParameterReads {
     TypeScriptMethodType,
     TypeScriptFunctionType,
     TypeScriptDestructured,
+    JavaScriptCallbackPattern,
+}
+
+impl ScopedParameterReads {
+    pub(super) const COUNT: usize = Self::JavaScriptCallbackPattern as usize + 1;
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +64,7 @@ pub(super) fn parameter_sites<'source>(
     facts
         .parameters()
         .iter()
+        .chain(facts.callback_pattern_parameters())
         .map(|site| (site.name, site))
         .collect()
 }
@@ -94,6 +100,10 @@ impl<'source> Index<'source> {
             ScopedParameterReads::Callback => (
                 &file.javascript_callback_parameters,
                 &mut result.deferred_callback_parameters,
+            ),
+            ScopedParameterReads::JavaScriptCallbackPattern => (
+                &file.javascript_callback_patterns,
+                &mut result.deferred_javascript_callback_patterns,
             ),
             ScopedParameterReads::Overload => (
                 &file.typescript_overload_parameters,

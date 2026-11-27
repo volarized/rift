@@ -242,6 +242,7 @@ const JSDOC_LINE_MARKER: char = '*';
 /// Provider kind of an ordinary ECMAScript value parameter.
 pub(crate) const PARAMETER_KIND: &str = "value_parameter";
 pub(crate) const CALLBACK_PARAMETER_KIND: &str = "callback_parameter";
+pub(crate) const CALLBACK_PATTERN_PARAMETER_KIND: &str = "javascript_callback_pattern_parameter";
 pub(crate) const OVERLOAD_PARAMETER_KIND: &str = "overload_parameter";
 pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
@@ -2646,6 +2647,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == CALLBACK_PARAMETER_KIND {
         return Some(CALLBACK_PARAMETER_KIND);
+    }
+    if name == CALLBACK_PATTERN_PARAMETER_KIND {
+        return Some(CALLBACK_PATTERN_PARAMETER_KIND);
     }
     if name == OVERLOAD_PARAMETER_KIND {
         return Some(OVERLOAD_PARAMETER_KIND);

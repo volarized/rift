@@ -182,6 +182,8 @@ const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
 const VARIABLE_KIND_WORD: &str = "variable";
 pub(crate) const LOOP_BINDING_KIND_WORD: &str = "loop_binding";
+/// The kind word a comprehension target carries.
+pub(crate) const COMPREHENSION_BINDING_KIND: &str = "python_comprehension_binding";
 /// The kind word a function declared in a class body carries on the wire.
 const METHOD_KIND_WORD: &str = "method";
 /// The kind word a `type` statement carries on the wire.
@@ -783,6 +785,31 @@ impl PythonRules {
         })
     }
 
+    /// An authored identifier bound by a comprehension's for clause.
+    fn comprehension_declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Option<Declaration> {
+        let clause = self.target_statement(visited, self.kinds.loop_kinds[1], false)?;
+        let scope = clause.parent()?.syntax_element();
+        if !matches!(
+            scope.kind(),
+            "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+        ) || scope.has_error()
+        {
+            return None;
+        }
+        let name = text.get(visited.syntax_element().byte_range())?;
+        Some(Declaration {
+            kind: COMPREHENSION_BINDING_KIND,
+            ..Self::variable(name, DeclarationScope::Local)
+        })
+    }
+
     /// The method an instance attribute target belongs to: the visited
     /// `attribute` is an assignment target, its object is the first
     /// parameter of the nearest enclosing `def`, and that `def` is a method.
@@ -1008,7 +1035,10 @@ type AttributeDocs = BTreeMap<crate::ByteRange, (StringText, u64)>;
 impl PythonRules {
     fn attach_assigned_docs(&self, symbols: &mut [crate::SyntaxSymbol]) {
         for symbol in symbols {
-            if symbol.container.is_some() || symbol.kind == MODULE_KIND {
+            if symbol.container.is_some()
+                || symbol.kind == MODULE_KIND
+                || symbol.is_python_comprehension_binding()
+            {
                 continue;
             }
             let Some((content, _)) = self.assigned_docs.get(&symbol.name) else {
@@ -1219,7 +1249,8 @@ impl GrammarRules for PythonRules {
             return Ok(self
                 .parameter_declaration(visited, text)
                 .or_else(|| self.pattern_declaration(visited, text))
-                .or_else(|| self.loop_declaration(visited, text)));
+                .or_else(|| self.loop_declaration(visited, text))
+                .or_else(|| self.comprehension_declaration(visited, text)));
         }
         if id == self.kinds.attribute {
             let Some(_) = self.attribute_method(visited, text) else {
@@ -1385,6 +1416,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         )?);
         export_bindings.sort_by_key(|binding| binding.range.start);
         let (mut static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
+        retain_comprehension_bindings(&mut symbols, &static_facts);
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         retain_loop_bindings(&mut symbols, &static_facts, source.text);
         retain_parameters(&mut symbols, &mut static_facts);
@@ -1420,6 +1452,50 @@ impl SyntaxProvider for PythonSyntaxProvider {
         }
         kinds
     }
+}
+
+/// Keeps a comprehension target's name within its checked physical expression scope.
+fn retain_comprehension_bindings(
+    symbols: &mut Vec<crate::SyntaxSymbol>,
+    facts: &crate::StaticFacts,
+) {
+    if !symbols
+        .iter()
+        .any(crate::SyntaxSymbol::is_python_comprehension_binding)
+    {
+        return;
+    }
+    let expression_scopes = facts
+        .expression_scopes()
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let bindings = facts
+        .bindings()
+        .iter()
+        .filter(|binding| expression_scopes.contains(&binding.scope))
+        .map(|binding| (binding.name, binding.scope))
+        .collect::<BTreeMap<_, _>>();
+    symbols.retain_mut(|symbol| {
+        if !symbol.is_python_comprehension_binding() {
+            return true;
+        }
+        let Some(scope) = symbol.name_range.and_then(|name| bindings.get(&name)) else {
+            return false;
+        };
+        let scope_name = format!("$comprehension#{}", scope.start);
+        let parent = extract::qualify(
+            SCOPE_QUALIFICATION_SEPARATOR,
+            symbol.container.as_deref().unwrap_or_default(),
+            &scope_name,
+        );
+        let qualified = extract::qualify(SCOPE_QUALIFICATION_SEPARATOR, &parent, &symbol.name);
+        if !rift_core::is_portable_name(&qualified) {
+            return false;
+        }
+        symbol.qualified_name = qualified;
+        true
+    });
 }
 
 /// Withholds loop targets redirected to another scope or already declared there.

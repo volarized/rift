@@ -94,6 +94,10 @@ pub(crate) struct StaticResolution {
     pub(crate) callback_parameter_start: Option<usize>,
     /// Callback parameter reads awaiting their place after containment.
     pub(crate) deferred_callback_parameters: Vec<StaticOccurrence>,
+    /// First Read of a JavaScript callback pattern binding after established facts.
+    pub(crate) javascript_callback_pattern_start: Option<usize>,
+    /// Reads of authored callback pattern bindings awaiting remaining capacity.
+    pub(crate) deferred_javascript_callback_patterns: Vec<StaticOccurrence>,
     /// First TypeScript overload parameter read after callback parameter reads.
     pub(crate) overload_parameter_start: Option<usize>,
     /// Overload parameter reads awaiting capacity after earlier package edges.
@@ -120,6 +124,7 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_shared_start: Option<usize>,
     /// First reference to an authored parent module after existing Rust references.
     pub(crate) rust_parent_module_start: Option<usize>,
+    pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
     /// Existing call sites left unresolved in files with authored extern bindings.
@@ -318,6 +323,11 @@ fn resolve_by<'source>(
     index.resolve_rust_shorthand(&mut work, &mut resolution);
     index.resolve_rust_shared_sources(documents.1, namespace, &mut work, &mut resolution);
     index.resolve_rust_parent_modules(&mut work, &mut resolution);
+    index.resolve_python_comprehension_reads(&mut work, &mut resolution);
+    resolution.javascript_callback_pattern_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_javascript_callback_patterns,
+    );
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -764,6 +774,7 @@ struct File<'source> {
     ecmascript_parameters: EcmaScriptParameters<'source>,
     typescript_method_parameters: EcmaScriptParameters<'source>,
     javascript_callback_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
+    javascript_callback_patterns: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     typescript_overload_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     javascript_method_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
@@ -776,6 +787,7 @@ struct File<'source> {
     javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
+    python_comprehension_bindings: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
@@ -947,6 +959,7 @@ impl<'source> File<'source> {
             ecmascript_parameters: BTreeMap::new(),
             typescript_method_parameters: BTreeMap::new(),
             javascript_callback_parameters: BTreeMap::new(),
+            javascript_callback_patterns: BTreeMap::new(),
             typescript_overload_parameters: BTreeMap::new(),
             javascript_method_parameters: BTreeMap::new(),
             scoped_javascript_parameters: BTreeMap::new(),
@@ -958,6 +971,7 @@ impl<'source> File<'source> {
             typescript_method_type_parameters: BTreeMap::new(),
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
+            python_comprehension_bindings: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
@@ -1263,6 +1277,8 @@ impl<'source> File<'source> {
             if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
                 self.python_parameters
                     .insert(name, admitted.then_some(symbol));
+            } else if admitted && symbol.is_python_comprehension_binding() {
+                self.python_comprehension_bindings.insert(name, symbol);
             } else if admitted && symbol.is_typescript_type_parameter() {
                 self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && symbol.is_javascript_wrapped_parameter() {
@@ -1286,6 +1302,10 @@ impl<'source> File<'source> {
                 let parameter = EcmaScriptParameter { symbol, site };
                 if symbol.is_ecmascript_callback_parameter() {
                     self.javascript_callback_parameters.insert(name, parameter);
+                    return;
+                }
+                if symbol.is_javascript_callback_pattern_parameter() {
+                    self.javascript_callback_patterns.insert(name, parameter);
                     return;
                 }
                 if symbol.is_ecmascript_overload_parameter() {
@@ -1470,6 +1490,10 @@ impl<'source> File<'source> {
             (
                 ScopedParameterReads::TypeScriptDestructured,
                 !self.typescript_destructured_parameters.is_empty(),
+            ),
+            (
+                ScopedParameterReads::JavaScriptCallbackPattern,
+                !self.javascript_callback_patterns.is_empty(),
             ),
         ]
         .into_iter()
@@ -2079,7 +2103,8 @@ impl<'source> Index<'source> {
         let mut python_variadic_sites = VecDeque::new();
         let mut module_specifiers = VecDeque::new();
         let mut module_qualifiers = VecDeque::new();
-        let mut scoped_parameters = std::array::from_fn::<_, 11, _>(|_| VecDeque::new());
+        let mut scoped_parameters =
+            std::array::from_fn::<_, { ScopedParameterReads::COUNT }, _>(|_| VecDeque::new());
         while let Some((file, remaining, sites)) = existing
             .pop_front()
             .or_else(|| macro_sites.pop_front())

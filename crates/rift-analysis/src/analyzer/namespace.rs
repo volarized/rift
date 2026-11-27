@@ -365,7 +365,9 @@ fn identity_anchors_with_roots(
     };
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols() {
-        if (symbol.is_python_parameter() || symbol.is_python_loop_binding())
+        if (symbol.is_python_parameter()
+            || symbol.is_python_loop_binding()
+            || symbol.is_python_comprehension_binding())
             && (input.release_version().is_none()
                 || !matches!(
                     input.owner(),
@@ -380,13 +382,20 @@ fn identity_anchors_with_roots(
             let Some(name) = python_declaration_name(symbol) else {
                 continue;
             };
-            if symbol.qualified_name != name {
-                continue;
-            }
-            let names = name.split('.').collect::<Vec<_>>();
-            if !names.iter().all(|name| python_identifier_is_valid(name)) {
-                continue;
-            }
+            let names = if symbol.is_python_comprehension_binding() {
+                let Some(names) = python_comprehension_path(symbol, &name) else {
+                    continue;
+                };
+                names
+            } else {
+                let names = name.split('.').collect::<Vec<_>>();
+                if symbol.qualified_name != name
+                    || !names.iter().all(|name| python_identifier_is_valid(name))
+                {
+                    continue;
+                }
+                names
+            };
             let mut qualified_path = module.clone();
             qualified_path.extend(names.into_iter().map(str::to_owned));
             qualified_path
@@ -440,6 +449,24 @@ fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String>
         Some(_) => None,
         None => Some(symbol.name.clone()),
     }
+}
+
+/// The checked source scope before a comprehension's ordinary Python binding name.
+fn python_comprehension_path<'a>(
+    symbol: &'a rift_syntax::SyntaxSymbol,
+    ordinary: &str,
+) -> Option<Vec<&'a str>> {
+    let parent = ordinary.strip_suffix(symbol.name.as_str())?;
+    let prefix = symbol.qualified_name.strip_prefix(parent)?;
+    let (scope, name) = prefix.split_once('.')?;
+    let position = scope.strip_prefix("$comprehension#")?;
+    if name != symbol.name.as_str()
+        || position.is_empty()
+        || !position.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(symbol.qualified_name.split('.').collect())
 }
 
 #[cfg(test)]

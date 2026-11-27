@@ -27,10 +27,12 @@ pub struct PackageBindingSlots {
     typescript_parameter: usize,
     python_receiver: usize,
     python_loop_binding: usize,
+    python_comprehension_binding: usize,
     python_variadic_parameter: usize,
     python_overload_parameter: usize,
     javascript_parameter: usize,
     javascript_callback_parameter: usize,
+    javascript_callback_pattern: usize,
     typescript_overload_parameter: usize,
     javascript_method_parameter: usize,
     typescript_signature_parameter: usize,
@@ -72,9 +74,11 @@ impl PackageBindingSlots {
             javascript_parameter: 0,
             python_receiver: 0,
             python_loop_binding: 0,
+            python_comprehension_binding: 0,
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
             javascript_callback_parameter: 0,
+            javascript_callback_pattern: 0,
             typescript_overload_parameter: 0,
             javascript_method_parameter: 0,
             typescript_signature_parameter: 0,
@@ -112,6 +116,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves slots remaining for Python comprehension targets.
+    #[must_use]
+    pub const fn with_python_comprehension_bindings(mut self, slots: usize) -> Self {
+        self.python_comprehension_binding = slots;
+        self
+    }
+
     /// Reserves separate slots for Python variadic parameter declarations.
     #[must_use]
     pub const fn with_python_variadic_parameter_slots(mut self, slots: usize) -> Self {
@@ -144,6 +155,13 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_javascript_callback_parameters(mut self, count: usize) -> Self {
         self.javascript_callback_parameter = count;
+        self
+    }
+
+    /// Holds the slots left for written JavaScript callback parameter patterns.
+    #[must_use]
+    pub const fn with_javascript_callback_patterns(mut self, count: usize) -> Self {
+        self.javascript_callback_pattern = count;
         self
     }
 
@@ -306,10 +324,12 @@ impl PackageBindingSlots {
             .saturating_add(self.javascript_parameter)
             .saturating_add(self.python_receiver)
             .saturating_add(self.python_loop_binding)
+            .saturating_add(self.python_comprehension_binding)
             .saturating_add(self.python_variadic_parameter)
             .saturating_add(self.python_overload_parameter)
             .saturating_add(self.typescript_method_parameter)
             .saturating_add(self.javascript_callback_parameter)
+            .saturating_add(self.javascript_callback_pattern)
             .saturating_add(self.typescript_overload_parameter)
             .saturating_add(self.rust_library_root)
             .saturating_add(self.rust_module_source)
@@ -341,6 +361,8 @@ impl PackageBindingSlots {
         let language = syntax.language().name.as_str();
         let available = if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callback_parameter
+        } else if symbol.is_javascript_callback_pattern_parameter() {
+            &mut self.javascript_callback_pattern
         } else if language == "typescript" && symbol.is_ecmascript_overload_parameter() {
             &mut self.typescript_overload_parameter
         } else if symbol.is_javascript_method_parameter() {
@@ -414,6 +436,8 @@ impl PackageBindingSlots {
             &mut self.rust_parameter
         } else if symbol.is_python_loop_binding() {
             &mut self.python_loop_binding
+        } else if symbol.is_python_comprehension_binding() {
+            &mut self.python_comprehension_binding
         } else {
             &mut self.rust_local
         };

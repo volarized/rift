@@ -177,7 +177,11 @@ impl EdgePythonKinds {
         if self.loops.contains(&id) {
             facts.loops.push(byte_range(syntax_element)?);
         } else if self.scopes[3..].contains(&id) {
-            facts.expression_scopes.push(byte_range(syntax_element)?);
+            let scope = byte_range(syntax_element)?;
+            facts.expression_scopes.push(scope);
+            if self.scopes[4..].contains(&id) && !syntax_element.has_error() {
+                names.comprehension(scope);
+            }
             self.edge_first_iterable(syntax_element, facts)?;
             self.edge_evaluated_outside(syntax_element, facts)?;
         }

@@ -92,6 +92,7 @@ pub(in crate::static_analysis) struct Names<'source> {
     deleted: Vec<StaticBinding>,
     /// The scope of each class body.
     classes: BTreeSet<ByteRange>,
+    comprehensions: BTreeSet<ByteRange>,
     reads: Vec<ByteRange>,
     direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
     receivers: BTreeMap<ByteRange, ByteRange>,
@@ -160,11 +161,16 @@ impl Names<'_> {
         self.classes.insert(scope);
     }
 
+    pub(super) fn comprehension(&mut self, scope: ByteRange) {
+        self.comprehensions.insert(scope);
+    }
+
     /// Binds each deleted name its scope does not bind otherwise: beside another binding a
     /// `del` statement changes no scope. Keeps the reads of names that the file shares and the
     /// writes of the names that its module and its classes hold.
     pub(in crate::static_analysis) fn close(mut self, source: &str, facts: &mut StaticFactsParts) {
         self.close_deleted(source, facts);
+        self.close_comprehensions(source, facts);
         let module = ByteRange {
             start: 0,
             end: u64::try_from(source.len()).unwrap_or(u64::MAX),
@@ -204,6 +210,39 @@ impl Names<'_> {
                 .references
                 .push(reference(*name, ReferenceRole::Write));
         }
+    }
+
+    fn close_comprehensions(&self, source: &str, facts: &mut StaticFactsParts) {
+        if self.comprehensions.is_empty() {
+            return;
+        }
+        let mut scopes = BTreeMap::<&str, Vec<ByteRange>>::new();
+        for binding in &facts.bindings {
+            if self.comprehensions.contains(&binding.scope)
+                && let Some(name) = text(source, binding.name)
+            {
+                scopes.entry(name).or_default().push(binding.scope);
+            }
+        }
+        // A name's overlapping candidate regions form a union. The resolver still
+        // chooses its exact lexical scope and checks the first iterable.
+        for regions in scopes.values_mut() {
+            regions.sort_unstable();
+            let mut end = 0;
+            for region in regions {
+                end = end.max(region.end);
+                region.end = end;
+            }
+        }
+        facts
+            .python_comprehension_reads
+            .extend(self.reads.iter().copied().filter(|&read| {
+                let Some(regions) = text(source, read).and_then(|name| scopes.get(name)) else {
+                    return false;
+                };
+                let before = regions.partition_point(|scope| scope.start <= read.start);
+                before > 0 && regions[before - 1].encloses(read)
+            }));
     }
 
     fn close_deleted(&mut self, source: &str, facts: &mut StaticFactsParts) {

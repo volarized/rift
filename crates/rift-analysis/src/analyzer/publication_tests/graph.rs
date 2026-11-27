@@ -541,6 +541,110 @@ fn package_python_loop_targets_respect_existing_names_and_scope_redirects() {
 }
 
 #[test]
+fn package_python_comprehensions_keep_exact_bindings_and_scope_reads() {
+    const SOURCE: &str = concat!(
+        "def choices():\n",
+        "    return ((1, 2),)\n",
+        "def gather(rows):\n",
+        "    label = 0\n",
+        "    one = [label for label, amount in rows if amount]\n",
+        "    two = [(label, [label for label in label]) for label in rows]\n",
+        "    three = {choices for choices in choices()}\n",
+        "    four = {item: item for item in rows}\n",
+        "    five = (entry for entry in rows)\n",
+        "    for amount in rows:\n",
+        "        pass\n",
+        "    return label, one, two, three, four, five\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let result = publication(&files, None, &["click"]);
+    let position = |context: &str, token: &str| {
+        u64::try_from(
+            SOURCE.find(context).expect("written context")
+                + context.find(token).expect("written token"),
+        )
+        .expect("source offset")
+    };
+    let declaration = |context: &str, name: &str| {
+        let start = position(context, name);
+        result
+            .declarations
+            .iter()
+            .find(|entry| {
+                entry.source == name
+                    && entry.range.start == start
+                    && entry.range.end == start + u64::try_from(name.len()).expect("name length")
+            })
+            .map(|entry| entry.symbol.as_str())
+            .expect("exact scoped declaration")
+    };
+    let read = |context: &str, name: &str, target: &str| {
+        let start = position(context, name);
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str() == target
+                    && edge.from.as_str().ends_with("/gather")
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start == start
+                            && site.range.end
+                                == start + u64::try_from(name.len()).expect("name length")
+                    })
+            }),
+            "{context} reads {target}"
+        );
+    };
+    let first = declaration("for label, amount", "label");
+    let amount = declaration("for label, amount", "amount");
+    let statement_loop = declaration("for amount in rows:", "amount");
+    assert!(statement_loop.ends_with("/gather/amount"));
+    assert_ne!(amount, statement_loop);
+    let inner = declaration("for label in label", "label");
+    let outer = declaration("for label in rows", "label");
+    assert_ne!(first, inner);
+    assert_ne!(first, outer);
+    assert_ne!(inner, outer);
+    read("[label for label, amount", "label", first);
+    read("if amount]", "amount", amount);
+    read("[label for label in label", "label", inner);
+    read("in label])", "label", outer);
+    read("(label, [", "label", outer);
+    let choices = declaration("for choices in choices()", "choices");
+    read("{choices for choices", "choices", choices);
+    let item = declaration("for item in rows", "item");
+    read("{item: item", "item", item);
+    let entry = declaration("for entry in rows", "entry");
+    read("(entry for entry", "entry", entry);
+    read(
+        "return label, one",
+        "label",
+        "rift://symbol/pypi/pypi.org/click/python/click/gather/label",
+    );
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/gather")
+            && edge.to.as_str() == "rift://symbol/pypi/pypi.org/click/python/click/choices"
+    }));
+
+    let targets = [first, amount, inner, outer, choices, item, entry];
+    let incumbent = result
+        .edges
+        .iter()
+        .filter(|edge| !targets.contains(&edge.to.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let tight = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(incumbent.len()),
+    );
+    assert_eq!(tight.declarations, result.declarations);
+    assert_eq!(tight.edges, incumbent);
+}
+
+#[test]
 fn package_python_variadic_parameters_keep_names_and_reads() {
     const SOURCE: &str = concat!(
         "def collect(*values: int, **options: str):\n",
@@ -1334,6 +1438,123 @@ pub fn call() { left::one(); right::one(); }
             publication.edges
         );
     }
+}
+
+#[test]
+fn package_rust_inactive_module_alias_leaves_the_selected_source_owner() {
+    const ROOT: &str = r#"
+#[cfg(feature = "primary")]
+mod shared;
+#[cfg(not(feature = "primary"))]
+#[path = "shared/mod.rs"]
+mod fallback;
+#[cfg(feature = "primary")]
+pub fn call_primary() { shared::leaf(); }
+#[cfg(not(feature = "primary"))]
+pub fn call_fallback() { fallback::leaf(); }
+pub fn retained() {}
+"#;
+    for (flags, active, inactive, caller) in [
+        (
+            [r#"feature="primary""#, "unix"].as_slice(),
+            "shared",
+            "fallback",
+            "call_primary",
+        ),
+        (["unix"].as_slice(), "fallback", "shared", "call_fallback"),
+    ] {
+        let publication = package_with_rust_alias_routes(ROOT, flags);
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0.as_str() == "src/shared/mod.rs")
+            .expect("original source unit");
+        let leaf = format!("/beacon/{active}/leaf");
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol.as_str().ends_with(&leaf)
+                && row.unit == unit.unit
+                && row.source == "pub fn leaf() {}"
+        }));
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/beacon/retained") })
+        );
+        assert!(!publication.declarations.iter().any(|row| {
+            row.symbol
+                .as_str()
+                .ends_with(&format!("/beacon/{inactive}/leaf"))
+        }));
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with(&format!("/beacon/{caller}"))
+                && edge.to.as_str().ends_with(&leaf)
+        }));
+    }
+}
+
+#[test]
+fn package_rust_module_alias_keeps_refusal_for_competing_routes() {
+    const CONFLICTS: &str = r#"
+mod shared;
+#[path = "shared/mod.rs"]
+mod fallback;
+pub fn retained() {}
+"#;
+    for (source, flags) in [
+        (CONFLICTS.to_owned(), ["unix"].as_slice()),
+        (
+            CONFLICTS.replace("mod fallback;", "#[cfg(custom_target)]\nmod fallback;"),
+            [].as_slice(),
+        ),
+    ] {
+        let publication = package_with_rust_alias_routes(&source, flags);
+        assert!(publication.declarations.is_empty());
+        assert!(publication.edges.is_empty());
+    }
+}
+
+fn package_with_rust_alias_routes(
+    source: &str,
+    flags: &[&str],
+) -> rift_protocol::index::PackagePublication {
+    let package = fixture::identity();
+    let owner = package.owner().expect("Cargo owner");
+    let language = fixture::language(ShippedLanguage::Rust);
+    let origin = fixture::origin(&package);
+    let root = ProjectPath::new("src/lib.rs").expect("library root");
+    let child = ProjectPath::new("src/shared/mod.rs").expect("shared source");
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname='beacon'\nversion='1.0.0'\n[features]\nprimary=[]\n",
+    )];
+    let sources = [
+        PackageSource::new(&root, source),
+        PackageSource::new(&child, "pub fn leaf() {}\n"),
+    ];
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(3, 4096),
+    )
+    .expect("authored source inventory")
+    .with_framework_context(&metadata, &[])
+    .expect("captured manifest");
+    let input = if flags.is_empty() {
+        input
+    } else {
+        input
+            .with_rust_configuration(&manifest, flags)
+            .expect("captured flags")
+    };
+    PackageAnalyzer::analyze(input, 1)
+        .expect("package analysis")
+        .into_parts()
+        .0
 }
 
 #[test]

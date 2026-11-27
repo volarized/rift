@@ -183,7 +183,7 @@ export function established() {
   return inspect(options.stable);
 }
 export function unsupported(first) {
-  return first ? { opaque: 5 } : { opaque: 6 };
+  return first ? { opaque: 5 } : [{ opaque: 6 }];
 }
 "#;
 
@@ -3110,6 +3110,465 @@ fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
         .map(|(start, _)| u64::try_from(start).expect("physical call position"))
         .collect::<BTreeSet<_>>();
     assert_eq!(calls, written);
+}
+
+#[test]
+fn non_entry_class_methods_keep_properties_of_returned_call_arguments() {
+    const SOURCE: &str = concat!(
+        "export class Builder {\n",
+        "  convert(first) {\n",
+        "    if (first) return this.wrap({ state: 'initial', value: 1 });\n",
+        "    return this.wrap({ state: 'final', value: 2 });\n",
+        "  }\n",
+        "  wrap(data) { return data; }\n",
+        "  existing() {\n",
+        "    const options = { stable: 3 };\n",
+        "    return this.wrap(options);\n",
+        "  }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("physical argument properties");
+
+    let mut identities = BTreeSet::new();
+    for written in ["state: 'initial'", "value: 1", "state: 'final'", "value: 2"] {
+        let start = SOURCE.find(written).expect("written property");
+        let property = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("class method argument property");
+        assert!(!property.public);
+        assert!(property.symbol.as_str().contains("/Builder/convert/"));
+        assert!(identities.insert(&property.symbol));
+    }
+    assert!(found.declarations.iter().any(|row| {
+        row.source == "stable: 3"
+            && row
+                .symbol
+                .as_str()
+                .ends_with("/Builder/existing/options/stable")
+    }));
+    let calls = found
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from.as_str().ends_with("/Builder/convert")
+                && edge.to.as_str().ends_with("/Builder/wrap")
+                && edge.kinds == [EdgeKind::Calls]
+        })
+        .map(|edge| {
+            let range = &edge.occurrence.as_ref().expect("written call").range;
+            (range.start, range.end)
+        })
+        .collect::<BTreeSet<_>>();
+    let written = [
+        "this.wrap({ state: 'initial', value: 1 })",
+        "this.wrap({ state: 'final', value: 2 })",
+    ]
+    .map(|call| {
+        let range = module_runtime_range(SOURCE.find(call).expect("authored call"), call);
+        (range.start, range.end)
+    });
+    assert_eq!(calls, written.into_iter().collect());
+
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
+fn non_entry_named_class_methods_keep_properties_in_separate_return_literals() {
+    const SOURCE: &str = concat!(
+        "function selectName() { return 'runtime'; }\n",
+        "export class Builder {\n",
+        "  convert(first) {\n",
+        "    if (first) return { state: 'first' };\n",
+        "    return { state: 'last' };\n",
+        "  }\n",
+        "  static prepare(first) {\n",
+        "    if (first) return { ready: 1 };\n",
+        "    return { ready: 2 };\n",
+        "  }\n",
+        "  [selectName()](first) {\n",
+        "    if (first) return { unknown: 3 };\n",
+        "    return { unknown: 4 };\n",
+        "  }\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("authored method return properties");
+    for (method, properties) in [
+        ("convert", ["state: 'first'", "state: 'last'"]),
+        ("prepare", ["ready: 1", "ready: 2"]),
+    ] {
+        let suffix = format!("/Builder/{method}");
+        let owner = found
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with(&suffix))
+            .expect("named class method");
+        let rows = properties.map(|written| {
+            let start = SOURCE.find(written).expect("written property");
+            let row = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == owner.unit
+                        && row.source == written
+                        && row.range == module_runtime_range(start, written)
+                })
+                .expect("physical method return property");
+            assert!(!row.public);
+            assert!(found.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&row.symbol)
+                    && object.container.as_ref() == Some(&owner.symbol)
+            }));
+            &row.symbol
+        });
+        assert_ne!(rows[0], rows[1]);
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| { row.source.starts_with("[selectName()](first)") })
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| { !matches!(row.source.as_str(), "unknown: 3" | "unknown: 4") })
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
+fn non_entry_conditional_returns_keep_distinct_literal_branch_properties() {
+    const SOURCE: &str = concat!(
+        "export function build(first) {\n",
+        "  return first ? ({ state: 1, ready: true }) : ({ state: 2, ready: false });\n",
+        "}\n",
+        "export function direct(first) {\n",
+        "  if (first) return { stable: 3 };\n",
+        "  return { stable: 4 };\n",
+        "}\n",
+        "export function caller(first) { const result = build(first); return result.state; }\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("authored conditional branch properties");
+
+    let mut identities = BTreeSet::new();
+    for (owner, written) in [
+        ("build", "state: 1"),
+        ("build", "ready: true"),
+        ("build", "state: 2"),
+        ("build", "ready: false"),
+        ("direct", "stable: 3"),
+        ("direct", "stable: 4"),
+    ] {
+        let start = SOURCE.find(written).expect("written property");
+        let property = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property");
+        assert!(!property.public);
+        assert!(property.symbol.as_str().contains(&format!("/{owner}/")));
+        assert!(identities.insert(&property.symbol));
+    }
+    assert!(found.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/caller")
+            && edge.to.as_str().ends_with("/build")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    assert!(
+        found
+            .edges
+            .iter()
+            .all(|edge| { edge.kinds != [EdgeKind::Reads] || !identities.contains(&edge.to) })
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
+fn package_javascript_callback_patterns_keep_separate_reads() {
+    const SOURCE: &str = concat!(
+        "export function project(records) {\n",
+        "  const fromTuple = ([value]) => value;\n",
+        "  const left = records.map(({value}) => value);\n",
+        "  return [left, fromTuple([4]), records.map(({value}) => value + 1)];\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 24);
+    let publication = analysis.publication();
+    publication
+        .validate_facts()
+        .expect("authored callback patterns");
+    let range = |start| module_runtime_range(start, "value");
+    let mut symbols = BTreeSet::new();
+    for (start, _) in SOURCE
+        .match_indices("value])")
+        .chain(SOURCE.match_indices("value})"))
+    {
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == "value" && row.range == range(start))
+            .expect("physical callback binding");
+        assert!(!binding.public);
+        assert!(symbols.insert(&binding.symbol));
+        let read = SOURCE[start..]
+            .find("=> value")
+            .expect("written callback read")
+            + start
+            + 3;
+        let references = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to == binding.symbol)
+            .collect::<Vec<_>>();
+        let [reference] = references.as_slice() else {
+            panic!("one read to each callback binding");
+        };
+        let at = reference
+            .occurrence
+            .as_ref()
+            .expect("written read location");
+        assert_eq!(at.range, range(read));
+        assert_eq!(at.unit, binding.unit);
+    }
+    assert_eq!(symbols.len(), 3);
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/project")
+            && edge.to.as_str().ends_with("/project/fromTuple")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, publication.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| { publication.edges.contains(edge) && !symbols.contains(&edge.to) })
+    );
+}
+
+#[test]
+fn non_entry_returns_keep_nested_keys_under_their_physical_parent() {
+    const SOURCE: &str = concat!(
+        "export function build(first) {\n",
+        "  if (first) return { payload: { code: 1 } };\n",
+        "  return { payload: { code: 2 } };\n",
+        "}\n",
+        "export function duplicate(first) {\n",
+        "  if (first) return { opaque: { key: 3, key: 4 } };\n",
+        "  return { opaque: { key: 5, key: 6 } };\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found.validate_facts().expect("authored nested properties");
+
+    let property = |written: &str| {
+        let start = SOURCE.find(written).expect("written property");
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property")
+    };
+    let ids = [
+        ("payload: { code: 1 }", "code: 1"),
+        ("payload: { code: 2 }", "code: 2"),
+    ]
+    .map(|(outer, inner)| {
+        let parent = property(outer);
+        let member = property(inner);
+        assert_eq!(member.unit, parent.unit);
+        assert!(!member.public);
+        assert!(found.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&member.symbol)
+                && row.container.as_ref() == Some(&parent.symbol)
+        }));
+        member.symbol.clone()
+    });
+    assert_ne!(ids[0], ids[1]);
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.source.starts_with("key: "))
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
+fn non_entry_callbacks_keep_properties_in_distinct_call_arguments() {
+    const SOURCE: &str = concat!(
+        "function inspect(value) { return value.status; }\n",
+        "export function choose(items) {\n",
+        "  return items.map(item => {\n",
+        "    if (item) return inspect({ status: 'first' });\n",
+        "    return inspect({ status: 'second' });\n",
+        "  });\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("callback argument properties");
+    let properties = ["status: 'first'", "status: 'second'"].map(|written| {
+        let start = SOURCE.find(written).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property");
+        assert!(!row.public);
+        row.symbol.clone()
+    });
+    assert_ne!(properties[0], properties[1]);
+    let calls = found
+        .edges
+        .iter()
+        .filter(|row| row.kinds == [EdgeKind::Calls] && row.to.as_str().ends_with("/inspect"))
+        .map(|row| row.occurrence.as_ref().expect("written call").range.start)
+        .collect::<BTreeSet<_>>();
+    let written = SOURCE
+        .match_indices("return inspect(")
+        .map(|(start, _)| u64::try_from(start + "return ".len()).expect("call position"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(calls, written);
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
+
+#[test]
+fn scoped_call_initializers_keep_argument_properties_without_result_reads() {
+    const SOURCE: &str = concat!(
+        "function wrap(value) { return { other: 1 }; }\n",
+        "export function build(first) {\n",
+        "  if (first === 0) { let record; return record; }\n",
+        "  if (first === 1) {\n",
+        "    const record = wrap({ code: 'one' });\n",
+        "    return record.code;\n",
+        "  }\n",
+        "  const record = wrap({ code: 'two' });\n",
+        "  return record.code;\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found.validate_facts().expect("physical call arguments");
+    let declaration = |written: &str| {
+        let start = SOURCE.find(written).expect("written declaration");
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical declaration")
+    };
+    for (index, written) in ["code: 'one'", "code: 'two'"].into_iter().enumerate() {
+        let call = format!("wrap({{ {written} }})");
+        let local = declaration(&format!("record = {call}"));
+        let property = declaration(written);
+        assert!(
+            local
+                .symbol
+                .as_str()
+                .ends_with(&format!("/record%23{}", index + 1))
+        );
+        assert_eq!(
+            property.symbol.as_str(),
+            format!("{}/code", local.symbol.as_str())
+        );
+        assert_eq!(property.unit, local.unit);
+        assert!(!property.public);
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&local.symbol)
+                && object.name == "code"
+        }));
+        let start = SOURCE.find(&call).expect("written call");
+        assert!(found.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from.as_str().ends_with("/build")
+                && edge.to.as_str().ends_with("/wrap")
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == property.unit
+                        && occurrence.range == module_runtime_range(start, &call)
+                })
+        }));
+        assert!(
+            found.edges.iter().all(|edge| {
+                edge.to != property.symbol || !edge.kinds.contains(&EdgeKind::Reads)
+            })
+        );
+    }
+    assert!(
+        declaration("record")
+            .symbol
+            .as_str()
+            .ends_with("/record%230")
+    );
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
 }
 
 #[test]

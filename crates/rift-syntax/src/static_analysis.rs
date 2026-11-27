@@ -483,6 +483,8 @@ pub struct StaticFactsParts {
     pub type_signatures: Vec<(ByteRange, bool)>,
     /// Simple parameters of functions, signatures and function types.
     pub parameters: Vec<StaticParameter>,
+    /// Bindings of written object and array parameters in JavaScript function values.
+    pub callback_pattern_parameters: Vec<StaticParameter>,
     /// Declaration names whose written type is a function type, with that type.
     pub function_types: Vec<(ByteRange, ByteRange)>,
     /// Function-like syntax and the named type its return annotation writes.
@@ -531,6 +533,8 @@ pub struct StaticFactsParts {
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
+    /// Named function and literal body for each written object branch of a conditional return.
+    pub returned_branch_objects: Vec<(ByteRange, ByteRange)>,
     /// Declared names whose initializer is an object literal that ends in a spread of a
     /// name, with that spread name: `const o = { a: 1, ...base }` gives `(o, base)`.
     pub spread_values: Vec<(ByteRange, ByteRange)>,
@@ -589,6 +593,8 @@ pub struct StaticFactsParts {
     pub python_receiver_reads: Vec<(ByteRange, ByteRange)>,
     /// Reads of Python variadic parameters paired with their declared names.
     pub python_variadic_reads: Vec<(ByteRange, ByteRange)>,
+    /// Plain reads that an enclosing Python comprehension may bind.
+    pub python_comprehension_reads: Vec<ByteRange>,
     /// Authored class fields for a possible generated Python initializer.
     pub python_initializers: Vec<StaticPythonInitializer>,
     /// The call and keyword name ranges of Python keyword arguments.
@@ -746,6 +752,12 @@ impl StaticFacts {
         &self.0.parameters
     }
 
+    /// Bindings that belong to a whole function value's parameter pattern.
+    #[must_use]
+    pub fn callback_pattern_parameters(&self) -> &[StaticParameter] {
+        &self.0.callback_pattern_parameters
+    }
+
     /// Declaration names whose written type is a function type, with that type.
     #[must_use]
     pub fn function_types(&self) -> &[(ByteRange, ByteRange)] {
@@ -894,6 +906,12 @@ impl StaticFacts {
         &self.0.returned_objects
     }
 
+    /// Authored conditional branches for declaration placement.
+    #[must_use]
+    pub fn returned_branch_objects(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.returned_branch_objects
+    }
+
     /// Names initialized by an object literal ending in a spread of a name, with that name.
     #[must_use]
     pub fn spread_values(&self) -> &[(ByteRange, ByteRange)] {
@@ -1032,6 +1050,12 @@ impl StaticFacts {
         &self.0.python_variadic_reads
     }
 
+    /// Plain reads that a Python comprehension may bind in one of its scopes.
+    #[must_use]
+    pub fn python_comprehension_reads(&self) -> &[ByteRange] {
+        &self.0.python_comprehension_reads
+    }
+
     /// The authored fields an initializer may expose as keyword arguments.
     #[must_use]
     pub fn python_initializers(&self) -> &[StaticPythonInitializer] {
@@ -1066,6 +1090,7 @@ impl StaticFacts {
             vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.type_signatures),
             vector_capacity(&self.0.parameters),
+            vector_capacity(&self.0.callback_pattern_parameters),
             vector_capacity(&self.0.function_types),
             vector_capacity(&self.0.return_types),
             vector_capacity(&self.0.function_contexts),
@@ -1088,6 +1113,7 @@ impl StaticFacts {
             vector_capacity(&self.0.object_members),
             vector_capacity(&self.0.body_members),
             vector_capacity(&self.0.returned_objects),
+            vector_capacity(&self.0.returned_branch_objects),
             vector_capacity(&self.0.spread_values),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
@@ -1115,6 +1141,7 @@ impl StaticFacts {
             vector_capacity(&self.0.python_captured_local_reads),
             vector_capacity(&self.0.python_receiver_reads),
             vector_capacity(&self.0.python_variadic_reads),
+            vector_capacity(&self.0.python_comprehension_reads),
             vector_capacity(&self.0.python_initializers),
             vector_capacity(&self.0.python_keyword_arguments),
             vector_capacity(&self.0.non_none_guards),
@@ -1157,6 +1184,7 @@ impl StaticFacts {
             self.declared_types().len(),
             self.type_signatures().len(),
             self.parameters().len(),
+            self.callback_pattern_parameters().len(),
             self.function_types().len(),
             self.return_types().len(),
             self.function_contexts().len(),
@@ -1179,6 +1207,7 @@ impl StaticFacts {
             self.object_members().len(),
             self.body_members().len(),
             self.returned_objects().len(),
+            self.returned_branch_objects().len(),
             self.spread_values().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
@@ -1206,6 +1235,7 @@ impl StaticFacts {
             self.python_captured_local_reads().len(),
             self.python_receiver_reads().len(),
             self.python_variadic_reads().len(),
+            self.python_comprehension_reads().len(),
             self.python_initializers().len(),
             self.python_keyword_arguments().len(),
             self.non_none_guards().len(),
@@ -1322,6 +1352,11 @@ impl StaticFacts {
     fn typed_values_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
         self.parameters().iter().all(|parameter| {
             valid(parameter.function) && valid(parameter.name) && parameter.owner.is_none_or(valid)
+        }) && self.callback_pattern_parameters().iter().all(|parameter| {
+            valid(parameter.function)
+                && valid(parameter.name)
+                && parameter.function.encloses(parameter.name)
+                && parameter.owner.is_none_or(valid)
         }) && self
             .function_types()
             .iter()
@@ -1396,6 +1431,10 @@ impl StaticFacts {
                 .iter()
                 .all(|(owner, object)| valid(*owner) && object.is_none_or(valid))
             && self
+                .returned_branch_objects()
+                .iter()
+                .all(|(owner, object)| valid(*owner) && valid(*object))
+            && self
                 .spread_values()
                 .iter()
                 .all(|(name, spread)| valid(*name) && valid(*spread))
@@ -1469,6 +1508,11 @@ impl StaticFacts {
         let rust = self.rust_rows_valid(&valid, limits);
         let flow = self.python_flow_valid(valid)
             && self.python_local_reads_valid(source, valid)
+            && self.python_comprehension_reads().iter().copied().all(valid)
+            && self
+                .python_comprehension_reads()
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
             && self.python_initializers_valid(valid, limits);
         if !(edges
             && references
@@ -1988,6 +2032,35 @@ mod python_local_read_tests {
         let mut inverted = original.0.clone();
         inverted.python_captured_local_reads[0] = (local[0], local[1]);
         assert!(StaticFacts::from_parts(source, SyntaxLimits::default(), inverted).is_err());
+    }
+
+    #[test]
+    fn test_python_comprehension_reads_restore_in_source_order() {
+        let source = "def collect(rows):\n    return [value for value in rows if value]\n";
+        let values = source
+            .match_indices("value")
+            .map(|(start, name)| ByteRange {
+                start: u64::try_from(start).expect("start"),
+                end: u64::try_from(start + name.len()).expect("end"),
+            })
+            .collect::<Vec<_>>();
+        let captured = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &rift_core::ProjectPath::new("collect.py").expect("path"),
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("authored Python source");
+        let facts = captured.facts().static_facts().expect("captured facts");
+        assert_eq!(facts.python_comprehension_reads(), [values[0], values[2]]);
+        let restored = StaticFacts::from_parts(source, SyntaxLimits::default(), facts.0.clone())
+            .expect("restored comprehension reads");
+        assert_eq!(&restored, facts);
+        let mut reversed = facts.0.clone();
+        reversed.python_comprehension_reads.reverse();
+        assert!(StaticFacts::from_parts(source, SyntaxLimits::default(), reversed).is_err());
     }
 
     #[test]
