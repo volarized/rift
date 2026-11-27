@@ -4677,7 +4677,7 @@ fn rust_captured_predicate_checks_globs_in_the_selected_inline_module_profile() 
         ("unguarded", "", GUARDED_FEATURE, false),
     ] {
         let chosen = format!(
-            "{header} mod nested {{ use super::*; }} #[derive(Debug)] pub struct Marker;\n{GUARDED_CHILD}"
+            "{header} mod nested {{ use super::*; macro_rules! local {{ () => {{}} }} }} #[derive(Debug)] pub struct Marker;\n{GUARDED_CHILD}"
         );
         let publication = guarded_macro_publication(
             &[
@@ -4688,6 +4688,83 @@ fn rust_captured_predicate_checks_globs_in_the_selected_inline_module_profile() 
                 ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
             ],
             flags,
+        );
+        assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
+    }
+}
+
+#[test]
+fn rust_captured_predicate_keeps_active_inline_imports_in_their_own_scope() {
+    let root = format!("{GUARDED_MACRO} pub mod branch; pub mod direct;");
+    let first = GUARDED_INVOCATION.replace(
+        "pub mod chosen;",
+        "pub mod chosen; pub use self::chosen::*;",
+    );
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let branch = format!("{first}{next}");
+    for (label, nested, expected) in [
+        (
+            "ordinary inline scope",
+            "mod nested { use super::*; }",
+            true,
+        ),
+        (
+            "selected inline scope",
+            "#[cfg(feature = \"checked\")] mod nested { use super::*; }",
+            true,
+        ),
+        (
+            "ordinary tests",
+            "mod nested { use super::*; #[test] fn check() { assert!(true); } }",
+            true,
+        ),
+        (
+            "unknown enclosing cfg",
+            "#[cfg(version(\"1.88\"))] mod nested { use super::*; }",
+            false,
+        ),
+        (
+            "enclosing transformer",
+            "#[custom] mod nested { use super::*; }",
+            false,
+        ),
+        (
+            "outer wildcard",
+            "use crate::direct::*; mod nested { use super::*; }",
+            false,
+        ),
+        (
+            "macro import",
+            "#[macro_use] mod nested { use super::*; macro_rules! imported { () => {} } }",
+            false,
+        ),
+        (
+            "macro export",
+            "mod nested { use super::*; #[macro_export] macro_rules! exported { () => {} } }",
+            false,
+        ),
+        (
+            "opaque item macro",
+            "mod nested { use super::*; unknown! {} }",
+            false,
+        ),
+        (
+            "opaque attribute",
+            "mod nested { use super::*; #[custom] fn check() {} }",
+            false,
+        ),
+    ] {
+        let chosen = format!("{nested} #[derive(Debug)] pub struct Marker;\n{GUARDED_CHILD}");
+        let test_profile = ["feature=\"checked\"", "test"];
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", &chosen),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            &test_profile,
         );
         assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
     }

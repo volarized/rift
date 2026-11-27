@@ -1,7 +1,7 @@
 //! Checks effects in complete original Rust scope ranges.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_syntax::ByteRange;
 
@@ -65,12 +65,18 @@ impl<'a> Tokens<'a> {
         if scopes.first().map(|(range, _)| *range) != Some(range) {
             return None;
         }
-        let inactive = match (selected, configuration) {
-            (Some(_), Some(configuration)) => result.inactive_modules(file, configuration)?,
+        let isolated = match (selected, configuration) {
+            (Some(_), Some(configuration)) => {
+                let mut isolated = result.inactive_modules(file, configuration)?;
+                isolated.extend(result.local_inline_modules(file, configuration)?);
+                isolated.sort_unstable();
+                isolated.dedup();
+                isolated
+            }
             _ => Vec::new(),
         };
         for (range, children) in scopes {
-            if within_inactive(&inactive, *range) {
+            if within_module(&isolated, *range) {
                 continue;
             }
             let Some(children) = children else {
@@ -86,7 +92,7 @@ impl<'a> Tokens<'a> {
             }
         }
         for (range, _, children) in file.syntax.macro_invocations()? {
-            if within_inactive(&inactive, *range) {
+            if within_module(&isolated, *range) {
                 continue;
             }
             if children.is_none() {
@@ -146,6 +152,81 @@ impl<'a> Tokens<'a> {
             }
         }
         Some(inactive.into_iter().collect())
+    }
+
+    fn local_inline_modules(
+        &self,
+        file: &SelectedFile<'_>,
+        configuration: &Configuration<'_>,
+    ) -> Option<Vec<ByteRange>> {
+        let Some(facts) = self.facts else {
+            return Some(Vec::new());
+        };
+        let symbols = file.syntax.symbols();
+        let scopes = file.syntax.scope()?;
+        let barriers = facts.rust_macro_barriers();
+        let definitions = facts.rust_macro_definitions();
+        self.charge(
+            symbols
+                .len()
+                .checked_add(scopes.len())?
+                .checked_add(barriers.len())?
+                .checked_add(definitions.len())?,
+        )?;
+        let complete_scopes = scopes
+            .iter()
+            .filter_map(|(range, children)| children.as_ref().map(|_| *range))
+            .collect::<BTreeSet<_>>();
+        let incomplete_scopes = scopes
+            .iter()
+            .filter_map(|(range, children)| children.is_none().then_some(*range))
+            .collect::<Vec<_>>();
+        let function_prefixes = symbols
+            .iter()
+            .filter(|symbol| symbol.syntax_element_kind == Some("function_item"))
+            .map(|symbol| (symbol.item_range, symbol.range.start))
+            .collect::<BTreeMap<_, _>>();
+        let mut effects = definitions
+            .iter()
+            .map(|definition| definition.item)
+            .collect::<BTreeSet<_>>();
+        for (item, scope) in barriers {
+            if !complete_scopes.contains(scope) {
+                continue;
+            }
+            let test_function = function_prefixes.get(item).is_some_and(|start| {
+                self.range(ByteRange {
+                    start: *start,
+                    end: item.start,
+                })
+                .is_some_and(|attributes| attributes == ["#", "[", "test", "]"])
+            });
+            if !test_function {
+                effects.insert(*item);
+            }
+        }
+        let mut modules = Vec::new();
+        for symbol in symbols.iter().filter(|symbol| {
+            symbol.container.is_none() && symbol.syntax_element_kind == Some("mod_item")
+        }) {
+            let Some(body) = symbol.body_range else {
+                continue;
+            };
+            // A nested inline module has its own import namespace. Only omit
+            // its checked scope from the enclosing derive proof, and keep any
+            // explicit macro declarations or possible module-level effects.
+            if complete_scopes.contains(&body)
+                && self.configured_item(symbol.item_range, Some(configuration)) == Some(true)
+                && self
+                    .charge(effects.len().checked_add(incomplete_scopes.len())?)
+                    .is_some()
+                && !incomplete_scopes.iter().any(|scope| body.encloses(*scope))
+                && !effects.iter().any(|effect| body.encloses(*effect))
+            {
+                modules.push(symbol.item_range);
+            }
+        }
+        Some(modules)
     }
 
     pub(super) fn range(&self, range: ByteRange) -> Option<Vec<&'a str>> {
@@ -268,40 +349,33 @@ impl<'a> Tokens<'a> {
         {
             return false;
         }
-        let Some(facts) = self.facts else {
-            return false;
-        };
+        self.configured_item(range, configuration).is_some()
+    }
+
+    fn configured_item(
+        &self,
+        range: ByteRange,
+        configuration: Option<&Configuration<'_>>,
+    ) -> Option<bool> {
+        let facts = self.facts?;
         let barriers = facts.rust_macro_barriers();
         let conditions = facts.conditional_items();
         // Outer attributes occupy separate syntax ranges. Check the bound
         // item ranges before treating the declaration as macro-inert.
-        if self
-            .charge(barriers.len().saturating_add(conditions.len()))
-            .is_none()
-            || barriers.iter().any(|(item, _)| *item == range)
-        {
-            return false;
+        self.charge(barriers.len().checked_add(conditions.len())?)?;
+        if barriers.iter().any(|(item, _)| *item == range) {
+            return None;
         }
-        conditions
-            .iter()
-            .filter(|item| item.range == range)
-            .all(|item| {
-                let Some(configuration) = configuration else {
-                    return false;
-                };
-                let Some(attribute) = self.range(item.attribute) else {
-                    return false;
-                };
-                let ["#", "[", "cfg", "(", predicate @ .., ")", "]"] = attribute.as_slice() else {
-                    return false;
-                };
-                predicate
-                    .len()
-                    .checked_mul(self.depth)
-                    .and_then(|work| self.charge(work))
-                    .is_some()
-                    && configuration.condition(predicate).is_some()
-            })
+        let mut admitted = true;
+        for item in conditions.iter().filter(|item| item.range == range) {
+            let attribute = self.range(item.attribute)?;
+            let ["#", "[", "cfg", "(", predicate @ .., ")", "]"] = attribute.as_slice() else {
+                return None;
+            };
+            self.charge(predicate.len().checked_mul(self.depth)?)?;
+            admitted &= configuration?.condition(predicate)?;
+        }
+        Some(admitted)
     }
 
     fn invocation_names(&mut self, range: ByteRange, captured: Option<&str>) -> Option<()> {
@@ -1223,9 +1297,9 @@ fn identifier(input: &mut &[&str]) -> Option<String> {
     Some(name)
 }
 
-fn within_inactive(inactive: &[ByteRange], range: ByteRange) -> bool {
-    let end = inactive.partition_point(|module| module.start <= range.start);
-    inactive[..end]
+fn within_module(isolated: &[ByteRange], range: ByteRange) -> bool {
+    let end = isolated.partition_point(|module| module.start <= range.start);
+    isolated[..end]
         .last()
         .is_some_and(|module| module.encloses(range))
 }
