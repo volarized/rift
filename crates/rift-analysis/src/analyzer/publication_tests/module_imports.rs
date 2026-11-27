@@ -6989,3 +6989,66 @@ fn written_argument_properties_keep_the_same_callback_without_a_call_target() {
     );
     assert_eq!(resolved, unresolved);
 }
+
+#[test]
+fn typescript_enum_members_keep_references_at_their_written_qualifiers() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const SOURCE: &str = concat!(
+        "import { Status as State, Details } from './codes.js';\n",
+        "export type Report = State.Ready | State.Waiting;\n",
+        "export type UnknownMember = State.Missing;\n",
+        "export type UnknownEnum = Other.Ready;\n",
+        "export type Detail = Details.Leaf;\n",
+    );
+    const TARGET: &str = concat!(
+        "export declare enum Status { Ready = 1, Waiting = 2 }\n",
+        "export declare namespace Details { type Leaf = number; }\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE), ("codes.d.ts", TARGET)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("retained source");
+    let qualifiers = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::References])
+        .filter_map(|edge| {
+            let site = edge.occurrence.as_ref()?;
+            (site.unit == unit.unit).then_some((
+                edge.from.as_str(),
+                edge.to.as_str(),
+                site.range.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(qualifiers.len(), 2);
+    for (member, target) in [("State.Ready", "/Ready"), ("State.Waiting", "/Waiting")] {
+        let start = SOURCE.find(member).expect("written type");
+        let range = module_runtime_range(start, "State");
+        assert!(qualifiers.iter().any(|(from, to, site)| {
+            from.ends_with("/Report") && to.ends_with("codes.d.ts/Status") && *site == range
+        }));
+        let range = module_runtime_range(start, member);
+        let target = format!("codes.d.ts/Status{target}");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::HasType]
+                && edge.from.as_str().ends_with("/Report")
+                && edge.to.as_str().ends_with(&target)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit.unit && site.range == range)
+        }));
+    }
+}
