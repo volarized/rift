@@ -1977,6 +1977,66 @@ fn non_entry_literal_properties_keep_uniquely_named_descendants() {
 }
 
 #[test]
+fn object_elements_of_a_written_call_array_keep_distinct_property_declarations() {
+    const SOURCE: &str = concat!(
+        "function keep(label, value) { return value; }\n",
+        "export function build(key) {\n",
+        "  keep('slots', [{ tag: 'first' }, { tag: 'second' }]);\n",
+        "  const rows = [{ tag: 'third' }, { tag: 'fourth' }];\n",
+        "  keep('control', rows);\n",
+        "  keep('computed', [{ [key]: 'other' }]);\n",
+        "}\n",
+    );
+    let analyzed = non_entry_lexical_binding_analysis(SOURCE, 128);
+    let graph = analyzed.publication();
+    graph.validate_facts().expect("written call array");
+    let mut seen = BTreeSet::new();
+    for value in ["first", "second", "third", "fourth"] {
+        let written = format!("tag: '{value}'");
+        let start = SOURCE.find(&written).expect("authored array slot");
+        let declaration = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, &written))
+            .expect("checked property declaration");
+        assert!(seen.insert(&declaration.symbol));
+    }
+    let computed = "[key]: 'other'";
+    let computed_start = SOURCE.find(computed).expect("written computed property");
+    let mut computed_rows = graph
+        .declarations
+        .iter()
+        .filter(|row| row.source == computed);
+    let retained = computed_rows.next().expect("existing computed property");
+    assert!(computed_rows.next().is_none());
+    assert!(retained.symbol.as_str().ends_with("/build/%5Bkey%5D"));
+    assert_eq!(
+        retained.range,
+        module_runtime_range(computed_start, computed)
+    );
+    let call = "keep('slots', [{ tag: 'first' }, { tag: 'second' }])";
+    let start = SOURCE.find(call).expect("written array call");
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/build")
+            && edge.to.as_str().ends_with("/keep")
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.range == module_runtime_range(start, call)
+                    && site.unit.0.ends_with("/reader.mjs")
+            })
+    }));
+    let capped = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(capped.publication().declarations, graph.declarations);
+    assert!(
+        capped
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| graph.edges.contains(edge))
+    );
+}
+
+#[test]
 fn npm_javascript_callbacks_keep_physical_parameters_and_reads() {
     const SOURCE: &str = concat!(
         "export function map(values) {\n",

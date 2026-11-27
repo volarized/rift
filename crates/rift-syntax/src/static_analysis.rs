@@ -179,7 +179,8 @@ pub struct StaticBodyMember {
     pub body: ByteRange,
     /// Syntax element holding the whole literal or class after reading through parentheses,
     /// assertions and annotations. For a property with consecutive array elements, the
-    /// containing array is the property's whole value.
+    /// containing array is the property's whole value. For direct object elements of an
+    /// array written as a call argument, the call's argument list holds their array.
     pub holder: ByteRange,
 }
 

@@ -716,6 +716,17 @@ impl Kinds {
         if holder.syntax_element().kind() != "array" {
             return holder;
         }
+        if let Some(arguments) = holder.parent().filter(|arguments| {
+            let node = arguments.syntax_element();
+            node.kind() == "arguments"
+                && arguments.parent().is_some_and(|parent| {
+                    let call = parent.syntax_element();
+                    call.kind() == "call_expression"
+                        && call.child_by_field_name("arguments") == Some(node)
+                })
+        }) {
+            return arguments;
+        }
         let mut array = holder;
         while let Some(parent) = array
             .parent()
