@@ -5171,3 +5171,93 @@ fn npm_package_imports_keep_runtime_calls_and_declared_type_ranges() {
         assert_eq!(type_uses, usize::from(typescript) * 2, "{manifest}");
     }
 }
+
+#[test]
+fn typescript_declared_function_type_parameters_keep_physical_signature_uses() {
+    const SOURCE: &str = concat!(
+        "declare function plain<T>(value: T): T;\n",
+        "export { plain };\n",
+        "export declare function choose<Value>(value: Value[]): Value;\n",
+        "export declare function choose<Value>(value: Value): Value;\n",
+        "export declare function own<Type>(value: Type): Type;\n",
+        "export declare function ambiguous<U, U>(value: U): U;\n",
+    );
+    const IMPLEMENTATION: &str = "export function implemented<T>(value: T): T { return value; }\n";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE), ("complete.ts", IMPLEMENTATION)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("checked declared signatures");
+    let found = result.publication();
+    found.validate_facts().expect("checked ranges and targets");
+    let index = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("declaration unit")
+        .unit;
+    let mut identities = BTreeSet::new();
+    let mut line_start = 0;
+    for (line, (owner, name)) in SOURCE.lines().zip([
+        ("plain", "T"),
+        ("", ""),
+        ("choose", "Value"),
+        ("choose", "Value"),
+        ("own", "Type"),
+    ]) {
+        if !owner.is_empty() {
+            let declaration = format!("{owner}<{name}>");
+            let start =
+                line_start + line.find(&declaration).expect("written owner") + owner.len() + 1;
+            let row = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == *index
+                        && row.source == name
+                        && row.range == module_runtime_range(start, name)
+                })
+                .expect("written type parameter in declared signature");
+            assert!(identities.insert(&row.symbol));
+            let expected = line
+                .match_indices(name)
+                .skip(1)
+                .map(|(offset, _)| {
+                    let range = module_runtime_range(line_start + offset, name);
+                    (range.start, range.end)
+                })
+                .collect::<BTreeSet<_>>();
+            let actual = found
+                .edges
+                .iter()
+                .filter_map(|edge| {
+                    let site = edge.occurrence.as_ref()?;
+                    (edge.to == row.symbol
+                        && edge.kinds == [EdgeKind::HasType]
+                        && edge.from.as_str().ends_with(&format!("/{owner}"))
+                        && site.unit == *index)
+                        .then_some((site.range.start, site.range.end))
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "{line}");
+        }
+        line_start += line.len() + 1;
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/implemented/T"))
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| row.source != "U" || row.unit != *index)
+    );
+}

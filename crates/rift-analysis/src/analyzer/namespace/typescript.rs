@@ -1565,6 +1565,7 @@ fn supplemental_parameter_scope(symbol: &SyntaxSymbol) -> Option<&str> {
         || symbol.is_javascript_shorthand_parameter()
         || symbol.is_typescript_callable_type_parameter()
         || symbol.is_typescript_signature_type_parameter()
+        || symbol.is_typescript_declared_signature_type_parameter()
         || symbol.is_typescript_index_signature_parameter()
     {
         symbol

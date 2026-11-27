@@ -53,3 +53,8 @@ pub(super) fn method(kind: &str) -> bool {
 pub(super) fn function(kind: &str) -> bool {
     kind == super::FUNCTION_DECLARATION_KIND
 }
+
+/// A named function's declaration signature, including overloads.
+pub(super) fn declared_signature(kind: &str) -> bool {
+    kind == super::FUNCTION_SIGNATURE_KIND
+}

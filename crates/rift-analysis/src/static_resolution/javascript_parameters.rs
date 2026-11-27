@@ -34,21 +34,11 @@ pub(super) enum ScopedParameterReads {
     TypeScriptDestructured,
     JavaScriptCallbackPattern,
     TypeScriptSignatureType,
+    TypeScriptDeclaredSignatureType,
 }
 
 impl ScopedParameterReads {
-    pub(super) const COUNT: usize = Self::TypeScriptSignatureType as usize + 1;
-}
-
-#[derive(Clone, Copy)]
-enum CheckedParameterReads {
-    TypeScriptType,
-    JavaScriptWrapped,
-    JavaScriptDestructured,
-    TypeScriptMethodType,
-    TypeScriptFunctionType,
-    TypeScriptDestructured,
-    TypeScriptSignatureType,
+    pub(super) const COUNT: usize = Self::TypeScriptDeclaredSignatureType as usize + 1;
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -123,63 +113,15 @@ impl<'source> Index<'source> {
                 &file.javascript_shorthand_parameters,
                 &mut result.deferred_javascript_shorthand_parameters,
             ),
-            ScopedParameterReads::TypeScriptType => {
-                self.checked_parameter_uses(
-                    file,
-                    CheckedParameterReads::TypeScriptType,
-                    work,
-                    result,
-                );
-                return;
-            }
-            ScopedParameterReads::JavaScriptWrapped => {
-                self.checked_parameter_uses(
-                    file,
-                    CheckedParameterReads::JavaScriptWrapped,
-                    work,
-                    result,
-                );
-                return;
-            }
-            ScopedParameterReads::JavaScriptDestructured => {
-                self.checked_parameter_uses(
-                    file,
-                    CheckedParameterReads::JavaScriptDestructured,
-                    work,
-                    result,
-                );
-                return;
-            }
-            ScopedParameterReads::TypeScriptMethodType => {
-                self.checked_parameter_uses(
-                    file,
-                    CheckedParameterReads::TypeScriptMethodType,
-                    work,
-                    result,
-                );
-                return;
-            }
-            ScopedParameterReads::TypeScriptFunctionType => {
-                self.checked_parameter_uses(
-                    file,
-                    CheckedParameterReads::TypeScriptFunctionType,
-                    work,
-                    result,
-                );
-                return;
-            }
-            ScopedParameterReads::TypeScriptDestructured => {
-                self.checked_parameter_uses(
-                    file,
-                    CheckedParameterReads::TypeScriptDestructured,
-                    work,
-                    result,
-                );
-                return;
-            }
-            ScopedParameterReads::TypeScriptSignatureType => {
-                let checked = CheckedParameterReads::TypeScriptSignatureType;
-                self.checked_parameter_uses(file, checked, work, result);
+            ScopedParameterReads::TypeScriptType
+            | ScopedParameterReads::JavaScriptWrapped
+            | ScopedParameterReads::JavaScriptDestructured
+            | ScopedParameterReads::TypeScriptMethodType
+            | ScopedParameterReads::TypeScriptFunctionType
+            | ScopedParameterReads::TypeScriptDestructured
+            | ScopedParameterReads::TypeScriptSignatureType
+            | ScopedParameterReads::TypeScriptDeclaredSignatureType => {
+                self.checked_parameter_uses(file, class, work, result);
                 return;
             }
         };
@@ -201,46 +143,52 @@ impl<'source> Index<'source> {
     fn checked_parameter_uses(
         &self,
         file: &File<'source>,
-        class: CheckedParameterReads,
+        class: ScopedParameterReads,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
         let (role, parameters, pending) = match class {
-            CheckedParameterReads::TypeScriptType => (
+            ScopedParameterReads::TypeScriptType => (
                 ReferenceRole::Type,
                 &file.typescript_type_parameters,
                 &mut result.deferred_typescript_type_parameters,
             ),
-            CheckedParameterReads::JavaScriptWrapped => (
+            ScopedParameterReads::JavaScriptWrapped => (
                 ReferenceRole::Read,
                 &file.javascript_wrapped_parameters,
                 &mut result.deferred_javascript_wrapped_parameters,
             ),
-            CheckedParameterReads::JavaScriptDestructured => (
+            ScopedParameterReads::JavaScriptDestructured => (
                 ReferenceRole::Read,
                 &file.javascript_destructured_parameters,
                 &mut result.deferred_javascript_destructured_parameters,
             ),
-            CheckedParameterReads::TypeScriptMethodType => (
+            ScopedParameterReads::TypeScriptMethodType => (
                 ReferenceRole::Type,
                 &file.typescript_method_type_parameters,
                 &mut result.deferred_typescript_method_type_parameters,
             ),
-            CheckedParameterReads::TypeScriptFunctionType => (
+            ScopedParameterReads::TypeScriptFunctionType => (
                 ReferenceRole::Type,
                 &file.typescript_function_type_parameters,
                 &mut result.deferred_typescript_function_type_parameters,
             ),
-            CheckedParameterReads::TypeScriptDestructured => (
+            ScopedParameterReads::TypeScriptDestructured => (
                 ReferenceRole::Read,
                 &file.typescript_destructured_parameters,
                 &mut result.deferred_typescript_destructured_parameters,
             ),
-            CheckedParameterReads::TypeScriptSignatureType => (
+            ScopedParameterReads::TypeScriptSignatureType => (
                 ReferenceRole::Type,
                 &file.typescript_signature_type_parameters,
                 &mut result.deferred_typescript_signature_type_parameters,
             ),
+            ScopedParameterReads::TypeScriptDeclaredSignatureType => (
+                ReferenceRole::Type,
+                &file.typescript_declared_signature_type_parameters,
+                &mut result.deferred_typescript_declared_signature_type_parameters,
+            ),
+            _ => return,
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -269,7 +217,28 @@ impl<'source> Index<'source> {
         let name = file.text(range)?;
         let binding = js_binding(file, &self.javascript, name, range.start, role, work)?;
         let symbol = *parameters.get(&binding.name)?;
-        let owner = file.qualified_target(symbol.container.as_deref()?)?;
+        let container = symbol.container.as_deref()?;
+        let owner = if symbol.is_typescript_declared_signature_type_parameter() {
+            let mut matches = file
+                .by_qualified_name
+                .get(container)?
+                .iter()
+                .copied()
+                .filter(|owner| {
+                    owner.item_range == binding.scope
+                        && owner.syntax_element_kind == Some("function_signature")
+                });
+            let owner = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Target {
+                file: file.document,
+                symbol: owner,
+            }
+        } else {
+            file.qualified_target(container)?
+        };
         let scope_matches = if symbol.is_typescript_signature_type_parameter() {
             owner.symbol.item_range.encloses(binding.scope)
                 && binding.scope.encloses(symbol.item_range)
