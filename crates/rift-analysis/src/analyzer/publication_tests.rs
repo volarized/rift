@@ -656,3 +656,58 @@ fn a_selected_python_script_under_an_import_root_retains_its_written_path() {
         );
     }
 }
+
+#[test]
+fn unaliased_python_imports_agree_on_their_package_root() {
+    use rift_protocol::read::EdgeKind;
+
+    const CHECKED: &str = concat!(
+        "import demo\nimport demo.parts\nimport demo.other\n",
+        "def read(value: demo.parts.Item):\n",
+        "    demo.top()\n    return demo.parts.Item()\n",
+        "def shadowed(demo):\n    return demo.parts.Item()\n",
+    );
+    const ALIASED: &str =
+        "import demo\nimport demo.parts as demo\ndef read():\n    return demo.top()\n";
+    const ASSIGNED: &str =
+        "import demo\nimport demo.parts\ndemo = 1\ndef read():\n    return demo.top()\n";
+    let files = [
+        ("demo/__init__.py", "def top(): return 1\n"),
+        ("demo/parts.py", "class Item: pass\n"),
+        ("demo/other.py", "def other(): return 2\n"),
+        ("demo/checked.py", CHECKED),
+        ("demo/aliased.py", ALIASED),
+        ("demo/assigned.py", ASSIGNED),
+    ];
+    let result = publication(&files, None, &["demo"]);
+    let targets = |path: &str, kind: EdgeKind| {
+        let unit = &result
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("source")
+            .unit;
+        result.edges.iter().filter(move |edge| {
+            edge.kinds == [kind]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| &site.unit == unit)
+        })
+    };
+    let expected = ["/demo/top", "/demo/parts/Item"];
+    let calls = targets("demo/checked.py", EdgeKind::Calls).collect::<Vec<_>>();
+    assert_eq!(calls.len(), expected.len());
+    for suffix in expected {
+        assert!(calls.iter().any(|edge| edge.to.as_str().ends_with(suffix)));
+    }
+    assert!(
+        targets("demo/checked.py", EdgeKind::HasType)
+            .any(|edge| edge.to.as_str().ends_with("/demo/parts/Item"))
+    );
+    for path in ["demo/aliased.py", "demo/assigned.py"] {
+        assert!(
+            !targets(path, EdgeKind::Calls).any(|edge| edge.to.as_str().ends_with("/demo/top"))
+        );
+    }
+}

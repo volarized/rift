@@ -1,4 +1,4 @@
-//! Selects one runtime implementation after validated overload signatures.
+//! Imports and overloads that bind one name in a Python scope.
 
 use rift_syntax::{PythonOverload, StaticBinding, StaticBindingKind};
 
@@ -12,6 +12,15 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
         let bindings = bindings.collect::<Vec<_>>();
+        if let [first, rest @ ..] = bindings.as_slice()
+            && !rest.is_empty()
+            && let Some(root) = unaliased_import_root(file, first)
+            && rest
+                .iter()
+                .all(|binding| work.charge() && unaliased_import_root(file, binding) == Some(root))
+        {
+            return Some(first);
+        }
         if let Some(class) = super::rebinding::python_class_rebinding(file, &bindings, work) {
             return Some(class);
         }
@@ -92,5 +101,25 @@ impl<'source> Index<'source> {
                     module: *module,
                     export: *imported,
                 }
+    }
+}
+
+/// The first package component that an import without an alias binds.
+fn unaliased_import_root<'source>(
+    file: &File<'source>,
+    binding: &StaticBinding,
+) -> Option<&'source str> {
+    let name = file.text(binding.name)?;
+    match binding.kind {
+        StaticBindingKind::PythonImport {
+            module,
+            export: None,
+        } if module == binding.name => Some(name),
+        StaticBindingKind::PythonModule { module }
+            if file.text(module)?.strip_prefix(name)?.starts_with('.') =>
+        {
+            Some(name)
+        }
+        _ => None,
     }
 }
