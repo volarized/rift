@@ -4845,8 +4845,11 @@ dependencies = [
 name = "rift-collect"
 version = "0.0.104"
 dependencies = [
+ "lsp-types",
  "rift-core",
+ "rift-error",
  "rift-lsp",
+ "rift-syntax",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -5205,8 +5208,10 @@ dependencies = [
  "tree-sitter-css",
  "tree-sitter-cython",
  "tree-sitter-html",
+ "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-json",
+ "tree-sitter-kotlin-ng",
  "tree-sitter-md",
  "tree-sitter-python",
  "tree-sitter-rust",
@@ -7020,6 +7025,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-javascript"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7036,6 +7051,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d727acca406c0020cffc6cf35516764f36c8e3dc4408e5ebe2cb35a947ec471"
 dependencies = [
  "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-kotlin-ng"
+version = "1.1.0+rift.1"
+dependencies = [
+ "cc",
+ "flate2",
  "tree-sitter-language",
 ]
 

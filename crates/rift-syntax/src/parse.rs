@@ -4,7 +4,7 @@ use crate::extract::{self, GrammarRules};
 use crate::{SyntaxDocument, SyntaxLimits, SyntaxSource};
 use rift_error::{RiftError, errors};
 use rift_protocol::read::Language;
-use tree_sitter::{Language as Grammar, Parser, Range};
+use tree_sitter::{Language as Grammar, Parser, Range, Tree};
 
 pub(crate) fn document(
     source: SyntaxSource<'_>,
@@ -14,6 +14,26 @@ pub(crate) fn document(
     rules: &dyn GrammarRules,
     included: &[Range],
 ) -> Result<SyntaxDocument, RiftError> {
+    let tree = tree(source, limits, grammar, included)?;
+    let (syntax_elements, symbols) =
+        extract::extract(tree.root_node(), source, limits, language, rules)?;
+    Ok(SyntaxDocument::new(
+        language.clone(),
+        source.path.clone(),
+        syntax_elements,
+        symbols,
+        tree.root_node().has_error(),
+    )
+    .with_source_witness(source.text)
+    .with_syntax_limits(limits))
+}
+
+pub(crate) fn tree(
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    grammar: &Grammar,
+    included: &[Range],
+) -> Result<Tree, RiftError> {
     limits.admit_source(source)?;
     let mut parser = Parser::new();
     parser.set_language(grammar).map_err(|_| {
@@ -26,20 +46,9 @@ pub(crate) fn document(
     parser
         .set_included_ranges(included)
         .map_err(|_| errors::syntax::facts_range_invalid().error())?;
-    let tree = parser
+    parser
         .parse(source.text, None)
-        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-    let (syntax_elements, symbols) =
-        extract::extract(tree.root_node(), source, limits, language, rules)?;
-    Ok(SyntaxDocument::new(
-        language.clone(),
-        source.path.clone(),
-        syntax_elements,
-        symbols,
-        tree.root_node().has_error(),
-    )
-    .with_source_witness(source.text)
-    .with_syntax_limits(limits))
+        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())
 }
 
 pub(crate) fn kind(grammar: &Grammar, name: &str) -> u16 {

@@ -37,7 +37,7 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 77] = [
+const ANALYZED_SOURCES: [&str; 85] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
     "crates/rift-dependency/src",
@@ -65,6 +65,14 @@ const ANALYZED_SOURCES: [&str; 77] = [
     "vendor/tree-sitter-angular/src/tree_sitter/array.h",
     "vendor/tree-sitter-angular/src/tree_sitter/parser.h",
     "vendor/tree-sitter-angular/src/tree_sitter/html.parser.h",
+    "vendor/tree-sitter-kotlin-ng/Cargo.toml",
+    "vendor/tree-sitter-kotlin-ng/bindings/rust",
+    "vendor/tree-sitter-kotlin-ng/grammar.js",
+    "vendor/tree-sitter-kotlin-ng/src/node-types.json",
+    "vendor/tree-sitter-kotlin-ng/src/parser.c.gz",
+    "vendor/tree-sitter-kotlin-ng/src/scanner.c",
+    "vendor/tree-sitter-kotlin-ng/src/tree_sitter/parser.h",
+    "vendor/tree-sitter-kotlin-ng/tree-sitter.json",
     "vendor/tree-sitter-python/Cargo.toml",
     "vendor/tree-sitter-python/bindings/rust",
     "vendor/tree-sitter-python/grammar.js",
@@ -173,9 +181,11 @@ pub fn render_analyzer_manifest(root: &Path) -> Result<String, ManifestError> {
     for named in ANALYZED_SOURCES {
         let found = analyzed_files(root, named, &mut examined)?;
         for relative in found {
-            let text = read_text(&root.join(&relative))?;
+            let path = root.join(&relative);
+            let bytes =
+                fs::read(&path).map_err(|source| ManifestError::Unreadable { path, source })?;
             sources.push(SourcePin {
-                digest: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
+                digest: data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes)),
                 path: relative,
             });
         }
@@ -456,6 +466,8 @@ mod tests {
             "vendor/tree-sitter-angular/src/scanner.c",
             "vendor/tree-sitter-angular/src/node-types.json",
             "vendor/tree-sitter-angular/bindings/rust/lib.rs",
+            "vendor/tree-sitter-kotlin-ng/src/parser.c.gz",
+            "vendor/tree-sitter-kotlin-ng/src/scanner.c",
             "vendor/tree-sitter-python/bindings/rust/lib.rs",
             "vendor/tree-sitter-python/grammar.js",
             "vendor/tree-sitter-python/src/parser.c",
@@ -612,7 +624,12 @@ checksum = \"def\"\n";
             } else {
                 path
             };
-            std::fs::write(path, "changed grammar input").expect("changed vendor input");
+            let bytes: &[u8] = if path.extension().is_some_and(|extension| extension == "gz") {
+                b"\x1f\x8b"
+            } else {
+                b"changed grammar input"
+            };
+            std::fs::write(path, bytes).expect("changed vendor input");
             let current = super::render_analyzer_manifest(root.path()).expect("manifest");
             assert_ne!(previous, current, "{source} must invalidate syntax reuse");
             previous = current;

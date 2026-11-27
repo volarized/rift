@@ -1342,6 +1342,11 @@ The registry itself assembles from one shipped definition list in `rift-syntax`:
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
 
+Java and Kotlin use separate grammars for `.java`, `.kt`, and `.kts` files. Declarations keep their
+names, package and enclosing type, and authored byte ranges. The syntax collector also records the
+names at call, reference, and import sites. A language engine can use those positions to resolve
+targets in the admitted source inventory.
+
 <VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
 
 HTML preserves elements, attributes, and source references as syntax elements. CSS publishes
@@ -1549,6 +1554,9 @@ Python packages include Cython sources. A C++ package selects `.h` as C++, and a
 selects `.html` and `.htm` as `html:angular`. Ordinary workspace selection keeps `.h` as C and
 `.html` as HTML.
 
+Java and Kotlin package inputs select both languages, including Kotlin scripts. The file extension
+selects each source's grammar.
+
 `ExactPackageInput::with_framework_context` adds captured metadata and explicit framework
 selections. Selected sources already belong to context. Additional metadata paths must be
 distinct. The combined sources share package file and aggregate byte bounds. Metadata informs
@@ -1574,6 +1582,10 @@ A declaration counts as public by its language's rule:
 
 - Rust - `pub` declarations, and the items of a `pub` trait and the variants of a `pub` enum
 - Python - names without a leading underscore
+- Java - public and protected declarations, plus implicitly public members such as interface
+  methods and record components
+- Kotlin - declarations with public or protected visibility, including declarations that are
+  public by default
 - TypeScript - every member but `private` and `protected` ones
 - JavaScript - the declarations an `export` wraps or names, including `module.exports` and
   `exports.name` assignments, `Object.defineProperty(exports, "name", ..)`, and the members of an

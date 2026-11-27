@@ -12,6 +12,7 @@
 mod bun;
 mod cargo;
 mod context;
+mod jvm;
 mod manifest;
 mod node;
 mod npm;
@@ -29,6 +30,7 @@ pub use context::{
     ContextAnswer, Degradation, Degraded, DependencyContext, EnvironmentObservation, InstallFolder,
     InstallLocation, resolve_context,
 };
+pub use jvm::{JvmBuildFile, JvmBuildSystem};
 pub use node::node_package_dependencies;
 pub use npm::{NpmResolver, npm_package_versions};
 pub use resolver::{

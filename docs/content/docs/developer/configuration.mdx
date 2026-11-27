@@ -739,6 +739,17 @@ Python selects the [embedded engine](#language-engines) the build carries, with
 `--lsp-embedded=ty`. For any other language, a missing executable leaves the recommendation
 unavailable.
 
+For Java and Kotlin, Rift recognizes Maven by `pom.xml` and Gradle by `settings.gradle`,
+`settings.gradle.kts`, `build.gradle`, or `build.gradle.kts`. A Gradle settings file sets the
+project root for its subprojects. Detection uses visible paths without running either build tool.
+
+Rift recommends the installed `jdtls` executable for Java and `kotlin-lsp` for Kotlin. The apply
+command writes an explicit LSP command with a project-specific state directory. The selected
+server imports the Maven or Gradle project when it starts. Install Maven for Kotlin projects
+that the Kotlin Language Server imports through `mvn`.
+[Eclipse JDT Language Server](https://github.com/eclipse-jdtls/eclipse.jdt.ls#installation),
+[Kotlin Language Server](https://kotlinlang.org/docs/kotlin-lsp.html#feedback).
+
 The recommendation command reads each directly registered project's own configuration and
 visible files. Registered names must resolve to distinct directories, each different from the
 primary project root.
