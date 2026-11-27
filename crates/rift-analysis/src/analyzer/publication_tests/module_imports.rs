@@ -3702,3 +3702,50 @@ fn typescript_typed_patterns_keep_bindings_apart_from_the_written_type() {
         );
     }
 }
+
+#[test]
+fn returned_literals_keep_proved_properties_when_a_same_named_owner_is_opaque() {
+    const SOURCE: &str = concat!(
+        "function inspect(value) { return value; }\n",
+        "export function build(first, second) {\n",
+        "  if (first) return { status: 'initial' };\n",
+        "  inspect(second ? { status: 'opaque' } : null);\n",
+        "  return { status: 'last' };\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 48);
+    let found = analysis.publication();
+    found.validate_facts().expect("proved returned properties");
+    let properties = ["status: 'initial'", "status: 'last'"].map(|written| {
+        let start = SOURCE.find(written).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("placed property");
+        assert!(!row.public);
+        assert!(row.symbol.as_str().contains("/build/status%23"));
+        row.symbol.clone()
+    });
+    assert_ne!(properties[0], properties[1]);
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| row.source != "status: 'opaque'")
+    );
+    assert!(found.edges.iter().any(|row| {
+        row.kinds == [EdgeKind::Calls]
+            && row.from.as_str().ends_with("/build")
+            && row.to.as_str().ends_with("/inspect")
+    }));
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}

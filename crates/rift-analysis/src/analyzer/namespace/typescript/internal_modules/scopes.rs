@@ -289,14 +289,12 @@ impl<'source> FileScopes<'source> {
             let mut groups = BTreeMap::<ByteRange, Vec<usize>>::new();
             for declaration in declarations {
                 let Some(row) = self.body_members.get(&declaration.item_range) else {
-                    groups.clear();
-                    break;
+                    continue;
                 };
                 if self.of(declaration, file) != Scope::Body(row.body, false)
                     || !owners.proves_body(declaration, row)
                 {
-                    groups.clear();
-                    break;
+                    continue;
                 }
                 groups
                     .entry(row.body)
