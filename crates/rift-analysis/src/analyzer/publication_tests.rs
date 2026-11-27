@@ -918,3 +918,80 @@ fn assert_python_property_receiver_priority(
     assert_eq!(limited.declarations, prior_declarations);
     assert_eq!(limited.edges, prior_edges);
 }
+
+#[test]
+fn python_annotations_keep_their_checked_root_module_tokens() {
+    use rift_protocol::read::EdgeKind;
+
+    const SOURCE: &str = concat!(
+        "import demo.members\n",
+        "class Child(demo.members.Item):\n    pass\n",
+        "def read(value: demo.members.Item) -> demo.members.Item:\n",
+        "    return demo.members.Item()\n",
+        "def shadowed(demo):\n    item: demo.members.Item\n    return item\n",
+    );
+    const ROOT: &str = "rift://symbol/pypi/pypi.org/click/python/demo";
+    const TYPE: &str = "rift://symbol/pypi/pypi.org/click/python/demo/members/Item";
+    let files = [
+        ("demo/__init__.py", ""),
+        ("demo/members.py", "class Item: pass\n"),
+        ("demo/reader.py", SOURCE),
+    ];
+    let sites = SOURCE
+        .match_indices("demo.members.Item")
+        .map(|(start, _)| u64::try_from(start).expect("source offset"))
+        .collect::<Vec<_>>();
+    let complete = publication(&files, None, &["demo"]);
+    let unit = &complete
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "demo/reader.py")
+        .expect("checked reader source")
+        .unit;
+    let mut roots = complete
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let occurrence = edge.occurrence.as_ref()?;
+            (edge.to.as_str() == ROOT
+                && edge.kinds == [EdgeKind::Reads]
+                && &occurrence.unit == unit)
+                .then_some(&occurrence.range)
+        })
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|range| range.start);
+    assert_eq!(roots.len(), 4);
+    for (range, start) in roots.into_iter().zip(&sites[..4]) {
+        assert_eq!((range.start, range.end), (*start, start + 4));
+    }
+    for kind in [EdgeKind::Calls, EdgeKind::HasType, EdgeKind::Extends] {
+        assert!(
+            complete
+                .edges
+                .iter()
+                .any(|edge| edge.to.as_str() == TYPE && edge.kinds == [kind])
+        );
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.to.as_str() != ROOT
+                || edge.kinds != [EdgeKind::Reads]
+                || edge.occurrence.as_ref().is_none_or(|site| {
+                    &site.unit != unit || !sites[..3].contains(&site.range.start)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(prior.len() + 2),
+    );
+    assert!(prior.iter().all(|edge| limited.edges.contains(edge)));
+    assert!(limited.edges.len() < complete.edges.len());
+    assert_eq!(limited.declarations, complete.declarations);
+}

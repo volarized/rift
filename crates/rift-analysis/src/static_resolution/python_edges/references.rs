@@ -160,6 +160,33 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Resolves the written first module segment of a checked type path.
+    pub(in crate::static_resolution) fn resolve_python_annotation_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_annotation_qualifier_start = Some(result.occurrences.len());
+        for file in self.python_files() {
+            for reference in file
+                .facts
+                .references()
+                .iter()
+                .filter(|reference| reference.role == ReferenceRole::Type)
+            {
+                if !work.charge() {
+                    return;
+                }
+                if let Some(root) = first_module_segment(file, reference.target)
+                    && let Some(qualifier) = self.python_member_module_qualifier(file, root, work)
+                    && self.python_type(file, reference.target, work).is_some()
+                {
+                    result.record(Some(qualifier));
+                }
+            }
+        }
+    }
+
     /// An access belongs to the enclosing callable, an annotation to its declaration.
     pub(super) fn python_access(
         &self,
@@ -255,6 +282,18 @@ impl<'source> Index<'source> {
         occurrence.edge_from = Some(self.python_identity(file, range, from)?);
         Some(occurrence)
     }
+}
+
+fn first_module_segment(file: &File<'_>, range: ByteRange) -> Option<ByteRange> {
+    let (first, tail) = file.text(range)?.split_once('.')?;
+    let first = first.trim_end();
+    if !tail.contains('.') || !rift_protocol::index::python_identifier_is_valid(first) {
+        return None;
+    }
+    Some(ByteRange {
+        start: range.start,
+        end: range.start.checked_add(u64::try_from(first.len()).ok()?)?,
+    })
 }
 
 /// The callees whose calls in one file have a target, with the declaration each call names

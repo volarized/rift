@@ -144,6 +144,8 @@ pub(crate) struct StaticResolution {
     pub(crate) deferred_python_import_qualifiers: Vec<ExternalOccurrence>,
     /// First direct Read of a receiver added for a checked property family.
     pub(crate) python_property_receiver_start: Option<usize>,
+    /// First module root reference of a checked Python annotation or base.
+    pub(crate) python_annotation_qualifier_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -376,6 +378,7 @@ fn resolve_by<'source>(
         &mut resolution.deferred_typescript_inference_parameters,
     );
     index.resolve_python_property_receivers(&mut work, &mut resolution);
+    index.resolve_python_annotation_qualifiers(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
