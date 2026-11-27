@@ -7287,3 +7287,94 @@ fn checked_commonjs_loads_keep_reads_of_the_required_namespace() {
             })
     }));
 }
+
+#[test]
+fn javascript_destructuring_reads_one_checked_return_object() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.mjs"}"#;
+    const PROVIDER: &str = concat!(
+        "export class Outcome {\n",
+        "  static explain(input) {\n",
+        "    const description = input;\n",
+        "    const options = {};\n",
+        "    return { description, options };\n",
+        "  }\n",
+        "  static unclear(flag) {\n",
+        "    if (flag) return { description: 'first' };\n",
+        "    return { description: 'second' };\n",
+        "  }\n",
+        "  static duplicate(input) { return { description: input, description: 'other' }; }\n",
+        "  static spreading(input) { return { description: 'first', ...input }; }\n",
+        "  static computed(input) { return { description: 'first', [input]: 'other' }; }\n",
+        "  static async future() { return { description: 'first' }; }\n",
+        "}\n",
+    );
+    const CONSUMER: &str = concat!(
+        "import { Outcome } from './outcome.mjs';\n",
+        "function left(value) { return { description: value }; }\n",
+        "function right(value) { return { description: value }; }\n",
+        "export class Client extends Outcome {\n",
+        "  constructor(input) {\n",
+        "    const { description = 'fallback', options: settings = {} } = Outcome.explain(input);\n",
+        "    const { description: second } = Outcome.unclear(input);\n",
+        "    const { description: third } = Outcome.duplicate(input);\n",
+        "    const { description: fourth } = Outcome.spreading(input);\n",
+        "    const { description: fifth } = Outcome.computed(input);\n",
+        "    const { description: sixth } = Outcome.future();\n",
+        "    const { missing } = Outcome.explain(input);\n",
+        "    const choose = input ? left : right;\n",
+        "    const { description: seventh } = choose(input);\n",
+        "    super(input);\n",
+        "  }\n",
+        "}\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.mjs", CONSUMER), ("outcome.mjs", PROVIDER)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("selected sources");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let caller = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.mjs")
+        .expect("caller source");
+    let selector_reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == caller.unit)
+                && edge.to.as_str().rsplit('/').next().is_some_and(|name| {
+                    name.starts_with("description") || name.starts_with("options")
+                })
+                && !edge.to.as_str().contains("/Client/constructor/")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selector_reads.len(), 2);
+    for (pattern, key) in [
+        ("description = 'fallback'", "description"),
+        ("options: settings", "options"),
+    ] {
+        let start = CONSUMER.find(pattern).expect("written selector");
+        let site = module_runtime_range(start, key);
+        let target = selector_reads.iter().find(|edge| {
+            edge.from.as_str().ends_with("/Client/constructor")
+                && edge
+                    .to
+                    .as_str()
+                    .contains(&format!("/Outcome/explain/{key}"))
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|span| span.range == site)
+        });
+        assert!(target.is_some(), "{pattern}");
+    }
+}

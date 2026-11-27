@@ -559,6 +559,8 @@ pub struct StaticFactsParts {
     /// Names bound from a call: the bound name, the key it is destructured by (absent when
     /// the name takes the whole result) and the call.
     pub destructured: Vec<(ByteRange, Option<ByteRange>, ByteRange)>,
+    /// Written property keys in JavaScript object patterns bound directly from a call.
+    pub call_object_selectors: Vec<(ByteRange, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
     /// Direct JavaScript arrow initializers with written defaulted or rest parameters.
@@ -600,6 +602,8 @@ pub struct StaticFactsParts {
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
+    /// Returned JavaScript objects with only written bare named properties.
+    pub plain_return_objects: Vec<ByteRange>,
     /// Named function and literal body for each written object branch of a conditional return.
     pub returned_branch_objects: Vec<(ByteRange, ByteRange)>,
     /// Declared names whose initializer is an object literal that ends in a spread of a
@@ -880,6 +884,12 @@ impl StaticFacts {
         &self.0.destructured
     }
 
+    /// Written JavaScript object binding keys and their direct call initializer ranges.
+    #[must_use]
+    pub fn call_object_selectors(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.call_object_selectors
+    }
+
     /// Runtime function expressions and their enclosing value ranges.
     #[must_use]
     pub fn function_values(&self) -> &[(ByteRange, ByteRange)] {
@@ -1007,6 +1017,12 @@ impl StaticFacts {
     #[must_use]
     pub fn returned_objects(&self) -> &[(ByteRange, Option<ByteRange>)] {
         &self.0.returned_objects
+    }
+
+    /// Returned JavaScript literals whose properties are all directly named.
+    #[must_use]
+    pub fn plain_return_objects(&self) -> &[ByteRange] {
+        &self.0.plain_return_objects
     }
 
     /// Authored conditional branches for declaration placement.
@@ -1202,6 +1218,7 @@ impl StaticFacts {
             vector_capacity(&self.0.member_type_shapes),
             vector_capacity(&self.0.declared_returns),
             vector_capacity(&self.0.destructured),
+            vector_capacity(&self.0.call_object_selectors),
             vector_capacity(&self.0.function_values),
             vector_capacity(&self.0.javascript_wrapped_arrow_bodies),
             vector_capacity(&self.0.function_scopes),
@@ -1221,6 +1238,7 @@ impl StaticFacts {
             vector_capacity(&self.0.body_members),
             vector_capacity(&self.0.typescript_union_branches),
             vector_capacity(&self.0.returned_objects),
+            vector_capacity(&self.0.plain_return_objects),
             vector_capacity(&self.0.returned_branch_objects),
             vector_capacity(&self.0.spread_values),
             vector_capacity(&self.0.unsupported_bindings),
@@ -1301,6 +1319,7 @@ impl StaticFacts {
             self.member_type_shapes().len(),
             self.declared_returns().len(),
             self.destructured().len(),
+            self.call_object_selectors().len(),
             self.function_values().len(),
             self.javascript_wrapped_arrow_bodies().len(),
             self.function_scopes().len(),
@@ -1320,6 +1339,7 @@ impl StaticFacts {
             self.body_members().len(),
             self.typescript_union_branches().len(),
             self.returned_objects().len(),
+            self.plain_return_objects().len(),
             self.returned_branch_objects().len(),
             self.spread_values().len(),
             self.unsupported_bindings().len(),
@@ -1493,6 +1513,10 @@ impl StaticFacts {
                 .destructured()
                 .iter()
                 .all(|(name, key, call)| valid(*name) && key.is_none_or(valid) && valid(*call))
+            && self
+                .call_object_selectors()
+                .iter()
+                .all(|(key, call)| valid(*key) && valid(*call) && key.end <= call.start)
             && self.function_contexts().iter().all(|(function, context)| {
                 valid(*function)
                     && match context {
@@ -1574,6 +1598,7 @@ impl StaticFacts {
                 .returned_objects()
                 .iter()
                 .all(|(owner, object)| valid(*owner) && object.is_none_or(valid))
+            && self.plain_return_objects().iter().copied().all(valid)
             && self
                 .returned_branch_objects()
                 .iter()
