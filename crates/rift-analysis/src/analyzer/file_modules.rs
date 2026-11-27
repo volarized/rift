@@ -128,7 +128,8 @@ impl Records {
         }
         targets
             .into_iter()
-            .filter_map(|(id, complete)| complete.then(|| id.to_owned()))
+            .filter(|(_, complete)| *complete)
+            .map(|(id, _)| id.to_owned())
             .collect()
     }
 
