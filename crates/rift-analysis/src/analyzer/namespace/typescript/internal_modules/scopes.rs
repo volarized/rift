@@ -1029,6 +1029,7 @@ struct LiteralOwners<'source> {
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
+    array_initializers: BTreeMap<&'source str, ByteRange>,
 }
 
 impl<'source> LiteralOwners<'source> {
@@ -1049,7 +1050,30 @@ impl<'source> LiteralOwners<'source> {
             .filter(|(function, _)| !receiver_scopes.contains(function))
             .map(|&(function, value)| (value, function))
             .collect::<BTreeMap<_, _>>();
-        let functions = literal_callable_owners(symbols, facts, anchors, &values);
+        let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
+        for symbol in symbols {
+            unique
+                .entry(&symbol.qualified_name)
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(symbol));
+        }
+        let functions = literal_callable_owners(&unique, facts, anchors, &values);
+        let array_initializers = unique
+            .into_iter()
+            .filter_map(|(name, symbol)| {
+                let declaration = symbol?;
+                let value = declaration.body_range?;
+                let written = source
+                    .get(usize::try_from(value.start).ok()?..usize::try_from(value.end).ok()?)?;
+                (declaration.kind == "variable"
+                    && declaration.syntax_element_kind == Some("variable_declarator")
+                    && declaration.item_range.encloses(value)
+                    && anchors.contains_key(name)
+                    && written.starts_with('[')
+                    && written.ends_with(']'))
+                .then_some((name, value))
+            })
+            .collect();
         let mut initializers = BTreeMap::new();
         for function in functions
             .values()
@@ -1114,6 +1138,7 @@ impl<'source> LiteralOwners<'source> {
                 .map(|&(_, _, call)| call)
                 .collect(),
             returned: returned_literal_owners(&functions, facts),
+            array_initializers,
         }
     }
 
@@ -1124,7 +1149,8 @@ impl<'source> LiteralOwners<'source> {
             .copied();
         let container = property.container.as_deref();
         if let Some(owner) = container
-            && self.returned.get(&member.body) == Some(&Some(owner))
+            && (self.returned.get(&member.body) == Some(&Some(owner))
+                || self.array_initializers.get(owner) == Some(&member.holder))
         {
             return true;
         }
@@ -1173,18 +1199,11 @@ impl<'source> LiteralOwners<'source> {
 
 /// Names callables with one authored and placed declaration.
 fn literal_callable_owners<'source>(
-    symbols: &'source [SyntaxSymbol],
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
     facts: &StaticFacts,
     anchors: &BTreeMap<String, SymbolId>,
     values: &BTreeMap<ByteRange, ByteRange>,
 ) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
-    let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
-    for symbol in symbols {
-        unique
-            .entry(&symbol.qualified_name)
-            .and_modify(|owner| *owner = None)
-            .or_insert(Some(symbol));
-    }
     let classes = unique
         .values()
         .flatten()
@@ -1200,8 +1219,9 @@ fn literal_callable_owners<'source>(
         .filter_map(|member| Some((member.member, *classes.get(&member.body)?)))
         .collect::<BTreeMap<_, _>>();
     unique
-        .into_values()
+        .values()
         .flatten()
+        .copied()
         .filter(|symbol| {
             anchors.contains_key(&symbol.qualified_name)
                 && match symbol.syntax_element_kind {

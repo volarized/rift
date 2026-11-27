@@ -4069,3 +4069,80 @@ fn javascript_members_follow_a_single_checked_call_result_assignment() {
             .all(|edge| { found.edges.contains(edge) && !new_edges.contains(edge) })
     );
 }
+
+#[test]
+fn javascript_array_records_keep_separate_written_properties() {
+    const SOURCE: &str = concat!(
+        "export const control = { preserved: 1 };\n",
+        "export const records = [\n",
+        "  { flag: true, flag: 1, nested: { field: 1 } },\n",
+        "  { flag: false, [unknown()]: 2 },\n",
+        "];\n",
+        "export function read(index) { return records[index].flag; }\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found.validate_facts().expect("valid array property facts");
+    let property = |written: &str| {
+        let start = SOURCE.find(written).expect("written property");
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .unwrap_or_else(|| panic!("missing written property {written}"))
+    };
+    let first = property("flag: true");
+    let repeated = property("flag: 1");
+    let second = property("flag: false");
+    assert_eq!(first.unit, second.unit);
+    assert_eq!(first.symbol, repeated.symbol);
+    assert_ne!(first.symbol, second.symbol);
+    for row in [first, second] {
+        let identity = rift_protocol::identity::SymbolIdentity::parse(row.symbol.as_str())
+            .expect("checked array property identity");
+        assert_eq!(
+            identity.qualified_path().get(1).map(String::as_str),
+            Some("records")
+        );
+    }
+    assert!(
+        property("preserved: 1")
+            .symbol
+            .as_str()
+            .ends_with("/control/preserved")
+    );
+    assert!(
+        property("field: 1")
+            .symbol
+            .as_str()
+            .ends_with("/records/nested/field")
+    );
+    let computed = property("[unknown()]: 2");
+    assert!(
+        computed
+            .symbol
+            .as_str()
+            .ends_with("/records/%5Bunknown()%5D")
+    );
+    assert_eq!(
+        found
+            .declarations
+            .iter()
+            .filter(|row| row.source == "[unknown()]: 2")
+            .count(),
+        1
+    );
+    assert!(found.edges.iter().all(|edge| {
+        !edge.kinds.contains(&EdgeKind::Reads)
+            || (edge.to != first.symbol && edge.to != second.symbol)
+    }));
+    let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| found.edges.contains(edge))
+    );
+}
