@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use rift_syntax::ByteRange;
 
 use super::{Scope, SelectedFile, consume, group};
-use crate::analyzer::namespace::rust::configuration::Configuration;
+use crate::analyzer::namespace::rust::configuration::{Configuration, split};
 
 type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> Option<()>>;
 
@@ -394,19 +394,38 @@ impl<'a> Tokens<'a> {
         match input {
             ["cfg", "(", predicate @ .., ")"] => super::cfg(predicate, library, depth).is_some(),
             ["cfg_attr", "(", body @ .., ")"] => {
-                let mut nested = 0_usize;
-                let Some(split) = body.iter().position(|token| {
-                    match *token {
-                        "(" => nested += 1,
-                        ")" => nested = nested.saturating_sub(1),
-                        _ => {}
-                    }
-                    *token == "," && nested == 0
-                }) else {
+                if body
+                    .len()
+                    .checked_mul(depth)
+                    .and_then(|work| self.charge(work))
+                    .is_none()
+                {
+                    return false;
+                }
+                let Some(parts) = split(body) else {
                     return false;
                 };
-                super::cfg(&body[..split], library, depth).is_some()
-                    && self.attribute(&body[split + 1..], scope, library, depth - 1, validate)
+                let [predicate, attributes @ ..] = parts.as_slice() else {
+                    return false;
+                };
+                !attributes.is_empty()
+                    && super::cfg(predicate, library, depth).is_some()
+                    && attributes.iter().all(|attribute| {
+                        (attributes.len() == 1
+                            || matches!(
+                                attribute.first(),
+                                Some(
+                                    &("allow"
+                                        | "warn"
+                                        | "deny"
+                                        | "forbid"
+                                        | "expect"
+                                        | "doc"
+                                        | "feature")
+                                )
+                            ))
+                            && self.attribute(attribute, scope, library, depth - 1, validate)
+                    })
             }
             ["derive", "(", names @ .., ")"] => {
                 (!validate || library) && self.derives(names, scope, validate)

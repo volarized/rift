@@ -4693,6 +4693,72 @@ fn rust_captured_predicate_checks_globs_in_the_selected_inline_module_profile() 
     }
 }
 
+#[test]
+fn rust_captured_predicate_keeps_scope_across_inert_cfg_attribute_lists() {
+    let first = GUARDED_INVOCATION.replace(
+        "pub mod chosen;",
+        "pub mod chosen; pub use self::chosen::*;",
+    );
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let branch = format!("{first}{next}");
+    let child = format!("#[derive(Debug)] pub struct Marker;\n{GUARDED_CHILD}");
+    for (label, attribute, expected) in [
+        (
+            "one control",
+            "#![cfg_attr(feature = \"checked\", allow(dead_code))]",
+            true,
+        ),
+        (
+            "active lint list",
+            "#![cfg_attr(feature = \"checked\", allow(dead_code, unused), warn(unused_imports),)]",
+            true,
+        ),
+        (
+            "inactive lint list",
+            "#![cfg_attr(feature = \"off\", allow(dead_code), warn(unused_imports))]",
+            true,
+        ),
+        (
+            "nested predicate and inert metadata",
+            "#![cfg_attr(all(feature = \"checked\", not(test)), doc(hidden), allow(dead_code),)]",
+            true,
+        ),
+        (
+            "macro-importing arm",
+            "#![cfg_attr(feature = \"checked\", allow(dead_code), macro_use)]",
+            false,
+        ),
+        (
+            "transforming arm",
+            "#![cfg_attr(feature = \"checked\", allow(dead_code), custom)]",
+            false,
+        ),
+        (
+            "conditional declaration arm",
+            "#![cfg_attr(feature = \"checked\", allow(dead_code), cfg(test))]",
+            false,
+        ),
+        (
+            "malformed separator",
+            "#![cfg_attr(feature = \"checked\", allow(dead_code),, warn(unused_imports))]",
+            false,
+        ),
+    ] {
+        let root = format!("{attribute}\n{GUARDED_MACRO} pub mod branch; pub mod direct;");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", &child),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,
