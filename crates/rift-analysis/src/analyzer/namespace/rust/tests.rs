@@ -4601,6 +4601,9 @@ fn rust_captured_predicate_keeps_scope_across_an_ordinary_extern_crate() {
     let next = GUARDED_INVOCATION.replace("chosen", "later");
     let branch = format!("{first}{next}");
     let plain = "extern crate alloc;";
+    let active = "#[cfg(feature = \"checked\")] extern crate alloc;";
+    let inactive = "#[cfg(feature = \"off\")] extern crate alloc;";
+    let unknown = "#[cfg(version(\"1.88\"))] extern crate alloc;";
     let macro_import = "#[macro_use] extern crate alloc;";
     let conditional_import = "#[cfg_attr(feature = \"checked\", macro_use)] extern crate alloc;";
     for (label, parent_extern, child_extern, expected) in [
@@ -4608,6 +4611,12 @@ fn rust_captured_predicate_keeps_scope_across_an_ordinary_extern_crate() {
         ("parent extern", plain, "", true),
         ("sibling extern", "", plain, true),
         ("both externs", plain, plain, true),
+        ("selected parent extern", active, "", true),
+        ("unselected parent extern", inactive, "", true),
+        ("selected sibling extern", "", active, true),
+        ("unselected sibling extern", "", inactive, true),
+        ("unproved parent condition", unknown, "", false),
+        ("unproved sibling condition", "", unknown, false),
         ("parent macro import", macro_import, "", false),
         ("sibling macro import", "", macro_import, false),
         ("conditional macro import", conditional_import, "", false),

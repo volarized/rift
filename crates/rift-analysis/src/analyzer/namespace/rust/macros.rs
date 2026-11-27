@@ -464,7 +464,7 @@ mod tests {
             .iter()
             .find(|symbol| symbol.kind == "macro")
             .expect("captured definition");
-        let tokens = super::scope::Tokens::new(&file).expect("original bounded scanner");
+        let tokens = super::scope::Tokens::new(&file, None).expect("original bounded scanner");
         let mut rows = Vec::new();
         assert!(
             tokens
@@ -755,7 +755,8 @@ impl Context<'_, '_> {
             {
                 return None;
             }
-            let mut tokens = scope::Tokens::new(file)?;
+            let configuration = self.configurations.file(path);
+            let mut tokens = scope::Tokens::new(file, Some(&configuration))?;
             let mut proof = scope.clone();
             self.file_exports(path, directory, &mut proof, visiting, &tokens, false)?;
             tokens.complete &= proof.complete;
@@ -771,7 +772,8 @@ impl Context<'_, '_> {
         directory: &str,
         scope: &Scope,
     ) -> Option<scope::Tokens<'a>> {
-        let mut tokens = scope::Tokens::new(file);
+        let configuration = self.configurations.file(file.path.as_str());
+        let mut tokens = scope::Tokens::new(file, Some(&configuration));
         if let Some(tokens) = tokens.as_mut() {
             let mut proof = scope.clone();
             let mut visiting = BTreeSet::new();
@@ -851,7 +853,8 @@ impl Context<'_, '_> {
         {
             return None;
         }
-        let definition = scope::Tokens::new(defining)?;
+        let configuration = self.configurations.file(path.as_str());
+        let definition = scope::Tokens::new(defining, Some(&configuration))?;
         let mut symbols = defining
             .syntax
             .symbols()
@@ -1222,7 +1225,7 @@ impl Context<'_, '_> {
             }
             if globs.contains(*module) {
                 let configuration = self.configurations.file(child.path.as_str());
-                let tokens = scope::Tokens::with_capture(child, Some((name, &configuration)))?;
+                let tokens = scope::Tokens::with_capture(child, Some(name), Some(&configuration))?;
                 bindings.extend(tokens.outward_bindings(child, name, scope, self.library)?);
             }
         }
@@ -1310,7 +1313,8 @@ impl Context<'_, '_> {
                 if defining.path == file.path {
                     tokens.definition_prefix(prefix)?;
                 } else {
-                    scope::Tokens::new(defining)?.definition_prefix(prefix)?;
+                    scope::Tokens::new(defining, Some(&defining_configuration))?
+                        .definition_prefix(prefix)?;
                 }
             }
             chain::captured_predicate_modules(

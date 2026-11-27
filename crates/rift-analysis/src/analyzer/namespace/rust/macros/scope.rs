@@ -13,6 +13,7 @@ type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> 
 pub(super) struct Tokens<'a> {
     rows: Vec<(ByteRange, &'a str)>,
     facts: Option<&'a rift_syntax::StaticFacts>,
+    ordinary_externs: BTreeSet<ByteRange>,
     bindings: BTreeSet<String>,
     pub(super) complete: bool,
     depth: usize,
@@ -21,13 +22,17 @@ pub(super) struct Tokens<'a> {
 }
 
 impl<'a> Tokens<'a> {
-    pub(super) fn new(file: &'a SelectedFile<'a>) -> Option<Self> {
-        Self::with_capture(file, None)
+    pub(super) fn new(
+        file: &'a SelectedFile<'a>,
+        configuration: Option<&Configuration<'_>>,
+    ) -> Option<Self> {
+        Self::with_capture(file, None, configuration)
     }
 
     pub(super) fn with_capture(
         file: &'a SelectedFile<'a>,
-        selected: Option<(&str, &Configuration<'_>)>,
+        selected: Option<&str>,
+        configuration: Option<&Configuration<'_>>,
     ) -> Option<Self> {
         let limits = file.syntax.syntax_limits()?;
         let mut rows = Vec::new();
@@ -47,6 +52,7 @@ impl<'a> Tokens<'a> {
         let mut result = Self {
             rows,
             facts: file.syntax.static_facts(),
+            ordinary_externs: BTreeSet::new(),
             bindings: BTreeSet::new(),
             complete: true,
             depth: limits.syntax_depth_max(),
@@ -59,9 +65,9 @@ impl<'a> Tokens<'a> {
         if scopes.first().map(|(range, _)| *range) != Some(range) {
             return None;
         }
-        let inactive = match selected {
-            Some((_, configuration)) => result.inactive_modules(file, configuration)?,
-            None => Vec::new(),
+        let inactive = match (selected, configuration) {
+            (Some(_), Some(configuration)) => result.inactive_modules(file, configuration)?,
+            _ => Vec::new(),
         };
         for (range, children) in scopes {
             if within_inactive(&inactive, *range) {
@@ -76,7 +82,7 @@ impl<'a> Tokens<'a> {
                     result.charge(file.syntax.symbols().len())?;
                     continue;
                 }
-                result.names(*child)?;
+                result.names(*child, configuration)?;
             }
         }
         for (range, _, children) in file.syntax.macro_invocations()? {
@@ -87,7 +93,7 @@ impl<'a> Tokens<'a> {
                 result.complete = false;
                 continue;
             }
-            result.invocation_names(*range, selected.map(|(name, _)| name))?;
+            result.invocation_names(*range, selected)?;
         }
         Some(result)
     }
@@ -173,7 +179,7 @@ impl<'a> Tokens<'a> {
                 continue;
             }
             let input = self.range(range)?;
-            if self.ordinary_extern_crate(range, &input) {
+            if self.ordinary_externs.contains(&range) {
                 continue;
             }
             if super::invocation_name(child.source, range) == Some(name) {
@@ -240,15 +246,21 @@ impl<'a> Tokens<'a> {
         Some(())
     }
 
-    fn names(&mut self, range: ByteRange) -> Option<()> {
+    fn names(&mut self, range: ByteRange, configuration: Option<&Configuration<'_>>) -> Option<()> {
         let tokens = self.range(range)?;
-        if self.ordinary_extern_crate(range, &tokens) {
+        if self.ordinary_extern_crate(range, &tokens, configuration) {
+            self.ordinary_externs.insert(range);
             return Some(());
         }
         self.names_tokens(&tokens)
     }
 
-    fn ordinary_extern_crate(&self, range: ByteRange, mut input: &[&str]) -> bool {
+    fn ordinary_extern_crate(
+        &self,
+        range: ByteRange,
+        mut input: &[&str],
+        configuration: Option<&Configuration<'_>>,
+    ) -> bool {
         if visibility(&mut input).is_none()
             || !consume(&mut input, &["extern", "crate"])
             || identifier(&mut input).is_none()
@@ -263,10 +275,33 @@ impl<'a> Tokens<'a> {
         let conditions = facts.conditional_items();
         // Outer attributes occupy separate syntax ranges. Check the bound
         // item ranges before treating the declaration as macro-inert.
-        self.charge(barriers.len().saturating_add(conditions.len()))
-            .is_some()
-            && !barriers.iter().any(|(item, _)| *item == range)
-            && !conditions.iter().any(|item| item.range == range)
+        if self
+            .charge(barriers.len().saturating_add(conditions.len()))
+            .is_none()
+            || barriers.iter().any(|(item, _)| *item == range)
+        {
+            return false;
+        }
+        conditions
+            .iter()
+            .filter(|item| item.range == range)
+            .all(|item| {
+                let Some(configuration) = configuration else {
+                    return false;
+                };
+                let Some(attribute) = self.range(item.attribute) else {
+                    return false;
+                };
+                let ["#", "[", "cfg", "(", predicate @ .., ")", "]"] = attribute.as_slice() else {
+                    return false;
+                };
+                predicate
+                    .len()
+                    .checked_mul(self.depth)
+                    .and_then(|work| self.charge(work))
+                    .is_some()
+                    && configuration.condition(predicate).is_some()
+            })
     }
 
     fn invocation_names(&mut self, range: ByteRange, captured: Option<&str>) -> Option<()> {
@@ -438,7 +473,7 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
-        if self.ordinary_extern_crate(range, &tokens) {
+        if self.ordinary_externs.contains(&range) {
             return Some(());
         }
         self.item_tokens(&tokens, scope, library, self.depth, true, &mut None)
@@ -754,7 +789,7 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn effects(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
-        if self.ordinary_extern_crate(range, &tokens) {
+        if self.ordinary_externs.contains(&range) {
             return Some(());
         }
         self.item_tokens(&tokens, scope, library, self.depth, false, &mut None)
@@ -1273,7 +1308,7 @@ mod tests {
             source,
             syntax: &facts,
         };
-        let tokens = Tokens::new(&file).expect("original complete source ranges");
+        let tokens = Tokens::new(&file, None).expect("original complete source ranges");
         check(&tokens);
     }
 
@@ -1566,7 +1601,7 @@ mod tests {
                 source,
                 syntax: &facts,
             };
-            let allowed = Tokens::new(&file).is_some_and(|tokens| {
+            let allowed = Tokens::new(&file, None).is_some_and(|tokens| {
                 let (range, _, _) = facts
                     .macro_invocations()
                     .expect("captured invocations")
