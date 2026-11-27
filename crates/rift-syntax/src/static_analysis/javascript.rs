@@ -611,7 +611,12 @@ impl Kinds {
         }) {
             holder = outer.parent();
         }
-        if let Some(holder) = holder {
+        if let Some(mut holder) = holder {
+            if body.syntax_element().kind_id() == self.object_literal[0]
+                && matches!(member.kind(), "pair" | "shorthand_property_identifier")
+            {
+                holder = self.array_property_holder(holder);
+            }
             facts.body_members.push(StaticBodyMember {
                 member: byte_range(member)?,
                 body: byte_range(body.syntax_element())?,
@@ -619,6 +624,32 @@ impl Kinds {
             });
         }
         Ok(())
+    }
+
+    /// A written property can hold objects through consecutive array element positions.
+    fn array_property_holder<'walk, 'tree>(
+        &self,
+        holder: Visited<'walk, 'tree>,
+    ) -> Visited<'walk, 'tree> {
+        if holder.syntax_element().kind() != "array" {
+            return holder;
+        }
+        let mut array = holder;
+        while let Some(parent) = array
+            .parent()
+            .filter(|parent| parent.syntax_element().kind() == "array")
+        {
+            array = parent;
+        }
+        if array.parent().is_some_and(|parent| {
+            let pair = parent.syntax_element();
+            pair.kind_id() == self.object_literal[1]
+                && pair.child_by_field_name("value") == Some(array.syntax_element())
+        }) {
+            array
+        } else {
+            holder
+        }
     }
 
     /// The object literal, type literal or class body a member is written in. A parameter of

@@ -177,8 +177,9 @@ pub struct StaticBodyMember {
     pub member: ByteRange,
     /// Literal or class holding the member.
     pub body: ByteRange,
-    /// Syntax element the literal or class is the whole value or the whole written type of,
-    /// once parentheses, assertions and the annotation are read through.
+    /// Syntax element holding the whole literal or class after reading through parentheses,
+    /// assertions and annotations. For a property with consecutive array elements, the
+    /// containing array is the property's whole value.
     pub holder: ByteRange,
 }
 

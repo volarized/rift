@@ -4899,3 +4899,72 @@ fn typescript_anonymous_signatures_keep_each_written_type_parameter_and_use() {
                 ))
     );
 }
+
+#[test]
+fn javascript_nested_array_elements_keep_checked_property_owners() {
+    const SOURCE: &str = concat!(
+        "export const rows = [{\n",
+        "  direct: [{ kept: 1 }, { kept: 2 }],\n",
+        "  tuple: [['left', { leaf: 3 }], ['right', { leaf: 4 }]],\n",
+        "  deep: [[[{ entry: 5 }, { entry: 6 }]]],\n",
+        "  wrapped: [...[[{ hidden: 7 }, { hidden: 8 }]]],\n",
+        "  sibling: 9,\n",
+        "}];\n",
+        "export function withheld(key) {\n",
+        "  return [{ [key]: [[{ opaque: 10 }], [{ opaque: 11 }]] }];\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export { rows } from './data.js';"),
+            ("data.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#,
+        )),
+    )
+    .expect("checked nested array elements");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid property declarations");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "data.js")
+        .expect("nested array source")
+        .unit;
+    let mut identities = BTreeSet::new();
+    for (written, owner) in [
+        ("kept: 1", "direct"),
+        ("kept: 2", "direct"),
+        ("leaf: 3", "tuple"),
+        ("leaf: 4", "tuple"),
+        ("entry: 5", "deep"),
+        ("entry: 6", "deep"),
+    ] {
+        let start = SOURCE.find(written).expect("written property");
+        let range = module_runtime_range(start, written);
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| &row.unit == unit && row.range == range && row.source == written)
+            .unwrap_or_else(|| panic!("missing written array element property {written}"));
+        let identity = SymbolIdentity::parse(row.symbol.as_str()).expect("property identity");
+        let path = identity.qualified_path();
+        assert_eq!(path[path.len() - 2], owner);
+        assert!(identities.insert(row.symbol.clone()));
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| &row.unit == unit && row.source == "sibling: 9")
+    );
+    assert!(
+        found.declarations.iter().all(|row| {
+            !row.source.starts_with("hidden: ") && !row.source.starts_with("opaque: ")
+        })
+    );
+}
