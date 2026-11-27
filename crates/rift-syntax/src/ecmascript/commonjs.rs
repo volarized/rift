@@ -1,6 +1,6 @@
 use super::{
-    DEFAULT_EXPORT_NAME, EcmaScriptGrammarField, EcmaScriptKinds, EcmaScriptSymbolKind,
-    ExportTarget, named_children,
+    ARROW_FUNCTION_KIND, DEFAULT_EXPORT_NAME, EcmaScriptGrammarField, EcmaScriptKinds,
+    EcmaScriptSymbolKind, ExportTarget, named_children,
 };
 use crate::{
     ByteRange, StaticCommonJsExport, SyntaxExportBinding, SyntaxExportKind, SyntaxLimits,
@@ -246,6 +246,7 @@ pub(super) fn record<'tree>(
     };
     let mut closed_export = None;
     let mut direct_callable = None;
+    let mut direct_arrow = None;
     let mut shadowing = BTreeSet::new();
     for &syntax_element in &captured.assignments {
         if synchronized != Some(syntax_element)
@@ -275,6 +276,9 @@ pub(super) fn record<'tree>(
             closed_export = Some((binding.range, synchronized == Some(syntax_element), None));
         } else if allow_literal && direct {
             direct_callable = body.checked_direct_callable(syntax_element, &binding)?;
+            if direct_callable.is_none() && body.is_closed_written_arrow(syntax_element, &binding) {
+                direct_arrow = Some(binding.range);
+            }
         }
         if declares_taken_name(
             syntax_element,
@@ -313,7 +317,15 @@ pub(super) fn record<'tree>(
             .as_ref()
             .is_some_and(|export| export.anonymous_callable.is_none())
             || body.is_closed_callable(&captured, closed_export.is_some()));
-    exports.closed_export = closed_export.or(direct_callable);
+    exports.closed_export = closed_export.or(direct_callable).or_else(|| {
+        direct_arrow.map(|assignment| StaticCommonJsExport {
+            assignment,
+            synchronized: false,
+            initialized: Vec::new(),
+            literal: None,
+            anonymous_callable: None,
+        })
+    });
     exports.shadowing = shadowing;
     exports.assignments = captured.assignments;
     Ok(exports)
@@ -473,6 +485,18 @@ impl<'tree> ModuleBody<'_, 'tree> {
                 .is_some_and(|child| child.kind() == "function" && !child.is_missing())
             && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds))
         .then_some(callable)
+    }
+
+    /// The written arrow that a closed module assigns directly to its default export.
+    fn is_closed_written_arrow(&self, assignment: Node<'_>, binding: &SyntaxExportBinding) -> bool {
+        let Some((property, value)) = self.kinds.export_definition(assignment, self.source) else {
+            return false;
+        };
+        binding.kind == SyntaxExportKind::Default
+            && value.kind() == ARROW_FUNCTION_KIND
+            && self.kinds.child(assignment, EcmaScriptGrammarField::Right) == Some(value)
+            && extract::byte_range(property).is_ok_and(|range| binding.local == Some(range))
+            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
     }
 
     /// Whether the default export names a declaration and the file uses its wrapper names

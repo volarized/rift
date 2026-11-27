@@ -7378,3 +7378,64 @@ fn javascript_destructuring_reads_one_checked_return_object() {
         assert!(target.is_some(), "{pattern}");
     }
 }
+
+#[test]
+fn checked_commonjs_default_arrow_keeps_the_selected_entry_and_relative_importer() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./lib/index.js"}"#;
+    const CLIENT: &str = "const load = require('..');\nload({ active: true });";
+    for (entry, complete) in [
+        ("module.exports = (item) => { return item.active; };", true),
+        (
+            "const load = (item) => item.active; module.exports = load;",
+            true,
+        ),
+        ("if (flag) module.exports = (item) => item.active;", false),
+        (
+            "module.exports = (item) => item.active; module.exports = replacement;",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = (item) => item.active;",
+            false,
+        ),
+        (
+            "module.exports = (item) => item.active; expose(module);",
+            false,
+        ),
+        ("module.exports = wrap((item) => item.active);", false),
+    ] {
+        let analyzed = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("lib/index.js", entry), ("test/client.js", CLIENT)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected module and importer");
+        let publication = analyzed.publication();
+        publication.validate_facts().expect("valid module facts");
+        let placed = |suffix: &str, source: &str| {
+            publication.declarations.iter().find(|row| {
+                row.unit.as_str().ends_with(suffix)
+                    && row.range.start == 0
+                    && row.source_complete
+                    && row.source == source
+            })
+        };
+        let root = placed("/lib/index.js", entry);
+        let client = placed("/test/client.js", CLIENT);
+        assert_eq!(root.is_some(), complete, "{entry}");
+        assert_eq!(client.is_some(), complete, "{entry}");
+        if let Some((root, client)) = root.zip(client) {
+            assert!(publication.edges.iter().any(|edge| {
+                edge.from == client.symbol
+                    && edge.to == root.symbol
+                    && edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == client.unit
+                            && CLIENT.get(offset_in(site.range.start)..offset_in(site.range.end))
+                                == Some("'..'")
+                    })
+            }));
+        }
+    }
+}
