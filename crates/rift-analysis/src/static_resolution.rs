@@ -134,6 +134,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_shared_start: Option<usize>,
     /// First reference to an authored parent module after existing Rust references.
     pub(crate) rust_parent_module_start: Option<usize>,
+    /// First reference from a written TypeScript export selector to a local declaration.
+    pub(crate) typescript_local_export_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -348,6 +350,7 @@ fn resolve_by<'source>(
         &mut resolution.occurrences,
         &mut resolution.deferred_typescript_signature_type_parameters,
     );
+    index.resolve_typescript_local_exports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

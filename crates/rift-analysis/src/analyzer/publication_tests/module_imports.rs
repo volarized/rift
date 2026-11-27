@@ -18,6 +18,104 @@ run(() => receive({ action: "second" }));
 "#;
 
 #[test]
+fn typescript_local_export_selectors_reference_their_written_declarations() {
+    const SOURCE: &str = concat!(
+        "interface Inline { value: string }\n",
+        "interface Renamed { value: number }\n",
+        "interface Statement { value: boolean }\n",
+        "interface Implicit { value: bigint }\n",
+        "declare function value(): number;\n",
+        "declare function defaultValue(): number;\n",
+        "export { type Inline, type Renamed as PublicRenamed, value };\n",
+        "export type { Statement };\n",
+        "export { Implicit, defaultValue };\n",
+        "export interface Direct { marker: string }\n",
+        "declare const clash: string; declare const clash: number;\n",
+        "export { clash, Missing };\n",
+        "export { External } from './other.js';\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.d.ts", SOURCE),
+            ("other.d.ts", "export interface External { marker: string }"),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("checked declaration package");
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("written declaration file")
+        .unit;
+    let module = publication
+        .objects
+        .iter()
+        .find(|symbol| symbol.name == "beacon" && symbol.kinds.contains(&SymbolKind::Module))
+        .and_then(|symbol| symbol.id.as_ref())
+        .expect("checked entry module");
+    let site = |statement: &str, name: &str| {
+        let start = SOURCE.find(statement).expect("written statement");
+        module_runtime_range(start + statement.find(name).expect("written token"), name)
+    };
+    for (statement, name) in [
+        ("type Inline", "Inline"),
+        ("type Renamed", "Renamed"),
+        ("export type { Statement", "Statement"),
+        ("Implicit, defaultValue", "Implicit"),
+        ("Implicit, defaultValue", "defaultValue"),
+        ("value };", "value"),
+    ] {
+        let range = site(statement, name);
+        let target = format!("{}/{name}", module.as_str());
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    &edge.from == module
+                        && edge.to.as_str() == target
+                        && edge.kinds == [EdgeKind::References]
+                        && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                            &occurrence.unit == unit && occurrence.range == range
+                        })
+                })
+                .count(),
+            1,
+            "checked local selector {name}"
+        );
+    }
+    for (statement, name) in [
+        ("as PublicRenamed", "PublicRenamed"),
+        ("export interface Direct", "Direct"),
+        ("export { clash, Missing", "clash"),
+        ("export { clash, Missing", "Missing"),
+        ("export { External", "External"),
+    ] {
+        let range = site(statement, name);
+        assert!(!publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::References]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|occurrence| &occurrence.unit == unit && occurrence.range == range)
+        }));
+    }
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/PublicRenamed")
+            && edge.to.as_str().ends_with("/Renamed")
+            && edge.kinds == [EdgeKind::Aliases]
+    }));
+}
+
+#[test]
 fn package_retains_distinct_top_level_argument_properties_in_non_entry_files() {
     let analysis = fixture::package_result_with_metadata(
         ShippedLanguage::JavaScript,
@@ -342,7 +440,7 @@ fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
     let imports = publication
         .edges
         .iter()
-        .filter(|edge| edge.from.as_str() == MODULE)
+        .filter(|edge| edge.from.as_str() == MODULE && edge.kinds == [EdgeKind::Imports])
         .collect::<Vec<_>>();
     assert_eq!(imports.len(), 4);
     let written = "\"./near\"";
@@ -400,6 +498,76 @@ fn module_imports_keep_exact_owners_ranges_and_existing_aliases() {
             && edge.from.as_str() == format!("{MODULE}/PublicShape")
             && edge.to.as_str() == format!("{MODULE}/Shape")
     }));
+}
+
+#[test]
+fn typescript_local_export_references_follow_existing_package_edges() {
+    let (publication, files, semantics, _) = analyze_module(
+        concat!(
+            "type Shape = string; export { Shape as PublicShape };\n",
+            "export function leaf() { return 1; }\n",
+            "function schedule(task: () => number) { return task(); }\n",
+            "schedule(() => leaf());\n",
+        ),
+        MANIFEST,
+        PackageConfiguration::default(),
+    )
+    .into_parts();
+    let selector = |edge: &rift_protocol::index::StoredEdge| {
+        edge.from.as_str() == MODULE && edge.kinds == [EdgeKind::References]
+    };
+    let reference = publication
+        .edges
+        .iter()
+        .find(|edge| selector(edge))
+        .expect("one written selector");
+    let callbacks = anonymous_callback_ids(&publication);
+    assert_eq!(callbacks.len(), 1);
+    let call = publication
+        .edges
+        .iter()
+        .find(|edge| callbacks.contains(&edge.from) && edge.kinds == [EdgeKind::Calls])
+        .expect("one checked callback call");
+    let prior = publication
+        .edges
+        .iter()
+        .filter(|edge| !selector(edge) && !callbacks.contains(&edge.from))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(prior.iter().any(|edge| edge.kinds == [EdgeKind::Aliases]));
+    assert_eq!(publication.edges.len(), prior.len() + 2);
+    for extra in 0..=2 {
+        let mut records = Records {
+            objects: publication
+                .objects
+                .iter()
+                .filter(|row| row.id.as_ref().is_none_or(|id| !callbacks.contains(id)))
+                .cloned()
+                .collect(),
+            declarations: publication
+                .declarations
+                .iter()
+                .filter(|row| !callbacks.contains(&row.symbol))
+                .cloned()
+                .collect(),
+            units: publication.units.clone(),
+            edges: prior.clone(),
+            ..Records::default()
+        };
+        let limits = ExactPackageLimits::new(3, 16_384)
+            .with_edges(prior.len() + extra)
+            .expect("bounded edge count");
+        records
+            .retain_ecmascript_modules(&publication.owner, &files, &semantics, limits)
+            .expect("bounded module references");
+        assert_eq!(records.edges.len(), prior.len() + extra);
+        assert_eq!(&records.edges[..prior.len()], &prior);
+        assert_eq!(records.edges.get(prior.len()), (extra >= 1).then_some(call));
+        assert_eq!(
+            records.edges.get(prior.len() + 1),
+            (extra >= 2).then_some(reference)
+        );
+    }
 }
 
 #[test]

@@ -1238,7 +1238,7 @@ impl<'source> File<'source> {
     }
 
     /// The name of a module-scope function a declaration file writes by signatures alone.
-    fn declared_signature(&self, name: &str) -> Option<rift_syntax::ByteRange> {
+    pub(super) fn declared_signature(&self, name: &str) -> Option<rift_syntax::ByteRange> {
         let declarations = self.by_qualified_name.get(name)?;
         (is_declaration_file(self.document.path.as_str())
             && declarations
