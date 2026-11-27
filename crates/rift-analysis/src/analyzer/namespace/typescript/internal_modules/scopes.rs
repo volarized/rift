@@ -4,7 +4,7 @@ mod assigned_literals;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::SymbolId;
+use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
@@ -1091,6 +1091,7 @@ impl<'source> FileScopes<'source> {
 struct LiteralOwners<'source> {
     enclosing: EnclosingDefinitions<(ByteRange, Option<&'source SyntaxSymbol>)>,
     callbacks: BTreeSet<ByteRange>,
+    invoked_initializers: BTreeMap<ByteRange, &'source str>,
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
@@ -1186,6 +1187,7 @@ impl<'source> LiteralOwners<'source> {
                     .then_some(function)
                 })
                 .collect(),
+            invoked_initializers: invoked_initializer_owners(file, facts, &unique, anchors),
             calls,
             bound_calls: facts
                 .destructured()
@@ -1237,6 +1239,15 @@ impl<'source> LiteralOwners<'source> {
                                 && !self.bound_calls.contains(&call.range)
                                 && self.callback_literal_container(scope, container)
                         }
+                        (Some(owner), Some((scope, None))) => {
+                            self.invoked_initializers.get(&scope) == Some(&owner)
+                                && scope.encloses(call.range)
+                                && matches!(
+                                    call.callee,
+                                    StaticCallee::Direct | StaticCallee::Member { .. }
+                                )
+                                && !self.bound_calls.contains(&call.range)
+                        }
                         _ => false,
                     }
             })
@@ -1252,6 +1263,54 @@ impl<'source> LiteralOwners<'source> {
             None | Some((_, None)) => false,
         }
     }
+}
+
+/// Finds the function scope of a uniquely placed variable's immediate invocation.
+fn invoked_initializer_owners<'source>(
+    file: &SelectedFile<'source>,
+    facts: &StaticFacts,
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<ByteRange, &'source str> {
+    let expressions = facts
+        .function_values()
+        .iter()
+        .map(|&(scope, value)| (value, scope))
+        .collect::<BTreeMap<_, _>>();
+    let invocations = facts
+        .calls()
+        .iter()
+        .filter(|call| {
+            call.callee == StaticCallee::Unsupported && call.range.start == call.callee_range.start
+        })
+        .filter_map(|call| Some((call.range, *expressions.get(&call.callee_range)?)))
+        .collect::<BTreeMap<_, _>>();
+    if invocations.is_empty() {
+        return BTreeMap::new();
+    }
+    let writes = facts
+        .references()
+        .iter()
+        .filter(|reference| reference.role == ReferenceRole::Write)
+        .filter_map(|reference| binding_name(file.source, reference.target))
+        .collect::<BTreeSet<_>>();
+    unique
+        .values()
+        .flatten()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("variable_declarator")
+                && symbol.kind == "variable"
+                && symbol.container.is_none()
+                && anchors.contains_key(&symbol.qualified_name)
+                && !writes.contains(symbol.name.as_str())
+        })
+        .filter_map(|symbol| {
+            let initializer = symbol.body_range?;
+            let scope = *invocations.get(&initializer)?;
+            (symbol.item_range.encloses(initializer) && initializer.encloses(scope))
+                .then_some((scope, symbol.qualified_name.as_str()))
+        })
+        .collect()
 }
 
 /// Selects placed declarations whose initializer is the written array itself.

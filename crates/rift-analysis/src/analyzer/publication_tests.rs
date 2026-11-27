@@ -14,6 +14,7 @@ mod declaration_parameters;
 mod facts;
 mod forwarded_names;
 mod graph;
+mod initializer_argument_properties;
 mod initializers;
 mod inline_import_types;
 mod internal_modules;
