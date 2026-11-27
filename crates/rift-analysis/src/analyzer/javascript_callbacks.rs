@@ -32,30 +32,32 @@ struct CallbackFile<'file> {
     unit: rift_protocol::read::SourceUnitId,
     lines: Vec<usize>,
     scopes: EnclosingDefinitions<Option<Callback>>,
+    member_receivers: BTreeMap<ByteRange, ByteRange>,
 }
 
-struct CallbackCall<'call, 'file> {
+struct CallbackEdge<'call, 'file> {
     site: &'call Edge,
     file: &'call CallbackFile<'file>,
     caller: Callback,
     existing: Option<usize>,
 }
 
-type CallKey<'site> = (&'site str, u64, u64, &'site str, &'site str);
+type CallbackEdgeKey<'site> = (&'site str, u64, u64, &'site str, &'site str);
 
 impl Records {
     /// Uses already resolved targets, and corrects admitted sites before adding any more edges.
-    pub(super) fn retain_ecmascript_callback_calls(
+    pub(super) fn retain_ecmascript_callback_edges(
         &mut self,
         owner: &SymbolOwner,
         analyzed: &[AnalyzedFile],
         semantics: &WorkspaceSemantics,
         limits: ExactPackageLimits,
+        kind: EdgeKind,
     ) -> Result<(), RiftError> {
         if self.symbols_truncated {
             return Ok(());
         }
-        let files = self.ecmascript_callback_files(analyzed);
+        let files = self.ecmascript_callback_files(analyzed, kind);
         if files.is_empty() {
             return Ok(());
         }
@@ -64,26 +66,29 @@ impl Records {
             .iter()
             .filter_map(|object| object.id.clone())
             .collect::<BTreeSet<_>>();
-        let mut calls = checked_callback_calls(&files, semantics, &objects);
+        let mut edges = checked_callback_edges(&files, semantics, &objects, kind);
+        if kind == EdgeKind::Reads {
+            retain_checked_member_reads(&mut edges);
+        }
         for (index, edge) in self.edges.iter().enumerate() {
-            if let Some(key) = stored_call_key(edge)
-                && let Some(call) = calls.get_mut(&key)
+            if let Some(key) = stored_callback_edge_key(edge, kind)
+                && let Some(candidate) = edges.get_mut(&key)
             {
-                call.existing = Some(index);
+                candidate.existing = Some(index);
             }
         }
         let mut callers = BTreeMap::<_, Option<SymbolId>>::new();
         let declaration_limit = limits
             .declarations_max()
             .min(bound(self.publication.symbols));
-        let calls = calls
+        let edges = edges
             .into_values()
-            .filter(|call| call.existing.is_some() || call.site.from() == call.file.module)
+            .filter(|edge| edge.existing.is_some() || edge.site.from() == edge.file.module)
             .collect::<Vec<_>>();
         for existing in [true, false] {
-            for call in calls
+            for edge in edges
                 .iter()
-                .filter(|call| call.existing.is_some() == existing)
+                .filter(|edge| edge.existing.is_some() == existing)
             {
                 if !existing && self.edges.len() >= limits.edges_max() {
                     self.warn(truncation(
@@ -92,24 +97,25 @@ impl Records {
                     ));
                     return Ok(());
                 }
-                let key = (&call.file.unit, call.caller.range);
+                let key = (&edge.file.unit, edge.caller.range);
                 let caller = match callers.entry(key) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(self.publish_ecmascript_callback(
                             owner,
-                            call.file,
-                            call.caller,
+                            edge.file,
+                            edge.caller,
                             &objects,
                             declaration_limit,
+                            kind == EdgeKind::Reads,
                         )?)
                     }
                 };
                 if let Some(caller) = caller {
-                    if let Some(index) = call.existing {
+                    if let Some(index) = edge.existing {
                         self.edges[index].from.clone_from(caller);
                     } else {
-                        let mut edge = call.site.to_protocol();
+                        let mut edge = edge.site.to_protocol();
                         edge.from.clone_from(caller);
                         self.edges.push(edge);
                     }
@@ -122,6 +128,7 @@ impl Records {
     fn ecmascript_callback_files<'file>(
         &self,
         analyzed: &'file [AnalyzedFile],
+        kind: EdgeKind,
     ) -> BTreeMap<&'file CoreSourceUnitId, CallbackFile<'file>> {
         let modules = self
             .objects
@@ -153,6 +160,11 @@ impl Records {
                 }
                 let scopes = callback_scopes(file)?;
                 let lines = line_starts(file.file.source());
+                let member_receivers = if kind == EdgeKind::Reads {
+                    checked_member_receivers(file)
+                } else {
+                    BTreeMap::new()
+                };
                 Some((
                     origin,
                     CallbackFile {
@@ -161,6 +173,7 @@ impl Records {
                         unit,
                         lines,
                         scopes,
+                        member_receivers,
                     },
                 ))
             })
@@ -174,6 +187,7 @@ impl Records {
         caller: Callback,
         objects: &BTreeSet<SymbolId>,
         declaration_limit: usize,
+        reuse_existing: bool,
     ) -> Result<Option<SymbolId>, RiftError> {
         if self.symbols_truncated {
             return Ok(None);
@@ -188,7 +202,7 @@ impl Records {
         };
         let id = SymbolId(identity.wire_identity());
         if objects.contains(&id) {
-            return Ok(None);
+            return Ok((reuse_existing && self.retained_callback(file, caller, &id)).then_some(id));
         }
         let limit = bound(self.publication.symbols);
         if self.objects.len() >= limit || self.declarations.len() >= declaration_limit {
@@ -247,13 +261,36 @@ impl Records {
         self.declarations.push(declaration);
         Ok(Some(id))
     }
+
+    fn retained_callback(&self, file: &CallbackFile<'_>, caller: Callback, id: &SymbolId) -> bool {
+        let object = self.objects.iter().any(|object| {
+            object.id.as_ref() == Some(id)
+                && object.document_local
+                && object
+                    .container
+                    .as_ref()
+                    .is_some_and(|owner| owner.as_str() == file.module.as_str())
+        });
+        object
+            && self.declarations.iter().any(|declaration| {
+                declaration.symbol == *id
+                    && declaration.unit == file.unit
+                    && declaration.range.start == caller.range.start
+                    && declaration.range.end == caller.range.end
+                    && declaration.source_complete
+                    && declaration.syntax_element_kind.as_deref() == Some(caller.kind)
+                    && source_text(file.file.file.source(), caller.range)
+                        == Some(declaration.source.as_str())
+            })
+    }
 }
 
-fn checked_callback_calls<'call, 'file>(
+fn checked_callback_edges<'call, 'file>(
     files: &'call BTreeMap<&CoreSourceUnitId, CallbackFile<'file>>,
     semantics: &'call WorkspaceSemantics,
     objects: &BTreeSet<SymbolId>,
-) -> BTreeMap<CallKey<'call>, CallbackCall<'call, 'file>> {
+    kind: EdgeKind,
+) -> BTreeMap<CallbackEdgeKey<'call>, CallbackEdge<'call, 'file>> {
     let objects = objects
         .iter()
         .map(SymbolId::as_str)
@@ -262,18 +299,18 @@ fn checked_callback_calls<'call, 'file>(
         .edges()
         .edges()
         .filter_map(|site| {
-            if site.kind() != EdgeKind::Calls
-                || site.is_graph_edge()
-                || !objects.contains(site.to().as_str())
+            if site.kind() != kind || site.is_graph_edge() || !objects.contains(site.to().as_str())
             {
                 return None;
             }
             let occurrence = site.occurrence();
             let file = files.get(occurrence.unit())?;
             let range = occurrence.range();
-            let callee_span = site.static_callee()?;
-            if callee_span.start < range.start() || range.end() < callee_span.end {
-                return None;
+            if kind == EdgeKind::Calls {
+                let callee_span = site.static_callee()?;
+                if callee_span.start < range.start() || range.end() < callee_span.end {
+                    return None;
+                }
             }
             let caller = file
                 .scopes
@@ -289,7 +326,7 @@ fn checked_callback_calls<'call, 'file>(
             );
             Some((
                 key,
-                CallbackCall {
+                CallbackEdge {
                     site,
                     file,
                     caller,
@@ -300,8 +337,41 @@ fn checked_callback_calls<'call, 'file>(
         .collect()
 }
 
-fn stored_call_key(edge: &StoredEdge) -> Option<CallKey<'_>> {
-    if edge.provider != EdgeProvider::Static || edge.kinds != [EdgeKind::Calls] {
+/// A qualifier is retained only when the complete written access has a resolved Read.
+fn retain_checked_member_reads(edges: &mut BTreeMap<CallbackEdgeKey<'_>, CallbackEdge<'_, '_>>) {
+    let mut written = BTreeSet::new();
+    for candidate in edges.values() {
+        let range = candidate.site.occurrence().range();
+        let member = ByteRange {
+            start: range.start(),
+            end: range.end(),
+        };
+        let Some(receiver) = candidate.file.member_receivers.get(&member) else {
+            continue;
+        };
+        let unit = candidate.file.unit.as_str();
+        let from = candidate.site.from().as_str();
+        for site in [member, *receiver] {
+            written.insert((unit, site.start, site.end, from));
+        }
+    }
+    edges.retain(|&(unit, start, end, from, _), _| written.contains(&(unit, start, end, from)));
+}
+
+fn checked_member_receivers(file: &AnalyzedFile) -> BTreeMap<ByteRange, ByteRange> {
+    let Some(facts) = file.file.syntax().static_facts() else {
+        return BTreeMap::new();
+    };
+    facts
+        .members()
+        .iter()
+        .filter(|member| member.member.is_some())
+        .map(|member| (member.range, member.receiver))
+        .collect()
+}
+
+fn stored_callback_edge_key(edge: &StoredEdge, kind: EdgeKind) -> Option<CallbackEdgeKey<'_>> {
+    if edge.provider != EdgeProvider::Static || edge.kinds != [kind] {
         return None;
     }
     let site = edge.occurrence.as_ref()?;
