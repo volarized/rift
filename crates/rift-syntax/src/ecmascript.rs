@@ -84,6 +84,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKi
 mod callback_parameters;
 mod checked_parameters;
 mod commonjs;
+pub(crate) use commonjs::commonjs_class_export_initializations;
 mod conditional_type_members;
 mod inline_import_types;
 mod members;

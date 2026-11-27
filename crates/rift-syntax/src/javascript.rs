@@ -4,6 +4,7 @@
 //! Declaration rules live in [`crate::ecmascript`], shared with the
 //! TypeScript providers.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use rift_protocol::read::{Language, SyntaxKind};
@@ -28,6 +29,22 @@ impl Default for JavaScriptSyntaxProvider {
             },
         }
     }
+}
+
+impl JavaScriptSyntaxProvider {
+    /// Proves a direct `CommonJS` export assignment follows a literal placeholder for its key.
+    ///
+    /// The caller supplies the exact later assignment and earlier member spans after checking
+    /// all writes. The result names only complete, unconditional later assignments.
+    #[must_use]
+    pub fn commonjs_class_export_initializations(
+        source: &str,
+        limits: SyntaxLimits,
+        initializations: &BTreeMap<ByteRange, ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        ecmascript::commonjs_class_export_initializations(source, limits, initializations)
+    }
+
 }
 
 impl SyntaxProvider for JavaScriptSyntaxProvider {

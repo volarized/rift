@@ -3,7 +3,9 @@
 use super::javascript::{ModuleMode, PackageModes, js_binding};
 use super::{File, Target, Work};
 use crate::analyzer::namespace::typescript::folder_path;
-use rift_syntax::{StaticBindingKind, SyntaxExportKind};
+use rift_syntax::{
+    ByteRange, JavaScriptSyntaxProvider, StaticBindingKind, SyntaxExportBinding, SyntaxExportKind,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -542,6 +544,14 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ExportCandidates<'source>> {
+        if mode == ModuleMode::CommonJs
+            && role == rift_core::ReferenceRole::Call
+            && let ExportSlot::Named(name) = name
+            && let Some(binding) = file.commonjs_class_initializations.get(name)
+            && let Some(class) = self.commonjs_initialized_class(file, binding, work)
+        {
+            return Some((Some(class), Vec::new()));
+        }
         let mut found: Option<Export<'source>> = None;
         let mut stars = Vec::new();
         let mut keys_are_symbols = None;
@@ -621,6 +631,32 @@ impl<'source> Exports<'_, 'source> {
             });
         }
         Some((found, stars))
+    }
+
+    /// The final write uses a unique module-scope class binding at its actual position.
+    fn commonjs_initialized_class(
+        &self,
+        file: &File<'source>,
+        assignment: &SyntaxExportBinding,
+        work: &mut Work,
+    ) -> Option<Export<'source>> {
+        let use_site = assignment.local?;
+        let role = rift_core::ReferenceRole::Call;
+        let binding = js_binding(
+            file,
+            self.modes,
+            file.text(use_site)?,
+            use_site.start,
+            role,
+            work,
+        )?;
+        let target = file.target_at(binding.name)?;
+        (binding.kind == StaticBindingKind::Local
+            && target.symbol.kind == "class"
+            && target.symbol.syntax_element_kind == Some("class_declaration")
+            && target.symbol.container.is_none()
+            && target.symbol.item_range.end <= assignment.range.start)
+            .then_some(Export::Declaration(binding.name))
     }
 
     fn collect_names<'index>(
@@ -1215,6 +1251,7 @@ impl<'source> File<'source> {
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(member));
         }
+        let mut repeated = BTreeMap::new();
         for &range in self.facts.assignments() {
             if !work.charge() {
                 return None;
@@ -1251,21 +1288,110 @@ impl<'source> File<'source> {
                     self.export_keys.push((key, member.range.start));
                     continue;
                 }
-                self.export_writes
-                    .entry(slot)
-                    .and_modify(|start| {
-                        if *start != Some(range.start) {
-                            *start = None;
-                        }
-                    })
-                    .or_insert(Some(range.start));
+                self.record_export_write(slot, range.start, &mut repeated);
             }
         }
+        self.index_commonjs_class_initializations(&repeated);
         self.module_value.writes.sort_unstable();
         let (value, modules) = self.module_value(work)?;
         self.module_value.value = value;
         self.module_value.modules = modules;
         Some(())
+    }
+
+    /// Retains exactly two named writes for checking an initial placeholder.
+    fn record_export_write(
+        &mut self,
+        slot: ExportSlot<'source>,
+        position: u64,
+        repeated: &mut BTreeMap<&'source str, [u64; 2]>,
+    ) {
+        use std::collections::btree_map::Entry;
+        match self.export_writes.entry(slot) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(position));
+            }
+            Entry::Occupied(mut entry) if *entry.get() != Some(position) => {
+                let previous = entry.insert(None);
+                if let ExportSlot::Named(name) = slot {
+                    if let Some(first) = previous {
+                        repeated.insert(name, [first, position]);
+                    } else {
+                        repeated.remove(name);
+                    }
+                }
+            }
+            Entry::Occupied(_) => {}
+        }
+    }
+
+    /// Checks exact original bytes without changing the ordinary export stability rules.
+    fn index_commonjs_class_initializations(
+        &mut self,
+        repeated: &BTreeMap<&'source str, [u64; 2]>,
+    ) {
+        let facts = self.document.facts;
+        let Some(exports) = self.exports.as_ref() else {
+            return;
+        };
+        if repeated.is_empty()
+            || facts.language().name != "javascript"
+            || !facts.declaration_syntax_complete()
+            || facts.left_out_declaration_count() != 0
+            || self.facts.has_javascript_module_syntax()
+            || !exports.defaults.is_empty()
+            || !exports.stars.is_empty()
+            || !self.export_keys.is_empty()
+            || self.unknown_member_writes.contains(&None)
+            || self.export_writes.contains_key(&ExportSlot::Default)
+            || self.export_writes.contains_key(&ExportSlot::Unknown)
+        {
+            return;
+        }
+        let candidates = repeated
+            .iter()
+            .filter_map(|(&name, &[first, last])| {
+                let [binding] = exports.named.get(name)?.as_slice() else {
+                    return None;
+                };
+                if binding.range.start != last
+                    || binding.local.is_none()
+                    || binding.source.is_some()
+                    || binding.container.is_some()
+                    || binding.type_only
+                    || binding.kind != SyntaxExportKind::Named
+                {
+                    return None;
+                }
+                let mut earlier = self
+                    .members
+                    .range(
+                        ByteRange {
+                            start: first,
+                            end: first,
+                        }..,
+                    )
+                    .take_while(|(range, _)| range.start == first);
+                let (&write, member) = earlier.next()?;
+                (member.is_some() && earlier.next().is_none())
+                    .then_some((binding.range, (write, name, *binding)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let ranges = candidates
+            .iter()
+            .map(|(&later, &(earlier, _, _))| (later, earlier))
+            .collect();
+        let established = JavaScriptSyntaxProvider::commonjs_class_export_initializations(
+            self.document.source,
+            facts.syntax_limits().unwrap_or_default(),
+            &ranges,
+        );
+        self.commonjs_class_initializations = candidates
+            .into_iter()
+            .filter_map(|(later, (_, name, binding))| {
+                established.contains(&later).then_some((name, binding))
+            })
+            .collect();
     }
 
     /// The name of a module-scope function a declaration file writes by signatures alone.

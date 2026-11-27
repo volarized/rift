@@ -905,6 +905,8 @@ struct File<'source> {
     callbacks: javascript_callbacks::Callbacks<'source>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
+    commonjs_class_initializations:
+        BTreeMap<&'source str, &'source rift_syntax::SyntaxExportBinding>,
     /// The writes of `module.exports` and what they leave the module with.
     module_value: javascript_exports::ModuleValues<'source>,
     /// Names written as computed keys of the module's exports: `name` and its position in
@@ -1082,6 +1084,7 @@ impl<'source> File<'source> {
             callbacks: javascript_callbacks::Callbacks::default(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
+            commonjs_class_initializations: BTreeMap::new(),
             module_value: javascript_exports::ModuleValues::default(),
             export_keys: Vec::new(),
             exports: None,
