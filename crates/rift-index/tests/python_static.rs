@@ -250,20 +250,28 @@ fn test_python_wildcard_import_stores_the_module_and_explicit_alias() {
         ("pkg/leaf.py", "value = 1\ndef leaf(): pass\n"),
         ("bridge.py", "from pkg.leaf import value as value\n"),
     ]);
-    let imported = index
+    let mut imported = index
         .edges()
         .edges()
-        .find(|edge| {
+        .filter(|edge| {
             edge.kind().as_ref() == "imports"
                 && edge.from().as_str() == "rift://symbol/local/python/pkg"
                 && edge.to().as_str() == "rift://symbol/local/python/pkg/leaf"
         })
-        .expect("stored wildcard module import");
-    let binding = imported.occurrence();
-    assert_eq!(binding.unit().key().as_str(), "pkg/__init__.py");
-    let start = usize::try_from(binding.range().start()).expect("source start");
-    let end = usize::try_from(binding.range().end()).expect("source end");
-    assert_eq!(&source[start..end], "*");
+        .map(|edge| {
+            let binding = edge.occurrence();
+            assert_eq!(binding.unit().key().as_str(), "pkg/__init__.py");
+            let start = usize::try_from(binding.range().start()).expect("source start");
+            let end = usize::try_from(binding.range().end()).expect("source end");
+            (start, end)
+        })
+        .collect::<Vec<_>>();
+    imported.sort_unstable();
+    let expected = [".leaf", "*"].map(|written| {
+        let start = source.find(written).expect("written import segment");
+        (start, start + written.len())
+    });
+    assert_eq!(imported, expected);
     for (kind, from) in [
         ("imports", "rift://symbol/local/python/bridge"),
         ("aliases", "rift://symbol/local/python/bridge/value"),
@@ -615,10 +623,8 @@ fn test_python_declared_container_elements_store_calls_alone() {
     assert_eq!(index.edges().dropped_edges(), 0);
 }
 
-/// The stored `has_type` and `reads` edges from the declarations of `use.py`, as
-/// `kind from -> to` without the package prefix.
-fn written_types(source: &str) -> Vec<String> {
-    let (_directory, index) = build(&[
+fn written_type_fixture(source: &str) -> (tempfile::TempDir, WorkspaceIndex) {
+    build(&[
         ("p/__init__.py", "from . import a as exported\n"),
         (
             "p/a.py",
@@ -627,7 +633,13 @@ fn written_types(source: &str) -> Vec<String> {
         ("p/sub/__init__.py", ""),
         ("p/sub/deep.py", "class Deep: pass\n"),
         ("use.py", source),
-    ]);
+    ])
+}
+
+/// The stored `has_type` and `reads` edges from the declarations of `use.py`, as
+/// `kind from -> to` without the package prefix.
+fn written_types(source: &str) -> Vec<String> {
+    let (_directory, index) = written_type_fixture(source);
     let mut found = index
         .edges()
         .edges()
@@ -689,20 +701,24 @@ fn test_python_dotted_annotations_have_the_type_and_read_the_module() {
             "import p.a\nfrom typing import Optional\ndef g(v: Optional['p.a.Base']): pass\n",
             &typed,
         ),
-        ("import p.a as m\ndef g(v: m.Base): pass\n", &typed),
-        ("from p import a\ndef g(v: a.Base): pass\n", &typed),
-        ("from p import a as m\ndef g(v: m.Base): pass\n", &typed),
+        ("import p.a as m\ndef g(v: m.Base): pass\n", &read),
+        ("from p import a\ndef g(v: a.Base): pass\n", &read),
+        ("from p import a as m\ndef g(v: m.Base): pass\n", &read),
         (
             "import p\ndef g(v: p.exported.Base): pass\n",
             &["HasType g -> p/a/Base", "Reads g -> p/a"],
         ),
         (
             "from p import a\ndef g(v: a.Base.Inner): pass\n",
-            &["HasType g -> p/a/Base/Inner", "Reads g -> p/a/Base"],
+            &[
+                "HasType g -> p/a/Base/Inner",
+                "Reads g -> p/a",
+                "Reads g -> p/a/Base",
+            ],
         ),
         (
             "from p import a\ndef g(v: a.Alias): pass\n",
-            &["HasType g -> p/a/Alias"],
+            &["HasType g -> p/a/Alias", "Reads g -> p/a"],
         ),
         // A module or a function is no type, whatever spells it.
         ("from p import a\ndef g(v: a): pass\n", &[]),
@@ -713,12 +729,49 @@ fn test_python_dotted_annotations_have_the_type_and_read_the_module() {
         ("from p.a import call\ndef g(v: call): pass\n", &[]),
         // Bases and the metaclass of a class.
         ("import p.a\nclass g(p.a.Base): pass\n", &read),
-        ("from p import a\nclass g(a.Base): pass\n", &typed),
+        ("from p import a\nclass g(a.Base): pass\n", &read),
         ("import p.a\nclass g(list[p.a.Base]): pass\n", &read),
         ("import p.a\nclass g(metaclass=p.a.Base): pass\n", &read),
         ("import p.a\ng: p.a.Base\n", &read),
         ("import p.a\ng: p.a.Base = None\n", &read),
     ] {
         assert_eq!(written_types(source), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_python_aliased_annotation_reads_its_written_module_qualifier() {
+    for (source, written) in [
+        ("import p.a as m\ndef g(v: m.Base): pass\n", "m.Base"),
+        ("from p import a\ndef g(v: a.Base): pass\n", "a.Base"),
+        ("from p import a as m\ndef g(v: m.Base): pass\n", "m.Base"),
+        ("from p import a\nclass g(a.Base): pass\n", "a.Base"),
+        (
+            "from p import a\ndef g(v: a.Base.Inner): pass\n",
+            "a.Base.Inner",
+        ),
+        ("from p import a\ndef g(v: a.Alias): pass\n", "a.Alias"),
+    ] {
+        let (_directory, index) = written_type_fixture(source);
+        let start = source.find(written).expect("written type");
+        let length = written.split_once('.').expect("qualified type").0.len();
+        let occurrences = index
+            .edges()
+            .edges()
+            .filter(|edge| {
+                edge.kind().as_ref() == "reads"
+                    && edge.from().as_str() == "rift://symbol/local/python/use/g"
+                    && edge.to().as_str() == "rift://symbol/local/python/p/a"
+            })
+            .map(|edge| {
+                let site = edge.occurrence();
+                assert_eq!(site.unit().key().as_str(), "use.py");
+                (
+                    usize::try_from(site.range().start()).expect("source start"),
+                    usize::try_from(site.range().end()).expect("source end"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(occurrences, [(start, start + length)], "{source}");
     }
 }
