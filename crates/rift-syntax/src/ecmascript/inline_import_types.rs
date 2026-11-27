@@ -1,4 +1,4 @@
-//! Checks written relative import types against a byte-preserving TypeScript parse.
+//! Checks written import types against a byte-preserving TypeScript parse.
 
 use rift_core::constants::PROJECT_PATH_BYTES_MAX;
 use rift_error::errors;
@@ -37,7 +37,9 @@ pub(crate) fn check(
     limits: SyntaxLimits,
 ) -> Result<Vec<CheckedInlineTypeImport>, RiftError> {
     limits.admit_source(source)?;
-    let candidates = bounded_candidates(source, limits)?;
+    let candidates = bounded_candidates(source, limits, |specifier| {
+        specifier.starts_with(b"./") || specifier.starts_with(b"../")
+    })?;
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -63,8 +65,9 @@ pub(crate) fn check(
 fn bounded_candidates(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
+    module_prefix: impl Fn(&[u8]) -> bool,
 ) -> Result<Vec<Candidate>, RiftError> {
-    candidates(source.text, limits.syntax_elements_max()).ok_or_else(|| {
+    candidates(source.text, limits.syntax_elements_max(), module_prefix).ok_or_else(|| {
         errors::syntax::too_many_syntax_elements()
             .path(source.path)
             .syntax_elements_max(limits.syntax_elements_max())
@@ -122,7 +125,11 @@ fn original_tokens(root: Node<'_>, candidate: &Candidate) -> bool {
             })
 }
 
-fn candidates(text: &str, maximum: usize) -> Option<Vec<Candidate>> {
+fn candidates(
+    text: &str,
+    maximum: usize,
+    module_prefix: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<Candidate>> {
     let mut results = Vec::new();
     let mut consumed = 0;
     for (position, _) in text.match_indices("import") {
@@ -138,7 +145,7 @@ fn candidates(text: &str, maximum: usize) -> Option<Vec<Candidate>> {
         {
             continue;
         }
-        if let Some(candidate) = candidate_at(text.as_bytes(), position) {
+        if let Some(candidate) = candidate_at(text.as_bytes(), position, &module_prefix) {
             if results.len() == maximum {
                 return None;
             }
@@ -149,7 +156,11 @@ fn candidates(text: &str, maximum: usize) -> Option<Vec<Candidate>> {
     Some(results)
 }
 
-fn candidate_at(bytes: &[u8], start: usize) -> Option<Candidate> {
+fn candidate_at(
+    bytes: &[u8],
+    start: usize,
+    module_prefix: &impl Fn(&[u8]) -> bool,
+) -> Option<Candidate> {
     let open = after_space(bytes, start.checked_add("import".len())?);
     if bytes.get(open) != Some(&b'(') {
         return None;
@@ -161,7 +172,7 @@ fn candidate_at(bytes: &[u8], start: usize) -> Option<Candidate> {
     }
     let module_start = quote_index + 1;
     let rest = bytes.get(module_start..)?;
-    if !(rest.starts_with(b"./") || rest.starts_with(b"../")) {
+    if !module_prefix(rest) {
         return None;
     }
     let module_len = rest
@@ -169,7 +180,7 @@ fn candidate_at(bytes: &[u8], start: usize) -> Option<Candidate> {
         .take(PROJECT_PATH_BYTES_MAX + 1)
         .position(|byte| *byte == quote || matches!(*byte, b'\\' | b'\r' | b'\n'))?;
     let module_end = module_start + module_len;
-    if bytes.get(module_end) != Some(&quote) {
+    if module_len == 0 || bytes.get(module_end) != Some(&quote) {
         return None;
     }
     let close = after_space(bytes, module_end + 1);
