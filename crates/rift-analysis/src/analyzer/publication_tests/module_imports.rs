@@ -4968,3 +4968,98 @@ fn javascript_nested_array_elements_keep_checked_property_owners() {
         })
     );
 }
+
+#[test]
+fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildcards() {
+    const ROOT: &str = "export { read } from './branch/index.js';";
+    const BRANCH: &str = "export * from '../detail';";
+    const DETAIL: &str = "export declare function read(input: string): string;";
+    const UNUSED: &str = "export declare function unused(input: string): string;";
+    const RUNTIME: &str = "export function kept() { return 1; }";
+    for (routes, alternate, admitted) in [
+        (r#""./*.js":"./*.js","./*":"./*.js""#, None, true),
+        (
+            r#""./detail.d.ts":{"types":"./other.d.ts"},"./*":"./*.js""#,
+            None,
+            false,
+        ),
+        (
+            r#""./*":"./*.js""#,
+            Some(("detail.d.ts.ts", "export const collision = 1;")),
+            false,
+        ),
+        (
+            r#""./*":"./*.js""#,
+            Some(("detail.ts", "export const collision = 1;")),
+            false,
+        ),
+        (
+            r#""./*":{"types":"./types/*","default":"./*.js"}"#,
+            None,
+            false,
+        ),
+    ] {
+        let manifest = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","exports":{{".":{{"types":"./index.d.ts","default":"./index.js"}},{routes}}}}}"#
+        );
+        let mut files = vec![
+            ("index.d.ts", ROOT),
+            ("branch/index.d.ts", BRANCH),
+            ("detail.d.ts", DETAIL),
+            ("unused.d.ts", UNUSED),
+            ("other.d.ts", "export declare const marker: string;"),
+            ("index.js", RUNTIME),
+        ];
+        files.extend(alternate);
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked package");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path)
+                .expect("retained source")
+        };
+        let detail = unit("detail.d.ts");
+        assert!(detail.source_complete);
+        assert_eq!(detail.source, DETAIL);
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == detail.unit && row.symbol.as_str().ends_with("/read"));
+        assert_eq!(declaration.is_some(), admitted, "{manifest}");
+        if let Some(row) = declaration {
+            let start = DETAIL.find("function read").expect("written declaration");
+            assert_eq!(row.source, &DETAIL[start..]);
+            assert_eq!(row.range, module_runtime_range(start, &DETAIL[start..]));
+            assert!(
+                publication.declarations.iter().any(|parameter| {
+                    parameter.unit == detail.unit
+                        && parameter.symbol.as_str().ends_with("/read/input")
+                        && parameter.source == "input"
+                }),
+                "written parameter"
+            );
+        }
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit("unused.d.ts").unit),
+            "unreached declarations still follow the wildcard"
+        );
+        assert!(
+            publication.declarations.iter().any(|row| {
+                row.unit == unit("index.js").unit && row.symbol.as_str().ends_with("/beacon/kept")
+            }),
+            "runtime entry retains its own declaration"
+        );
+    }
+}

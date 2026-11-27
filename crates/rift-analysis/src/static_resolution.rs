@@ -32,7 +32,7 @@ use rift_syntax::{
 };
 
 pub(crate) use external::ExternalOccurrence;
-pub(crate) use javascript_exports::is_declaration_file;
+pub(crate) use javascript_exports::{declared_extensions, is_declaration_file};
 
 use crate::{EnclosingDefinitions, NamespaceInput};
 
