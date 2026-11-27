@@ -2737,6 +2737,22 @@ async fn workspace_root_without_a_name_still_initializes() {
     session.shutdown().await;
 }
 
+const BAD_RUST_DECLARATION_TOKENS: [[u32; 5]; 13] = [
+    [0, 3, 4, 1, 2],  // Overlap with the preceding declaration.
+    [1, 0, 0, 1, 2],  // Empty declaration.
+    [1, 0, 0, 2, 2],  // Empty string marked as a declaration.
+    [5, 0, 0, 2, 0],  // Empty unmarked string on a nonempty line.
+    [6, 0, 0, 2, 0],  // Empty string outside the source.
+    [0, 5, 0, 2, 1],  // Macro string before the line end.
+    [1, 0, 0, 2, 3],  // Macro string marked as a declaration.
+    [0, 7, 0, 2, 8],  // Attribute string before the line end.
+    [1, 0, 0, 2, 9],  // String with both attribute and macro modifiers.
+    [1, 0, 0, 2, 12], // Attribute string marked as a declaration.
+    [1, 0, 0, 1, 8],  // Empty variable with the attribute modifier.
+    [6, 0, 0, 2, 8],  // Attribute string outside the source.
+    [1, 0, 0, 2, 16], // String with a modifier outside the legend.
+];
+
 async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStream>) {
     engine
         .handshake(json!({
@@ -2744,7 +2760,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
                 "full": true,
                 "legend": {
                     "tokenTypes": ["parameter", "variable", "string"],
-                    "tokenModifiers": ["macro", "definition", "declaration"]
+                    "tokenModifiers": ["macro", "definition", "declaration", "attribute"]
                 }
             }
         }))
@@ -2771,19 +2787,14 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
                 0, 4, 0, 2, 1,
                 1, 0, 0, 2, 0,
                 1, 0, 0, 2, 1,
+                1, 0, 0, 2, 8,
+                1, 1, 4, 2, 8,
+                0, 4, 0, 2, 8,
                 1, 1, 5, 1, 2
             ]}),
         )
         .await;
-    for bad_token in [
-        [0, 3, 4, 1, 2], // Overlap with the preceding declaration.
-        [1, 0, 0, 1, 2], // Empty declaration.
-        [1, 0, 0, 2, 2], // Empty string marked as a declaration.
-        [3, 0, 0, 2, 0], // Empty string on a nonempty line.
-        [4, 0, 0, 2, 0], // Empty string outside the source.
-        [0, 5, 0, 2, 1], // Macro string before the line end.
-        [1, 0, 0, 2, 3], // Macro string marked as a declaration.
-    ] {
+    for bad_token in BAD_RUST_DECLARATION_TOKENS {
         let (id, _) = engine
             .expect_request("textDocument/semanticTokens/full")
             .await;
@@ -2804,7 +2815,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
 
 #[tokio::test]
 async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
-    const SOURCE: &str = "é🪿 alpha beta\r\n\r\n\r\n gamma";
+    const SOURCE: &str = "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma";
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
     let file = path("lib.rs");
@@ -2852,7 +2863,7 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
             ("gamma", rift_lsp::RustDeclarationKind::Local),
         ]
     );
-    for _ in 0..7 {
+    for _ in BAD_RUST_DECLARATION_TOKENS {
         assert_eq!(
             session
                 .rust_declarations(&file, SOURCE)

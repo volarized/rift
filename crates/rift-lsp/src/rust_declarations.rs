@@ -11,6 +11,7 @@ use crate::capabilities::PositionEncoding;
 use crate::position::LineIndex;
 
 const MACRO: SemanticTokenModifier = SemanticTokenModifier::new("macro");
+const ATTRIBUTE: SemanticTokenModifier = SemanticTokenModifier::new("attribute");
 const TOKENS_MAX: usize = 262_144;
 
 /// Which source-local declaration kind Rust reported.
@@ -70,6 +71,7 @@ pub(crate) fn offered() -> SemanticTokensClientCapabilities {
             SemanticTokenModifier::DECLARATION,
             SemanticTokenModifier::DEFINITION,
             MACRO,
+            ATTRIBUTE,
         ],
         formats: vec![TokenFormat::RELATIVE],
         overlapping_token_support: Some(false),
@@ -83,6 +85,7 @@ pub(crate) struct RustTokenLegend<'legend> {
     types: &'legend [SemanticTokenType],
     declarations: u32,
     macro_expansion: u32,
+    attribute: u32,
     all_modifiers: u32,
 }
 
@@ -92,10 +95,13 @@ impl<'legend> RustTokenLegend<'legend> {
         let all_modifiers = u32::MAX.checked_shr(u32::BITS.checked_sub(bits)?)?;
         let mut declarations = 0;
         let mut macro_expansion = 0;
+        let mut attribute = 0;
         for (index, modifier) in legend.token_modifiers.iter().enumerate() {
             let bit = 1_u32.checked_shl(u32::try_from(index).ok()?)?;
             if *modifier == MACRO {
                 macro_expansion |= bit;
+            } else if *modifier == ATTRIBUTE {
+                attribute |= bit;
             } else if *modifier == SemanticTokenModifier::DECLARATION
                 || *modifier == SemanticTokenModifier::DEFINITION
             {
@@ -106,6 +112,7 @@ impl<'legend> RustTokenLegend<'legend> {
             types: &legend.token_types,
             declarations,
             macro_expansion,
+            attribute,
             all_modifiers,
         })
     }
@@ -133,8 +140,10 @@ impl<'legend> RustTokenLegend<'legend> {
             let placeholder = if token.length == 0 && token_type == &SemanticTokenType::STRING {
                 match modifiers {
                     0 => Some(StringPlaceholder::BlankLine),
-                    mask if mask == self.macro_expansion && mask.is_power_of_two() => {
-                        Some(StringPlaceholder::MacroLineEnd)
+                    mask if mask.is_power_of_two()
+                        && (mask == self.macro_expansion || mask == self.attribute) =>
+                    {
+                        Some(StringPlaceholder::TaggedLineEnd)
                     }
                     _ => None,
                 }
@@ -170,7 +179,7 @@ enum TokenSpan {
 
 enum StringPlaceholder {
     BlankLine,
-    MacroLineEnd,
+    TaggedLineEnd,
 }
 
 #[derive(Default)]
