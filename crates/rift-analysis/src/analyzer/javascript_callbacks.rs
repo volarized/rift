@@ -18,6 +18,8 @@ use super::{
     AnalyzedFile, Records, bound, digest_of, line_of, line_starts, truncation, wire_path, wire_unit,
 };
 
+mod argument_properties;
+
 /// One written function value and its ordinal among the unit's function expressions.
 #[derive(Clone, Copy)]
 struct Callback {

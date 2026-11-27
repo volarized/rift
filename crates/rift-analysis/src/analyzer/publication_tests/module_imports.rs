@@ -3688,6 +3688,106 @@ fn non_entry_callbacks_keep_properties_in_distinct_call_arguments() {
 }
 
 #[test]
+fn admitted_anonymous_callbacks_keep_written_argument_properties() {
+    const SOURCE: &str = concat!(
+        "function take(options) { return options.state; }\n",
+        "function schedule(callback) { return callback(); }\n",
+        "export function stable() { return 0; }\n",
+        "schedule(() => {\n",
+        "  take({ state: 'first', uniqueFirst: true });\n",
+        "  take({ state: 'second', uniqueSecond: false });\n",
+        "  schedule(() => {\n",
+        "    take({ state: 'third' });\n",
+        "    take({ state: 'fourth' });\n",
+        "    take({ duplicate: 1, duplicate: 2 });\n",
+        "    unknown({ state: 'unknown' });\n",
+        "  });\n",
+        "});\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 128);
+    let graph = analysis.publication();
+    graph.validate_facts().expect("argument properties");
+    let callers = anonymous_callback_ids(graph);
+    assert_eq!(callers.len(), 2);
+    let mut properties = BTreeSet::new();
+    for value in ["first", "second", "third", "fourth"] {
+        let written = format!("state: '{value}'");
+        let start = SOURCE.find(&written).expect("written property");
+        let property = graph
+            .declarations
+            .iter()
+            .find(|row| row.range == module_runtime_range(start, &written) && row.source == written)
+            .expect("placed argument property");
+        assert!(property.source_complete && !property.public);
+        assert!(properties.insert(property.symbol.clone()));
+        let object = graph
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&property.symbol))
+            .expect("property identity");
+        assert_eq!(object.name, "state");
+        let caller = object.container.as_ref().expect("argument property owner");
+        assert!(callers.contains(caller));
+        assert!(
+            caller
+                .as_str()
+                .ends_with(if matches!(value, "first" | "second") {
+                    "$callback%230"
+                } else {
+                    "$callback%231"
+                })
+        );
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.from == *caller
+                && edge.to.as_str().ends_with("/take")
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == property.unit
+                        && site.range.start <= property.range.start
+                        && property.range.end <= site.range.end
+                })
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Contains]
+                && edge.from == *caller
+                && edge.to == property.symbol
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == property.unit && site.range == module_runtime_range(start, "state")
+                })
+        }));
+    }
+    assert!(
+        graph
+            .declarations
+            .iter()
+            .any(|row| row.source == "uniqueFirst: true")
+    );
+    assert!(
+        graph
+            .declarations
+            .iter()
+            .any(|row| row.source == "uniqueSecond: false")
+    );
+    assert!(graph.objects.iter().all(|object| {
+        !object
+            .container
+            .as_ref()
+            .is_some_and(|id| callers.contains(id))
+            || object.name != "duplicate"
+    }));
+    assert!(
+        !graph
+            .declarations
+            .iter()
+            .any(|row| row.source == "state: 'unknown'")
+    );
+    let capped = non_entry_lexical_binding_analysis(SOURCE, 2);
+    let capped = capped.publication();
+    assert!(capped.edges.len() <= 2);
+    assert!(capped.edges.iter().all(|edge| graph.edges.contains(edge)));
+}
+
+#[test]
 fn scoped_call_initializers_keep_argument_properties_without_result_reads() {
     const SOURCE: &str = concat!(
         "function wrap(value) { return { other: 1 }; }\n",
