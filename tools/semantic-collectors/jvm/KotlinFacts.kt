@@ -8,10 +8,14 @@ import org.jetbrains.kotlin.KtPsiSourceElement
 import org.jetbrains.kotlin.KtRealSourceElementKind
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.cli.common.ExitCode
+import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
+import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.cli.jvm.K2JVMCompiler
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
 import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.jetbrains.kotlin.config.CompilerConfiguration
+import org.jetbrains.kotlin.config.JvmTarget
+import org.jetbrains.kotlin.config.Services
 import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.unwrapUseSiteSubstitutionOverrides
@@ -44,6 +48,7 @@ import org.jetbrains.kotlin.fir.extensions.FirExtensionRegistrar
 import org.jetbrains.kotlin.fir.extensions.FirExtensionRegistrarAdapter
 import org.jetbrains.kotlin.fir.references.FirResolvedNamedReference
 import org.jetbrains.kotlin.fir.resolve.providers.symbolProvider
+import org.jetbrains.kotlin.fir.resolve.typeParameterSymbol
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirConstructorSymbol
@@ -66,26 +71,40 @@ import org.jetbrains.kotlin.psi.KtUserType
 
 class KotlinFacts : KotlinCompiler {
     override fun collect(
-        facts: Facts, paths: List<Path>, classpath: List<Path>, home: Path, output: Path, stdlib: Boolean,
+        facts: Facts, paths: List<Path>, classpath: List<Path>, home: Path, output: Path,
+        stdlib: Boolean, settings: KotlinLanguageSettings,
     ) {
         val options = mutableListOf(
             "-kotlin-home", home.toString(), "-d", output.toString(),
-            "-Xuse-fir-lt=false", "-Xdisable-default-scripting-plugin",
+            "-Xuse-fir-lt=false", "-Xdisable-default-scripting-plugin", "-Xuse-fast-jar-file-system=false",
             "-Xplugin=${Path.of(KotlinFacts::class.java.protectionDomain.codeSource.location.toURI())}",
         )
         if (classpath.isNotEmpty()) options.addAll(listOf("-classpath", classpath.joinToString(File.pathSeparator)))
+        settings.optIns().forEach { options.add("-opt-in=$it") }
+        settings.languageVersion()?.let { options.addAll(listOf("-language-version", it)) }
+        settings.apiVersion()?.let { options.addAll(listOf("-api-version", it)) }
+        settings.jvmTarget()?.let { options.addAll(listOf("-jvm-target", it)) }
+        val friends = settings.friendPaths().toMutableList()
         if (stdlib) {
-            val library = home.resolve("lib").resolve("kotlin-stdlib.jar")
-            options.addAll(listOf("-Xallow-kotlin-package", "-Xfriend-paths=$library"))
+            options.add("-Xallow-kotlin-package")
+            if (settings.jvmTarget() == null || settings.jvmTarget() == JvmTarget.JVM_1_8.description) {
+                options.add("-Xjdk-release=8")
+            }
+            friends.add(home.resolve("lib").resolve("kotlin-stdlib.jar"))
         }
         options.addAll(paths.map(Path::toString))
+        val compiler = K2JVMCompiler()
+        val arguments = compiler.createArguments()
+        compiler.parseArguments(options.toTypedArray(), arguments)
+        if (friends.isNotEmpty()) arguments.friendPaths = friends.map(Path::toString).toTypedArray()
 
         val active = KotlinFactsRegistrar.facts
         check(active.get() == null)
         active.set(facts)
         try {
             PrintStream(OutputStream.nullOutputStream()).use { diagnostics ->
-                val exit = K2JVMCompiler().exec(diagnostics, *options.toTypedArray())
+                val messages = PrintingMessageCollector(diagnostics, MessageRenderer.PLAIN_FULL_PATHS, false)
+                val exit = compiler.exec(messages, Services.EMPTY, arguments)
                 facts.partial = facts.partial || exit != ExitCode.OK
             }
         } finally {
@@ -97,6 +116,7 @@ class KotlinFacts : KotlinCompiler {
 @OptIn(ExperimentalCompilerApi::class)
 class KotlinFactsRegistrar : CompilerPluginRegistrar() {
     override val supportsK2 = true
+    override val pluginId = "rift.jvm.collector"
 
     override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
         FirExtensionRegistrarAdapter.registerExtension(Registrar(checkNotNull(facts.get())))
@@ -211,7 +231,7 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
                 context(context: CheckerContext, reporter: DiagnosticReporter)
                 override fun check(expression: FirResolvedQualifier) {
                     if (facts.category != Facts.Category.REFERENCES || !context.isSelected()) return
-                    val classifier = expression.symbol ?: return
+                    val classifier = expression.qualifierSymbol ?: return
                     val source = expression.source as? KtPsiSourceElement ?: return
                     if (source.kind != KtRealSourceElementKind) return
                     val occurrence = source.psi.nameRange() ?: return

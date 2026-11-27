@@ -17,7 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.regex.Pattern;
 
 final class CollectorProtocol {
-    private static final Gson JSON = new GsonBuilder()
+    static final Gson JSON = new GsonBuilder()
         .setStrictness(Strictness.STRICT)
         .disableJdkUnsafe()
         .disableHtmlEscaping()

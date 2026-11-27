@@ -1,0 +1,179 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.security.MessageDigest
+import org.gradle.api.tasks.SourceSet
+import org.gradle.api.tasks.bundling.Jar
+import org.gradle.api.tasks.compile.JavaCompile
+
+enum JvmSource {
+    JAVA('.java'), KOTLIN('.kt')
+
+    final String suffix
+
+    JvmSource(String suffix) {
+        this.suffix = suffix
+    }
+
+    boolean matches(String path) {
+        path.endsWith(suffix)
+    }
+}
+
+def paths = { files -> files.findAll { it.exists() }.collect { it.canonicalPath }.unique() }
+def property = { object, name -> object?.hasProperty(name) ? object."$name" : null }
+
+def languageSettings = { task ->
+    def options = property(task, 'compilerOptions')
+    def legacy = property(task, 'kotlinOptions')
+    def arguments = property(options, 'freeCompilerArgs')?.getOrElse([]) ?:
+        property(legacy, 'freeCompilerArgs') ?: []
+    def optIns = new LinkedHashSet(property(options, 'optIn')?.getOrElse([]) ?: [])
+    def flags = ['-opt-in', '-Xopt-in']
+    for (int index = 0; index < arguments.size(); index++) {
+        String argument = arguments[index]
+        def flag = flags.find { argument.startsWith(it + '=') }
+        if (flag != null) {
+            optIns.add(argument.substring(flag.length() + 1))
+        } else if (argument in flags && index + 1 < arguments.size()) {
+            optIns.add(arguments[++index])
+        }
+    }
+    [
+        opt_ins: optIns.toList(),
+        language_version: property(options, 'languageVersion')?.orNull?.version ?:
+            property(legacy, 'languageVersion'),
+        api_version: property(options, 'apiVersion')?.orNull?.version ?: property(legacy, 'apiVersion'),
+        jvm_target: property(options, 'jvmTarget')?.orNull?.target ?: property(legacy, 'jvmTarget'),
+        friend_paths: paths(property(task, 'friendPaths')?.files ?: []),
+    ]
+}
+
+def fingerprints = { compilations ->
+    def result = new TreeMap()
+    byte[] buffer = new byte[64 * 1024]
+    long remainingBytes = 4L << 30
+    int remainingPaths = 100_000
+    compilations.collectMany { it.classpath + (it.kotlin?.friend_paths ?: []) }.unique().each { name ->
+        def root = new File(name).toPath()
+        def entries = []
+        Files.walk(root).withCloseable { stream ->
+            stream.iterator().each { entry ->
+                if (--remainingPaths < 0) {
+                    throw new GradleException('collector classpath exceeds its path bound')
+                }
+                if (Files.isSymbolicLink(entry)) {
+                    throw new GradleException("symbolic link in collector classpath: $entry")
+                }
+                if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
+                    entries.add(entry)
+                }
+            }
+        }
+        def digest = MessageDigest.getInstance('SHA-256')
+        entries.sort().each { entry ->
+            def fileDigest = MessageDigest.getInstance('SHA-256')
+            Files.newInputStream(entry).withCloseable { input ->
+                int count
+                while ((count = input.read(buffer)) != -1) {
+                    remainingBytes -= count
+                    if (remainingBytes < 0) {
+                        throw new GradleException('collector classpath exceeds its byte bound')
+                    }
+                    fileDigest.update(buffer, 0, count)
+                }
+            }
+            digest.update(root.relativize(entry).toString().getBytes('UTF-8'))
+            digest.update((byte) 0)
+            digest.update(fileDigest.digest())
+        }
+        result[name] = digest.digest().encodeHex().toString()
+    }
+    result
+}
+
+gradle.projectsEvaluated {
+    gradle.rootProject.tasks.register('riftCollectContext') {
+        doLast {
+            def admitted = new JsonSlurper().parse(new File(System.getenv('RIFT_GRADLE_SOURCES')))
+            def sources = admitted.groupBy { it.path }
+            def assignments = [:]
+            def compilations = []
+            def javaByArtifact = [:]
+            def inputs = { files, language ->
+                paths(files).findAll { language.matches(it) }.collectMany { sources[it] ?: [] }
+            }
+            def units = { sourcesInTask -> sourcesInTask.collect { it.unit }.unique().sort() }
+            def add = { task, selected, support, classpath, settings ->
+                selected.each { unit ->
+                    def previous = assignments.put(unit, task.path)
+                    if (previous != null) {
+                        throw new GradleException("source $unit matches both $previous and ${task.path}")
+                    }
+                }
+                compilations.add([
+                    task: task.path,
+                    selected: selected,
+                    support: units(support),
+                    classpath: paths(classpath),
+                    kotlin: settings,
+                ])
+            }
+            gradle.rootProject.allprojects.sort { it.path }.each { project ->
+                project.extensions.findByName('sourceSets')?.each { sourceSet ->
+                    def java = project.tasks.findByName(sourceSet.compileJavaTaskName)
+                    def kotlin = project.tasks.findByName(sourceSet.getCompileTaskName('kotlin'))
+                    def javaInputs = java instanceof JavaCompile ? inputs(java.source.files, JvmSource.JAVA) : []
+                    def kotlinFiles = property(kotlin, 'sources') ?: property(kotlin, 'source')
+                    def kotlinInputs = inputs(kotlinFiles?.files ?: [], JvmSource.KOTLIN)
+                    def selectedJava = units(javaInputs.findAll { it.selected })
+                    def selectedKotlin = units(kotlinInputs.findAll { it.selected })
+                    def outputs = sourceSet.output.classesDirs.files
+                    if (!javaInputs.isEmpty()) {
+                        def artifacts = paths(outputs)
+                        if (sourceSet.name == SourceSet.MAIN_SOURCE_SET_NAME) {
+                            def jar = project.tasks.findByName('jar')
+                            if (jar instanceof Jar) {
+                                artifacts.addAll(paths([jar.archiveFile.get().asFile]))
+                            }
+                        }
+                        def javaUnits = units(javaInputs)
+                        artifacts.each { artifact ->
+                            javaByArtifact.computeIfAbsent(artifact) { [] }.addAll(javaUnits)
+                        }
+                    }
+                    if (!selectedJava.isEmpty()) {
+                        add(java, selectedJava, javaInputs, java.classpath.files, null)
+                    }
+                    if (!selectedKotlin.isEmpty()) {
+                        def libraries = property(kotlin, 'libraries')?.files ?: sourceSet.compileClasspath.files
+                        add(kotlin, selectedKotlin, javaInputs + kotlinInputs, libraries + outputs,
+                            languageSettings(kotlin))
+                    }
+                }
+            }
+            compilations.findAll { it.kotlin != null }.each { compilation ->
+                def dependencyJava = compilation.classpath.collectMany { javaByArtifact[it] ?: [] }
+                compilation.support = (compilation.support + dependencyJava).unique().sort()
+            }
+            def missing = admitted.find { source ->
+                source.selected && JvmSource.values().any { it.matches(source.path) } &&
+                    !assignments.containsKey(source.unit)
+            }
+            if (missing != null) {
+                throw new GradleException("source ${missing.unit} is outside Gradle JVM source sets")
+            }
+            def report = JsonOutput.toJson([
+                gradle_version: gradle.gradleVersion,
+                java_version: System.getProperty('java.version'),
+                compilations: compilations,
+                artifacts: fingerprints(compilations),
+            ]).getBytes('UTF-8')
+            if (report.length > (8 << 20)) {
+                throw new GradleException('Gradle context exceeds its byte bound')
+            }
+            Files.write(new File(System.getenv('RIFT_GRADLE_CONTEXT')).toPath(), report)
+        }
+    }
+}

@@ -1,5 +1,7 @@
 //! Run a collector over a supplied source inventory.
 
+mod gradle;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -16,6 +18,8 @@ use rift_core::{FileDigest, ProjectPath, ProviderId, SourceUnitId};
 use rift_lsp::{EngineLaunch, JvmLanguageServer};
 use serde::Deserialize;
 use serde_json::json;
+
+use gradle::GradleSources;
 
 const MANIFEST_BYTES_MAX: u64 = 8 << 20;
 
@@ -75,6 +79,7 @@ enum Mode {
     Stdio {
         program: OsString,
         arguments: Vec<OsString>,
+        gradle_root: Option<PathBuf>,
     },
     Static,
     Lsp {
@@ -157,9 +162,11 @@ impl CollectionRun {
         manifest_path: &Path,
         cache_path: &Path,
         lsp: Option<&mut LspWorkspace>,
+        gradle: Option<&mut GradleSources>,
     ) -> Result<Self, Error> {
         let root = manifest_root(manifest_path);
         let mut lsp = lsp;
+        let mut gradle = gradle;
         let mut manifest: Manifest =
             serde_json::from_slice(&read_bounded(manifest_path, MANIFEST_BYTES_MAX)?)?;
         let id = ProviderId::new(manifest.producer.clone())
@@ -178,6 +185,9 @@ impl CollectionRun {
                     return Err(Error::Input("LSP source must be a regular file".into()));
                 }
                 lsp.paths.insert(unit.clone(), lsp_path(&lsp.root, &path)?);
+            }
+            if let Some(gradle) = &mut gradle {
+                gradle.add(unit.clone(), path.canonicalize()?, source.selected);
             }
             let text = String::from_utf8(read_bounded(&path, SOURCE_BYTES_MAX as u64)?)
                 .map_err(|error| Error::Input(error.to_string()))?;
@@ -316,8 +326,18 @@ fn parse_arguments(
     };
     let mode = match mode.and_then(std::ffi::OsStr::to_str) {
         Some("collect") => {
+            let mut args = args.peekable();
+            let gradle_root = if args.next_if(|option| option == "--gradle-root").is_some() {
+                Some(args.next().ok_or_else(usage)?.into())
+            } else {
+                None
+            };
             let (program, arguments) = command(&mut args)?;
-            Mode::Stdio { program, arguments }
+            Mode::Stdio {
+                program,
+                arguments,
+                gradle_root,
+            }
         }
         Some("static") if args.next().is_none() => Mode::Static,
         Some("lsp") => {
@@ -363,12 +383,33 @@ async fn run() -> Result<bool, Error> {
     } else {
         None
     };
-    let run = CollectionRun::load(&manifest, &cache, lsp.as_mut()).await?;
+    let mut gradle = matches!(
+        mode,
+        Mode::Stdio {
+            gradle_root: Some(_),
+            ..
+        }
+    )
+    .then(GradleSources::default);
+    let run = CollectionRun::load(&manifest, &cache, lsp.as_mut(), gradle.as_mut()).await?;
     let mut output = BufWriter::new(io::stdout().lock());
     let stats = match mode {
-        Mode::Stdio { program, arguments } => {
+        Mode::Stdio {
+            program,
+            mut arguments,
+            gradle_root,
+        } => {
+            let (context, _gradle_directory) = if let Some(root) = gradle_root {
+                let (directory, context) = gradle
+                    .ok_or_else(usage)?
+                    .export(&root, &run.inventory, run.context, &mut arguments)
+                    .await?;
+                (context, Some(directory))
+            } else {
+                (run.context, None)
+            };
             let mut collector = StdioCollector::new(program, arguments, Duration::from_secs(30));
-            let result = run.write(run.context, &mut collector, &mut output).await;
+            let result = run.write(context, &mut collector, &mut output).await;
             let closed = collector.close().await;
             let stats = result?;
             closed?;
@@ -394,7 +435,7 @@ async fn run() -> Result<bool, Error> {
 
 fn usage() -> Error {
     Error::Input(
-        "usage: rift-collect collect MANIFEST CACHE -- PROGRAM [ARGS...] | rift-collect static MANIFEST CACHE | rift-collect lsp LANGUAGE MANIFEST CACHE [-- PROGRAM [ARGS...]] | rift-collect schema"
+        "usage: rift-collect collect MANIFEST CACHE [--gradle-root ROOT] -- PROGRAM [ARGS...] | rift-collect static MANIFEST CACHE | rift-collect lsp LANGUAGE MANIFEST CACHE [-- PROGRAM [ARGS...]] | rift-collect schema"
             .into(),
     )
 }

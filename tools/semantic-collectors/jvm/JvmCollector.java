@@ -1,5 +1,6 @@
 import com.google.gson.annotations.SerializedName;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -52,19 +53,38 @@ public final class JvmCollector {
 
     private final CollectorProtocol protocol;
     private final Options options;
+    private final GradleContext gradle;
     private KotlinCompiler kotlin;
 
-    private JvmCollector(CollectorProtocol protocol, Options options) {
+    private JvmCollector(CollectorProtocol protocol, Options options) throws IOException {
         this.protocol = protocol;
         this.options = options;
+        gradle = GradleContext.read(options.gradleContext());
     }
 
     public static void main(String[] arguments) throws Exception {
         var protocol = new CollectorProtocol(System.in, System.out);
         System.setOut(System.err);
-        var collector = new JvmCollector(protocol, Options.parse(arguments));
+        var options = Options.parse(arguments);
+        if (options.kotlinHome() != null) {
+            requireRestrictedJvm();
+        }
+        var collector = new JvmCollector(protocol, options);
         for (var request = protocol.next(); request != null; request = protocol.next()) {
             protocol.reply(request.id(), collector.extract(request.params()));
+        }
+    }
+
+    private static void requireRestrictedJvm() {
+        String prefix = "--sun-misc-unsafe-memory-access=";
+        var policy = ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+            .filter(argument -> argument.startsWith(prefix))
+            .reduce((first, last) -> last);
+        if (policy.filter((prefix + "deny")::equals).isEmpty()
+            || ModuleLayer.boot().findModule("jdk.unsupported").isPresent()) {
+            throw new IllegalArgumentException("Kotlin collection requires restricted JVM options: "
+                + "--sun-misc-unsafe-memory-access=deny "
+                + "and --limit-modules=java.se,jdk.compiler,jdk.zipfs,jdk.management");
         }
     }
 
@@ -85,14 +105,23 @@ public final class JvmCollector {
             return new Batch(Coverage.UNSUPPORTED, List.of());
         }
 
+        var scope = gradle.scope(selected.unit());
+        var supports = new LinkedHashSet<>(scope.support());
+        supports.addAll(options.support());
+        supports.remove(selected.unit());
+        var classpath = new LinkedHashSet<>(scope.classpath());
+        classpath.addAll(options.classpath());
+        var libraries = List.copyOf(classpath);
         try (var staging = new Staging(Files.createTempDirectory("rift-jvm-"), language)) {
             var input = AdmitSource.from(selected, language);
             staging.add(input);
             int supportBytes = 0;
+            int supportCount = 0;
             boolean partial = false;
-            for (String unit : options.support()) {
-                if (unit.equals(selected.unit())) {
-                    continue;
+            for (String unit : supports) {
+                if (++supportCount > SUPPORT_COUNT_MAX) {
+                    partial = true;
+                    break;
                 }
                 var source = protocol.supportingSource(unit);
                 if (source == null) {
@@ -117,15 +146,15 @@ public final class JvmCollector {
             var facts = new Facts(request.category(), limit, staging.paths);
             if (language == Language.JAVA) {
                 Path module = staging.root.resolve("module");
-                JavacFacts.collect(facts, staging.paths, options.classpath(), staging.root,
+                JavacFacts.collect(facts, staging.paths, libraries, staging.root,
                     Files.isDirectory(module) ? options.javaModule() + "=" + module : null);
             } else {
                 if (kotlin == null) {
                     kotlin = ServiceLoader.load(KotlinCompiler.class).findFirst()
                         .orElseThrow(() -> new IOException("Kotlin compiler is unavailable"));
                 }
-                kotlin.collect(facts, staging.paths, options.classpath(), options.kotlinHome(),
-                    staging.root.resolve("classes"), options.kotlinStdlib());
+                kotlin.collect(facts, staging.paths, libraries, options.kotlinHome(),
+                    staging.root.resolve("classes"), options.kotlinStdlib(), scope.kotlin());
             }
             return staging.batch(facts, partial);
         }
@@ -220,12 +249,13 @@ public final class JvmCollector {
     }
 
     private record Options(List<Path> classpath, List<String> support, Set<String> moduleSources,
-        Path kotlinHome, boolean kotlinStdlib, String javaModule) {
+        Path kotlinHome, boolean kotlinStdlib, String javaModule, Path gradleContext) {
         static Options parse(String[] args) throws IOException {
             var classpath = new ArrayList<Path>();
             var support = new LinkedHashSet<String>();
             var moduleSources = new TreeSet<String>();
             Path kotlinHome = null;
+            Path gradleContext = null;
             boolean kotlinStdlib = false;
             String javaModule = null;
             for (int index = 0; index < args.length; index++) {
@@ -243,6 +273,7 @@ public final class JvmCollector {
                     case "--source-unit" -> support.add(value);
                     case "--java-module-source" -> moduleSources.add(value);
                     case "--kotlin-home" -> kotlinHome = Path.of(value).toRealPath();
+                    case "--gradle-context" -> gradleContext = Path.of(value).toRealPath();
                     case "--java-module" -> javaModule = value;
                     default -> throw new IllegalArgumentException("unknown collector option " + option);
                 }
@@ -261,7 +292,7 @@ public final class JvmCollector {
                 throw new IllegalArgumentException("supporting source count exceeds its bound");
             }
             return new Options(List.copyOf(classpath), List.copyOf(support), Set.copyOf(moduleSources),
-                kotlinHome, kotlinStdlib, javaModule);
+                kotlinHome, kotlinStdlib, javaModule, gradleContext);
         }
     }
 }

@@ -46,13 +46,16 @@ fn manifest(root: &Path, revision: &str) -> std::path::PathBuf {
     path
 }
 
-fn collect(root: &Path, manifest: &Path) -> Command {
+fn collect(root: &Path, manifest: &Path, gradle: Option<&Path>) -> Command {
     let mut command = command();
     command
         .arg("collect")
         .arg(manifest)
-        .arg(root.join("checkpoints.sqlite"))
-        .arg("--");
+        .arg(root.join("checkpoints.sqlite"));
+    if let Some(gradle) = gradle {
+        command.arg("--gradle-root").arg(gradle);
+    }
+    command.arg("--");
     command
 }
 
@@ -72,7 +75,7 @@ async fn schema_and_manifest_failures_are_visible_at_the_cli() {
 
     let directory = tempfile::tempdir().expect("fixture directory");
     let path = manifest(directory.path(), "invalid");
-    let mut invalid = collect(directory.path(), &path);
+    let mut invalid = collect(directory.path(), &path, None);
     invalid.arg("unused");
     let result = run(invalid).await;
     assert_eq!(result.status.code(), Some(1));
@@ -82,8 +85,14 @@ async fn schema_and_manifest_failures_are_visible_at_the_cli() {
 }
 
 #[cfg(unix)]
-fn host(root: &Path, manifest: &Path, coverage: &str, after_response: &str) -> Command {
-    let mut command = collect(root, manifest);
+fn host(
+    root: &Path,
+    manifest: &Path,
+    coverage: &str,
+    after_response: &str,
+    gradle: Option<&Path>,
+) -> Command {
+    let mut command = collect(root, manifest, gradle);
     let body = json!({
         "jsonrpc": "2.0", "id": 1, "result": {
             "coverage": coverage,
@@ -111,14 +120,14 @@ async fn runner_streams_a_batch_and_skips_host_start_on_warm_restart() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let root = directory.path();
     let path = manifest(root, &"a".repeat(64));
-    let cold = run(host(root, &path, "complete", "")).await;
+    let cold = run(host(root, &path, "complete", "", None)).await;
     assert!(cold.status.success(), "{:?}", cold.stderr);
     assert!(String::from_utf8_lossy(&cold.stderr).contains("reused=0 collected=1 partial=0"));
     let batch: Value = serde_json::from_slice(&cold.stdout).expect("batch");
     assert_eq!(batch["batch"]["observations"][0]["id"], "fixture");
     assert_eq!(batch["producer"], "fixture.calls");
 
-    let mut missing = collect(root, &path);
+    let mut missing = collect(root, &path, None);
     missing.arg(root.join("missing-collector"));
     let warm = run(missing).await;
     assert!(warm.status.success());
@@ -126,7 +135,7 @@ async fn runner_streams_a_batch_and_skips_host_start_on_warm_restart() {
     assert!(String::from_utf8_lossy(&warm.stderr).contains("reused=1 collected=0 partial=0"));
 
     std::fs::write(root.join("entry.py"), "g()").expect("edit source");
-    let edited = run(host(root, &path, "complete", "")).await;
+    let edited = run(host(root, &path, "complete", "", None)).await;
     assert!(edited.status.success());
     assert_ne!(edited.stdout, cold.stdout);
     assert!(String::from_utf8_lossy(&edited.stderr).contains("reused=0 collected=1 partial=0"));
@@ -138,13 +147,58 @@ async fn partial_and_nonzero_host_exit_keep_distinct_status() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let root = directory.path();
     let path = manifest(root, &"a".repeat(64));
-    let partial = run(host(root, &path, "partial", "")).await;
+    let partial = run(host(root, &path, "partial", "", None)).await;
     assert_eq!(partial.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&partial.stderr).contains("reused=0 collected=0 partial=1"));
 
-    let failed = run(host(root, &path, "complete", "fail")).await;
+    let failed = run(host(root, &path, "complete", "fail", None)).await;
     assert_eq!(failed.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&failed.stderr).contains("collector exited with"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gradle_artifact_changes_invalidate_retained_batches() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let root = directory.path();
+    let path = manifest(root, &"a".repeat(64));
+    let wrapper = root.join("gradlew");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+test -s "$RIFT_GRADLE_SOURCES"
+printf '%s' "$RIFT_GRADLE_CONTEXT" > context-path
+cat artifact.json > "$RIFT_GRADLE_CONTEXT"
+"#,
+    )
+    .expect("wrapper script");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("executable wrapper");
+    let artifact = root.join("artifact.json");
+    std::fs::write(&artifact, br#"{"artifacts":{"generated":"first"}}"#).expect("artifact digest");
+
+    let cold = run(host(root, &path, "complete", "", Some(root))).await;
+    assert!(
+        cold.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let report = std::fs::read_to_string(root.join("context-path")).expect("report path");
+    assert!(!Path::new(&report).exists());
+    let mut missing = collect(root, &path, Some(root));
+    missing.arg(root.join("missing-collector"));
+    let warm = run(missing).await;
+    assert!(warm.status.success());
+    assert_eq!(warm.stdout, cold.stdout);
+
+    std::fs::write(&artifact, br#"{"artifacts":{"generated":"second"}}"#).expect("new digest");
+    let edited = run(host(root, &path, "complete", "", Some(root))).await;
+    assert!(edited.status.success());
+    assert_ne!(edited.stdout, cold.stdout);
+    assert!(String::from_utf8_lossy(&edited.stderr).contains("reused=0 collected=1 partial=0"));
 }
 
 #[tokio::test]
