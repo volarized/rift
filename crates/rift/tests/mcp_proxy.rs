@@ -1006,17 +1006,36 @@ fn text_of(result: &CallToolResult) -> TestResult<&str> {
 /// Checks the one generated blank node alongside every fixed term in the fixture.
 fn assert_term_kind_text(text: &str) -> TestResult {
     let mut lines = text.lines();
-    assert_eq!(lines.next(), Some("?blank\t?iri\t?number\t?language"));
+    let max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
+    assert_eq!(
+        lines.next(),
+        Some(
+            format!(
+                "Query finished: 1 results found on 1/1 pages with {max_results} results per page."
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(lines.next(), Some(""));
+    assert!(
+        lines
+            .next()
+            .is_some_and(|line| line.starts_with("| ?blank "))
+    );
+    assert!(lines.next().is_some_and(|line| line.starts_with("| ---")));
     let row = lines.next().ok_or("term-kind row missing")?;
-    let (blank, rest) = row
-        .split_once('\t')
-        .ok_or("term-kind row needs four columns")?;
+    let cells: Vec<_> = row.trim_matches('|').split('|').map(str::trim).collect();
+    let [blank, iri, number, language] = cells.as_slice() else {
+        return Err("term-kind row needs four columns".into());
+    };
     assert!(
         blank
-            .strip_prefix("_:")
+            .strip_prefix(r"\_:")
             .is_some_and(|value| !value.is_empty())
     );
-    assert_eq!(rest, "<urn:fixture:term>\t1\t\"hello\"@en");
+    assert_eq!(*iri, r"\<urn:fixture:term>");
+    assert_eq!(*number, "1");
+    assert_eq!(*language, r#""hello"@en"#);
     assert!(lines.next().is_none());
     Ok(())
 }
@@ -1157,12 +1176,13 @@ async fn assert_paged_index_text(
     result: &CallToolResult,
 ) -> TestResult {
     let max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
-    let mut expected = String::from("?index\n");
-    for index in 0..max_results {
-        writeln!(expected, "{index}")?;
-    }
     let total = max_results + 1;
-    writeln!(expected, "page 1/2, total {total} results")?;
+    let mut expected = format!(
+        "Query finished: {total} results found on 1/2 pages with {max_results} results per page.\n\n| ?index |\n| ------ |\n"
+    );
+    for index in 0..max_results {
+        writeln!(expected, "| {index:<6} |")?;
+    }
     assert_eq!(text_of(result)?, expected);
     let query = format!(
         "SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index",
@@ -1183,7 +1203,9 @@ async fn assert_paged_index_text(
     assert_ne!(held.is_error, Some(true), "{held:?}");
     assert_eq!(
         text_of(&held)?,
-        format!("?index\n{max_results}\npage 2/2, total {total} results\n")
+        format!(
+            "Query finished: {total} results found on 2/2 pages with {max_results} results per page.\n\n| ?index |\n| ------ |\n| {max_results:<6} |\n"
+        )
     );
     Ok(())
 }

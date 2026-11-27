@@ -1,5 +1,6 @@
 import { CodeBlock, Pre } from "fumadocs-ui/components/codeblock";
 import { ExampleTabs } from "@/components/example-tabs";
+import { SearchResponse } from "@/components/search-response";
 import generated from "./workspace-examples.generated.json";
 
 const examples = { ...generated.queries, map: generated.map };
@@ -27,7 +28,13 @@ export function ReadExample({ name }: { name: keyof typeof examples }) {
     <ExampleTabs
       sparql={typeof query === "string" && <ExampleCode source={query} />}
       mcp={<ExampleCode source={JSON.stringify(example.arguments, null, 2)} />}
-      text={<ExampleCode source={example.text} />}
+      text={
+        typeof query === "string" && example.text.includes("\n\n|") ? (
+          <SearchResponse source={example.text} />
+        ) : (
+          <ExampleCode source={example.text} />
+        )
+      }
       json={<ExampleCode source={JSON.stringify(example.json, null, 2)} />}
     />
   );

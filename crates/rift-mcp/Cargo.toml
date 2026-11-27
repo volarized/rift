@@ -55,6 +55,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "net"] }
 tokio-util.workspace = true
 tower-service = "0.3.3"
+unicode-width.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-spawn.workspace = true

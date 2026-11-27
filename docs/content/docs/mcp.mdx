@@ -88,6 +88,10 @@ optional `language`, whose default is `sparql`:
 
 <ReadExample name="select-symbols" />
 
+The Response tab renders the Markdown as a table, with a summary of the result count, page, and
+page size above it. See [search result text](/docs/developer/protocol/mcp#search-result-text) for
+the format.
+
 The empty prefix names `urn:rift:vocabulary:`. `r:`, `rdf:`, `rdfs:`, and `xsd:` are also
 available. An explicit `PREFIX` declaration can name another namespace.
 
@@ -95,6 +99,10 @@ available. An explicit `PREFIX` declaration can name another namespace.
 return triples. The selected variables are the answer's columns. An unbound variable is
 absent from its row. An IRI, blank node, literal with a datatype, and literal with a language
 remain distinct terms.
+
+The example project has no declaration named `load_configs`.
+
+<ReadExample name="empty-search" />
 
 ### Names and declarations
 
@@ -391,7 +399,7 @@ A query over the captured inventory answers from partly covered facts. An empty 
 `outcome: "unavailable"` with `insufficient_coverage` when that coverage is missing. Run
 `rift server logs` to inspect missing facts or preparation still in progress.
 
-The proxy returns compact text by default. Start `rift mcp --output=all` for structured
+The proxy returns text by default. Start `rift mcp --output=all` for structured
 results and output schemas. The map and workspace resources then carry both compact text
 and JSON.
 

@@ -715,7 +715,7 @@ impl AcquiredGraph {
             configuration: &configuration,
             paging,
             warnings,
-            display: QueryDisplay::selected(&answer, query.presentation()),
+            display: QueryDisplay::for_answer(&answer),
             acquired: &acquired,
             retrieved: &retrieved,
         };

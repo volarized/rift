@@ -11,8 +11,7 @@ limits, and failures. For an introduction through an agent's workflow, see the
 
 The expandable tool properties and examples come from the served [JSON schema](https://volar.sh/rift/mcp.json).
 The Request tab shows the MCP call and offers a SPARQL view for searches. The Response tab shows
-compact text or JSON.
-[Result content](#result-content) defines the compact text.
+tool text or JSON. [Result content](#result-content) defines both forms.
 
 ## Map [#resource-map]
 
@@ -111,14 +110,27 @@ Each binding or triple term carries its kind: `iri`, `blank_node`, `literal` wit
 `language_literal` with `language`. Unbound variables are omitted from the row. Duplicate
 bindings and projected variable order follow SPARQL. Graph answers use RDF set semantics.
 
-MCP text leads with selected matches and call paths for direct retrieval projections. Other
-queries show their projected rows, boolean, or triples. Text shortens common RDF namespaces
-and writes ordinary integers and booleans without datatype names. If one page holds the
-entire graph and its only subject is an unreferenced blank node, text groups that subject's
-properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct. Structured
-content carries the exact RDF terms and identities.
-
 `DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine fact. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms. Bounds still refuse incomplete admission.
+
+### Search result text [#search-result-text]
+
+Search text for a nonempty result set starts with a summary of the total count, current page,
+page count, and page size. It uses `pagination.total`, `pagination.page`, `pagination.pages`,
+and `pagination.max_results`. A blank line separates the summary from the Markdown table.
+
+A `SELECT` table has one column per projected variable, in projection order, with `?` before
+each variable name. An unbound variable leaves an empty cell. A graph table has `subject`,
+`predicate`, and `object` columns. An `ASK` answer uses `1/1` pages and shows `true` or `false`
+in one row under `result`.
+
+Text shortens common RDF namespaces and escapes Markdown syntax in cells. Structured content
+carries the exact RDF terms and identities.
+
+A query with zero results returns one sentence that points to the query examples.
+
+<ReadExample name="empty-search" />
+
+A page past the last page of a nonempty result set keeps the counts and has a table with no rows.
 
 ### Full-text search [#search-fulltext]
 
@@ -217,10 +229,8 @@ between the same steps contribute evidence to the same path.
 
 The server scores each path by the strongest matched symbol and adds a quarter of the second
 strongest score when a distinct matched symbol is present. Step order follows the direction
-of the calls in the graph. Text shows ordinary scores as decimals and writes each step with its
-index and an arrow, such as `0 → ReadService`. An answer with a single anonymous path needs
-no path label in text. Multiple anonymous paths carry numbers on a single page or retain
-their shortened labels across pages.
+of the calls in the graph. The Markdown table follows the projected variables, so callers can
+include each step's index and symbol.
 
 The service applies `:max_results` to whole flows before SPARQL evaluates the outer query. Outer
 `LIMIT` and `OFFSET` apply to solution rows and can split a flow's steps. When the caller
@@ -678,7 +688,7 @@ The caller selects the representations when it starts the proxy with `rift mcp -
 The proxy **MUST** keep the selected output for its lifetime. Direct HTTP access to
 `rift server` carries both tool representations.
 
-Search text shows the query answer and its pagination. An exact read states its outcome and
+Search uses [Markdown result text](#search-result-text). An exact read states its outcome and
 selected object. Use `rift server logs` for diagnostic codes and details.
 The [tool execution failure](#tool-execution-failures) form applies when `isError` is set.
 

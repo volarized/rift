@@ -199,13 +199,16 @@ fn query_continuation_text(text: &str, _structured: &serde_json::Value) -> Resul
     Ok(())
 }
 
-fn query_term(term: &serde_json::Value) -> Result<String, String> {
+fn query_term(term: &serde_json::Value, blank_width: usize) -> Result<String, String> {
     let value = term["value"].as_str().ok_or("query term value")?;
     let quoted = || serde_json::to_string(value).map_err(|error| error.to_string());
     match term["type"].as_str() {
         Some("iri") => Ok(query_iri(value)),
         Some("blank_node") => {
-            let mut display = format!("_:{}", &value[..value.ceil_char_boundary(12)]);
+            let mut display = format!(
+                "_:{}",
+                &value[..value.ceil_char_boundary(blank_width.max(12))]
+            );
             if let Some(providers) = term["providers"]
                 .as_array()
                 .filter(|values| !values.is_empty())
@@ -256,29 +259,156 @@ fn query_iri(value: &str) -> String {
     format!("<{value}>")
 }
 
-fn bindings_text(answer: &serde_json::Value, mut text: std::str::Lines<'_>) -> Result<(), String> {
+// Spaces around column separators belong to the table, so cell whitespace stays intact.
+fn query_cells(line: Option<&str>) -> Result<Vec<String>, String> {
+    let body = line
+        .and_then(|line| line.strip_prefix("| "))
+        .and_then(|line| line.strip_suffix(" |"))
+        .ok_or("query table row")?;
+    body.split(" | ")
+        .map(|cell| {
+            let mut chars = cell.trim_ascii().chars();
+            let mut value = String::new();
+            while let Some(character) = chars.next() {
+                value.push(match character {
+                    '\\' => chars.next().ok_or("incomplete Markdown escape")?,
+                    '|' => return Err("unescaped table delimiter".into()),
+                    other => other,
+                });
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn query_rdf_row<'a>(
+    line: Option<&str>,
+    terms: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
+) -> Result<(), String> {
+    let cells = query_cells(line)?;
+    let mut cells = cells.iter();
+    for term in terms {
+        let actual = cells.next().ok_or("missing query cell")?;
+        let blank_width = actual
+            .strip_prefix("_:")
+            .and_then(|label| label.split_ascii_whitespace().next())
+            .map_or(12, str::len);
+        let expected =
+            term.map_or_else(|| Ok(String::new()), |term| query_term(term, blank_width))?;
+        if *actual != expected {
+            return Err(format!(
+                "query cell differs: expected {expected}, got {actual}"
+            ));
+        }
+    }
+    if cells.next().is_some() {
+        return Err("unexpected query cell".into());
+    }
+    Ok(())
+}
+
+fn query_heading(
+    lines: &mut std::str::Lines<'_>,
+    structured: &serde_json::Value,
+) -> Result<bool, String> {
+    let pagination = &structured["pagination"];
+    let (total, page, pages, max_results) = if structured["answer"]["result"] == "boolean" {
+        (1, 1, 1, 1)
+    } else {
+        (
+            pagination["total"].as_u64().ok_or("query total")?,
+            pagination["page"].as_u64().ok_or("query page")?,
+            pagination["pages"].as_u64().ok_or("query total pages")?,
+            pagination["max_results"]
+                .as_u64()
+                .ok_or("query results per page")?,
+        )
+    };
+    if total == 0 {
+        if lines.next()
+            != Some("No results were found. Please check the query examples to build it correctly.")
+            || lines.next().is_some()
+        {
+            return Err("empty query report differs".into());
+        }
+        return Ok(false);
+    }
+    let heading = format!(
+        "Query finished: {total} results found on {page}/{pages} pages with {max_results} results per page."
+    );
+    if lines.next() != Some(heading.as_str()) || lines.next() != Some("") {
+        return Err("query heading differs".into());
+    }
+    Ok(true)
+}
+
+fn query_columns(
+    lines: &mut std::str::Lines<'_>,
+    headers: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), String> {
+    let found = query_cells(lines.next())?;
+    let expected = headers
+        .into_iter()
+        .map(|header| header.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let divider = query_cells(lines.next())?;
+    if found != expected
+        || divider.len() != found.len()
+        || divider
+            .iter()
+            .any(|cell| cell.len() < 3 || !cell.bytes().all(|byte| byte == b'-'))
+    {
+        return Err("query table header differs".into());
+    }
+    Ok(())
+}
+
+fn bindings_text(
+    answer: &serde_json::Value,
+    lines: &mut std::str::Lines<'_>,
+) -> Result<(), String> {
     let variables = answer["variables"]
         .as_array()
         .ok_or("query variables")?
         .iter()
         .map(|value| value.as_str().ok_or("query variable"))
         .collect::<Result<Vec<_>, _>>()?;
-    let header = variables
-        .iter()
-        .map(|name| format!("?{name}"))
-        .collect::<Vec<_>>()
-        .join("\t");
     let rows = answer["bindings"].as_array().ok_or("binding rows")?;
-    if text.next() == Some(header.as_str()) {
+    if variables.is_empty() {
+        query_columns(lines, ["result"])?;
+        for _ in rows {
+            query_rdf_row(lines.next(), [None])?;
+        }
+    } else {
+        query_columns(lines, variables.iter().map(|name| format!("?{name}")))?;
         for row in rows {
-            let cells = variables
-                .iter()
-                .map(|name| row.get(*name).map_or_else(|| Ok(String::new()), query_term))
-                .collect::<Result<Vec<_>, _>>()?;
-            if text.next() != Some(cells.join("\t").as_str()) {
-                return Err("binding row differs".into());
+            query_rdf_row(lines.next(), variables.iter().map(|name| row.get(*name)))?;
+        }
+    }
+    Ok(())
+}
+
+fn query_table(lines: &mut std::str::Lines<'_>, answer: &serde_json::Value) -> Result<(), String> {
+    match answer["result"].as_str() {
+        Some("bindings") => bindings_text(answer, lines)?,
+        Some("boolean") => {
+            query_columns(lines, ["result"])?;
+            let value = answer["value"].as_bool().ok_or("query boolean value")?;
+            if query_cells(lines.next())? != [value.to_string()] {
+                return Err("query boolean differs".into());
             }
         }
+        Some("graph") => {
+            let columns = ["subject", "predicate", "object"];
+            query_columns(lines, columns)?;
+            for triple in answer["triples"].as_array().ok_or("query triples")? {
+                query_rdf_row(lines.next(), columns.map(|column| triple.get(column)))?;
+            }
+        }
+        _ => return Err("unknown query result".into()),
+    }
+    if lines.next().is_some() {
+        return Err("text after the query table".into());
     }
     Ok(())
 }
@@ -289,43 +419,9 @@ fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), S
             return Err("missing unavailable outcome".into());
         }
     } else {
-        let answer = &structured["answer"];
-        let pagination = &structured["pagination"];
-        let total = if answer["result"] == "boolean" {
-            0
-        } else {
-            pagination["pages"].as_u64().ok_or("query total pages")?
-        };
-        if total > 1 {
-            let page = pagination["page"].as_u64().ok_or("query page")?;
-            if !text
-                .lines()
-                .any(|line| line.starts_with(&format!("page {page}/{total}, total ")))
-            {
-                return Err("query page differs".into());
-            }
-        }
         let mut lines = text.lines();
-        match answer["result"].as_str() {
-            Some("boolean")
-                if lines.next().and_then(|value| value.parse::<bool>().ok())
-                    == answer["value"].as_bool() => {}
-            Some("boolean") => return Err("query boolean differs".into()),
-            Some("bindings") => bindings_text(answer, lines)?,
-            Some("graph") => {
-                for triple in answer["triples"].as_array().ok_or("query triples")? {
-                    let expected = format!(
-                        "{} {} {} .",
-                        query_term(&triple["subject"])?,
-                        query_term(&triple["predicate"])?,
-                        query_term(&triple["object"])?
-                    );
-                    if lines.next() != Some(expected.as_str()) {
-                        return Err("query triple differs".into());
-                    }
-                }
-            }
-            _ => return Err("unknown query result".into()),
+        if query_heading(&mut lines, structured)? {
+            query_table(&mut lines, &structured["answer"])?;
         }
     }
     query_continuation_text(text, structured)?;
@@ -347,6 +443,11 @@ mod tests {
 
     use super::*;
 
+    const ASK_TRUE: &str = concat!(
+        "Query finished: 1 results found on 1/1 pages with 1 results per page.\n\n",
+        "| result |\n| ------ |\n| true   |\n",
+    );
+
     /// A successful result holding `text` and `structured`.
     fn result_of(text: &str, structured: Value) -> CallToolResult {
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
@@ -362,12 +463,16 @@ mod tests {
             }]},
             "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 1}
         });
-        let included = result_of(
-            "?edge\n_:edge (providers: engine, lsp, static)\n",
-            answer.clone(),
+        let text = concat!(
+            "Query finished: 1 results found on 1/1 pages with 10 results per page.\n\n",
+            "| ?edge                                    |\n| ---------------------------------------- |\n| \\_:edge (providers: engine, lsp, static) |\n",
         );
+        let included = result_of(text, answer.clone());
         assert_eq!(text_states(SEARCH_TOOL, &included), Ok(()));
-        let missing = result_of("?edge\n_:edge\n", answer);
+        let missing = result_of(
+            &text.replace(" (providers: engine, lsp, static)", ""),
+            answer,
+        );
         assert!(text_states(SEARCH_TOOL, &missing).is_err());
     }
 
@@ -419,10 +524,9 @@ mod tests {
         );
         assert_eq!(text_states(FACETS_TOOL, &syntax_elements), Ok(()));
         let answer = result_of(
-            "true\n",
+            ASK_TRUE,
             json!({
-                "answer": { "result": "boolean", "value": true },
-                "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
+                "answer": { "result": "boolean", "value": true }
             }),
         );
         assert!(text_states(FACETS_TOOL, &answer).is_err());
@@ -433,31 +537,31 @@ mod tests {
     fn query_text_omits_routine_view_metadata() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
-            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
             "view": { "id": "claims.syntax_elements", "expires_at": "2030-01-01T00:15:00Z" }
         });
         assert_eq!(
-            text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())),
+            text_states(SEARCH_TOOL, &result_of(ASK_TRUE, structured.clone())),
             Ok(())
         );
-        let with_view = "true\nview claims.syntax_elements | expires 2030-01-01T00:15:00Z\n";
-        assert!(text_states(SEARCH_TOOL, &result_of(with_view, structured)).is_err());
+        let with_view =
+            format!("{ASK_TRUE}view claims.syntax_elements | expires 2030-01-01T00:15:00Z\n");
+        assert!(text_states(SEARCH_TOOL, &result_of(&with_view, structured)).is_err());
     }
 
     #[test]
     fn query_answers_refuse_diagnostics_in_either_representation() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
-            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
             "warnings": [{ "code": "traversal_truncated", "detail": "flow discovery reached the provider request bound" }]
         });
-        assert!(text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())).is_err());
+        assert!(text_states(SEARCH_TOOL, &result_of(ASK_TRUE, structured.clone())).is_err());
         let mut without_warnings = structured;
         without_warnings
             .as_object_mut()
             .expect("query result")
             .remove("warnings");
-        let warned = "true\nwarning | flow discovery reached the provider request bound\n";
-        assert!(text_states(SEARCH_TOOL, &result_of(warned, without_warnings)).is_err());
+        let warned =
+            format!("{ASK_TRUE}warning | flow discovery reached the provider request bound\n");
+        assert!(text_states(SEARCH_TOOL, &result_of(&warned, without_warnings)).is_err());
     }
 }

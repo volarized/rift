@@ -315,7 +315,7 @@ impl RiftProxy {
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
                 }
-                let display = QueryDisplay::selected(&answer, query.presentation());
+                let display = QueryDisplay::for_answer(&answer);
                 let retained = key
                     .map(|key| {
                         let bytes = serde_json::to_vec(&(&answer, &warnings, &display))

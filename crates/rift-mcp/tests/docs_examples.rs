@@ -89,6 +89,10 @@ const QUERIES: &[(&str, &str)] = &[
         "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } ORDER BY ?name ?symbol LIMIT 5",
     ),
     (
+        "empty-search",
+        "SELECT ?symbol { ?symbol a :Symbol; :name \"load_configs\" }",
+    ),
+    (
         "symbol-name",
         "SELECT ?symbol ?kind {\n  ?symbol a :Symbol; :name \"load_config\"; :kind ?kind\n} ORDER BY ?symbol",
     ),
@@ -210,6 +214,55 @@ fn check_capture(text: &str, answer: &Value) {
             .any(|line| line.trim_start().starts_with("warning | ")),
         "MCP capture carries a warning line: {text}"
     );
+}
+
+fn check_search_examples(examples: &Map<String, Value>) -> TestResult<()> {
+    let selected = &examples["select-symbols"];
+    let table = selected["text"].as_str().ok_or("search text")?;
+    let mut lines = table.lines();
+    assert_eq!(
+        lines.next(),
+        Some("Query finished: 5 results found on 1/1 pages with 10 results per page."),
+        "{table}"
+    );
+    assert_eq!(lines.next(), Some(""), "{table}");
+    let header = lines.next().ok_or("search table header")?;
+    assert_eq!(
+        header.split('|').map(str::trim).collect::<Vec<_>>(),
+        ["", "?symbol", "?name", ""],
+        "{table}"
+    );
+    let divider = lines.next().ok_or("search table divider")?;
+    let divider_cells: Vec<_> = divider
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    assert_eq!(divider_cells.len(), 2, "{table}");
+    assert!(
+        divider_cells
+            .iter()
+            .all(|cell| cell.len() >= 3 && cell.bytes().all(|byte| byte == b'-')),
+        "{table}"
+    );
+    let rows: Vec<_> = lines.collect();
+    assert_eq!(rows.len(), 5, "{table}");
+    assert!(
+        rows.iter()
+            .all(|row| row.starts_with("| ") && row.ends_with(" |")),
+        "{table}"
+    );
+
+    let empty = &examples["empty-search"];
+    assert!(
+        workspace_client::query::rows(&empty["json"])?.is_empty(),
+        "{empty}"
+    );
+    assert_eq!(
+        empty["text"],
+        "No results were found. Please check the query examples to build it correctly.\n"
+    );
+    Ok(())
 }
 
 /// Captures both MCP response forms and drops the process-local view.
@@ -463,6 +516,7 @@ async fn capture_docs_examples() -> TestResult {
     for &(name, query) in QUERIES {
         queries.insert(name.to_owned(), capture_query(&client, query).await?);
     }
+    check_search_examples(&queries)?;
     let symbol = captured_seed(&client, "load_config", "src/config.rs").await?;
     for (name, tool, arguments, expected_error) in [
         ("local-symbol", "get_symbol", json!({"id": symbol}), false),
