@@ -2,12 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rift_core::ReferenceRole;
 use rift_protocol::read::EdgeKind;
+use rift_provider::NormalizedTarget;
 use rift_syntax::{
     ByteRange, HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee,
 };
 
-use super::{Binding, File, Index, Target, Work};
+use super::{Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work};
 use crate::NamespaceInput;
 use crate::analyzer::namespace::typescript::{PackageFiles, nested_runtime_candidates};
 
@@ -421,6 +423,130 @@ impl<'source> Index<'source> {
                 self.javascript_shorthand_callable(target, work)
                     .then_some(target)
             })
+    }
+
+    /// Follows an unchanged local alias for an authored direct invocation after earlier facts.
+    pub(super) fn resolve_javascript_lexical_alias_calls(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        let candidates = std::mem::take(&mut result.javascript_lexical_alias_candidates);
+        if candidates.is_empty() {
+            return;
+        }
+        for file in self.files.values().filter(|file| {
+            let facts = file.document.facts;
+            matches!(facts.language().name.as_str(), "javascript" | "typescript")
+                && !facts.has_errors()
+                && facts.left_out_declaration_count() == 0
+        }) {
+            if work.exhausted {
+                break;
+            }
+            let unit = file.document.placement.unit();
+            let Some((calls, coverage)) = candidates.get(unit).zip(result.edge_calls.get_mut(unit))
+            else {
+                continue;
+            };
+            if coverage.unavailable {
+                continue;
+            }
+            let mut resolved = BTreeSet::new();
+            for call in calls {
+                if !work.charge() {
+                    break;
+                }
+                if let Some(found) = self.javascript_lexical_alias_call(file, call, work) {
+                    result.occurrences.push(found);
+                    resolved.insert(call.range);
+                }
+            }
+            coverage
+                .unresolved
+                .retain(|range| !resolved.contains(range));
+        }
+        let resolved = result.occurrences.len() - start;
+        result.javascript_lexical_alias_call_start = (resolved > 0).then_some(start);
+        result.unresolved_sites = result.unresolved_sites.saturating_sub(resolved);
+        if let Some(count) = result.omitted.get_mut(&EdgeKind::Calls) {
+            *count = count.saturating_sub(u64::try_from(resolved).unwrap_or(u64::MAX));
+            if *count == 0 {
+                result.omitted.remove(&EdgeKind::Calls);
+            }
+        }
+    }
+
+    fn javascript_lexical_alias_call(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let alias = self.javascript_unchanged_local(file, call.callee_range, work)?;
+        let value = Self::javascript_alias_initializer(alias)?;
+        let target = self.javascript_lexical_callable(file, value, work)?;
+        let mut found = self.occurrence(
+            file,
+            call.range,
+            call.callee_range,
+            ReferenceRole::Call,
+            target,
+        )?;
+        if !matches!(found.target, NormalizedTarget::Symbol(_)) {
+            return None;
+        }
+        found.edge_from = Some(self.javascript_call_from(file, call.range, work)?);
+        Some(found)
+    }
+
+    /// Follows direct identifiers only, using the existing nesting and work limits.
+    fn javascript_lexical_callable(
+        &self,
+        file: &File<'source>,
+        value: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        work.javascript_lookup(|work| {
+            let target = self.javascript_unchanged_local(file, value, work)?;
+            if target.symbol.syntax_element_kind == Some("function_declaration") {
+                target.symbol.body_range?;
+                return target.callable();
+            }
+            self.javascript_lexical_callable(
+                file,
+                Self::javascript_alias_initializer(target)?,
+                work,
+            )
+        })
+    }
+
+    fn javascript_unchanged_local(
+        &self,
+        file: &File<'source>,
+        name: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            file.text(name)?,
+            name.start,
+            ReferenceRole::Call,
+            work,
+        )?;
+        if binding.kind != StaticBindingKind::Local || file.javascript_binding_reassigned(binding) {
+            return None;
+        }
+        file.target_at(binding.name)
+    }
+
+    fn javascript_alias_initializer(target: Target<'source>) -> Option<ByteRange> {
+        (target.symbol.kind == "variable"
+            && target.symbol.syntax_element_kind == Some("variable_declarator"))
+        .then_some(target.symbol.body_range)
+        .flatten()
     }
 
     /// Whether a shorthand object member (`{ verify }`) holds a callable value: the name it

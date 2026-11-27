@@ -3816,3 +3816,147 @@ fn returned_literals_keep_proved_properties_when_a_same_named_owner_is_opaque() 
             .all(|edge| found.edges.contains(edge))
     );
 }
+
+const JAVASCRIPT_LEXICAL_ALIASES: &str = concat!(
+    "function leaf(value) { return value; }\n",
+    "function branch(value) { return value + 1; }\n",
+    "export function run(value) {\n",
+    "  const alias = leaf;\n",
+    "  const nested = alias;\n",
+    "  return alias(value) + nested(value) + branch(value);\n",
+    "}\n",
+    "export function reassigned(value) {\n",
+    "  let alias = leaf; alias = branch; return alias(value);\n",
+    "}\n",
+    "export function shadowed(value) {\n",
+    "  const alias = leaf;\n",
+    "  return function deferred(alias) { return alias(value); };\n",
+    "}\n",
+    "export function choice(flag, value) {\n",
+    "  const alias = flag ? leaf : branch; return alias(value);\n",
+    "}\n",
+    "export function unresolved(value) {\n",
+    "  const alias = missing; return alias(value);\n",
+    "}\n",
+    "export function property(value) {\n",
+    "  const alias = leaf; return alias.unknown(value);\n",
+    "}\n",
+    "export function replaced(value) {\n",
+    "  function changing(input) { return input; }\n",
+    "  const alias = changing; changing = branch; return alias(value);\n",
+    "}\n",
+);
+
+#[test]
+fn javascript_calls_follow_unchanged_local_function_aliases() {
+    let analysis = non_entry_lexical_binding_analysis(JAVASCRIPT_LEXICAL_ALIASES, 96);
+    let found = analysis.publication();
+    found.validate_facts().expect("checked function aliases");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.source == JAVASCRIPT_LEXICAL_ALIASES)
+        .expect("retained package module");
+    let calls = found
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls])
+        .map(|edge| {
+            let occurrence = edge.occurrence.as_ref().expect("written invocation");
+            assert_eq!(occurrence.unit, unit.unit);
+            assert!(edge.from.as_str().ends_with("/run"));
+            (
+                edge.to.as_str().rsplit('/').next().expect("target name"),
+                (occurrence.range.start, occurrence.range.end),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = [
+        ("leaf", "alias(value)"),
+        ("leaf", "nested(value)"),
+        ("branch", "branch(value)"),
+    ]
+    .map(|(target, written)| {
+        let from_body = JAVASCRIPT_LEXICAL_ALIASES
+            .find("return alias(value)")
+            .expect("written body");
+        let start = JAVASCRIPT_LEXICAL_ALIASES[from_body..]
+            .find(written)
+            .expect("authored call");
+        let range = module_runtime_range(from_body + start, written);
+        (target, (range.start, range.end))
+    })
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(calls, expected);
+    for (written, target) in [("alias = leaf", "/leaf"), ("alias(value)", "/run/alias")] {
+        let start = JAVASCRIPT_LEXICAL_ALIASES
+            .find(written)
+            .expect("written reference");
+        let (offset, name) = if target == "/leaf" {
+            (8, "leaf")
+        } else {
+            (0, "alias")
+        };
+        assert!(found.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().ends_with(target)
+                && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.unit == unit.unit
+                        && occurrence.range == module_runtime_range(start + offset, name)
+                })
+        }));
+    }
+    let incumbent = found
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds != [EdgeKind::Calls] || !edge.to.as_str().ends_with("/leaf"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounded = non_entry_lexical_binding_analysis(JAVASCRIPT_LEXICAL_ALIASES, incumbent.len());
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| incumbent.contains(edge))
+    );
+    assert!(
+        bounded.publication().edges.iter().any(|edge| {
+            edge.to.as_str().ends_with("/branch") && edge.kinds == [EdgeKind::Calls]
+        })
+    );
+}
+
+#[test]
+fn typescript_alias_types_do_not_record_calls() {
+    const SOURCE: &str = concat!(
+        "function leaf() { return 1; }\n",
+        "const callable = leaf;\n",
+        "export type Shape = typeof callable;\n",
+        "export function run() { return callable(); }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("typed package");
+    let found = analysis.publication();
+    let calls = found
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Calls])
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].from.as_str().ends_with("/run"));
+    assert!(calls[0].to.as_str().ends_with("/leaf"));
+    let start = SOURCE.find("callable()").expect("written invocation");
+    let occurrence = calls[0].occurrence.as_ref().expect("written invocation");
+    assert_eq!(occurrence.range, module_runtime_range(start, "callable()"));
+}

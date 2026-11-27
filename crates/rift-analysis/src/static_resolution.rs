@@ -98,6 +98,11 @@ pub(crate) struct StaticResolution {
     pub(crate) javascript_callback_pattern_start: Option<usize>,
     /// Reads of authored callback pattern bindings awaiting remaining capacity.
     pub(crate) deferred_javascript_callback_patterns: Vec<StaticOccurrence>,
+    /// First Call through an unchanged lexical alias, after established edges.
+    pub(crate) javascript_lexical_alias_call_start: Option<usize>,
+    /// Unresolved direct calls in ECMAScript units, available for the late alias pass.
+    pub(crate) javascript_lexical_alias_candidates:
+        BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// First TypeScript overload parameter read after callback parameter reads.
     pub(crate) overload_parameter_start: Option<usize>,
     /// Overload parameter reads awaiting capacity after earlier package edges.
@@ -328,6 +333,7 @@ fn resolve_by<'source>(
         &mut resolution.occurrences,
         &mut resolution.deferred_javascript_callback_patterns,
     );
+    index.resolve_javascript_lexical_alias_calls(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -2494,6 +2500,19 @@ impl<'source> Index<'source> {
                 continue;
             }
             if occurrence.is_none()
+                && call.callee == rift_syntax::StaticCallee::Direct
+                && matches!(
+                    file.document.facts.language().name.as_str(),
+                    "javascript" | "typescript"
+                )
+            {
+                result
+                    .javascript_lexical_alias_candidates
+                    .entry(file.document.placement.unit().clone())
+                    .or_default()
+                    .push(*call);
+            }
+            if occurrence.is_none()
                 && !file.rust_extern_aliases.is_empty()
                 && call.callee == rift_syntax::StaticCallee::Qualified
             {
@@ -2984,6 +3003,8 @@ impl StaticResolution {
         self.external.append(&mut apart.external);
         self.rust_extern_candidates
             .append(&mut apart.rust_extern_candidates);
+        self.javascript_lexical_alias_candidates
+            .append(&mut apart.javascript_lexical_alias_candidates);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);
