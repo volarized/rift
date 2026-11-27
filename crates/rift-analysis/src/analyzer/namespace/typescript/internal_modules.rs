@@ -102,6 +102,7 @@ pub(super) fn prepare(
             input.syntax(),
         ));
         scopes.place_mixed_shorthand(file, &withheld, &anchors, &mut physical);
+        scopes.place_disjoint_module_bindings(file, &withheld, &anchors, &mut physical);
         anchors.retain(|name, _| {
             ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
         });

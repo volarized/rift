@@ -17,6 +17,7 @@ use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
 mod conditional_types;
+mod disjoint_properties;
 mod mixed_shorthand;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity

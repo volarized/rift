@@ -45,6 +45,114 @@ impl JavaScriptSyntaxProvider {
         ecmascript::commonjs_class_export_initializations(source, limits, initializations)
     }
 
+    /// Checks getter slots in direct module call arguments. The slots occupy object scope.
+    #[must_use]
+    pub fn module_disjoint_object_members(
+        source: &str,
+        limits: SyntaxLimits,
+        selected: &BTreeSet<ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        module_object_members(source, limits, selected, |node, _| match node.kind() {
+            "method_definition" => {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|child| !child.is_extra())
+                    .is_some_and(|token| token.kind() == "get")
+                    && node
+                        .child_by_field_name("name")
+                        .is_some_and(|key| key.kind() == "property_identifier")
+                    && node
+                        .child_by_field_name("parameters")
+                        .is_some_and(|parameters| {
+                            let mut cursor = parameters.walk();
+                            parameters
+                                .named_children(&mut cursor)
+                                .all(|formal| formal.is_extra())
+                        })
+                    && module_call_argument_member(node)
+            }
+            _ => false,
+        })
+    }
+}
+
+fn module_object_members(
+    source: &str,
+    limits: SyntaxLimits,
+    selected: &BTreeSet<ByteRange>,
+    accepts: impl Fn(tree_sitter::Node<'_>, &str) -> bool,
+) -> BTreeSet<ByteRange> {
+    if selected.is_empty()
+        || selected.len() > limits.syntax_elements_max()
+        || source.len() > limits.source_bytes_max()
+    {
+        return BTreeSet::new();
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&javascript_grammar()).is_err() {
+        return BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return BTreeSet::new();
+    }
+    let mut visited = 0_usize;
+    let mut pending = vec![(root, 0_usize)];
+    let mut cursor = root.walk();
+    let mut accepted = BTreeSet::new();
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if depth > limits.syntax_depth_max()
+            || visited
+                .saturating_add(pending.len())
+                .saturating_add(node.named_child_count())
+                > limits.syntax_elements_max()
+        {
+            return BTreeSet::new();
+        }
+        if matches!(node.kind(), "pair" | "method_definition")
+            && let Ok(range) = crate::extract::byte_range(node)
+            && selected.contains(&range)
+            && accepts(node, source)
+        {
+            accepted.insert(range);
+        }
+        crate::extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+            (child, depth + 1)
+        });
+    }
+    accepted
+}
+
+fn module_call_argument_member(node: tree_sitter::Node<'_>) -> bool {
+    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+    let Some(arguments) = object
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")
+    else {
+        return false;
+    };
+    let Some(call) = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")
+    else {
+        return false;
+    };
+    call.child_by_field_name("function")
+        .is_some_and(|function| function.kind() == "identifier")
+        && call.child_by_field_name("arguments") == Some(arguments)
+        && call.child_by_field_name("optional_chain").is_none()
+        && call.parent().is_some_and(|statement| {
+            statement.kind() == "expression_statement"
+                && statement
+                    .parent()
+                    .is_some_and(|root| root.kind() == "program")
+        })
 }
 
 impl SyntaxProvider for JavaScriptSyntaxProvider {
