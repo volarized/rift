@@ -95,6 +95,9 @@ class Client(val label: String) : Runnable {
 
 typealias Names = Items<String>
 
+@Target(AnnotationTarget.CLASS)
+annotation class Scope(val modules: Array<String> = [], val excluded: Array<String> = [])
+
 fun String.wrap(): String = trim()
 "#;
     let document = analyze("Client.kt", text);
@@ -126,6 +129,9 @@ fun String.wrap(): String = trim()
         Some("internal")
     );
     assert_eq!(symbol("example.api.Names").kind, "type_alias");
+    assert_eq!(symbol("example.api.Scope").kind, "annotation");
+    assert_eq!(symbol("example.api.Scope.modules").kind, "property");
+    assert_eq!(symbol("example.api.Scope.excluded").kind, "property");
     assert_eq!(symbol("example.api.wrap").kind, "function");
     assert_eq!(
         JvmLanguage::from_filename(r"C:\repo\build.gradle.kts"),

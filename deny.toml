@@ -134,9 +134,10 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The embedded ty engine's crates are unpublished and come from the ruff
 # repository at a pinned revision, except the three under `vendor/`.
-# The Cython grammar is unpublished and pinned in the workspace dependencies.
+# The Cython and Kotlin grammars use pinned workspace dependencies.
 allow-git = [
   "https://github.com/oxigraph/oxigraph",
   "https://github.com/astral-sh/ruff",
   "https://github.com/b0o/tree-sitter-cython",
+  "https://github.com/lzehrung/tree-sitter-kotlin",
 ]
