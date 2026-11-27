@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 use rift_protocol::read::{Language, SyntaxKind};
 
+use crate::ByteRange;
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
 use crate::failure::RiftError;

@@ -116,6 +116,17 @@ pub(in crate::analyzer::namespace::typescript) fn private_local_identities(
     identities_by_name
 }
 
+fn unique_declarations(symbols: &[SyntaxSymbol]) -> BTreeMap<&str, Option<&SyntaxSymbol>> {
+    let mut unique = BTreeMap::new();
+    for symbol in symbols {
+        unique
+            .entry(symbol.qualified_name.as_str())
+            .and_modify(|owner| *owner = None)
+            .or_insert(Some(symbol));
+    }
+    unique
+}
+
 fn private_local_declaration(symbol: &SyntaxSymbol) -> bool {
     symbol.container.is_none()
         && symbol.qualified_name == symbol.name
@@ -1120,13 +1131,7 @@ impl<'source> LiteralOwners<'source> {
             .filter(|(function, _)| !receiver_scopes.contains(function))
             .map(|&(function, value)| (value, function))
             .collect::<BTreeMap<_, _>>();
-        let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
-        for symbol in symbols {
-            unique
-                .entry(&symbol.qualified_name)
-                .and_modify(|owner| *owner = None)
-                .or_insert(Some(symbol));
-        }
+        let unique = unique_declarations(symbols);
         let functions = literal_callable_owners(&unique, facts, anchors, &values);
         let object_methods = literal_object_method_owners(&unique, facts, anchors);
         let array_initializers = array_literal_owners(file, &unique, anchors);
