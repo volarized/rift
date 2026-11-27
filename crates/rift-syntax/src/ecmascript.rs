@@ -2386,11 +2386,11 @@ pub(crate) fn analyze_included(
             &mut symbols,
         )?;
         facts.set_member_aliases(aliases);
-        if !recovered && !tree.root_node().has_error() {
+        if !recovered {
             append_package_parameters(
                 language,
                 tree.root_node(),
-                source.text,
+                source,
                 &mut symbols,
                 parameters,
                 facts,
@@ -2440,11 +2440,18 @@ fn parser_for_ranges(
 fn append_package_parameters(
     language: &Language,
     root: Node<'_>,
-    source: &str,
+    source: SyntaxSource<'_>,
     symbols: &mut Vec<crate::SyntaxSymbol>,
     candidates: ParameterDeclarations,
     facts: &crate::StaticFacts,
 ) {
+    if root.has_error() {
+        if language.name == "typescript" && source.path.as_str().ends_with(".d.ts") {
+            append_parameters(symbols, candidates.values, facts, Some(root));
+        }
+        return;
+    }
+    let source = source.text;
     let ParameterDeclarations {
         values: parameters,
         types: type_parameters,
@@ -2469,7 +2476,7 @@ fn append_package_parameters(
     } else {
         Vec::new()
     };
-    append_parameters(symbols, parameters, facts);
+    append_parameters(symbols, parameters, facts, None);
     symbols.extend(scoped);
     symbols.extend(shorthand);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
@@ -2585,6 +2592,7 @@ fn append_parameters(
     symbols: &mut Vec<crate::SyntaxSymbol>,
     parameters: Vec<crate::SyntaxSymbol>,
     facts: &crate::StaticFacts,
+    incomplete_declaration: Option<Node<'_>>,
 ) {
     if parameters.is_empty() {
         return;
@@ -2617,9 +2625,13 @@ fn append_parameters(
         })
         .filter(|symbol| rift_core::is_portable_name(&symbol.qualified_name))
         .filter(|symbol| {
-            symbol
-                .name_range
-                .is_some_and(|name| anchors.contains_key(&name))
+            symbol.name_range.is_some_and(|name| {
+                anchors.get(&name).is_some_and(|&owner| {
+                    incomplete_declaration.is_none_or(|root| {
+                        complete_declaration_parameter(root, name, owner).is_some()
+                    })
+                })
+            })
         })
         .filter(|symbol| rift_core::is_portable_name(&symbol.name))
         .map(|symbol| symbol.name_range)
@@ -2633,6 +2645,61 @@ fn append_parameters(
         }
         Some(symbol)
     }));
+}
+
+/// A declaration file may have an unrelated parse error. Only a complete named
+/// signature can own one of its ordinary parameters in that case.
+fn complete_declaration_parameter(
+    root: Node<'_>,
+    name: ByteRange,
+    expected_owner: ByteRange,
+) -> Option<()> {
+    let start = usize::try_from(name.start).ok()?;
+    let end = usize::try_from(name.end).ok()?;
+    let identifier = root.named_descendant_for_byte_range(start, end)?;
+    if start >= end || identifier.kind() != "identifier" || identifier.byte_range() != (start..end)
+    {
+        return None;
+    }
+    let parameter = identifier.parent()?;
+    if !matches!(
+        parameter.kind(),
+        "required_parameter" | "optional_parameter"
+    ) || parameter.child_by_field_name("pattern") != Some(identifier)
+        || parameter.has_error()
+    {
+        return None;
+    }
+    let list = parameter.parent()?;
+    let signature = list.parent()?;
+    if list.kind() != "formal_parameters"
+        || signature.has_error()
+        || extract::byte_range(signature.child_by_field_name("name")?).ok()? != expected_owner
+    {
+        return None;
+    }
+    let mut container = signature.parent()?;
+    match signature.kind() {
+        FUNCTION_SIGNATURE_KIND => {
+            while matches!(container.kind(), "ambient_declaration" | "export_statement") {
+                container = container.parent()?;
+            }
+            (container == root).then_some(())
+        }
+        METHOD_SIGNATURE_KIND | ABSTRACT_METHOD_SIGNATURE_KIND
+            if container.kind() == "class_body" =>
+        {
+            let class = container.parent()?;
+            (matches!(
+                class.kind(),
+                CLASS_DECLARATION_KIND | ABSTRACT_CLASS_DECLARATION_KIND
+            ) && class
+                .child_by_field_name("name")
+                .is_some_and(|name| !name.is_missing()))
+            .then_some(())
+        }
+        _ => None,
+    }
 }
 
 /// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
