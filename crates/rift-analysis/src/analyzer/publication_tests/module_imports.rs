@@ -831,7 +831,13 @@ fn typescript_local_export_references_follow_existing_package_edges() {
             .with_edges(prior.len() + extra)
             .expect("bounded edge count");
         records
-            .retain_ecmascript_modules(&publication.owner, &files, &semantics, limits)
+            .retain_ecmascript_modules(
+                &publication.owner,
+                &files,
+                &semantics,
+                limits,
+                &BTreeSet::new(),
+            )
             .expect("bounded module references");
         assert_eq!(records.edges.len(), prior.len() + extra);
         assert_eq!(&records.edges[..prior.len()], &prior);

@@ -206,7 +206,7 @@ pub(super) struct CommonJsExports<'tree> {
     /// Every assignment of the source, in walk order.
     pub(super) assignments: Vec<Node<'tree>>,
     pub(super) closed_export: Option<StaticCommonJsExport>,
-    /// A single root wrapper assignment with a written callable composite.
+    /// A single root wrapper assignment with a written callable expression.
     pub(super) expression_export: bool,
     /// Assignments that declare their own export at module scope.
     pub(super) declared: BTreeSet<usize>,
@@ -310,8 +310,9 @@ pub(super) fn record<'tree>(
         })
         .transpose()?;
     let mut exports = exported(&body, &captured, bindings);
-    exports.expression_export =
-        allow_literal && closed_export.is_none() && body.is_closed_callable_composite(&captured);
+    exports.expression_export = allow_literal
+        && (direct_function.is_some()
+            || body.is_closed_callable(&captured, closed_export.is_some()));
     exports.closed_export = closed_export.or_else(|| {
         direct_function.map(|assignment| StaticCommonJsExport {
             assignment,
@@ -387,17 +388,33 @@ impl<'tree> ModuleBody<'_, 'tree> {
             .filter(|_| closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds))
     }
 
-    /// Whether one direct assignment uses the unshadowed callable composite constructor.
-    fn is_closed_callable_composite(&self, captured: &CapturedAssignments<'_>) -> bool {
-        !captured.blocked.contains(&self.root.id())
-            && !captured.bound.contains_key("Object")
+    /// Whether the default assignment has a checked callable value.
+    fn is_closed_callable(&self, captured: &CapturedAssignments<'_>, closed_export: bool) -> bool {
+        let Some(assignment) = captured.direct_default else {
+            return false;
+        };
+        let Some(value) = self.kinds.assigned_value(assignment) else {
+            return false;
+        };
+        if captured.blocked.contains(&self.root.id()) {
+            return false;
+        }
+        if closed_export {
+            let name = text(self.source, value);
+            return value.kind_id() == self.kinds.identifier
+                && captured.bound.get(name) == Some(&1)
+                && !captured.rebound.contains(name)
+                && named_children(self.root).any(|statement| {
+                    statement.kind() == "function_declaration"
+                        && statement
+                            .child_by_field_name("name")
+                            .is_some_and(|written| text(self.source, written) == name)
+                });
+        }
+        !captured.bound.contains_key("Object")
             && !captured.rebound.contains("Object")
-            && captured.direct_default.is_some_and(|assignment| {
-                self.kinds
-                    .assigned_value(assignment)
-                    .is_some_and(|value| written_callable_composite(value, self.source, self.kinds))
-                    && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
-            })
+            && written_callable_composite(value, self.source, self.kinds)
+            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
     }
 
     /// The written function that a closed module assigns directly to its default export.

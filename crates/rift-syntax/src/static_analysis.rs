@@ -697,7 +697,7 @@ impl StaticFacts {
         self.0.commonjs_export.as_ref()
     }
 
-    /// Whether a direct `module.exports` write combines a callable and object literals with `Object.assign`.
+    /// Whether a closed `module.exports` write assigns a checked callable.
     #[must_use]
     pub const fn has_commonjs_expression_export(&self) -> bool {
         self.0.commonjs_expression_export

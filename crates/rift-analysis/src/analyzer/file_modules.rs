@@ -27,7 +27,9 @@ impl Records {
     ) -> Result<(), RiftError> {
         let owner = input.owner();
         let limits = input.limits();
-        self.retain_ecmascript_modules(owner, analyzed, semantics, limits)?;
+        let namespace = input.namespace_input();
+        let authored = super::namespace::typescript::checked_javascript_module_paths(&namespace);
+        self.retain_ecmascript_modules(owner, analyzed, semantics, limits, &authored)?;
         self.retain_javascript_callback_argument_properties(owner, analyzed, limits)?;
         if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
             let candidates = self.checked_local_export_module_candidates(analyzed, semantics);
@@ -39,7 +41,7 @@ impl Records {
         self.retain_checked_inline_import_type_edges(semantics, limits.edges_max());
         self.retain_commonjs_argument_imports(semantics, limits.edges_max());
         self.retain_checked_inline_import_modules(semantics, limits.edges_max());
-        if super::namespace::typescript::checked_commonjs_package(&input.namespace_input()) {
+        if super::namespace::typescript::checked_commonjs_package(&namespace) {
             self.retain_commonjs_expression_entry(owner, analyzed, semantics, limits)?;
         }
         self.retain_written_callback_argument_properties(owner, analyzed, limits)?;
@@ -60,12 +62,21 @@ impl Records {
         if candidates.values().all(Option::is_none) {
             return Ok(());
         }
-        let previous = self.declarations.len();
         self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
-        let entries = self.declarations[previous..]
+        let complete = self
+            .declarations
             .iter()
-            .filter(|row| row.source_complete)
-            .map(|row| row.symbol.as_str().to_owned())
+            .filter(|row| row.source_complete && row.range.start == 0)
+            .map(|row| (row.symbol.as_str(), row.unit.as_str()))
+            .collect::<BTreeSet<_>>();
+        let entries = candidates
+            .into_iter()
+            .filter_map(|(id, file)| {
+                let (file, _) = file?;
+                complete
+                    .contains(&(id.as_str(), file.placement.unit().to_string().as_str()))
+                    .then(|| id.as_str().to_owned())
+            })
             .collect::<BTreeSet<_>>();
         if entries.is_empty() {
             return Ok(());
@@ -83,6 +94,7 @@ impl Records {
         analyzed: &[AnalyzedFile],
         semantics: &WorkspaceSemantics,
         limits: ExactPackageLimits,
+        authored: &BTreeSet<&str>,
     ) -> Result<(), RiftError> {
         if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
             self.retain_ecmascript_file_modules(
@@ -90,6 +102,7 @@ impl Records {
                 analyzed,
                 semantics,
                 limits.declarations_max(),
+                authored,
             )?;
             self.retain_ecmascript_file_module_edges(
                 semantics,
@@ -495,11 +508,12 @@ impl Records {
         analyzed: &[AnalyzedFile],
         semantics: &WorkspaceSemantics,
         declaration_limit: usize,
+        authored: &BTreeSet<&str>,
     ) -> Result<(), RiftError> {
         if self.symbols_truncated {
             return Ok(());
         }
-        let modules = file_module_candidates(owner, analyzed, &self.units, semantics);
+        let modules = file_module_candidates(owner, analyzed, &self.units, semantics, authored);
         self.retain_file_module_candidates(owner, &modules, declaration_limit)
     }
 
@@ -767,6 +781,7 @@ fn file_module_candidates<'file>(
     analyzed: &'file [AnalyzedFile],
     units: &[PackageSourceUnit],
     semantics: &WorkspaceSemantics,
+    authored: &BTreeSet<&str>,
 ) -> FileModuleCandidates<'file> {
     let proven_receivers = commonjs_module_source_units(semantics);
     let complete = units
@@ -787,11 +802,14 @@ fn file_module_candidates<'file>(
             ("javascript", Some((_, "mjs" | "cjs"))) | ("typescript", Some((_, "mts" | "cts")))
         );
         let previous = explicit || javascript_module_source(owner, file);
+        let written = syntax.primary_symbols_len() > 0
+            && (previous || proven_receivers.contains(file.placement.unit()));
+        let authored_module =
+            language == "javascript" && authored.contains(path) && !file.file.source().is_empty();
         let proven = matches!(language, "javascript" | "typescript")
-            && (previous || proven_receivers.contains(file.placement.unit()))
+            && (written || authored_module)
             && !syntax.has_errors()
             && syntax.left_out_declaration_count() == 0
-            && syntax.primary_symbols_len() > 0
             && complete.contains(file.placement.unit().to_string().as_str());
         modules
             .entry(module)

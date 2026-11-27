@@ -524,6 +524,60 @@ pub(crate) fn checked_commonjs_package(input: &NamespaceInput<'_>) -> bool {
         .is_some_and(|metadata| matches!(metadata.module_type.as_deref(), None | Some("commonjs")))
 }
 
+/// JavaScript files whose nearest captured package scope explicitly declares ESM.
+pub(crate) fn checked_javascript_module_paths<'input>(
+    input: &'input NamespaceInput<'_>,
+) -> BTreeSet<&'input str> {
+    #[derive(Deserialize)]
+    struct NestedMode {
+        name: Option<String>,
+        #[serde(rename = "type")]
+        module_type: Option<String>,
+    }
+
+    let Some(metadata) = captured_metadata(input) else {
+        return BTreeSet::new();
+    };
+    let mut scopes = BTreeMap::new();
+    for source in input.files().iter().chain(input.context_sources()) {
+        let Some(directory) = source.path().as_str().strip_suffix("/package.json") else {
+            continue;
+        };
+        let mode = (source.text().len() <= input.syntax().source_bytes_max())
+            .then(|| serde_json::from_str::<NestedMode>(source.text()).ok())
+            .flatten()
+            .filter(|manifest| {
+                manifest
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| name == metadata.name)
+            })
+            .map(|manifest| manifest.module_type.as_deref() == Some("module"));
+        scopes
+            .entry(directory)
+            .and_modify(|previous| *previous = None)
+            .or_insert(mode);
+    }
+    let root = metadata.module_type.as_deref() == Some("module");
+    input
+        .files()
+        .iter()
+        .map(|source| source.path().as_str())
+        .filter(|path| matches!(path.rsplit_once('.'), Some((_, "js"))))
+        .filter(|path| {
+            let mut module = root;
+            for (end, _) in path.match_indices('/') {
+                match scopes.get(&path[..end]) {
+                    Some(Some(nested)) => module = *nested,
+                    Some(None) => return false,
+                    None => {}
+                }
+            }
+            module
+        })
+        .collect()
+}
+
 fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     let mut sources = input
         .files()
