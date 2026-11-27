@@ -159,6 +159,17 @@ pub struct StaticBinding {
     pub kind: StaticBindingKind,
 }
 
+/// One direct call result assigned in an ECMAScript statement block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticAssignedCall {
+    /// The written lexical target.
+    pub target: ByteRange,
+    /// The complete invocation assigned to the target.
+    pub call: ByteRange,
+    /// The authored statement block that contains the assignment directly.
+    pub block: ByteRange,
+}
+
 /// One member of an ECMAScript object literal, type literal or class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticBodyMember {
@@ -516,6 +527,8 @@ pub struct StaticFactsParts {
     pub reexports: Vec<StaticReexport>,
     /// Assignment targets.
     pub assignments: Vec<ByteRange>,
+    /// Direct call-result assignments and the blocks that contain them.
+    pub assigned_calls: Vec<StaticAssignedCall>,
     /// Name and member targets of assignments whose value is a function written in place.
     pub function_writes: Vec<ByteRange>,
     /// Plain assignments copying a member from `this`.
@@ -864,6 +877,12 @@ impl StaticFacts {
         &self.0.assignments
     }
 
+    /// Call-result assignments whose written target and direct block are known.
+    #[must_use]
+    pub fn assigned_calls(&self) -> &[StaticAssignedCall] {
+        &self.0.assigned_calls
+    }
+
     /// Name and member targets of assignments whose value is a function written in place.
     #[must_use]
     pub fn function_writes(&self) -> &[ByteRange] {
@@ -1106,6 +1125,7 @@ impl StaticFacts {
             vector_capacity(&self.0.bindings),
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
+            vector_capacity(&self.0.assigned_calls),
             vector_capacity(&self.0.function_writes),
             vector_capacity(&self.0.member_copies),
             vector_capacity(&self.0.element_types),
@@ -1200,6 +1220,7 @@ impl StaticFacts {
             self.bindings().len(),
             self.reexports().len(),
             self.assignments().len(),
+            self.assigned_calls().len(),
             self.function_writes().len(),
             self.member_copies().len(),
             self.element_types().len(),
@@ -1400,6 +1421,18 @@ impl StaticFacts {
             .chain(self.skippable())
             .copied()
             .all(valid)
+            && self.assigned_calls().iter().all(|row| {
+                valid(row.target)
+                    && valid(row.call)
+                    && valid(row.block)
+                    && row.target.end < row.call.start
+                    && row.block.encloses(row.target)
+                    && row.block.encloses(row.call)
+            })
+            && self
+                .assigned_calls()
+                .windows(2)
+                .all(|pair| pair[0].target.start < pair[1].target.start)
             && self.member_copies().iter().all(|copy| {
                 valid(copy.assignment)
                     && valid(copy.target)

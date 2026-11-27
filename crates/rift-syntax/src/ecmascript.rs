@@ -249,6 +249,7 @@ pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_paramete
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
 pub(crate) const FUNCTION_TYPE_PARAMETER_KIND: &str = "typescript_function_type_parameter";
+pub(crate) const SIGNATURE_TYPE_PARAMETER_KIND: &str = "typescript_signature_type_parameter";
 pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
@@ -1650,6 +1651,10 @@ impl EcmaScriptRules<'_> {
                     .map(|name| (name, METHOD_TYPE_PARAMETER_KIND))
             })
             .or_else(|| {
+                type_parameters::named_owner(visited, type_signature_parameters::callable_signature)
+                    .map(|name| (name, SIGNATURE_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
                 type_signature_parameters::callable_parameter_name(visited)
                     .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
             })
@@ -1690,7 +1695,10 @@ impl EcmaScriptRules<'_> {
         let name = text.get(name.byte_range())?;
         let type_parameter = matches!(
             kind,
-            TYPE_PARAMETER_KIND | METHOD_TYPE_PARAMETER_KIND | FUNCTION_TYPE_PARAMETER_KIND
+            TYPE_PARAMETER_KIND
+                | METHOD_TYPE_PARAMETER_KIND
+                | FUNCTION_TYPE_PARAMETER_KIND
+                | SIGNATURE_TYPE_PARAMETER_KIND
         );
         if !name.is_ascii() || name.contains('\\') || (!type_parameter && name == "this") {
             return None;
@@ -2430,6 +2438,7 @@ fn append_package_parameters(
         destructured,
         method_types,
         function_types,
+        signature_types,
         typed_patterns,
     } = candidates;
     let scoped = if language.name == "typescript" {
@@ -2478,6 +2487,12 @@ fn append_package_parameters(
         facts,
         type_parameters::function,
     );
+    type_signature_parameters::append_callable_type_parameters(
+        root,
+        symbols,
+        signature_types,
+        facts,
+    );
     checked_parameters::append_under_named_owner(
         symbols,
         typed_patterns,
@@ -2495,6 +2510,7 @@ struct ParameterDeclarations {
     wrapped: Vec<crate::SyntaxSymbol>,
     destructured: Vec<crate::SyntaxSymbol>,
     function_types: Vec<crate::SyntaxSymbol>,
+    signature_types: Vec<crate::SyntaxSymbol>,
     typed_patterns: Vec<crate::SyntaxSymbol>,
     method_types: Vec<crate::SyntaxSymbol>,
 }
@@ -2517,6 +2533,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.method_types
         } else if symbol.is_typescript_function_type_parameter() {
             &mut candidates.function_types
+        } else if symbol.is_typescript_signature_type_parameter() {
+            &mut candidates.signature_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut candidates.typed_patterns
         } else {
@@ -2683,6 +2701,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == FUNCTION_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(FUNCTION_TYPE_PARAMETER_KIND);
+    }
+    if name == SIGNATURE_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(SIGNATURE_TYPE_PARAMETER_KIND);
     }
     if name == TYPED_DESTRUCTURED_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPED_DESTRUCTURED_PARAMETER_KIND);

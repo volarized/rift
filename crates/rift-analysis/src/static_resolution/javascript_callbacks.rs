@@ -620,6 +620,22 @@ impl<'source> Index<'source> {
         if file.javascript_binding_reassigned(binding) {
             return None;
         }
+        let pair_unchanged = file
+            .text(binding.name)
+            .is_some_and(|receiver| !file.javascript_reassigned(receiver, Some(member)));
+        self.javascript_member_of_returned_call(file, call, member, role, pair_unchanged, work)
+    }
+
+    /// Uses the checked authored object literals returned by the selected call.
+    pub(super) fn javascript_member_of_returned_call(
+        &self,
+        file: &File<'source>,
+        call: ByteRange,
+        member: &str,
+        role: ReferenceRole,
+        pair_unchanged: bool,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
         let call = file.callbacks.calls.get(&call).copied()?;
         work.javascript_lookup(|work| {
             let callee = self.javascript_call(file, call, work)?;
@@ -633,17 +649,15 @@ impl<'source> Index<'source> {
             let objects = declared.callbacks.returned_objects.get(&owner)?;
             let mut first = None;
             let mut pair_target: Option<Target<'source>> = None;
-            let mut resolve_pair = role == ReferenceRole::Call
+            let mut resolve_pair = pair_unchanged
+                && role == ReferenceRole::Call
                 && file.document.facts.language().name == "javascript"
                 && declared.document.facts.language().name == "javascript";
             for object in objects {
                 let object = (*object)?;
                 let target = Self::javascript_literal_member(declared, object, member, work)?;
                 if first.is_none() && resolve_pair {
-                    resolve_pair = target.symbol.syntax_element_kind == Some("pair")
-                        && file.text(binding.name).is_some_and(|receiver| {
-                            !file.javascript_reassigned(receiver, Some(member))
-                        });
+                    resolve_pair = target.symbol.syntax_element_kind == Some("pair");
                 }
                 first.get_or_insert(target);
                 if resolve_pair {

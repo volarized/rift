@@ -33,17 +33,41 @@ impl Records {
                 semantics,
                 limits.declarations_max(),
             )?;
-            self.retain_ecmascript_file_module_edges(semantics, limits.edges_max());
+            self.retain_ecmascript_file_module_edges(
+                semantics,
+                limits.edges_max(),
+                &[EdgeKind::Imports, EdgeKind::Reads],
+            );
+            self.retain_ecmascript_callback_calls(owner, analyzed, semantics, limits)?;
+            self.retain_ecmascript_file_module_edges(
+                semantics,
+                limits.edges_max(),
+                &[EdgeKind::References],
+            );
         }
         Ok(())
     }
 
-    /// Adds references to authored modules after their source units and targets have been retained.
+    /// Adds references with a retained authored module and target.
     fn retain_ecmascript_file_module_edges(
         &mut self,
         semantics: &WorkspaceSemantics,
         edge_limit: usize,
+        kinds: &[EdgeKind],
     ) {
+        let mut references = kinds
+            .iter()
+            .copied()
+            .flat_map(|kind| {
+                semantics
+                    .edges()
+                    .edges()
+                    .filter(move |edge| edge.is_file_module_reference() && edge.kind() == kind)
+            })
+            .peekable();
+        if references.peek().is_none() {
+            return;
+        }
         let modules = self
             .objects
             .iter()
@@ -66,27 +90,28 @@ impl Records {
             .filter_map(|object| object.id.as_ref())
             .map(SymbolId::as_str)
             .collect::<BTreeSet<_>>();
-        for kind in [EdgeKind::Imports, EdgeKind::Reads] {
-            let references = semantics
-                .edges()
-                .edges()
-                .filter(|edge| edge.is_file_module_reference() && edge.kind() == kind);
-            for edge in references {
-                if !objects.contains(edge.from().as_str())
-                    || !declared.contains_key(edge.to().as_str())
-                    || !source_units.contains(edge.occurrence().unit().to_string().as_str())
-                {
-                    continue;
-                }
-                if self.edges.len() >= edge_limit {
-                    self.warn(truncation(
-                        "edges",
-                        u64::try_from(edge_limit).unwrap_or(u64::MAX),
-                    ));
-                    return;
-                }
-                self.edges.push(edge.to_protocol());
+        for edge in references {
+            let unit = edge.occurrence().unit().to_string();
+            let from = edge.from().as_str();
+            let to = edge.to().as_str();
+            let retained = if edge.kind() == EdgeKind::References {
+                declared.get(from).copied() == Some(unit.as_str()) && objects.contains(to)
+            } else {
+                objects.contains(from)
+                    && declared.contains_key(to)
+                    && source_units.contains(unit.as_str())
+            };
+            if !retained {
+                continue;
             }
+            if self.edges.len() >= edge_limit {
+                self.warn(truncation(
+                    "edges",
+                    u64::try_from(edge_limit).unwrap_or(u64::MAX),
+                ));
+                return;
+            }
+            self.edges.push(edge.to_protocol());
         }
     }
 
@@ -155,7 +180,7 @@ impl Records {
             let source = file.file.source();
             let path = wire_path(file.file.path());
             let bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
-            if !self.file_module_source_fits(bytes) {
+            if !self.retained_source_fits(bytes) {
                 self.warn(PackageAnalysisWarning::SourceTruncated {
                     path,
                     dropped: bytes,
@@ -198,7 +223,7 @@ impl Records {
         Ok(())
     }
 
-    fn file_module_source_fits(&self, bytes: u64) -> bool {
+    pub(super) fn retained_source_fits(&self, bytes: u64) -> bool {
         self.retained_source
             .map_or(bytes <= u64::from(PACKAGE_SOURCE_BYTES_MAX), |limit| {
                 bytes <= u64::from(limit.record_bytes_max)

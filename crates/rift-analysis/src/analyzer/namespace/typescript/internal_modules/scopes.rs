@@ -7,7 +7,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
-    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxFacts, SyntaxSymbol,
+    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::{SelectedFile, binding_name};
@@ -282,21 +282,19 @@ impl<'source> FileScopes<'source> {
         else {
             return BTreeMap::new();
         };
-        let owners = LiteralOwners::new(symbols, facts, anchors, file.source);
+        let owners = LiteralOwners::new(file, facts, anchors);
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
         let mut scoped = BTreeMap::new();
         for (name, declarations) in candidates {
             let mut groups = BTreeMap::<ByteRange, Vec<usize>>::new();
             for declaration in declarations {
                 let Some(row) = self.body_members.get(&declaration.item_range) else {
-                    groups.clear();
-                    break;
+                    continue;
                 };
                 if self.of(declaration, file) != Scope::Body(row.body, false)
                     || !owners.proves_body(declaration, row)
                 {
-                    groups.clear();
-                    break;
+                    continue;
                 }
                 groups
                     .entry(row.body)
@@ -1031,16 +1029,50 @@ struct LiteralOwners<'source> {
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
+    array_initializers: BTreeMap<&'source str, ByteRange>,
 }
 
 impl<'source> LiteralOwners<'source> {
     fn new(
-        symbols: &'source [SyntaxSymbol],
+        file: &SelectedFile<'source>,
         facts: &'source StaticFacts,
         anchors: &BTreeMap<String, SymbolId>,
-        source: &str,
     ) -> Self {
-        let functions = literal_callable_owners(symbols, facts, anchors);
+        let symbols = file.syntax.symbols();
+        let source = file.source;
+        let receiver_scopes = facts
+            .function_scopes()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let values = facts
+            .function_values()
+            .iter()
+            .filter(|(function, _)| !receiver_scopes.contains(function))
+            .map(|&(function, value)| (value, function))
+            .collect::<BTreeMap<_, _>>();
+        let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
+        for symbol in symbols {
+            unique
+                .entry(&symbol.qualified_name)
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(symbol));
+        }
+        let functions = literal_callable_owners(&unique, facts, anchors, &values);
+        let object_methods = literal_object_method_owners(&unique, facts, anchors);
+        let array_initializers = array_literal_owners(file, &unique, anchors);
+        let mut initializers = BTreeMap::new();
+        for function in functions
+            .values()
+            .filter(|owner| owner.syntax_element_kind == Some("variable_declarator"))
+        {
+            if let Some(range) = function.body_range.and_then(|value| values.get(&value)) {
+                initializers
+                    .entry(*range)
+                    .and_modify(|owner| *owner = None)
+                    .or_insert(Some(*function));
+            }
+        }
         let enclosing = EnclosingDefinitions::new(
             symbols
                 .iter()
@@ -1062,7 +1094,10 @@ impl<'source> LiteralOwners<'source> {
                         .copied()
                         .chain(facts.function_values().iter().map(|&(scope, _)| scope))
                         .chain(facts.static_blocks().iter().copied())
-                        .map(|scope| (scope.start, scope.end, (scope, None))),
+                        .map(|scope| {
+                            let owner = initializers.get(&scope).copied().flatten();
+                            (scope.start, scope.end, (scope, owner))
+                        }),
                 ),
         );
         let mut calls = BTreeMap::<u64, Vec<_>>::new();
@@ -1089,7 +1124,8 @@ impl<'source> LiteralOwners<'source> {
                 .iter()
                 .map(|&(_, _, call)| call)
                 .collect(),
-            returned: returned_literal_owners(&functions, facts),
+            returned: returned_literal_owners(&functions, &object_methods, facts),
+            array_initializers,
         }
     }
 
@@ -1100,7 +1136,8 @@ impl<'source> LiteralOwners<'source> {
             .copied();
         let container = property.container.as_deref();
         if let Some(owner) = container
-            && self.returned.get(&member.body) == Some(&Some(owner))
+            && (self.returned.get(&member.body) == Some(&Some(owner))
+                || self.array_initializers.get(owner) == Some(&member.holder))
         {
             return true;
         }
@@ -1147,19 +1184,63 @@ impl<'source> LiteralOwners<'source> {
     }
 }
 
-/// Names functions and class methods with one authored and placed declaration.
+/// Selects placed declarations whose initializer is the written array itself.
+fn array_literal_owners<'source>(
+    file: &SelectedFile<'source>,
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<&'source str, ByteRange> {
+    let assigned_exports = file
+        .syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|binding| {
+            let name = binding.exported?;
+            (binding.kind == SyntaxExportKind::Named
+                && binding.local == Some(name)
+                && binding.source.is_none()
+                && binding.container.is_none()
+                && !binding.type_only)
+                .then_some((binding.range, name))
+        })
+        .collect::<BTreeSet<_>>();
+    unique
+        .iter()
+        .filter_map(|(&name, &declaration)| {
+            let declaration = declaration?;
+            let value = declaration.body_range?;
+            let written = file
+                .source
+                .get(usize::try_from(value.start).ok()?..usize::try_from(value.end).ok()?)?;
+            let initializer = match declaration.syntax_element_kind {
+                Some("variable_declarator") => true,
+                Some("assignment_expression") => {
+                    declaration.container.is_none()
+                        && declaration.kinds.contains(&SymbolKind::Public)
+                        && assigned_exports
+                            .contains(&(declaration.item_range, declaration.name_range?))
+                }
+                _ => false,
+            };
+            (initializer
+                && declaration.kind == "variable"
+                && declaration.item_range.encloses(value)
+                && anchors.contains_key(name)
+                && written.starts_with('[')
+                && written.ends_with(']'))
+            .then_some((name, value))
+        })
+        .collect()
+}
+
+/// Names callables with one authored and placed declaration.
 fn literal_callable_owners<'source>(
-    symbols: &'source [SyntaxSymbol],
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
     facts: &StaticFacts,
     anchors: &BTreeMap<String, SymbolId>,
+    values: &BTreeMap<ByteRange, ByteRange>,
 ) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
-    let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
-    for symbol in symbols {
-        unique
-            .entry(&symbol.qualified_name)
-            .and_modify(|owner| *owner = None)
-            .or_insert(Some(symbol));
-    }
     let classes = unique
         .values()
         .flatten()
@@ -1175,12 +1256,19 @@ fn literal_callable_owners<'source>(
         .filter_map(|member| Some((member.member, *classes.get(&member.body)?)))
         .collect::<BTreeMap<_, _>>();
     unique
-        .into_values()
+        .values()
         .flatten()
+        .copied()
         .filter(|symbol| {
             anchors.contains_key(&symbol.qualified_name)
                 && match symbol.syntax_element_kind {
                     Some("function_declaration") => true,
+                    Some("variable_declarator") if symbol.kind == "variable" => {
+                        symbol.kinds.contains(&SymbolKind::Callable)
+                            && symbol.body_range.is_some_and(|value| {
+                                symbol.item_range.encloses(value) && values.contains_key(&value)
+                            })
+                    }
                     Some("method_definition") if symbol.kind == "method" => {
                         class_methods.get(&symbol.item_range).copied()
                             == symbol.container.as_deref()
@@ -1193,9 +1281,60 @@ fn literal_callable_owners<'source>(
         .collect()
 }
 
-/// Selects returned literal ranges from one admitted, physically named function or class method.
+/// Names a placed method whose literal is the entire value of one checked declaration.
+fn literal_object_method_owners<'source>(
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    facts: &StaticFacts,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
+    let mut holders = BTreeMap::new();
+    for declaration in unique.values().flatten() {
+        let Some(body) = declaration.body_range else {
+            continue;
+        };
+        if matches!(
+            declaration.syntax_element_kind,
+            Some("variable_declarator" | "assignment_expression" | "pair")
+        ) && matches!(declaration.kind, "variable" | "property")
+            && declaration.item_range.encloses(body)
+            && anchors.contains_key(&declaration.qualified_name)
+        {
+            holders
+                .entry((declaration.item_range, body))
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(declaration.qualified_name.as_str()));
+        }
+    }
+    let members = facts
+        .body_members()
+        .iter()
+        .filter_map(|member| {
+            Some((
+                member.member,
+                (*holders.get(&(member.holder, member.body))?)?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    unique
+        .values()
+        .flatten()
+        .copied()
+        .filter_map(|method| {
+            let owner = members.get(&method.item_range)?;
+            (method.syntax_element_kind == Some("method_definition")
+                && method.kind == "method"
+                && !method.name.starts_with('[')
+                && method.container.as_deref() == Some(owner)
+                && anchors.contains_key(&method.qualified_name))
+            .then_some((method.name_range?, method))
+        })
+        .collect()
+}
+
+/// Selects written literal returns of a placed function or method.
 fn returned_literal_owners<'source>(
     declarations: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    object_methods: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
     facts: &StaticFacts,
 ) -> BTreeMap<ByteRange, Option<&'source str>> {
     let mut owners = BTreeMap::new();
@@ -1206,11 +1345,14 @@ fn returned_literal_owners<'source>(
             .map(|&(name, object)| (name, Some(object))),
     );
     for (name, object) in bodies {
-        let Some((owner, body)) = declarations.get(&name).zip(object) else {
+        let owner = declarations
+            .get(&name)
+            .or_else(|| object_methods.get(&name));
+        let Some((owner, body)) = owner.zip(object) else {
             continue;
         };
         let named = match owner.syntax_element_kind {
-            Some("function_declaration") => true,
+            Some("function_declaration" | "variable_declarator") => true,
             Some("method_definition") => !owner.name.starts_with('['),
             _ => false,
         };

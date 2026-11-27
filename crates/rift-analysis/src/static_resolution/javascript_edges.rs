@@ -9,12 +9,79 @@ use rift_syntax::{
     SyntaxExportKind, SyntaxSymbol,
 };
 
-use super::javascript::{MemberMode, ModuleMode};
+use super::javascript::{AssignedMemberSite, MemberMode, ModuleMode, js_binding};
 use super::javascript_exports::{self, matches_export_form};
 use super::javascript_parameters::ParameterReads;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
 impl<'source> Index<'source> {
+    /// References named selectors after admitting the existing static facts.
+    pub(super) fn resolve_typescript_local_exports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values() {
+            let facts = file.document.facts;
+            if facts.language().name != "typescript" || !facts.declaration_syntax_complete() {
+                continue;
+            }
+            for export in facts.export_bindings().unwrap_or_default() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if let Some(reference) = self.typescript_local_export_reference(file, export, work)
+                {
+                    result.record(Some(reference));
+                }
+            }
+        }
+        result.typescript_local_export_start = (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn typescript_local_export_reference(
+        &self,
+        file: &File<'source>,
+        export: &SyntaxExportBinding,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let range = export.local?;
+        if export.kind != SyntaxExportKind::Named
+            || export.source.is_some()
+            || export.container.is_some()
+            || file.by_range.contains_key(&range)
+            || !matches_export_form(file.text(export.range)?, ModuleMode::Esm)
+        {
+            return None;
+        }
+        let name = file.text(range)?;
+        let target = file.qualified_target(name)?;
+        let written = target.symbol.name_range?;
+        let is_type = target.symbol.kinds.contains(&SymbolKind::Type);
+        if target.symbol.container.is_some() || written == range || (export.type_only && !is_type) {
+            return None;
+        }
+        let role =
+            if is_type && (export.type_only || !target.symbol.kinds.contains(&SymbolKind::Value)) {
+                ReferenceRole::Type
+            } else {
+                ReferenceRole::Read
+            };
+        let local = js_binding(file, &self.javascript, name, range.start, role, work)
+            .is_some_and(|binding| binding.name == written);
+        let signature = role == ReferenceRole::Read
+            && file.declared_signature(name) == Some(written)
+            && !file.blocked(range.start, work);
+        if !(local || signature) {
+            return None;
+        }
+        let owner = self.javascript_module_from(file, range, work)?;
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Unknown, target)?;
+        occurrence.edge_from = Some(owner);
+        Some(occurrence)
+    }
+
     pub(super) fn javascript_call_from(
         &self,
         file: &File<'source>,
@@ -198,6 +265,15 @@ impl<'source> Index<'source> {
             }
             if occurrence.is_none() && reference.role == ReferenceRole::Read {
                 file.record_parameter_read(reference.target, parameter_reads);
+                if !file.facts.assigned_calls().is_empty()
+                    && file.members.contains_key(&reference.target)
+                {
+                    result
+                        .javascript_assigned_members
+                        .entry(file.document.placement.unit().clone())
+                        .or_default()
+                        .push(AssignedMemberSite::Read(reference.target));
+                }
             }
             result.record(occurrence);
         }

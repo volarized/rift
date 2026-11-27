@@ -33,10 +33,11 @@ pub(super) enum ScopedParameterReads {
     TypeScriptFunctionType,
     TypeScriptDestructured,
     JavaScriptCallbackPattern,
+    TypeScriptSignatureType,
 }
 
 impl ScopedParameterReads {
-    pub(super) const COUNT: usize = Self::JavaScriptCallbackPattern as usize + 1;
+    pub(super) const COUNT: usize = Self::TypeScriptSignatureType as usize + 1;
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +48,7 @@ enum CheckedParameterReads {
     TypeScriptMethodType,
     TypeScriptFunctionType,
     TypeScriptDestructured,
+    TypeScriptSignatureType,
 }
 
 /// Exact parameter ranges, built only when syntax holds an ordinary candidate.
@@ -175,6 +177,11 @@ impl<'source> Index<'source> {
                 );
                 return;
             }
+            ScopedParameterReads::TypeScriptSignatureType => {
+                let checked = CheckedParameterReads::TypeScriptSignatureType;
+                self.checked_parameter_uses(file, checked, work, result);
+                return;
+            }
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -229,6 +236,11 @@ impl<'source> Index<'source> {
                 &file.typescript_destructured_parameters,
                 &mut result.deferred_typescript_destructured_parameters,
             ),
+            CheckedParameterReads::TypeScriptSignatureType => (
+                ReferenceRole::Type,
+                &file.typescript_signature_type_parameters,
+                &mut result.deferred_typescript_signature_type_parameters,
+            ),
         };
         for reference in file.facts.references() {
             if !work.charge() {
@@ -258,8 +270,14 @@ impl<'source> Index<'source> {
         let binding = js_binding(file, &self.javascript, name, range.start, role, work)?;
         let symbol = *parameters.get(&binding.name)?;
         let owner = file.qualified_target(symbol.container.as_deref()?)?;
+        let scope_matches = if symbol.is_typescript_signature_type_parameter() {
+            owner.symbol.item_range.encloses(binding.scope)
+                && binding.scope.encloses(symbol.item_range)
+        } else {
+            binding.scope == owner.symbol.item_range
+        };
         if binding.kind != StaticBindingKind::Shadow
-            || binding.scope != owner.symbol.item_range
+            || !scope_matches
             || !binding.scope.encloses(range)
             || (role == ReferenceRole::Read && !owner.symbol.body_range?.encloses(range))
         {

@@ -1,0 +1,399 @@
+//! Physical caller ownership for directly passed anonymous ECMAScript functions.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rift_core::{PortableSymbolFacts, SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId};
+use rift_error::RiftError;
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+use rift_protocol::index::{PackageAnalysisWarning, PackageSymbol, StoredEdge};
+use rift_protocol::read::{
+    Digest, EdgeKind, EdgeProvider, ExactKind, SymbolId, SymbolKind, TextRange,
+};
+use rift_provider::AssembledSymbol;
+use rift_syntax::{ByteRange, StaticFunctionContext};
+
+use crate::{EnclosingDefinitions, ExactPackageLimits, WorkspaceSemantics, edge::Edge};
+
+use super::{
+    AnalyzedFile, Records, bound, digest_of, line_of, line_starts, truncation, wire_path, wire_unit,
+};
+
+/// One written function value and its ordinal among the unit's function expressions.
+#[derive(Clone, Copy)]
+struct Callback {
+    range: ByteRange,
+    ordinal: usize,
+    kind: &'static str,
+}
+
+struct CallbackFile<'file> {
+    file: &'file AnalyzedFile,
+    module: &'file CoreSymbolId,
+    unit: rift_protocol::read::SourceUnitId,
+    lines: Vec<usize>,
+    scopes: EnclosingDefinitions<Option<Callback>>,
+}
+
+struct CallbackCall<'call, 'file> {
+    site: &'call Edge,
+    file: &'call CallbackFile<'file>,
+    caller: Callback,
+    existing: Option<usize>,
+}
+
+type CallKey<'site> = (&'site str, u64, u64, &'site str, &'site str);
+
+impl Records {
+    /// Uses already resolved targets, and corrects admitted sites before adding any more edges.
+    pub(super) fn retain_ecmascript_callback_calls(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+    ) -> Result<(), RiftError> {
+        if self.symbols_truncated {
+            return Ok(());
+        }
+        let files = self.ecmascript_callback_files(analyzed);
+        if files.is_empty() {
+            return Ok(());
+        }
+        let objects = self
+            .objects
+            .iter()
+            .filter_map(|object| object.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut calls = checked_callback_calls(&files, semantics, &objects);
+        for (index, edge) in self.edges.iter().enumerate() {
+            if let Some(key) = stored_call_key(edge)
+                && let Some(call) = calls.get_mut(&key)
+            {
+                call.existing = Some(index);
+            }
+        }
+        let mut callers = BTreeMap::<_, Option<SymbolId>>::new();
+        let declaration_limit = limits
+            .declarations_max()
+            .min(bound(self.publication.symbols));
+        let calls = calls
+            .into_values()
+            .filter(|call| call.existing.is_some() || call.site.from() == call.file.module)
+            .collect::<Vec<_>>();
+        for existing in [true, false] {
+            for call in calls
+                .iter()
+                .filter(|call| call.existing.is_some() == existing)
+            {
+                if !existing && self.edges.len() >= limits.edges_max() {
+                    self.warn(truncation(
+                        "edges",
+                        u64::try_from(limits.edges_max()).unwrap_or(u64::MAX),
+                    ));
+                    return Ok(());
+                }
+                let key = (&call.file.unit, call.caller.range);
+                let caller = match callers.entry(key) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(self.publish_ecmascript_callback(
+                            owner,
+                            call.file,
+                            call.caller,
+                            &objects,
+                            declaration_limit,
+                        )?)
+                    }
+                };
+                if let Some(caller) = caller {
+                    if let Some(index) = call.existing {
+                        self.edges[index].from.clone_from(caller);
+                    } else {
+                        let mut edge = call.site.to_protocol();
+                        edge.from.clone_from(caller);
+                        self.edges.push(edge);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ecmascript_callback_files<'file>(
+        &self,
+        analyzed: &'file [AnalyzedFile],
+    ) -> BTreeMap<&'file CoreSourceUnitId, CallbackFile<'file>> {
+        let modules = self
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Module))
+            .filter_map(|object| object.id.as_ref())
+            .collect::<BTreeSet<_>>();
+        let mut complete = BTreeMap::new();
+        for row in &self.declarations {
+            if row.source_complete && modules.contains(&row.symbol) {
+                complete
+                    .entry(row.symbol.as_str())
+                    .and_modify(|candidate| *candidate = None)
+                    .or_insert(Some(row));
+            }
+        }
+        analyzed
+            .iter()
+            .filter_map(|file| {
+                let origin = file.placement.unit();
+                let unit = wire_unit(origin);
+                let module = file.placement.logical_identity(".")?;
+                let declaration = (*complete.get(module.as_str())?)?;
+                if declaration.unit != unit
+                    || declaration.range.start != 0
+                    || declaration.source != file.file.source()
+                {
+                    return None;
+                }
+                let scopes = callback_scopes(file)?;
+                let lines = line_starts(file.file.source());
+                Some((
+                    origin,
+                    CallbackFile {
+                        file,
+                        module,
+                        unit,
+                        lines,
+                        scopes,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn publish_ecmascript_callback(
+        &mut self,
+        owner: &SymbolOwner,
+        file: &CallbackFile<'_>,
+        caller: Callback,
+        objects: &BTreeSet<SymbolId>,
+        declaration_limit: usize,
+    ) -> Result<Option<SymbolId>, RiftError> {
+        if self.symbols_truncated {
+            return Ok(None);
+        }
+        let module = SymbolIdentity::parse(file.module.as_str())?;
+        let name = format!("$callback#{}", caller.ordinal);
+        let mut qualified = module.qualified_path().to_vec();
+        qualified.push(name.clone());
+        let language = file.file.file.syntax().language();
+        let Ok(identity) = SymbolIdentity::new(owner.clone(), language.clone(), qualified) else {
+            return Ok(None);
+        };
+        let id = SymbolId(identity.wire_identity());
+        if objects.contains(&id) {
+            return Ok(None);
+        }
+        let limit = bound(self.publication.symbols);
+        if self.objects.len() >= limit || self.declarations.len() >= declaration_limit {
+            self.symbols_truncated = true;
+            self.warn(truncation(
+                "declarations",
+                u64::try_from(declaration_limit).unwrap_or(u64::MAX),
+            ));
+            return Ok(None);
+        }
+        let Some(source) = source_text(file.file.file.source(), caller.range) else {
+            return Ok(None);
+        };
+        let path = wire_path(file.file.file.path());
+        let bytes = caller.range.end - caller.range.start;
+        if !self.retained_source_fits(bytes) {
+            self.warn(PackageAnalysisWarning::SourceTruncated {
+                path,
+                dropped: bytes,
+            });
+            return Ok(None);
+        }
+        let facts = PortableSymbolFacts::new(
+            language.clone(),
+            &name,
+            &name,
+            ExactKind("function".to_owned()),
+        )
+        .kinds(vec![SymbolKind::Value, SymbolKind::Callable]);
+        let origin = file.file.placement.origin();
+        let mut object = AssembledSymbol::wire_facts(&facts, origin);
+        object.id = Some(id.clone());
+        object.container = Some(SymbolId(file.module.as_str().to_owned()));
+        object.document_local = true;
+        let retained = self.retained(source, &path, 1)?;
+        let mut declaration = PackageSymbol {
+            symbol: id.clone(),
+            origin: object.origin.clone(),
+            unit: file.unit.clone(),
+            range: TextRange {
+                start: caller.range.start,
+                end: caller.range.end,
+            },
+            syntax_element_kind: Some(caller.kind.to_owned()),
+            line: line_of(&file.lines, caller.range.start),
+            signature_indices: Vec::new(),
+            type_indices: Vec::new(),
+            documentation_indices: Vec::new(),
+            source: retained.text,
+            source_complete: retained.complete,
+            public: false,
+            digest: Digest(String::new()),
+        };
+        declaration.digest = digest_of(&declaration, owner)?;
+        self.objects.push(object);
+        self.declarations.push(declaration);
+        Ok(Some(id))
+    }
+}
+
+fn checked_callback_calls<'call, 'file>(
+    files: &'call BTreeMap<&CoreSourceUnitId, CallbackFile<'file>>,
+    semantics: &'call WorkspaceSemantics,
+    objects: &BTreeSet<SymbolId>,
+) -> BTreeMap<CallKey<'call>, CallbackCall<'call, 'file>> {
+    let objects = objects
+        .iter()
+        .map(SymbolId::as_str)
+        .collect::<BTreeSet<_>>();
+    semantics
+        .edges()
+        .edges()
+        .filter_map(|site| {
+            if site.kind() != EdgeKind::Calls
+                || site.is_graph_edge()
+                || !objects.contains(site.to().as_str())
+            {
+                return None;
+            }
+            let occurrence = site.occurrence();
+            let file = files.get(occurrence.unit())?;
+            let range = occurrence.range();
+            let callee_span = site.static_callee()?;
+            if callee_span.start < range.start() || range.end() < callee_span.end {
+                return None;
+            }
+            let caller = file
+                .scopes
+                .resolve(range.start(), range.end())
+                .copied()
+                .flatten()?;
+            let key = (
+                file.unit.as_str(),
+                range.start(),
+                range.end(),
+                site.from().as_str(),
+                site.to().as_str(),
+            );
+            Some((
+                key,
+                CallbackCall {
+                    site,
+                    file,
+                    caller,
+                    existing: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn stored_call_key(edge: &StoredEdge) -> Option<CallKey<'_>> {
+    if edge.provider != EdgeProvider::Static || edge.kinds != [EdgeKind::Calls] {
+        return None;
+    }
+    let site = edge.occurrence.as_ref()?;
+    Some((
+        site.unit.as_str(),
+        site.range.start,
+        site.range.end,
+        edge.from.as_str(),
+        edge.to.as_str(),
+    ))
+}
+
+fn callback_scopes(file: &AnalyzedFile) -> Option<EnclosingDefinitions<Option<Callback>>> {
+    let syntax = file.file.syntax();
+    if !matches!(syntax.language().name.as_str(), "javascript" | "typescript")
+        || syntax.has_errors()
+        || syntax.left_out_declaration_count() != 0
+    {
+        return None;
+    }
+    let facts = syntax.static_facts()?;
+    let calls = facts
+        .calls()
+        .iter()
+        .map(|call| call.range)
+        .collect::<BTreeSet<_>>();
+    let arguments = facts
+        .function_contexts()
+        .iter()
+        .filter_map(|(range, context)| {
+            matches!(context, StaticFunctionContext::Argument { call, .. } if calls.contains(call))
+                .then_some(*range)
+        })
+        .collect::<BTreeSet<_>>();
+    if arguments.is_empty() {
+        return None;
+    }
+    let block_functions = facts
+        .function_scopes()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let function_values = facts
+        .function_values()
+        .iter()
+        .filter_map(|(range, value)| (range == value).then_some(*range))
+        .collect::<BTreeSet<_>>();
+    let scopes = function_values
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, range)| {
+            let callback = if arguments.contains(&range) {
+                anonymous_kind(file.file.source(), range, block_functions.contains(&range)).map(
+                    |kind| Callback {
+                        range,
+                        ordinal,
+                        kind,
+                    },
+                )
+            } else {
+                None
+            };
+            (range.start, range.end, callback)
+        });
+    let named = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.kinds.contains(&SymbolKind::Callable))
+        .map(|symbol| (symbol.range.start, symbol.range.end, None));
+    let deferred = facts
+        .static_blocks()
+        .iter()
+        .map(|range| (range.start, range.end, None));
+    Some(EnclosingDefinitions::new(
+        named.chain(deferred).chain(scopes),
+    ))
+}
+
+fn anonymous_kind(source: &str, range: ByteRange, block: bool) -> Option<&'static str> {
+    if !block {
+        return Some("arrow_function");
+    }
+    // The captured range is a checked function expression. A name or ambiguous written
+    // prefix before its parameter list leaves any established caller unchanged.
+    let written = source_text(source, range)?;
+    let written = written
+        .strip_prefix("async")
+        .map_or(written, str::trim_start);
+    let parameters = written.strip_prefix("function")?.trim_start();
+    parameters.starts_with('(').then_some("function_expression")
+}
+
+fn source_text(source: &str, range: ByteRange) -> Option<&str> {
+    source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+}
