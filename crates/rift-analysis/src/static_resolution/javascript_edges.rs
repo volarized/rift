@@ -1059,6 +1059,51 @@ impl<'source> Index<'source> {
             && !file.document.facts.has_errors()
     }
 
+    /// Adds checked literal requires occupying an immediate argument expression.
+    pub(super) fn resolve_commonjs_argument_imports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values().filter(|file| {
+            file.document.facts.language().name == "javascript"
+                && self.javascript_has_file_module(file)
+                && file.document.facts.declaration_syntax_complete()
+        }) {
+            let mut sites = BTreeSet::new();
+            for reference in file.facts.references().iter().filter(|reference| {
+                reference.role == ReferenceRole::Import
+                    && commonjs_argument_call(file, reference.target)
+            }) {
+                if !work.charge() {
+                    break 'files;
+                }
+                sites.insert(reference.target);
+            }
+            if sites.is_empty() {
+                continue;
+            }
+            for call in file.facts.calls() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if sites.remove(&call.range)
+                    && let Some(module) = Self::commonjs_literal_require(file, call)
+                    && self.builtin_require(file, call.callee_range.start, work)
+                    && let Some(imported) =
+                        self.javascript_module_specifier(file, module, true, work)
+                {
+                    result.record(Some(imported));
+                }
+                if sites.is_empty() {
+                    break;
+                }
+            }
+        }
+        result.commonjs_argument_import_start = (result.occurrences.len() > start).then_some(start);
+    }
+
     /// Retains literal requires written directly in a checked `CommonJS` export object.
     pub(super) fn resolve_commonjs_export_imports(
         &self,
@@ -1269,6 +1314,13 @@ impl<'source> Index<'source> {
         imported.document.placement.logical_identity(".")?;
         Some(imported)
     }
+}
+
+/// Recognizes the retained full call range in the import reference carrier.
+fn commonjs_argument_call(file: &File<'_>, range: ByteRange) -> bool {
+    file.text(range)
+        .and_then(|text| text.strip_prefix("require"))
+        .is_some_and(|tail| tail.trim_ascii_start().starts_with('(') && tail.ends_with(')'))
 }
 
 impl Target<'_> {

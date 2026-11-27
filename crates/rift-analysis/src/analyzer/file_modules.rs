@@ -36,6 +36,7 @@ impl Records {
         self.retain_checked_declaration_specifiers(owner, analyzed, semantics, limits)?;
         self.retain_imported_export_selectors(semantics, limits.edges_max());
         self.retain_checked_inline_import_type_edges(semantics, limits.edges_max());
+        self.retain_commonjs_argument_imports(semantics, limits.edges_max());
         Ok(())
     }
 
@@ -181,6 +182,18 @@ impl Records {
         }
     }
 
+    pub(super) fn retain_commonjs_argument_imports(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        edge_limit: usize,
+    ) {
+        let references = semantics
+            .edges()
+            .edges()
+            .filter(|edge| edge.is_commonjs_argument_import());
+        self.retain_file_module_edge_rows(references, edge_limit);
+    }
+
     fn checked_declaration_source_candidates<'file>(
         &self,
         analyzed: &'file [AnalyzedFile],
@@ -288,6 +301,7 @@ impl Records {
                 edge.is_file_module_reference()
                     && !edge.is_incomplete_local_export_reference()
                     && !edge.is_imported_export_selector()
+                    && !edge.is_commonjs_argument_import()
                     && edge.kind() == kind
                     && edge.is_deferred_commonjs_export_import() == deferred_exports
             })
@@ -355,9 +369,12 @@ impl Records {
             let retained = if edge.kind() == EdgeKind::References {
                 declared.get(from).copied() == Some(unit.as_str()) && objects.contains(to)
             } else {
-                objects.contains(from)
-                    && declared.contains_key(to)
-                    && source_units.contains(unit.as_str())
+                let source_matches = if edge.is_commonjs_argument_import() {
+                    declared.get(from).copied() == Some(unit.as_str())
+                } else {
+                    source_units.contains(unit.as_str())
+                };
+                source_matches && objects.contains(from) && declared.contains_key(to)
             };
             if !retained {
                 continue;

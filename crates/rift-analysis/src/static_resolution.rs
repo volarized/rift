@@ -89,6 +89,8 @@ pub(crate) struct StaticResolution {
     pub(crate) file_module_qualifier_start: Option<usize>,
     /// First import in a checked `CommonJS` default export object.
     pub(crate) commonjs_export_import_start: Option<usize>,
+    /// First import written as a `CommonJS` call argument, after established edges.
+    pub(crate) commonjs_argument_import_start: Option<usize>,
     /// First checked selector reference to a declaration in a relative imported module.
     pub(crate) typescript_imported_export_start: Option<usize>,
     /// First containment edge of a physically scoped literal declaration.
@@ -403,6 +405,7 @@ fn resolve_by<'source>(
     index.resolve_incomplete_typescript_local_exports(&mut work, &mut resolution);
     index.resolve_typescript_imported_export_selectors(&mut work, &mut resolution);
     index.resolve_typescript_inline_import_types(&mut work, &mut resolution);
+    index.resolve_commonjs_argument_imports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

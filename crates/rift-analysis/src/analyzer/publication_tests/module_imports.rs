@@ -6114,3 +6114,91 @@ fn typescript_reexport_only_declaration_files_keep_their_module_imports() {
             })
     );
 }
+
+#[test]
+fn checked_commonjs_literals_as_direct_call_arguments_keep_module_imports() {
+    const SOURCE: &str = concat!(
+        "const established = require('./leaf');\n",
+        "function wrap(value) { return value; }\n",
+        "const wrapped = wrap(require('./leaf'));\n",
+        "wrap(require('./leaf'));\n",
+        "wrap(wrap(require('./leaf')));\n",
+        "wrap?.(require('./leaf'));\n",
+        "wrap(require('./leaf', 1));\n",
+        "wrap(require('./le' + 'af'));\n",
+        "wrap(require('./missing'));\n",
+        "wrap([require('./leaf')]);\n",
+        "function shadow(require) { return wrap(require('./leaf')); }\n",
+        "exports.established = established;\n",
+        "exports.wrapped = wrapped;\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const TARGET: &str = "exports.leaf = function leaf() { return 1; };\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE), ("leaf.js", TARGET)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked CommonJS source");
+    let (found, _, semantics, _) = analysis.into_parts();
+    found.validate_facts().expect("valid written imports");
+    let modules = |text| {
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source_complete && row.source == text)
+            .expect("complete physical module")
+    };
+    let entry = modules(SOURCE);
+    let target = modules(TARGET);
+    let quoted = SOURCE
+        .match_indices("'./leaf'")
+        .map(|(start, text)| {
+            let start = u64::try_from(start).expect("bounded fixture offset");
+            let size = u64::try_from(text.len()).expect("bounded literal");
+            TextRange {
+                start,
+                end: start + size,
+            }
+        })
+        .collect::<Vec<_>>();
+    let imports = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.from == entry.symbol
+            && edge.to == target.symbol
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == entry.unit)
+    };
+    let mut written = found
+        .edges
+        .iter()
+        .filter(|edge| imports(edge))
+        .filter_map(|edge| edge.occurrence.as_ref().map(|site| site.range.clone()))
+        .collect::<Vec<_>>();
+    written.sort_by_key(|site| (site.start, site.end));
+    assert_eq!(written, quoted[..4]);
+    let mut records = Records {
+        units: found.units.clone(),
+        objects: found.objects.clone(),
+        declarations: found.declarations.clone(),
+        edges: found
+            .edges
+            .into_iter()
+            .filter(|edge| {
+                !imports(edge)
+                    || edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range == quoted[0])
+            })
+            .collect(),
+        ..Records::default()
+    };
+    let earlier = records.edges.clone();
+    records.retain_commonjs_argument_imports(&semantics, earlier.len());
+    assert_eq!(records.edges, earlier, "incumbent capacity");
+}

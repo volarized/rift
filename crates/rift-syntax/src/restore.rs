@@ -883,6 +883,14 @@ impl SyntaxFacts {
             {
                 return errors::syntax::facts_structure_invalid().fail();
             }
+            if parts.language.name != "javascript"
+                && facts
+                    .references()
+                    .iter()
+                    .any(|reference| reference.role == rift_core::ReferenceRole::Import)
+            {
+                return errors::syntax::facts_range_invalid().fail();
+            }
             facts.validate(source, limits)?;
             validate_member_aliases(&parts, facts.member_aliases())?;
             if let Some(export) = facts.commonjs_export()
