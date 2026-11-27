@@ -273,6 +273,36 @@ impl<'source> Index<'source> {
         self.python_access(file, range, ReferenceRole::Read, target)
     }
 
+    /// Reads the independently resolved first name of an established value path.
+    pub(super) fn python_value_qualifier(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        match self.python_shared_name(file, range, work) {
+            Name::Declared(target) if target.symbol.kinds.contains(&SymbolKind::Module) => {
+                if let Some(occurrence) =
+                    self.python_access(file, range, ReferenceRole::Read, target)
+                {
+                    result.record(Some(occurrence));
+                }
+            }
+            Name::Declared(target) if target.symbol.kinds.contains(&SymbolKind::Constructible) => {
+                result
+                    .deferred_python_class_qualifiers
+                    .extend(self.python_access(file, range, ReferenceRole::Read, target));
+            }
+            Name::External(target) => {
+                result
+                    .deferred_python_import_qualifiers
+                    .extend(self.python_external_access(file, range, target));
+            }
+            Name::Local | Name::Refused | Name::Declared(_) => {}
+        }
+    }
+
     /// Records one write of a name that the module or a class holds.
     pub(super) fn python_name_write(
         &self,

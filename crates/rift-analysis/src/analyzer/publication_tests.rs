@@ -711,3 +711,82 @@ fn unaliased_python_imports_agree_on_their_package_root() {
         );
     }
 }
+
+#[test]
+fn python_qualified_member_calls_keep_class_and_runtime_reads() {
+    use rift_protocol::read::EdgeKind;
+
+    const SOURCE: &str = concat!(
+        "import demo.parents\nimport demo.other\nimport time\nimport time\n",
+        "class Tone(demo.parents.Base):\n    pass\n",
+        "def build():\n    return Tone.make()\n",
+        "def read_clock():\n    return time.time()\n",
+        "def shadowed(Tone, time):\n    return Tone.make(), time.time()\n",
+    );
+    let files = [
+        ("demo/__init__.py", ""),
+        (
+            "demo/parents.py",
+            "class Base:\n    @classmethod\n    def make(cls): return cls()\n",
+        ),
+        ("demo/other.py", "def other(): return None\n"),
+        ("demo/child.py", SOURCE),
+    ];
+    let result = publication(&files, None, &["demo"]);
+    let unit = &result
+        .units
+        .iter()
+        .find(|file| file.path.0 == "demo/child.py")
+        .expect("physical source")
+        .unit;
+    for (written, qualifier, callee, name) in [
+        (
+            "Tone.make()",
+            "/demo/child/Tone",
+            "/demo/parents/Base/make",
+            "Tone",
+        ),
+        (
+            "time.time()",
+            "/cpython/python/time",
+            "/cpython/python/time/time",
+            "time",
+        ),
+    ] {
+        let start =
+            u64::try_from(SOURCE.find(written).expect("written call")).expect("call offset");
+        let width = u64::try_from(name.len()).expect("qualifier length");
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to.as_str().ends_with(qualifier)
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == unit
+                            && site.range.start == start
+                            && site.range.end == start + width
+                    })
+            }),
+            "{qualifier}"
+        );
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge.to.as_str().ends_with(callee)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| &site.unit == unit && site.range.start == start)
+            }),
+            "{callee}"
+        );
+        let shadow =
+            u64::try_from(SOURCE.rfind(written).expect("shadowed call")).expect("shadowed offset");
+        assert!(result.edges.iter().all(|edge| {
+            !(edge.to.as_str().ends_with(qualifier) || edge.to.as_str().ends_with(callee))
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_none_or(|site| &site.unit != unit || site.range.start != shadow)
+        }));
+    }
+}

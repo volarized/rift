@@ -13,7 +13,7 @@ use super::Value;
 /// Plain names read after member, annotation, and containment facts have been resolved.
 pub(in crate::static_resolution) struct PythonNameSites {
     names: Vec<StaticReference>,
-    paths: BTreeSet<u64>,
+    path_starts: BTreeMap<u64, bool>,
 }
 
 impl<'source> Index<'source> {
@@ -24,10 +24,10 @@ impl<'source> Index<'source> {
         result: &mut StaticResolution,
     ) -> Option<PythonNameSites> {
         let callees = established_callees(result);
-        let mut paths = callees
+        let mut path_starts = callees
             .keys()
-            .map(|callee| callee.start)
-            .collect::<BTreeSet<_>>();
+            .map(|callee| (callee.start, true))
+            .collect::<BTreeMap<_, _>>();
         let mut names = Vec::new();
         for reference in file.facts.references() {
             // A member access spells its receiver. A name alone states no member.
@@ -57,7 +57,7 @@ impl<'source> Index<'source> {
                     self.python_access(file, reference.target, reference.role, target)
                 });
             if occurrence.is_some() {
-                paths.insert(reference.target.start);
+                path_starts.entry(reference.target.start).or_insert(false);
             }
             if !names_callee(&callees, reference, occurrence.as_ref()) {
                 result.record(occurrence);
@@ -97,7 +97,7 @@ impl<'source> Index<'source> {
             }
         }
         self.named_type_references(file, work, result);
-        (!work.exhausted && !names.is_empty()).then_some(PythonNameSites { names, paths })
+        (!work.exhausted && !names.is_empty()).then_some(PythonNameSites { names, path_starts })
     }
 
     /// Resolve plain names and retain suppressed module qualifier sites for later.
@@ -107,7 +107,7 @@ impl<'source> Index<'source> {
         sites: PythonNameSites,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) -> Vec<ByteRange> {
+    ) -> Vec<(ByteRange, bool)> {
         let mut qualifiers = Vec::new();
         for reference in sites.names {
             if !work.charge() {
@@ -116,8 +116,10 @@ impl<'source> Index<'source> {
             let name = reference.target;
             if reference.role == ReferenceRole::Write {
                 self.python_name_write(file, name, work, result);
-            } else if sites.paths.contains(&name.start) && file.python_path_starts(name) {
-                qualifiers.push(name);
+            } else if let Some(&call) = sites.path_starts.get(&name.start)
+                && file.python_path_starts(name)
+            {
+                qualifiers.push((name, call));
             } else {
                 self.python_name_read(file, name, work, result);
             }
@@ -130,7 +132,7 @@ impl<'source> Index<'source> {
         &self,
         file: &File<'source>,
         imports: Vec<super::PythonImportQualifier<'source>>,
-        names: Vec<ByteRange>,
+        names: Vec<(ByteRange, bool)>,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
@@ -146,11 +148,13 @@ impl<'source> Index<'source> {
                 result.record(Some(occurrence));
             }
         }
-        for name in names {
+        for (name, call) in names {
             if !work.charge() {
                 return;
             }
-            if let Some(occurrence) = self.python_member_module_qualifier(file, name, work) {
+            if call {
+                self.python_value_qualifier(file, name, work, result);
+            } else if let Some(occurrence) = self.python_member_module_qualifier(file, name, work) {
                 result.record(Some(occurrence));
             }
         }
