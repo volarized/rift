@@ -528,7 +528,7 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     if source.text().len() > input.syntax().source_bytes_max() || sources.next().is_some() {
         return None;
     }
-    let metadata: PackageMetadata = serde_json::from_str(source.text()).ok()?;
+    let metadata = PackageMetadata::parse(source.text())?;
     let accepted = match input.owner() {
         SymbolOwner::Package { manager, name, .. } => {
             manager == "npm"
@@ -668,7 +668,8 @@ fn map_declared_types(
         return;
     }
     // Two written implementations leave open which one the types describe.
-    if matches!((&metadata.main, &metadata.module), (Some(main), Some(module)) if main != module) {
+    if matches!((metadata.main(), metadata.module.as_deref()), (Some(main), Some(module)) if main != module)
+    {
         return;
     }
     let Entry::File(types_path) = entry::resolve(files, metadata, "typescript") else {
@@ -841,7 +842,7 @@ fn entry_target<'metadata>(
     }
     match language {
         "typescript" => metadata.types.as_deref().or(metadata.typings.as_deref()),
-        "javascript" => match (&metadata.main, &metadata.module) {
+        "javascript" => match (metadata.main(), metadata.module.as_deref()) {
             (Some(main), Some(module)) if main != module => None,
             (Some(main), _) => Some(main),
             (_, Some(module)) => Some(module),
@@ -857,7 +858,7 @@ struct PackageMetadata {
     version: String,
     types: Option<String>,
     typings: Option<String>,
-    main: Option<String>,
+    main: Option<CapturedMain>,
     module: Option<String>,
     exports: Option<Exports>,
     imports: Option<CapturedPackageImports>,
@@ -865,6 +866,32 @@ struct PackageMetadata {
     types_versions: Option<serde_json::Value>,
     #[serde(rename = "type")]
     module_type: Option<String>,
+}
+
+impl PackageMetadata {
+    fn parse(source: &str) -> Option<Self> {
+        let metadata: Self = serde_json::from_str(source).ok()?;
+        match metadata.main {
+            Some(CapturedMain::Disabled(disabled)) => (!disabled
+                && matches!(metadata.exports, Some(Exports::Subpaths(_))))
+            .then_some(metadata),
+            _ => Some(metadata),
+        }
+    }
+
+    fn main(&self) -> Option<&str> {
+        match self.main.as_ref()? {
+            CapturedMain::Path(path) => Some(path),
+            CapturedMain::Disabled(_) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CapturedMain {
+    Path(String),
+    Disabled(bool),
 }
 
 /// Import targets selected in the same declared condition order as package exports.

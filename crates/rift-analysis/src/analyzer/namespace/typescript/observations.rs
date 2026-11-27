@@ -260,7 +260,7 @@ fn package_observation(
             .observed_targets(&metadata.name, observation.module(), conditions)
             .and_then(|(types, implementation)| target_path(types).zip(target_path(implementation)))
     } else if observation.module() == metadata.name {
-        let implementation = match (&metadata.main, &metadata.module) {
+        let implementation = match (metadata.main(), metadata.module.as_deref()) {
             (Some(main), Some(module)) if main != module => {
                 if conditions == ["import"] {
                     target_path(module)
@@ -270,7 +270,7 @@ fn package_observation(
                     None
                 }
             }
-            (main, module) => established(files.runtime(main.as_deref(), module.as_deref())),
+            (main, module) => established(files.runtime(main, module)),
         };
         established(files.types(metadata)).zip(implementation)
     } else {

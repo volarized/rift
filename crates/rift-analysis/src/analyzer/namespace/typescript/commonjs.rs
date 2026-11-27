@@ -136,7 +136,7 @@ fn entry_matches(
             )
             .and_then(|(_, implementation)| observations::target_path(implementation))
     } else if observation.module() == metadata.name {
-        match files.runtime(metadata.main.as_deref(), None) {
+        match files.runtime(metadata.main(), None) {
             Entry::File(path) => Some(path),
             Entry::Unknown | Entry::Absent => None,
         }
