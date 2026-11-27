@@ -1915,6 +1915,68 @@ fn package_keeps_initializer_properties_under_their_physical_lexical_bindings() 
 }
 
 #[test]
+fn non_entry_literal_properties_keep_uniquely_named_descendants() {
+    const SOURCE: &str = concat!(
+        "function receive(value) { return value; }\n",
+        "receive({ details: { first: { score: 1 }, shared: 2 } });\n",
+        "receive({ details: { second: { score: 3 }, shared: 4 } });\n",
+        "const ordinary = { details: { existing: 5 } };\n",
+        "export const marker = ordinary;\n",
+    );
+    let analyzed = non_entry_lexical_binding_analysis(SOURCE, 96);
+    let graph = analyzed.publication();
+    graph.validate_facts().expect("checked owner paths");
+    let declaration = |written: &str| {
+        let start = SOURCE.find(written).expect("written member");
+        graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical property")
+    };
+    let mut owners = BTreeSet::new();
+    for (details, child, leaf, kept) in [
+        (
+            "details: { first: { score: 1 }, shared: 2 }",
+            "first: { score: 1 }",
+            "score: 1",
+            "shared: 2",
+        ),
+        (
+            "details: { second: { score: 3 }, shared: 4 }",
+            "second: { score: 3 }",
+            "score: 3",
+            "shared: 4",
+        ),
+    ] {
+        let [details, child, leaf, kept] = [details, child, leaf, kept].map(declaration);
+        assert!(owners.insert(&details.symbol));
+        for (parent, member) in [(details, child), (details, kept), (child, leaf)] {
+            assert_eq!(parent.unit, member.unit);
+            assert!(graph.objects.iter().any(|row| {
+                row.id.as_ref() == Some(&member.symbol)
+                    && row.container.as_ref() == Some(&parent.symbol)
+            }));
+        }
+    }
+    assert!(
+        declaration("existing: 5")
+            .symbol
+            .as_str()
+            .ends_with("/ordinary/details/existing")
+    );
+    let limited = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(limited.publication().declarations, graph.declarations);
+    assert!(
+        limited
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| graph.edges.contains(edge))
+    );
+}
+
+#[test]
 fn npm_javascript_callbacks_keep_physical_parameters_and_reads() {
     const SOURCE: &str = concat!(
         "export function map(values) {\n",
