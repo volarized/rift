@@ -103,6 +103,11 @@ pub(crate) struct StaticResolution {
     /// Unresolved direct calls in ECMAScript units, available for the late alias pass.
     pub(crate) javascript_lexical_alias_candidates:
         BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
+    /// First member reference through a checked call-result assignment.
+    pub(crate) javascript_assigned_member_start: Option<usize>,
+    /// Member sites that the ordinary pass could not place.
+    pub(crate) javascript_assigned_members:
+        BTreeMap<rift_core::SourceUnitId, Vec<javascript::AssignedMemberSite>>,
     /// First TypeScript overload parameter read after callback parameter reads.
     pub(crate) overload_parameter_start: Option<usize>,
     /// Overload parameter reads awaiting capacity after earlier package edges.
@@ -334,6 +339,7 @@ fn resolve_by<'source>(
         &mut resolution.deferred_javascript_callback_patterns,
     );
     index.resolve_javascript_lexical_alias_calls(&mut work, &mut resolution);
+    index.resolve_javascript_assigned_members(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -2513,6 +2519,16 @@ impl<'source> Index<'source> {
                     .push(*call);
             }
             if occurrence.is_none()
+                && !file.facts.assigned_calls().is_empty()
+                && matches!(call.callee, rift_syntax::StaticCallee::Member { .. })
+            {
+                result
+                    .javascript_assigned_members
+                    .entry(file.document.placement.unit().clone())
+                    .or_default()
+                    .push(javascript::AssignedMemberSite::Call(*call));
+            }
+            if occurrence.is_none()
                 && !file.rust_extern_aliases.is_empty()
                 && call.callee == rift_syntax::StaticCallee::Qualified
             {
@@ -3005,6 +3021,8 @@ impl StaticResolution {
             .append(&mut apart.rust_extern_candidates);
         self.javascript_lexical_alias_candidates
             .append(&mut apart.javascript_lexical_alias_candidates);
+        self.javascript_assigned_members
+            .append(&mut apart.javascript_assigned_members);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);

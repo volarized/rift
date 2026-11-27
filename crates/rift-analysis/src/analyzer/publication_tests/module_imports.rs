@@ -3960,3 +3960,112 @@ fn typescript_alias_types_do_not_record_calls() {
     let occurrence = calls[0].occurrence.as_ref().expect("written invocation");
     assert_eq!(occurrence.range, module_runtime_range(start, "callable()"));
 }
+
+const JAVASCRIPT_ASSIGNED_RESULTS: &str = concat!(
+    "function leaf(value) { return value; }\n",
+    "function other(value) { return value + 1; }\n",
+    "function make() { return { leaf }; }\n",
+    "function uncertain(flag) { if (flag) return { leaf }; return null; }\n",
+    "export function direct(value) {\n",
+    "  const receiver = make(); return receiver.leaf(value);\n",
+    "}\n",
+    "export function assigned(value, unrelated, key) {\n",
+    "  let receiver; receiver = make(); unrelated[key] = 0;\n",
+    "  return receiver.leaf(value);\n",
+    "}\n",
+    "export function before(value) {\n",
+    "  let receiver; const old = receiver.leaf(value); receiver = make(); return old;\n",
+    "}\n",
+    "export function conditional(flag, value) {\n",
+    "  let receiver; if (flag) receiver = make(); return receiver.leaf(value);\n",
+    "}\n",
+    "export function reassigned(value) {\n",
+    "  let receiver; receiver = make(); receiver = null; return receiver.leaf(value);\n",
+    "}\n",
+    "export function changed(value) {\n",
+    "  let receiver; receiver = make(); receiver.leaf = other; return receiver.leaf(value);\n",
+    "}\n",
+    "export function escaped(take, value) {\n",
+    "  let receiver; receiver = make(); take(receiver); return receiver.leaf(value);\n",
+    "}\n",
+    "export function deferred(value) {\n",
+    "  let receiver; receiver = make(); return () => receiver.leaf(value);\n",
+    "}\n",
+    "export function differentShape(flag, value) {\n",
+    "  let receiver; receiver = uncertain(flag); return receiver.leaf(value);\n",
+    "}\n",
+);
+
+#[test]
+fn javascript_members_follow_a_single_checked_call_result_assignment() {
+    let source = JAVASCRIPT_ASSIGNED_RESULTS;
+    let analysis = non_entry_lexical_binding_analysis(source, 120);
+    let found = analysis.publication();
+    found.validate_facts().expect("checked assignment results");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.source == source)
+        .expect("retained package module");
+    let direct_start = source
+        .find("receiver.leaf(value)")
+        .expect("written direct use");
+    let assigned = source
+        .find("export function assigned")
+        .expect("written assignment");
+    let assigned_start = assigned
+        + source[assigned..]
+            .find("receiver.leaf(value)")
+            .expect("written use after assignment");
+    let mut new_edges = Vec::new();
+    for (kind, text) in [
+        (EdgeKind::Reads, "receiver.leaf"),
+        (EdgeKind::Calls, "receiver.leaf(value)"),
+    ] {
+        let at = |start: usize| {
+            found
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.kinds == [kind]
+                        && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                            occurrence.unit == unit.unit
+                                && occurrence.range == module_runtime_range(start, text)
+                        })
+                })
+                .unwrap_or_else(|| panic!("written member edge {kind:?} at {start}"))
+        };
+        let direct = at(direct_start);
+        let after = at(assigned_start);
+        assert!(direct.from.as_str().ends_with("/direct"));
+        assert!(after.from.as_str().ends_with("/assigned"));
+        assert_eq!(direct.to, after.to);
+        new_edges.push(after.clone());
+    }
+    assert_eq!(
+        found
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.to == new_edges[0].to
+                    && matches!(edge.kinds.as_slice(), [EdgeKind::Reads | EdgeKind::Calls])
+                    && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                        occurrence.unit == unit.unit
+                            && source
+                                [usize::try_from(occurrence.range.start).expect("source offset")..]
+                                .starts_with("receiver.leaf(")
+                    })
+            })
+            .count(),
+        4
+    );
+    let bounded = non_entry_lexical_binding_analysis(source, found.edges.len() - new_edges.len());
+    assert_eq!(bounded.publication().declarations, found.declarations);
+    assert!(
+        bounded
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| { found.edges.contains(edge) && !new_edges.contains(edge) })
+    );
+}

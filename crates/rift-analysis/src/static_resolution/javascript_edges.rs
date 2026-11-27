@@ -9,7 +9,7 @@ use rift_syntax::{
     SyntaxExportKind, SyntaxSymbol,
 };
 
-use super::javascript::{MemberMode, ModuleMode};
+use super::javascript::{AssignedMemberSite, MemberMode, ModuleMode};
 use super::javascript_exports::{self, matches_export_form};
 use super::javascript_parameters::ParameterReads;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
@@ -198,6 +198,15 @@ impl<'source> Index<'source> {
             }
             if occurrence.is_none() && reference.role == ReferenceRole::Read {
                 file.record_parameter_read(reference.target, parameter_reads);
+                if !file.facts.assigned_calls().is_empty()
+                    && file.members.contains_key(&reference.target)
+                {
+                    result
+                        .javascript_assigned_members
+                        .entry(file.document.placement.unit().clone())
+                        .or_default()
+                        .push(AssignedMemberSite::Read(reference.target));
+                }
             }
             result.record(occurrence);
         }

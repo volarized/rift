@@ -13,6 +13,15 @@ use super::{Binding, File, Index, StaticOccurrence, StaticResolution, Target, Wo
 use crate::NamespaceInput;
 use crate::analyzer::namespace::typescript::{PackageFiles, nested_runtime_candidates};
 
+/// A member site awaiting proof of its receiver's call-result assignment.
+#[derive(Debug)]
+pub(crate) enum AssignedMemberSite {
+    /// A written member invocation.
+    Call(StaticCall),
+    /// A written member access.
+    Read(ByteRange),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModuleMode {
     Esm,
@@ -547,6 +556,182 @@ impl<'source> Index<'source> {
             && target.symbol.syntax_element_kind == Some("variable_declarator"))
         .then_some(target.symbol.body_range)
         .flatten()
+    }
+
+    /// Adds the checked member facts after the previously resolved package edges.
+    pub(super) fn resolve_javascript_assigned_members(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let candidates = std::mem::take(&mut result.javascript_assigned_members);
+        if candidates.is_empty() {
+            return;
+        }
+        let start = result.occurrences.len();
+        let mut resolved_calls = 0_usize;
+        for file in self.files.values() {
+            if work.exhausted {
+                break;
+            }
+            let unit = file.document.placement.unit();
+            let Some((sites, coverage)) = candidates.get(unit).zip(result.edge_calls.get_mut(unit))
+            else {
+                continue;
+            };
+            if coverage.unavailable
+                || file.document.facts.has_errors()
+                || file.document.facts.left_out_declaration_count() != 0
+            {
+                continue;
+            }
+            let mut resolved = BTreeSet::new();
+            let mut assignments = BTreeMap::new();
+            for site in sites {
+                if !work.charge() {
+                    break;
+                }
+                if let Some(found) =
+                    self.javascript_assigned_member(file, site, &mut assignments, work)
+                {
+                    if let AssignedMemberSite::Call(call) = site {
+                        resolved.insert(call.range);
+                    }
+                    result.occurrences.push(found);
+                }
+            }
+            resolved_calls += resolved.len();
+            coverage
+                .unresolved
+                .retain(|range| !resolved.contains(range));
+        }
+        let resolved = result.occurrences.len() - start;
+        result.javascript_assigned_member_start = (resolved > 0).then_some(start);
+        result.unresolved_sites = result.unresolved_sites.saturating_sub(resolved);
+        if let Some(count) = result.omitted.get_mut(&EdgeKind::Calls) {
+            *count = count.saturating_sub(u64::try_from(resolved_calls).unwrap_or(u64::MAX));
+            if *count == 0 {
+                result.omitted.remove(&EdgeKind::Calls);
+            }
+        }
+    }
+
+    fn javascript_assigned_member(
+        &self,
+        file: &File<'source>,
+        site: &AssignedMemberSite,
+        assignments: &mut BTreeMap<ByteRange, Option<ByteRange>>,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let (range, callee, receiver, member, role) = match site {
+            AssignedMemberSite::Call(call) => {
+                let StaticCallee::Member { receiver, member } = call.callee else {
+                    return None;
+                };
+                (
+                    call.range,
+                    call.callee_range,
+                    receiver,
+                    member,
+                    ReferenceRole::Call,
+                )
+            }
+            AssignedMemberSite::Read(range) => {
+                let member = (*file.members.get(range)?)?;
+                (
+                    *range,
+                    *range,
+                    member.receiver,
+                    member.member?,
+                    ReferenceRole::Read,
+                )
+            }
+        };
+        let member = file.text(member)?;
+        let assignment = (*assignments
+            .entry(receiver)
+            .or_insert_with(|| self.javascript_settled_call_assignment(file, receiver, work)))?;
+        let target =
+            self.javascript_member_of_returned_call(file, assignment, member, role, true, work)?;
+        if role == ReferenceRole::Call
+            && target.callable().is_none()
+            && !self.javascript_shorthand_callable(target, work)
+        {
+            return None;
+        }
+        let mut occurrence = self.occurrence(file, range, callee, role, target)?;
+        if !matches!(occurrence.target, NormalizedTarget::Symbol(_)) {
+            return None;
+        }
+        occurrence.edge_from = Some(self.javascript_call_from(file, range, work)?);
+        Some(occurrence)
+    }
+
+    /// Proves that the first use follows one direct assignment in its lexical block.
+    fn javascript_settled_call_assignment(
+        &self,
+        file: &File<'source>,
+        receiver: ByteRange,
+        work: &mut Work,
+    ) -> Option<ByteRange> {
+        let name = file.text(receiver)?;
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            name,
+            receiver.start,
+            ReferenceRole::Read,
+            work,
+        )?;
+        let local = file.target_at(binding.name)?;
+        if binding.kind != StaticBindingKind::Local
+            || local.symbol.syntax_element_kind != Some("variable_declarator")
+            || local.symbol.body_range.is_some()
+        {
+            return None;
+        }
+        let mut writes = file
+            .assignments
+            .name_writes
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|write| binding.scope.contains(*write));
+        let write = writes.next()?;
+        if writes.next().is_some() {
+            return None;
+        }
+        let assignments = file.facts.assigned_calls();
+        let index = assignments
+            .binary_search_by_key(&write, |assignment| assignment.target.start)
+            .ok()?;
+        let site = assignments[index];
+        if site.block != binding.scope
+            || binding.name.end > site.target.start
+            || site.call.end > receiver.start
+            || !site.block.encloses(receiver)
+        {
+            return None;
+        }
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        if scopes.deferred.resolve(site.target.start, site.target.end)
+            != scopes.deferred.resolve(receiver.start, receiver.end)
+        {
+            return None;
+        }
+        for reference in file.facts.references() {
+            if !work.charge() {
+                return None;
+            }
+            if site.call.end <= reference.target.start
+                && reference.target.start < receiver.start
+                && reference.role == ReferenceRole::Read
+                && file.text(reference.target) == Some(name)
+            {
+                return None;
+            }
+        }
+        Some(site.call)
     }
 
     /// Whether a shorthand object member (`{ verify }`) holds a callable value: the name it
