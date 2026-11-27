@@ -15,6 +15,7 @@ mod forwarded_names;
 mod graph;
 mod initializers;
 mod internal_modules;
+mod mixed_shorthand;
 mod module_imports;
 mod overload_parameters;
 mod returned_callables;

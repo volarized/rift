@@ -16,6 +16,8 @@ use super::super::conflicting_assignment_name;
 use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
+mod mixed_shorthand;
+
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
 /// only when they bind it in the same place: overloads, merged interfaces and namespaces,
 /// an accessor pair and a redeclared `var` do.
