@@ -651,13 +651,8 @@ impl<'a> Tokens<'a> {
         if exported && !input.starts_with(&["macro_rules", "!"]) {
             return None;
         }
-        if consume(&mut input, &["use"]) {
-            let mut bindings = BTreeSet::new();
-            imports(&mut input, None, &mut bindings, depth)?;
-            if !consume(&mut input, &[";"]) || !input.is_empty() {
-                return None;
-            }
-            for name in bindings {
+        if input.first() == Some(&"use") {
+            for name in named_imports(input, depth)? {
                 scope.insert(name, false);
             }
             return Some(());
@@ -990,6 +985,16 @@ fn identifier(input: &mut &[&str]) -> Option<String> {
     };
     *input = &input[1..];
     Some(name)
+}
+
+/// Exact names an ordinary, fully bounded use item can introduce.
+pub(super) fn named_imports(mut input: &[&str], depth: usize) -> Option<BTreeSet<String>> {
+    if !consume(&mut input, &["use"]) {
+        return None;
+    }
+    let mut bindings = BTreeSet::new();
+    imports(&mut input, None, &mut bindings, depth)?;
+    (consume(&mut input, &[";"]) && input.is_empty()).then_some(bindings)
 }
 
 fn imports(

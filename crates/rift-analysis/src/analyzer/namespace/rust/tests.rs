@@ -4465,6 +4465,41 @@ fn rust_captured_macro_predicate_keeps_scope_after_checked_plain_outlines() {
     }
 }
 
+#[test]
+fn rust_captured_macro_predicate_tracks_only_complete_named_import_effects() {
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    for (label, tail, expected) in [
+        ("ordinary named import", "pub use chosen::used;", true),
+        (
+            "grouped renamed import",
+            "pub use chosen::{used as alias};",
+            true,
+        ),
+        ("wildcard import", "pub use chosen::*;", false),
+        (
+            "potential macro rebinding",
+            "pub use chosen::used as select;",
+            false,
+        ),
+        ("opaque sibling", "unknown! {}", false),
+    ] {
+        let first =
+            GUARDED_INVOCATION.replace("pub mod chosen;", &format!("pub mod chosen; {tail}"));
+        let root = format!("{GUARDED_MACRO}{first}{next} pub mod direct;");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/chosen.rs", GUARDED_CHILD),
+                ("src/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/chosen.rs", label, true);
+        assert_guarded_module(&publication, "src/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,

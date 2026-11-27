@@ -1167,7 +1167,7 @@ impl Context<'_, '_> {
     fn chain_children<'a>(
         &self,
         (invocation, name, directory): (ByteRange, &str, &str),
-        scope: &Scope,
+        scope: &mut Scope,
         tokens: &scope::Tokens<'a>,
         (children, conditioned): (&mut Vec<Child>, &mut Vec<Conditioned<'a>>),
         registry: bool,
@@ -1177,30 +1177,36 @@ impl Context<'_, '_> {
             tokens
                 .range(invocation)
                 .and_then(|invocation| chain::modules(&invocation, self.depth_max))
-                .map(|modules| (modules, false))
+                .map(|modules| (modules, chain::ScopeAfter::Unknown))
         } else {
             self.chain(invocation, name, scope, tokens, selection)
         };
-        let Some((modules, scope_unchanged)) = modules else {
+        let Some((modules, certainty)) = modules else {
             return false;
         };
-        let unchanged = scope_unchanged
+        let mut inherited = scope.clone();
+        let preserved = if let chain::ScopeAfter::CheckedImports(bindings) = certainty
             && modules.iter().all(|(module, _)| {
                 child_path(module, directory, self.inventory)
                     .and_then(|path| self.inventory.get(path.as_str()))
                     .is_some_and(|child| self.outline_keeps_macro_scope(child))
-            });
-        let mut inherited = scope.clone();
-        if !unchanged {
+            }) {
+            for name in bindings {
+                inherited.insert(name, false);
+            }
+            *scope = inherited.clone();
+            true
+        } else {
             inherited.clear();
-        }
+            false
+        };
         for (module, condition) in modules {
             if let Some(path) = child_path(module, directory, self.inventory) {
                 children.push((path.clone(), vec![module.to_owned()], inherited.clone()));
                 conditioned.push((path, condition));
             }
         }
-        unchanged
+        preserved
     }
 
     fn outline_keeps_macro_scope(&self, file: &SelectedFile<'_>) -> bool {
@@ -1242,7 +1248,7 @@ impl Context<'_, '_> {
         scope: &Scope,
         tokens: &scope::Tokens<'a>,
         (file, configuration): (&SelectedFile<'_>, &super::configuration::Configuration<'_>),
-    ) -> Option<(chain::ModuleBranches<'a>, bool)> {
+    ) -> Option<chain::CheckedBranches<'a>> {
         let (path, range) = scope.definition(name)?;
         let defining = self.inventory.get(path.as_str())?;
         let limits = defining.syntax.syntax_limits()?;
@@ -1287,7 +1293,7 @@ impl Context<'_, '_> {
             )
         } else if chain::is_definition(&definition, name, limits) {
             chain::modules(&tokens.range(invocation)?, self.depth_max)
-                .map(|modules| (modules, false))
+                .map(|modules| (modules, chain::ScopeAfter::Unknown))
         } else {
             None
         }
