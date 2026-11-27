@@ -56,12 +56,37 @@ impl JavaScriptSyntaxProvider {
         limits: SyntaxLimits,
         selected: &BTreeSet<ByteRange>,
     ) -> BTreeSet<ByteRange> {
-        module_object_members(source, limits, selected, |node, _| {
-            node.kind() == "pair"
-                && node
+        Self::scoped_call_argument_properties(source, limits, selected, &BTreeMap::new())
+    }
+
+    /// Checks direct argument properties in complete module and function bodies.
+    ///
+    /// A function case requires the property and its independent class or variable
+    /// declaration to be direct statements in the same body.
+    #[must_use]
+    pub fn scoped_call_argument_properties(
+        source: &str,
+        limits: SyntaxLimits,
+        module: &BTreeSet<ByteRange>,
+        functions: &BTreeMap<ByteRange, ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        let selected = module.len().saturating_add(functions.len());
+        module_object_members(source, limits, selected, |root, property, range, _| {
+            if property.kind() != "pair"
+                || property
                     .child_by_field_name("key")
-                    .is_some_and(|key| key.kind() == "property_identifier")
-                && module_call_argument_member(node)
+                    .is_none_or(|key| key.kind() != "property_identifier")
+            {
+                return false;
+            }
+            if module.contains(&range) {
+                return direct_argument_statement(property)
+                    .and_then(|statement| statement.parent())
+                    == Some(root);
+            }
+            functions
+                .get(&range)
+                .is_some_and(|binding| sibling_argument_binding(root, property, *binding))
         })
     }
 
@@ -73,43 +98,60 @@ impl JavaScriptSyntaxProvider {
         limits: SyntaxLimits,
         selected: &BTreeSet<ByteRange>,
     ) -> BTreeSet<ByteRange> {
-        module_object_members(source, limits, selected, |node, source| match node.kind() {
-            "method_definition" => {
-                let mut cursor = node.walk();
-                node.children(&mut cursor)
-                    .find(|child| !child.is_extra())
-                    .is_some_and(|token| token.kind() == "get")
-                    && node
-                        .child_by_field_name("name")
-                        .is_some_and(|key| key.kind() == "property_identifier")
-                    && node
-                        .child_by_field_name("parameters")
-                        .is_some_and(|parameters| {
-                            let mut cursor = parameters.walk();
-                            parameters
-                                .named_children(&mut cursor)
-                                .all(|formal| formal.is_extra())
-                        })
-                    && module_call_argument_member(node)
-            }
-            "pair" => {
-                node.child_by_field_name("key")
-                    .is_some_and(|key| key.kind() == "property_identifier")
-                    && short_circuited_export_member(node, source)
-            }
-            _ => false,
-        })
+        module_object_members(
+            source,
+            limits,
+            selected.len(),
+            |root, node, range, source| {
+                if !selected.contains(&range) {
+                    return false;
+                }
+                match node.kind() {
+                    "method_definition" => {
+                        let mut cursor = node.walk();
+                        node.children(&mut cursor)
+                            .find(|child| !child.is_extra())
+                            .is_some_and(|token| token.kind() == "get")
+                            && node
+                                .child_by_field_name("name")
+                                .is_some_and(|key| key.kind() == "property_identifier")
+                            && node
+                                .child_by_field_name("parameters")
+                                .is_some_and(|parameters| {
+                                    let mut cursor = parameters.walk();
+                                    parameters
+                                        .named_children(&mut cursor)
+                                        .all(|formal| formal.is_extra())
+                                })
+                            && direct_argument_statement(node)
+                                .and_then(|statement| statement.parent())
+                                == Some(root)
+                    }
+                    "pair" => {
+                        node.child_by_field_name("key")
+                            .is_some_and(|key| key.kind() == "property_identifier")
+                            && short_circuited_export_member(node, source)
+                    }
+                    _ => false,
+                }
+            },
+        )
     }
 }
 
 fn module_object_members(
     source: &str,
     limits: SyntaxLimits,
-    selected: &BTreeSet<ByteRange>,
-    accepts: impl Fn(tree_sitter::Node<'_>, &str) -> bool,
+    selected: usize,
+    accepts: impl for<'tree> Fn(
+        tree_sitter::Node<'tree>,
+        tree_sitter::Node<'tree>,
+        ByteRange,
+        &str,
+    ) -> bool,
 ) -> BTreeSet<ByteRange> {
-    if selected.is_empty()
-        || selected.len() > limits.syntax_elements_max()
+    if selected == 0
+        || selected > limits.syntax_elements_max()
         || source.len() > limits.source_bytes_max()
     {
         return BTreeSet::new();
@@ -141,8 +183,7 @@ fn module_object_members(
         }
         if matches!(node.kind(), "pair" | "method_definition")
             && let Ok(range) = crate::extract::byte_range(node)
-            && selected.contains(&range)
-            && accepts(node, source)
+            && accepts(root, node, range, source)
         {
             accepted.insert(range);
         }
@@ -153,32 +194,59 @@ fn module_object_members(
     accepted
 }
 
-fn module_call_argument_member(node: tree_sitter::Node<'_>) -> bool {
-    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+fn direct_argument_statement(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let object = node.parent().filter(|parent| parent.kind() == "object")?;
+    let arguments = object
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let call = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")?;
+    if call
+        .child_by_field_name("function")
+        .is_none_or(|function| function.kind() != "identifier")
+        || call.child_by_field_name("arguments") != Some(arguments)
+        || call.child_by_field_name("optional_chain").is_some()
+    {
+        return None;
+    }
+    call.parent()
+        .filter(|statement| statement.kind() == "expression_statement")
+}
+
+fn sibling_argument_binding(
+    root: tree_sitter::Node<'_>,
+    property: tree_sitter::Node<'_>,
+    range: ByteRange,
+) -> bool {
+    let body = direct_argument_statement(property).and_then(|node| node.parent());
+    let Some(body) = body.filter(|body| {
+        body.kind() == "statement_block"
+            && body.parent().is_some_and(|function| {
+                matches!(
+                    function.kind(),
+                    "arrow_function" | "function_expression" | "function_declaration"
+                ) && function.child_by_field_name("body") == Some(*body)
+            })
+    }) else {
         return false;
     };
-    let Some(arguments) = object
-        .parent()
-        .filter(|parent| parent.kind() == "arguments")
+    let Some(binding) = usize::try_from(range.start)
+        .ok()
+        .zip(usize::try_from(range.end).ok())
+        .and_then(|(start, end)| root.named_descendant_for_byte_range(start, end))
+        .filter(|binding| crate::extract::byte_range(*binding).ok() == Some(range))
     else {
         return false;
     };
-    let Some(call) = arguments
-        .parent()
-        .filter(|parent| parent.kind() == "call_expression")
-    else {
-        return false;
+    let statement = match binding.kind() {
+        "class_declaration" => Some(binding),
+        "variable_declarator" => binding
+            .parent()
+            .filter(|node| matches!(node.kind(), "variable_declaration" | "lexical_declaration")),
+        _ => None,
     };
-    call.child_by_field_name("function")
-        .is_some_and(|function| function.kind() == "identifier")
-        && call.child_by_field_name("arguments") == Some(arguments)
-        && call.child_by_field_name("optional_chain").is_none()
-        && call.parent().is_some_and(|statement| {
-            statement.kind() == "expression_statement"
-                && statement
-                    .parent()
-                    .is_some_and(|root| root.kind() == "program")
-        })
+    statement.and_then(|statement| statement.parent()) == Some(body)
 }
 
 fn short_circuited_export_member(node: tree_sitter::Node<'_>, source: &str) -> bool {

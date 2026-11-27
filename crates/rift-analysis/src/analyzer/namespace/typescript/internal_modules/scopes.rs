@@ -318,17 +318,20 @@ impl<'source> FileScopes<'source> {
                 };
                 if !ordinary_private_property(property, file.source)
                     || property.syntax_element_kind != Some("pair")
-                    || property.container.is_some()
-                    || binding.container.is_some()
                     || !matches!(
                         binding.syntax_element_kind,
                         Some("class_declaration" | "variable_declarator")
                     )
                     || binding.is_ecmascript_package_binding()
-                    || self.lexical(binding, file.source) != self.source
                     || !bound.contains(&binding.name_range?)
-                    || written.contains(name)
+                    || written.contains(binding.name.as_str())
                     || !self.body_members.contains_key(&property.item_range)
+                {
+                    return None;
+                }
+                let nested = (self.lexical(binding, file.source) != self.source)
+                    .then_some(binding.item_range);
+                if nested.is_none() && (binding.container.is_some() || property.container.is_some())
                 {
                     return None;
                 }
@@ -336,18 +339,30 @@ impl<'source> FileScopes<'source> {
                     local_group_identity(anchors.get(name)?, property.declaration_ordinal)?;
                 Some((
                     property.item_range,
-                    (name, property.declaration_ordinal, identity),
+                    (name, property.declaration_ordinal, identity, nested),
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        let accepted = JavaScriptSyntaxProvider::module_call_argument_properties(
+        let limits = file.syntax.syntax_limits().unwrap_or_default();
+        let module = candidates
+            .iter()
+            .filter_map(|(&property, (_, _, _, binding))| binding.is_none().then_some(property))
+            .collect();
+        let nested = candidates
+            .iter()
+            .filter_map(|(&property, (_, _, _, binding))| {
+                binding.map(|binding| (property, binding))
+            })
+            .collect();
+        let accepted = JavaScriptSyntaxProvider::scoped_call_argument_properties(
             file.source,
-            file.syntax.syntax_limits().unwrap_or_default(),
-            &candidates.keys().copied().collect(),
+            limits,
+            &module,
+            &nested,
         );
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
         let mut physical = BTreeMap::new();
-        for (range, (name, ordinal, identity)) in candidates {
+        for (range, (name, ordinal, identity, _)) in candidates {
             if accepted.contains(&range) && occupied.insert(identity.clone()) {
                 repeated.remove(name);
                 physical.insert(name.to_owned(), BTreeMap::from([(ordinal, identity)]));

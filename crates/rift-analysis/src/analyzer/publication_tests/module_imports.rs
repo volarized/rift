@@ -1934,6 +1934,93 @@ fn assert_argument_collision_preserves_local_uses(
 }
 
 #[test]
+fn direct_function_body_arguments_keep_sibling_classes_and_written_members() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","exports":{".":{"import":"./entry.mjs","require":"./entry.js"}}}"#;
+    const CLASS: &str = "var Channel = class {
+  run(flag) {
+    let current = 1;
+    if (flag) { let current = 2; void (current + 4); }
+    void (current + 3);
+    return STATES.closed;
+  }
+};";
+    for (label, start, end) in [
+        ("arrow initializer", "var Bundle = (() => {", "})();"),
+        (
+            "function initializer",
+            "var Bundle = (function () {",
+            "})();",
+        ),
+        ("named function", "function Bundle() {", "}"),
+    ] {
+        for (statement, expected) in [
+            ("register(api, { Channel: () => Channel });", true),
+            (
+                "if (enabled) { register(api, { Channel: () => Channel }); }",
+                false,
+            ),
+            ("register(api, [{ Channel: () => Channel }]);", false),
+        ] {
+            let source = format!(
+                "{start}
+const api = {{}};
+function register() {{}}
+{statement}
+const STATES = {{ closed: 1 }};
+{CLASS}
+return api;
+{end}
+module.exports = Bundle;
+"
+            );
+            let result = fixture::package_result_with_metadata(
+                ShippedLanguage::JavaScript,
+                vec![
+                    ("entry.js", &source),
+                    ("entry.mjs", "export function anchor() { return 1; }"),
+                ],
+                None,
+                Some(("package.json", MANIFEST)),
+            )
+            .expect("both checked entries");
+            let publication = result.publication();
+            let declarations = &publication.declarations;
+            let item = module_runtime_range(
+                source.find(CLASS).expect("written class") + 4,
+                &CLASS[4..CLASS.len() - 1],
+            );
+            let binding = declarations.iter().find(|row| {
+                row.range == item
+                    && row.source_complete
+                    && row.symbol.as_str().ends_with("/Channel")
+            });
+            let property = "Channel: () => Channel";
+            let site = module_runtime_range(
+                source.find(property).expect("written argument property"),
+                property,
+            );
+            let paired = declarations.iter().find(|row| {
+                row.range == site
+                    && row.source_complete
+                    && row.symbol.as_str().contains("/Channel%23")
+            });
+            assert_eq!(binding.is_some(), expected, "{label}: {statement}");
+            assert_eq!(paired.is_some(), expected, "{label}: {statement}");
+            if let (Some(binding), Some(paired)) = (binding, paired) {
+                assert_eq!(binding.unit, paired.unit);
+                let method = declarations
+                    .iter()
+                    .find(|row| {
+                        row.unit == binding.unit && row.symbol.as_str().ends_with("/Channel/run")
+                    })
+                    .expect("the restored class owns its written method");
+                assert_argument_collision_preserves_local_uses(publication, &source, method, label);
+            }
+        }
+    }
+}
+
+#[test]
 fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
     let analysis = fixture::package_result_with_metadata(
         ShippedLanguage::JavaScript,
