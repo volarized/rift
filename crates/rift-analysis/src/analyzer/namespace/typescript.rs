@@ -860,10 +860,114 @@ struct PackageMetadata {
     main: Option<String>,
     module: Option<String>,
     exports: Option<Exports>,
+    imports: Option<CapturedPackageImports>,
     #[serde(rename = "typesVersions")]
     types_versions: Option<serde_json::Value>,
     #[serde(rename = "type")]
     module_type: Option<String>,
+}
+
+/// Import targets selected in the same declared condition order as package exports.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CapturedPackageImports {
+    Routes(OrderedConditions),
+    Unresolved(de::IgnoredAny),
+}
+
+type ImportTargets = [[Option<String>; 2]; 2];
+
+struct PackageImportPattern {
+    prefix: String,
+    suffix: String,
+    targets: ImportTargets,
+}
+
+/// The captured package's own import aliases. No alias leaves this package.
+pub(crate) struct PackageImports {
+    exact: BTreeMap<String, ImportTargets>,
+    patterns: Vec<PackageImportPattern>,
+}
+
+impl PackageImports {
+    pub(crate) fn captured(input: &NamespaceInput<'_>) -> Option<Self> {
+        let CapturedPackageImports::Routes(routes) = captured_metadata(input)?.imports? else {
+            return None;
+        };
+        let mut exact = BTreeMap::new();
+        let mut patterns = Vec::new();
+        for (key, target) in routes.0 {
+            let Some(name) = key.strip_prefix('#') else {
+                continue;
+            };
+            let targets = ["javascript", "typescript"].map(|language| {
+                [Loader::Module, Loader::CommonJs].map(|loader| {
+                    target
+                        .selected_target(
+                            language == "typescript",
+                            consumer_conditions(language, loader),
+                        )
+                        .map(str::to_owned)
+                })
+            });
+            if let Some((prefix, suffix)) = name.split_once('*') {
+                if !suffix.contains('*') && export_subpath_is_valid(&format!("{prefix}x{suffix}")) {
+                    patterns.push(PackageImportPattern {
+                        prefix: format!("#{prefix}"),
+                        suffix: suffix.to_owned(),
+                        targets,
+                    });
+                }
+            } else if export_subpath_is_valid(name) {
+                exact.insert(key, targets);
+            }
+        }
+        patterns.sort_by_key(|pattern| {
+            std::cmp::Reverse((
+                pattern.prefix.len(),
+                pattern.prefix.len() + pattern.suffix.len(),
+            ))
+        });
+        Some(Self { exact, patterns })
+    }
+
+    pub(crate) fn destination(
+        &self,
+        specifier: &str,
+        typescript: bool,
+        require: bool,
+        mut charge: impl FnMut() -> bool,
+    ) -> Option<ProjectPath> {
+        if !charge() || !export_subpath_is_valid(specifier.strip_prefix('#')?) {
+            return None;
+        }
+        let chosen = |targets: &ImportTargets| {
+            targets[usize::from(typescript)][usize::from(require)].clone()
+        };
+        let path = if let Some(targets) = self.exact.get(specifier) {
+            chosen(targets)?
+        } else {
+            let mut selected = None;
+            for pattern in &self.patterns {
+                if !charge() {
+                    return None;
+                }
+                if let Some(matched) = specifier
+                    .strip_prefix(&pattern.prefix)
+                    .and_then(|suffix| suffix.strip_suffix(&pattern.suffix))
+                    .filter(|matched| !matched.is_empty())
+                {
+                    selected = Some(chosen(&pattern.targets)?.replace('*', matched));
+                    break;
+                }
+            }
+            selected?
+        };
+        let path = path.strip_prefix("./")?;
+        export_subpath_is_valid(path)
+            .then(|| ProjectPath::new(path).ok())
+            .flatten()
+    }
 }
 
 #[derive(Deserialize)]

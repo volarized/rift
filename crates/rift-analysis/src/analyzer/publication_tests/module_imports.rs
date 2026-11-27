@@ -5063,3 +5063,111 @@ fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildca
         );
     }
 }
+
+#[test]
+fn npm_package_imports_keep_runtime_calls_and_declared_type_ranges() {
+    const RUNTIME: &str = "import { Flags, select } from '#items/state';\nexport function run() { return select(Flags.enabled); }\n";
+    const TYPES: &str = "import type { State } from '#items/state';\nexport declare function run(state: State): State;\n";
+    const TARGET: &str =
+        "export const Flags = { enabled: 1 };\nexport function select(value) { return value; }\n";
+    const DECLARATIONS: &str = concat!(
+        "export interface State { enabled: number }\n",
+        "export declare const Flags: State;\n",
+        "export declare function select(value: number): number;\n",
+    );
+    for (imports, javascript, typescript) in [
+        (
+            r##""#items/*":{"types":"./types/*.d.ts","default":"./runtime/*.js"}"##,
+            true,
+            true,
+        ),
+        (
+            r##""#items/state":null,"#items/*":{"types":"./types/*.d.ts","default":"./runtime/*.js"}"##,
+            false,
+            false,
+        ),
+        (r##""#items/*":{"browser":"./runtime/*.js"}"##, false, false),
+        (r##""#items/*":"../runtime/*.js""##, false, false),
+        (
+            r##""#items/*":{"types":"./types/*.d.ts","default":"./runtime/*.js"},"#items/state":"./unknown.js""##,
+            false,
+            false,
+        ),
+    ] {
+        let manifest = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","exports":{{".":{{"types":"./index.d.ts","default":"./index.js"}}}},"imports":{{{imports}}}}}"#
+        );
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.js", RUNTIME),
+                ("index.d.ts", TYPES),
+                ("runtime/state.js", TARGET),
+                ("types/state.d.ts", DECLARATIONS),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked package files");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let origin = |path| {
+            &publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path)
+                .expect("retained source")
+                .unit
+        };
+        let written = |source: &str, marker: &str, token: &str| {
+            let start = source.find(marker).expect("written use");
+            module_runtime_range(start, token)
+        };
+        let calls = |target, range, unit| {
+            publication.edges.iter().any(|row| {
+                row.kinds == [EdgeKind::Calls]
+                    && row.to.as_str().ends_with(target)
+                    && row
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| &site.unit == unit && site.range == range)
+            })
+        };
+        assert_eq!(
+            calls(
+                "runtime%2Fstate.js/select",
+                written(RUNTIME, "select(Flags.enabled)", "select(Flags.enabled)"),
+                origin("index.js"),
+            ),
+            javascript,
+            "{manifest}",
+        );
+        assert_eq!(
+            publication.edges.iter().any(|row| {
+                row.kinds == [EdgeKind::Reads]
+                    && row.to.as_str().ends_with("runtime%2Fstate.js/Flags")
+                    && row.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == origin("index.js")
+                            && site.range == written(RUNTIME, "Flags.enabled", "Flags")
+                    })
+            }),
+            javascript,
+            "{manifest}",
+        );
+        let type_uses = publication
+            .edges
+            .iter()
+            .filter(|row| {
+                row.kinds == [EdgeKind::HasType]
+                    && row.to.as_str().ends_with("types%2Fstate.d.ts/State")
+                    && row.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == origin("index.d.ts")
+                            && site.range.start
+                                >= u64::try_from(TYPES.find("run(").expect("function"))
+                                    .expect("source range")
+                    })
+            })
+            .count();
+        assert_eq!(type_uses, usize::from(typescript) * 2, "{manifest}");
+    }
+}

@@ -54,6 +54,9 @@ impl<'source> Exports<'_, 'source> {
         module: &str,
         work: &mut Work,
     ) -> Option<&File<'source>> {
+        if module.starts_with('#') {
+            return package_import_file(self.files, self.modes, from, module, false, work);
+        }
         let from_path = from.document.path.as_str();
         let path = relative_path(from_path, module, work)?;
         if is_declaration_file(from_path) {
@@ -87,7 +90,8 @@ impl<'source> Exports<'_, 'source> {
         let imported = self.imported(from, module, work);
         let from = from.document.path.as_str();
         let (name, _) = split_name(name);
-        if !is_declaration_file(from)
+        if module.starts_with('#')
+            || !is_declaration_file(from)
             || imported.is_some_and(|imported| self.declares(imported, name, work))
         {
             return imported;
@@ -712,6 +716,33 @@ fn names_source(module: &str) -> bool {
         && std::path::Path::new(module)
             .extension()
             .is_none_or(|extension| matches!(extension.to_str(), Some("js" | "cjs" | "mjs")))
+}
+
+/// Resolves a checked package import alias under its own manifest. A declaration
+/// consumer can use typed source substitution, while runtime reads keep the selected file.
+pub(super) fn package_import_file<'index, 'source>(
+    files: &'index BTreeMap<&'source str, File<'source>>,
+    modes: &PackageModes<'source>,
+    from: &File<'source>,
+    specifier: &str,
+    require: bool,
+    work: &mut Work,
+) -> Option<&'index File<'source>> {
+    let typescript = from.document.facts.language().name == "typescript";
+    let current = from.document.path.as_str();
+    if !typescript && !require && modes.mode(current, work) == ModuleMode::CommonJs {
+        return None;
+    }
+    let path = modes.import_alias(current, specifier, typescript, require, work)?;
+    let path = path.as_str();
+    if typescript && let Some(typed) = declared_file(files, modes, path) {
+        typed.document.placement.logical_identity(".")?;
+        return Some(typed);
+    }
+    files.get(path).filter(|file| {
+        file.document.facts.language().name == "javascript"
+            && file.document.placement.logical_identity(".").is_some()
+    })
 }
 
 /// Whether the file declares types alone.

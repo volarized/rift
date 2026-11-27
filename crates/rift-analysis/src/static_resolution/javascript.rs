@@ -11,7 +11,9 @@ use rift_syntax::{
 
 use super::{Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work};
 use crate::NamespaceInput;
-use crate::analyzer::namespace::typescript::{PackageFiles, nested_runtime_candidates};
+use crate::analyzer::namespace::typescript::{
+    PackageFiles, PackageImports, nested_runtime_candidates,
+};
 
 /// A member site awaiting proof of its receiver's call-result assignment.
 #[derive(Debug)]
@@ -36,6 +38,7 @@ pub(super) struct PackageModes<'source> {
     /// What the manifest of each folder names for a specifier of the folder.
     folders: BTreeMap<String, Folder>,
     module_syntax: std::collections::BTreeSet<&'source str>,
+    imports: Option<PackageImports>,
     pub(super) owner: rift_protocol::identity::SymbolOwner,
     pub(super) scopes: BTreeMap<&'source str, Scopes<'source>>,
 }
@@ -132,6 +135,7 @@ impl<'source> PackageModes<'source> {
             modes,
             folders,
             module_syntax,
+            imports: PackageImports::captured(namespace),
             owner: namespace.owner().clone(),
             scopes,
         })
@@ -140,6 +144,24 @@ impl<'source> PackageModes<'source> {
     /// What the manifest of a folder names, or `None` for a folder without one.
     pub(super) fn folder(&self, directory: &str) -> Option<&Folder> {
         self.folders.get(directory)
+    }
+
+    /// The root imports map applies only to sources within the root manifest's own scope.
+    pub(super) fn import_alias(
+        &self,
+        from: &str,
+        specifier: &str,
+        typescript: bool,
+        require: bool,
+        work: &mut Work,
+    ) -> Option<rift_core::ProjectPath> {
+        let imports = self.imports.as_ref()?;
+        for (end, _) in from.rmatch_indices('/') {
+            if !work.charge() || self.folders.contains_key(&from[..end]) {
+                return None;
+            }
+        }
+        imports.destination(specifier, typescript, require, || work.charge())
     }
 
     pub(super) fn mode(&self, path: &str, work: &mut Work) -> ModuleMode {

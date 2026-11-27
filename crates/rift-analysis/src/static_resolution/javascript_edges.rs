@@ -989,7 +989,18 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<&File<'source>> {
         let current = file.document.path.as_str();
-        let path = javascript_exports::relative_path(current, file.text(module)?, work)?;
+        let specifier = file.text(module)?;
+        if specifier.starts_with('#') {
+            return javascript_exports::package_import_file(
+                &self.files,
+                &self.javascript,
+                file,
+                specifier,
+                require,
+                work,
+            );
+        }
+        let path = javascript_exports::relative_path(current, specifier, work)?;
         let declaration_only = javascript_exports::is_declaration_file(current);
         let imported = if declaration_only {
             javascript_exports::declared_file(&self.files, &self.javascript, &path)
