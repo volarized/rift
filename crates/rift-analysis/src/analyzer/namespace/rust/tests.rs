@@ -4592,6 +4592,42 @@ fn rust_captured_predicate_keeps_macro_scope_after_a_checked_sibling_glob() {
     }
 }
 
+#[test]
+fn rust_captured_predicate_keeps_scope_across_an_ordinary_extern_crate() {
+    let first = GUARDED_INVOCATION.replace(
+        "pub mod chosen;",
+        "pub mod chosen; pub use self::chosen::*;",
+    );
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let branch = format!("{first}{next}");
+    let plain = "extern crate alloc;";
+    let macro_import = "#[macro_use] extern crate alloc;";
+    let conditional_import = "#[cfg_attr(feature = \"checked\", macro_use)] extern crate alloc;";
+    for (label, parent_extern, child_extern, expected) in [
+        ("no extern", "", "", true),
+        ("parent extern", plain, "", true),
+        ("sibling extern", "", plain, true),
+        ("both externs", plain, plain, true),
+        ("parent macro import", macro_import, "", false),
+        ("sibling macro import", "", macro_import, false),
+        ("conditional macro import", conditional_import, "", false),
+    ] {
+        let root = format!("{parent_extern} {GUARDED_MACRO} pub mod branch; pub mod direct;");
+        let chosen = format!("{child_extern} #[derive(Debug)] pub struct Marker;\n{GUARDED_CHILD}");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", &chosen),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,

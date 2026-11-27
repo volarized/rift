@@ -11,6 +11,7 @@ type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> 
 
 pub(super) struct Tokens<'a> {
     rows: Vec<(ByteRange, &'a str)>,
+    facts: Option<&'a rift_syntax::StaticFacts>,
     bindings: BTreeSet<String>,
     pub(super) complete: bool,
     depth: usize,
@@ -41,6 +42,7 @@ impl<'a> Tokens<'a> {
         }
         let mut result = Self {
             rows,
+            facts: file.syntax.static_facts(),
             bindings: BTreeSet::new(),
             complete: true,
             depth: limits.syntax_depth_max(),
@@ -107,6 +109,9 @@ impl<'a> Tokens<'a> {
                 continue;
             }
             let input = self.range(range)?;
+            if self.ordinary_extern_crate(range, &input) {
+                continue;
+            }
             if super::invocation_name(child.source, range) == Some(name) {
                 let body = super::chain::invocation_body(&input)?;
                 let (predicate, body) = super::chain::captured_predicate_body(body)?;
@@ -173,7 +178,31 @@ impl<'a> Tokens<'a> {
 
     fn names(&mut self, range: ByteRange) -> Option<()> {
         let tokens = self.range(range)?;
+        if self.ordinary_extern_crate(range, &tokens) {
+            return Some(());
+        }
         self.names_tokens(&tokens)
+    }
+
+    fn ordinary_extern_crate(&self, range: ByteRange, mut input: &[&str]) -> bool {
+        if visibility(&mut input).is_none()
+            || !consume(&mut input, &["extern", "crate"])
+            || identifier(&mut input).is_none()
+            || input != [";"]
+        {
+            return false;
+        }
+        let Some(facts) = self.facts else {
+            return false;
+        };
+        let barriers = facts.rust_macro_barriers();
+        let conditions = facts.conditional_items();
+        // Outer attributes occupy separate syntax ranges. Check the bound
+        // item ranges before treating the declaration as macro-inert.
+        self.charge(barriers.len().saturating_add(conditions.len()))
+            .is_some()
+            && !barriers.iter().any(|(item, _)| *item == range)
+            && !conditions.iter().any(|item| item.range == range)
     }
 
     fn invocation_names(&mut self, range: ByteRange, captured: Option<&str>) -> Option<()> {
@@ -345,6 +374,9 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
+        if self.ordinary_extern_crate(range, &tokens) {
+            return Some(());
+        }
         self.item_tokens(&tokens, scope, library, self.depth, true, &mut None)
     }
 
@@ -658,6 +690,9 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn effects(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
+        if self.ordinary_extern_crate(range, &tokens) {
+            return Some(());
+        }
         self.item_tokens(&tokens, scope, library, self.depth, false, &mut None)
     }
 
@@ -1255,7 +1290,8 @@ mod tests {
     fn complete_derive_proof_refuses_glob_unknown_later_and_qualified_names() {
         for source in [
             "use other::*;",
-            "extern crate other;",
+            "#[macro_use] extern crate other;",
+            "extern crate other as alias;",
             "#[custom] struct Neighbor;",
             "#[derive(Debug)] struct Neighbor; use other::Debug;",
         ] {
