@@ -12,8 +12,8 @@ use super::{
     StaticParameter, StaticReexport, StaticReference, binding, call, enclosing, field, identifier,
     kind,
 };
-use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
+use crate::{ByteRange, SyntaxLimits};
 
 mod documentation;
 mod member_callbacks;
@@ -181,6 +181,58 @@ impl TypeShapeKinds {
 pub(super) fn kinds() -> &'static Kinds {
     static KINDS: OnceLock<Kinds> = OnceLock::new();
     KINDS.get_or_init(|| Kinds::resolve_edge(&crate::javascript::javascript_grammar()))
+}
+
+pub(super) fn checked_argument_require_ranges(
+    source: &str,
+    limits: SyntaxLimits,
+    mut ranges: BTreeSet<ByteRange>,
+) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    if source.len() > limits.source_bytes_max() {
+        return false;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&crate::javascript::javascript_grammar())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let kinds = kinds();
+    let mut pending = vec![(root, 0_usize)];
+    let mut cursor = root.walk();
+    let mut visited = 0_usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if depth > limits.syntax_depth_max()
+            || visited
+                .saturating_add(pending.len())
+                .saturating_add(node.named_child_count())
+                > limits.syntax_elements_max()
+        {
+            return false;
+        }
+        if node.kind_id() == kinds.call
+            && let Ok(range) = byte_range(node)
+            && ranges.contains(&range)
+            && kinds
+                .argument_require(node, source)
+                .is_ok_and(|checked| checked)
+        {
+            ranges.remove(&range);
+        }
+        crate::extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+            (child, depth + 1)
+        });
+    }
+    ranges.is_empty()
 }
 
 pub(super) fn edge_typescript_kinds(
@@ -715,6 +767,17 @@ impl Kinds {
     ) -> Visited<'walk, 'tree> {
         if holder.syntax_element().kind() != "array" {
             return holder;
+        }
+        if let Some(arguments) = holder.parent().filter(|arguments| {
+            let node = arguments.syntax_element();
+            node.kind() == "arguments"
+                && arguments.parent().is_some_and(|parent| {
+                    let call = parent.syntax_element();
+                    call.kind() == "call_expression"
+                        && call.child_by_field_name("arguments") == Some(node)
+                })
+        }) {
+            return arguments;
         }
         let mut array = holder;
         while let Some(parent) = array
@@ -1568,7 +1631,55 @@ impl Kinds {
             self.member(callee)?
         };
         facts.calls.push(call(syntax_element, callee, shape)?);
+        if self.type_identifier.is_none()
+            && shape == StaticCallee::Direct
+            && text(callee, source) == Some("require")
+            && self.argument_require(syntax_element, source)?
+        {
+            // Keep the call range for the checked binding join. Module statements
+            // retain their literal's interior in the same reference carrier.
+            facts.references.push(StaticReference {
+                target: byte_range(syntax_element)?,
+                role: rift_core::ReferenceRole::Import,
+            });
+        }
         Ok(())
+    }
+
+    /// Whether a call is the direct literal require argument of another call.
+    fn argument_require(&self, syntax_element: Node<'_>, source: &str) -> Result<bool, RiftError> {
+        let named_require = syntax_element
+            .child_by_field_id(self.callee)
+            .is_some_and(|callee| {
+                callee.kind_id() == self.identifier && text(callee, source) == Some("require")
+            });
+        let Some(arguments) = syntax_element.parent() else {
+            return Ok(false);
+        };
+        let Some(outer) = arguments.parent() else {
+            return Ok(false);
+        };
+        if !named_require
+            || outer.kind_id() != self.call
+            || outer.child_by_field_id(self.arguments) != Some(arguments)
+            || outer.child_by_field_name("optional_chain").is_some()
+            || outer.has_error()
+            || syntax_element
+                .child_by_field_name("optional_chain")
+                .is_some()
+        {
+            return Ok(false);
+        }
+        if let Some(inner) = syntax_element.child_by_field_id(self.arguments)
+            && inner.named_child_count() == 1
+            && let Some(literal) = inner.named_child(0)
+            && self.literal(literal, source)?.is_some()
+            && let Some(path) = text(literal, source).and_then(|quoted| quoted.get(1..))
+            && (path.starts_with("./") || path.starts_with("../"))
+        {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {

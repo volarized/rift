@@ -4,6 +4,175 @@ use super::*;
 use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
+#[test]
+fn checked_commonjs_export_object_values_keep_their_literal_imports() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.cjs"}"#;
+    const SOURCE: &str = concat!(
+        "const stable = require('./stable.cjs');\n",
+        "module.exports = { part: require( './leaf.cjs' ), stable };\n"
+    );
+    let collect = |source| {
+        internal_modules::analyze(
+            MANIFEST,
+            &[
+                ("index.cjs", source),
+                (
+                    "leaf.cjs",
+                    "exports.convert = function convert(value) { return value + 1; };",
+                ),
+                (
+                    "stable.cjs",
+                    "exports.stable = function stable(value) { return value + 1; };",
+                ),
+            ],
+        )
+    };
+    let supported = collect(SOURCE);
+    let publication = supported.publication();
+    let source_module = publication
+        .declarations
+        .iter()
+        .find(|row| row.source_complete && row.source == SOURCE)
+        .expect("complete module source owner");
+
+    let edges = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Imports]);
+    for specifier in ["'./leaf.cjs'", "'./stable.cjs'"] {
+        let offset = SOURCE.find(specifier).expect("written specifier");
+        assert!(
+            edges.clone().any(|edge| {
+                let Some(occurrence) = &edge.occurrence else {
+                    return false;
+                };
+                occurrence.range == module_runtime_range(offset, specifier)
+                    && edge.from == source_module.symbol
+                    && publication
+                        .units
+                        .iter()
+                        .any(|unit| unit.unit == occurrence.unit && unit.path.0 == "index.cjs")
+                    && edge
+                        .to
+                        .as_str()
+                        .ends_with(specifier.trim_matches('\'').trim_start_matches("./"))
+            }),
+            "missing import at {specifier}"
+        );
+    }
+    for source in [
+        "module.exports = { part: require('./missing.cjs') };",
+        "const specifier = './leaf.cjs'; module.exports = { part: require(specifier) };",
+        "const require = () => ({}); module.exports = { part: require('./leaf.cjs') };",
+        "module.exports = { part: require('./leaf.cjs', sideEffect()) };",
+        "module.exports = make({ part: require('./leaf.cjs') });",
+    ] {
+        let unsupported = collect(source);
+        assert!(
+            unsupported.publication().edges.iter().all(|edge| {
+                !edge.kinds.contains(&EdgeKind::Imports) || !edge.to.as_str().ends_with("leaf.cjs")
+            }),
+            "unproved import in {source}"
+        );
+    }
+}
+
+#[test]
+fn typescript_selectors_reference_uniquely_imported_declarations() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const LEAF: &str =
+        "export interface Source { mode: string; }\nexport declare function prepare(): Source;\n";
+    const SOURCE: &str = concat!(
+        "import { Source as Local, prepare } from './leaf';\n",
+        "export { Local as Public, prepare };\n",
+        "export type { Local as Typed };\n"
+    );
+    let collect = |source| {
+        internal_modules::analyze(MANIFEST, &[("index.d.ts", source), ("leaf.d.ts", LEAF)])
+    };
+    let found = collect(SOURCE);
+    let publication = found.publication();
+    let source = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("original unit");
+    let complete_owner = publication
+        .declarations
+        .iter()
+        .find(|row| row.unit == source.unit && row.source_complete && row.source == SOURCE)
+        .expect("complete checked type entry");
+    let selectors = [
+        (
+            SOURCE.find("Local as Public").expect("renamed selector"),
+            "Local",
+            "/Source",
+        ),
+        (
+            SOURCE.find("prepare };").expect("value selector"),
+            "prepare",
+            "/prepare",
+        ),
+        (
+            SOURCE.find("Local as Typed").expect("type selector"),
+            "Local",
+            "/Source",
+        ),
+    ];
+    for (offset, name, target) in selectors {
+        let range = module_runtime_range(offset, name);
+        assert!(
+            publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds == [EdgeKind::References]
+                    && edge.from == complete_owner.symbol
+                    && edge.to.as_str().ends_with(target)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|occurrence| occurrence.unit == source.unit
+                            && occurrence.range == range)),
+            "missing imported selector {name}"
+        );
+    }
+    for (offset, name) in [
+        (SOURCE.find("Local").expect("written import"), "Local"),
+        (SOURCE.find("prepare").expect("named import"), "prepare"),
+    ] {
+        let range = module_runtime_range(offset, name);
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == source.unit && site.range == range)
+        }));
+    }
+    assert!(
+        publication
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Aliases]
+                && edge.from.as_str().ends_with("/Public")
+                && edge.to.as_str().ends_with("/Source"))
+    );
+    for source in [
+        "import { Source as Local } from './missing'; export { Local as Public };",
+        "import * as Local from './leaf'; export { Local as Public };",
+    ] {
+        let unresolved = collect(source);
+        assert!(
+            unresolved
+                .publication()
+                .edges
+                .iter()
+                .all(|edge| edge.kinds != [EdgeKind::References])
+        );
+    }
+}
+
 const NON_ENTRY_ARGUMENT_PROPERTIES: &str = r#"
 import { receive } from "../index.mjs";
 receive({ action: "first" });
@@ -1911,6 +2080,128 @@ fn package_keeps_initializer_properties_under_their_physical_lexical_bindings() 
             .symbol
             .as_str()
             .ends_with("/initialize/named/code")
+    );
+}
+
+#[test]
+fn non_entry_literal_properties_keep_uniquely_named_descendants() {
+    const SOURCE: &str = concat!(
+        "function receive(value) { return value; }\n",
+        "receive({ details: { first: { score: 1 }, shared: 2 } });\n",
+        "receive({ details: { second: { score: 3 }, shared: 4 } });\n",
+        "const ordinary = { details: { existing: 5 } };\n",
+        "export const marker = ordinary;\n",
+    );
+    let analyzed = non_entry_lexical_binding_analysis(SOURCE, 96);
+    let graph = analyzed.publication();
+    graph.validate_facts().expect("checked owner paths");
+    let declaration = |written: &str| {
+        let start = SOURCE.find(written).expect("written member");
+        graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical property")
+    };
+    let mut owners = BTreeSet::new();
+    for (details, child, leaf, kept) in [
+        (
+            "details: { first: { score: 1 }, shared: 2 }",
+            "first: { score: 1 }",
+            "score: 1",
+            "shared: 2",
+        ),
+        (
+            "details: { second: { score: 3 }, shared: 4 }",
+            "second: { score: 3 }",
+            "score: 3",
+            "shared: 4",
+        ),
+    ] {
+        let [details, child, leaf, kept] = [details, child, leaf, kept].map(declaration);
+        assert!(owners.insert(&details.symbol));
+        for (parent, member) in [(details, child), (details, kept), (child, leaf)] {
+            assert_eq!(parent.unit, member.unit);
+            assert!(graph.objects.iter().any(|row| {
+                row.id.as_ref() == Some(&member.symbol)
+                    && row.container.as_ref() == Some(&parent.symbol)
+            }));
+        }
+    }
+    assert!(
+        declaration("existing: 5")
+            .symbol
+            .as_str()
+            .ends_with("/ordinary/details/existing")
+    );
+    let limited = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(limited.publication().declarations, graph.declarations);
+    assert!(
+        limited
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| graph.edges.contains(edge))
+    );
+}
+
+#[test]
+fn object_elements_of_a_written_call_array_keep_distinct_property_declarations() {
+    const SOURCE: &str = concat!(
+        "function keep(label, value) { return value; }\n",
+        "export function build(key) {\n",
+        "  keep('slots', [{ tag: 'first' }, { tag: 'second' }]);\n",
+        "  const rows = [{ tag: 'third' }, { tag: 'fourth' }];\n",
+        "  keep('control', rows);\n",
+        "  keep('computed', [{ [key]: 'other' }]);\n",
+        "}\n",
+    );
+    let analyzed = non_entry_lexical_binding_analysis(SOURCE, 128);
+    let graph = analyzed.publication();
+    graph.validate_facts().expect("written call array");
+    let mut seen = BTreeSet::new();
+    for value in ["first", "second", "third", "fourth"] {
+        let written = format!("tag: '{value}'");
+        let start = SOURCE.find(&written).expect("authored array slot");
+        let declaration = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, &written))
+            .expect("checked property declaration");
+        assert!(seen.insert(&declaration.symbol));
+    }
+    let computed = "[key]: 'other'";
+    let computed_start = SOURCE.find(computed).expect("written computed property");
+    let mut computed_rows = graph
+        .declarations
+        .iter()
+        .filter(|row| row.source == computed);
+    let retained = computed_rows.next().expect("existing computed property");
+    assert!(computed_rows.next().is_none());
+    assert!(retained.symbol.as_str().ends_with("/build/%5Bkey%5D"));
+    assert_eq!(
+        retained.range,
+        module_runtime_range(computed_start, computed)
+    );
+    let call = "keep('slots', [{ tag: 'first' }, { tag: 'second' }])";
+    let start = SOURCE.find(call).expect("written array call");
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/build")
+            && edge.to.as_str().ends_with("/keep")
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.range == module_runtime_range(start, call)
+                    && site.unit.0.ends_with("/reader.mjs")
+            })
+    }));
+    let capped = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(capped.publication().declarations, graph.declarations);
+    assert!(
+        capped
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| graph.edges.contains(edge))
     );
 }
 
@@ -5756,4 +6047,158 @@ fn assert_callback_reads_preserve_prior_records_at_the_cap(
     assert_eq!(records.edges, prior_edges);
     assert_eq!(records.objects, prior_objects);
     assert_eq!(records.declarations, prior_declarations);
+}
+
+#[test]
+fn typescript_reexport_only_declaration_files_keep_their_module_imports() {
+    const BARREL: &str = "export * from './leaf.js';\nexport * from './absent.js';\n";
+    const LEGACY: &str = "declare interface LocalOnly { value: number }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.js", "export const runtime = true;\n"),
+            ("index.d.ts", "export * from './branch/index.js';\n"),
+            ("branch/index.d.ts", BARREL),
+            ("branch/leaf.d.ts", "export interface Reader { value: number }\n"),
+            ("branch/leaf.js", "export const source = 1;\n"),
+            ("branch/legacy.d.ts", LEGACY),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("written declaration barrel");
+    let found = analysis.publication();
+    found.validate_facts().expect("checked typescript module");
+    let owner_suffix = "/typescript/beacon%2Fbranch%2Findex.d.ts";
+    let module = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with(owner_suffix) && row.source == BARREL)
+        .expect("complete declaration barrel owner");
+    let literal = "'./leaf.js'";
+    let occurrence = module_runtime_range(BARREL.find(literal).expect("specifier"), literal);
+    assert!(found.edges.iter().any(|edge| {
+        edge.from == module.symbol
+            && edge.kinds == [EdgeKind::Imports]
+            && edge
+                .to
+                .as_str()
+                .ends_with("/typescript/beacon%2Fbranch%2Fleaf.d.ts")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == module.unit && site.range == occurrence)
+    }));
+    assert!(found.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Aliases]
+            && edge.from.as_str().ends_with("index.d.ts/Reader")
+            && edge.to.as_str().ends_with("leaf.d.ts/Reader")
+    }));
+    assert!(found.declarations.iter().all(|row| row.source != LEGACY));
+    let missing = "'./absent.js'";
+    let missing = module_runtime_range(BARREL.find(missing).expect("missing specifier"), missing);
+    assert!(
+        found
+            .edges
+            .iter()
+            .filter(|edge| edge.from == module.symbol)
+            .all(|edge| {
+                !edge.to.as_str().ends_with("leaf.js")
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_none_or(|site| site.unit != module.unit || site.range != missing)
+            })
+    );
+}
+
+#[test]
+fn checked_commonjs_literals_as_direct_call_arguments_keep_module_imports() {
+    const SOURCE: &str = concat!(
+        "const established = require('./leaf');\n",
+        "function wrap(value) { return value; }\n",
+        "const wrapped = wrap(require('./leaf'));\n",
+        "wrap(require('./leaf'));\n",
+        "wrap(wrap(require('./leaf')));\n",
+        "wrap?.(require('./leaf'));\n",
+        "wrap(require('./leaf', 1));\n",
+        "wrap(require('./le' + 'af'));\n",
+        "wrap(require('./missing'));\n",
+        "wrap([require('./leaf')]);\n",
+        "function shadow(require) { return wrap(require('./leaf')); }\n",
+        "exports.established = established;\n",
+        "exports.wrapped = wrapped;\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const TARGET: &str = "exports.leaf = function leaf() { return 1; };\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE), ("leaf.js", TARGET)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked CommonJS source");
+    let (found, _, semantics, _) = analysis.into_parts();
+    found.validate_facts().expect("valid written imports");
+    let modules = |text| {
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source_complete && row.source == text)
+            .expect("complete physical module")
+    };
+    let entry = modules(SOURCE);
+    let target = modules(TARGET);
+    let quoted = SOURCE
+        .match_indices("'./leaf'")
+        .map(|(start, text)| {
+            let start = u64::try_from(start).expect("bounded fixture offset");
+            let size = u64::try_from(text.len()).expect("bounded literal");
+            TextRange {
+                start,
+                end: start + size,
+            }
+        })
+        .collect::<Vec<_>>();
+    let imports = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.from == entry.symbol
+            && edge.to == target.symbol
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == entry.unit)
+    };
+    let mut written = found
+        .edges
+        .iter()
+        .filter(|edge| imports(edge))
+        .filter_map(|edge| edge.occurrence.as_ref().map(|site| site.range.clone()))
+        .collect::<Vec<_>>();
+    written.sort_by_key(|site| (site.start, site.end));
+    assert_eq!(written, quoted[..4]);
+    let mut records = Records {
+        units: found.units.clone(),
+        objects: found.objects.clone(),
+        declarations: found.declarations.clone(),
+        edges: found
+            .edges
+            .into_iter()
+            .filter(|edge| {
+                !imports(edge)
+                    || edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range == quoted[0])
+            })
+            .collect(),
+        ..Records::default()
+    };
+    let earlier = records.edges.clone();
+    records.retain_commonjs_argument_imports(&semantics, earlier.len());
+    assert_eq!(records.edges, earlier, "incumbent capacity");
 }

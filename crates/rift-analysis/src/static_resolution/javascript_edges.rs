@@ -1,16 +1,19 @@
 //! ECMAScript containment, access, type usage, and override facts.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rift_core::{ReferenceRole, SourceLocation, SourceRange, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    ByteRange, StaticBinding, StaticBindingKind, StaticReference, SyntaxExportBinding,
-    SyntaxExportKind, SyntaxSymbol,
+    ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticReference,
+    SyntaxExportBinding, SyntaxExportKind, SyntaxSource, SyntaxSymbol, TypeScriptDialect,
+    TypeScriptSyntaxProvider,
 };
 
 use super::javascript::{AssignedMemberSite, MemberMode, ModuleMode, js_binding};
-use super::javascript_exports::{self, matches_export_form};
+use super::javascript_exports::{self, is_declaration_file, matches_export_form};
 use super::javascript_parameters::ParameterReads;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
@@ -31,7 +34,8 @@ impl<'source> Index<'source> {
                 if !work.charge() {
                     break 'files;
                 }
-                if let Some(reference) = self.typescript_local_export_reference(file, export, work)
+                if let Some((reference, _)) =
+                    self.typescript_local_export_reference(file, export, work)
                 {
                     result.record(Some(reference));
                 }
@@ -40,12 +44,67 @@ impl<'source> Index<'source> {
         result.typescript_local_export_start = (result.occurrences.len() != start).then_some(start);
     }
 
+    /// Checks local selectors independently in declaration files with parser recovery.
+    pub(super) fn resolve_incomplete_typescript_local_exports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        let provider = TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript);
+        for file in self.files.values() {
+            let facts = file.document.facts;
+            if facts.language().name != "typescript"
+                || facts.declaration_syntax_complete()
+                || !is_declaration_file(file.document.path.as_str())
+            {
+                continue;
+            }
+            let Some(limits) = facts.syntax_limits() else {
+                continue;
+            };
+            let mut candidates = Vec::new();
+            let mut references = Vec::new();
+            for export in facts.export_bindings().unwrap_or_default() {
+                if !work.charge() {
+                    break;
+                }
+                if let Some((reference, target)) =
+                    self.typescript_local_export_reference(file, export, work)
+                {
+                    candidates.push((export, target));
+                    references.push(reference);
+                }
+            }
+            if !candidates.is_empty() {
+                let source = SyntaxSource {
+                    path: file.document.path,
+                    text: file.document.source,
+                };
+                if let Ok(checked) =
+                    provider.checked_local_export_selectors(source, limits, &candidates)
+                {
+                    result.occurrences.extend(
+                        references
+                            .into_iter()
+                            .filter(|reference| checked.contains(&reference.callee_range)),
+                    );
+                }
+            }
+            if work.exhausted {
+                break;
+            }
+        }
+        result.typescript_incomplete_local_export_start =
+            (result.occurrences.len() != start).then_some(start);
+    }
+
     fn typescript_local_export_reference(
         &self,
         file: &File<'source>,
         export: &SyntaxExportBinding,
         work: &mut Work,
-    ) -> Option<StaticOccurrence> {
+    ) -> Option<(StaticOccurrence, &'source SyntaxSymbol)> {
         let range = export.local?;
         if export.kind != SyntaxExportKind::Named
             || export.source.is_some()
@@ -74,6 +133,101 @@ impl<'source> Index<'source> {
             && file.declared_signature(name) == Some(written)
             && !file.blocked(range.start, work);
         if !(local || signature) {
+            return None;
+        }
+        let owner = self.javascript_module_from(file, range, work)?;
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Unknown, target)?;
+        occurrence.edge_from = Some(owner);
+        Some((occurrence, target.symbol))
+    }
+
+    /// Retains selectors of already resolved relative imports after established edges.
+    pub(super) fn resolve_typescript_imported_export_selectors(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values().filter(|file| {
+            file.document.facts.language().name == "typescript"
+                && file.document.facts.declaration_syntax_complete()
+                && self.javascript_has_file_module(file)
+        }) {
+            for export in file.document.facts.export_bindings().unwrap_or_default() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if let Some(reference) =
+                    self.typescript_imported_export_selector(file, export, work)
+                {
+                    result.record(Some(reference));
+                }
+            }
+        }
+        result.typescript_imported_export_start =
+            (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn typescript_imported_export_selector(
+        &self,
+        file: &File<'source>,
+        export: &SyntaxExportBinding,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let range = export.local?;
+        if export.kind != SyntaxExportKind::Named
+            || export.source.is_some()
+            || export.container.is_some()
+            || !matches_export_form(file.text(export.range)?, ModuleMode::Esm)
+        {
+            return None;
+        }
+        let name = file.text(range)?;
+        let typed = js_binding(
+            file,
+            &self.javascript,
+            name,
+            range.start,
+            ReferenceRole::Type,
+            work,
+        );
+        let read = (!export.type_only)
+            .then(|| {
+                js_binding(
+                    file,
+                    &self.javascript,
+                    name,
+                    range.start,
+                    ReferenceRole::Read,
+                    work,
+                )
+            })
+            .flatten();
+        if typed.zip(read).is_some_and(|(typed, read)| typed != read) {
+            return None;
+        }
+        let binding = typed.or(read)?;
+        let StaticBindingKind::JavaScriptImport { module, .. } = binding.kind else {
+            return None;
+        };
+        let specifier = file.text(module)?;
+        if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+            return None;
+        }
+        let destination = self.javascript_specifier_file(file, module, false, work)?;
+        let type_target =
+            typed.and_then(|_| self.javascript_target(file, range, ReferenceRole::Type, work));
+        let value_target =
+            read.and_then(|_| self.javascript_target(file, range, ReferenceRole::Read, work));
+        if let Some((left, right)) = type_target.zip(value_target)
+            && self.javascript_identity(left)? != self.javascript_identity(right)?
+        {
+            return None;
+        }
+        let target = type_target.or(value_target)?;
+        if target.file.path != destination.document.path
+            || (export.type_only && !target.symbol.kinds.contains(&SymbolKind::Type))
+        {
             return None;
         }
         let owner = self.javascript_module_from(file, range, work)?;
@@ -905,6 +1059,147 @@ impl<'source> Index<'source> {
             && !file.document.facts.has_errors()
     }
 
+    /// Adds checked literal requires occupying an immediate argument expression.
+    pub(super) fn resolve_commonjs_argument_imports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values().filter(|file| {
+            file.document.facts.language().name == "javascript"
+                && self.javascript_has_file_module(file)
+                && file.document.facts.declaration_syntax_complete()
+        }) {
+            let mut sites = BTreeSet::new();
+            for reference in file.facts.references().iter().filter(|reference| {
+                reference.role == ReferenceRole::Import
+                    && commonjs_argument_call(file, reference.target)
+            }) {
+                if !work.charge() {
+                    break 'files;
+                }
+                sites.insert(reference.target);
+            }
+            if sites.is_empty() {
+                continue;
+            }
+            for call in file.facts.calls() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if sites.remove(&call.range)
+                    && let Some(module) = Self::commonjs_literal_require(file, call)
+                    && self.builtin_require(file, call.callee_range.start, work)
+                    && let Some(imported) =
+                        self.javascript_module_specifier(file, module, true, work)
+                {
+                    result.record(Some(imported));
+                }
+                if sites.is_empty() {
+                    break;
+                }
+            }
+        }
+        result.commonjs_argument_import_start = (result.occurrences.len() > start).then_some(start);
+    }
+
+    /// Retains literal requires written directly in a checked `CommonJS` export object.
+    pub(super) fn resolve_commonjs_export_imports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.commonjs_export_import_start = Some(result.occurrences.len());
+        for file in self.files.values().filter(|file| {
+            file.document.facts.language().name == "javascript"
+                && self.javascript_has_file_module(file)
+                && file.document.facts.declaration_syntax_complete()
+        }) {
+            let Some(export) = file.facts.commonjs_export() else {
+                continue;
+            };
+            let Some(literal) = export.literal else {
+                continue;
+            };
+            let mut pairs = BTreeSet::new();
+            for member in file.facts.body_members() {
+                if !work.charge() {
+                    return;
+                }
+                if member.body == literal && member.holder == export.assignment {
+                    pairs.insert(member.member);
+                }
+            }
+            if pairs.is_empty() {
+                continue;
+            }
+            let mut calls = BTreeMap::new();
+            for call in file.facts.calls() {
+                if !work.charge() {
+                    return;
+                }
+                if literal.encloses(call.range) {
+                    calls
+                        .entry(call.range)
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(call));
+                }
+            }
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    return;
+                }
+                if symbol.syntax_element_kind == Some("pair")
+                    && pairs.contains(&symbol.item_range)
+                    && let Some(Some(call)) = symbol.body_range.and_then(|body| calls.get(&body))
+                    && let Some(module) = Self::commonjs_literal_require(file, call)
+                    && self.builtin_require(file, call.callee_range.start, work)
+                    && let Some(imported) =
+                        self.javascript_module_specifier(file, module, true, work)
+                {
+                    result.record(Some(imported));
+                }
+            }
+        }
+    }
+
+    /// The unquoted relative specifier in a captured direct call with one string argument.
+    fn commonjs_literal_require(file: &File<'source>, call: &StaticCall) -> Option<ByteRange> {
+        if call.callee != StaticCallee::Direct || file.text(call.callee_range)? != "require" {
+            return None;
+        }
+        let start = call.callee_range.end;
+        let tail = file.text(ByteRange {
+            start,
+            end: call.range.end,
+        })?;
+        let arguments = tail
+            .trim_ascii_start()
+            .strip_prefix('(')?
+            .strip_suffix(')')?;
+        let value = arguments.trim_ascii();
+        let [quote, bytes @ .., close] = value.as_bytes() else {
+            return None;
+        };
+        if quote != close
+            || !matches!(quote, b'\'' | b'"')
+            || !(bytes.starts_with(b"./") || bytes.starts_with(b"../"))
+            || bytes
+                .iter()
+                .any(|byte| byte == quote || *byte == b'\\' || byte.is_ascii_control())
+        {
+            return None;
+        }
+        let opening =
+            tail.len() - arguments.len() + arguments.len() - arguments.trim_ascii_start().len();
+        let start = start.checked_add(u64::try_from(opening).ok()?)?;
+        Some(ByteRange {
+            start,
+            end: start.checked_add(u64::try_from(bytes.len()).ok()?)?,
+        })
+    }
+
     /// Retains a checked relative import at the written module specifier.
     pub(super) fn javascript_module_specifiers(
         &self,
@@ -1019,6 +1314,13 @@ impl<'source> Index<'source> {
         imported.document.placement.logical_identity(".")?;
         Some(imported)
     }
+}
+
+/// Recognizes the retained full call range in the import reference carrier.
+fn commonjs_argument_call(file: &File<'_>, range: ByteRange) -> bool {
+    file.text(range)
+        .and_then(|text| text.strip_prefix("require"))
+        .is_some_and(|tail| tail.trim_ascii_start().starts_with('(') && tail.ends_with(')'))
 }
 
 impl Target<'_> {

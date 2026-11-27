@@ -387,7 +387,7 @@ impl<'source> FileScopes<'source> {
                 continue;
             };
             if child.container.as_deref() != Some(parent.qualified_name.as_str())
-                || !repeated.contains(child.qualified_name.as_str())
+                || !conflicting_assignment_name(&child.qualified_name, repeated)
             {
                 continue;
             }

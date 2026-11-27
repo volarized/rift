@@ -8,6 +8,7 @@ pub use heritage_edges::HeritageEdge;
 
 use rift_core::ReferenceRole;
 use rift_error::{RiftError, errors};
+use std::collections::BTreeSet;
 use tree_sitter::{Language, Node};
 
 use crate::extract::{Visited, byte_range};
@@ -179,7 +180,8 @@ pub struct StaticBodyMember {
     pub body: ByteRange,
     /// Syntax element holding the whole literal or class after reading through parentheses,
     /// assertions and annotations. For a property with consecutive array elements, the
-    /// containing array is the property's whole value.
+    /// containing array is the property's whole value. For direct object elements of an
+    /// array written as a call argument, the call's argument list holds their array.
     pub holder: ByteRange,
 }
 
@@ -1530,15 +1532,16 @@ impl StaticFacts {
                 )
         });
         let calls = self.calls().iter().all(|call| call.valid(valid));
+        let mut argument_requires = BTreeSet::new();
         let references = self.references().iter().all(|reference| {
             valid(reference.target)
-                && matches!(
-                    reference.role,
-                    rift_core::ReferenceRole::Read
-                        | rift_core::ReferenceRole::Write
-                        | rift_core::ReferenceRole::Type
-                )
-        });
+                && match reference.role {
+                    ReferenceRole::Read | ReferenceRole::Write | ReferenceRole::Type => true,
+                    ReferenceRole::Import => argument_requires.insert(reference.target),
+                    _ => false,
+                }
+        }) && (argument_requires.is_empty()
+            || self.checked_argument_requires(source, limits, argument_requires));
         let functions = self
             .function_values()
             .iter()
@@ -1602,6 +1605,21 @@ impl StaticFacts {
             return errors::syntax::facts_range_invalid().fail();
         }
         Ok(())
+    }
+
+    fn checked_argument_requires(
+        &self,
+        source: &str,
+        limits: SyntaxLimits,
+        ranges: BTreeSet<ByteRange>,
+    ) -> bool {
+        let captured = self
+            .calls()
+            .iter()
+            .filter(|call| call.callee == StaticCallee::Direct && ranges.contains(&call.range))
+            .map(|call| call.range)
+            .collect::<BTreeSet<_>>();
+        captured == ranges && javascript::checked_argument_require_ranges(source, limits, ranges)
     }
 
     fn python_initializers_valid(
@@ -1967,6 +1985,89 @@ fn call(
         callee_range: byte_range(callee)?,
         callee: shape,
     })
+}
+
+#[cfg(test)]
+mod commonjs_argument_require_tests {
+    use super::{ReferenceRole, StaticFacts, StaticReference};
+    use crate::javascript::JavaScriptSyntaxProvider;
+    use crate::{SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxProvider, SyntaxSource};
+
+    #[test]
+    fn direct_argument_require_evidence_restores_only_its_original_checked_shape() {
+        const SOURCE: &str = "const first = require('./leaf');\nwrap(require('./leaf'));\n";
+        const LEGACY: &str = "import './leaf';";
+        let path = rift_core::ProjectPath::new("index.js").expect("path");
+        let limits = SyntaxLimits::default();
+        let capture = |source| {
+            JavaScriptSyntaxProvider::default()
+                .analyze(
+                    SyntaxSource {
+                        path: &path,
+                        text: source,
+                    },
+                    limits,
+                )
+                .expect("original JavaScript")
+        };
+        let document = capture(SOURCE);
+        let captured = document.facts();
+        let facts = captured.static_facts().expect("captured facts");
+        let restored = StaticFacts::from_parts(SOURCE, limits, facts.0.clone())
+            .expect("checked source range restores");
+        assert_eq!(&restored, facts);
+        let parts = SyntaxFactsParts {
+            origin: captured.origin(),
+            language: captured.language().clone(),
+            symbols: captured.symbols().to_vec(),
+            left_out_symbols: captured.left_out_symbols().to_vec(),
+            export_bindings: captured.export_bindings().map(<[_]>::to_vec),
+            macro_invocations: None,
+            scope: None,
+            static_facts: Some(restored.clone()),
+            has_errors: captured.has_errors(),
+            variance_errors_only: false,
+            left_out_declarations: captured.left_out_declaration_count(),
+            markdown_facts: None,
+            source_digest: rift_core::FileDigest::of(SOURCE.as_bytes()),
+        };
+        let whole =
+            SyntaxFacts::from_parts(SOURCE, limits, parts).expect("checked JavaScript facts");
+        assert_eq!(whole.static_facts(), Some(facts));
+        let requires = restored
+            .references()
+            .iter()
+            .filter(|reference| reference.role == ReferenceRole::Import)
+            .collect::<Vec<_>>();
+        assert_eq!(requires.len(), 1);
+        let first = facts.calls().first().expect("standalone initialization");
+        let mut wrong = facts.0.clone();
+        wrong.references.push(StaticReference {
+            target: first.range,
+            role: ReferenceRole::Import,
+        });
+        assert!(StaticFacts::from_parts(SOURCE, limits, wrong).is_err());
+        let mut no_call = facts.0.clone();
+        no_call
+            .calls
+            .retain(|call| call.range != requires[0].target);
+        assert!(StaticFacts::from_parts(SOURCE, limits, no_call).is_err());
+        let mut duplicate = facts.0.clone();
+        duplicate.references.push(*requires[0]);
+        assert!(StaticFacts::from_parts(SOURCE, limits, duplicate).is_err());
+
+        let document = capture(LEGACY);
+        let legacy = document.facts().static_facts().expect("legacy facts");
+        let restored = StaticFacts::from_parts(LEGACY, limits, legacy.0.clone())
+            .expect("ordinary side-effect import facts restore");
+        assert_eq!(&restored, legacy);
+        let mut wrong_role = legacy.0.clone();
+        wrong_role.references.push(StaticReference {
+            target: crate::ByteRange { start: 8, end: 14 },
+            role: ReferenceRole::Import,
+        });
+        assert!(StaticFacts::from_parts(LEGACY, limits, wrong_role).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ mod python_edges;
 mod rust;
 #[cfg(test)]
 mod tests;
+mod typescript_inline_imports;
 
 use javascript_parameters::{ParameterReads, ScopedParameterReads};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -86,6 +87,12 @@ pub(crate) struct StaticResolution {
     pub(crate) file_module_start: Option<usize>,
     /// First qualifier reference after the file module specifiers.
     pub(crate) file_module_qualifier_start: Option<usize>,
+    /// First import in a checked `CommonJS` default export object.
+    pub(crate) commonjs_export_import_start: Option<usize>,
+    /// First import written as a `CommonJS` call argument, after established edges.
+    pub(crate) commonjs_argument_import_start: Option<usize>,
+    /// First checked selector reference to a declaration in a relative imported module.
+    pub(crate) typescript_imported_export_start: Option<usize>,
     /// First containment edge of a physically scoped literal declaration.
     pub(crate) literal_start: Option<usize>,
     /// Containment awaiting the capacity left by existing references.
@@ -153,6 +160,10 @@ pub(crate) struct StaticResolution {
     /// First qualifier backed by an established legacy alias type occurrence.
     pub(crate) python_legacy_annotation_qualifier_start: Option<usize>,
     pub(crate) python_loop_read_start: Option<usize>,
+    /// First independently checked local selector in an incomplete declaration file.
+    pub(crate) typescript_incomplete_local_export_start: Option<usize>,
+    /// First checked type occurrence at a relative inline import qualifier.
+    pub(crate) typescript_inline_import_type_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -390,6 +401,11 @@ fn resolve_by<'source>(
     index.resolve_python_wildcard_modules(&mut work, &mut resolution);
     index.resolve_python_legacy_annotation_qualifiers(&mut work, &mut resolution);
     index.resolve_python_loop_reads(&mut work, &mut resolution);
+    index.resolve_commonjs_export_imports(&mut work, &mut resolution);
+    index.resolve_incomplete_typescript_local_exports(&mut work, &mut resolution);
+    index.resolve_typescript_imported_export_selectors(&mut work, &mut resolution);
+    index.resolve_typescript_inline_import_types(&mut work, &mut resolution);
+    index.resolve_commonjs_argument_imports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
