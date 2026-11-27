@@ -101,7 +101,7 @@ macro_rules! __rift_error_state {
         }
     };
     (
-        @walk [$name:ident $slug:literal $message:literal $action:literal]
+        @walk [$name:ident $slug:tt $message:literal $action:literal]
         states [$($state:ident)*] done $done:tt pending []
         count [$($count:tt)*] items [$($items:tt)*] fields []
     ) => {

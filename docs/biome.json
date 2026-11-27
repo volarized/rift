@@ -16,6 +16,7 @@
       "!public/icons",
       "!public/schemas",
       "!public/rift.schema.json",
+      "!public/errors.json",
       "!public/mcp.json",
       "!public/package-index.schema.json",
       "!public/global-api.openapi.json",

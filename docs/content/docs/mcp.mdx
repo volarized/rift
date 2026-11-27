@@ -144,7 +144,7 @@ describes selection and refusal behavior.
 
 `:packages` names releases beside the ones the workspace depends on. Each entry names its
 `manager`, `registry`, and `name`, and an optional exact `version`. Without one, the newest
-collected release answers:
+collected release answers. This request finds `beacon` in the example package `demo`:
 
 <ReadExample name="package-scope" />
 
@@ -153,9 +153,6 @@ The server refuses a `:packages` value written as a plain string, and an entry t
 is `global` reads this service with no `:scope`.
 
 Global edge queries read facts already collected for the selected package or runtime.
-
-The local example project runs with the Global connection disabled. Its response shows what
-happens when the named package index cannot be read.
 
 ### Edge provider
 
@@ -239,7 +236,7 @@ The result carries `outcome: "found"`, one `symbol`, the `revision` it was read 
 `declarations` in deterministic source order. Each declaration keeps its own origin,
 source address, byte range, and indices into the symbol's signatures, types, and documentation.
 Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
-be found with no declarations. A runtime symbol, such as `readFile` in Node's `fs` module, reads
+be found with no declarations. A runtime symbol, such as `len` in Python's builtins, reads
 the same way, and its `revision` names the runtime release:
 
 <ReadExample name="runtime-symbol" />
@@ -293,9 +290,8 @@ later declarations. The server refuses a tree revision once the index serves ano
 
 <span id="get_symbol-scope" />
 
-A named local identity selects an extra project accepted by the connection:
-
-<ReadExample name="named-symbol" />
+A named local identity such as `rift://symbol/local@sdk/rust/docs_sdk/load_config` selects an
+extra project accepted by the connection.
 
 A package or runtime identity names an owner across releases. Discover it with
 `:scope "global"` and `:packages` inside `SERVICE :search`, then pass the identity and selected
@@ -307,7 +303,7 @@ If the requested release has no complete coverage, `search` can return an unavai
 answer. Check `rift server logs` for the release and the coverage details.
 
 Several declaration bindings share one identity, such as the `cfg(unix)` and `cfg(windows)`
-declarations of `data_dir` in the `sdk` project. `page` and `max_results` select those bindings
+declarations of `data_dir` in the example below. `page` and `max_results` select those bindings
 at the same revision:
 
 <ReadExample name="multi-declaration-full" />
@@ -330,8 +326,7 @@ A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
 
- An incomplete exact selection returns
-`outcome: "unavailable"` with its typed reason, rather than a definite miss.
+An incomplete exact selection returns `outcome: "unavailable"` with its typed reason.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
 ## Facets [#tool-facets]
@@ -432,57 +427,8 @@ and argument constraints.
 </Accordion>
 <Accordion title="Errors" id="errors">
 
-When a call fails, the agent gets a result marked as an error instead of an answer. Its text is one
-section, titled with the count of errors, that lists the failure first and then its causes,
-outermost first. Each entry names its `code` and a `retry` directive, which says whether sending
-the same request again can help, and the line below states what failed:
-
-<Tabs items={["invalid_request", "limit_exceeded", "causes"]}>
-
-<Tab value="invalid_request">
-
-**Tool execution failure, compact text** of a request whose `max_results` is below 1:
-
-```text
-1 error
-	invalid_request · retry never
-		the request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request
-```
-
-</Tab>
-
-<Tab value="limit_exceeded">
-
-**Tool execution failure, compact text** of a request that crosses a limit on `source.files`, with one cause:
-
-```text
-2 errors
-	limit_exceeded · retry never
-		the request crosses a limit
-		limit source.files: 11 over 10
-	storage_failure · retry same_request
-		the store refused
-```
-
-</Tab>
-
-<Tab value="causes">
-
-**Tool execution failure, compact text** of a history store that could not be opened, with two causes:
-
-```text
-3 errors
-	storage_failure · retry same_request
-		history store database operation failed: open: unable to open database file; check the history store database and retry
-	storage_failure · retry same_request
-		unable to open database file
-	storage_failure · retry same_request
-		Permission denied (os error 13)
-```
-
-</Tab>
-
-</Tabs>
+When a call fails, the agent gets a result marked as an error. Its text lists the failure first,
+then its causes from outermost to innermost. Each entry names its `code` and a `retry` directive.
 
 - `retry never` tells the agent to change its arguments first. `retry same_request` says the same
   request can succeed later.
@@ -491,8 +437,8 @@ the same request again can help, and the line below states what failed:
 - The `retry` of the first entry governs the call. A cause's `retry` says what could be done
   about that cause.
 
-See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for the other
-directives and the complete form.
+See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for examples
+and the complete form. The [error registry](/docs/developer/errors) lists registered errors.
 
 </Accordion>
 </Accordions>
@@ -517,24 +463,6 @@ Complete tool examples, resource fields, limits, and failure behavior.
 </IconCard>
 </Cards>
 
-The workspace resource comes as compact text, in the same form as a tool result:
-
-**`rift://workspace`, compact text** of a workspace with one TypeScript language and one source file:
-
-```text
-workspace
-languages:
-	typescript:tsx · syntax · lsp typescript:tsx ready
-		include src/**/*.tsx
-		exclude src/generated/**
-source:
-	src/view.tsx · typescript:tsx
-```
-
-
 The workspace text lists effective languages with their include and exclude patterns, then
 lists source paths with their languages. Follow the next URI when the catalog spans pages.
-
-
-See [resource contents](/docs/developer/protocol/mcp#resource-contents) for the compact text and
-the JSON body a read carries.
+See the [workspace resource](/docs/developer/protocol/mcp#resource-workspace) for an example.

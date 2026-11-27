@@ -29,6 +29,12 @@ const required = [
   path.join(basePath.replace(/^\//, ""), "docs", "index.html"),
   path.join(basePath.replace(/^\//, ""), "install.sh"),
   path.join(basePath.replace(/^\//, ""), "install.ps1"),
+  path.join(basePath.replace(/^\//, ""), "cli-help.txt"),
+  path.join(basePath.replace(/^\//, ""), "errors.json"),
+  path.join(basePath.replace(/^\//, ""), "global-api.openapi.json"),
+  path.join(basePath.replace(/^\//, ""), "mcp.json"),
+  path.join(basePath.replace(/^\//, ""), "package-index.schema.json"),
+  path.join(basePath.replace(/^\//, ""), "rift.schema.json"),
   path.join(basePath.replace(/^\//, ""), "404.html"),
 ];
 

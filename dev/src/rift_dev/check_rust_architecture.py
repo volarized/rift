@@ -46,7 +46,6 @@ EXPECTED_EDGES = {
     "rift-core -> rift-protocol",
     "rift-core -> rift-error",
     "rift-error -> rift-error-macros",
-    "rift-error-codegen -> rift-error",
     "rift-dependency -> rift-core",
     "rift-dependency -> rift-protocol",
     "rift-history -> rift-core",

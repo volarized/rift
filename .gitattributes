@@ -1,1 +1,3 @@
+*.rs text eol=lf
+vendor/tree-sitter-*/** text=auto eol=lf
 crates/rift-cloud-client/src/generated.rs whitespace=-blank-at-eof

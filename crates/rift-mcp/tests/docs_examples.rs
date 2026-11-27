@@ -1,5 +1,7 @@
 //! Capture the documentation fixtures through the live, in-process MCP surface.
 
+#[allow(dead_code)]
+mod global_api;
 mod hermetic_search;
 #[allow(dead_code)]
 mod workspace_client;
@@ -7,16 +9,46 @@ mod workspace_client;
 use std::fs;
 use std::path::Path;
 
+use global_api::{FixtureOptions, GlobalFixture, NAMED_POSITIONS, SymbolFixture};
 use rift_history::fixture::{commit_all_at, git, init};
-use rmcp::model::ReadResourceRequestParams;
-use serde_json::{Map, json};
+use rmcp::{RoleClient, model::ReadResourceRequestParams, service::RunningService};
+use serde_json::{Map, Value, json};
 use workspace_client::{
-    TestResult, query_after_population, resource_json, resource_text, served_prepared_workspace,
-    tool_request,
+    TestResult, captured_seed, query_after_population, resource_json, resource_text,
+    served_prepared_workspace, served_workspace, tool_request,
 };
 
 const MAP_URI: &str = "rift://map";
 const FIXTURE_CONFIGURATION: &str = include_str!("fixtures/docs-example/rift.toml");
+const WORKSPACE_URI: &str = "rift://workspace";
+const PACKAGE_QUERIES: &[(&str, &str)] = &[
+    (
+        "package-scope",
+        r#"SELECT ?symbol ?name {
+  SERVICE :search {
+    ?hit :query "beacon"; :target "symbol"; :scope "global";
+         :packages '[{"manager":"cargo","registry":"crates.io","name":"demo"}]'^^rdf:JSON;
+         :symbol ?symbol; :index ?index .
+    ?symbol :name ?name
+  }
+}
+ORDER BY ?index
+LIMIT 5"#,
+    ),
+    (
+        "pinned-package",
+        r#"SELECT ?symbol ?name {
+  SERVICE :search {
+    ?hit :query "beacon"; :target "symbol"; :scope "all";
+         :packages '[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]'^^rdf:JSON;
+         :symbol ?symbol; :index ?index .
+    ?symbol :name ?name
+  }
+}
+ORDER BY ?index
+LIMIT 5"#,
+    ),
+];
 const FIXTURE: &[(&str, &str, &str)] = &[
     (
         "Cargo.toml",
@@ -81,19 +113,6 @@ LIMIT 3"#,
   }
 }
 ORDER BY ?path ?start"#,
-    ),
-    (
-        "package-scope",
-        r#"SELECT ?symbol ?name {
-  SERVICE :search {
-    ?hit :query "Serialize"; :target "symbol"; :scope "global";
-         :packages '[{"manager":"cargo","registry":"crates.io","name":"serde_core"}]'^^rdf:JSON;
-         :symbol ?symbol; :index ?index .
-    ?symbol :name ?name
-  }
-}
-ORDER BY ?index
-LIMIT 5"#,
     ),
     (
         "edge-provider",
@@ -168,20 +187,214 @@ ORDER BY ?symbol ?kind"#,
 }
 ORDER BY ?message ?revision"#,
     ),
-    (
-        "pinned-package",
-        r#"SELECT ?symbol ?name {
-  SERVICE :search {
-    ?hit :query "spawn_blocking"; :target "symbol"; :scope "all";
-         :packages '[{"manager":"cargo","registry":"crates.io","name":"tokio","version":"1.54.1"}]'^^rdf:JSON;
-         :symbol ?symbol; :index ?index .
-    ?symbol :name ?name
-  }
-}
-ORDER BY ?index
-LIMIT 5"#,
-    ),
 ];
+
+/// Captures both MCP response forms and drops the process-local view.
+async fn capture_tool(
+    client: &RunningService<RoleClient, ()>,
+    tool: &'static str,
+    arguments: Value,
+    expected_error: bool,
+) -> TestResult<Value> {
+    let response = client.call_tool(tool_request(tool, &arguments)).await?;
+    let text = &response
+        .content
+        .first()
+        .and_then(rmcp::model::ContentBlock::as_text)
+        .ok_or("tool response is missing its compact text")?
+        .text;
+    assert_eq!(
+        response.is_error.unwrap_or(false),
+        expected_error,
+        "{tool} {arguments}: {text}"
+    );
+    let mut answer = match &response.structured_content {
+        Some(answer) => answer.clone(),
+        None => serde_json::to_value(&response)?,
+    };
+    if let Some(fields) = answer.as_object_mut() {
+        fields.remove("view");
+    }
+    Ok(json!({ "tool": tool, "arguments": arguments, "text": text, "json": answer }))
+}
+
+async fn capture_query(client: &RunningService<RoleClient, ()>, query: &str) -> TestResult<Value> {
+    let arguments = json!({ "query": query });
+    query_after_population(client, &serde_json::from_value(arguments.clone())?).await?;
+    let example = capture_tool(client, "search", arguments, false).await?;
+    assert!(
+        example["json"].get("answer").is_some(),
+        "{query}: {example}"
+    );
+    Ok(example)
+}
+
+async fn capture_resource(client: &RunningService<RoleClient, ()>, uri: &str) -> TestResult<Value> {
+    let response = client
+        .read_resource(ReadResourceRequestParams::new(uri.to_owned()))
+        .await?;
+    Ok(json!({
+        "arguments": { "uri": uri },
+        "text": resource_text(&response, uri)?,
+        "json": resource_json(&response, uri)?,
+    }))
+}
+
+/// A separate workspace keeps the loopback endpoint out of the illustrated project.
+async fn capture_routed_examples(examples: &mut Map<String, Value>) -> TestResult<()> {
+    let global = GlobalFixture::start_with(FixtureOptions {
+        python_collection: true,
+        query_narrowed: false,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    // The loopback port changes on each capture. Keep configuration bytes out of the tree digest.
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n\
+         [languages.rust]\nstdlib = false\n\n[source]\nexclude = [\"rift.toml\"]\n",
+        global.endpoint
+    );
+    let (directory, client, server) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = 'docs-example'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n",
+            ),
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\n\
+                 #[cfg(unix)]\npub fn data_dir() -> &'static str { \"/var/lib/demo\" }\n\n\
+                 #[cfg(windows)]\npub fn data_dir() -> &'static str { \"C:/ProgramData/demo\" }\n",
+            ),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let collected = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let local = captured_seed(&client, "beacon", "lib.rs").await?;
+    for &(name, query) in PACKAGE_QUERIES {
+        let example = capture_query(&client, query).await?;
+        let rows = workspace_client::query::rows(&example["json"])?;
+        assert!(
+            rows.iter()
+                .any(|row| workspace_client::query::iri(row, "symbol").ok()
+                    == Some(collected.as_str())),
+            "{name} must return the collected package symbol: {example}"
+        );
+        if name == "pinned-package" {
+            assert!(
+                rows.iter()
+                    .any(|row| workspace_client::query::iri(row, "symbol").ok()
+                        == Some(local.as_str())),
+                "the all-scope example must include the local symbol: {example}"
+            );
+        }
+        examples.insert(name.to_owned(), example);
+    }
+    for (name, arguments) in [
+        (
+            "global-symbol-documentation",
+            json!({
+                "id": collected,
+                "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
+                "include": {"documentation": true},
+            }),
+        ),
+        (
+            "global-symbol-history",
+            json!({"id": collected, "include": {"history": true}}),
+        ),
+        (
+            "runtime-symbol",
+            json!({
+                "id": global_api::named_identity(&NAMED_POSITIONS[0]),
+                "revision": global_api::named_release(&NAMED_POSITIONS[0]),
+            }),
+        ),
+    ] {
+        let example = capture_tool(&client, "get_symbol", arguments, false).await?;
+        assert_eq!(example["json"]["outcome"], "found", "{name}: {example}");
+        examples.insert(name.to_owned(), example);
+    }
+    assert!(examples["global-symbol-documentation"]["json"]["documentation"].is_object());
+    assert!(examples["global-symbol-history"]["json"]["history"]["edges"].is_array());
+    capture_missing_examples(&client, &local, directory.path(), examples).await?;
+    capture_paged_examples(&client, examples).await?;
+    client.cancel().await?;
+    server.await?;
+    Ok(())
+}
+
+async fn capture_paged_examples(
+    client: &RunningService<RoleClient, ()>,
+    examples: &mut Map<String, Value>,
+) -> TestResult<()> {
+    let id = captured_seed(client, "data_dir", "lib.rs").await?;
+    let all = capture_tool(client, "get_symbol", json!({"id": id}), false).await?;
+    assert_eq!(all["json"]["pagination"]["total"], 2, "{all}");
+    let first = capture_tool(
+        client,
+        "get_symbol",
+        json!({"id": id, "page": 1, "max_results": 1}),
+        false,
+    )
+    .await?;
+    let revision = first["json"]["revision"].as_str().ok_or("page revision")?;
+    let next = capture_tool(
+        client,
+        "get_symbol",
+        json!({"id": id, "page": 2, "max_results": 1, "revision": revision}),
+        false,
+    )
+    .await?;
+    assert_eq!(next["json"]["pagination"]["page"], 2, "{next}");
+    for (name, example) in [
+        ("multi-declaration-full", all),
+        ("multi-declaration-first", first),
+        ("multi-declaration-next", next),
+    ] {
+        examples.insert(name.to_owned(), example);
+    }
+    Ok(())
+}
+
+async fn capture_missing_examples(
+    client: &RunningService<RoleClient, ()>,
+    anchor: &str,
+    workspace: &Path,
+    examples: &mut Map<String, Value>,
+) -> TestResult<()> {
+    let prefix = anchor.strip_suffix("/beacon").ok_or("beacon identity")?;
+    let missing = capture_tool(
+        client,
+        "get_symbol",
+        json!({"id": format!("{prefix}/beacn")}),
+        true,
+    )
+    .await?;
+    assert_eq!(missing["json"]["outcome"], "missing", "{missing}");
+    assert_eq!(
+        missing["json"]["symbol_not_found"]["alternatives"][0]["id"], anchor,
+        "{missing}"
+    );
+    examples.insert("missing-symbol".to_owned(), missing);
+    let mut unavailable = capture_tool(
+        client,
+        "get_symbol",
+        json!({"id": anchor, "revision": "rift://revision/git/main"}),
+        true,
+    )
+    .await?;
+    // The registered failure includes the canonical workspace path in its message.
+    let workspace = fs::canonicalize(workspace)?;
+    let workspace = workspace.to_string_lossy();
+    let text = unavailable["text"].as_str().ok_or("unavailable text")?;
+    assert!(text.contains(workspace.as_ref()), "{unavailable}");
+    unavailable["text"] = json!(text.replace(workspace.as_ref(), "example-project"));
+    unavailable["json"]["content"][0]["text"] = unavailable["text"].clone();
+    examples.insert("revision-unavailable".to_owned(), unavailable);
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "run with cargo xtask docs-examples"]
@@ -221,45 +434,32 @@ async fn capture_docs_examples() -> TestResult {
 
     let mut queries = Map::new();
     for &(name, query) in QUERIES {
-        let arguments = json!({ "query": query });
-        let remote = matches!(name, "package-scope" | "pinned-package");
-        if !remote {
-            query_after_population(&client, &serde_json::from_value(arguments.clone())?).await?;
-        }
-        let response = client.call_tool(tool_request("search", &arguments)).await?;
-        let text = response
-            .content
-            .first()
-            .and_then(rmcp::model::ContentBlock::as_text)
-            .ok_or("search response is missing its compact text")?
-            .text
-            .clone();
-        let mut json = match response.structured_content {
-            Some(json) => json,
-            None if remote => json!({ "content": response.content, "isError": response.is_error }),
-            None => return Err(format!("{name}: search failed with {text}").into()),
-        };
-        // A retained-view identity and expiry belong to the capture's process.
-        if let Some(fields) = json.as_object_mut() {
-            fields.remove("view");
-        }
-        queries.insert(
-            name.to_owned(),
-            json!({ "query": query, "arguments": arguments, "text": text, "json": json }),
-        );
+        queries.insert(name.to_owned(), capture_query(&client, query).await?);
+    }
+    let symbol = captured_seed(&client, "load_config", "src/config.rs").await?;
+    for (name, tool, arguments, expected_error) in [
+        ("local-symbol", "get_symbol", json!({"id": symbol}), false),
+        ("symbol-facets", "facets", json!({"symbol": symbol}), false),
+        (
+            "malformed-symbol",
+            "get_symbol",
+            json!({"id": "load_config"}),
+            true,
+        ),
+    ] {
+        let example = capture_tool(&client, tool, arguments, expected_error).await?;
+        queries.insert(name.to_owned(), example);
     }
 
-    let resource = client
-        .read_resource(ReadResourceRequestParams::new(MAP_URI.to_owned()))
-        .await?;
-    let map = json!({
-        "arguments": { "uri": MAP_URI },
-        "text": resource_text(&resource, MAP_URI)?,
-        "json": resource_json(&resource, MAP_URI)?,
-    });
+    let map = capture_resource(&client, MAP_URI).await?;
+    queries.insert(
+        "workspace".to_owned(),
+        capture_resource(&client, WORKSPACE_URI).await?,
+    );
 
     client.cancel().await?;
     server.await?;
+    Box::pin(capture_routed_examples(&mut queries)).await?;
     let files: Vec<_> = FIXTURE
         .iter()
         .map(|&(path, language, code)| {

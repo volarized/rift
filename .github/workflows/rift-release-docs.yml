@@ -16,7 +16,7 @@ permissions:
 jobs:
   build-docs:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: docs
@@ -51,6 +51,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: docs-release
       - name: Cache bun install
         uses: actions/cache@v6.1.0
         with:
@@ -68,10 +71,11 @@ jobs:
             ${{ runner.os }}-next-${{ hashFiles('docs/bun.lock') }}-
             ${{ runner.os }}-next-
       - run: bun install --frozen-lockfile
+      - run: bun run artifacts
       - run: bunx biome ci .
       - run: bunx next typegen
       - run: bunx tsc --noEmit
-      - run: bun run build
+      - run: bun run build:static
       - run: bun run pack
       - uses: actions/upload-artifact@v7.0.2
         with:

@@ -17,6 +17,7 @@ env:
 
 jobs:
   docs:
+    needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 3
     defaults:
@@ -30,6 +31,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: docs-generated
+          path: docs
 
       # DO NOT DELETE as redundant with setup-bun. setup-bun caches only the
       # downloaded *bun executable* (`no-cache` input, `cache-hit` output -
@@ -76,7 +82,7 @@ jobs:
 
       - run: bunx tsc --noEmit
 
-      - run: bun run build
+      - run: bun run build:static
       - run: bun run pack
 
       # Dependabot supports version updates for bun but NOT security updates,
@@ -132,6 +138,19 @@ jobs:
 
       - run: uv run --locked --project dev pre-commit run --all-files --show-diff-on-failure
         timeout-minutes: 30
+      - name: Upload generated docs data
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: docs-generated
+          path: |
+            docs/public/cli-help.txt
+            docs/public/errors.json
+            docs/public/global-api.openapi.json
+            docs/public/mcp.json
+            docs/public/package-index.schema.json
+            docs/public/rift.schema.json
+            docs/src/components/workspace-examples.generated.json
+          if-no-files-found: error
       - run: just audit
         timeout-minutes: 1
       # The pre-commit quick gate runs generated checks, the all-features

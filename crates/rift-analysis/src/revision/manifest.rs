@@ -6,25 +6,19 @@
 //! content digest of the extraction, normalization, identity, and document-builder source
 //! - and [`analyzer_revision`](crate::analyzer_revision) is the digest of that document.
 //!
-//! The document is generated beside the served schemas and committed, so a change to any
-//! named input that ships without a regenerated manifest fails `just generate-check`
-//! before it reaches a reader.
+//! Cargo renders this document from the inputs of the current build and embeds its digest.
 
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rift_protocol::canonical::canonical_json;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-#[cfg(test)]
-const ANALYZER_MANIFEST: &str = include_str!("../analyzer-manifest.json");
-
 /// The lockfile the grammar versions and checksums are read from, relative to the
 /// repository root.
-const LOCKFILE_PATH: &str = "Cargo.lock";
+pub(super) const LOCKFILE_PATH: &str = "Cargo.lock";
 
 /// The package-name prefix every shipped grammar carries, including the runtime itself.
 const GRAMMAR_PREFIX: &str = "tree-sitter";
@@ -37,7 +31,7 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 85] = [
+pub(super) const ANALYZED_SOURCES: [&str; 85] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
     "crates/rift-dependency/src",
@@ -161,8 +155,7 @@ struct AnalyzerManifest {
 
 /// Renders the analyzer manifest from the tree below `root`.
 ///
-/// The rendering is RFC 8785 canonical JSON with a trailing newline, so the committed
-/// document is byte-identical wherever it is generated. The work is one pass over the
+/// The rendering is RFC 8785 canonical JSON with a trailing newline. The work is one pass over the
 /// lockfile plus one read per analyzed source file, and the walk that finds those files
 /// examines at most 4096 entries at a depth of at most 8 directories below each named
 /// root.
@@ -192,10 +185,11 @@ pub fn render_analyzer_manifest(root: &Path) -> Result<String, ManifestError> {
     }
     sources.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = AnalyzerManifest { grammars, sources };
-    let mut rendered = canonical_json(&manifest).map_err(|source| ManifestError::Render {
-        path: lockfile_path,
-        source,
-    })?;
+    let mut rendered =
+        serde_json_canonicalizer::to_string(&manifest).map_err(|source| ManifestError::Render {
+            path: lockfile_path,
+            source,
+        })?;
     rendered.push('\n');
     Ok(rendered)
 }
@@ -263,12 +257,6 @@ fn analyzed_files(
     }
     found.sort();
     Ok(found)
-}
-
-/// The path the generated manifest is committed at, relative to the repository root.
-#[must_use]
-pub fn analyzer_manifest_path() -> PathBuf {
-    PathBuf::from("crates/rift-analysis/src/analyzer-manifest.json")
 }
 
 /// Every shipped grammar the lockfile pins, in name order.
@@ -406,11 +394,11 @@ impl std::error::Error for ManifestError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ANALYZER_MANIFEST, ManifestError, grammar_pins};
+    use super::{ManifestError, grammar_pins};
     use crate::analyzer_revision;
 
     #[test]
-    fn test_analyzer_revision_is_the_wire_digest_of_the_committed_manifest() {
+    fn test_analyzer_revision_is_the_wire_digest_of_the_build_manifest() {
         let revision = analyzer_revision();
         assert_eq!(revision.0.len(), 8, "{revision:?}");
         assert!(revision.0.chars().all(|symbol| symbol.is_ascii_hexdigit()));
@@ -422,9 +410,12 @@ mod tests {
     }
 
     #[test]
-    fn test_committed_manifest_names_every_shipped_grammar_and_source() {
-        let manifest: serde_json::Value =
-            serde_json::from_str(ANALYZER_MANIFEST).expect("the committed manifest is JSON");
+    fn test_build_manifest_names_every_shipped_grammar_and_source() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("OUT_DIR"),
+            "/analyzer-manifest.json"
+        )))
+        .expect("the build manifest is JSON");
         let grammars = manifest["grammars"]
             .as_array()
             .expect("the manifest lists grammars");
@@ -684,12 +675,12 @@ checksum = \"def\"\n";
     }
 
     #[test]
-    fn test_the_manifest_is_committed_below_the_analyzer_it_states() {
-        let path = super::analyzer_manifest_path();
+    fn test_the_exported_manifest_is_below_the_analyzer_it_states() {
+        let path = crate::analyzer_manifest_path();
 
         assert_eq!(
             path,
-            std::path::PathBuf::from("crates/rift-analysis/src/analyzer-manifest.json")
+            std::path::PathBuf::from("crates/rift-analysis/analyzer-manifest.json")
         );
     }
 

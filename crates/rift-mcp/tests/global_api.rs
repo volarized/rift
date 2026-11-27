@@ -676,6 +676,13 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
     let hit = collected_hit(fixture, declaration, false);
     let binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"signature_indices":[],"type_indices":[],"documentation_indices":[]});
     let mut found = json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"revision":release_revision(id)});
+    if request["include"]["documentation"] == json!(true) {
+        found["documentation"] = json!({
+            "documentation_revision": "0123abcd",
+            "references": [],
+            "truncated": false,
+        });
+    }
     if request["include"]["history"] == json!(true) {
         found["history"] = release_history(id);
     }

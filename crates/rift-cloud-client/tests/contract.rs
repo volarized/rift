@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rift_cloud_client::contract::{self, ContractError};
 use rift_cloud_client::search::PackageSearchPage;
@@ -14,18 +14,8 @@ use serde_json::{Map, Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-fn repository_root() -> TestResult<PathBuf> {
-    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .ok_or("the crate sits two directories below the repository root")?
-        .to_path_buf())
-}
-
-fn contract() -> TestResult<Value> {
-    Ok(serde_json::from_slice(&fs::read(
-        repository_root()?.join(contract::CONTRACT_PATH),
-    )?)?)
+fn contract() -> Value {
+    contract::document()
 }
 
 fn write_contract(document: &Value) -> TestResult<(tempfile::TempDir, PathBuf)> {
@@ -51,8 +41,9 @@ fn assert_invalid(document: &Value, rule: &str) -> TestResult {
 }
 
 #[test]
-fn committed_contract_is_valid() -> TestResult {
-    contract::validate(&repository_root()?.join(contract::CONTRACT_PATH))?;
+fn generated_contract_is_valid() -> TestResult {
+    let (_directory, path) = write_contract(&contract())?;
+    contract::validate(&path)?;
     Ok(())
 }
 
@@ -61,7 +52,7 @@ fn committed_contract_is_valid() -> TestResult {
 /// compiles, which has no lookahead. A lookahead the validator accepts fails the contract.
 #[test]
 fn every_schema_pattern_compiles_for_the_validator_and_the_generator() -> TestResult {
-    let document = contract()?;
+    let document = contract();
     let mut pending = vec![&document];
     let mut patterns = Vec::new();
     while let Some(value) = pending.pop() {
@@ -92,7 +83,7 @@ fn every_schema_pattern_compiles_for_the_validator_and_the_generator() -> TestRe
         regex::Regex::new(pattern).map_err(|error| format!("{pattern}: {error}"))?;
     }
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["ProjectPath"]["pattern"] = json!(r"^(?!\.rift)[a-z]*$");
     assert_invalid(&document, "must compile under the `regex` crate")?;
     Ok(())
@@ -118,26 +109,26 @@ fn missing_and_malformed_contracts_keep_their_sources() -> TestResult {
 
 #[test]
 fn fixed_surface_changes_fail_validation() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["openapi"] = json!("3.0.4");
     assert_invalid(&document, "OpenAPI version")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]
         .as_object_mut()
         .ok_or("paths must be an object")?
         .remove("/v1/symbols");
     assert_invalid(&document, "paths differ")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/search"]["post"]["operationId"] = json!("search");
     assert_invalid(&document, "operationId")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/search"]["post"]["security"] = json!([]);
     assert_invalid(&document, "optional bearer authentication")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["servers"] = json!([{"url": "https://example.com/rift/rest"}]);
     assert_invalid(&document, "`servers` must stay absent")?;
     Ok(())
@@ -145,33 +136,33 @@ fn fixed_surface_changes_fail_validation() -> TestResult {
 
 #[test]
 fn request_and_response_changes_fail_validation() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/capabilities"]["get"]["requestBody"] =
         document["paths"]["/v1/search"]["post"]["requestBody"].clone();
     assert_invalid(&document, "must not declare a request body")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/resolutions"]["post"]["requestBody"]["required"] = json!(false);
     assert_invalid(&document, "request body must be required")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/search"]["post"]["responses"]
         .as_object_mut()
         .ok_or("responses must be an object")?
         .remove("504");
     assert_invalid(&document, "response statuses differ")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/search"]["post"]["responses"]["400"]["content"] =
         json!({"application/json": {}});
     assert_invalid(&document, "application/problem+json")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/capabilities"]["get"]["responses"]["304"]["content"] =
         json!({"application/json": {}});
     assert_invalid(&document, "304 response must not carry content")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/resolutions"]["post"]["requestBody"]["content"] =
         json!({"application/problem+json": {}});
     assert_invalid(
@@ -183,15 +174,15 @@ fn request_and_response_changes_fail_validation() -> TestResult {
 
 #[test]
 fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["parameters"]["MaxResults"]["schema"]["maximum"] = json!(201);
     assert_invalid(&document, "MaxResults/schema/maximum")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["parameters"]["MaxResults"]["schema"]["default"] = json!(101);
     assert_invalid(&document, "MaxResults/schema/default")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["CapabilityBounds"]["properties"]["page_limit_max"]["maximum"] =
         json!(200);
     assert_invalid(
@@ -199,17 +190,17 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
         "CapabilityBounds/properties/page_limit_max/maximum",
     )?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["GetSymbolResult"]["oneOf"][0]["properties"]["declarations"]
         ["maxItems"] = json!(200);
     assert_invalid(&document, "GetSymbolResult/found/declarations/maxItems")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["GetSymbolParams"]["properties"]["max_results"]["maximum"] =
         json!(200);
     assert_invalid(&document, "GetSymbolParams/max_results/maximum")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["PackagePatternRequest"]["properties"]["pattern"]["maxLength"] =
         json!(4096);
     assert_invalid(
@@ -217,11 +208,11 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
         "PackagePatternRequest/properties/pattern/maxLength",
     )?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/patterns"]["post"]["x-rift-page-files-max"] = json!(2000);
     assert_invalid(&document, "x-rift-page-files-max")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["FindDeclarationsParams"]["properties"]["positions"]["maxItems"] =
         json!(10000);
     assert_invalid(
@@ -229,23 +220,23 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
         "FindDeclarationsParams/properties/positions/maxItems",
     )?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["SourcePosition"]["properties"]["character"]["maximum"] =
         json!(65535);
     assert_invalid(&document, "SourcePosition/properties/character/maximum")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["PackageIdentity"]["properties"]["name"]["maxLength"] =
         json!(4095);
     assert_invalid(&document, "PackageIdentity")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["Warning"]["properties"]["detail"]["maxLength"] = json!(1024);
     assert_invalid(&document, "Warning/properties/detail/maxLength")?;
 
     // A longer requirement makes a longer `requirement_unsatisfied` detail than the warning
     // bound holds.
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["PackageContextEntry"]["properties"]["requirement"]["maxLength"] =
         json!(8192);
     assert_invalid(&document, "Warning/properties/detail/maxLength")?;
@@ -256,7 +247,7 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
 /// enforces, and both count characters.
 #[test]
 fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
-    let document = contract()?;
+    let document = contract();
     let request = &document["components"]["schemas"]["PackagePatternRequest"];
     let max_length = &request["properties"]["pattern"]["maxLength"];
     assert_eq!(
@@ -271,21 +262,21 @@ fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
 /// client enforces, and a drift in either fails validation.
 #[test]
 fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/facets"]["post"]["x-rift-page-source-bytes-max"] = json!(2_097_152);
     assert_invalid(&document, "x-rift-page-source-bytes-max")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["FacetsParams"]["properties"]["max_results"]["maximum"] =
         json!(99);
     assert_invalid(&document, "FacetsParams/max_results/maximum")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/facets"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
         json!({"$ref": "#/components/schemas/GetSymbolParams"});
     assert_invalid(&document, "POST /v1/facets request must use FacetsParams")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/facets"]["post"]["responses"]["200"]["content"]["application/json"]["schema"] =
         json!({"$ref": "#/components/schemas/GetSymbolResult"});
     assert_invalid(
@@ -293,7 +284,7 @@ fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
         "POST /v1/facets 200 response must use FacetsResult",
     )?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/facets"]["post"]["parameters"] = json!([]);
     assert_invalid(
         &document,
@@ -306,12 +297,12 @@ fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
 /// contract alone defines: the service omits an absent field.
 #[test]
 fn an_optional_property_accepting_null_fails_validation() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["PackageSearchPage"]["properties"]["documentation_revision"]
         ["type"] = json!(["string", "null"]);
     assert_invalid(&document, "schema `PackageSearchPage` accepts `null`")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["Symbol"]["properties"]["visibility"]["type"] =
         json!(["string", "null"]);
     assert_invalid(&document, "schema `Symbol` accepts `null`")?;
@@ -322,7 +313,7 @@ fn an_optional_property_accepting_null_fails_validation() -> TestResult {
 /// in it and the contract stays valid.
 #[test]
 fn a_boolean_component_schema_passes_the_optional_null_rule() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["AnyValue"] = json!(true);
     let (_directory, path) = write_contract(&document)?;
     contract::validate(&path)?;
@@ -331,7 +322,7 @@ fn a_boolean_component_schema_passes_the_optional_null_rule() -> TestResult {
 
 #[test]
 fn every_contract_example_validates_against_its_schema() -> TestResult {
-    let document = contract()?;
+    let document = contract();
     let components = document["components"]["schemas"]
         .as_object()
         .ok_or("components.schemas must be an object")?;
@@ -346,7 +337,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
 
 #[test]
 fn every_contract_response_example_decodes_through_generated_types() -> TestResult {
-    let document = contract()?;
+    let document = contract();
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
@@ -358,7 +349,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
 
 #[test]
 fn search_request_examples_carry_the_terms_and_identifiers_of_their_query() -> TestResult {
-    let document = contract()?;
+    let document = contract();
     let examples = document["paths"]["/v1/search"]["post"]["requestBody"]["content"]
         ["application/json"]["examples"]
         .as_object()
@@ -580,7 +571,7 @@ fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult 
         ("response_body_bytes_max", 32 << 20),
         ("source_bytes_max", 1 << 20),
     ] {
-        let mut document = contract()?;
+        let mut document = contract();
         document["components"]["schemas"]["CapabilityBounds"]["properties"][property]["maximum"] =
             json!(old_default);
         assert_invalid(
@@ -593,7 +584,7 @@ fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult 
         "PackagePatternDeclaration",
         "PackagePatternHit",
     ] {
-        let mut document = contract()?;
+        let mut document = contract();
         document["components"]["schemas"][component]["properties"]["source"]["maxLength"] =
             json!(1 << 20);
         assert_invalid(
@@ -606,18 +597,18 @@ fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult 
 
 #[test]
 fn exact_symbol_contract_rejects_name_selectors_and_legacy_pages() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/symbols"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
         json!({"$ref": "#/components/schemas/PackageSymbolRequest"});
     assert_invalid(&document, "request must use GetSymbolParams")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/symbols"]["post"]["parameters"] =
         json!([{"$ref": "#/components/parameters/Limit"}]);
     assert_invalid(&document, "must not declare query selectors")?;
 
     for status in ["200", "404", "503"] {
-        let mut document = contract()?;
+        let mut document = contract();
         document["paths"]["/v1/symbols"]["post"]["responses"][status]["content"]["application/json"]
             ["schema"] = json!({"$ref": "#/components/schemas/PackageSymbolPage"});
         assert_invalid(
@@ -630,25 +621,25 @@ fn exact_symbol_contract_rejects_name_selectors_and_legacy_pages() -> TestResult
 
 #[test]
 fn exact_symbol_contract_requires_typed_miss_and_unavailability() -> TestResult {
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/symbols"]["post"]["responses"]
         .as_object_mut()
         .ok_or("responses must be an object")?
         .remove("404");
     assert_invalid(&document, "response statuses differ")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["paths"]["/v1/symbols"]["post"]["responses"]["503"]["content"]
         .as_object_mut()
         .ok_or("response content must be an object")?
         .remove("application/json");
     assert_invalid(&document, "must declare typed outcomes and problem details")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["GetSymbolParams"]["required"] = json!([]);
     assert_invalid(&document, "shared schema `GetSymbolParams` differs")?;
 
-    let mut document = contract()?;
+    let mut document = contract();
     document["components"]["schemas"]["GetSymbolResult"]["oneOf"]
         .as_array_mut()
         .ok_or("symbol outcomes must be an array")?
@@ -661,7 +652,7 @@ fn exact_symbol_contract_requires_typed_miss_and_unavailability() -> TestResult 
 fn merged_edges_validate_with_optional_provider_sets() -> TestResult {
     use rift_protocol::edge_read::EdgeInclude;
     use rift_protocol::index::StoredEdge;
-    let document = contract()?;
+    let document = contract();
     let schema = json!({"$ref":"#/components/schemas/Edge", "components": document["components"]});
     let validator = jsonschema::validator_for(&schema)?;
     let mut rows = Vec::new();
@@ -718,7 +709,7 @@ fn merged_edges_validate_with_optional_provider_sets() -> TestResult {
 
 #[test]
 fn traversal_search_accepts_typed_provider_projection() -> TestResult {
-    let document = contract()?;
+    let document = contract();
     let schema = json!({"$ref":"#/components/schemas/PackageSearchRequest", "components":document["components"]});
     let validator = jsonschema::validator_for(&schema)?;
     let mut request = rift_cloud_client::PackageSearchRequest {

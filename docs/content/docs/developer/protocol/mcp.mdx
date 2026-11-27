@@ -424,11 +424,9 @@ owner identically.
 
 A `local@name` owner selects an extra project accepted by the connection:
 
-<ReadExample name="named-symbol" />
-
 A package or runtime identity names its owner across releases, as
-`rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer`, and `revision` selects the release to read,
-as `rift://revision/cargo/crates.io/itoa@1.0.18`. Discover these identities through
+`rift://symbol/cargo/crates.io/demo/rust/demo/beacon`, and `revision` selects the release to read,
+as `rift://revision/cargo/crates.io/demo@1.0.0`. Discover these identities through
 `SERVICE :search` using `:scope "global"` and `:packages`. When the request omits
 `revision`, the server reads a package at the version the workspace's dependencies pin, and otherwise
 the newest release the global index collected. The answer **MUST** carry the release it read as
@@ -758,8 +756,7 @@ answers from the nearest collected release under `package_substituted`. A packag
 collected release answers `package_absent`, or `package_requirement_absent` for an entry without
 `version`.
 
-This search requests Tokio 1.54.1 alongside project results. The local fixture runs with the
-Global connection disabled, so the response shows unavailability:
+This search requests `demo` 1.0.0 alongside project results:
 
 <ReadExample name="pinned-package" />
 
@@ -819,7 +816,7 @@ The compact text has these parts:
 - under a language entry, `include` and `exclude` lines with their patterns joined by `, `, each only when the list is not empty
 - a source entry as `path · language`, with only the path when no language matched
 
-The tabs below show the page of a workspace with one TypeScript language and one source unit:
+The tabs below show the source catalog of the example project:
 
 <ReadExample name="workspace" />
 
@@ -829,6 +826,8 @@ logs [`local_index_preparing`](#reads) and the page lists prepared files.
 After preparation, the catalog also includes visible files without enabled syntax.
 
 ## Errors
+
+The [error registry](/docs/developer/errors) lists registered slugs, messages, and evidence fields.
 
 A failure travels by its class. A **tool execution failure** is a Rift operating failure on a
 `get_symbol`, `search`, or `facets` call, such as invalid input, a crossed limit, or a storage

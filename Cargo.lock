@@ -4797,6 +4797,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2 0.11.1",
  "tar",
  "tempfile",
@@ -4897,17 +4898,7 @@ name = "rift-error"
 version = "0.0.104"
 dependencies = [
  "rift-error-macros",
-]
-
-[[package]]
-name = "rift-error-codegen"
-version = "0.0.104"
-dependencies = [
- "rift-error",
  "serde",
- "syn 2.0.119",
- "thiserror 2.0.21",
- "toml",
 ]
 
 [[package]]
@@ -8018,7 +8009,9 @@ dependencies = [
 name = "xtask"
 version = "0.0.104"
 dependencies = [
- "rift-error-codegen",
+ "rift-error",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

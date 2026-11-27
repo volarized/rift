@@ -10,7 +10,7 @@ mod runtime;
 /// Ambient context constructors.
 pub mod ctx;
 
-/// Generated error builders, grouped by registry namespace.
+/// Registered error builders, grouped by namespace.
 pub mod errors;
 
 pub use evidence::EvidenceFor;
@@ -160,7 +160,7 @@ macro_rules! format {
 }
 
 #[cfg(test)]
-mod generated_api_tests {
+mod registry_api_tests {
     #![allow(private_interfaces, unreachable_pub)]
 
     use super::{ErrorSlug, RiftError, errors};

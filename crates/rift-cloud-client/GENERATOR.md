@@ -1,8 +1,9 @@
 # Rust client generator selection
 
-Rift generates the checked wire module from
-`docs/public/global-api.openapi.json`. Runtime builds use the checked Rust source and need no
-generator or network access.
+`cargo xtask docs` exports `docs/public/global-api.openapi.json` from the endpoint definitions,
+protocol schemas, and examples in Rust. `just generate` feeds that OpenAPI document to `oas3-gen`
+to update the checked wire module. The 0.28.0 generator ships as a command, and Cargo builds use
+the checked Rust module without installing it.
 
 ## Selected generator
 
@@ -14,7 +15,7 @@ Source reviewed before use:
   published 0.28.0 crate
 - [oas3-gen source](https://github.com/eklipse2k8/oas3-gen)
 
-Generation command:
+Type generation command used by `just generate`:
 
 ```sh
 oas3-gen generate types -q --enum-mode relaxed --no-ordered-collections \
@@ -22,12 +23,12 @@ oas3-gen generate types -q --enum-mode relaxed --no-ordered-collections \
   -o crates/rift-cloud-client/src/generated.rs
 ```
 
-Observed output: 53 types, comprising 32 structs, 16 enums, and 5 type aliases, with 4
-operations converted. Two clean runs produced equal output.
-
-`just generate` runs this command directly. `just generate-check` writes fresh output to a
-temporary file and compares its bytes with the checked module. Keep generated source
-rustfmt-skipped so checked bytes remain exact `oas3-gen` output. Types mode emits operation request
+`just generate-check` exports fresh OpenAPI, applies the same generator adaptations as
+`just generate`, and compares the resulting Rust bytes with the checked module. The generator
+input omits the edge request's object-presence condition because the 0.28.0 generator emits an
+invalid constructor for it. The output spells two large bounds as `u64` literals so the generated
+validators compile. The published OpenAPI document retains the full edge request condition.
+Keep generated source rustfmt-skipped. Types mode emits operation request
 and query types, response parsers, and status enums without a transport client or default endpoint.
 `GlobalClient` owns configured endpoint selection, bounds, retries, caches, and response streaming.
 Public exports contain the generated wire types needed by callers.

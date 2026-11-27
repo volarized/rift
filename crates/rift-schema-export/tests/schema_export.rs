@@ -200,12 +200,15 @@ fn package_index_schema_document_is_deterministic() -> TestResult {
 
 #[test]
 fn global_contract_target_validates_the_published_contract() -> TestResult {
-    let request = export::parse_arguments([
+    let directory = tempfile::tempdir()?;
+    let target = "--global-contract".to_owned();
+    let output = directory.path().display().to_string();
+    export::run(&export::parse_arguments([target.clone(), output.clone()])?)?;
+    export::run(&export::parse_arguments([
         "--check".to_owned(),
-        "--global-contract".to_owned(),
-        repository_root()?.join("docs").display().to_string(),
-    ])?;
-    export::run(&request)?;
+        target,
+        output,
+    ])?)?;
     Ok(())
 }
 
@@ -215,8 +218,7 @@ fn global_contract_write_restores_shared_models_and_keeps_route_examples() -> Te
     let public = directory.path().join("public");
     fs::create_dir_all(&public)?;
     let path = public.join("global-api.openapi.json");
-    let source = repository_root()?.join("docs/public/global-api.openapi.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(source)?)?;
+    let mut document = rift_cloud_client::contract::document();
     let routes = document["paths"].clone();
     document["components"]["schemas"]["FacetsParams"] = serde_json::json!({});
     fs::write(&path, serde_json::to_vec(&document)?)?;
@@ -272,19 +274,18 @@ fn check_fails_when_the_package_index_schema_is_stale() -> TestResult {
     Ok(())
 }
 
-/// A tree holding every input the analyzer manifest names, taken from the committed
-/// manifest itself: it lists each pinned source path, and the lockfile is copied from the
+/// A tree holding every input the analyzer manifest names. The renderer lists each pinned
+/// source path, and the lockfile is copied from the
 /// repository so the grammar pins are the shipped ones.
 fn analyzer_root(repository: &std::path::Path) -> TestResult<tempfile::TempDir> {
-    let committed: Value = serde_json::from_str(&fs::read_to_string(
-        repository.join(rift_analysis::analyzer_manifest_path()),
-    )?)?;
+    let generated: Value =
+        serde_json::from_str(&rift_analysis::render_analyzer_manifest(repository)?)?;
     let root = tempfile::tempdir()?;
     fs::copy(
         repository.join("Cargo.lock"),
         root.path().join("Cargo.lock"),
     )?;
-    for source in committed["sources"]
+    for source in generated["sources"]
         .as_array()
         .ok_or("the manifest lists sources")?
     {
@@ -307,7 +308,7 @@ fn repository_root() -> TestResult<std::path::PathBuf> {
 }
 
 /// Writing the analyzer manifest below a root, then checking it, is the pair
-/// `just generate` and `just generate-check` run: the write lands at the committed path
+/// the exporter supports: the write lands at the analyzer manifest path
 /// and the check over the same tree accepts it.
 #[test]
 fn the_analyzer_manifest_writes_below_its_root_and_checks_clean() -> TestResult {

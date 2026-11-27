@@ -1,6 +1,6 @@
 /// Extracts registered evidence from a domain value into an error builder.
 pub trait EvidenceFor<Target, Output, Tag = ()> {
-    /// Applies the value's evidence to a generated error builder.
+    /// Applies the value's evidence to a registered error builder.
     fn apply_evidence(&self, target: Target) -> Output;
 }
 

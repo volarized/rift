@@ -67,12 +67,13 @@ atomically replaces the current executable.
 ## Protocol development
 
 The protocol models are Rust types in `crates/rift-protocol/src`, and the MCP server in
-`crates/rift-mcp` serves tools built from them. The document at `docs/public/mcp.json` is the
-served tool surface - names, descriptions, and JSON Schemas serialized from the same tool router
-the server runs. Regenerate and verify the export with:
+`crates/rift-mcp` serves tools built from them. The docs build runs `cargo xtask docs` to export
+the served tool surface to `docs/public/mcp.json`. Tool names, descriptions, and JSON Schemas
+come from the router the server runs. Generate the docs data and verify the generated files
+distributed with the checkout:
 
 ```sh
-just generate
+cargo xtask docs
 just generate-check
 ```
 

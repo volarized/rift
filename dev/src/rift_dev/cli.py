@@ -276,10 +276,10 @@ def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None
 @app.command()
 def generate(
     check: Annotated[
-        bool, typer.Option(help="Fail on a stale generated file instead of writing.")
+        bool, typer.Option(help="Fail when a generated file shipped in the checkout differs.")
     ] = False,
 ) -> None:
-    """Write the schemas, analyzer manifest, API client, and CLI help transcript."""
+    """Export docs data and write or check generated files shipped in the checkout."""
     generated.generate(check)
 
 

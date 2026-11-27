@@ -7,7 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-rift-error-codegen.workspace = true
+rift-error = { workspace = true, features = ["registry"] }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

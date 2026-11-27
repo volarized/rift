@@ -5,20 +5,14 @@ import { Maximize2, X } from "lucide-react";
 import { dereference, type JsonSchema, PayloadTree, schemaType } from "@/components/json-tree";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import mcpDocumentJson from "../../public/mcp.json";
 
-type McpToolDefinition = {
+export type McpToolDefinition = {
   description: string;
   input_schema: JsonSchema;
   name: string;
   output_schema: JsonSchema;
 };
 
-type McpDocument = {
-  tools: McpToolDefinition[];
-};
-
-const mcpDocument = mcpDocumentJson as unknown as McpDocument;
 const RECURSION_DEPTH_MAX = 8;
 
 function schemaTypeText(schema: JsonSchema, root: JsonSchema): string {
@@ -223,10 +217,7 @@ function JsonShape({
   );
 }
 
-export function McpTool({ name }: { name: string }) {
-  const tool = mcpDocument.tools.find((candidate) => candidate.name === name);
-  if (!tool) throw new Error(`MCP schema has no tool named ${name}`);
-
+export function McpTool({ tool }: { tool: McpToolDefinition }) {
   const planned = tool.input_schema["rift:since"] === undefined;
   return (
     <section

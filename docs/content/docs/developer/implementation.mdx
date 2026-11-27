@@ -1177,52 +1177,29 @@ store that published it, and deciding which identities win does not.
 
 ## Error registry
 
-`crates/rift-error/errors.toml` defines concrete Rift failures and evidence fields. `rift-error-codegen` validates those
-definitions and writes the `errors` module of `rift-error`: `crates/rift-error/src/errors.rs` holds the registry
-constants and one `pub mod` line per namespace, and `crates/rift-error/src/errors/<namespace>.rs` holds one
-`__rift_error_definition!` declaration per error in that namespace, carrying only its name, slug, message, action, and
-fields. A namespace is the slug segment after `rift.`, such as `analysis` or `cli`. Builder types, bounds, conversions, typestate, and setter
-names are derived by the macros, not written into the file. The `committed_registry_files_stay_within_generated_line_bound`
-test in `rift-error-codegen` holds each generated file under a fixed line bound.
+`crates/rift-error/src/errors/<namespace>.rs` declares each error's name, message, action, and
+evidence fields. The namespace and name form a slug such as `rift.analysis.context7_malformed`.
+The declarations supply the error builders and the [error registry](/docs/developer/errors).
 
-```rust
-__rift_error_definition!(
-    context7_malformed,
-    slug = "rift.analysis.context7_malformed",
-    message = "context7.json has an invalid JSON shape",
-    action = "correct context7.json shape and retry",
-    fields = {
-        file: required(path),
-        key: optional(string),
-        source: optional(source),
-    },
-);
-```
-
-Each field reads `name: presence(kind, flags...)`. Presence is `required` or `optional`. The kind is the field's
-`type` in `errors.toml` (`string`, `bool`, `integer`, `unsigned`, `pid`, `port`, `path`, `duration`), or its role
-(`source`, `cause`). The flags are `hidden` for `display = false` and `sensitive` for `sensitive = true`.
+Each field reads `name: presence(kind, flags...)`. Presence is `required` or `optional`. The kind
+sets the evidence type or the field's role as a `source` or `cause`. The flags are `hidden` and
+`sensitive`.
 
 The macros in `crates/rift-error/src/definition` expand each declaration into the builder. The kind table maps each
 kind to the Rust bound a setter accepts and the `ErrorValue` conversion it applies. Each required field adds one builder
 type parameter that starts at `Unset` and becomes `Set` when its setter runs. `.error()`, `.fail()`, and the
 `IntoRiftError` implementation exist only once every parameter is `Set`. Each optional field adds `.maybe_<field>()`,
 which takes `Option<T>` and leaves the builder type unchanged. The `maybe_<field>` and `<Field>State` names come from
-`rift-error-macros`, which depends on `proc_macro` alone. A crate that reaches `rift-error` by path, such as the
-generated-code compile test in `rift-error-codegen`, therefore builds it with `--offline` and no downloaded crates.
+`rift-error-macros`, which depends on `proc_macro` alone.
 
 A `source` field retains an underlying Rust error and exposes it through `std::error::Error::source`.
 A `cause` field retains another `RiftError` in that chain. The runtime also converts owned and
 borrowed `RiftError` values, including shared `Arc` values, without dropping their source chains.
 Sensitive evidence is redacted in rendered output.
 
-The registry does not contain transport codes. The MCP adapter maps each slug to its wire code and
-retry directive, then supplies the request phase with `.tool_error(phase)`. Calling `.fail()` on
-that representation returns its JSON-RPC error. `cargo xtask errors generate` updates generated
-Rust. The generator writes the declarations as text in the layout above, which `rustfmt` leaves
-unchanged, and parses the result before returning it. `cargo xtask errors generate` also removes any file under `crates/rift-error/src/errors/` that the registry no longer
-generates. `cargo xtask errors check` compares generated output without writing it and fails on a differing, missing,
-or unexpected file. CI runs that check through `just generate-check`.
+The MCP adapter maps each slug to its wire code and retry directive, then supplies the request
+phase with `.tool_error(phase)`. Calling `.fail()` on that representation returns its JSON-RPC
+error. The docs build exports the registry from `rift-error` as `errors.json`.
 
 ## Vector search
 
@@ -1611,10 +1588,9 @@ bytes under the same analyzer revision produce byte-identical output, and an ada
 added, replaced, and removed records by identity and digest alone. A publication addresses source
 by package-relative path and source unit, so no machine's directory layout reaches a consumer.
 
-The analyzer manifest is generated beside the served schemas and committed at
-`crates/rift-analysis/src/analyzer-manifest.json`, so a change to any of those files
-that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
-exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
+The `rift-analysis` build computes `analyzer_revision` from the same inputs as the manifest. The
+publication's own schema is exported to
+[`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
 `documentation.coverage` always states `fields_omitted`: the headings, languages, links, and
 reference spellings left out of parsed documentation sources, as `limit_exceeded` and
