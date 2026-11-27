@@ -7125,3 +7125,78 @@ fn closed_anonymous_commonjs_callable_keeps_its_exact_literal_properties() {
         }));
     }
 }
+
+#[test]
+fn checked_commonjs_loads_keep_reads_of_the_required_namespace() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const SOURCE: &str = concat!(
+        "const helper = require('./helper');\n",
+        "function run() { return helper.apply(); }\n",
+        "function shadow(helper) { return helper.apply(); }\n",
+        "let changing = require('./helper');\n",
+        "changing = {};\n",
+        "function ignore() { return changing.apply(); }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "module.exports = require('./helper');\n"),
+            (
+                "helper.js",
+                "function apply() { return 7; }\nmodule.exports = { apply };\n",
+            ),
+            ("secondary.js", SOURCE),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked CommonJS sources");
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid facts");
+    let site = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "secondary.js")
+        .expect("secondary source");
+    let receiver = SOURCE.find("helper.apply").expect("written receiver");
+    let receiver_range = module_runtime_range(receiver, "helper");
+    let reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().ends_with("beacon%2Fhelper.js")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|span| span.unit == site.unit)
+        })
+        .collect::<Vec<_>>();
+    let [read] = reads.as_slice() else {
+        panic!("expected one checked receiver Read, got {reads:?}");
+    };
+    assert!(read.from.as_str().ends_with("secondary.js/run"));
+    assert_eq!(
+        read.occurrence.as_ref().expect("receiver span").range,
+        receiver_range
+    );
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from == read.from
+            && edge.to.as_str().ends_with("secondary.js/helper")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|span| span.unit == site.unit && span.range == receiver_range)
+    }));
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from == read.from
+            && edge.to.as_str().ends_with("helper.js/apply")
+            && edge.occurrence.as_ref().is_some_and(|span| {
+                span.unit == site.unit
+                    && span.range == module_runtime_range(receiver, "helper.apply()")
+            })
+    }));
+}
