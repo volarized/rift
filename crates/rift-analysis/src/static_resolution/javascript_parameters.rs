@@ -275,6 +275,77 @@ impl<'source> Index<'source> {
         Some(occurrence)
     }
 
+    pub(super) fn resolve_javascript_wrapped_arrow_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self
+            .files
+            .values()
+            .filter(|file| !file.javascript_arrow_wrapped_parameters.is_empty())
+        {
+            let mut bodies = BTreeMap::new();
+            for &(scope, body) in file.facts.javascript_wrapped_arrow_bodies() {
+                if !work.charge() {
+                    break 'files;
+                }
+                bodies.insert(scope, body);
+            }
+            for reference in file.facts.references() {
+                if !work.charge() {
+                    break 'files;
+                }
+                if reference.role == ReferenceRole::Read
+                    && !file.members.contains_key(&reference.target)
+                    && let Some(occurrence) =
+                        self.javascript_wrapped_arrow_read(file, reference.target, &bodies, work)
+                {
+                    result.occurrences.push(occurrence);
+                    result.unresolved_sites = result.unresolved_sites.saturating_sub(1);
+                }
+            }
+        }
+        result.javascript_wrapped_arrow_read_start =
+            (result.occurrences.len() > start).then_some(start);
+    }
+
+    fn javascript_wrapped_arrow_read(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        bodies: &BTreeMap<ByteRange, ByteRange>,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let role = ReferenceRole::Read;
+        let binding = js_binding(
+            file,
+            &self.javascript,
+            file.text(range)?,
+            range.start,
+            role,
+            work,
+        )?;
+        let symbol = *file
+            .javascript_arrow_wrapped_parameters
+            .get(&binding.name)?;
+        let owner = file.qualified_target(symbol.container.as_deref()?)?;
+        if binding.kind != StaticBindingKind::Shadow
+            || owner.symbol.body_range != Some(binding.scope)
+            || !bodies.get(&binding.scope)?.encloses(range)
+        {
+            return None;
+        }
+        let target = Target {
+            file: file.document,
+            symbol,
+        };
+        let mut occurrence = self.occurrence(file, range, range, role, target)?;
+        occurrence.edge_from = Some(self.javascript_call_from(file, range, work)?);
+        Some(occurrence)
+    }
+
     fn ecmascript_scoped_parameter_read(
         &self,
         file: &File<'source>,

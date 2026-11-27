@@ -529,6 +529,8 @@ pub struct StaticFactsParts {
     pub destructured: Vec<(ByteRange, Option<ByteRange>, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
+    /// Direct JavaScript arrow initializers with written defaulted or rest parameters.
+    pub javascript_wrapped_arrow_bodies: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
     pub function_scopes: Vec<ByteRange>,
     /// Static class initialization blocks.
@@ -838,6 +840,12 @@ impl StaticFacts {
         &self.0.function_values
     }
 
+    /// The direct arrow's span and the expression or block in its body.
+    #[must_use]
+    pub fn javascript_wrapped_arrow_bodies(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.javascript_wrapped_arrow_bodies
+    }
+
     /// Function expressions that establish their own receiver.
     #[must_use]
     pub fn function_scopes(&self) -> &[ByteRange] {
@@ -1142,6 +1150,7 @@ impl StaticFacts {
             vector_capacity(&self.0.declared_returns),
             vector_capacity(&self.0.destructured),
             vector_capacity(&self.0.function_values),
+            vector_capacity(&self.0.javascript_wrapped_arrow_bodies),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
             vector_capacity(&self.0.heritage_edges),
@@ -1238,6 +1247,7 @@ impl StaticFacts {
             self.declared_returns().len(),
             self.destructured().len(),
             self.function_values().len(),
+            self.javascript_wrapped_arrow_bodies().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
             self.heritage_edges().len(),
@@ -1506,6 +1516,18 @@ impl StaticFacts {
                 .all(|(name, spread)| valid(*name) && valid(*spread))
     }
 
+    fn function_ranges_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.function_values()
+            .iter()
+            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
+            && self
+                .javascript_wrapped_arrow_bodies()
+                .iter()
+                .all(|(scope, body)| valid(*scope) && valid(*body) && contains(*scope, *body))
+            && self.function_scopes().iter().copied().all(valid)
+            && self.static_blocks().iter().copied().all(valid)
+    }
+
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
@@ -1542,12 +1564,7 @@ impl StaticFacts {
                 }
         }) && (argument_requires.is_empty()
             || self.checked_argument_requires(source, limits, argument_requires));
-        let functions = self
-            .function_values()
-            .iter()
-            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
-            && self.function_scopes().iter().copied().all(valid)
-            && self.static_blocks().iter().copied().all(valid);
+        let functions = self.function_ranges_valid(valid);
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
             .reexports()

@@ -48,6 +48,7 @@ pub struct PackageBindingSlots {
     typescript_callable_type_parameter: usize,
     typescript_index_signature_parameter: usize,
     javascript_wrapped_parameter: usize,
+    javascript_arrow_wrapped_parameter: usize,
     javascript_destructured_parameter: usize,
     typescript_function_type_parameter: usize,
     typescript_signature_type_parameter: usize,
@@ -99,6 +100,7 @@ impl PackageBindingSlots {
             typescript_callable_type_parameter: 0,
             typescript_index_signature_parameter: 0,
             javascript_wrapped_parameter: 0,
+            javascript_arrow_wrapped_parameter: 0,
             javascript_destructured_parameter: 0,
             typescript_function_type_parameter: 0,
             typescript_signature_type_parameter: 0,
@@ -287,6 +289,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves remaining slots for defaulted and rest parameters of named arrow initializers.
+    #[must_use]
+    pub const fn with_javascript_arrow_wrapped_parameters(mut self, count: usize) -> Self {
+        self.javascript_arrow_wrapped_parameter = count;
+        self
+    }
+
     /// Holds the slots left for authored JavaScript object and array parameter bindings.
     #[must_use]
     pub const fn with_javascript_destructured_parameters(mut self, count: usize) -> Self {
@@ -391,6 +400,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_callable_type_parameter)
             .saturating_add(self.typescript_index_signature_parameter)
             .saturating_add(self.javascript_wrapped_parameter)
+            .saturating_add(self.javascript_arrow_wrapped_parameter)
             .saturating_add(self.javascript_destructured_parameter)
             .saturating_add(self.typescript_function_type_parameter)
             .saturating_add(self.typescript_signature_type_parameter)
@@ -433,6 +443,8 @@ impl PackageBindingSlots {
             &mut self.typescript_index_signature_parameter
         } else if symbol.is_javascript_wrapped_parameter() {
             &mut self.javascript_wrapped_parameter
+        } else if symbol.is_javascript_arrow_wrapped_parameter() {
+            &mut self.javascript_arrow_wrapped_parameter
         } else if symbol.is_javascript_destructured_parameter() {
             &mut self.javascript_destructured_parameter
         } else if symbol.is_typescript_method_type_parameter() {

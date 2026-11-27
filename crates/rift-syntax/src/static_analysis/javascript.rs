@@ -1047,6 +1047,13 @@ impl Kinds {
             return Ok(());
         }
         let range = byte_range(element)?;
+        if self.type_shapes.is_none()
+            && let Some(body) = crate::ecmascript::arrow_body_with_wrapped_parameters(element)
+        {
+            facts
+                .javascript_wrapped_arrow_bodies
+                .push((range, byte_range(body)?));
+        }
         if element.kind_id() != self.arrow {
             facts.function_scopes.push(range);
         }

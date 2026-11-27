@@ -100,6 +100,7 @@ mod wrapped_parameters;
 pub(crate) use conditional_type_members::check as checked_conditional_type_members;
 pub use inline_import_types::CheckedInlineTypeImport;
 pub(crate) use inline_import_types::check as checked_inline_import_types;
+pub(crate) use wrapped_parameters::arrow_body_with_wrapped_parameters;
 
 use tree_sitter::{Node, Parser};
 
@@ -265,6 +266,7 @@ pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_para
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
+pub(crate) const ARROW_WRAPPED_PARAMETER_KIND: &str = "javascript_arrow_wrapped_parameter";
 pub(crate) const DESTRUCTURED_PARAMETER_KIND: &str = "javascript_destructured_parameter";
 pub(crate) const TYPED_DESTRUCTURED_PARAMETER_KIND: &str = "typescript_destructured_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
@@ -1691,6 +1693,10 @@ impl EcmaScriptRules<'_> {
                     wrapped_parameters::declared_name(written)
                         .map(|name| (name, WRAPPED_PARAMETER_KIND))
                         .or_else(|| {
+                            wrapped_parameters::arrow_parameter_name(written)
+                                .map(|name| (name, ARROW_WRAPPED_PARAMETER_KIND))
+                        })
+                        .or_else(|| {
                             wrapped_parameters::destructured_name(written, false)
                                 .map(|name| (name, DESTRUCTURED_PARAMETER_KIND))
                         })
@@ -2032,7 +2038,10 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .kinds
             .formal_parameter_kinds
             .is_empty()
-            .then(|| wrapped_parameters::declared_name(syntax_element))
+            .then(|| {
+                wrapped_parameters::declared_name(syntax_element)
+                    .or_else(|| wrapped_parameters::arrow_parameter_name(syntax_element))
+            })
             .flatten();
         let name = self
             .kinds
@@ -2578,6 +2587,7 @@ fn append_package_parameters(
         callable_types,
         index_signatures,
         wrapped,
+        arrow_wrapped,
         destructured,
         method_types,
         function_types,
@@ -2657,6 +2667,9 @@ fn append_package_parameters(
         wrapped_parameters::accepted_owner,
     );
     type_signature_parameters::append_mapped_types(root, symbols, mapped_types);
+    checked_parameters::append_under_checked_owner(symbols, arrow_wrapped, facts, |owner, name| {
+        wrapped_parameters::arrow_binding_scope(root, owner, name)
+    });
 }
 
 #[derive(Default)]
@@ -2666,6 +2679,7 @@ struct ParameterDeclarations {
     callable_types: Vec<crate::SyntaxSymbol>,
     index_signatures: Vec<crate::SyntaxSymbol>,
     wrapped: Vec<crate::SyntaxSymbol>,
+    arrow_wrapped: Vec<crate::SyntaxSymbol>,
     destructured: Vec<crate::SyntaxSymbol>,
     function_types: Vec<crate::SyntaxSymbol>,
     signature_types: Vec<crate::SyntaxSymbol>,
@@ -2688,6 +2702,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.index_signatures
         } else if symbol.is_javascript_wrapped_parameter() {
             &mut candidates.wrapped
+        } else if symbol.is_javascript_arrow_wrapped_parameter() {
+            &mut candidates.arrow_wrapped
         } else if symbol.is_javascript_destructured_parameter() {
             &mut candidates.destructured
         } else if symbol.is_typescript_method_type_parameter() {
@@ -2919,6 +2935,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(WRAPPED_PARAMETER_KIND);
+    }
+    if name == ARROW_WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(ARROW_WRAPPED_PARAMETER_KIND);
     }
     if name == DESTRUCTURED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(DESTRUCTURED_PARAMETER_KIND);
