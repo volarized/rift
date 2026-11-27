@@ -429,7 +429,7 @@ impl Kinds {
         self.record_type_union_branch(syntax_element, facts)?;
         self.record_returned_object(visited, facts)?;
         self.record_spread_value(syntax_element, facts)?;
-        self.record_module_statement(visited, facts);
+        self.record_module_statement(visited, source, facts)?;
         self.record_module_syntax(visited, source, facts);
         self.record_commonjs_write(visited, source, facts)?;
         self.record_skippable(visited, facts)?;
@@ -956,12 +956,53 @@ impl Kinds {
         })
     }
 
-    fn record_module_statement(&self, visited: Visited<'_, '_>, facts: &mut StaticFactsParts) {
-        facts.javascript_module_statement |= [self.import, self.export]
-            .contains(&visited.syntax_element().kind_id())
-            && visited
+    fn record_module_statement(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let statement = visited.syntax_element();
+        if ![self.import, self.export].contains(&statement.kind_id())
+            || visited
                 .parent()
-                .is_some_and(|parent| parent.syntax_element().kind_id() == self.scopes[0]);
+                .is_none_or(|parent| parent.syntax_element().kind_id() != self.scopes[0])
+        {
+            return Ok(());
+        }
+        facts.javascript_module_statement = true;
+        if statement.kind_id() == self.import
+            && self.type_shapes.is_some()
+            && !statement.has_error()
+            && let Some(literal) = statement.child_by_field_id(self.source)
+        {
+            self.record_relative_module_import(statement, literal, source, facts)?;
+        }
+        Ok(())
+    }
+
+    fn record_relative_module_import(
+        &self,
+        statement: Node<'_>,
+        literal: Node<'_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let mut cursor = statement.walk();
+        let has_clause = statement
+            .named_children(&mut cursor)
+            .any(|child| child.kind_id() == self.import_clause);
+        if has_clause
+            && self.literal(literal, source)?.is_some()
+            && text(literal, source)
+                .and_then(|token| token.get(1..))
+                .is_some_and(|specifier| {
+                    specifier.starts_with("./") || specifier.starts_with("../")
+                })
+        {
+            facts.typescript_module_imports.push(byte_range(literal)?);
+        }
+        Ok(())
     }
 
     fn record_module_syntax(
@@ -1047,6 +1088,13 @@ impl Kinds {
             return Ok(());
         }
         let range = byte_range(element)?;
+        if self.type_shapes.is_none()
+            && let Some(body) = crate::ecmascript::arrow_body_with_wrapped_parameters(element)
+        {
+            facts
+                .javascript_wrapped_arrow_bodies
+                .push((range, byte_range(body)?));
+        }
         if element.kind_id() != self.arrow {
             facts.function_scopes.push(range);
         }

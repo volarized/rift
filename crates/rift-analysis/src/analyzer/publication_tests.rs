@@ -9,6 +9,7 @@ use rift_core::ProjectPath;
 
 mod aliases;
 mod annotations;
+mod arrow_parameters;
 mod commonjs_literals;
 mod conditional_types;
 mod declaration_parameters;

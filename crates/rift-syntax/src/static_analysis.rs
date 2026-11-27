@@ -495,6 +495,8 @@ pub struct StaticFactsParts {
     pub skippable: Vec<ByteRange>,
     /// Whether an ECMAScript import or export statement stands directly in the source file.
     pub javascript_module_statement: bool,
+    /// Quoted relative specifiers of TypeScript imports with a clause in the source file.
+    pub typescript_module_imports: Vec<ByteRange>,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
     /// Value accesses and type references.
@@ -529,6 +531,8 @@ pub struct StaticFactsParts {
     pub destructured: Vec<(ByteRange, Option<ByteRange>, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
+    /// Direct JavaScript arrow initializers with written defaulted or rest parameters.
+    pub javascript_wrapped_arrow_bodies: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
     pub function_scopes: Vec<ByteRange>,
     /// Static class initialization blocks.
@@ -664,6 +668,12 @@ impl StaticFacts {
     #[must_use]
     pub fn has_javascript_module_statement(&self) -> bool {
         self.0.javascript_module_statement
+    }
+
+    /// Quoted relative specifiers of TypeScript imports outside every ambient module and namespace.
+    #[must_use]
+    pub fn typescript_module_imports(&self) -> &[ByteRange] {
+        &self.0.typescript_module_imports
     }
 
     /// Assignments to `module.exports` or a computed key of `module` that run while the file
@@ -836,6 +846,12 @@ impl StaticFacts {
     #[must_use]
     pub fn function_values(&self) -> &[(ByteRange, ByteRange)] {
         &self.0.function_values
+    }
+
+    /// The direct arrow's span and the expression or block in its body.
+    #[must_use]
+    pub fn javascript_wrapped_arrow_bodies(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.javascript_wrapped_arrow_bodies
     }
 
     /// Function expressions that establish their own receiver.
@@ -1127,6 +1143,7 @@ impl StaticFacts {
         [
             self.commonjs_export()
                 .map_or(0, |export| vector_capacity(&export.initialized)),
+            vector_capacity(&self.0.typescript_module_imports),
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
             vector_capacity(&self.0.member_aliases),
@@ -1142,6 +1159,7 @@ impl StaticFacts {
             vector_capacity(&self.0.declared_returns),
             vector_capacity(&self.0.destructured),
             vector_capacity(&self.0.function_values),
+            vector_capacity(&self.0.javascript_wrapped_arrow_bodies),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
             vector_capacity(&self.0.heritage_edges),
@@ -1223,6 +1241,7 @@ impl StaticFacts {
         let lengths = [
             self.commonjs_export()
                 .map_or(0, |export| export.initialized.len()),
+            self.typescript_module_imports().len(),
             self.references().len(),
             self.members().len(),
             self.member_aliases().len(),
@@ -1238,6 +1257,7 @@ impl StaticFacts {
             self.declared_returns().len(),
             self.destructured().len(),
             self.function_values().len(),
+            self.javascript_wrapped_arrow_bodies().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
             self.heritage_edges().len(),
@@ -1506,6 +1526,18 @@ impl StaticFacts {
                 .all(|(name, spread)| valid(*name) && valid(*spread))
     }
 
+    fn function_ranges_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.function_values()
+            .iter()
+            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
+            && self
+                .javascript_wrapped_arrow_bodies()
+                .iter()
+                .all(|(scope, body)| valid(*scope) && valid(*body) && contains(*scope, *body))
+            && self.function_scopes().iter().copied().all(valid)
+            && self.static_blocks().iter().copied().all(valid)
+    }
+
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
@@ -1515,11 +1547,13 @@ impl StaticFacts {
                 .zip(end)
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
-        if self.commonjs_export().is_some_and(|export| {
-            !valid(export.assignment)
-                || !export.initialized.iter().copied().all(valid)
-                || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
-        }) {
+        if !self.typescript_module_imports().iter().copied().all(valid)
+            || self.commonjs_export().is_some_and(|export| {
+                !valid(export.assignment)
+                    || !export.initialized.iter().copied().all(valid)
+                    || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
+            })
+        {
             return errors::syntax::facts_range_invalid().fail();
         }
         let edges = self.heritage_edges().iter().all(|edge| {
@@ -1542,12 +1576,7 @@ impl StaticFacts {
                 }
         }) && (argument_requires.is_empty()
             || self.checked_argument_requires(source, limits, argument_requires));
-        let functions = self
-            .function_values()
-            .iter()
-            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
-            && self.function_scopes().iter().copied().all(valid)
-            && self.static_blocks().iter().copied().all(valid);
+        let functions = self.function_ranges_valid(valid);
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
             .reexports()

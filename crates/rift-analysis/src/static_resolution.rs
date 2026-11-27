@@ -93,6 +93,10 @@ pub(crate) struct StaticResolution {
     pub(crate) commonjs_argument_import_start: Option<usize>,
     /// First checked selector reference to a declaration in a relative imported module.
     pub(crate) typescript_imported_export_start: Option<usize>,
+    /// First type use of a declaration merged with a namespace, after established edges.
+    pub(crate) typescript_namespace_type_start: Option<usize>,
+    /// Unresolved plain type names that can have two checked declaration facets.
+    pub(crate) typescript_namespace_type_sites: BTreeMap<rift_core::SourceUnitId, Vec<ByteRange>>,
     /// First containment edge of a physically scoped literal declaration.
     pub(crate) literal_start: Option<usize>,
     /// Containment awaiting the capacity left by existing references.
@@ -226,6 +230,8 @@ pub(crate) struct StaticResolution {
     /// First appended type use of a conditional inference parameter.
     pub(crate) typescript_inference_parameter_start: Option<usize>,
     pub(crate) deferred_typescript_inference_parameters: Vec<StaticOccurrence>,
+    /// First checked body Read of a defaulted or rest parameter in a JavaScript arrow.
+    pub(crate) javascript_wrapped_arrow_read_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -411,6 +417,8 @@ fn resolve_by<'source>(
     index.resolve_commonjs_argument_imports(&mut work, &mut resolution);
     resolution.typescript_inline_import_module_start =
         append_late_occurrences(&mut resolution.occurrences, &mut inline_modules);
+    index.resolve_typescript_namespace_type_uses(&mut work, &mut resolution);
+    index.resolve_javascript_wrapped_arrow_reads(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -863,6 +871,7 @@ struct File<'source> {
     scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_arrow_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_function_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
@@ -1055,6 +1064,7 @@ impl<'source> File<'source> {
             scoped_javascript_parameters: BTreeMap::new(),
             typescript_type_parameters: BTreeMap::new(),
             javascript_wrapped_parameters: BTreeMap::new(),
+            javascript_arrow_wrapped_parameters: BTreeMap::new(),
             javascript_destructured_parameters: BTreeMap::new(),
             typescript_destructured_parameters: BTreeMap::new(),
             typescript_function_type_parameters: BTreeMap::new(),
@@ -1384,6 +1394,9 @@ impl<'source> File<'source> {
                 self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && symbol.is_javascript_wrapped_parameter() {
                 self.javascript_wrapped_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_javascript_arrow_wrapped_parameter() {
+                self.javascript_arrow_wrapped_parameters
+                    .insert(name, symbol);
             } else if admitted && symbol.is_javascript_destructured_parameter() {
                 self.javascript_destructured_parameters.insert(name, symbol);
             } else if admitted && symbol.is_typescript_method_type_parameter() {
@@ -3175,6 +3188,8 @@ impl StaticResolution {
             .append(&mut apart.javascript_lexical_alias_candidates);
         self.javascript_assigned_members
             .append(&mut apart.javascript_assigned_members);
+        self.typescript_namespace_type_sites
+            .append(&mut apart.typescript_namespace_type_sites);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);

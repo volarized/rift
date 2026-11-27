@@ -2,13 +2,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{StaticBindingKind, StaticFacts, SyntaxSymbol};
+use crate::{ByteRange, StaticBindingKind, StaticFacts, SyntaxSymbol};
 
 pub(super) fn append_under_named_owner(
     symbols: &mut Vec<SyntaxSymbol>,
     parameters: Vec<SyntaxSymbol>,
     facts: &StaticFacts,
     accepts_owner: impl Fn(&str) -> bool,
+) {
+    append_under_checked_owner(symbols, parameters, facts, |owner, _| {
+        accepts_owner(owner.syntax_element_kind?).then_some(owner.item_range)
+    });
+}
+
+pub(super) fn append_under_checked_owner(
+    symbols: &mut Vec<SyntaxSymbol>,
+    parameters: Vec<SyntaxSymbol>,
+    facts: &StaticFacts,
+    binding_scope: impl Fn(&SyntaxSymbol, ByteRange) -> Option<ByteRange>,
 ) {
     if parameters.is_empty() {
         return;
@@ -18,12 +29,7 @@ pub(super) fn append_under_named_owner(
         owners
             .entry(symbol.qualified_name.as_str())
             .and_modify(|entry| *entry = None)
-            .or_insert(
-                symbol
-                    .syntax_element_kind
-                    .filter(|kind| accepts_owner(kind))
-                    .map(|_| symbol.item_range),
-            );
+            .or_insert(Some(symbol));
     }
     let mut counts = BTreeMap::new();
     for parameter in &parameters {
@@ -40,11 +46,12 @@ pub(super) fn append_under_named_owner(
     let retained = parameters
         .iter()
         .filter_map(|parameter| {
-            let owner = *owners.get(parameter.container.as_deref()?)?.as_ref()?;
+            let owner = owners.get(parameter.container.as_deref()?)?.as_ref()?;
             let name = parameter.name_range?;
+            let scope = binding_scope(owner, name)?;
             (!owners.contains_key(parameter.qualified_name.as_str())
                 && counts.get(parameter.qualified_name.as_str()) == Some(&1)
-                && checked.contains(&(name, owner))
+                && checked.contains(&(name, scope))
                 && rift_core::is_portable_name(&parameter.qualified_name)
                 && rift_core::is_portable_name(&parameter.name))
             .then_some(name)

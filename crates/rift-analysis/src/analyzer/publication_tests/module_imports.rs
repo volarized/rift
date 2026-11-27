@@ -5,6 +5,110 @@ use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
 #[test]
+fn typescript_plain_annotations_use_the_checked_type_facet_of_a_namespace_merge() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const INTERFACE: &str = "export interface Mode { readonly state: string; }\n";
+    const NAMESPACE: &str = "export declare namespace Mode { const Ready: number; }\n";
+    const USE: &str = "export interface Consumer { check(mode: Mode): Mode; }\n";
+    fn collect(source: &str, leaf: &str) -> PackageAnalysis {
+        internal_modules::analyze(MANIFEST, &[("index.d.ts", source), ("leaf.d.ts", leaf)])
+    }
+    for (declaration, namespace_first) in [
+        (INTERFACE, false),
+        (INTERFACE, true),
+        (
+            "export declare class Mode { readonly state: string; }\n",
+            false,
+        ),
+        ("export declare enum Mode { Off = 0 }\n", false),
+        ("export type Mode = { readonly state: string };\n", false),
+    ] {
+        let merged = if namespace_first {
+            format!("{NAMESPACE}{declaration}")
+        } else {
+            format!("{declaration}{NAMESPACE}")
+        };
+        for (source, path) in [
+            (format!("{merged}{USE}"), "index.d.ts"),
+            (
+                format!("import {{ Mode }} from './leaf';\n{USE}"),
+                "leaf.d.ts",
+            ),
+            (
+                format!("import type {{ Mode }} from './leaf';\n{USE}"),
+                "leaf.d.ts",
+            ),
+        ] {
+            let found = collect(&source, &merged);
+            let publication = found.publication();
+            let written_unit = publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == "index.d.ts")
+                .expect("original annotation unit");
+            let target_unit = publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path)
+                .expect("original type unit");
+            let declared = if path == "index.d.ts" {
+                &source
+            } else {
+                &merged
+            };
+            let name_offset = declared.find(declaration).expect("written type item")
+                + declaration.find("Mode").expect("written type name");
+            let name = module_runtime_range(name_offset, "Mode");
+            let type_declaration = publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == target_unit.unit
+                        && row.symbol.as_str().ends_with("/Mode")
+                        && row.range.start <= name.start
+                        && name.end <= row.range.end
+                })
+                .expect("checked type declaration");
+            let annotations = source.find(USE).expect("consumer declaration");
+            let expected = [
+                USE.find("Mode").expect("parameter"),
+                USE.rfind("Mode").expect("return"),
+            ]
+            .map(|offset| module_runtime_range(annotations + offset, "Mode"));
+            let annotation_count = publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::HasType]
+                        && edge.to == type_declaration.symbol
+                        && edge.occurrence.as_ref().is_some_and(|site| {
+                            site.unit == written_unit.unit && expected.contains(&site.range)
+                        })
+                })
+                .count();
+            assert_eq!(annotation_count, 2, "{source}");
+        }
+    }
+
+    let unresolved = format!("import type {{ Mode }} from './missing';\n{USE}");
+    let competing =
+        format!("{INTERFACE}export interface Mode {{ other: number; }}\n{NAMESPACE}{USE}");
+    for source in [unresolved, competing] {
+        let found = collect(&source, "");
+        let start = u64::try_from(source.find(USE).expect("consumer declaration"))
+            .expect("bounded fixture offset");
+        assert!(found.publication().edges.iter().all(|edge| {
+            edge.kinds != [EdgeKind::HasType]
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_none_or(|site| site.range.start < start)
+        }));
+    }
+}
+
+#[test]
 fn checked_commonjs_export_object_values_keep_their_literal_imports() {
     const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.cjs"}"#;
     const SOURCE: &str = concat!(
@@ -1790,6 +1894,307 @@ export function callbacks(run) {
   run(() => consume({ hidden: 4 }));
 }
 "#;
+
+#[test]
+fn secondary_javascript_argument_keys_keep_the_separate_written_module_binding() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./entry.js","module":"./entry.mjs","exports":{"import":{"default":"./entry.mjs"},"require":{"default":"./entry.js"}}}"#;
+    const CLASS: &str = r"
+var Channel = class {
+  run(flag) {
+    let current = 1;
+    if (flag) { let current = 2; void (current + 4); }
+    void (current + 3);
+    return STATES.closed;
+  }
+};
+";
+    for (label, registration, after, expected) in [
+        (
+            "direct arrow",
+            "register(api, { Channel: () => Channel });",
+            "",
+            true,
+        ),
+        (
+            "direct primitive",
+            "register(api, { Channel: 1 });",
+            "",
+            true,
+        ),
+        (
+            "array position",
+            "register(api, [null, { Channel: 1 }, null]);",
+            "",
+            false,
+        ),
+        (
+            "duplicate keys",
+            "register(api, { Channel: 1, Channel: 2 });",
+            "",
+            false,
+        ),
+        (
+            "write to binding",
+            "register(api, { Channel: 1 });",
+            "Channel = replacement;",
+            false,
+        ),
+        (
+            "unknown scope",
+            "if (enabled) { register(api, { Channel: 1 }); }",
+            "",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "const api = {{}};\nfunction register() {{}}\nfunction expose(value) {{ return value; }}\n{registration}\nmodule.exports = expose(api);\nconst STATES = {{ closed: 1 }};\n{CLASS}\n{after}\n"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("entry.js", &source),
+                ("entry.mjs", "export function anchor() { return 1; }"),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("both configured package routes");
+        let publication = analysis.publication();
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/beacon%2Fentry.js/Channel"));
+        let method = publication.declarations.iter().find(|row| {
+            row.symbol
+                .as_str()
+                .ends_with("/beacon%2Fentry.js/Channel/run")
+        });
+        let paired = publication.declarations.iter().find(|row| {
+            row.symbol.as_str().contains("/entry.js/Channel%23")
+                || row.symbol.as_str().contains("%2Fentry.js/Channel%23")
+        });
+        assert_eq!(binding.is_some(), expected, "{label}");
+        assert_eq!(method.is_some(), expected, "{label}");
+        assert_eq!(paired.is_some(), expected, "{label}");
+        if let (Some(binding), Some(method), Some(paired)) = (binding, method, paired) {
+            assert_eq!(
+                binding.syntax_element_kind.as_deref(),
+                Some("variable_declarator")
+            );
+            assert_eq!(paired.syntax_element_kind.as_deref(), Some("pair"));
+            assert_eq!(binding.unit, paired.unit);
+            assert!(paired.range.end < binding.range.start, "{label}");
+            assert_argument_collision_preserves_local_uses(publication, &source, method, label);
+        }
+    }
+}
+
+/// The supplemental class does not change the original checked lexical target of a use.
+fn assert_argument_collision_preserves_local_uses(
+    publication: &PackagePublication,
+    source: &str,
+    method: &PackageSymbol,
+    label: &str,
+) {
+    let mut reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from == method.symbol
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().contains("/STATES")
+        })
+        .map(|edge| edge.to.as_str().rsplit('/').next().expect("written target"))
+        .collect::<Vec<_>>();
+    reads.sort_unstable();
+    assert_eq!(reads, ["STATES", "closed"], "{label}");
+    let locals = publication
+        .declarations
+        .iter()
+        .filter(|row| row.symbol.as_str().ends_with("/current"))
+        .collect::<Vec<_>>();
+    assert_eq!(locals.len(), 2, "{label}");
+    for (initializer, usage) in [
+        ("current = 1", "current + 3"),
+        ("current = 2", "current + 4"),
+    ] {
+        let item = module_runtime_range(
+            source.find(initializer).expect("written local"),
+            initializer,
+        );
+        let use_site = module_runtime_range(source.find(usage).expect("written use"), "current");
+        let local = locals
+            .iter()
+            .find(|row| row.range == item && row.source_complete && row.source == initializer)
+            .expect("local declaration");
+        assert!(local.symbol.as_str().contains("/$scope%23"), "{label}");
+        assert!(
+            publication.occurrences.iter().any(|row| {
+                row.symbol == local.symbol && row.unit == local.unit && row.range == use_site
+            }),
+            "{label}: {initializer}"
+        );
+    }
+}
+
+#[test]
+fn direct_function_body_arguments_keep_sibling_classes_and_written_members() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","exports":{".":{"import":"./entry.mjs","require":"./entry.js"}}}"#;
+    const CLASS: &str = "var Channel = class {
+  run(flag) {
+    let current = 1;
+    if (flag) { let current = 2; void (current + 4); }
+    void (current + 3);
+    return STATES.closed;
+  }
+};";
+    for (label, start, end) in [
+        ("arrow initializer", "var Bundle = (() => {", "})();"),
+        (
+            "function initializer",
+            "var Bundle = (function () {",
+            "})();",
+        ),
+        ("named function", "function Bundle() {", "}"),
+    ] {
+        for (statement, expected) in [
+            ("register(api, { Channel: () => Channel });", true),
+            (
+                "if (enabled) { register(api, { Channel: () => Channel }); }",
+                false,
+            ),
+            ("register(api, [{ Channel: () => Channel }]);", false),
+        ] {
+            let source = format!(
+                "{start}
+const api = {{}};
+function register() {{}}
+{statement}
+const STATES = {{ closed: 1 }};
+{CLASS}
+return api;
+{end}
+module.exports = Bundle;
+"
+            );
+            let result = fixture::package_result_with_metadata(
+                ShippedLanguage::JavaScript,
+                vec![
+                    ("entry.js", &source),
+                    ("entry.mjs", "export function anchor() { return 1; }"),
+                ],
+                None,
+                Some(("package.json", MANIFEST)),
+            )
+            .expect("both checked entries");
+            let publication = result.publication();
+            let declarations = &publication.declarations;
+            let item = module_runtime_range(
+                source.find(CLASS).expect("written class") + 4,
+                &CLASS[4..CLASS.len() - 1],
+            );
+            let binding = declarations.iter().find(|row| {
+                row.range == item
+                    && row.source_complete
+                    && row.symbol.as_str().ends_with("/Channel")
+            });
+            let property = "Channel: () => Channel";
+            let site = module_runtime_range(
+                source.find(property).expect("written argument property"),
+                property,
+            );
+            let paired = declarations.iter().find(|row| {
+                row.range == site
+                    && row.source_complete
+                    && row.symbol.as_str().contains("/Channel%23")
+            });
+            assert_eq!(binding.is_some(), expected, "{label}: {statement}");
+            assert_eq!(paired.is_some(), expected, "{label}: {statement}");
+            if let (Some(binding), Some(paired)) = (binding, paired) {
+                assert_eq!(binding.unit, paired.unit);
+                let method = declarations
+                    .iter()
+                    .find(|row| {
+                        row.unit == binding.unit && row.symbol.as_str().ends_with("/Channel/run")
+                    })
+                    .expect("the restored class owns its written method");
+                assert_argument_collision_preserves_local_uses(publication, &source, method, label);
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_named_function_initializers_keep_independent_argument_properties() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./main.mjs"}}"#;
+    for (holder, open, close, count) in [
+        ("function named(input)", "", "", 2),
+        ("function (input)", "", "", 0),
+        (
+            "function named(input)",
+            "return remote.combine(function (item) {",
+            "});",
+            2,
+        ),
+        (
+            "function named(input)",
+            "const other = function (item) {",
+            "}; return other;",
+            0,
+        ),
+    ] {
+        let source = format!(
+            "import * as remote from 'external';
+function emit(value) {{ return value; }}
+export const run = {holder} {{
+  {open}
+  return emit([
+    remote.copy(input, {{ key: 1, first: true }}),
+    remote.copy(input, {{ key: 2, second: false }}),
+  ]);
+  {close}
+}};"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("main.mjs", "export const entry = true;"),
+                ("case.mjs", &source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package");
+        let publication = analysis.publication();
+        let owner = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/case.mjs/run")
+                    || row.symbol.as_str().ends_with("%2Fcase.mjs/run")
+            })
+            .expect("the complete variable declaration remains");
+        let mut repeated = BTreeSet::new();
+        for spelling in ["key: 1", "key: 2", "first: true", "second: false"] {
+            let site =
+                module_runtime_range(source.find(spelling).expect("written property"), spelling);
+            let found = publication
+                .declarations
+                .iter()
+                .find(|row| row.unit == owner.unit && row.source == spelling && row.range == site);
+            if spelling.starts_with("key:") {
+                if let Some(property) = found {
+                    assert!(property.symbol.as_str().starts_with(owner.symbol.as_str()));
+                    repeated.insert(property.symbol.as_str());
+                }
+            } else {
+                assert!(found.is_some(), "incumbent property {spelling}");
+            }
+        }
+        assert_eq!(repeated.len(), count, "{holder}");
+    }
+}
 
 #[test]
 fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
@@ -5532,6 +5937,133 @@ fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildca
             "runtime entry retains its own declaration"
         );
     }
+}
+
+#[test]
+fn typescript_relative_imports_keep_checked_declarations_beside_runtime_wildcards() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"},"./*.js":"./*.js","./*":"./*.js"}}"#;
+    const ROOT: &str = concat!(
+        "import type { Chosen } from './detail.js';\n",
+        "import type * as settings from './options.js';\n",
+        "import type { Missing } from './missing.js';\n",
+        "import type { Collision } from './collision.js';\n",
+        "export interface Box { item: Chosen; options: settings.Options }\n",
+        "declare module 'ambient' { import type { Unreached } from './unreached.js'; }\n",
+    );
+    const DETAIL: &str =
+        "import type { Leaf } from './leaf.js';\nexport interface Chosen { value: Leaf }";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.d.ts", ROOT),
+            ("index.js", "export const kept = 1;"),
+            ("detail.d.ts", DETAIL),
+            ("detail.js", "export const kept = 2;"),
+            ("options.d.ts", "export interface Options { value: number }"),
+            ("leaf.d.ts", "export interface Leaf { value: number }"),
+            (
+                "collision.d.ts",
+                "export interface Collision { value: number }",
+            ),
+            (
+                "collision.ts",
+                "export interface Collision { value: string }",
+            ),
+            (
+                "unreached.d.ts",
+                "export interface Unreached { value: number }",
+            ),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = |path| {
+        publication
+            .units
+            .iter()
+            .find(|row| row.path.0 == path && row.source_complete)
+            .expect("retained source")
+    };
+    let edge = |path, source: &str, spelling: &str, from: &str, to: &str, kind| {
+        let start = source.rfind(spelling).expect("written use");
+        let range = module_runtime_range(start, spelling);
+        publication.edges.iter().any(|row| {
+            row.kinds == [kind]
+                && row.from.as_str().ends_with(from)
+                && row.to.as_str().ends_with(to)
+                && row
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit(path).unit && site.range == range)
+        })
+    };
+    for (path, source, specifier, from, to) in [
+        (
+            "index.d.ts",
+            ROOT,
+            "'./detail.js'",
+            "/beacon",
+            "%2Fdetail.d.ts",
+        ),
+        (
+            "index.d.ts",
+            ROOT,
+            "'./options.js'",
+            "/beacon",
+            "%2Foptions.d.ts",
+        ),
+        (
+            "detail.d.ts",
+            DETAIL,
+            "'./leaf.js'",
+            "%2Fdetail.d.ts",
+            "%2Fleaf.d.ts",
+        ),
+    ] {
+        assert!(
+            edge(path, source, specifier, from, to, EdgeKind::Imports),
+            "{path}: {specifier}"
+        );
+    }
+    assert!(edge(
+        "index.d.ts",
+        ROOT,
+        "Chosen",
+        "/Box/item",
+        "%2Fdetail.d.ts/Chosen",
+        EdgeKind::HasType
+    ));
+    assert!(edge(
+        "detail.d.ts",
+        DETAIL,
+        "Leaf",
+        "/Chosen/value",
+        "%2Fleaf.d.ts/Leaf",
+        EdgeKind::HasType
+    ));
+    assert!(edge(
+        "index.d.ts",
+        ROOT,
+        "settings.Options",
+        "/Box/options",
+        "%2Foptions.d.ts/Options",
+        EdgeKind::HasType
+    ));
+    for path in ["collision.d.ts", "unreached.d.ts"] {
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit(path).unit),
+            "{path}"
+        );
+    }
+    assert!(publication.declarations.iter().any(|row| {
+        row.unit == unit("index.js").unit && row.symbol.as_str().ends_with("/beacon/kept")
+    }));
 }
 
 #[test]

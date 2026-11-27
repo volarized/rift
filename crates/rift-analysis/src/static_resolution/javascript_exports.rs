@@ -1233,6 +1233,37 @@ impl<'source> Export<'source> {
 }
 
 impl<'source> File<'source> {
+    /// Reads two declarations exported directly under one checked TypeScript name.
+    pub(super) fn typescript_direct_namespace_export_pair(
+        &self,
+        name: &str,
+        work: &mut Work,
+    ) -> Option<[Target<'source>; 2]> {
+        if self.document.facts.language().name != "typescript"
+            || !self.document.facts.declaration_syntax_complete()
+        {
+            return None;
+        }
+        let [left, right] = self.exports.as_ref()?.named.get(name)?.as_slice() else {
+            return None;
+        };
+        let declaration = |written: &rift_syntax::SyntaxExportBinding, work: &mut Work| {
+            let local = written.local?;
+            if !work.charge()
+                || written.exported != Some(local)
+                || written.source.is_some()
+                || written.container.is_some()
+                || !matches_export_form(self.text(written.range)?, ModuleMode::Esm)
+                || self.blocked(local.start, work)
+            {
+                return None;
+            }
+            self.target_at(local)
+                .filter(|target| target.symbol.container.is_none())
+        };
+        Some([declaration(left, work)?, declaration(right, work)?])
+    }
+
     pub(super) fn index_javascript_members(&mut self, work: &mut Work) -> Option<()> {
         self.exports = match self.document.facts.export_bindings() {
             Some(bindings) => Some(ExportBindings::read(self, bindings, work)?),
