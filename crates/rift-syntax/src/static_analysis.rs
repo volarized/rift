@@ -499,6 +499,8 @@ pub struct StaticFactsParts {
     pub typescript_module_imports: Vec<ByteRange>,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
+    /// Whether an unshadowed wrapper assigns an expression directly at the file root.
+    pub commonjs_expression_export: bool,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
     /// Receiver and property spans for member expressions.
@@ -693,6 +695,12 @@ impl StaticFacts {
     #[must_use]
     pub const fn commonjs_export(&self) -> Option<&StaticCommonJsExport> {
         self.0.commonjs_export.as_ref()
+    }
+
+    /// Whether a direct `module.exports` write combines a callable and object literals with `Object.assign`.
+    #[must_use]
+    pub const fn has_commonjs_expression_export(&self) -> bool {
+        self.0.commonjs_expression_export
     }
 
     /// Captured value accesses and type references.
@@ -1946,8 +1954,13 @@ impl<'source> Capture<'source> {
         Ok((self.facts, invalid_default))
     }
 
-    pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {
-        self.facts.0.commonjs_export = export;
+    pub(crate) fn record_commonjs_exports(
+        &mut self,
+        closed: Option<StaticCommonJsExport>,
+        expression: bool,
+    ) {
+        self.facts.0.commonjs_export = closed;
+        self.facts.0.commonjs_expression_export = expression;
     }
 }
 

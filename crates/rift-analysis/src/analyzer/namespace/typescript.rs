@@ -518,6 +518,12 @@ fn selected_source_is_valid(input: &NamespaceInput<'_>, file: &SelectedFile<'_>)
             .any(|source| source.path() == file.path && source.text().len() == file.source.len())
 }
 
+/// Whether the selected package manifest permits `CommonJS` resolution of `.js` files.
+pub(crate) fn checked_commonjs_package(input: &NamespaceInput<'_>) -> bool {
+    captured_metadata(input)
+        .is_some_and(|metadata| matches!(metadata.module_type.as_deref(), None | Some("commonjs")))
+}
+
 fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     let mut sources = input
         .files()

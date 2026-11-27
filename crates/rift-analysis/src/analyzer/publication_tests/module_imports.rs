@@ -6734,3 +6734,95 @@ fn checked_commonjs_literals_as_direct_call_arguments_keep_module_imports() {
     records.retain_commonjs_argument_imports(&semantics, earlier.len());
     assert_eq!(records.edges, earlier, "incumbent capacity");
 }
+
+#[test]
+fn checked_commonjs_expression_entries_keep_the_module_and_relative_load() {
+    for (entry, mode, module, loader) in [
+        (
+            "module.exports = Object.assign(function run(value) { return value; }, { flag: true });",
+            "commonjs",
+            "'../'",
+            true,
+        ),
+        (
+            "module.exports = function run(value) { return value; };",
+            "commonjs",
+            "'..'",
+            false,
+        ),
+        (
+            "module.exports = Object.assign(function run(value) { return value; }, { flag: true });",
+            "commonjs",
+            "'../missing'",
+            false,
+        ),
+        (
+            "const Object = { assign: make }; module.exports = Object.assign(function run() {}, {});",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = make();",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+        ("module.exports = make();", "module", "'../'", false),
+        (
+            "if (enabled) module.exports = make();",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "const load = require({module}); function inspect() {{ return load(1); }} inspect();"
+        );
+        let manifest =
+            format!(r#"{{"name":"beacon","version":"1.0.0","type":"{mode}","main":"index.js"}}"#);
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", entry), ("test/check.js", &source)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked CommonJS source");
+        let publication = analysis.publication();
+        publication.validate_facts().expect("complete module facts");
+        let physical = |source| {
+            publication.declarations.iter().find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.range.start == 0
+                    && publication.objects.iter().any(|object| {
+                        object.id.as_ref() == Some(&row.symbol)
+                            && object.kinds.contains(&SymbolKind::Module)
+                    })
+            })
+        };
+        let target = physical(entry);
+        let load = physical(source.as_str());
+        assert_eq!(
+            load.is_some(),
+            loader || mode == "module",
+            "{entry} {mode} {module}"
+        );
+        let expects_entry = loader || module == "'../missing'" || mode == "module";
+        assert_eq!(target.is_some(), expects_entry, "{entry} {mode} {module}");
+        let imported = target.zip(load).is_some_and(|(target, load)| {
+            let start = u64::try_from(source.find(module).expect("written specifier"))
+                .expect("small source");
+            let end = start + u64::try_from(module.len()).expect("small specifier");
+            publication.edges.iter().any(|edge| {
+                edge.from == load.symbol
+                    && edge.to == target.symbol
+                    && edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == load.unit && site.range == TextRange { start, end }
+                    })
+            })
+        });
+        assert_eq!(imported, loader, "{entry} {mode} {module}");
+    }
+}

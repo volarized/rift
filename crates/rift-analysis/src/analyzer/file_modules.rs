@@ -14,18 +14,19 @@ use rift_protocol::{
 use rift_provider::AssembledSymbol;
 
 use super::{
-    AnalyzedFile, ExactPackageLimits, Records, bound, digest_of, javascript_module_source,
-    truncation, wire_path, wire_unit,
+    AnalyzedFile, ExactPackageInput, ExactPackageLimits, Records, bound, digest_of,
+    javascript_module_source, truncation, wire_path, wire_unit,
 };
 
 impl Records {
     pub(super) fn retain_selected_ecmascript_facts(
         &mut self,
-        owner: &SymbolOwner,
+        input: &ExactPackageInput<'_>,
         analyzed: &[AnalyzedFile],
         semantics: &WorkspaceSemantics,
-        limits: ExactPackageLimits,
     ) -> Result<(), RiftError> {
+        let owner = input.owner();
+        let limits = input.limits();
         self.retain_ecmascript_modules(owner, analyzed, semantics, limits)?;
         self.retain_javascript_callback_argument_properties(owner, analyzed, limits)?;
         if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
@@ -38,7 +39,41 @@ impl Records {
         self.retain_checked_inline_import_type_edges(semantics, limits.edges_max());
         self.retain_commonjs_argument_imports(semantics, limits.edges_max());
         self.retain_checked_inline_import_modules(semantics, limits.edges_max());
+        if super::namespace::typescript::checked_commonjs_package(&input.namespace_input()) {
+            self.retain_commonjs_expression_entry(owner, analyzed, semantics, limits)?;
+        }
         Ok(())
+    }
+
+    fn retain_commonjs_expression_entry(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+    ) -> Result<(), RiftError> {
+        if self.symbols_truncated {
+            return Ok(());
+        }
+        let candidates = commonjs_expression_entries(owner, analyzed, &self.units);
+        if candidates.values().all(Option::is_none) {
+            return Ok(());
+        }
+        let previous = self.declarations.len();
+        self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
+        let entries = self.declarations[previous..]
+            .iter()
+            .filter(|row| row.source_complete)
+            .map(|row| row.symbol.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (loaders, loads) =
+            checked_expression_loaders(owner, analyzed, &self.units, semantics, &entries);
+        self.retain_file_module_candidates(owner, &loaders, limits.declarations_max())?;
+        self.retain_file_module_edge_rows(loads.into_iter(), limits.edges_max());
+        self.retain_javascript_callback_argument_properties(owner, analyzed, limits)
     }
 
     pub(super) fn retain_ecmascript_modules(
@@ -586,6 +621,145 @@ impl Records {
 
 type FileModuleCandidates<'file> =
     BTreeMap<&'file CoreSymbolId, Option<(&'file AnalyzedFile, bool)>>;
+
+fn commonjs_expression_entries<'file>(
+    owner: &SymbolOwner,
+    analyzed: &'file [AnalyzedFile],
+    units: &[PackageSourceUnit],
+) -> FileModuleCandidates<'file> {
+    let SymbolOwner::Package { manager, name, .. } = owner else {
+        return BTreeMap::new();
+    };
+    if manager != "npm" {
+        return BTreeMap::new();
+    }
+    let complete = units
+        .iter()
+        .filter(|unit| unit.source_complete)
+        .map(|unit| unit.unit.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = BTreeMap::<_, Option<(&AnalyzedFile, bool)>>::new();
+    for file in analyzed {
+        let Some(module) = file.placement.logical_identity(".") else {
+            continue;
+        };
+        let syntax = file.file.syntax();
+        let path = file.file.path().as_str();
+        let proven = syntax.language().name == "javascript"
+            && !path.contains('/')
+            && matches!(path.rsplit_once('.'), Some((_, "js")))
+            && syntax.declaration_syntax_complete()
+            && complete.contains(file.placement.unit().to_string().as_str())
+            && SymbolIdentity::parse(module.as_str()).is_ok_and(|identity| {
+                identity.owner() == owner && identity.qualified_path() == [name.as_str()]
+            })
+            && syntax.static_facts().is_some_and(|facts| {
+                facts.has_commonjs_expression_export() && !facts.has_javascript_module_syntax()
+            });
+        candidates
+            .entry(module)
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(proven.then_some((file, false)));
+    }
+    candidates
+}
+
+/// Admits a complete secondary script only through its checked load of the entry.
+fn checked_expression_loaders<'file, 'edge>(
+    owner: &SymbolOwner,
+    analyzed: &'file [AnalyzedFile],
+    units: &[PackageSourceUnit],
+    semantics: &'edge WorkspaceSemantics,
+    entries: &BTreeSet<String>,
+) -> (FileModuleCandidates<'file>, Vec<&'edge Edge>) {
+    let SymbolOwner::Package { name, .. } = owner else {
+        return (BTreeMap::new(), Vec::new());
+    };
+    let complete = units
+        .iter()
+        .filter(|unit| unit.source_complete)
+        .map(|unit| unit.unit.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut checked = BTreeMap::new();
+    for file in analyzed {
+        let Some(module) = file.placement.logical_identity(".") else {
+            continue;
+        };
+        let unit = file.placement.unit();
+        let path = file.file.path().as_str();
+        let syntax = file.file.syntax();
+        let complete_source = syntax.language().name == "javascript"
+            && path.ends_with(".js")
+            && syntax.declaration_syntax_complete()
+            && complete.contains(unit.to_string().as_str())
+            && SymbolIdentity::parse(module.as_str()).is_ok_and(|identity| {
+                identity.owner() == owner && identity.qualified_path() == [format!("{name}/{path}")]
+            });
+        let mut loads = BTreeMap::<_, Option<&Edge>>::new();
+        if complete_source {
+            let ranges = written_relative_require_ranges(file);
+            for load in semantics.edges().outgoing(module) {
+                let site = load.occurrence();
+                let range = (site.range().start(), site.range().end());
+                if load.kind() == EdgeKind::Imports
+                    && load.is_file_module_reference()
+                    && !load.is_commonjs_argument_import()
+                    && site.unit() == unit
+                    && entries.contains(load.to().as_str())
+                    && ranges.contains(&range)
+                {
+                    loads
+                        .entry(range)
+                        .and_modify(|edge| *edge = None)
+                        .or_insert(Some(load));
+                }
+            }
+        }
+        let loads = loads.into_values().flatten().collect::<Vec<_>>();
+        checked
+            .entry(module)
+            .and_modify(|candidate| *candidate = None)
+            .or_insert_with(|| (!loads.is_empty()).then_some((file, loads)));
+    }
+    let mut candidates = BTreeMap::new();
+    let mut loads = Vec::new();
+    for (module, checked) in checked {
+        if let Some((file, edges)) = checked {
+            candidates.insert(module, Some((file, false)));
+            loads.extend(edges);
+        }
+    }
+    (candidates, loads)
+}
+
+fn written_relative_require_ranges(file: &AnalyzedFile) -> BTreeSet<(u64, u64)> {
+    let source = file.file.source();
+    let leading = source.len() - source.trim_start().len();
+    let trailing = source.trim_end().len()..=source.len();
+    file.file
+        .syntax()
+        .static_facts()
+        .into_iter()
+        .flat_map(rift_syntax::StaticFacts::bindings)
+        .filter_map(|binding| {
+            let rift_syntax::StaticBindingKind::JavaScriptRequire { module, .. } = binding.kind
+            else {
+                return None;
+            };
+            let start = usize::try_from(binding.scope.start).ok()?;
+            let end = usize::try_from(binding.scope.end).ok()?;
+            let literal = source
+                .get(usize::try_from(module.start).ok()?..usize::try_from(module.end).ok()?)?;
+            (start <= leading
+                && trailing.contains(&end)
+                && (literal.starts_with("./")
+                    || literal.starts_with("../")
+                    || matches!(literal, "." | "..")))
+            .then_some(())?;
+            Some((module.start.checked_sub(1)?, module.end.checked_add(1)?))
+        })
+        .collect()
+}
 
 fn file_module_candidates<'file>(
     owner: &SymbolOwner,

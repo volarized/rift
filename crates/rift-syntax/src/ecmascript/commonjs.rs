@@ -206,6 +206,8 @@ pub(super) struct CommonJsExports<'tree> {
     /// Every assignment of the source, in walk order.
     pub(super) assignments: Vec<Node<'tree>>,
     pub(super) closed_export: Option<StaticCommonJsExport>,
+    /// A single root wrapper assignment with a written callable composite.
+    pub(super) expression_export: bool,
     /// Assignments that declare their own export at module scope.
     pub(super) declared: BTreeSet<usize>,
     /// Identifiers an export names, whose declarations the module exports.
@@ -302,10 +304,43 @@ pub(super) fn record<'tree>(
         })
         .transpose()?;
     let mut exports = exported(&body, &captured, bindings);
+    exports.expression_export = allow_literal
+        && closed_export.is_none()
+        && !captured.blocked.contains(&root.id())
+        && captured.direct_default.is_some_and(|assignment| {
+            !captured.bound.contains_key("Object")
+                && !captured.rebound.contains("Object")
+                && kinds
+                    .assigned_value(assignment)
+                    .is_some_and(|value| written_callable_composite(value, source.text, kinds))
+                && closed_wrapper_uses(root, None, assignment, source.text, kinds)
+        });
     exports.closed_export = closed_export;
     exports.shadowing = shadowing;
     exports.assignments = captured.assignments;
     Ok(exports)
+}
+
+fn written_callable_composite(value: Node<'_>, source: &str, kinds: &EcmaScriptKinds) -> bool {
+    if value.kind() != "call_expression"
+        || value.child_by_field_name("optional_chain").is_some()
+        || value
+            .child_by_field_name("function")
+            .is_none_or(|callee| text(source, callee) != "Object.assign")
+    {
+        return false;
+    }
+    let Some(arguments) = value.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut children = named_children(arguments).filter(|child| !child.is_extra());
+    children
+        .next()
+        .is_some_and(|first| kinds.function_values.contains(&first.kind_id()))
+        && children
+            .next()
+            .is_some_and(|next| next.kind_id() == kinds.object_literal)
+        && children.all(|argument| argument.kind_id() == kinds.object_literal)
 }
 
 /// The module body and the writes that replace or synchronize its exported object.
