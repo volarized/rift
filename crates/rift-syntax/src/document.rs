@@ -290,6 +290,7 @@ impl SyntaxSymbol {
             || self.is_typescript_type_parameter()
             || self.is_typescript_method_type_parameter()
             || self.is_typescript_function_type_parameter()
+            || self.is_typescript_signature_type_parameter()
     }
 
     /// Whether this is the written type parameter of a TypeScript method.
@@ -302,6 +303,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_typescript_function_type_parameter(&self) -> bool {
         self.kind == crate::ecmascript::FUNCTION_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this is the written type parameter of an anonymous TypeScript signature.
+    #[must_use]
+    pub fn is_typescript_signature_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::SIGNATURE_TYPE_PARAMETER_KIND
     }
 
     /// Whether a checked local macro emits a method at this written name.

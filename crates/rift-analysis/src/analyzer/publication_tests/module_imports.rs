@@ -4538,3 +4538,108 @@ fn assert_callback_edge_capacity(
         2
     );
 }
+
+const ANONYMOUS_SIGNATURE_TYPE_SOURCE: &str = concat!(
+    "export interface Reader {\n",
+    "  <Value>(value: Value): Value;\n",
+    "  <Value, Option>(value: Value, option: Option): Option;\n",
+    "  named<Value>(value: Value): Value;\n",
+    "}\n",
+    "export type Select = <Picked>(chosen: Picked) => Picked;\n",
+    "export interface Factory {\n",
+    "  new <Created>(created: Created): { value: Created };\n",
+    "}\n",
+);
+
+#[test]
+fn typescript_anonymous_signatures_keep_each_written_type_parameter_and_use() {
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", ANONYMOUS_SIGNATURE_TYPE_SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("checked TypeScript declarations");
+    let publication = analysis.publication();
+    publication
+        .validate_facts()
+        .expect("valid type parameter facts");
+    let unit = &publication.units[0].unit;
+    let mut type_parameters = BTreeSet::new();
+    for (signature, name) in [
+        ("<Value>(value: Value): Value", "Value"),
+        (
+            "<Value, Option>(value: Value, option: Option): Option",
+            "Value",
+        ),
+        (
+            "<Value, Option>(value: Value, option: Option): Option",
+            "Option",
+        ),
+        ("<Picked>(chosen: Picked) => Picked", "Picked"),
+        (
+            "new <Created>(created: Created): { value: Created }",
+            "Created",
+        ),
+    ] {
+        let start = ANONYMOUS_SIGNATURE_TYPE_SOURCE
+            .find(signature)
+            .expect("authored signature");
+        let mut sites = signature
+            .match_indices(name)
+            .map(|(at, written)| module_runtime_range(start + at, written));
+        let declaration = sites.next().expect("type parameter name");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == *unit && row.source == name && row.range == declaration)
+            .unwrap_or_else(|| panic!("missing written type parameter {name} at {declaration:?}"));
+        assert!(type_parameters.insert(&row.symbol));
+        assert!(
+            publication
+                .objects
+                .iter()
+                .any(|symbol| symbol.id.as_ref() == Some(&row.symbol)
+                    && symbol.kinds.contains(&SymbolKind::TypeParameter))
+        );
+        for use_site in sites {
+            let matches = publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.to == row.symbol
+                        && edge.kinds == [EdgeKind::HasType]
+                        && edge.occurrence.as_ref().is_some_and(|occurrence| {
+                            occurrence.unit == *unit && occurrence.range == use_site
+                        })
+                })
+                .count();
+            assert_eq!(matches, 1, "{name} use at {use_site:?}");
+        }
+    }
+    assert!(
+        publication
+            .objects
+            .iter()
+            .any(|symbol| symbol.name == "value" && symbol.kinds.contains(&SymbolKind::Parameter))
+    );
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/Reader/named/Value"))
+    );
+    assert!(
+        publication
+            .edges
+            .iter()
+            .all(|edge| !type_parameters.contains(&edge.to)
+                || !matches!(
+                    edge.kinds.as_slice(),
+                    [EdgeKind::Reads | EdgeKind::Writes | EdgeKind::Calls]
+                ))
+    );
+}

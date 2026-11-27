@@ -785,6 +785,7 @@ struct EcmaScriptBindingDemand {
     typescript_function_types: BindingDemand,
     typescript_patterns: BindingDemand,
     typescript_method_types: BindingDemand,
+    typescript_signature_types: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -825,6 +826,7 @@ impl EcmaScriptBindingDemand {
             disjoint_slots,
             python_comprehension_slots,
             callback_pattern_slots,
+            signature_type_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -848,6 +850,7 @@ impl EcmaScriptBindingDemand {
                 rust_disjoint,
                 python_comprehensions,
                 &self.javascript_callback_patterns,
+                &self.typescript_signature_types,
             ],
             &mut slots,
             &mut bytes,
@@ -874,6 +877,7 @@ impl EcmaScriptBindingDemand {
             .with_disjoint_rust_bindings(disjoint_slots)
             .with_python_comprehension_bindings(python_comprehension_slots)
             .with_javascript_callback_patterns(callback_pattern_slots)
+            .with_typescript_signature_type_parameters(signature_type_slots)
     }
 
     fn classify(
@@ -910,6 +914,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_method_types
         } else if symbol.is_typescript_function_type_parameter() {
             &mut self.typescript_function_types
+        } else if symbol.is_typescript_signature_type_parameter() {
+            &mut self.typescript_signature_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut self.typescript_patterns
         } else if javascript {
@@ -944,6 +950,7 @@ impl EcmaScriptBindingDemand {
             + self.typescript_method_types.count
             + self.typescript_function_types.count
             + self.typescript_patterns.count
+            + self.typescript_signature_types.count
     }
 }
 

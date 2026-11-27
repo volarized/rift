@@ -1,11 +1,11 @@
-//! Value parameter declarations inside written TypeScript type signatures.
+//! Parameter declarations inside written TypeScript type signatures.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use tree_sitter::Node;
 
 use crate::extract::{self, Visited};
-use crate::{ByteRange, StaticFacts, SyntaxSymbol};
+use crate::{ByteRange, StaticBindingKind, StaticFacts, SyntaxSymbol};
 
 pub(super) fn callable_parameter_name<'tree>(visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
     let parameter = visited.syntax_element();
@@ -30,11 +30,14 @@ fn callable_type_scope(parameter: Node<'_>) -> Option<Node<'_>> {
         .parent()
         .filter(|node| node.kind() == "formal_parameters")?;
     let scope = list.parent()?;
+    callable_signature(scope.kind()).then_some(scope)
+}
+
+pub(super) fn callable_signature(kind: &str) -> bool {
     matches!(
-        scope.kind(),
+        kind,
         "function_type" | "call_signature" | "construct_signature" | "constructor_type"
     )
-    .then_some(scope)
 }
 
 pub(super) fn append_callable_types(
@@ -55,6 +58,37 @@ pub(super) fn append_callable_types(
         let written = written_name(root, name)?;
         let scope = extract::byte_range(callable_type_scope(written.parent()?)?).ok()?;
         (sites.get(&name) == Some(&scope)).then_some(scope)
+    });
+}
+
+pub(super) fn append_callable_type_parameters(
+    root: Node<'_>,
+    symbols: &mut Vec<SyntaxSymbol>,
+    parameters: Vec<SyntaxSymbol>,
+    facts: &StaticFacts,
+) {
+    if parameters.is_empty() {
+        return;
+    }
+    let captured = facts
+        .bindings()
+        .iter()
+        .filter(|site| site.kind == StaticBindingKind::Shadow)
+        .map(|site| (site.name, site.scope))
+        .collect::<BTreeSet<_>>();
+    append_scoped(symbols, parameters, "$type-signature", |name| {
+        let written = written_name(root, name)?;
+        let parameter = written.parent()?;
+        let list = parameter.parent()?;
+        let owner = list.parent()?;
+        if parameter.child_by_field_name("name") != Some(written)
+            || owner.child_by_field_name("type_parameters") != Some(list)
+            || !callable_signature(owner.kind())
+        {
+            return None;
+        }
+        let scope = extract::byte_range(owner).ok()?;
+        captured.contains(&(name, scope)).then_some(scope)
     });
 }
 
