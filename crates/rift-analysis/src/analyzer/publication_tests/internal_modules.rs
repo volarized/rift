@@ -821,3 +821,101 @@ exports.use = use;
         assert_eq!(!reached.is_empty(), settled, "{forward} {reached:?}");
     }
 }
+
+#[test]
+fn non_entry_lexical_declarations_keep_separate_object_slot_names() {
+    const HEADER: &str = concat!(
+        "Object.defineProperty(exports, '__esModule', { value: true });\n",
+        "function observe(entries) { return entries; }\n",
+    );
+    const DECLARATIONS: [&str; 5] = [
+        "class Entry { count = 1; read() { return this.count; } }",
+        "count = 1",
+        "read() { return this.count; }",
+        "function create() { return new Entry(); }",
+        "LIMIT = 2",
+    ];
+    const LEXICAL: &str = concat!(
+        "class Entry { count = 1; read() { return this.count; } }\n",
+        "function create() { return new Entry(); }\n",
+        "const LIMIT = 2;\n",
+    );
+    const GETTERS: &str = "observe({ get Entry() { return Entry; }, get create() { return create; }, get LIMIT() { return LIMIT; } });\n";
+    const GUARDED: &str = "0 && (module.exports = { Entry: null, create: null, LIMIT: null });\n";
+    let combined = format!("{GETTERS}{GUARDED}");
+    let false_guard = GUARDED.replacen('0', "false", 1);
+    let real_guard = GUARDED.replacen('0', "1", 1);
+    let unknown_guard = GUARDED.replacen('0', "unknown", 1);
+    let alternate = format!("{GETTERS}if (choice) {{ class Entry {{}} }}\n");
+    for (before, after, retained) in [
+        (GETTERS, "", true),
+        ("", GETTERS, true),
+        (GUARDED, "", true),
+        ("", false_guard.as_str(), true),
+        (combined.as_str(), "", true),
+        ("", combined.as_str(), true),
+        (real_guard.as_str(), GETTERS, false),
+        (unknown_guard.as_str(), GETTERS, false),
+        (GETTERS, GETTERS, false),
+    ] {
+        let source = format!("{HEADER}{before}{LEXICAL}{after}");
+        let analysis = analyze(
+            MAIN,
+            &[("index.js", "exports.main = 1;"), ("impl.js", &source)],
+        );
+        let result = analysis.publication();
+        result.validate_facts().expect("checked package facts");
+        let module = result
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == "impl.js")
+            .expect("source unit");
+        assert!(module.source_complete);
+        let placed = DECLARATIONS.map(|written| {
+            result
+                .declarations
+                .iter()
+                .find(|row| row.unit == module.unit && row.source == written)
+        });
+        assert_eq!(
+            placed.iter().flatten().count(),
+            if retained { DECLARATIONS.len() } else { 0 },
+            "{before} {after}"
+        );
+        if let [
+            Some(class),
+            Some(field),
+            Some(method),
+            Some(function),
+            Some(variable),
+        ] = placed
+        {
+            for row in [class, field, method, function, variable] {
+                let start = usize::try_from(row.range.start).expect("start");
+                let end = usize::try_from(row.range.end).expect("end");
+                assert_eq!(source.get(start..end), Some(row.source.as_str()));
+                assert!(row.source_complete && !row.public, "{row:?}");
+            }
+            for member in [field, method] {
+                let object = result
+                    .objects
+                    .iter()
+                    .find(|object| object.id.as_ref() == Some(&member.symbol))
+                    .expect("class member");
+                assert_eq!(object.container.as_ref(), Some(&class.symbol));
+            }
+        }
+    }
+    let source = format!("{HEADER}{alternate}{LEXICAL}");
+    let analysis = analyze(
+        MAIN,
+        &[("index.js", "exports.main = 1;"), ("impl.js", &source)],
+    );
+    assert!(
+        !analysis
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| row.source == DECLARATIONS[0])
+    );
+}

@@ -37,6 +37,7 @@ impl Records {
         self.retain_imported_export_selectors(semantics, limits.edges_max());
         self.retain_checked_inline_import_type_edges(semantics, limits.edges_max());
         self.retain_commonjs_argument_imports(semantics, limits.edges_max());
+        self.retain_checked_inline_import_modules(semantics, limits.edges_max());
         Ok(())
     }
 
@@ -182,6 +183,66 @@ impl Records {
         }
     }
 
+    pub(super) fn retain_checked_inline_import_modules(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        limit: usize,
+    ) {
+        let mut references = semantics
+            .edges()
+            .edges()
+            .filter(|edge| edge.is_inline_import_module())
+            .peekable();
+        if references.peek().is_none() {
+            return;
+        }
+        let units = self
+            .units
+            .iter()
+            .filter(|unit| unit.source_complete)
+            .map(|unit| (unit.unit.as_str(), unit.source.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let modules = self
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Module))
+            .filter_map(|object| object.id.as_ref())
+            .collect::<BTreeSet<_>>();
+        let mut complete = BTreeMap::new();
+        for row in &self.declarations {
+            if modules.contains(&row.symbol)
+                && row.source_complete
+                && row.range.start == 0
+                && units.get(row.unit.as_str()) == Some(&row.source.as_str())
+            {
+                complete
+                    .entry(row.symbol.as_str())
+                    .and_modify(|prior| *prior = None)
+                    .or_insert(Some(row.unit.as_str()));
+            }
+        }
+        for edge in references {
+            let unit = edge.occurrence().unit().to_string();
+            if complete.get(edge.from().as_str()).copied().flatten() != Some(unit.as_str())
+                || complete
+                    .get(edge.to().as_str())
+                    .copied()
+                    .flatten()
+                    .is_none()
+            {
+                continue;
+            }
+            if self.edges.len() >= limit {
+                self.warn(truncation(
+                    "edges",
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ));
+                return;
+            }
+            self.edges.push(edge.to_protocol());
+        }
+    }
+
     pub(super) fn retain_commonjs_argument_imports(
         &mut self,
         semantics: &WorkspaceSemantics,
@@ -302,6 +363,7 @@ impl Records {
                     && !edge.is_incomplete_local_export_reference()
                     && !edge.is_imported_export_selector()
                     && !edge.is_commonjs_argument_import()
+                    && !edge.is_inline_import_module()
                     && edge.kind() == kind
                     && edge.is_deferred_commonjs_export_import() == deferred_exports
             })

@@ -4,7 +4,7 @@ use rift_core::ReferenceRole;
 use rift_protocol::read::SymbolKind;
 use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    CheckedInlineTypeImport, SyntaxSource, TypeScriptDialect, TypeScriptSyntaxProvider,
+    ByteRange, CheckedInlineTypeImport, SyntaxSource, TypeScriptDialect, TypeScriptSyntaxProvider,
 };
 
 use super::javascript::ModuleMode;
@@ -16,8 +16,9 @@ impl<'source> Index<'source> {
         &self,
         work: &mut Work,
         result: &mut StaticResolution,
-    ) {
+    ) -> Vec<StaticOccurrence> {
         let start = result.occurrences.len();
+        let mut modules = Vec::new();
         let provider = TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript);
         for file in self.files.values() {
             let document = file.document;
@@ -46,13 +47,17 @@ impl<'source> Index<'source> {
                 if !work.charge() {
                     break;
                 }
-                if let Some(reference) = self.typescript_inline_import_type(file, import, work) {
+                if let Some((reference, module)) =
+                    self.typescript_inline_import_type(file, import, work)
+                {
                     result.record(Some(reference));
+                    modules.extend(module);
                 }
             }
         }
         result.typescript_inline_import_type_start =
             (result.occurrences.len() != start).then_some(start);
+        modules
     }
 
     fn typescript_inline_import_type(
@@ -60,7 +65,7 @@ impl<'source> Index<'source> {
         file: &File<'source>,
         import: CheckedInlineTypeImport,
         work: &mut Work,
-    ) -> Option<StaticOccurrence> {
+    ) -> Option<(StaticOccurrence, Option<StaticOccurrence>)> {
         let owner = file.target_at(import.owner_name)?;
         let [checked_owner] = file
             .by_qualified_name
@@ -112,6 +117,27 @@ impl<'source> Index<'source> {
         if !matches!(occurrence.target, NormalizedTarget::Symbol(_)) {
             return None;
         }
+        occurrence.edge_from = Some(from);
+        let module = self.typescript_inline_import_module(file, imported, import.module, work);
+        Some((occurrence, module))
+    }
+
+    fn typescript_inline_import_module(
+        &self,
+        file: &File<'source>,
+        imported: &File<'source>,
+        module: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        // The syntax check proved the quotes and the declaration resolver selected this file.
+        imported.document.placement.logical_identity(".")?;
+        let from = file.document.placement.logical_identity(".")?.clone();
+        let quoted = ByteRange {
+            start: module.start.checked_sub(1)?,
+            end: module.end.checked_add(1)?,
+        };
+        let mut occurrence =
+            self.javascript_module_occurrence(file, quoted, imported, ReferenceRole::Import, work)?;
         occurrence.edge_from = Some(from);
         Some(occurrence)
     }

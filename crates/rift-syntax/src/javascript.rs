@@ -4,10 +4,12 @@
 //! Declaration rules live in [`crate::ecmascript`], shared with the
 //! TypeScript providers.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use rift_protocol::read::{Language, SyntaxKind};
 
+use crate::ByteRange;
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
 use crate::failure::RiftError;
@@ -28,6 +30,189 @@ impl Default for JavaScriptSyntaxProvider {
             },
         }
     }
+}
+
+impl JavaScriptSyntaxProvider {
+    /// Proves a direct `CommonJS` export assignment follows a literal placeholder for its key.
+    ///
+    /// The caller supplies the exact later assignment and earlier member spans after checking
+    /// all writes. The result names only complete, unconditional later assignments.
+    #[must_use]
+    pub fn commonjs_class_export_initializations(
+        source: &str,
+        limits: SyntaxLimits,
+        initializations: &BTreeMap<ByteRange, ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        ecmascript::commonjs_class_export_initializations(source, limits, initializations)
+    }
+
+    /// Checks getter slots in direct module call arguments and keys of short-circuited
+    /// `CommonJS` export objects. These keys occupy an object scope.
+    #[must_use]
+    pub fn module_disjoint_object_members(
+        source: &str,
+        limits: SyntaxLimits,
+        selected: &BTreeSet<ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        module_object_members(source, limits, selected, |node, source| match node.kind() {
+            "method_definition" => {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|child| !child.is_extra())
+                    .is_some_and(|token| token.kind() == "get")
+                    && node
+                        .child_by_field_name("name")
+                        .is_some_and(|key| key.kind() == "property_identifier")
+                    && node
+                        .child_by_field_name("parameters")
+                        .is_some_and(|parameters| {
+                            let mut cursor = parameters.walk();
+                            parameters
+                                .named_children(&mut cursor)
+                                .all(|formal| formal.is_extra())
+                        })
+                    && module_call_argument_member(node)
+            }
+            "pair" => {
+                node.child_by_field_name("key")
+                    .is_some_and(|key| key.kind() == "property_identifier")
+                    && short_circuited_export_member(node, source)
+            }
+            _ => false,
+        })
+    }
+}
+
+fn module_object_members(
+    source: &str,
+    limits: SyntaxLimits,
+    selected: &BTreeSet<ByteRange>,
+    accepts: impl Fn(tree_sitter::Node<'_>, &str) -> bool,
+) -> BTreeSet<ByteRange> {
+    if selected.is_empty()
+        || selected.len() > limits.syntax_elements_max()
+        || source.len() > limits.source_bytes_max()
+    {
+        return BTreeSet::new();
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&javascript_grammar()).is_err() {
+        return BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return BTreeSet::new();
+    }
+    let mut visited = 0_usize;
+    let mut pending = vec![(root, 0_usize)];
+    let mut cursor = root.walk();
+    let mut accepted = BTreeSet::new();
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if depth > limits.syntax_depth_max()
+            || visited
+                .saturating_add(pending.len())
+                .saturating_add(node.named_child_count())
+                > limits.syntax_elements_max()
+        {
+            return BTreeSet::new();
+        }
+        if matches!(node.kind(), "pair" | "method_definition")
+            && let Ok(range) = crate::extract::byte_range(node)
+            && selected.contains(&range)
+            && accepts(node, source)
+        {
+            accepted.insert(range);
+        }
+        crate::extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+            (child, depth + 1)
+        });
+    }
+    accepted
+}
+
+fn module_call_argument_member(node: tree_sitter::Node<'_>) -> bool {
+    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+    let Some(arguments) = object
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")
+    else {
+        return false;
+    };
+    let Some(call) = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")
+    else {
+        return false;
+    };
+    call.child_by_field_name("function")
+        .is_some_and(|function| function.kind() == "identifier")
+        && call.child_by_field_name("arguments") == Some(arguments)
+        && call.child_by_field_name("optional_chain").is_none()
+        && call.parent().is_some_and(|statement| {
+            statement.kind() == "expression_statement"
+                && statement
+                    .parent()
+                    .is_some_and(|root| root.kind() == "program")
+        })
+}
+
+fn short_circuited_export_member(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+    let Some(assignment) = object.parent().filter(|parent| {
+        parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("right") == Some(object)
+    }) else {
+        return false;
+    };
+    let Some(target) = assignment.child_by_field_name("left") else {
+        return false;
+    };
+    if target.kind() != "member_expression"
+        || target.child_by_field_name("optional_chain").is_some()
+        || target.child_by_field_name("object").is_none_or(|receiver| {
+            receiver.kind() != "identifier" || source.get(receiver.byte_range()) != Some("module")
+        })
+        || target
+            .child_by_field_name("property")
+            .is_none_or(|property| {
+                property.kind() != "property_identifier"
+                    || source.get(property.byte_range()) != Some("exports")
+            })
+    {
+        return false;
+    }
+    let Some(wrapped) = assignment
+        .parent()
+        .filter(|parent| parent.kind() == "parenthesized_expression")
+    else {
+        return false;
+    };
+    let Some(guard) = wrapped.parent().filter(|parent| {
+        parent.kind() == "binary_expression"
+            && parent.child_by_field_name("right") == Some(wrapped)
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "&&")
+    }) else {
+        return false;
+    };
+    guard.child_by_field_name("left").is_some_and(|condition| {
+        condition.kind() == "false"
+            || (condition.kind() == "number" && source.get(condition.byte_range()) == Some("0"))
+    }) && guard.parent().is_some_and(|statement| {
+        statement.kind() == "expression_statement"
+            && statement
+                .parent()
+                .is_some_and(|root| root.kind() == "program")
+    })
 }
 
 impl SyntaxProvider for JavaScriptSyntaxProvider {

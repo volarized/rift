@@ -132,6 +132,107 @@ fn inline_import_type_qualifiers_wait_for_remaining_publication_capacity() {
         );
     }
 }
+
+#[test]
+fn inline_import_specifiers_keep_the_written_declaration_module() {
+    let double = INLINE.replace("'./contract.js'", "\"./contract.js\"");
+    let missing = INLINE.replace("contract.js", "absent.js");
+    let nested = INLINE.replace(").Shape", ").Shape.Width");
+    let unqualified = INLINE.replace(").Shape", ")");
+    let query = INLINE.replace("import(", "typeof import(");
+    for (source, literal, count) in [
+        (INLINE, "'./contract.js'", 1),
+        (double.as_str(), "\"./contract.js\"", 1),
+        (NAMED, "'./contract.js'", 1),
+        (missing.as_str(), "'./absent.js'", 0),
+        (nested.as_str(), "'./contract.js'", 0),
+        (unqualified.as_str(), "'./contract.js'", 0),
+        (query.as_str(), "'./contract.js'", 0),
+    ] {
+        let analysis = analyze(source, CONTRACT);
+        let publication = analysis.publication();
+        publication
+            .validate_facts()
+            .expect("valid type publication");
+        let unit = publication
+            .units
+            .iter()
+            .find(|row| row.path.0 == "lib/consumer.d.ts")
+            .expect("written consumer");
+        let start = u64::try_from(source.find(literal).expect("written literal")).expect("start");
+        let end = start + u64::try_from(literal.len()).expect("length");
+        let imports = publication
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == unit.unit && site.range == TextRange { start, end }
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(imports.len(), count, "{source}");
+        if let [edge] = imports.as_slice() {
+            let source = publication
+                .declarations
+                .iter()
+                .find(|row| row.symbol == edge.from && row.unit == unit.unit)
+                .expect("retained source module");
+            let target = publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.symbol == edge.to && row.unit.as_str().ends_with("/lib/contract.d.ts")
+                })
+                .expect("retained declaration module");
+            assert!(source.source_complete && source.range.start == 0);
+            assert!(target.source_complete && target.range.start == 0);
+        }
+    }
+}
+
+#[test]
+fn inline_import_module_edges_keep_earlier_edges_and_require_complete_modules() {
+    let (publication, _, semantics, _) = analyze(INLINE, CONTRACT).into_parts();
+    let (modules, prior): (Vec<_>, Vec<_>) = publication.edges.into_iter().partition(|edge| {
+        edge.kinds == [EdgeKind::Imports] && edge.to.as_str().ends_with("%2Flib%2Fcontract.d.ts")
+    });
+    let [module] = modules.as_slice() else {
+        panic!("one checked inline import module");
+    };
+    assert!(!prior.is_empty());
+    for (spare, incomplete) in [
+        (0, None),
+        (1, None),
+        (1, Some(&module.from)),
+        (1, Some(&module.to)),
+    ] {
+        let mut records = Records {
+            objects: publication.objects.clone(),
+            declarations: publication.declarations.clone(),
+            units: publication.units.clone(),
+            edges: prior.clone(),
+            ..Records::default()
+        };
+        if let Some(id) = incomplete {
+            let row = records
+                .declarations
+                .iter_mut()
+                .find(|row| &row.symbol == id)
+                .expect("complete module before the control");
+            row.source_complete = false;
+        }
+        records.retain_checked_inline_import_modules(&semantics, prior.len() + spare);
+        assert_eq!(&records.edges[..prior.len()], prior.as_slice());
+        let new = if spare == 0 || incomplete.is_some() {
+            &[][..]
+        } else {
+            modules.as_slice()
+        };
+        assert_eq!(&records.edges[prior.len()..], new);
+    }
+}
+
 #[test]
 fn checked_inline_import_type_alias_keeps_the_full_written_declaration() {
     const PREFIX: &str = "// declaration\n";

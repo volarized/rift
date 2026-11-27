@@ -84,6 +84,8 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKi
 mod callback_parameters;
 mod checked_parameters;
 mod commonjs;
+pub(crate) use commonjs::commonjs_class_export_initializations;
+mod conditional_type_members;
 mod inline_import_types;
 mod members;
 mod overload_parameters;
@@ -95,6 +97,7 @@ mod type_signature_parameters;
 mod variance;
 mod wrapped_parameters;
 
+pub(crate) use conditional_type_members::check as checked_conditional_type_members;
 pub use inline_import_types::CheckedInlineTypeImport;
 pub(crate) use inline_import_types::check as checked_inline_import_types;
 

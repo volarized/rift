@@ -3,12 +3,202 @@ use super::{
     ExportTarget, named_children,
 };
 use crate::{
-    StaticCommonJsExport, SyntaxExportBinding, SyntaxExportKind, SyntaxLimits, SyntaxSource,
-    extract,
+    ByteRange, StaticCommonJsExport, SyntaxExportBinding, SyntaxExportKind, SyntaxLimits,
+    SyntaxSource, extract,
 };
 use rift_error::{RiftError, errors};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
+
+/// Checks the exact direct statements of a superseded `CommonJS` placeholder.
+pub(crate) fn commonjs_class_export_initializations(
+    source: &str,
+    limits: SyntaxLimits,
+    initializations: &BTreeMap<ByteRange, ByteRange>,
+) -> BTreeSet<ByteRange> {
+    if initializations.is_empty()
+        || initializations.len() > limits.syntax_elements_max()
+        || source.len() > limits.source_bytes_max()
+    {
+        return BTreeSet::new();
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&crate::javascript::javascript_grammar())
+        .is_err()
+    {
+        return BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let root = tree.root_node();
+    if root.has_error() || !checked_placeholder_wrapper(root, source, limits) {
+        return BTreeSet::new();
+    }
+    initializations
+        .iter()
+        .filter_map(|(&later, &earlier)| {
+            let earlier = exact_named_node(root, earlier, "member_expression")?;
+            let first = earlier.parent()?;
+            if first.child_by_field_name("left") != Some(earlier) {
+                return None;
+            }
+            let last = exact_named_node(root, later, "assignment_expression")?;
+            let last_key = last.child_by_field_name("left")?;
+            let first_key = named_placeholder_member(earlier, source)?;
+            (first_key == named_placeholder_member(last_key, source)?
+                && first.end_byte() <= last.start_byte()
+                && pure_placeholder_statement(first, root, source)
+                && direct_expression_statement(last, root)
+                && last.child_by_field_name("right")?.kind() == "identifier")
+                .then_some(later)
+        })
+        .collect()
+}
+
+fn exact_named_node<'tree>(root: Node<'tree>, range: ByteRange, kind: &str) -> Option<Node<'tree>> {
+    let start = usize::try_from(range.start).ok()?;
+    let end = usize::try_from(range.end).ok()?;
+    let node = root.named_descendant_for_byte_range(start, end)?;
+    (node.kind() == kind && node.start_byte() == start && node.end_byte() == end).then_some(node)
+}
+
+fn named_placeholder_member<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    let receiver = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    (node.kind() == "member_expression"
+        && receiver.kind() == "identifier"
+        && text(source, receiver) == "exports"
+        && property.kind() == "property_identifier"
+        && !matches!(text(source, property), "__proto__" | "__esModule"))
+    .then(|| text(source, property))
+}
+
+/// The full assignment chain writes only named exports and ends in literal undefined.
+fn pure_placeholder_statement(mut node: Node<'_>, root: Node<'_>, source: &str) -> bool {
+    while let Some(parent) = node
+        .parent()
+        .filter(|node| node.kind() == "assignment_expression")
+    {
+        if parent.child_by_field_name("right") != Some(node) {
+            return false;
+        }
+        node = parent;
+    }
+    if !direct_expression_statement(node, root) {
+        return false;
+    }
+    while node.kind() == "assignment_expression" {
+        if node
+            .child_by_field_name("left")
+            .and_then(|left| named_placeholder_member(left, source))
+            .is_none()
+        {
+            return false;
+        }
+        let Some(value) = node.child_by_field_name("right") else {
+            return false;
+        };
+        node = value;
+    }
+    node.kind() == "unary_expression" && text(source, node) == "void 0"
+}
+
+fn direct_expression_statement(node: Node<'_>, root: Node<'_>) -> bool {
+    node.parent().is_some_and(|statement| {
+        statement.kind() == "expression_statement" && statement.parent() == Some(root)
+    })
+}
+
+/// The exported object stays with known writes and an optional compiler marker.
+fn checked_placeholder_wrapper(root: Node<'_>, source: &str, limits: SyntaxLimits) -> bool {
+    let mut pending = vec![(root, 0_usize)];
+    let mut cursor = root.walk();
+    let mut visited = 0_usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if depth > limits.syntax_depth_max()
+            || visited
+                .saturating_add(pending.len())
+                .saturating_add(node.named_child_count())
+                > limits.syntax_elements_max()
+        {
+            return false;
+        }
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+        ) {
+            let name = text(source, node);
+            if name.contains('\\')
+                || matches!(name, "module" | "eval")
+                || (name == "exports" && !placeholder_exports_use(node, root, source))
+                || (name == "Object" && !placeholder_marker_receiver(node, root, source))
+            {
+                return false;
+            }
+        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| (child, depth + 1));
+    }
+    true
+}
+
+fn placeholder_exports_use(node: Node<'_>, root: Node<'_>, source: &str) -> bool {
+    node.parent().is_some_and(|parent| {
+        (parent.child_by_field_name("object") == Some(node)
+            && named_placeholder_member(parent, source).is_some()
+            && parent.parent().is_some_and(|assignment| {
+                assignment.kind() == "assignment_expression"
+                    && assignment.child_by_field_name("left") == Some(parent)
+            }))
+            || (parent.kind() == "arguments"
+                && parent
+                    .parent()
+                    .is_some_and(|call| placeholder_marker(call, root, source)))
+    })
+}
+
+fn placeholder_marker_receiver(node: Node<'_>, root: Node<'_>, source: &str) -> bool {
+    node.parent().is_some_and(|member| {
+        member.child_by_field_name("object") == Some(node)
+            && member.parent().is_some_and(|call| {
+                call.child_by_field_name("function") == Some(member)
+                    && placeholder_marker(call, root, source)
+            })
+    })
+}
+
+/// The boolean module marker gives another named property a value without moving the object.
+fn placeholder_marker(call: Node<'_>, root: Node<'_>, source: &str) -> bool {
+    if call.kind() != "call_expression"
+        || !direct_expression_statement(call, root)
+        || call
+            .child_by_field_name("function")
+            .is_none_or(|function| text(source, function) != "Object.defineProperty")
+    {
+        return false;
+    }
+    let args = call_arguments(call);
+    let [receiver, property, descriptor] = args.as_slice() else {
+        return false;
+    };
+    text(source, *receiver) == "exports"
+        && matches!(text(source, *property), "\"__esModule\"" | "'__esModule'")
+        && descriptor.kind() == "object"
+        && descriptor.named_child_count() == 1
+        && descriptor.named_child(0).is_some_and(|pair| {
+            pair.kind() == "pair"
+                && pair
+                    .child_by_field_name("key")
+                    .is_some_and(|key| text(source, key) == "value")
+                && pair
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "true")
+        })
+}
 
 /// What the module body assigns to its exports, beside the recorded bindings.
 #[derive(Default)]
