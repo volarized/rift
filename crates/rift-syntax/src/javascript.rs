@@ -45,14 +45,15 @@ impl JavaScriptSyntaxProvider {
         ecmascript::commonjs_class_export_initializations(source, limits, initializations)
     }
 
-    /// Checks getter slots in direct module call arguments. The slots occupy object scope.
+    /// Checks getter slots in direct module call arguments and keys of short-circuited
+    /// `CommonJS` export objects. These keys occupy an object scope.
     #[must_use]
     pub fn module_disjoint_object_members(
         source: &str,
         limits: SyntaxLimits,
         selected: &BTreeSet<ByteRange>,
     ) -> BTreeSet<ByteRange> {
-        module_object_members(source, limits, selected, |node, _| match node.kind() {
+        module_object_members(source, limits, selected, |node, source| match node.kind() {
             "method_definition" => {
                 let mut cursor = node.walk();
                 node.children(&mut cursor)
@@ -70,6 +71,11 @@ impl JavaScriptSyntaxProvider {
                                 .all(|formal| formal.is_extra())
                         })
                     && module_call_argument_member(node)
+            }
+            "pair" => {
+                node.child_by_field_name("key")
+                    .is_some_and(|key| key.kind() == "property_identifier")
+                    && short_circuited_export_member(node, source)
             }
             _ => false,
         })
@@ -153,6 +159,59 @@ fn module_call_argument_member(node: tree_sitter::Node<'_>) -> bool {
                     .parent()
                     .is_some_and(|root| root.kind() == "program")
         })
+}
+
+fn short_circuited_export_member(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+    let Some(assignment) = object.parent().filter(|parent| {
+        parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("right") == Some(object)
+    }) else {
+        return false;
+    };
+    let Some(target) = assignment.child_by_field_name("left") else {
+        return false;
+    };
+    if target.kind() != "member_expression"
+        || target.child_by_field_name("optional_chain").is_some()
+        || target.child_by_field_name("object").is_none_or(|receiver| {
+            receiver.kind() != "identifier" || source.get(receiver.byte_range()) != Some("module")
+        })
+        || target
+            .child_by_field_name("property")
+            .is_none_or(|property| {
+                property.kind() != "property_identifier"
+                    || source.get(property.byte_range()) != Some("exports")
+            })
+    {
+        return false;
+    }
+    let Some(wrapped) = assignment
+        .parent()
+        .filter(|parent| parent.kind() == "parenthesized_expression")
+    else {
+        return false;
+    };
+    let Some(guard) = wrapped.parent().filter(|parent| {
+        parent.kind() == "binary_expression"
+            && parent.child_by_field_name("right") == Some(wrapped)
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "&&")
+    }) else {
+        return false;
+    };
+    guard.child_by_field_name("left").is_some_and(|condition| {
+        condition.kind() == "false"
+            || (condition.kind() == "number" && source.get(condition.byte_range()) == Some("0"))
+    }) && guard.parent().is_some_and(|statement| {
+        statement.kind() == "expression_statement"
+            && statement
+                .parent()
+                .is_some_and(|root| root.kind() == "program")
+    })
 }
 
 impl SyntaxProvider for JavaScriptSyntaxProvider {

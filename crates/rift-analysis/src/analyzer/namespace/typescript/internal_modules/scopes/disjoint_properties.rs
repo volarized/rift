@@ -110,7 +110,9 @@ impl<'source> FileScopes<'source> {
                         return None;
                     }
                 }
-                "method_definition" if self.body_members.contains_key(&symbol.item_range) => {
+                "method_definition" | "pair"
+                    if self.body_members.contains_key(&symbol.item_range) =>
+                {
                     if properties.insert(kind, symbol.item_range).is_some() {
                         return None;
                     }

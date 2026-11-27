@@ -841,10 +841,21 @@ fn non_entry_lexical_declarations_keep_separate_object_slot_names() {
         "const LIMIT = 2;\n",
     );
     const GETTERS: &str = "observe({ get Entry() { return Entry; }, get create() { return create; }, get LIMIT() { return LIMIT; } });\n";
+    const GUARDED: &str = "0 && (module.exports = { Entry: null, create: null, LIMIT: null });\n";
+    let combined = format!("{GETTERS}{GUARDED}");
+    let false_guard = GUARDED.replacen('0', "false", 1);
+    let real_guard = GUARDED.replacen('0', "1", 1);
+    let unknown_guard = GUARDED.replacen('0', "unknown", 1);
     let alternate = format!("{GETTERS}if (choice) {{ class Entry {{}} }}\n");
     for (before, after, retained) in [
         (GETTERS, "", true),
         ("", GETTERS, true),
+        (GUARDED, "", true),
+        ("", false_guard.as_str(), true),
+        (combined.as_str(), "", true),
+        ("", combined.as_str(), true),
+        (real_guard.as_str(), GETTERS, false),
+        (unknown_guard.as_str(), GETTERS, false),
         (GETTERS, GETTERS, false),
     ] {
         let source = format!("{HEADER}{before}{LEXICAL}{after}");
