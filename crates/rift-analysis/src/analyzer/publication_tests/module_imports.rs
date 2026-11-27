@@ -4242,3 +4242,91 @@ fn commonjs_named_export_arrays_keep_properties_under_their_written_slots() {
                 || !edge.to.as_str().contains("/rows/direct"))
     );
 }
+
+#[test]
+fn javascript_direct_literal_returns_keep_their_checked_object_and_initializer_owners() {
+    const SOURCE: &str = concat!(
+        "function named(first) {\n",
+        "  if (first) return { control: 1 };\n",
+        "  return { control: 2 };\n",
+        "}\n",
+        "const choose = (first) => {\n",
+        "  if (first) return { arrow: 1 };\n",
+        "  return { arrow: 2 };\n",
+        "};\n",
+        "exports.api = {\n",
+        "  read(first) {\n",
+        "    if (first) return { state: 1, child: { trace: 3 } };\n",
+        "    return { state: 2, child: { trace: 4 } };\n",
+        "  },\n",
+        "  [computed()](first) {\n",
+        "    if (first) return { hidden: 1 };\n",
+        "    return { hidden: 2 };\n",
+        "  },\n",
+        "};\n",
+        "exports.named = named;\n",
+        "exports.choose = choose;\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.cjs", "exports.api = require('./api.cjs');"),
+            ("api.cjs", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.cjs"}"#,
+        )),
+    )
+    .expect("checked JavaScript sources");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid written properties");
+    let declaration = |written: &str| {
+        let start = SOURCE.find(written).expect("authored property");
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .unwrap_or_else(|| panic!("missing authored property {written}"))
+    };
+    for (first, second, owner) in [
+        ("control: 1", "control: 2", "/named/control"),
+        ("arrow: 1", "arrow: 2", "/choose/arrow"),
+        ("state: 1", "state: 2", "/api/read/state"),
+        (
+            "child: { trace: 3 }",
+            "child: { trace: 4 }",
+            "/api/read/child",
+        ),
+    ] {
+        let first = declaration(first);
+        let second = declaration(second);
+        assert_eq!(first.unit, second.unit);
+        assert_ne!(first.symbol, second.symbol);
+        assert!(first.symbol.as_str().contains(owner));
+        assert!(second.symbol.as_str().contains(owner));
+    }
+    for (parent, child) in [
+        ("child: { trace: 3 }", "trace: 3"),
+        ("child: { trace: 4 }", "trace: 4"),
+    ] {
+        let parent = declaration(parent);
+        let child = declaration(child);
+        assert_eq!(parent.unit, child.unit);
+        assert_eq!(
+            child
+                .symbol
+                .as_str()
+                .rsplit_once('/')
+                .map(|(parent, _)| parent),
+            Some(parent.symbol.as_str())
+        );
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.source.starts_with("hidden:"))
+    );
+}

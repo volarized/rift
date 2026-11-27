@@ -1059,6 +1059,7 @@ impl<'source> LiteralOwners<'source> {
                 .or_insert(Some(symbol));
         }
         let functions = literal_callable_owners(&unique, facts, anchors, &values);
+        let object_methods = literal_object_method_owners(&unique, facts, anchors);
         let array_initializers = array_literal_owners(file, &unique, anchors);
         let mut initializers = BTreeMap::new();
         for function in functions
@@ -1123,7 +1124,7 @@ impl<'source> LiteralOwners<'source> {
                 .iter()
                 .map(|&(_, _, call)| call)
                 .collect(),
-            returned: returned_literal_owners(&functions, facts),
+            returned: returned_literal_owners(&functions, &object_methods, facts),
             array_initializers,
         }
     }
@@ -1280,9 +1281,60 @@ fn literal_callable_owners<'source>(
         .collect()
 }
 
-/// Selects returned literal ranges from one admitted, physically named function or class method.
+/// Names a placed method whose literal is the entire value of one checked declaration.
+fn literal_object_method_owners<'source>(
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    facts: &StaticFacts,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
+    let mut holders = BTreeMap::new();
+    for declaration in unique.values().flatten() {
+        let Some(body) = declaration.body_range else {
+            continue;
+        };
+        if matches!(
+            declaration.syntax_element_kind,
+            Some("variable_declarator" | "assignment_expression" | "pair")
+        ) && matches!(declaration.kind, "variable" | "property")
+            && declaration.item_range.encloses(body)
+            && anchors.contains_key(&declaration.qualified_name)
+        {
+            holders
+                .entry((declaration.item_range, body))
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(declaration.qualified_name.as_str()));
+        }
+    }
+    let members = facts
+        .body_members()
+        .iter()
+        .filter_map(|member| {
+            Some((
+                member.member,
+                (*holders.get(&(member.holder, member.body))?)?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    unique
+        .values()
+        .flatten()
+        .copied()
+        .filter_map(|method| {
+            let owner = members.get(&method.item_range)?;
+            (method.syntax_element_kind == Some("method_definition")
+                && method.kind == "method"
+                && !method.name.starts_with('[')
+                && method.container.as_deref() == Some(owner)
+                && anchors.contains_key(&method.qualified_name))
+            .then_some((method.name_range?, method))
+        })
+        .collect()
+}
+
+/// Selects written literal returns of a placed function or method.
 fn returned_literal_owners<'source>(
     declarations: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    object_methods: &BTreeMap<ByteRange, &'source SyntaxSymbol>,
     facts: &StaticFacts,
 ) -> BTreeMap<ByteRange, Option<&'source str>> {
     let mut owners = BTreeMap::new();
@@ -1293,11 +1345,14 @@ fn returned_literal_owners<'source>(
             .map(|&(name, object)| (name, Some(object))),
     );
     for (name, object) in bodies {
-        let Some((owner, body)) = declarations.get(&name).zip(object) else {
+        let owner = declarations
+            .get(&name)
+            .or_else(|| object_methods.get(&name));
+        let Some((owner, body)) = owner.zip(object) else {
             continue;
         };
         let named = match owner.syntax_element_kind {
-            Some("function_declaration") => true,
+            Some("function_declaration" | "variable_declarator") => true,
             Some("method_definition") => !owner.name.starts_with('['),
             _ => false,
         };
