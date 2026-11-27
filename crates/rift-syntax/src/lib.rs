@@ -11,6 +11,7 @@ mod failure;
 mod html;
 mod javascript;
 mod json;
+mod jvm;
 pub mod language;
 mod markdown;
 mod native;
@@ -41,6 +42,7 @@ pub use document::{
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;
+pub use jvm::{JvmLanguage, JvmOccurrence, JvmOccurrenceKind, JvmOccurrences};
 pub use language::{LanguageDefinition, ShippedLanguage, definitions};
 pub use markdown::{
     MARKDOWN_INLINE_RANGES_MAX, MARKDOWN_PROGRESS_CALLBACKS_MAX, MarkdownBlockFact,
