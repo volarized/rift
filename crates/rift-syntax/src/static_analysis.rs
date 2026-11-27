@@ -469,6 +469,23 @@ pub struct StaticCommonJsExport {
     pub initialized: Vec<ByteRange>,
     /// The physical right-hand side of a checked direct object literal assignment.
     pub literal: Option<ByteRange>,
+    /// The physical function expression of a checked direct anonymous callable assignment.
+    pub anonymous_callable: Option<ByteRange>,
+}
+
+impl StaticCommonJsExport {
+    fn ranges_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
+        valid(self.assignment)
+            && self.anonymous_callable.is_none_or(|callable| {
+                valid(callable)
+                    && contains(self.assignment, callable)
+                    && !self.synchronized
+                    && self.literal.is_none()
+                    && self.initialized.is_empty()
+            })
+            && self.initialized.iter().copied().all(valid)
+            && self.initialized.windows(2).all(|pair| pair[0] < pair[1])
+    }
 }
 
 /// A direct type annotation use with its written generic binding.
@@ -1556,11 +1573,9 @@ impl StaticFacts {
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
         if !self.typescript_module_imports().iter().copied().all(valid)
-            || self.commonjs_export().is_some_and(|export| {
-                !valid(export.assignment)
-                    || !export.initialized.iter().copied().all(valid)
-                    || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
-            })
+            || self
+                .commonjs_export()
+                .is_some_and(|export| !export.ranges_valid(valid))
         {
             return errors::syntax::facts_range_invalid().fail();
         }

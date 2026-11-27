@@ -1250,13 +1250,17 @@ impl<'source> LiteralOwners<'source> {
         let object_methods = literal_object_method_owners(&unique, facts, anchors);
         let array_initializers = array_literal_owners(file, &unique, anchors);
         let mut initializers = BTreeMap::new();
-        for function in functions
-            .values()
-            .filter(|owner| owner.syntax_element_kind == Some("variable_declarator"))
-        {
-            if let Some(range) = function.body_range.and_then(|value| values.get(&value)) {
+        for function in functions.values() {
+            let range = match function.syntax_element_kind {
+                Some("variable_declarator") => function
+                    .body_range
+                    .and_then(|value| values.get(&value).copied()),
+                Some("assignment_expression") => closed_callable_scope(facts, function),
+                _ => None,
+            };
+            if let Some(range) = range {
                 initializers
-                    .entry(*range)
+                    .entry(range)
                     .and_modify(|owner| *owner = None)
                     .or_insert(Some(*function));
             }
@@ -1517,6 +1521,7 @@ fn literal_callable_owners<'source>(
             anchors.contains_key(&symbol.qualified_name)
                 && match symbol.syntax_element_kind {
                     Some("function_declaration") => true,
+                    Some("assignment_expression") => closed_callable_scope(facts, symbol).is_some(),
                     Some("variable_declarator") if symbol.kind == "variable" => {
                         symbol.kinds.contains(&SymbolKind::Callable)
                             && symbol.body_range.is_some_and(|value| {
@@ -1533,6 +1538,17 @@ fn literal_callable_owners<'source>(
         })
         .filter_map(|symbol| Some((symbol.name_range?, symbol)))
         .collect()
+}
+
+/// The unique physical function expression of an already placed anonymous default callable.
+fn closed_callable_scope(facts: &StaticFacts, symbol: &SyntaxSymbol) -> Option<ByteRange> {
+    let export = facts.commonjs_export()?;
+    let callable = export.anonymous_callable?;
+    (symbol.name == "default"
+        && symbol.kind == "function"
+        && symbol.item_range == export.assignment
+        && callable.encloses(symbol.body_range?))
+    .then_some(callable)
 }
 
 /// Names a placed method whose literal is the entire value of one checked declaration.

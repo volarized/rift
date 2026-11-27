@@ -7052,3 +7052,76 @@ fn typescript_enum_members_keep_references_at_their_written_qualifiers() {
         }));
     }
 }
+
+#[test]
+fn closed_anonymous_commonjs_callable_keeps_its_exact_literal_properties() {
+    const ENTRY: &str = "const build = require('./worker.js');\nmodule.exports = build;\n";
+    const WORKER: &str = concat!(
+        "module.exports = function (ready) {\n",
+        "    const results = [];\n",
+        "    if (ready) results.push({ kind: 'ready', line: 1 });\n",
+        "    else results.push({ kind: 'pending', line: 2 });\n",
+        "    return results;\n",
+        "};\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let closed = |worker: &str| {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", ENTRY), ("worker.js", worker)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("analyzed source");
+        analysis
+            .publication()
+            .validate_facts()
+            .expect("valid source");
+        analysis.into_parts().0
+    };
+    let publication = closed(WORKER);
+    let module = publication
+        .declarations
+        .iter()
+        .find(|row| row.source_complete && row.source == WORKER)
+        .expect("complete worker module");
+    let callable = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.unit == module.unit
+                && row.syntax_element_kind.as_deref() == Some("assignment_expression")
+                && row.symbol.as_str().ends_with("/default")
+        })
+        .expect("existing physical default callable");
+    let mut properties = BTreeSet::new();
+    for text in ["kind: 'ready'", "line: 1", "kind: 'pending'", "line: 2"] {
+        let start = u64::try_from(WORKER.find(text).expect("written property")).expect("offset");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == module.unit
+                    && row.range.start == start
+                    && row.source_complete
+                    && row.source == text
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("complete written property");
+        assert!(properties.insert(&row.symbol));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&callable.symbol)
+        }));
+    }
+    for worker in [
+        format!("if (enabled) {{ {WORKER} }}"),
+        format!("{WORKER} if (enabled) module.exports = other;"),
+        format!("{WORKER} inspect(module);"),
+        WORKER.replace("function (ready)", "async function (ready)"),
+    ] {
+        assert!(!closed(&worker).declarations.iter().any(|row| {
+            row.source == worker || row.source == "kind: 'ready'" || row.source == "line: 1"
+        }));
+    }
+}
