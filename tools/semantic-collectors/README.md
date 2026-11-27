@@ -131,8 +131,8 @@ on generated classes, including KSP output. The collector reads existing class o
 dependency resolution can use the project's configured repositories during export. A selected
 Java or Kotlin file must belong to one compile task.
 
-For Kotlin, admitted Java sources from project dependencies can supply declaration anchors when
-their class output or main JAR is on the compile classpath. An explicit Kotlin language version
+Admitted Java sources from project dependencies can supply declaration anchors when their class
+output or main JAR is on the compile classpath. An explicit Kotlin language version
 must be 2.2 or later. Gradle builds that leave the language version unset use the compiler default.
 
 The runner adds the Gradle model and classpath content digests to its checkpoint context. Keep the

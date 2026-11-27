@@ -101,6 +101,9 @@ gradle.projectsEvaluated {
             def assignments = [:]
             def compilations = []
             def javaByArtifact = [:]
+            def javaRelativePaths = [:]
+            def javaClasspaths = [:]
+            def javaClasspath = { task -> javaClasspaths.computeIfAbsent(task) { paths(task.classpath.files) } }
             def inputs = { files, language ->
                 paths(files).findAll { language.matches(it) }.collectMany { sources[it] ?: [] }
             }
@@ -116,7 +119,7 @@ gradle.projectsEvaluated {
                     task: task.path,
                     selected: selected,
                     support: units(support),
-                    classpath: paths(classpath),
+                    classpath: classpath,
                     kotlin: settings,
                 ])
             }
@@ -131,6 +134,15 @@ gradle.projectsEvaluated {
                     def selectedKotlin = units(kotlinInputs.findAll { it.selected })
                     def outputs = sourceSet.output.classesDirs.files
                     if (!javaInputs.isEmpty()) {
+                        def roots = sourceSet.java.srcDirs.collect { it.canonicalFile.toPath() }
+                            .sort { -it.nameCount }
+                        javaInputs.each { input ->
+                            def file = new File(input.path).toPath()
+                            def root = roots.find { file.startsWith(it) }
+                            if (root != null) {
+                                javaRelativePaths.putIfAbsent(input.unit, root.relativize(file))
+                            }
+                        }
                         def artifacts = paths(outputs)
                         if (sourceSet.name == SourceSet.MAIN_SOURCE_SET_NAME) {
                             def jar = project.tasks.findByName('jar')
@@ -138,24 +150,39 @@ gradle.projectsEvaluated {
                                 artifacts.addAll(paths([jar.archiveFile.get().asFile]))
                             }
                         }
-                        def javaUnits = units(javaInputs)
+                        def dependency = [task: java, units: units(javaInputs)]
                         artifacts.each { artifact ->
-                            javaByArtifact.computeIfAbsent(artifact) { [] }.addAll(javaUnits)
+                            javaByArtifact.computeIfAbsent(artifact) { [] }.add(dependency)
                         }
                     }
                     if (!selectedJava.isEmpty()) {
-                        add(java, selectedJava, javaInputs, java.classpath.files, null)
+                        add(java, selectedJava, javaInputs, javaClasspath(java), null)
                     }
                     if (!selectedKotlin.isEmpty()) {
                         def libraries = property(kotlin, 'libraries')?.files ?: sourceSet.compileClasspath.files
-                        add(kotlin, selectedKotlin, javaInputs + kotlinInputs, libraries + outputs,
+                        add(kotlin, selectedKotlin, javaInputs + kotlinInputs, paths(libraries + outputs),
                             languageSettings(kotlin))
                     }
                 }
             }
-            compilations.findAll { it.kotlin != null }.each { compilation ->
-                def dependencyJava = compilation.classpath.collectMany { javaByArtifact[it] ?: [] }
+            compilations.each { compilation ->
+                // Multi-release sources can replace a class from the compile classpath.
+                def visibleJava = compilation.support.collect { javaRelativePaths[it] }.findAll { it != null }.toSet()
+                def classpath = new LinkedHashSet(compilation.classpath)
+                def dependencies = compilation.classpath.collectMany { javaByArtifact[it] ?: [] }.unique { it.task.path }
+                def dependencyJava = dependencies.collectMany { dependency ->
+                    def support = dependency.units.findAll { unit ->
+                        def relative = javaRelativePaths[unit]
+                        relative == null || visibleJava.add(relative)
+                    }
+                    if (!support.isEmpty() && compilation.kotlin == null) {
+                        // Supporting sources can need compile-only dependencies absent from their published API.
+                        classpath.addAll(javaClasspath(dependency.task))
+                    }
+                    support
+                }
                 compilation.support = (compilation.support + dependencyJava).unique().sort()
+                compilation.classpath = classpath.toList()
             }
             def missing = admitted.find { source ->
                 source.selected && JvmSource.values().any { it.matches(source.path) } &&

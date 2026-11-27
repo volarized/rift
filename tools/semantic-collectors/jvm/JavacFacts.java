@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.util.Elements;
 import javax.tools.Diagnostic;
@@ -91,11 +92,16 @@ public final class JavacFacts {
         }
 
         private Facts.Anchor target(Element element) {
-            if (element == null || element.asType().getKind() == TypeKind.ERROR) {
+            if (element == null) {
+                return null;
+            }
+            // Javac can bind a variable even when its declared type is missing.
+            boolean missingType = element.asType().getKind() == TypeKind.ERROR;
+            if (missingType && !(element instanceof VariableElement)) {
                 return null;
             }
             TreePath target = trees.getPath(element);
-            if (target == null) {
+            if (target == null || (missingType && !(target.getLeaf() instanceof VariableTree))) {
                 return null;
             }
             var source = target.getCompilationUnit();
