@@ -84,6 +84,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKi
 mod callback_parameters;
 mod checked_parameters;
 mod commonjs;
+mod inline_import_types;
 mod members;
 mod overload_parameters;
 pub(crate) mod recovery;
@@ -93,6 +94,9 @@ pub(crate) mod type_parameters;
 mod type_signature_parameters;
 mod variance;
 mod wrapped_parameters;
+
+pub use inline_import_types::CheckedInlineTypeImport;
+pub(crate) use inline_import_types::check as checked_inline_import_types;
 
 use tree_sitter::{Node, Parser};
 

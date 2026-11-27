@@ -47,6 +47,7 @@ enum FileModuleReference {
     CommonJsExportImport,
     IncompleteLocalExport,
     ImportedExportSelector,
+    InlineImportType,
 }
 
 /// One resolved reference edge: the enclosing definition a reference occurred in, the
@@ -69,7 +70,7 @@ impl Edge {
         self.from_graph
     }
 
-    /// Whether this reference needs two admitted ECMAScript file modules.
+    /// Whether this reference waits for checked ECMAScript package projection.
     pub(crate) const fn is_file_module_reference(&self) -> bool {
         !matches!(self.file_module_reference, FileModuleReference::None)
     }
@@ -99,6 +100,14 @@ impl Edge {
         matches!(
             self.file_module_reference,
             FileModuleReference::ImportedExportSelector
+        )
+    }
+
+    /// A written qualifier in a checked relative inline TypeScript import type.
+    pub(crate) const fn is_inline_import_type_reference(&self) -> bool {
+        matches!(
+            self.file_module_reference,
+            FileModuleReference::InlineImportType
         )
     }
 
@@ -499,7 +508,7 @@ fn static_tail_starts(
     resolution: &mut StaticResolution,
     alias: Option<usize>,
     value_qualifier: Option<usize>,
-) -> [Option<usize>; 53] {
+) -> [Option<usize>; 54] {
     [
         resolution.late_supplemental_start.take(),
         resolution.python_reassignment_start.take(),
@@ -556,6 +565,7 @@ fn static_tail_starts(
         resolution.commonjs_export_import_start.take(),
         resolution.typescript_incomplete_local_export_start.take(),
         resolution.typescript_imported_export_start.take(),
+        resolution.typescript_inline_import_type_start.take(),
     ]
 }
 
@@ -563,7 +573,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 55] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 56] {
     let supplemental_start = resolution.supplemental_start.take();
     let (value_qualifier, value_qualifier_external) = resolution
         .python_value_qualifier_start
@@ -578,10 +588,10 @@ fn static_admission_batches<'a>(
             (Some(internal), external)
         });
     let tail_starts = static_tail_starts(resolution, alias, value_qualifier);
-    let mut boundaries = [0; 56];
+    let mut boundaries = [0; 57];
     let mut next = resolution.occurrences.len();
-    boundaries[55] = next;
-    for (boundary, start) in boundaries[2..55].iter_mut().zip(tail_starts).rev() {
+    boundaries[56] = next;
+    for (boundary, start) in boundaries[2..56].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }
@@ -605,6 +615,7 @@ fn static_admission_batches<'a>(
                 52 => FileModuleReference::CommonJsExportImport,
                 53 => FileModuleReference::IncompleteLocalExport,
                 54 => FileModuleReference::ImportedExportSelector,
+                55 => FileModuleReference::InlineImportType,
                 _ => FileModuleReference::None,
             },
         );

@@ -99,6 +99,19 @@ impl TypeScriptSyntaxProvider {
             candidates,
         )
     }
+
+    /// Checks written relative import qualifiers in TypeScript type declarations.
+    ///
+    /// # Errors
+    /// Returns the registered syntax refusal if the source, candidate count or parse
+    /// exceeds its accepted bounds.
+    pub fn checked_inline_import_types(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<Vec<crate::CheckedInlineTypeImport>, RiftError> {
+        ecmascript::checked_inline_import_types(&self.dialect.grammar(), source, limits)
+    }
 }
 
 impl SyntaxProvider for TypeScriptSyntaxProvider {

@@ -35,6 +35,7 @@ impl Records {
         }
         self.retain_checked_declaration_specifiers(owner, analyzed, semantics, limits)?;
         self.retain_imported_export_selectors(semantics, limits.edges_max());
+        self.retain_checked_inline_import_type_edges(semantics, limits.edges_max());
         Ok(())
     }
 
@@ -127,6 +128,57 @@ impl Records {
             .edges()
             .filter(|edge| edge.is_imported_export_selector());
         self.retain_file_module_edge_rows(references, edge_limit);
+    }
+
+    pub(super) fn retain_checked_inline_import_type_edges(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        limit: usize,
+    ) {
+        let mut references = semantics
+            .edges()
+            .edges()
+            .filter(|edge| edge.is_inline_import_type_reference())
+            .peekable();
+        if references.peek().is_none() {
+            return;
+        }
+        let complete = self
+            .units
+            .iter()
+            .filter(|unit| unit.source_complete)
+            .map(|unit| unit.unit.as_str())
+            .collect::<BTreeSet<_>>();
+        let declarations = self
+            .declarations
+            .iter()
+            .map(|row| (row.symbol.as_str(), row.unit.as_str()))
+            .collect::<BTreeSet<_>>();
+        let types = self
+            .objects
+            .iter()
+            .filter(|row| row.kinds.contains(&SymbolKind::Type))
+            .filter_map(|row| row.id.as_ref())
+            .map(SymbolId::as_str)
+            .collect::<BTreeSet<_>>();
+        for edge in references {
+            let from = edge.from().as_str();
+            let unit = edge.occurrence().unit().to_string();
+            if !complete.contains(unit.as_str())
+                || !declarations.contains(&(from, unit.as_str()))
+                || !types.contains(edge.to().as_str())
+            {
+                continue;
+            }
+            if self.edges.len() >= limit {
+                self.warn(truncation(
+                    "edges",
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ));
+                return;
+            }
+            self.edges.push(edge.to_protocol());
+        }
     }
 
     fn checked_declaration_source_candidates<'file>(

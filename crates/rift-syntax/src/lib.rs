@@ -39,6 +39,7 @@ pub use document::{
     SyntaxElement, SyntaxExportBinding, SyntaxExportKind, SyntaxFacts, SyntaxHolder, SyntaxMatch,
     SyntaxOrigin, SyntaxPlace, SyntaxSymbol,
 };
+pub use ecmascript::CheckedInlineTypeImport;
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;

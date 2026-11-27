@@ -15,6 +15,7 @@ mod facts;
 mod forwarded_names;
 mod graph;
 mod initializers;
+mod inline_import_types;
 mod internal_modules;
 mod mixed_shorthand;
 mod module_imports;

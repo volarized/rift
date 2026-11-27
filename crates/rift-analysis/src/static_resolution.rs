@@ -15,6 +15,7 @@ mod python_edges;
 mod rust;
 #[cfg(test)]
 mod tests;
+mod typescript_inline_imports;
 
 use javascript_parameters::{ParameterReads, ScopedParameterReads};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -159,6 +160,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_loop_read_start: Option<usize>,
     /// First independently checked local selector in an incomplete declaration file.
     pub(crate) typescript_incomplete_local_export_start: Option<usize>,
+    /// First checked type occurrence at a relative inline import qualifier.
+    pub(crate) typescript_inline_import_type_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -399,6 +402,7 @@ fn resolve_by<'source>(
     index.resolve_commonjs_export_imports(&mut work, &mut resolution);
     index.resolve_incomplete_typescript_local_exports(&mut work, &mut resolution);
     index.resolve_typescript_imported_export_selectors(&mut work, &mut resolution);
+    index.resolve_typescript_inline_import_types(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
