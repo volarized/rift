@@ -20,6 +20,8 @@ import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationCheckers
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirFileChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.ExpressionCheckers
+import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirGetClassCallChecker
+import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirThisReceiverExpressionChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirQualifiedAccessExpressionChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirResolvedQualifierChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirVariableAssignmentChecker
@@ -30,6 +32,9 @@ import org.jetbrains.kotlin.fir.declarations.FirFile
 import org.jetbrains.kotlin.fir.declarations.FirResolvedImport
 import org.jetbrains.kotlin.fir.expressions.FirDesugaredAssignmentValueReferenceExpression
 import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
+import org.jetbrains.kotlin.fir.expressions.FirGetClassCall
+import org.jetbrains.kotlin.fir.expressions.FirResolvedReifiedParameterReference
+import org.jetbrains.kotlin.fir.expressions.FirThisReceiverExpression
 import org.jetbrains.kotlin.fir.expressions.FirImplicitInvokeCall
 import org.jetbrains.kotlin.fir.expressions.FirPropertyAccessExpression
 import org.jetbrains.kotlin.fir.expressions.FirQualifiedAccessExpression
@@ -43,10 +48,14 @@ import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirConstructorSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirRegularClassSymbol
+import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
+import org.jetbrains.kotlin.fir.symbols.impl.FirReceiverParameterSymbol
 import org.jetbrains.kotlin.fir.types.ConeClassLikeType
 import org.jetbrains.kotlin.fir.types.ConeTypeParameterType
 import org.jetbrains.kotlin.fir.types.FirResolvedTypeRef
 import org.jetbrains.kotlin.name.ClassId
+import org.jetbrains.kotlin.psi.KtClassLiteralExpression
+import org.jetbrains.kotlin.psi.KtThisExpression
 import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtImportDirective
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
@@ -164,6 +173,38 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
     }
 
     override val expressionCheckers = object : ExpressionCheckers() {
+        override val getClassCallCheckers = setOf(
+            object : FirGetClassCallChecker(MppCheckerKind.Common) {
+                context(context: CheckerContext, reporter: DiagnosticReporter)
+                override fun check(expression: FirGetClassCall) {
+                    if (facts.category != Facts.Category.REFERENCES || !context.isSelected()) return
+                    val source = expression.source as? KtPsiSourceElement ?: return
+                    if (source.kind != KtRealSourceElementKind) return
+                    val literal = source.psi as? KtClassLiteralExpression ?: return
+                    val argument = expression.argument as? FirResolvedReifiedParameterReference ?: return
+                    val occurrence = literal.receiverExpression.nameRange() ?: return
+                    facts.add(occurrence, context.enclosing(), argument.symbol.anchor())
+                }
+            }
+        )
+
+        override val thisReceiverExpressionCheckers = setOf(
+            object : FirThisReceiverExpressionChecker(MppCheckerKind.Common) {
+                context(context: CheckerContext, reporter: DiagnosticReporter)
+                override fun check(expression: FirThisReceiverExpression) {
+                    if (facts.category != Facts.Category.REFERENCES || !context.isSelected()) return
+                    val source = expression.source as? KtPsiSourceElement ?: return
+                    if (source.kind != KtRealSourceElementKind) return
+                    val label = (source.psi as? KtThisExpression)?.getTargetLabel() ?: return
+                    val receiver = expression.calleeReference.boundSymbol as? FirReceiverParameterSymbol ?: return
+                    val symbol = receiver.containingDeclarationSymbol as? FirNamedFunctionSymbol ?: return
+                    if (symbol.name != label.getReferencedNameAsName()) return
+                    val occurrence = label.getReferencedNameElement().range() ?: return
+                    facts.add(occurrence, context.enclosing(), symbol.anchor())
+                }
+            }
+        )
+
         override val resolvedQualifierCheckers = setOf(
             object : FirResolvedQualifierChecker(MppCheckerKind.Common) {
                 context(context: CheckerContext, reporter: DiagnosticReporter)
