@@ -1090,3 +1090,93 @@ fn python_annotations_keep_checked_single_module_aliases() {
     assert_eq!(limited.declarations, complete.declarations);
     assert_eq!(limited.edges, incumbent);
 }
+
+#[test]
+fn python_wildcard_imports_keep_the_written_module_and_star() {
+    use rift_protocol::configuration::PackageConfiguration;
+    use rift_protocol::read::EdgeKind;
+
+    let files = [
+        ("demo/__init__.py", ""),
+        ("demo/leaf.py", "class Item: pass\n"),
+        ("demo/wild.py", "from .leaf import *\n"),
+        ("demo/named.py", "from .leaf import Item\n"),
+        ("demo/absent.py", "from .missing import *\n"),
+        ("demo/relative.py", "from . import *\n"),
+    ];
+    let complete = publication(&files, None, &["demo"]);
+    let target = |edge: &rift_protocol::index::StoredEdge, module: &str, name: &str| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.to.as_str().ends_with(name)
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit.0.ends_with(module))
+    };
+    let module_ranges = |path| {
+        let mut ranges = complete
+            .edges
+            .iter()
+            .filter(|edge| target(edge, path, "/demo/leaf"))
+            .map(|edge| {
+                let range = &edge.occurrence.as_ref().expect("written import").range;
+                (range.start, range.end)
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        ranges
+    };
+    assert_eq!(module_ranges("/demo/wild.py"), [(5, 10), (18, 19)]);
+    assert_eq!(module_ranges("/demo/named.py"), [(5, 10)]);
+    assert!(complete.edges.iter().any(|edge| {
+        target(edge, "/demo/named.py", "/demo/leaf/Item")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.range.start == 18 && site.range.end == 22)
+    }));
+    assert!(complete.edges.iter().all(|edge| {
+        edge.kinds != [EdgeKind::Imports]
+            || edge.occurrence.as_ref().is_none_or(|site| {
+                !site.unit.0.ends_with("/demo/absent.py")
+                    && (!site.unit.0.ends_with("/demo/relative.py") || site.range.start != 5)
+            })
+    }));
+
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            !target(edge, "/demo/wild.py", "/demo/leaf")
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range.start != 5)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    let tight_incumbents = prior
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Contains] || target(edge, "/demo/named.py", "/demo/leaf/Item")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(limited.declarations, complete.declarations);
+    assert_eq!(limited.edges, tight_incumbents);
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior.len() + 1),
+    );
+    assert!(prior.iter().all(|edge| limited.edges.contains(edge)));
+}
