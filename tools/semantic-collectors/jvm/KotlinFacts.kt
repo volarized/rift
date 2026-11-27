@@ -74,6 +74,7 @@ import org.jetbrains.kotlin.fir.symbols.impl.FirPropertyAccessorSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirRegularClassSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirReceiverParameterSymbol
+import org.jetbrains.kotlin.fir.symbols.impl.FirValueParameterSymbol
 import org.jetbrains.kotlin.fir.types.ConeClassLikeType
 import org.jetbrains.kotlin.fir.types.ConeErrorType
 import org.jetbrains.kotlin.fir.types.ConeFlexibleType
@@ -451,7 +452,15 @@ private class KotlinCheckers(session: FirSession, val facts: Facts) :
                 override fun check(typeRef: FirResolvedTypeRef) {
                     if (facts.category != Facts.Category.REFERENCES || !context.isSelected()) return
                     val occurrence = typeRef.source.range() ?: return
-                    val type = typeRef.coneType
+                    val element = typeRef.delegatedTypeRef as? FirResolvedTypeRef
+                    val type = if (element?.source?.kind == KtFakeSourceElementKind.ArrayTypeFromVarargParameter) {
+                        val parameter = context.containingDeclarations.lastOrNull() as? FirValueParameterSymbol ?: return
+                        val syntax = (typeRef.source as? KtPsiSourceElement)?.psi as? KtTypeReference ?: return
+                        val declaration = syntax.parent as? KtParameter ?: return
+                        if (!parameter.isVararg || declaration.typeReference !== syntax ||
+                            (element.source as? KtPsiSourceElement)?.psi !== syntax) return
+                        element.coneType
+                    } else typeRef.coneType
                     val target = when (type) {
                         is ConeClassLikeType -> session.symbolProvider.getClassLikeSymbolByClassId(type.lookupTag.classId)
                         is ConeTypeParameterType -> type.lookupTag.typeParameterSymbol
