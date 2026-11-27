@@ -3032,6 +3032,85 @@ fn non_entry_typescript_union_properties_keep_their_written_branches() {
 }
 
 #[test]
+fn non_entry_typescript_wrapped_and_return_unions_keep_their_written_branches() {
+    const SOURCE: &str = concat!(
+        "export type Direct = { prior: number } | { prior: string };\n",
+        "export type Wrapped = Promise<{ value: number } | { value: string }>;\n",
+        "export declare class Reader {\n",
+        "    plain(): { code: number } | { code: string };\n",
+        "    wrapped(): Promise<{ rendered: number } | { rendered: string }>;\n",
+        "}\n",
+        "export declare function read(): Promise<{ result: number } | { result: string }>;\n",
+        "export declare function accept(input: { other: number } | { other: string }): void;\n",
+    );
+    let analyze = |entry| {
+        let manifest = format!(r#"{{"name":"beacon","version":"1.0.0","types":"./{entry}"}}"#);
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                (
+                    "index.d.ts",
+                    "export { Direct, Reader, Wrapped, read } from './reader.js';",
+                ),
+                ("reader.d.ts", SOURCE),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("written type sources")
+    };
+    let non_entry = analyze("index.d.ts");
+    let entry = analyze("reader.d.ts");
+    let found = non_entry.publication();
+    found.validate_facts().expect("checked branch owners");
+    let unit = found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "reader.d.ts")
+        .expect("written declaration file");
+    for (owner, name) in [
+        ("Direct", "prior"),
+        ("Wrapped", "value"),
+        ("Reader/plain", "code"),
+        ("Reader/wrapped", "rendered"),
+        ("read", "result"),
+    ] {
+        let mut identities = BTreeSet::new();
+        for ty in ["number", "string"] {
+            let written = format!("{name}: {ty}");
+            let start = SOURCE.find(&written).expect("written property");
+            let range = module_runtime_range(start, &written);
+            let declaration = found
+                .declarations
+                .iter()
+                .find(|row| row.unit == unit.unit && row.range == range && row.source == written)
+                .unwrap_or_else(|| panic!("missing {owner}/{written}"));
+            let suffix = format!("%2Freader.d.ts/{owner}/{name}");
+            assert!(declaration.symbol.as_str().contains(&suffix));
+            assert!(identities.insert(&declaration.symbol));
+            assert!(entry.publication().declarations.iter().any(|row| {
+                row.unit == unit.unit
+                    && row.range == range
+                    && row.source == written
+                    && row.symbol.as_str().ends_with(&format!("/{owner}/{name}"))
+            }));
+        }
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/accept"))
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| !row.symbol.as_str().contains("/accept/other"))
+    );
+}
+
+#[test]
 fn typescript_method_type_parameters_keep_their_own_annotation_targets() {
     const SOURCE: &str = concat!(
         "export interface Reader { read<Value>(value: Value): Value; }\n",
