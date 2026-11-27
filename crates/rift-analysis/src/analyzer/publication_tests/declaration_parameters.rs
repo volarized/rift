@@ -378,3 +378,96 @@ fn mapped_type_parameters_use_only_remaining_declaration_capacity() {
     let bounded = collect(Some(limit));
     assert_eq!(bounded.declarations.iter().collect::<Vec<_>>(), remaining);
 }
+
+#[test]
+fn callable_type_rest_parameters_keep_their_written_signatures() {
+    const REST_ONLY: &str = "    (...early: number[]): Reader;\n";
+    const SOURCE: &str = concat!(
+        "export type Reader = (input: string, ...restArgs: number[]) => number;\n",
+        "export interface Route {\n",
+        "    (...early: number[]): Reader;\n",
+        "    (query: string, ...invokeArgs: string[]): Reader;\n",
+        "    new (name: string, ...ctorArgs: number[]): Reader;\n",
+        "}\n",
+        "export type Factory = new (route: Reader, ...values: string[]) => Route;\n",
+    );
+    for (path, secondary) in [("index.d.ts", false), ("lib/worker.d.ts", true)] {
+        let collect = |text: &str| {
+            let manifest =
+                r#"{"name":"beacon","version":"1.0.0","type":"module","types":"index.d.ts"}"#;
+            let mut files = vec![(path, text)];
+            if secondary {
+                files.push(("index.d.ts", "export * from './lib/worker.js';"));
+            }
+            fixture::package_result_with_metadata(
+                ShippedLanguage::TypeScript,
+                files,
+                None,
+                Some(("package.json", manifest)),
+            )
+            .expect("checked declaration source")
+            .into_parts()
+            .0
+        };
+        let full = collect(SOURCE);
+        let without = collect(&SOURCE.replace(REST_ONLY, ""));
+        let identifier = |publication: &PackagePublication, name: &str| {
+            let row = publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.source == name && row.symbol.as_str().ends_with(&format!("/{name}"))
+                })
+                .expect("written parameter");
+            assert_eq!(row.syntax_element_kind.as_deref(), Some("identifier"));
+            let object = publication
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&row.symbol))
+                .expect("parameter object");
+            assert!(object.kinds.contains(&SymbolKind::Parameter));
+            row.symbol.clone()
+        };
+        for (plain, rest) in [
+            ("input", "restArgs"),
+            ("query", "invokeArgs"),
+            ("name", "ctorArgs"),
+            ("route", "values"),
+        ] {
+            let parameter = identifier(&full, plain);
+            assert_eq!(parameter, identifier(&without, plain));
+            let additional = identifier(&full, rest);
+            assert_eq!(
+                parameter
+                    .as_str()
+                    .rsplit_once('/')
+                    .expect("written signature")
+                    .0,
+                additional
+                    .as_str()
+                    .rsplit_once('/')
+                    .expect("written signature")
+                    .0
+            );
+            assert!(
+                full.edges
+                    .iter()
+                    .all(|edge| edge.to != additional || edge.kinds != [EdgeKind::Reads])
+            );
+        }
+        let rest_only = identifier(&full, "early");
+        let ordinary = identifier(&full, "query");
+        assert_ne!(
+            rest_only
+                .as_str()
+                .rsplit_once('/')
+                .expect("rest-only signature")
+                .0,
+            ordinary
+                .as_str()
+                .rsplit_once('/')
+                .expect("ordinary signature")
+                .0
+        );
+    }
+}

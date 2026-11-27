@@ -19,6 +19,41 @@ pub(super) fn callable_parameter_name<'tree>(visited: Visited<'_, 'tree>) -> Opt
         .filter(|name| name.kind() == "identifier" && !name.is_missing())
 }
 
+pub(super) fn callable_rest_parameter_name<'tree>(
+    visited: Visited<'_, 'tree>,
+) -> Option<Node<'tree>> {
+    let name = visited.syntax_element();
+    callable_rest_scope(name)?;
+    Some(name)
+}
+
+fn callable_rest_scope(name: Node<'_>) -> Option<Node<'_>> {
+    let rest = name.parent()?;
+    let parameter = rest.parent()?;
+    let scope = callable_type_scope(parameter)?;
+    if name.kind() != "identifier"
+        || name.is_missing()
+        || rest.kind() != "rest_pattern"
+        || rest.named_child(0) != Some(name)
+        || parameter.kind() != "required_parameter"
+        || parameter.child_by_field_name("pattern") != Some(rest)
+        || parameter.child_by_field_name("value").is_some()
+        || parameter.has_error()
+        || scope.child_by_field_name("parameters") != parameter.parent()
+    {
+        return None;
+    }
+    // A rest parameter is the last formal. The syntax tree bounds the remaining siblings.
+    let mut following = parameter.next_named_sibling();
+    while let Some(next) = following {
+        if !next.is_extra() {
+            return None;
+        }
+        following = next.next_named_sibling();
+    }
+    Some(scope)
+}
+
 fn callable_type_scope(parameter: Node<'_>) -> Option<Node<'_>> {
     if !matches!(
         parameter.kind(),
@@ -54,8 +89,23 @@ pub(super) fn append_callable_types(
         .iter()
         .map(|site| (site.name, site.function))
         .collect::<BTreeMap<_, _>>();
+    let rests = parameters
+        .iter()
+        .any(SyntaxSymbol::is_typescript_callable_type_rest_parameter)
+        .then(|| {
+            facts
+                .bindings()
+                .iter()
+                .filter(|site| site.kind == StaticBindingKind::Shadow)
+                .map(|binding| (binding.name, binding.scope))
+                .collect::<BTreeSet<_>>()
+        });
     append_scoped(symbols, parameters, "$signature", |name| {
         let written = written_name(root, name)?;
+        if written.parent()?.kind() == "rest_pattern" {
+            let scope = extract::byte_range(callable_rest_scope(written)?).ok()?;
+            return rests.as_ref()?.contains(&(name, scope)).then_some(scope);
+        }
         let scope = extract::byte_range(callable_type_scope(written.parent()?)?).ok()?;
         (sites.get(&name) == Some(&scope)).then_some(scope)
     });
@@ -296,7 +346,12 @@ fn append_scoped(
     let mut next = BTreeMap::<String, usize>::new();
     let mut scopes = BTreeMap::<ByteRange, usize>::new();
     let mut retained = BTreeMap::new();
-    parameters.sort_unstable_by_key(|parameter| parameter.item_range.start);
+    parameters.sort_unstable_by_key(|parameter| {
+        (
+            parameter.is_typescript_callable_type_rest_parameter(),
+            parameter.item_range.start,
+        )
+    });
     for mut parameter in parameters {
         let Some(name) = parameter.name_range else {
             continue;

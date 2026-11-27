@@ -259,6 +259,13 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_typescript_callable_type_parameter(&self) -> bool {
         self.kind == crate::ecmascript::CALLABLE_TYPE_PARAMETER_KIND
+            || self.is_typescript_callable_type_rest_parameter()
+    }
+
+    /// Whether a TypeScript callable type writes this parameter with a rest pattern.
+    #[must_use]
+    pub fn is_typescript_callable_type_rest_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::CALLABLE_TYPE_REST_PARAMETER_KIND
     }
 
     /// Whether this value parameter is written in a TypeScript index signature.
