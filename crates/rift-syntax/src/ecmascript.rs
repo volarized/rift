@@ -2350,19 +2350,9 @@ pub(crate) fn analyze_included(
         &mut rules.exports.bindings,
     )?;
     rules.exports.add_commonjs(&commonjs, source.text);
-    let mut capture = ranges.is_empty().then(|| {
-        if language.name == "typescript" {
-            crate::static_analysis::Capture::for_edge_typescript(
-                source.text,
-                match language.dialect.as_deref() {
-                    Some("tsx") => crate::typescript::TypeScriptDialect::Tsx,
-                    _ => crate::typescript::TypeScriptDialect::TypeScript,
-                },
-            )
-        } else {
-            crate::static_analysis::Capture::for_javascript(source.text)
-        }
-    });
+    let mut capture = ranges
+        .is_empty()
+        .then(|| package_capture(language, source.text));
     if let Some(capture) = &mut capture
         && !recovered
         && !tree.root_node().has_error()
@@ -2401,12 +2391,16 @@ pub(crate) fn analyze_included(
             );
         }
     }
+    let variance_errors_only = finish_package_type_recovery(
+        language,
+        &mut parser,
+        tree.root_node(),
+        source,
+        limits,
+        ranges.is_empty() && !recovered,
+        &mut symbols,
+    );
     symbols.sort_by_key(|symbol| symbol.range.start);
-    let variance_errors_only = language.name == "typescript"
-        && ranges.is_empty()
-        && !recovered
-        && tree.root_node().has_error()
-        && variance::accounts_for_parse_errors(&mut parser, tree.root_node(), source.text, limits);
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
@@ -2420,6 +2414,44 @@ pub(crate) fn analyze_included(
     .with_export_bindings(export_bindings)
     .with_static_facts(static_facts)
     .with_syntax_limits(limits))
+}
+
+fn package_capture<'source>(
+    language: &Language,
+    text: &'source str,
+) -> crate::static_analysis::Capture<'source> {
+    if language.name == "typescript" {
+        crate::static_analysis::Capture::for_edge_typescript(
+            text,
+            match language.dialect.as_deref() {
+                Some("tsx") => crate::typescript::TypeScriptDialect::Tsx,
+                _ => crate::typescript::TypeScriptDialect::TypeScript,
+            },
+        )
+    } else {
+        crate::static_analysis::Capture::for_javascript(text)
+    }
+}
+
+fn finish_package_type_recovery(
+    language: &Language,
+    parser: &mut Parser,
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    original_unit: bool,
+    symbols: &mut [crate::SyntaxSymbol],
+) -> bool {
+    if !original_unit || language.name != "typescript" || !root.has_error() {
+        return false;
+    }
+    if [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| source.path.as_str().ends_with(suffix))
+    {
+        let _ = inline_import_types::recover_type_aliases(parser, root, source, limits, symbols);
+    }
+    variance::accounts_for_parse_errors(parser, root, source.text, limits)
 }
 
 fn parser_for_ranges(

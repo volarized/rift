@@ -2,7 +2,10 @@
 
 use rift_core::constants::PROJECT_PATH_BYTES_MAX;
 use rift_error::errors;
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser, Tree};
+
+mod checked_type_aliases;
+pub(super) use checked_type_aliases::recover as recover_type_aliases;
 
 use crate::{ByteRange, SyntaxLimits, SyntaxSource, failure::RiftError};
 
@@ -34,13 +37,7 @@ pub(crate) fn check(
     limits: SyntaxLimits,
 ) -> Result<Vec<CheckedInlineTypeImport>, RiftError> {
     limits.admit_source(source)?;
-    let candidates = candidates(source.text, limits.syntax_elements_max());
-    let Some(mut candidates) = candidates else {
-        return errors::syntax::too_many_syntax_elements()
-            .path(source.path)
-            .syntax_elements_max(limits.syntax_elements_max())
-            .fail();
-    };
+    let candidates = bounded_candidates(source, limits)?;
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -48,19 +45,49 @@ pub(crate) fn check(
     let original = parser
         .parse(source.text, None)
         .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-    let root = original.root_node();
-    if root.kind() != "program" || root.is_error() {
+    let Some((tree, candidates)) =
+        comparison_tree(&mut parser, original.root_node(), source, candidates)?
+    else {
         return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    let mut checked = Vec::new();
+    for candidate in &candidates {
+        if let Some(import) = checked_candidate(root, candidate, limits.syntax_depth_max()) {
+            checked.push(import);
+        }
+    }
+    Ok(checked)
+}
+
+fn bounded_candidates(
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+) -> Result<Vec<Candidate>, RiftError> {
+    candidates(source.text, limits.syntax_elements_max()).ok_or_else(|| {
+        errors::syntax::too_many_syntax_elements()
+            .path(source.path)
+            .syntax_elements_max(limits.syntax_elements_max())
+            .error()
+    })
+}
+
+fn comparison_tree(
+    parser: &mut Parser,
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    mut candidates: Vec<Candidate>,
+) -> Result<Option<(Tree, Vec<Candidate>)>, RiftError> {
+    if root.kind() != "program" || root.is_error() {
+        return Ok(None);
     }
     candidates.retain(|candidate| original_tokens(root, candidate));
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    drop(original);
     let mut comparison = source.text.as_bytes().to_vec();
     for candidate in &candidates {
-        // Keep newline and token offsets so the checked identifier still names the
-        // precise bytes of the original source. The comparison tree contributes no facts.
+        // Keep newlines and byte offsets; the comparison tree contributes no other facts.
         for byte in &mut comparison[candidate.prefix.clone()] {
             if !matches!(*byte, b'\n' | b'\r') {
                 *byte = b' ';
@@ -71,16 +98,7 @@ pub(crate) fn check(
         .parse(&comparison, None)
         .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
     let root = tree.root_node();
-    if root.kind() != "program" || root.is_error() {
-        return Ok(Vec::new());
-    }
-    let mut checked = Vec::new();
-    for candidate in &candidates {
-        if let Some(import) = checked_candidate(root, candidate, limits.syntax_depth_max()) {
-            checked.push(import);
-        }
-    }
-    Ok(checked)
+    Ok((root.kind() == "program" && !root.is_error()).then_some((tree, candidates)))
 }
 
 fn original_tokens(root: Node<'_>, candidate: &Candidate) -> bool {
