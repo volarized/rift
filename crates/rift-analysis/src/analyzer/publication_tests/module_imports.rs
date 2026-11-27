@@ -6745,7 +6745,7 @@ fn checked_commonjs_expression_entries_keep_the_module_and_relative_load() {
             true,
         ),
         (
-            "module.exports = function run(value) { return value; };",
+            "if (enabled) module.exports = function run(value) { return value; };",
             "commonjs",
             "'..'",
             false,
@@ -6824,5 +6824,66 @@ fn checked_commonjs_expression_entries_keep_the_module_and_relative_load() {
             })
         });
         assert_eq!(imported, loader, "{entry} {mode} {module}");
+    }
+}
+
+#[test]
+fn checked_commonjs_default_function_keeps_the_physical_entry_module() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js","exports":{".":[{"default":"./index.js"},"./index.js"]}}"#;
+    const CLIENT: &str =
+        "const base = require('../');\nfunction local() { return base(); }\nlocal();\n";
+    for (entry, complete) in [
+        ("module.exports = function serve() { return 1; };", true),
+        (
+            "function serve() { return 1; } module.exports = serve;",
+            true,
+        ),
+        (
+            "if (flag) module.exports = function serve() { return 1; };",
+            false,
+        ),
+        (
+            "module.exports = function serve() { return 1; }; module.exports = change;",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = function serve() { return 1; };",
+            false,
+        ),
+        (
+            "module.exports = function serve() { return 1; }; expose(module);",
+            false,
+        ),
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", entry), ("sub/client.js", CLIENT)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected package");
+        let publication = analysis.publication();
+        let source = |path: &str, written: &str| {
+            publication.declarations.iter().any(|row| {
+                row.unit.as_str().ends_with(path)
+                    && row.range.start == 0
+                    && row.source_complete
+                    && row.source == written
+            })
+        };
+        assert_eq!(source("/index.js", entry), complete, "{entry}");
+        assert_eq!(source("/client.js", CLIENT), complete, "{entry}");
+        assert_eq!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit.as_str().ends_with("/client.js")
+                            && CLIENT.get(offset_in(site.range.start)..offset_in(site.range.end))
+                                == Some("'../'")
+                    })
+            }),
+            complete,
+            "{entry}"
+        );
     }
 }

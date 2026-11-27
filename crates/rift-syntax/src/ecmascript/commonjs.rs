@@ -245,6 +245,7 @@ pub(super) fn record<'tree>(
         synchronized,
     };
     let mut closed_export = None;
+    let mut direct_function = None;
     let mut shadowing = BTreeSet::new();
     for &syntax_element in &captured.assignments {
         if synchronized != Some(syntax_element)
@@ -272,6 +273,11 @@ pub(super) fn record<'tree>(
         }
         if body.is_closed_default(syntax_element, &binding, direct) {
             closed_export = Some((binding.range, synchronized == Some(syntax_element), None));
+        } else if allow_literal
+            && direct
+            && body.is_closed_written_function(syntax_element, &binding)
+        {
+            direct_function = Some(binding.range);
         }
         if declares_taken_name(
             syntax_element,
@@ -315,7 +321,14 @@ pub(super) fn record<'tree>(
                     .is_some_and(|value| written_callable_composite(value, source.text, kinds))
                 && closed_wrapper_uses(root, None, assignment, source.text, kinds)
         });
-    exports.closed_export = closed_export;
+    exports.closed_export = closed_export.or_else(|| {
+        direct_function.map(|assignment| StaticCommonJsExport {
+            assignment,
+            synchronized: false,
+            initialized: Vec::new(),
+            literal: None,
+        })
+    });
     exports.shadowing = shadowing;
     exports.assignments = captured.assignments;
     Ok(exports)
@@ -381,6 +394,23 @@ impl<'tree> ModuleBody<'_, 'tree> {
             .child(assignment, EcmaScriptGrammarField::Right)
             .filter(|value| value.kind_id() == self.kinds.object_literal)
             .filter(|_| closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds))
+    }
+
+    /// The written function that a closed module assigns directly to its default export.
+    fn is_closed_written_function(
+        &self,
+        assignment: Node<'_>,
+        binding: &SyntaxExportBinding,
+    ) -> bool {
+        let Some(value) = self.kinds.child(assignment, EcmaScriptGrammarField::Right) else {
+            return false;
+        };
+        binding.kind == SyntaxExportKind::Default
+            && value.kind() == "function_expression"
+            && value
+                .child_by_field_name("name")
+                .is_some_and(|name| extract::byte_range(name).ok() == binding.local)
+            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
     }
 
     /// Whether the default export names a declaration and the file uses its wrapper names
