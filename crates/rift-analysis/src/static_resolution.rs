@@ -146,6 +146,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_property_receiver_start: Option<usize>,
     /// First module root reference of a checked Python annotation or base.
     pub(crate) python_annotation_qualifier_start: Option<usize>,
+    /// First checked simple module alias Read in an annotation or base.
+    pub(crate) python_direct_annotation_qualifier_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -379,6 +381,7 @@ fn resolve_by<'source>(
     );
     index.resolve_python_property_receivers(&mut work, &mut resolution);
     index.resolve_python_annotation_qualifiers(&mut work, &mut resolution);
+    index.resolve_python_direct_annotation_qualifiers(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

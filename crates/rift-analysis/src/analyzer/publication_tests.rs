@@ -995,3 +995,98 @@ fn python_annotations_keep_their_checked_root_module_tokens() {
     assert!(limited.edges.len() < complete.edges.len());
     assert_eq!(limited.declarations, complete.declarations);
 }
+
+#[test]
+fn python_annotations_keep_checked_single_module_aliases() {
+    use rift_protocol::configuration::PackageConfiguration;
+    use rift_protocol::read::EdgeKind;
+
+    const SOURCE: &str = concat!(
+        "from . import helpers as members\n",
+        "from . import helpers as ambiguous\n",
+        "from . import other as ambiguous\n",
+        "class Child(members.Item):\n    pass\n",
+        "def read(value: members.Item) -> members.Item:\n",
+        "    return members.Item()\n",
+        "def shadowed(members):\n    item: members.Item\n    return item\n",
+        "def unresolved(value: ambiguous.Item, callback: members.make):\n    pass\n",
+    );
+    let files = [
+        ("demo/__init__.py", ""),
+        (
+            "demo/helpers.py",
+            "class Item: pass\ndef make(): return Item()\n",
+        ),
+        ("demo/other.py", "class Item: pass\n"),
+        ("demo/reader.py", SOURCE),
+    ];
+    let complete = publication(&files, None, &["demo"]);
+    let unit = &complete
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "demo/reader.py")
+        .expect("reader source")
+        .unit;
+    let sites = SOURCE
+        .match_indices("members.Item")
+        .map(|(start, _)| u64::try_from(start).expect("source offset"))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 5);
+    let module_read = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.to.as_str().ends_with("/demo/helpers")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| &site.unit == unit)
+    };
+    let mut offsets = complete
+        .edges
+        .iter()
+        .filter(|edge| module_read(edge))
+        .map(|edge| {
+            let range = &edge.occurrence.as_ref().expect("physical read").range;
+            assert_eq!(range.end - range.start, 7);
+            range.start
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    assert_eq!(offsets, sites[..4]);
+    let ambiguous = u64::try_from(SOURCE.find("ambiguous.Item").expect("written alias"))
+        .expect("source offset");
+    assert!(complete.edges.iter().all(|edge| {
+        edge.occurrence.as_ref().is_none_or(|site| {
+            &site.unit != unit || site.range.start != ambiguous || edge.kinds != [EdgeKind::Reads]
+        })
+    }));
+    for kind in [EdgeKind::Calls, EdgeKind::HasType, EdgeKind::Extends] {
+        assert!(complete.edges.iter().any(|edge| {
+            edge.to.as_str().ends_with("/demo/helpers/Item") && edge.kinds == [kind]
+        }));
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            !module_read(edge)
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| !sites[..3].contains(&site.range.start))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    let incumbent = prior
+        .into_iter()
+        .filter(|edge| !module_read(edge))
+        .collect::<Vec<_>>();
+    assert_eq!(limited.declarations, complete.declarations);
+    assert_eq!(limited.edges, incumbent);
+}

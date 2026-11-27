@@ -61,10 +61,16 @@ fn package_python_compound_string_annotations_keep_written_type_ranges() {
     assert!(!complete.edges.iter().any(|edge| {
         edge.from.as_str().ends_with("/consumer/label") && edge.to.as_str().ends_with("/model/Item")
     }));
+    let alias_read = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from.as_str().ends_with("/consumer/plain")
+            && edge.to.as_str().ends_with("/model")
+    };
+    assert_direct_annotation_aliases(&complete, CONSUMER, alias_read);
     let prior = complete
         .edges
         .iter()
-        .filter(|edge| !compound(edge))
+        .filter(|edge| !compound(edge) && !alias_read(edge))
         .cloned()
         .collect::<Vec<_>>();
     let capped = python_publication_with_limits(
@@ -76,4 +82,41 @@ fn package_python_compound_string_annotations_keep_written_type_ranges() {
     );
     assert_eq!(capped.declarations, complete.declarations);
     assert_eq!(capped.edges, prior);
+}
+
+fn assert_direct_annotation_aliases(
+    complete: &PackagePublication,
+    source: &str,
+    alias_read: impl Fn(&rift_protocol::index::StoredEdge) -> bool,
+) {
+    let plain = source.find("def plain").expect("written function");
+    let expected = source[plain..]
+        .match_indices("model.Item")
+        .take(2)
+        .map(|(offset, _)| {
+            let start = u64::try_from(plain + offset).expect("module offset");
+            rift_protocol::read::TextRange {
+                start,
+                end: start + 5,
+            }
+        })
+        .collect::<Vec<_>>();
+    let actual = complete
+        .edges
+        .iter()
+        .filter(|edge| alias_read(edge))
+        .map(|edge| {
+            edge.occurrence
+                .as_ref()
+                .expect("written module")
+                .range
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert!(!complete.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from.as_str().ends_with("/consumer/label")
+            && edge.to.as_str().ends_with("/model")
+    }));
 }

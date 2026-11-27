@@ -167,6 +167,25 @@ impl<'source> Index<'source> {
         result: &mut StaticResolution,
     ) {
         result.python_annotation_qualifier_start = Some(result.occurrences.len());
+        self.python_annotation_module_reads(work, result, AnnotationModule::Nested);
+    }
+
+    /// Resolves a checked module alias written directly beside a type name.
+    pub(in crate::static_resolution) fn resolve_python_direct_annotation_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_direct_annotation_qualifier_start = Some(result.occurrences.len());
+        self.python_annotation_module_reads(work, result, AnnotationModule::Direct);
+    }
+
+    fn python_annotation_module_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+        path: AnnotationModule,
+    ) {
         for file in self.python_files() {
             for reference in file
                 .facts
@@ -174,12 +193,15 @@ impl<'source> Index<'source> {
                 .iter()
                 .filter(|reference| reference.role == ReferenceRole::Type)
             {
-                if !work.charge() {
+                let module = path.module_range(file, reference.target);
+                if (path == AnnotationModule::Nested || module.is_some()) && !work.charge() {
                     return;
                 }
-                if let Some(root) = first_module_segment(file, reference.target)
+                if let Some(root) = module
                     && let Some(qualifier) = self.python_member_module_qualifier(file, root, work)
-                    && self.python_type(file, reference.target, work).is_some()
+                    && let Some(target) = self.python_type(file, reference.target, work)
+                    && (path == AnnotationModule::Nested
+                        || target.symbol.kinds.contains(&SymbolKind::Type))
                 {
                     result.record(Some(qualifier));
                 }
@@ -284,16 +306,28 @@ impl<'source> Index<'source> {
     }
 }
 
-fn first_module_segment(file: &File<'_>, range: ByteRange) -> Option<ByteRange> {
-    let (first, tail) = file.text(range)?.split_once('.')?;
-    let first = first.trim_end();
-    if !tail.contains('.') || !rift_protocol::index::python_identifier_is_valid(first) {
-        return None;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnnotationModule {
+    Direct,
+    Nested,
+}
+
+impl AnnotationModule {
+    fn module_range(self, file: &File<'_>, range: ByteRange) -> Option<ByteRange> {
+        let (first, tail) = file.text(range)?.split_once('.')?;
+        let first = first.trim_end();
+        if tail.contains('.') != (self == Self::Nested)
+            || !rift_protocol::index::python_identifier_is_valid(first)
+            || (self == Self::Direct
+                && !rift_protocol::index::python_identifier_is_valid(tail.trim()))
+        {
+            return None;
+        }
+        Some(ByteRange {
+            start: range.start,
+            end: range.start.checked_add(u64::try_from(first.len()).ok()?)?,
+        })
     }
-    Some(ByteRange {
-        start: range.start,
-        end: range.start.checked_add(u64::try_from(first.len()).ok()?)?,
-    })
 }
 
 /// The callees whose calls in one file have a target, with the declaration each call names
