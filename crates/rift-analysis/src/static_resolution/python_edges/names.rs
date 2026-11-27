@@ -65,8 +65,15 @@ impl<'source> Index<'source> {
     ) -> Vec<ReassignedLocalRead<'source>> {
         let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
+            if file.python_loop_bindings.contains_key(&name) {
+                continue;
+            }
             let target = match file.python_parameters.get(&name) {
-                Some(&Some(symbol)) if parameters && !symbol.is_python_overload_parameter() => {
+                Some(&Some(symbol))
+                    if parameters
+                        && !symbol.is_python_overload_parameter()
+                        && !symbol.is_python_property_receiver() =>
+                {
                     Some(Target {
                         file: file.document,
                         symbol,
@@ -144,8 +151,49 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if let Some(target) = file.python_receiver_read_target(read, name, work) {
+            if !file.is_python_property_receiver(name)
+                && let Some(target) = file.python_receiver_read_target(read, name, work)
+            {
                 self.record_python_local_read(file, read, target, result);
+            }
+        }
+    }
+
+    /// Resolves the new property receivers after the earlier work and edge stages.
+    pub(in crate::static_resolution) fn resolve_python_property_receivers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for file in self
+            .python_files()
+            .filter(|file| file.has_python_property_receiver)
+        {
+            result
+                .python_property_receiver_start
+                .get_or_insert(result.occurrences.len());
+            for &(read, name) in file.facts.python_local_reads() {
+                if file.python_loop_bindings.contains_key(&name) {
+                    continue;
+                }
+                if !work.charge() {
+                    return;
+                }
+                if file.is_python_property_receiver(name)
+                    && let Some(target) = file.python_parameter_read_target(read, name, work)
+                {
+                    self.record_python_local_read(file, read, target, result);
+                }
+            }
+            for &(read, name) in file.facts.python_receiver_reads() {
+                if !work.charge() {
+                    return;
+                }
+                if file.is_python_property_receiver(name)
+                    && let Some(target) = file.python_receiver_read_target(read, name, work)
+                {
+                    self.record_python_local_read(file, read, target, result);
+                }
             }
         }
     }
@@ -214,6 +262,38 @@ impl<'source> Index<'source> {
                 }
                 if let Some(target) = file.python_comprehension_read_target(read, work) {
                     result.record(self.python_access(file, read, ReferenceRole::Read, target));
+                }
+            }
+        }
+    }
+
+    /// Resolves exact, admitted loop target reads after all established edge work.
+    pub(in crate::static_resolution) fn resolve_python_loop_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_loop_read_start = Some(result.occurrences.len());
+        for file in self
+            .python_files()
+            .filter(|file| !file.python_loop_bindings.is_empty())
+        {
+            for &(read, name) in file.facts.python_local_reads() {
+                let Some(&Some(symbol)) = file.python_loop_bindings.get(&name) else {
+                    continue;
+                };
+                if !work.charge() {
+                    return;
+                }
+                let target = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if matches!(
+                    file.python_local_read_scope(read, name, target, work),
+                    Some(LocalReadScope::Single)
+                ) {
+                    self.record_python_local_read(file, read, target, result);
                 }
             }
         }
@@ -684,6 +764,14 @@ impl<'source> File<'source> {
         })
     }
 
+    fn is_python_property_receiver(&self, name: ByteRange) -> bool {
+        self.has_python_property_receiver
+            && self
+                .python_parameters
+                .get(&name)
+                .is_some_and(|symbol| symbol.is_some_and(SyntaxSymbol::is_python_property_receiver))
+    }
+
     fn python_receiver_read_target(
         &self,
         read: ByteRange,
@@ -736,7 +824,8 @@ impl<'source> File<'source> {
         let in_scope = if target.symbol.is_python_parameter() {
             caller.symbol.item_range.encloses(item) && item.end <= body.start
         } else {
-            target.symbol.kind == "variable" && body.encloses(item)
+            (target.symbol.kind == "variable" || target.symbol.is_python_loop_binding())
+                && body.encloses(item)
         };
         if !in_scope
             || target.symbol.container.as_deref() != Some(caller.symbol.qualified_name.as_str())

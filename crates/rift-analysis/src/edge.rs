@@ -457,25 +457,12 @@ fn admit_occurrences<'a>(
     }
 }
 
-fn static_admission_batches<'a>(
-    spans: &'a DefinitionSpans,
-    edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
-    resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 44] {
-    let supplemental_start = resolution.supplemental_start.take();
-    let (value_qualifier, value_qualifier_external) = resolution
-        .python_value_qualifier_start
-        .take()
-        .map_or((None, resolution.external.len()), |(internal, external)| {
-            (Some(internal), external)
-        });
-    let (alias, alias_external) = resolution
-        .rust_extern_alias_start
-        .take()
-        .map_or((None, value_qualifier_external), |(internal, external)| {
-            (Some(internal), external)
-        });
-    let tail_starts = [
+fn static_tail_starts(
+    resolution: &mut StaticResolution,
+    alias: Option<usize>,
+    value_qualifier: Option<usize>,
+) -> [Option<usize>; 50] {
+    [
         resolution.late_supplemental_start.take(),
         resolution.python_reassignment_start.take(),
         resolution.python_capture_start.take(),
@@ -518,11 +505,42 @@ fn static_admission_batches<'a>(
         resolution.typescript_signature_type_parameter_start.take(),
         resolution.typescript_local_export_start.take(),
         value_qualifier,
-    ];
-    let mut boundaries = [0; 45];
+        resolution
+            .typescript_declared_signature_type_parameter_start
+            .take(),
+        resolution.typescript_inference_parameter_start.take(),
+        resolution.python_property_receiver_start.take(),
+        resolution.python_annotation_qualifier_start.take(),
+        resolution.python_direct_annotation_qualifier_start.take(),
+        resolution.python_wildcard_module_start.take(),
+        resolution.python_legacy_annotation_qualifier_start.take(),
+        resolution.python_loop_read_start.take(),
+    ]
+}
+
+fn static_admission_batches<'a>(
+    spans: &'a DefinitionSpans,
+    edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
+    resolution: &'a mut StaticResolution,
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 52] {
+    let supplemental_start = resolution.supplemental_start.take();
+    let (value_qualifier, value_qualifier_external) = resolution
+        .python_value_qualifier_start
+        .take()
+        .map_or((None, resolution.external.len()), |(internal, external)| {
+            (Some(internal), external)
+        });
+    let (alias, alias_external) = resolution
+        .rust_extern_alias_start
+        .take()
+        .map_or((None, value_qualifier_external), |(internal, external)| {
+            (Some(internal), external)
+        });
+    let tail_starts = static_tail_starts(resolution, alias, value_qualifier);
+    let mut boundaries = [0; 53];
     let mut next = resolution.occurrences.len();
-    boundaries[44] = next;
-    for (boundary, start) in boundaries[2..44].iter_mut().zip(tail_starts).rev() {
+    boundaries[52] = next;
+    for (boundary, start) in boundaries[2..52].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }

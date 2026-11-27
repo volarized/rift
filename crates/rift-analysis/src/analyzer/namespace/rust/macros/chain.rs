@@ -6,13 +6,24 @@
 //! one. The `mod` items of an invocation of such a macro declare modules like ordinary
 //! `#[cfg]` items do.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_syntax::{ByteRange, SyntaxLimits};
 
 use super::{consume, group};
 
 pub(super) type ModuleBranches<'a> = Vec<(&'a str, Vec<&'a str>)>;
+
+pub(super) enum ScopeAfter {
+    CheckedImports(BTreeSet<String>),
+    CheckedSiblingGlobs {
+        bindings: BTreeSet<String>,
+        modules: BTreeSet<String>,
+    },
+    Unknown,
+}
+
+pub(super) type CheckedBranches<'a> = (ModuleBranches<'a>, ScopeAfter);
 
 /// The conditional item chain definition without comments and attributes.
 const DEFINITION: &str = "macro_rules! cfg_if {
@@ -178,8 +189,26 @@ pub(super) fn captured_predicate_modules<'a>(
     tokens: &[&'a str],
     depth: usize,
     selected: impl FnOnce(&[&str]) -> Option<bool>,
-) -> Option<(ModuleBranches<'a>, bool)> {
-    let mut body = invocation_body(tokens)?;
+) -> Option<CheckedBranches<'a>> {
+    let (predicate, body) = captured_predicate_body(invocation_body(tokens)?)?;
+    let selection = selected(predicate);
+    let mut modules = Vec::new();
+    let active_scope = branch_modules(body, depth, |name| {
+        if selection == Some(true) {
+            modules.push((name, predicate.to_vec()));
+        }
+    })?;
+    let scope = match selection {
+        Some(true) => active_scope,
+        Some(false) => ScopeAfter::CheckedImports(BTreeSet::new()),
+        None => ScopeAfter::Unknown,
+    };
+    Some((modules, scope))
+}
+
+pub(super) fn captured_predicate_body<'tokens, 'source>(
+    mut body: &'tokens [&'source str],
+) -> Option<(&'tokens [&'source str], &'tokens [&'source str])> {
     if !consume(&mut body, &["#", "!"]) {
         return None;
     }
@@ -187,22 +216,10 @@ pub(super) fn captured_predicate_modules<'a>(
     if predicate.last() == Some(&",") || metas(predicate)?.len() != 1 {
         return None;
     }
-    let selection = selected(predicate);
-    let mut modules = Vec::new();
-    let only_outlines = branch_modules(body, depth, |name| {
-        if selection == Some(true) {
-            modules.push((name, predicate.to_vec()));
-        }
-    })?;
-    let scope_unchanged = match selection {
-        Some(true) => only_outlines,
-        Some(false) => true,
-        None => false,
-    };
-    Some((modules, scope_unchanged))
+    Some((predicate, body))
 }
 
-fn invocation_body<'tokens, 'source>(
+pub(super) fn invocation_body<'tokens, 'source>(
     mut input: &'tokens [&'source str],
 ) -> Option<&'tokens [&'source str]> {
     super::super::source_identifier(input.first()?)?;
@@ -268,30 +285,49 @@ fn condition<'a>(metas: &[&[&'a str]], previous: &[&[&'a str]]) -> Vec<&'a str> 
     condition
 }
 
-/// Names of the plain `[visibility] mod name;` items of one branch. Reports whether
-/// every item is an outline module with a distinct name. Incomplete item lists refuse.
+/// Names of plain outline modules and the known bindings added by other checked items.
 fn branch_modules<'a>(
     items: &[&'a str],
     depth: usize,
     mut module: impl FnMut(&'a str),
-) -> Option<bool> {
-    let mut distinct = std::collections::BTreeSet::new();
-    let mut only_outlines = true;
+) -> Option<ScopeAfter> {
+    let mut distinct = BTreeSet::new();
+    let mut bindings = BTreeSet::new();
+    let mut globs = BTreeSet::new();
+    let mut complete = true;
     super::scope::items(items, depth, |item| {
         let mut input = item;
-        if super::scope::visibility(&mut input).is_some()
-            && consume(&mut input, &["mod"])
+        if super::scope::visibility(&mut input).is_none() {
+            complete = false;
+        } else if consume(&mut input, &["mod"])
             && let [name, ";"] = input
             && super::super::source_identifier(name).as_deref() == Some(*name)
         {
-            only_outlines &= distinct.insert(*name);
+            complete &= distinct.insert(*name);
             module(name);
+        } else if let ["use", "self", ":", ":", name, ":", ":", "*", ";"] = input
+            && super::super::source_identifier(name).as_deref() == Some(*name)
+        {
+            complete &= globs.insert(*name);
+        } else if let Some(named) = super::scope::named_imports(input, depth) {
+            for name in named {
+                complete &= name != "cfg" && name != "cfg_attr" && bindings.insert(name);
+            }
         } else {
-            only_outlines = false;
+            complete = false;
         }
         Some(())
     })?;
-    Some(only_outlines)
+    Some(if !complete || !globs.is_subset(&distinct) {
+        ScopeAfter::Unknown
+    } else if globs.is_empty() {
+        ScopeAfter::CheckedImports(bindings)
+    } else {
+        ScopeAfter::CheckedSiblingGlobs {
+            bindings,
+            modules: globs.into_iter().map(str::to_owned).collect(),
+        }
+    })
 }
 
 #[cfg(test)]

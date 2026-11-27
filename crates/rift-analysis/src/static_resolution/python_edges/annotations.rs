@@ -3,7 +3,7 @@
 use rift_core::ReferenceRole;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::SymbolKind;
-use rift_syntax::ByteRange;
+use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use super::super::{File, Index, StaticResolution, Target, Work};
 use super::{Value, edge_python_binding};
@@ -46,6 +46,37 @@ impl<'source> Index<'source> {
         }
         self.value_target(value)
             .filter(|target| target.symbol.kinds.contains(&SymbolKind::Constructible))
+    }
+
+    /// Whether the selected module assignment names a type through an established alias.
+    pub(super) fn python_legacy_type_alias(
+        &self,
+        target: Target<'source>,
+        work: &mut Work,
+    ) -> bool {
+        let Some(file) = self.files.get(target.file.path.as_str()) else {
+            return false;
+        };
+        let symbol = target.symbol;
+        if self
+            .python_unchanged_module_binding(file, &symbol.name)
+            .is_none_or(|binding| Some(binding.name) != symbol.name_range)
+        {
+            return false;
+        }
+        let Some((head, generic)) = assignment_type_path(file, symbol, work) else {
+            return false;
+        };
+        if generic {
+            return ["Callable", "Union"]
+                .iter()
+                .any(|name| self.python_typing_name(file, head, name, work));
+        }
+        self.python_typing_name(file, head, "Any", work)
+            || self.python_library_name(file, head, work).as_deref() == Some("types.ModuleType")
+            || self
+                .python_type(file, head, work)
+                .is_some_and(|target| target.symbol.kinds.contains(&SymbolKind::Type))
     }
 
     /// The annotation inside every `Optional[...]`, and every `Union` beside `None`, around it.
@@ -179,6 +210,62 @@ impl<'source> Index<'source> {
                 })
             })
     }
+}
+
+/// The written type expression of a plain assignment preserved in package facts.
+fn assignment_type_path(
+    file: &File<'_>,
+    symbol: &SyntaxSymbol,
+    work: &mut Work,
+) -> Option<(ByteRange, bool)> {
+    let name = symbol.name_range?;
+    let assignment = symbol.item_range;
+    if symbol.syntax_element_kind != Some("assignment") || name.start != assignment.start {
+        return None;
+    }
+    let text = file.text(assignment)?;
+    let right = text
+        .strip_prefix(file.text(name)?)?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim();
+    if right.len() > QUOTED_TYPE_BYTES_MAX {
+        return None;
+    }
+    let (head, generic) = if let Some((path, arguments)) = right.split_once('[') {
+        if !exact_alias_arguments(arguments, work) {
+            return None;
+        }
+        (path.trim_end(), true)
+    } else {
+        (right, false)
+    };
+    head.split('.')
+        .all(|part| rift_protocol::index::python_identifier_is_valid(part.trim()))
+        .then(|| slice_range(assignment, text, head).map(|range| (range, generic)))
+        .flatten()
+}
+
+fn exact_alias_arguments(arguments: &str, work: &mut Work) -> bool {
+    let mut depth = 1_u8;
+    for (offset, character) in arguments.char_indices() {
+        if !work.charge() {
+            return false;
+        }
+        match character {
+            '[' if depth < QUOTED_TYPE_DEPTH_MAX => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return offset + character.len_utf8() == arguments.len();
+                }
+            }
+            '.' | ',' | '|' | '_' => {}
+            letter if letter.is_alphanumeric() || letter.is_whitespace() => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Longest quoted type text and deepest generic nesting this pass reads.

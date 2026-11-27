@@ -5063,3 +5063,370 @@ fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildca
         );
     }
 }
+
+#[test]
+fn npm_package_imports_keep_runtime_calls_and_declared_type_ranges() {
+    const RUNTIME: &str = "import { Flags, select } from '#items/state';\nexport function run() { return select(Flags.enabled); }\n";
+    const TYPES: &str = "import type { State } from '#items/state';\nexport declare function run(state: State): State;\n";
+    const TARGET: &str =
+        "export const Flags = { enabled: 1 };\nexport function select(value) { return value; }\n";
+    const DECLARATIONS: &str = concat!(
+        "export interface State { enabled: number }\n",
+        "export declare const Flags: State;\n",
+        "export declare function select(value: number): number;\n",
+    );
+    for (imports, javascript, typescript) in [
+        (
+            r##""#items/*":{"types":"./types/*.d.ts","default":"./runtime/*.js"}"##,
+            true,
+            true,
+        ),
+        (
+            r##""#items/state":null,"#items/*":{"types":"./types/*.d.ts","default":"./runtime/*.js"}"##,
+            false,
+            false,
+        ),
+        (r##""#items/*":{"browser":"./runtime/*.js"}"##, false, false),
+        (r##""#items/*":"../runtime/*.js""##, false, false),
+        (
+            r##""#items/*":{"types":"./types/*.d.ts","default":"./runtime/*.js"},"#items/state":"./unknown.js""##,
+            false,
+            false,
+        ),
+    ] {
+        let manifest = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","exports":{{".":{{"types":"./index.d.ts","default":"./index.js"}}}},"imports":{{{imports}}}}}"#
+        );
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.js", RUNTIME),
+                ("index.d.ts", TYPES),
+                ("runtime/state.js", TARGET),
+                ("types/state.d.ts", DECLARATIONS),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked package files");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let origin = |path| {
+            &publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path)
+                .expect("retained source")
+                .unit
+        };
+        let written = |source: &str, marker: &str, token: &str| {
+            let start = source.find(marker).expect("written use");
+            module_runtime_range(start, token)
+        };
+        let calls = |target, range, unit| {
+            publication.edges.iter().any(|row| {
+                row.kinds == [EdgeKind::Calls]
+                    && row.to.as_str().ends_with(target)
+                    && row
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| &site.unit == unit && site.range == range)
+            })
+        };
+        assert_eq!(
+            calls(
+                "runtime%2Fstate.js/select",
+                written(RUNTIME, "select(Flags.enabled)", "select(Flags.enabled)"),
+                origin("index.js"),
+            ),
+            javascript,
+            "{manifest}",
+        );
+        assert_eq!(
+            publication.edges.iter().any(|row| {
+                row.kinds == [EdgeKind::Reads]
+                    && row.to.as_str().ends_with("runtime%2Fstate.js/Flags")
+                    && row.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == origin("index.js")
+                            && site.range == written(RUNTIME, "Flags.enabled", "Flags")
+                    })
+            }),
+            javascript,
+            "{manifest}",
+        );
+        let type_uses = publication
+            .edges
+            .iter()
+            .filter(|row| {
+                row.kinds == [EdgeKind::HasType]
+                    && row.to.as_str().ends_with("types%2Fstate.d.ts/State")
+                    && row.occurrence.as_ref().is_some_and(|site| {
+                        &site.unit == origin("index.d.ts")
+                            && site.range.start
+                                >= u64::try_from(TYPES.find("run(").expect("function"))
+                                    .expect("source range")
+                    })
+            })
+            .count();
+        assert_eq!(type_uses, usize::from(typescript) * 2, "{manifest}");
+    }
+}
+
+#[test]
+fn typescript_declared_function_type_parameters_keep_physical_signature_uses() {
+    const SOURCE: &str = concat!(
+        "declare function plain<T>(value: T): T;\n",
+        "export { plain };\n",
+        "export declare function choose<Value>(value: Value[]): Value;\n",
+        "export declare function choose<Value>(value: Value): Value;\n",
+        "export declare function own<Type>(value: Type): Type;\n",
+        "export declare function ambiguous<U, U>(value: U): U;\n",
+    );
+    const IMPLEMENTATION: &str = "export function implemented<T>(value: T): T { return value; }\n";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE), ("complete.ts", IMPLEMENTATION)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("checked declared signatures");
+    let found = result.publication();
+    found.validate_facts().expect("checked ranges and targets");
+    let index = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("declaration unit")
+        .unit;
+    let mut identities = BTreeSet::new();
+    let mut line_start = 0;
+    for (line, (owner, name)) in SOURCE.lines().zip([
+        ("plain", "T"),
+        ("", ""),
+        ("choose", "Value"),
+        ("choose", "Value"),
+        ("own", "Type"),
+    ]) {
+        if !owner.is_empty() {
+            let declaration = format!("{owner}<{name}>");
+            let start =
+                line_start + line.find(&declaration).expect("written owner") + owner.len() + 1;
+            let row = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == *index
+                        && row.source == name
+                        && row.range == module_runtime_range(start, name)
+                })
+                .expect("written type parameter in declared signature");
+            assert!(identities.insert(&row.symbol));
+            let expected = line
+                .match_indices(name)
+                .skip(1)
+                .map(|(offset, _)| {
+                    let range = module_runtime_range(line_start + offset, name);
+                    (range.start, range.end)
+                })
+                .collect::<BTreeSet<_>>();
+            let actual = found
+                .edges
+                .iter()
+                .filter_map(|edge| {
+                    let site = edge.occurrence.as_ref()?;
+                    (edge.to == row.symbol
+                        && edge.kinds == [EdgeKind::HasType]
+                        && edge.from.as_str().ends_with(&format!("/{owner}"))
+                        && site.unit == *index)
+                        .then_some((site.range.start, site.range.end))
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "{line}");
+        }
+        line_start += line.len() + 1;
+    }
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/implemented/T"))
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .all(|row| row.source != "U" || row.unit != *index)
+    );
+}
+
+#[test]
+fn typescript_inferred_names_only_bind_their_checked_true_branches() {
+    const SOURCE: &str = concat!(
+        "export type Result = string;\n",
+        "export interface Kept<Value> { value: Value }\n",
+        "export type ValueOf<T> = T extends { value: infer Value } ? Value : never;\n",
+        "export type ItemOf<T> = T extends [infer Item, ...unknown[]] ? Item : never;\n",
+        "export type Read<T> = T extends { read(): infer Result } ? Result : Result;\n",
+        "export type Nested<T> = T extends [infer Item] ? (Item extends { value: infer Item } ? Item : Item) : never;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("complete package declaration");
+    let found = result.publication();
+    found.validate_facts().expect("checked conditional types");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("physical declaration")
+        .unit;
+    let declaration = |prefix: &str, name: &str| {
+        let begin = SOURCE.find(prefix).expect("written prefix") + prefix.len();
+        found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == *unit
+                    && row.source == name
+                    && row.range == module_runtime_range(begin, name)
+            })
+            .unwrap_or_else(|| panic!("written inference {prefix}{name} at {begin}"))
+    };
+    let edges = |row: &rift_protocol::index::PackageSymbol| {
+        found
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let site = edge.occurrence.as_ref()?;
+                (edge.to == row.symbol && edge.kinds == [EdgeKind::HasType] && site.unit == *unit)
+                    .then_some((site.range.start, site.range.end))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let written_use = |prefix: &str, name: &str| {
+        let begin = SOURCE.find(prefix).expect("written use") + prefix.len();
+        let range = module_runtime_range(begin, name);
+        (range.start, range.end)
+    };
+    for (decl, usage, name) in [
+        ("value: infer ", "infer Value } ? ", "Value"),
+        ("extends [infer ", "infer Item, ...unknown[]] ? ", "Item"),
+        ("read(): infer ", "infer Result } ? ", "Result"),
+    ] {
+        assert_eq!(
+            edges(declaration(decl, name)),
+            BTreeSet::from([written_use(usage, name)])
+        );
+    }
+    let ordinary = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/beacon/Result"))
+        .expect("outer type alias");
+    assert!(edges(ordinary).contains(&written_use("infer Result } ? Result : ", "Result")));
+    let outer = declaration("export type Nested<T> = T extends [infer ", "Item");
+    let inner = declaration("(Item extends { value: infer ", "Item");
+    assert_ne!(outer.symbol, inner.symbol);
+    assert_eq!(
+        edges(outer),
+        BTreeSet::from([
+            written_use("Nested<T> = T extends [infer Item] ? (", "Item"),
+            written_use("value: infer Item } ? Item : ", "Item"),
+        ])
+    );
+    assert_eq!(
+        edges(inner),
+        BTreeSet::from([written_use("value: infer Item } ? ", "Item")])
+    );
+    assert!(
+        found
+            .declarations
+            .iter()
+            .any(|row| row.symbol.as_str().ends_with("/Kept/Value"))
+    );
+}
+
+#[test]
+fn javascript_assignments_keep_distinct_checked_member_literal_owners() {
+    const SOURCE: &str = concat!(
+        "export function set(key) {\n",
+        "    const state = { errors: [] };\n",
+        "    const check = [{ found: 1, visible: { member: 2 } }];\n",
+        "    state.errors = [{ params: { additionalProperty: 3 } }];\n",
+        "    state[key] = [{ params: { additionalProperty: 5 } }];\n",
+        "    return (state.errors = [{ params: { additionalProperty: 4 } }], check);\n",
+        "}\n",
+        "export function replaced(value) {\n",
+        "    let holder = { errors: [] };\n",
+        "    holder = value;\n",
+        "    holder.errors = [{ withheld: 6 }];\n",
+        "    return (holder.errors = [{ withheld: 7 }], holder);\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export { set } from './data.js';"),
+            ("data.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#,
+        )),
+    )
+    .expect("checked local member assignments");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid literal owners");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "data.js")
+        .expect("written module")
+        .unit;
+    let declaration = |written: &str| {
+        let range = module_runtime_range(SOURCE.find(written).expect("written site"), written);
+        found
+            .declarations
+            .iter()
+            .find(|row| &row.unit == unit && row.range == range && row.source == written)
+            .unwrap_or_else(|| panic!("missing checked literal property {written}"))
+    };
+    let first = declaration("params: { additionalProperty: 3 }");
+    let second = declaration("params: { additionalProperty: 4 }");
+    assert_ne!(first.symbol, second.symbol);
+    for (written, parent) in [
+        ("additionalProperty: 3", first),
+        ("additionalProperty: 4", second),
+    ] {
+        let child = declaration(written);
+        let symbol = found
+            .objects
+            .iter()
+            .find(|symbol| symbol.id.as_ref() == Some(&child.symbol))
+            .expect("authored nested property");
+        assert_eq!(symbol.container.as_ref(), Some(&parent.symbol));
+    }
+    assert!(
+        declaration("errors: []")
+            .symbol
+            .as_str()
+            .ends_with("/set/state/errors")
+    );
+    declaration("found: 1");
+    declaration("member: 2");
+    assert!(found.declarations.iter().all(|row| !matches!(
+        row.source.as_str(),
+        "additionalProperty: 5" | "withheld: 6" | "withheld: 7"
+    )));
+}

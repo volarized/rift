@@ -145,6 +145,7 @@ impl SyntaxSymbol {
         self.kind == crate::python::PARAMETER_KIND_WORD
             || self.is_python_variadic_parameter()
             || self.is_python_overload_parameter()
+            || self.is_python_property_receiver()
     }
 
     /// Whether this parameter captures an argument list or a keyword dictionary.
@@ -157,6 +158,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_python_overload_parameter(&self) -> bool {
         self.kind == crate::python::OVERLOAD_PARAMETER_KIND_WORD
+    }
+
+    /// Whether this parameter belongs to one facet of a Python property.
+    #[must_use]
+    pub fn is_python_property_receiver(&self) -> bool {
+        self.kind == crate::python::PROPERTY_RECEIVER_KIND_WORD
     }
 
     /// Whether this is the physical name of an authored Python loop target.
@@ -291,6 +298,8 @@ impl SyntaxSymbol {
             || self.is_typescript_method_type_parameter()
             || self.is_typescript_function_type_parameter()
             || self.is_typescript_signature_type_parameter()
+            || self.is_typescript_declared_signature_type_parameter()
+            || self.is_typescript_inference_parameter()
     }
 
     /// Whether this is the written type parameter of a TypeScript method.
@@ -309,6 +318,18 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_typescript_signature_type_parameter(&self) -> bool {
         self.kind == crate::ecmascript::SIGNATURE_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this is the written type parameter of a declared TypeScript function signature.
+    #[must_use]
+    pub fn is_typescript_declared_signature_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::DECLARED_SIGNATURE_TYPE_PARAMETER_KIND
+    }
+
+    /// Whether this is an authored inference name in a TypeScript conditional type.
+    #[must_use]
+    pub fn is_typescript_inference_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::INFERENCE_PARAMETER_KIND
     }
 
     /// Whether a checked local macro emits a method at this written name.

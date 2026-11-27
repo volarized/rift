@@ -833,16 +833,16 @@ fn test_python_wildcard_imports_keep_modules_without_resolving_exports() {
         .iter()
         .filter(|edge| edge.role == ReferenceRole::Import)
         .collect::<Vec<_>>();
-    assert_eq!(imports.len(), 1, "{result:?}");
+    assert_eq!(imports.len(), 2, "{result:?}");
     assert_eq!(source_of(imports[0], source), "*");
-    assert_eq!(target(imports[0]), "rift://symbol/local/python/pkg/leaf");
-    assert_eq!(
-        imports[0]
-            .edge_from
-            .as_ref()
-            .map(rift_core::SymbolId::as_str),
-        Some("rift://symbol/local/python/pkg")
-    );
+    assert_eq!(source_of(imports[1], source), ".leaf");
+    for import in imports {
+        assert_eq!(target(import), "rift://symbol/local/python/pkg/leaf");
+        assert_eq!(
+            import.edge_from.as_ref().map(rift_core::SymbolId::as_str),
+            Some("rift://symbol/local/python/pkg")
+        );
+    }
     assert_eq!(calls(&result, "pkg/__init__.py").count(), 0);
 }
 

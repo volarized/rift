@@ -790,3 +790,502 @@ fn python_qualified_member_calls_keep_class_and_runtime_reads() {
         }));
     }
 }
+
+#[test]
+fn python_property_accessors_retain_each_written_receiver() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = concat!(
+        "class Box:\n",
+        "    def __init__(self, initial: int):\n        self._amount = initial\n",
+        "    @property\n    def amount(self) -> int:\n        return self._amount\n",
+        "    @amount.setter\n    def amount(self, value: int):\n        self._amount = value\n",
+        "    @amount.deleter\n    def amount(self):\n        del self._amount\n",
+        "    def control(self, checked: int):\n        self._amount = checked\n",
+    );
+    let files = [("demo/__init__.py", source)];
+    let result = publication(&files, None, &["demo"]);
+    let property_receiver = |id: &str| id.ends_with("/Box/amount/self");
+    let offsets = |needle: &str| -> Vec<u64> {
+        source
+            .match_indices(needle)
+            .map(|(offset, text)| {
+                u64::try_from(offset + text.find("self").expect("written receiver"))
+                    .expect("receiver range")
+            })
+            .collect()
+    };
+    let declarations = |suffix: &str| -> Vec<u64> {
+        let mut starts = result
+            .declarations
+            .iter()
+            .filter(|entry| entry.symbol.as_str().ends_with(suffix))
+            .map(|entry| entry.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_unstable();
+        starts
+    };
+    assert_eq!(declarations("/Box/amount/self"), offsets("def amount(self"));
+    for receiver in result
+        .declarations
+        .iter()
+        .filter(|entry| property_receiver(entry.symbol.as_str()))
+    {
+        assert_eq!(receiver.source, "self");
+        assert_eq!(receiver.range.end - receiver.range.start, 4);
+    }
+    assert_eq!(declarations("/Box/amount").len(), 3);
+    assert_eq!(declarations("/Box/amount/value").len(), 1);
+    assert_eq!(
+        declarations("/Box/control/self"),
+        offsets("def control(self")
+    );
+    let mut reads = result
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/Box/amount/self")
+        })
+        .map(|edge| edge.occurrence.as_ref().expect("authored read").range.start)
+        .collect::<Vec<_>>();
+    reads.sort_unstable();
+    assert!(reads.contains(&offsets("return self._amount")[0]));
+
+    assert_python_property_receiver_priority(&files, &result, property_receiver);
+
+    for refused in [
+        source.replace("@amount.setter", "@other.setter"),
+        source.replace("@amount.setter", "@amount.setter()"),
+        source.replace("class Box:", "property = custom\nclass Box:"),
+        source.replace("@amount.setter", "amount = replacement\n    @amount.setter"),
+        source.replace("@amount.setter", "del amount\n    @amount.setter"),
+        source.replace("class Box:", "del property\nclass Box:"),
+        source.replace("@amount.deleter", "@amount.setter"),
+    ] {
+        let result = publication(&[("demo/__init__.py", &refused)], None, &["demo"]);
+        assert!(
+            result
+                .declarations
+                .iter()
+                .all(|entry| { !entry.symbol.as_str().ends_with("/Box/amount/self") })
+        );
+        assert!(
+            result
+                .declarations
+                .iter()
+                .any(|entry| { entry.symbol.as_str().ends_with("/Box/control/self") })
+        );
+    }
+}
+
+fn assert_python_property_receiver_priority(
+    files: &[(&str, &str)],
+    result: &PackagePublication,
+    property_receiver: impl Fn(&str) -> bool,
+) {
+    use rift_protocol::configuration::PackageConfiguration;
+
+    let prior_declarations = result
+        .declarations
+        .iter()
+        .filter(|entry| !property_receiver(entry.symbol.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let prior_edges = result
+        .edges
+        .iter()
+        .filter(|edge| !property_receiver(edge.to.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior_edges.len()),
+    );
+    assert_eq!(limited.declarations, result.declarations);
+    assert_eq!(limited.edges, prior_edges);
+    let limited = publication_with_configuration(
+        files,
+        None,
+        &["demo"],
+        PackageConfiguration {
+            symbols: u32::try_from(prior_declarations.len()).expect("fixture count"),
+            ..PackageConfiguration::default()
+        },
+    );
+    assert_eq!(limited.declarations, prior_declarations);
+    assert_eq!(limited.edges, prior_edges);
+}
+
+#[test]
+fn python_annotations_keep_their_checked_root_module_tokens() {
+    use rift_protocol::read::EdgeKind;
+
+    const SOURCE: &str = concat!(
+        "import demo.members\n",
+        "class Child(demo.members.Item):\n    pass\n",
+        "def read(value: demo.members.Item) -> demo.members.Item:\n",
+        "    return demo.members.Item()\n",
+        "def shadowed(demo):\n    item: demo.members.Item\n    return item\n",
+    );
+    const ROOT: &str = "rift://symbol/pypi/pypi.org/click/python/demo";
+    const TYPE: &str = "rift://symbol/pypi/pypi.org/click/python/demo/members/Item";
+    let files = [
+        ("demo/__init__.py", ""),
+        ("demo/members.py", "class Item: pass\n"),
+        ("demo/reader.py", SOURCE),
+    ];
+    let sites = SOURCE
+        .match_indices("demo.members.Item")
+        .map(|(start, _)| u64::try_from(start).expect("source offset"))
+        .collect::<Vec<_>>();
+    let complete = publication(&files, None, &["demo"]);
+    let unit = &complete
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "demo/reader.py")
+        .expect("checked reader source")
+        .unit;
+    let mut roots = complete
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let occurrence = edge.occurrence.as_ref()?;
+            (edge.to.as_str() == ROOT
+                && edge.kinds == [EdgeKind::Reads]
+                && &occurrence.unit == unit)
+                .then_some(&occurrence.range)
+        })
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|range| range.start);
+    assert_eq!(roots.len(), 4);
+    for (range, start) in roots.into_iter().zip(&sites[..4]) {
+        assert_eq!((range.start, range.end), (*start, start + 4));
+    }
+    for kind in [EdgeKind::Calls, EdgeKind::HasType, EdgeKind::Extends] {
+        assert!(
+            complete
+                .edges
+                .iter()
+                .any(|edge| edge.to.as_str() == TYPE && edge.kinds == [kind])
+        );
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.to.as_str() != ROOT
+                || edge.kinds != [EdgeKind::Reads]
+                || edge.occurrence.as_ref().is_none_or(|site| {
+                    &site.unit != unit || !sites[..3].contains(&site.range.start)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(prior.len() + 2),
+    );
+    assert!(prior.iter().all(|edge| limited.edges.contains(edge)));
+    assert!(limited.edges.len() < complete.edges.len());
+    assert_eq!(limited.declarations, complete.declarations);
+}
+
+#[test]
+fn python_annotations_keep_checked_single_module_aliases() {
+    use rift_protocol::configuration::PackageConfiguration;
+    use rift_protocol::read::EdgeKind;
+
+    const SOURCE: &str = concat!(
+        "from . import helpers as members\n",
+        "from . import helpers as ambiguous\n",
+        "from . import other as ambiguous\n",
+        "class Child(members.Item):\n    pass\n",
+        "def read(value: members.Item) -> members.Item:\n",
+        "    return members.Item()\n",
+        "def shadowed(members):\n    item: members.Item\n    return item\n",
+        "def unresolved(value: ambiguous.Item, callback: members.make):\n    pass\n",
+    );
+    let files = [
+        ("demo/__init__.py", ""),
+        (
+            "demo/helpers.py",
+            "class Item: pass\ndef make(): return Item()\n",
+        ),
+        ("demo/other.py", "class Item: pass\n"),
+        ("demo/reader.py", SOURCE),
+    ];
+    let complete = publication(&files, None, &["demo"]);
+    let unit = &complete
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "demo/reader.py")
+        .expect("reader source")
+        .unit;
+    let sites = SOURCE
+        .match_indices("members.Item")
+        .map(|(start, _)| u64::try_from(start).expect("source offset"))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 5);
+    let module_read = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.to.as_str().ends_with("/demo/helpers")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| &site.unit == unit)
+    };
+    let mut offsets = complete
+        .edges
+        .iter()
+        .filter(|edge| module_read(edge))
+        .map(|edge| {
+            let range = &edge.occurrence.as_ref().expect("physical read").range;
+            assert_eq!(range.end - range.start, 7);
+            range.start
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    assert_eq!(offsets, sites[..4]);
+    let ambiguous = u64::try_from(SOURCE.find("ambiguous.Item").expect("written alias"))
+        .expect("source offset");
+    assert!(complete.edges.iter().all(|edge| {
+        edge.occurrence.as_ref().is_none_or(|site| {
+            &site.unit != unit || site.range.start != ambiguous || edge.kinds != [EdgeKind::Reads]
+        })
+    }));
+    for kind in [EdgeKind::Calls, EdgeKind::HasType, EdgeKind::Extends] {
+        assert!(complete.edges.iter().any(|edge| {
+            edge.to.as_str().ends_with("/demo/helpers/Item") && edge.kinds == [kind]
+        }));
+    }
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            !module_read(edge)
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| !sites[..3].contains(&site.range.start))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    let incumbent = prior
+        .into_iter()
+        .filter(|edge| !module_read(edge))
+        .collect::<Vec<_>>();
+    assert_eq!(limited.declarations, complete.declarations);
+    assert_eq!(limited.edges, incumbent);
+}
+
+#[test]
+fn python_wildcard_imports_keep_the_written_module_and_star() {
+    use rift_protocol::configuration::PackageConfiguration;
+    use rift_protocol::read::EdgeKind;
+
+    let files = [
+        ("demo/__init__.py", ""),
+        ("demo/leaf.py", "class Item: pass\n"),
+        ("demo/wild.py", "from .leaf import *\n"),
+        ("demo/named.py", "from .leaf import Item\n"),
+        ("demo/absent.py", "from .missing import *\n"),
+        ("demo/relative.py", "from . import *\n"),
+    ];
+    let complete = publication(&files, None, &["demo"]);
+    let target = |edge: &rift_protocol::index::StoredEdge, module: &str, name: &str| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.to.as_str().ends_with(name)
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit.0.ends_with(module))
+    };
+    let module_ranges = |path| {
+        let mut ranges = complete
+            .edges
+            .iter()
+            .filter(|edge| target(edge, path, "/demo/leaf"))
+            .map(|edge| {
+                let range = &edge.occurrence.as_ref().expect("written import").range;
+                (range.start, range.end)
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        ranges
+    };
+    assert_eq!(module_ranges("/demo/wild.py"), [(5, 10), (18, 19)]);
+    assert_eq!(module_ranges("/demo/named.py"), [(5, 10)]);
+    assert!(complete.edges.iter().any(|edge| {
+        target(edge, "/demo/named.py", "/demo/leaf/Item")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.range.start == 18 && site.range.end == 22)
+    }));
+    assert!(complete.edges.iter().all(|edge| {
+        edge.kinds != [EdgeKind::Imports]
+            || edge.occurrence.as_ref().is_none_or(|site| {
+                !site.unit.0.ends_with("/demo/absent.py")
+                    && (!site.unit.0.ends_with("/demo/relative.py") || site.range.start != 5)
+            })
+    }));
+
+    let prior = complete
+        .edges
+        .iter()
+        .filter(|edge| {
+            !target(edge, "/demo/wild.py", "/demo/leaf")
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range.start != 5)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior.len()),
+    );
+    let tight_incumbents = prior
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Contains] || target(edge, "/demo/named.py", "/demo/leaf/Item")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(limited.declarations, complete.declarations);
+    assert_eq!(limited.edges, tight_incumbents);
+    let limited = python_publication_with_limits(
+        &files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior.len() + 1),
+    );
+    assert!(prior.iter().all(|edge| limited.edges.contains(edge)));
+}
+
+const LOOP_READ_SOURCE: &str = concat!(
+    "def chosen(): return 0\n",
+    "def direct(source):\n    local = source\n    return local\n",
+    "def via_loop(source):\n    for chosen in source:\n        return chosen\n",
+    "    else:\n        return chosen\n",
+    "def tupled(source):\n    for left, right in source:\n        return left, right\n",
+    "async def async_loop(source):\n    async for item in source:\n        return item\n",
+    "def shadowed(source):\n    for chosen in source:\n",
+    "        def nested(chosen):\n            return chosen\n",
+    "        return nested(1), chosen\n",
+    "def changed(source):\n    for chosen in source:\n",
+    "        chosen = 0\n        return chosen\n",
+    "def iterable():\n    for chosen in chosen:\n        return chosen\n",
+);
+
+#[test]
+fn python_loop_bodies_read_their_written_targets() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = LOOP_READ_SOURCE;
+    let result = publication(&[("demo/__init__.py", source)], None, &["demo"]);
+    let range = |context: &str, name: &str| {
+        let offset = source.find(context).expect("written context")
+            + context.rfind(name).expect("written name");
+        (
+            u64::try_from(offset).expect("source offset"),
+            u64::try_from(offset + name.len()).expect("source offset"),
+        )
+    };
+    let reads_at = |context, name| {
+        let range = range(context, name);
+        result.edges.iter().filter(move |edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| (site.range.start, site.range.end) == range)
+        })
+    };
+    for (suffix, declaration, use_context, name) in [
+        (
+            "/via_loop/chosen",
+            "def via_loop(source):\n    for chosen",
+            "in source:\n        return chosen\n    else:",
+            "chosen",
+        ),
+        (
+            "/tupled/left",
+            "for left, right",
+            "return left, right",
+            "left",
+        ),
+        (
+            "/tupled/right",
+            "for left, right",
+            "return left, right",
+            "right",
+        ),
+        ("/async_loop/item", "async for item", "return item", "item"),
+        (
+            "/shadowed/chosen",
+            "def shadowed(source):\n    for chosen",
+            "return nested(1), chosen",
+            "chosen",
+        ),
+    ] {
+        let declaration = result
+            .declarations
+            .iter()
+            .find(|entry| {
+                entry.symbol.as_str().ends_with(suffix)
+                    && (entry.range.start, entry.range.end) == range(declaration, name)
+            })
+            .expect("exact loop declaration");
+        let [read] = reads_at(use_context, name).collect::<Vec<_>>()[..] else {
+            panic!("one exact Read for {suffix}");
+        };
+        assert_eq!(read.to, declaration.symbol);
+    }
+    for (suffix, context, name) in [
+        ("/direct/local", "return local", "local"),
+        (
+            "/via_loop/source",
+            "def via_loop(source):\n    for chosen in source",
+            "source",
+        ),
+        (
+            "/shadowed/nested/chosen",
+            "def nested(chosen):\n            return chosen",
+            "chosen",
+        ),
+    ] {
+        assert!(
+            reads_at(context, name).any(|edge| edge.to.as_str().ends_with(suffix)),
+            "{suffix}"
+        );
+    }
+    for (suffix, context) in [
+        ("/via_loop/chosen", "else:\n        return chosen"),
+        ("/changed/chosen", "chosen = 0\n        return chosen"),
+        ("/iterable/chosen", "for chosen in chosen"),
+    ] {
+        assert!(
+            reads_at(context, "chosen").all(|edge| !edge.to.as_str().ends_with(suffix)),
+            "{suffix}"
+        );
+    }
+}

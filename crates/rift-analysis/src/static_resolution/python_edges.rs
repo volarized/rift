@@ -498,6 +498,54 @@ impl<'source> Index<'source> {
         Some(occurrence)
     }
 
+    /// Resolves the module token that precedes an established wildcard import.
+    pub(super) fn resolve_python_wildcard_modules(
+        &self,
+        work: &mut Work,
+        result: &mut super::StaticResolution,
+    ) {
+        result.python_wildcard_module_start = Some(result.occurrences.len());
+        for file in self.python_files() {
+            for binding in file.facts.bindings() {
+                let StaticBindingKind::PythonImport {
+                    module,
+                    export: None,
+                } = binding.kind
+                else {
+                    continue;
+                };
+                if file.text(binding.name) != Some("*")
+                    || file
+                        .text(module)
+                        .is_none_or(|name| name.bytes().all(|byte| byte == b'.'))
+                {
+                    continue;
+                }
+                if !work.charge() {
+                    return;
+                }
+                if file.inactive(binding.name, work) {
+                    continue;
+                }
+                if let Some((_, Some(target))) = self.import_target(file, binding, work)
+                    && target.symbol.kind == "module"
+                    && let Some(mut site) = self.occurrence(
+                        file,
+                        module,
+                        module,
+                        rift_core::ReferenceRole::Import,
+                        target,
+                    )
+                    && let Some(source) = file.qualified_target(".")
+                    && let Some(from) = self.python_identity(file, module, source)
+                {
+                    site.edge_from = Some(from);
+                    result.record(Some(site));
+                }
+            }
+        }
+    }
+
     pub(super) fn python_import_qualifier(
         &self,
         file: &File<'source>,

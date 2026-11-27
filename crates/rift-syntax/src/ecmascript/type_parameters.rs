@@ -53,3 +53,30 @@ pub(super) fn method(kind: &str) -> bool {
 pub(super) fn function(kind: &str) -> bool {
     kind == super::FUNCTION_DECLARATION_KIND
 }
+
+/// A named function's declaration signature, including overloads.
+pub(super) fn declared_signature(kind: &str) -> bool {
+    kind == super::FUNCTION_SIGNATURE_KIND
+}
+
+/// The inferred name and the true branch that can use it.
+pub(crate) fn inferred_name_and_branch(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    if node.kind() != "infer_type" || node.has_error() {
+        return None;
+    }
+    let name = node
+        .named_child(0)
+        .filter(|name| name.kind() == "type_identifier" && !name.is_missing())?;
+    let mut contained = node;
+    while let Some(parent) = contained.parent() {
+        if parent.kind() == "conditional_type" {
+            if parent.child_by_field_name("right") != Some(contained) || parent.has_error() {
+                return None;
+            }
+            let branch = parent.child_by_field_name("consequence")?;
+            return (!branch.is_missing()).then_some((name, branch));
+        }
+        contained = parent;
+    }
+    None
+}

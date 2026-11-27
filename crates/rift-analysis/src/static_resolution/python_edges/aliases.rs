@@ -129,7 +129,7 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn python_unchanged_module_binding(
+    pub(super) fn python_unchanged_module_binding(
         &self,
         file: &File<'source>,
         name: &str,

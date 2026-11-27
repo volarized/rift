@@ -160,6 +160,111 @@ impl<'source> Index<'source> {
         }
     }
 
+    /// Resolves the written first module segment of a checked type path.
+    pub(in crate::static_resolution) fn resolve_python_annotation_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_annotation_qualifier_start = Some(result.occurrences.len());
+        self.python_annotation_module_reads(work, result, AnnotationModule::Nested);
+    }
+
+    /// Resolves a checked module alias written directly beside a type name.
+    pub(in crate::static_resolution) fn resolve_python_direct_annotation_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_direct_annotation_qualifier_start = Some(result.occurrences.len());
+        self.python_annotation_module_reads(work, result, AnnotationModule::Direct);
+    }
+
+    /// Adds a module Read beside a previously established legacy alias type occurrence.
+    pub(in crate::static_resolution) fn resolve_python_legacy_annotation_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let files = self
+            .python_files()
+            .map(|file| (file.document.placement.unit(), file))
+            .collect::<BTreeMap<_, _>>();
+        let mut added = BTreeSet::new();
+        let mut reads = Vec::new();
+        for known in &result.occurrences {
+            if known.role != ReferenceRole::Type
+                || !matches!(known.target, NormalizedTarget::Symbol(_))
+            {
+                continue;
+            }
+            let Some(file) = files.get(known.binding.unit()) else {
+                continue;
+            };
+            let range = known.callee_range;
+            if known.binding.range().start() != range.start
+                || known.binding.range().end() != range.end
+                || file.document.facts.source_digest() != Some(&known.source_digest)
+            {
+                continue;
+            }
+            let Some(module) = AnnotationModule::Direct.module_range(file, range) else {
+                continue;
+            };
+            if !work.charge() {
+                break;
+            }
+            if !added.insert((known.binding.unit(), range)) {
+                continue;
+            }
+            if let Some(target) = self.python_type(file, range, work)
+                && !target.symbol.kinds.contains(&SymbolKind::Type)
+                && self.python_legacy_type_alias(target, work)
+                && self
+                    .occurrence(file, range, range, ReferenceRole::Type, target)
+                    .is_some_and(|site| {
+                        site.target == known.target && site.target_binding == known.target_binding
+                    })
+                && let Some(read) = self.python_member_module_qualifier(file, module, work)
+            {
+                reads.push(read);
+            }
+        }
+        if !reads.is_empty() {
+            result.python_legacy_annotation_qualifier_start = Some(result.occurrences.len());
+            result.occurrences.extend(reads);
+        }
+    }
+
+    fn python_annotation_module_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+        path: AnnotationModule,
+    ) {
+        for file in self.python_files() {
+            for reference in file
+                .facts
+                .references()
+                .iter()
+                .filter(|reference| reference.role == ReferenceRole::Type)
+            {
+                let module = path.module_range(file, reference.target);
+                if (path == AnnotationModule::Nested || module.is_some()) && !work.charge() {
+                    return;
+                }
+                if let Some(root) = module
+                    && let Some(qualifier) = self.python_member_module_qualifier(file, root, work)
+                    && let Some(target) = self.python_type(file, reference.target, work)
+                    && (path == AnnotationModule::Nested
+                        || target.symbol.kinds.contains(&SymbolKind::Type))
+                {
+                    result.record(Some(qualifier));
+                }
+            }
+        }
+    }
+
     /// An access belongs to the enclosing callable, an annotation to its declaration.
     pub(super) fn python_access(
         &self,
@@ -254,6 +359,30 @@ impl<'source> Index<'source> {
         occurrence.edge_kind = Some(kind);
         occurrence.edge_from = Some(self.python_identity(file, range, from)?);
         Some(occurrence)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnnotationModule {
+    Direct,
+    Nested,
+}
+
+impl AnnotationModule {
+    fn module_range(self, file: &File<'_>, range: ByteRange) -> Option<ByteRange> {
+        let (first, tail) = file.text(range)?.split_once('.')?;
+        let first = first.trim_end();
+        if tail.contains('.') != (self == Self::Nested)
+            || !rift_protocol::index::python_identifier_is_valid(first)
+            || (self == Self::Direct
+                && !rift_protocol::index::python_identifier_is_valid(tail.trim()))
+        {
+            return None;
+        }
+        Some(ByteRange {
+            start: range.start,
+            end: range.start.checked_add(u64::try_from(first.len()).ok()?)?,
+        })
     }
 }
 

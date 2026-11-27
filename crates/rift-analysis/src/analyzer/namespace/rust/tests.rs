@@ -4465,6 +4465,133 @@ fn rust_captured_macro_predicate_keeps_scope_after_checked_plain_outlines() {
     }
 }
 
+#[test]
+fn rust_captured_macro_predicate_tracks_only_complete_named_import_effects() {
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    for (label, tail, expected) in [
+        ("ordinary named import", "pub use chosen::used;", true),
+        (
+            "grouped renamed import",
+            "pub use chosen::{used as alias};",
+            true,
+        ),
+        ("wildcard import", "pub use chosen::*;", false),
+        (
+            "potential macro rebinding",
+            "pub use chosen::used as select;",
+            false,
+        ),
+        ("opaque sibling", "unknown! {}", false),
+    ] {
+        let first =
+            GUARDED_INVOCATION.replace("pub mod chosen;", &format!("pub mod chosen; {tail}"));
+        let root = format!("{GUARDED_MACRO}{first}{next} pub mod direct;");
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/chosen.rs", GUARDED_CHILD),
+                ("src/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&publication, "src/chosen.rs", label, true);
+        assert_guarded_module(&publication, "src/later.rs", label, expected);
+    }
+}
+
+#[test]
+fn rust_captured_predicate_keeps_macro_scope_after_a_checked_sibling_glob() {
+    let root = format!("{GUARDED_MACRO} pub mod branch; pub mod direct;");
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let ordinary = format!("#[derive(Clone)] pub struct Marker;\n{GUARDED_CHILD}");
+    let guarded = format!(
+        r#"{GUARDED_CHILD}
+        select! {{
+            #![feature = "checked"]
+            use crate::direct::preserved;
+            struct Marker;
+            impl Marker {{}}
+        }}"#
+    );
+    let conflicting = format!(
+        "{GUARDED_CHILD} macro_rules! select {{ ($($rest:tt)*) => {{}} }} pub(crate) use select;"
+    );
+    let unknown = format!("{GUARDED_CHILD} unknown! {{}}");
+    let wildcard = format!("{GUARDED_CHILD} pub use self::unknown::*;");
+    for (label, import, child, expected) in [
+        (
+            "checked sibling",
+            "pub use self::chosen::*;",
+            GUARDED_CHILD,
+            true,
+        ),
+        (
+            "checked inert attributes",
+            "pub use self::chosen::*;",
+            ordinary.as_str(),
+            true,
+        ),
+        (
+            "captured sibling items",
+            "pub use self::chosen::*;",
+            guarded.as_str(),
+            true,
+        ),
+        (
+            "unqualified glob",
+            "pub use chosen::*;",
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "different module",
+            "pub use self::unknown::*;",
+            GUARDED_CHILD,
+            false,
+        ),
+        (
+            "competing macro",
+            "pub use self::chosen::*;",
+            conflicting.as_str(),
+            false,
+        ),
+        (
+            "opaque child item",
+            "pub use self::chosen::*;",
+            unknown.as_str(),
+            false,
+        ),
+        (
+            "transitive wildcard",
+            "pub use self::chosen::*;",
+            wildcard.as_str(),
+            false,
+        ),
+        (
+            "introduced macro name",
+            "pub use self::chosen::*; use self::chosen::used as select;",
+            GUARDED_CHILD,
+            false,
+        ),
+    ] {
+        let first =
+            GUARDED_INVOCATION.replace("pub mod chosen;", &format!("pub mod chosen; {import}"));
+        let branch = format!("{first}{next}");
+        let result = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", child),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            GUARDED_FEATURE,
+        );
+        assert_guarded_module(&result, "src/branch/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,

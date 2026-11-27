@@ -44,6 +44,7 @@ use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 mod declared_exports;
 mod overload;
+mod property;
 mod variable_scopes;
 
 #[cfg(test)]
@@ -177,6 +178,7 @@ const FUNCTION_KIND_WORD: &str = "function";
 pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
 pub(crate) const VARIADIC_PARAMETER_KIND_WORD: &str = "variadic_parameter";
 pub(crate) const OVERLOAD_PARAMETER_KIND_WORD: &str = "overload_parameter";
+pub(crate) const PROPERTY_RECEIVER_KIND_WORD: &str = "python_property_receiver";
 /// The kind word a Python class carries on the wire.
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
@@ -1428,7 +1430,13 @@ impl SyntaxProvider for PythonSyntaxProvider {
         retain_comprehension_bindings(&mut symbols, &static_facts);
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         retain_loop_bindings(&mut symbols, &static_facts, source.text);
-        retain_parameters(&mut symbols, &mut static_facts, &rules.overloads);
+        retain_parameters(
+            &mut symbols,
+            &mut static_facts,
+            &rules.overloads,
+            tree.root_node(),
+            source.text,
+        );
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -1571,6 +1579,8 @@ fn retain_parameters(
     symbols: &mut Vec<crate::SyntaxSymbol>,
     facts: &mut crate::StaticFacts,
     overloads: &overload::OverloadContext,
+    root: Node<'_>,
+    source: &str,
 ) {
     use std::collections::BTreeSet;
 
@@ -1599,6 +1609,7 @@ fn retain_parameters(
     }
     let overload_parameters =
         overload::repeated_parameters(symbols, facts, &names, &eligible, overloads);
+    let property_parameters = property::receivers(root, source, symbols, facts, &names);
     let withheld = symbols
         .iter()
         .filter(|symbol| symbol.is_python_parameter())
@@ -1606,7 +1617,8 @@ fn retain_parameters(
             let range = symbol.name_range?;
             let admitted = eligible.contains_key(&range)
                 && (names.get(symbol.qualified_name.as_str()) == Some(&1)
-                    || overload_parameters.contains(&range))
+                    || overload_parameters.contains(&range)
+                    || property_parameters.contains(&range))
                 && rift_core::is_portable_name(&symbol.name)
                 && rift_core::is_portable_name(&symbol.qualified_name);
             (!admitted).then_some(range)
@@ -1621,6 +1633,8 @@ fn retain_parameters(
         };
         if overload_parameters.contains(&range) {
             symbol.kind = OVERLOAD_PARAMETER_KIND_WORD;
+        } else if property_parameters.contains(&range) {
+            symbol.kind = PROPERTY_RECEIVER_KIND_WORD;
         }
         !withheld.contains(&range)
     });
@@ -1633,6 +1647,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         PARAMETER_KIND_WORD,
         VARIADIC_PARAMETER_KIND_WORD,
         OVERLOAD_PARAMETER_KIND_WORD,
+        PROPERTY_RECEIVER_KIND_WORD,
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
         LOOP_BINDING_KIND_WORD,

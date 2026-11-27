@@ -95,6 +95,7 @@ pub(in crate::static_analysis) struct Names<'source> {
     comprehensions: BTreeSet<ByteRange>,
     reads: Vec<ByteRange>,
     direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
+    loop_locals: BTreeMap<&'source str, BTreeMap<ByteRange, LoopLocal>>,
     receivers: BTreeMap<ByteRange, ByteRange>,
     /// Written names with the scope that holds the target.
     writes: Vec<(ByteRange, ByteRange, NameUse)>,
@@ -104,6 +105,22 @@ pub(in crate::static_analysis) struct Names<'source> {
 impl<'source> Names<'source> {
     pub(super) fn receiver_binding(&mut self, scope: ByteRange, name: ByteRange) {
         self.receivers.insert(scope, name);
+    }
+
+    pub(super) fn loop_binding(
+        &mut self,
+        source: &'source str,
+        name: ByteRange,
+        scope: ByteRange,
+        body: ByteRange,
+    ) {
+        if let Some(spelling) = text(source, name) {
+            self.loop_locals
+                .entry(spelling)
+                .or_default()
+                .entry(scope)
+                .or_insert(LoopLocal { name, body });
+        }
     }
 
     pub(super) fn direct_binding(
@@ -122,6 +139,12 @@ impl<'source> Names<'source> {
                 .or_insert(DirectLocal { name, end, kind });
         }
     }
+}
+
+/// A loop target and the written suite where it already has its item.
+struct LoopLocal {
+    name: ByteRange,
+    body: ByteRange,
 }
 
 /// One parameter or initialized name directly inside a function body.
@@ -372,14 +395,26 @@ impl EdgePythonKinds {
         facts: &mut StaticFactsParts,
         names: &Names<'_>,
     ) -> Result<(), RiftError> {
-        let Some(assignments) = text(source, range).and_then(|name| names.direct_locals.get(name))
-        else {
+        let Some(spelling) = text(source, range) else {
             return Ok(());
         };
+        let assignments = names.direct_locals.get(spelling);
+        let loops = names.loop_locals.get(spelling);
+        if assignments.is_none() && loops.is_none() {
+            return Ok(());
+        }
         let Some(scope) = self.direct_local_read_scope(visited) else {
             return Ok(());
         };
         let inner = byte_range(scope)?;
+        if let Some(local) = loops.and_then(|loops| loops.get(&inner))
+            && local.body.encloses(range)
+        {
+            facts.python_local_reads.push((range, local.name));
+        }
+        let Some(assignments) = assignments else {
+            return Ok(());
+        };
         if let Some(local) = assignments.get(&inner) {
             if local.end <= range.start {
                 let reads = if local.kind == DirectBindingKind::VariadicParameter {

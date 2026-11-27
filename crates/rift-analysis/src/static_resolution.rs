@@ -142,6 +142,17 @@ pub(crate) struct StaticResolution {
     pub(crate) deferred_python_class_qualifiers: Vec<StaticOccurrence>,
     /// Imported qualifier Reads awaiting remaining edge capacity.
     pub(crate) deferred_python_import_qualifiers: Vec<ExternalOccurrence>,
+    /// First direct Read of a receiver added for a checked property family.
+    pub(crate) python_property_receiver_start: Option<usize>,
+    /// First module root reference of a checked Python annotation or base.
+    pub(crate) python_annotation_qualifier_start: Option<usize>,
+    /// First checked simple module alias Read in an annotation or base.
+    pub(crate) python_direct_annotation_qualifier_start: Option<usize>,
+    /// First module selector of a checked Python wildcard import.
+    pub(crate) python_wildcard_module_start: Option<usize>,
+    /// First qualifier backed by an established legacy alias type occurrence.
+    pub(crate) python_legacy_annotation_qualifier_start: Option<usize>,
+    pub(crate) python_loop_read_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -195,6 +206,13 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_signature_type_parameter_start: Option<usize>,
     /// Signature type uses awaiting the capacity left by earlier references.
     pub(crate) deferred_typescript_signature_type_parameters: Vec<StaticOccurrence>,
+    /// First reference to a type parameter written in a named function signature.
+    pub(crate) typescript_declared_signature_type_parameter_start: Option<usize>,
+    /// Type uses of declared signatures awaiting remaining edge capacity.
+    pub(crate) deferred_typescript_declared_signature_type_parameters: Vec<StaticOccurrence>,
+    /// First appended type use of a conditional inference parameter.
+    pub(crate) typescript_inference_parameter_start: Option<usize>,
+    pub(crate) deferred_typescript_inference_parameters: Vec<StaticOccurrence>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -358,6 +376,20 @@ fn resolve_by<'source>(
     );
     index.resolve_typescript_local_exports(&mut work, &mut resolution);
     resolution.append_python_value_qualifiers();
+    resolution.typescript_declared_signature_type_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_declared_signature_type_parameters,
+    );
+    resolution.typescript_inference_parameter_start = append_late_occurrences(
+        &mut resolution.occurrences,
+        &mut resolution.deferred_typescript_inference_parameters,
+    );
+    index.resolve_python_property_receivers(&mut work, &mut resolution);
+    index.resolve_python_annotation_qualifiers(&mut work, &mut resolution);
+    index.resolve_python_direct_annotation_qualifiers(&mut work, &mut resolution);
+    index.resolve_python_wildcard_modules(&mut work, &mut resolution);
+    index.resolve_python_legacy_annotation_qualifiers(&mut work, &mut resolution);
+    index.resolve_python_loop_reads(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -814,10 +846,14 @@ struct File<'source> {
     typescript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_function_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_signature_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    typescript_declared_signature_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    typescript_inference_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_method_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
+    python_loop_bindings: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
+    has_python_property_receiver: bool,
     python_comprehension_bindings: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
@@ -1000,9 +1036,13 @@ impl<'source> File<'source> {
             typescript_destructured_parameters: BTreeMap::new(),
             typescript_function_type_parameters: BTreeMap::new(),
             typescript_signature_type_parameters: BTreeMap::new(),
+            typescript_declared_signature_type_parameters: BTreeMap::new(),
+            typescript_inference_parameters: BTreeMap::new(),
             typescript_method_type_parameters: BTreeMap::new(),
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
+            python_loop_bindings: BTreeMap::new(),
+            has_python_property_receiver: false,
             python_comprehension_bindings: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
@@ -1307,7 +1347,12 @@ impl<'source> File<'source> {
                 usize::from(admitted && !symbol.is_rust_explicit_local_binding());
         } else if let Some(name) = symbol.name_range {
             if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
+                self.has_python_property_receiver |=
+                    admitted && symbol.is_python_property_receiver();
                 self.python_parameters
+                    .insert(name, admitted.then_some(symbol));
+            } else if symbol.is_python_loop_binding() {
+                self.python_loop_bindings
                     .insert(name, admitted.then_some(symbol));
             } else if admitted && symbol.is_python_comprehension_binding() {
                 self.python_comprehension_bindings.insert(name, symbol);
@@ -1325,6 +1370,11 @@ impl<'source> File<'source> {
             } else if admitted && symbol.is_typescript_signature_type_parameter() {
                 self.typescript_signature_type_parameters
                     .insert(name, symbol);
+            } else if admitted && symbol.is_typescript_declared_signature_type_parameter() {
+                self.typescript_declared_signature_type_parameters
+                    .insert(name, symbol);
+            } else if admitted && symbol.is_typescript_inference_parameter() {
+                self.typescript_inference_parameters.insert(name, symbol);
             } else if admitted && symbol.is_typescript_destructured_parameter() {
                 self.typescript_destructured_parameters.insert(name, symbol);
             } else if admitted && let Some(site) = site {
@@ -1534,6 +1584,16 @@ impl<'source> File<'source> {
                 ScopedParameterReads::TypeScriptSignatureType,
                 !self.typescript_signature_type_parameters.is_empty(),
             ),
+            (
+                ScopedParameterReads::TypeScriptDeclaredSignatureType,
+                !self
+                    .typescript_declared_signature_type_parameters
+                    .is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptInference,
+                !self.typescript_inference_parameters.is_empty(),
+            ),
         ]
         .into_iter()
         .skip(earlier.map_or(0, |class| class as usize + 1))
@@ -1570,6 +1630,16 @@ impl<'source> File<'source> {
                 ScopedParameterReads::TypeScriptSignatureType,
                 !self.typescript_signature_type_parameters.is_empty(),
             ),
+            (
+                ScopedParameterReads::TypeScriptDeclaredSignatureType,
+                !self
+                    .typescript_declared_signature_type_parameters
+                    .is_empty(),
+            ),
+            (
+                ScopedParameterReads::TypeScriptInference,
+                !self.typescript_inference_parameters.is_empty(),
+            ),
         ]
         .into_iter()
         .find_map(|(class, present)| present.then_some(DeferredReferences::ScopedParameters(class)))
@@ -1577,8 +1647,13 @@ impl<'source> File<'source> {
 
     fn has_python_local_reads(&self) -> bool {
         self.facts.python_local_reads().iter().any(|(_, name)| {
+            if self.python_loop_bindings.contains_key(name) {
+                return false;
+            }
             match self.python_parameters.get(name) {
-                Some(Some(symbol)) => !symbol.is_python_overload_parameter(),
+                Some(Some(symbol)) => {
+                    !symbol.is_python_overload_parameter() && !symbol.is_python_property_receiver()
+                }
                 Some(None) => false,
                 None => true,
             }
@@ -2641,7 +2716,11 @@ impl<'source> Index<'source> {
                         || !file.typescript_method_type_parameters.is_empty()
                         || !file.typescript_function_type_parameters.is_empty()
                         || !file.typescript_destructured_parameters.is_empty()
-                        || !file.typescript_signature_type_parameters.is_empty()))
+                        || !file.typescript_signature_type_parameters.is_empty()
+                        || !file
+                            .typescript_declared_signature_type_parameters
+                            .is_empty()
+                        || !file.typescript_inference_parameters.is_empty()))
                 .then_some(DeferredReferences::EcmaScriptParameters {
                     reads: parameter_reads,
                     file_module,

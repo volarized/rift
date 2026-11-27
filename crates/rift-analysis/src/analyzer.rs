@@ -576,6 +576,7 @@ struct BindingDemands {
     python_comprehension_bindings: BindingDemand,
     python_variadic_parameters: BindingDemand,
     python_overload_parameters: BindingDemand,
+    python_property_receivers: BindingDemand,
     ecmascript: EcmaScriptBindingDemand,
     primary: usize,
     unnamed: usize,
@@ -615,6 +616,8 @@ impl BindingDemands {
                     &mut demands.python_variadic_parameters
                 } else if symbol.is_python_overload_parameter() {
                     &mut demands.python_overload_parameters
+                } else if symbol.is_python_property_receiver() {
+                    &mut demands.python_property_receivers
                 } else if symbol.is_python_parameter() {
                     if symbol
                         .name_range
@@ -662,6 +665,7 @@ impl BindingDemands {
             + self.python_comprehension_bindings.count
             + self.python_variadic_parameters.count
             + self.python_overload_parameters.count
+            + self.python_property_receivers.count
             + self.rust_receivers.count
             + self.rust_generics.count
             + self.rust_library.count
@@ -757,7 +761,10 @@ fn binding_capacity(
                 &demands.rust_macro_methods,
                 &demands.rust_disjoint,
             ],
-            &demands.python_comprehension_bindings,
+            [
+                &demands.python_comprehension_bindings,
+                &demands.python_property_receivers,
+            ],
             (slots, bytes),
             record,
             &established,
@@ -786,6 +793,8 @@ struct EcmaScriptBindingDemand {
     typescript_patterns: BindingDemand,
     typescript_method_types: BindingDemand,
     typescript_signature_types: BindingDemand,
+    typescript_declared_signature_types: BindingDemand,
+    typescript_inferred_types: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -793,7 +802,7 @@ impl EcmaScriptBindingDemand {
         &self,
         documents: &[AnalyzedFile],
         rust: [&BindingDemand; 4],
-        python_comprehensions: &BindingDemand,
+        [python_comprehensions, python_property_receivers]: [&BindingDemand; 2],
         capacity: (usize, u64),
         record: u64,
         established: &rift_syntax::PackageBindingSlots,
@@ -827,6 +836,9 @@ impl EcmaScriptBindingDemand {
             python_comprehension_slots,
             callback_pattern_slots,
             signature_type_slots,
+            declared_signature_type_slots,
+            inferred_type_slots,
+            property_receiver_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -851,6 +863,9 @@ impl EcmaScriptBindingDemand {
                 python_comprehensions,
                 &self.javascript_callback_patterns,
                 &self.typescript_signature_types,
+                &self.typescript_declared_signature_types,
+                &self.typescript_inferred_types,
+                python_property_receivers,
             ],
             &mut slots,
             &mut bytes,
@@ -878,6 +893,9 @@ impl EcmaScriptBindingDemand {
             .with_python_comprehension_bindings(python_comprehension_slots)
             .with_javascript_callback_patterns(callback_pattern_slots)
             .with_typescript_signature_type_parameters(signature_type_slots)
+            .with_typescript_declared_signature_type_parameters(declared_signature_type_slots)
+            .with_typescript_inference_parameters(inferred_type_slots)
+            .with_python_property_receivers(property_receiver_slots)
     }
 
     fn classify(
@@ -916,6 +934,10 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_function_types
         } else if symbol.is_typescript_signature_type_parameter() {
             &mut self.typescript_signature_types
+        } else if symbol.is_typescript_declared_signature_type_parameter() {
+            &mut self.typescript_declared_signature_types
+        } else if symbol.is_typescript_inference_parameter() {
+            &mut self.typescript_inferred_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut self.typescript_patterns
         } else if javascript {

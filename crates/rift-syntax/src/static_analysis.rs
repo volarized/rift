@@ -190,6 +190,8 @@ pub enum StaticBindingKind {
     Local,
     /// The binding prevents lookup in an outer scope.
     Shadow,
+    /// An inference name visible in the true branch of its conditional type.
+    TypeScriptInference,
     /// Statically named ESM import.
     JavaScriptImport {
         /// Unquoted module specifier.
@@ -1713,6 +1715,7 @@ impl StaticBinding {
             StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
+            | StaticBindingKind::TypeScriptInference
             | StaticBindingKind::PythonNone
             | StaticBindingKind::PythonEmptyList
             | StaticBindingKind::PythonGlobal

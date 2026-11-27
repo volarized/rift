@@ -1167,7 +1167,7 @@ impl Context<'_, '_> {
     fn chain_children<'a>(
         &self,
         (invocation, name, directory): (ByteRange, &str, &str),
-        scope: &Scope,
+        scope: &mut Scope,
         tokens: &scope::Tokens<'a>,
         (children, conditioned): (&mut Vec<Child>, &mut Vec<Conditioned<'a>>),
         registry: bool,
@@ -1177,22 +1177,22 @@ impl Context<'_, '_> {
             tokens
                 .range(invocation)
                 .and_then(|invocation| chain::modules(&invocation, self.depth_max))
-                .map(|modules| (modules, false))
+                .map(|modules| (modules, chain::ScopeAfter::Unknown))
         } else {
             self.chain(invocation, name, scope, tokens, selection)
         };
-        let Some((modules, scope_unchanged)) = modules else {
+        let Some((modules, certainty)) = modules else {
             return false;
         };
-        let unchanged = scope_unchanged
-            && modules.iter().all(|(module, _)| {
-                child_path(module, directory, self.inventory)
-                    .and_then(|path| self.inventory.get(path.as_str()))
-                    .is_some_and(|child| self.outline_keeps_macro_scope(child))
-            });
-        let mut inherited = scope.clone();
-        if !unchanged {
-            inherited.clear();
+        let checked = self.chain_scope((name, directory), (&modules, certainty), scope);
+        let preserved = checked.is_some();
+        let inherited = checked.unwrap_or_else(|| {
+            let mut unknown = scope.clone();
+            unknown.clear();
+            unknown
+        });
+        if preserved {
+            *scope = inherited.clone();
         }
         for (module, condition) in modules {
             if let Some(path) = child_path(module, directory, self.inventory) {
@@ -1200,7 +1200,39 @@ impl Context<'_, '_> {
                 conditioned.push((path, condition));
             }
         }
-        unchanged
+        preserved
+    }
+
+    fn chain_scope(
+        &self,
+        (name, directory): (&str, &str),
+        (modules, certainty): (&chain::ModuleBranches<'_>, chain::ScopeAfter),
+        scope: &Scope,
+    ) -> Option<Scope> {
+        let (mut bindings, globs) = match certainty {
+            chain::ScopeAfter::CheckedImports(bindings) => (bindings, BTreeSet::new()),
+            chain::ScopeAfter::CheckedSiblingGlobs { bindings, modules } => (bindings, modules),
+            chain::ScopeAfter::Unknown => return None,
+        };
+        for (module, _) in modules {
+            let path = child_path(module, directory, self.inventory)?;
+            let child = self.inventory.get(path.as_str())?;
+            if !self.outline_keeps_macro_scope(child) {
+                return None;
+            }
+            if globs.contains(*module) {
+                let tokens = scope::Tokens::with_capture(child, Some(name))?;
+                bindings.extend(tokens.outward_bindings(child, name, scope, self.library)?);
+            }
+        }
+        if !globs.is_empty() && bindings.contains(name) {
+            return None;
+        }
+        let mut inherited = scope.clone();
+        for binding in bindings {
+            inherited.insert(binding, false);
+        }
+        Some(inherited)
     }
 
     fn outline_keeps_macro_scope(&self, file: &SelectedFile<'_>) -> bool {
@@ -1242,7 +1274,7 @@ impl Context<'_, '_> {
         scope: &Scope,
         tokens: &scope::Tokens<'a>,
         (file, configuration): (&SelectedFile<'_>, &super::configuration::Configuration<'_>),
-    ) -> Option<(chain::ModuleBranches<'a>, bool)> {
+    ) -> Option<chain::CheckedBranches<'a>> {
         let (path, range) = scope.definition(name)?;
         let defining = self.inventory.get(path.as_str())?;
         let limits = defining.syntax.syntax_limits()?;
@@ -1287,7 +1319,7 @@ impl Context<'_, '_> {
             )
         } else if chain::is_definition(&definition, name, limits) {
             chain::modules(&tokens.range(invocation)?, self.depth_max)
-                .map(|modules| (modules, false))
+                .map(|modules| (modules, chain::ScopeAfter::Unknown))
         } else {
             None
         }
