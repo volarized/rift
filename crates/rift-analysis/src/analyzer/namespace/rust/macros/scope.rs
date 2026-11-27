@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use rift_syntax::ByteRange;
 
 use super::{Scope, SelectedFile, consume, group};
+use crate::analyzer::namespace::rust::configuration::Configuration;
 
 type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> Option<()>>;
 
@@ -24,7 +25,10 @@ impl<'a> Tokens<'a> {
         Self::with_capture(file, None)
     }
 
-    pub(super) fn with_capture(file: &'a SelectedFile<'a>, selected: Option<&str>) -> Option<Self> {
+    pub(super) fn with_capture(
+        file: &'a SelectedFile<'a>,
+        selected: Option<(&str, &Configuration<'_>)>,
+    ) -> Option<Self> {
         let limits = file.syntax.syntax_limits()?;
         let mut rows = Vec::new();
         let range = ByteRange {
@@ -55,7 +59,14 @@ impl<'a> Tokens<'a> {
         if scopes.first().map(|(range, _)| *range) != Some(range) {
             return None;
         }
-        for (_, children) in scopes {
+        let inactive = match selected {
+            Some((_, configuration)) => result.inactive_modules(file, configuration)?,
+            None => Vec::new(),
+        };
+        for (range, children) in scopes {
+            if within_inactive(&inactive, *range) {
+                continue;
+            }
             let Some(children) = children else {
                 result.complete = false;
                 continue;
@@ -69,13 +80,66 @@ impl<'a> Tokens<'a> {
             }
         }
         for (range, _, children) in file.syntax.macro_invocations()? {
+            if within_inactive(&inactive, *range) {
+                continue;
+            }
             if children.is_none() {
                 result.complete = false;
                 continue;
             }
-            result.invocation_names(*range, selected)?;
+            result.invocation_names(*range, selected.map(|(name, _)| name))?;
         }
         Some(result)
+    }
+
+    fn inactive_modules(
+        &self,
+        file: &SelectedFile<'_>,
+        configuration: &Configuration<'_>,
+    ) -> Option<Vec<ByteRange>> {
+        let Some(facts) = self.facts else {
+            return Some(Vec::new());
+        };
+        let conditions = facts.conditional_items();
+        if conditions.is_empty() {
+            return Some(Vec::new());
+        }
+        let barriers = facts.rust_macro_barriers();
+        let symbols = file.syntax.symbols();
+        self.charge(
+            barriers
+                .len()
+                .checked_add(symbols.len())?
+                .checked_add(conditions.len())?,
+        )?;
+        let blocked = barriers
+            .iter()
+            .map(|(item, _)| *item)
+            .collect::<BTreeSet<_>>();
+        let candidates = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.container.is_none()
+                    && symbol.syntax_element_kind == Some("mod_item")
+                    && symbol.body_range.is_some()
+                    && !blocked.contains(&symbol.item_range)
+            })
+            .map(|symbol| symbol.item_range)
+            .collect::<BTreeSet<_>>();
+        let mut inactive = BTreeSet::new();
+        for item in conditions {
+            if !candidates.contains(&item.range) {
+                continue;
+            }
+            let attribute = self.range(item.attribute)?;
+            if let ["#", "[", "cfg", "(", predicate @ .., ")", "]"] = attribute.as_slice() {
+                self.charge(predicate.len().checked_mul(self.depth)?)?;
+                if configuration.condition(predicate) == Some(false) {
+                    inactive.insert(item.range);
+                }
+            }
+        }
+        Some(inactive.into_iter().collect())
     }
 
     pub(super) fn range(&self, range: ByteRange) -> Option<Vec<&'a str>> {
@@ -1103,6 +1167,13 @@ fn identifier(input: &mut &[&str]) -> Option<String> {
     };
     *input = &input[1..];
     Some(name)
+}
+
+fn within_inactive(inactive: &[ByteRange], range: ByteRange) -> bool {
+    let end = inactive.partition_point(|module| module.start <= range.start);
+    inactive[..end]
+        .last()
+        .is_some_and(|module| module.encloses(range))
 }
 
 /// Exact names an ordinary, fully bounded use item can introduce.

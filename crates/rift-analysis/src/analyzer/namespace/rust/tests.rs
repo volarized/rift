@@ -4628,6 +4628,62 @@ fn rust_captured_predicate_keeps_scope_across_an_ordinary_extern_crate() {
     }
 }
 
+#[test]
+fn rust_captured_predicate_checks_globs_in_the_selected_inline_module_profile() {
+    let root = format!("{GUARDED_MACRO} pub mod branch; pub mod direct;");
+    let first = GUARDED_INVOCATION.replace(
+        "pub mod chosen;",
+        "pub mod chosen; pub use self::chosen::*;",
+    );
+    let next = GUARDED_INVOCATION.replace("chosen", "later");
+    let branch = format!("{first}{next}");
+    let with_test = ["feature=\"checked\"", "test"];
+    for (label, header, flags, expected) in [
+        ("inactive test", "#[cfg(test)]", GUARDED_FEATURE, true),
+        ("active test", "#[cfg(test)]", &with_test[..], false),
+        (
+            "inactive feature",
+            "#[cfg(feature = \"off\")]",
+            GUARDED_FEATURE,
+            true,
+        ),
+        (
+            "active feature",
+            "#[cfg(feature = \"checked\")]",
+            GUARDED_FEATURE,
+            false,
+        ),
+        (
+            "unknown predicate",
+            "#[cfg(version(\"1.88\"))]",
+            GUARDED_FEATURE,
+            false,
+        ),
+        (
+            "unresolved attribute",
+            "#[cfg(test)] #[custom]",
+            GUARDED_FEATURE,
+            false,
+        ),
+        ("unguarded", "", GUARDED_FEATURE, false),
+    ] {
+        let chosen = format!(
+            "{header} mod nested {{ use super::*; }} #[derive(Debug)] pub struct Marker;\n{GUARDED_CHILD}"
+        );
+        let publication = guarded_macro_publication(
+            &[
+                ("src/lib.rs", &root),
+                ("src/branch.rs", &branch),
+                ("src/branch/chosen.rs", &chosen),
+                ("src/branch/later.rs", GUARDED_CHILD),
+                ("src/direct.rs", "pub fn preserved() -> u8 { 2 }\n"),
+            ],
+            flags,
+        );
+        assert_guarded_module(&publication, "src/branch/later.rs", label, expected);
+    }
+}
+
 fn assert_guarded_module(
     publication: &rift_protocol::index::PackagePublication,
     path: &str,

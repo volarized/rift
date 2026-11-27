@@ -1221,7 +1221,8 @@ impl Context<'_, '_> {
                 return None;
             }
             if globs.contains(*module) {
-                let tokens = scope::Tokens::with_capture(child, Some(name))?;
+                let configuration = self.configurations.file(child.path.as_str());
+                let tokens = scope::Tokens::with_capture(child, Some((name, &configuration)))?;
                 bindings.extend(tokens.outward_bindings(child, name, scope, self.library)?);
             }
         }
