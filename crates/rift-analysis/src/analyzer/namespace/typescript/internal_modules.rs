@@ -3,10 +3,11 @@
 use super::entry::{Entry, PackageFiles};
 use super::{
     BTreeMap, BTreeSet, Exports, NamespaceInput, PackageMetadata, PreparedNamespace, ProjectPath,
-    SelectedFile, SymbolIdentity, SymbolOwner, binding_name, declaration_anchors, observations,
-    prepare_anchors, selected_source_is_valid,
+    SelectedFile, SymbolId, SymbolIdentity, SymbolOwner, binding_name, declaration_anchors,
+    observations, prepare_anchors, selected_source_is_valid,
 };
 use crate::static_resolution::is_declaration_file;
+use rift_syntax::ScopedIdentityAnchors;
 use serde::Deserialize;
 
 mod scopes;
@@ -88,28 +89,7 @@ pub(super) fn prepare(
         }
         prepared.anchors.remove(path);
         let mut anchors = declaration_anchors(input, file, Some(&module));
-        let scopes = scopes::FileScopes::new(file.syntax, file.source);
-        let withheld = scopes.repeated_names(file);
-        let mut physical = scopes.literal_properties(file, &withheld, &anchors);
-        physical.extend(scopes.withheld_lexical_bindings(file, &withheld, &anchors));
-        scopes.place_scoped_call_argument_properties(file, &withheld, &anchors, &mut physical);
-        physical.extend(scopes.withheld_union_properties(file, &withheld, &anchors));
-        physical.extend(scopes.withheld_conditional_properties(
-            file,
-            &withheld,
-            &anchors,
-            &physical,
-            input.syntax(),
-        ));
-        scopes.place_mixed_shorthand(file, &withheld, &anchors, &mut physical);
-        scopes.place_disjoint_module_bindings(file, &withheld, &anchors, &mut physical);
-        anchors.retain(|name, _| {
-            ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
-        });
-        if input.release_version().is_some() {
-            let bindings = scopes.unplaced_lexical_bindings(file, &anchors, &physical);
-            physical.extend(bindings);
-        }
+        let physical = module_scoped_anchors(input, file, &mut anchors, &ambient);
         if prepare_anchors(input, file, &module, anchors, prepared) {
             if !physical.is_empty() {
                 prepared
@@ -126,6 +106,80 @@ pub(super) fn prepare(
             }
         }
     }
+}
+
+/// Places checked file-local scopes without obscuring a separate module binding.
+fn module_scoped_anchors(
+    input: &NamespaceInput<'_>,
+    file: &SelectedFile<'_>,
+    anchors: &mut BTreeMap<String, SymbolId>,
+    ambient: &BTreeMap<String, SymbolId>,
+) -> ScopedIdentityAnchors {
+    let scopes = scopes::FileScopes::new(file.syntax, file.source);
+    let mut withheld = scopes.repeated_names(file);
+    let original_withheld = withheld.clone();
+    let arguments = scopes.separate_module_argument_properties(file, &mut withheld, anchors);
+    let lexical = scopes.withheld_lexical_bindings(file, &withheld, anchors);
+    let mut physical = scopes.literal_properties(file, &withheld, anchors);
+    physical.extend(lexical);
+    physical.extend(arguments);
+    scopes.place_scoped_call_argument_properties(file, &withheld, anchors, &mut physical);
+    physical.extend(scopes.withheld_union_properties(file, &withheld, anchors));
+    physical.extend(scopes.withheld_conditional_properties(
+        file,
+        &withheld,
+        anchors,
+        &physical,
+        input.syntax(),
+    ));
+    scopes.place_mixed_shorthand(file, &withheld, anchors, &mut physical);
+    scopes.place_disjoint_module_bindings(file, &withheld, anchors, &mut physical);
+    anchors.retain(|name, _| {
+        ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
+    });
+    if input.release_version().is_none() {
+        return physical;
+    }
+    let restored = original_withheld
+        .difference(&withheld)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if restored.is_empty() {
+        physical.extend(scopes.unplaced_lexical_bindings(file, anchors, &physical));
+        return physical;
+    }
+    let earlier_anchors = anchors
+        .iter()
+        .filter(|(name, _)| {
+            ambient.contains_key(*name) || !super::conflicting_assignment_name(name, &restored)
+        })
+        .map(|(name, identity)| (name.clone(), identity.clone()))
+        .collect();
+    let earlier_scopes = physical
+        .iter()
+        .filter(|(name, _)| !super::conflicting_assignment_name(name, &restored))
+        .map(|(name, ordinals)| (name.clone(), ordinals.clone()))
+        .collect();
+    let earlier = scopes.unplaced_lexical_bindings(file, &earlier_anchors, &earlier_scopes);
+    // A restored callable can own prior scope bindings without taking their place.
+    // Keep a shared spelling only if it still names an independently placed declaration.
+    let shared = file
+        .syntax
+        .symbols()
+        .iter()
+        .filter_map(|symbol| {
+            let ordinals = earlier.get(&symbol.qualified_name)?;
+            (!ordinals.contains_key(&symbol.declaration_ordinal))
+                .then_some(symbol.qualified_name.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    for (name, ordinals) in earlier {
+        if !shared.contains(name.as_str()) {
+            anchors.remove(&name);
+        }
+        physical.entry(name).or_default().extend(ordinals);
+    }
+    physical
 }
 
 /// Follow relative reexports from prepared declaration entries. A physical path can

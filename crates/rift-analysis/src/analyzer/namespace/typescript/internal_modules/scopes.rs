@@ -8,8 +8,9 @@ use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
-    ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
-    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
+    ByteRange, JavaScriptSyntaxProvider, ScopedIdentityAnchors, StaticBindingKind,
+    StaticBodyMember, StaticCall, StaticCallee, StaticFacts, StaticFunctionContext,
+    SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::super::conflicting_assignment_name;
@@ -264,6 +265,95 @@ impl<'source> FileScopes<'source> {
             }
         }
         repeated
+    }
+
+    /// Keeps an authored module binding and scopes a same-named direct argument property.
+    pub(super) fn separate_module_argument_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        repeated: &mut BTreeSet<&'source str>,
+        anchors: &BTreeMap<String, SymbolId>,
+    ) -> ScopedIdentityAnchors {
+        let Some(facts) = file.syntax.static_facts().filter(|_| {
+            !repeated.is_empty()
+                && file.syntax.language().name == "javascript"
+                && !file.syntax.has_errors()
+                && file.syntax.left_out_declaration_count() == 0
+        }) else {
+            return BTreeMap::new();
+        };
+        let mut groups = BTreeMap::<&str, Vec<_>>::new();
+        for symbol in file.syntax.symbols() {
+            let name = symbol.qualified_name.as_str();
+            if repeated.contains(name) && anchors.contains_key(name) {
+                groups.entry(name).or_default().push(symbol);
+            }
+        }
+        let bound = facts
+            .bindings()
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.kind,
+                    StaticBindingKind::Local | StaticBindingKind::JavaScriptClassValue { .. }
+                )
+            })
+            .map(|binding| binding.name)
+            .collect::<BTreeSet<_>>();
+        let written = facts
+            .assignments()
+            .iter()
+            .filter_map(|&range| binding_name(file.source, range))
+            .collect::<BTreeSet<_>>();
+        let candidates = groups
+            .into_iter()
+            .filter_map(|(name, group)| {
+                let [a, b] = group.as_slice() else {
+                    return None;
+                };
+                let (binding, property) = if ordinary_private_property(a, file.source) {
+                    (*b, *a)
+                } else {
+                    (*a, *b)
+                };
+                if !ordinary_private_property(property, file.source)
+                    || property.syntax_element_kind != Some("pair")
+                    || property.container.is_some()
+                    || binding.container.is_some()
+                    || !matches!(
+                        binding.syntax_element_kind,
+                        Some("class_declaration" | "variable_declarator")
+                    )
+                    || binding.is_ecmascript_package_binding()
+                    || self.lexical(binding, file.source) != self.source
+                    || !bound.contains(&binding.name_range?)
+                    || written.contains(name)
+                    || !self.body_members.contains_key(&property.item_range)
+                {
+                    return None;
+                }
+                let identity =
+                    local_group_identity(anchors.get(name)?, property.declaration_ordinal)?;
+                Some((
+                    property.item_range,
+                    (name, property.declaration_ordinal, identity),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let accepted = JavaScriptSyntaxProvider::module_call_argument_properties(
+            file.source,
+            file.syntax.syntax_limits().unwrap_or_default(),
+            &candidates.keys().copied().collect(),
+        );
+        let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+        let mut physical = BTreeMap::new();
+        for (range, (name, ordinal, identity)) in candidates {
+            if accepted.contains(&range) && occupied.insert(identity.clone()) {
+                repeated.remove(name);
+                physical.insert(name.to_owned(), BTreeMap::from([(ordinal, identity)]));
+            }
+        }
+        physical
     }
 
     /// Names repeated private keys by their captured literal and physical ordinal.

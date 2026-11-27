@@ -1792,6 +1792,148 @@ export function callbacks(run) {
 "#;
 
 #[test]
+fn secondary_javascript_argument_keys_keep_the_separate_written_module_binding() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./entry.js","module":"./entry.mjs","exports":{"import":{"default":"./entry.mjs"},"require":{"default":"./entry.js"}}}"#;
+    const CLASS: &str = r"
+var Channel = class {
+  run(flag) {
+    let current = 1;
+    if (flag) { let current = 2; void (current + 4); }
+    void (current + 3);
+    return STATES.closed;
+  }
+};
+";
+    for (label, registration, after, expected) in [
+        (
+            "direct arrow",
+            "register(api, { Channel: () => Channel });",
+            "",
+            true,
+        ),
+        (
+            "direct primitive",
+            "register(api, { Channel: 1 });",
+            "",
+            true,
+        ),
+        (
+            "array position",
+            "register(api, [null, { Channel: 1 }, null]);",
+            "",
+            false,
+        ),
+        (
+            "duplicate keys",
+            "register(api, { Channel: 1, Channel: 2 });",
+            "",
+            false,
+        ),
+        (
+            "write to binding",
+            "register(api, { Channel: 1 });",
+            "Channel = replacement;",
+            false,
+        ),
+        (
+            "unknown scope",
+            "if (enabled) { register(api, { Channel: 1 }); }",
+            "",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "const api = {{}};\nfunction register() {{}}\nfunction expose(value) {{ return value; }}\n{registration}\nmodule.exports = expose(api);\nconst STATES = {{ closed: 1 }};\n{CLASS}\n{after}\n"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("entry.js", &source),
+                ("entry.mjs", "export function anchor() { return 1; }"),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("both configured package routes");
+        let publication = analysis.publication();
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/beacon%2Fentry.js/Channel"));
+        let method = publication.declarations.iter().find(|row| {
+            row.symbol
+                .as_str()
+                .ends_with("/beacon%2Fentry.js/Channel/run")
+        });
+        let paired = publication.declarations.iter().find(|row| {
+            row.symbol.as_str().contains("/entry.js/Channel%23")
+                || row.symbol.as_str().contains("%2Fentry.js/Channel%23")
+        });
+        assert_eq!(binding.is_some(), expected, "{label}");
+        assert_eq!(method.is_some(), expected, "{label}");
+        assert_eq!(paired.is_some(), expected, "{label}");
+        if let (Some(binding), Some(method), Some(paired)) = (binding, method, paired) {
+            assert_eq!(
+                binding.syntax_element_kind.as_deref(),
+                Some("variable_declarator")
+            );
+            assert_eq!(paired.syntax_element_kind.as_deref(), Some("pair"));
+            assert_eq!(binding.unit, paired.unit);
+            assert!(paired.range.end < binding.range.start, "{label}");
+            assert_argument_collision_preserves_local_uses(publication, &source, method, label);
+        }
+    }
+}
+
+/// The supplemental class does not change the original checked lexical target of a use.
+fn assert_argument_collision_preserves_local_uses(
+    publication: &PackagePublication,
+    source: &str,
+    method: &PackageSymbol,
+    label: &str,
+) {
+    let mut reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from == method.symbol
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().contains("/STATES")
+        })
+        .map(|edge| edge.to.as_str().rsplit('/').next().expect("written target"))
+        .collect::<Vec<_>>();
+    reads.sort_unstable();
+    assert_eq!(reads, ["STATES", "closed"], "{label}");
+    let locals = publication
+        .declarations
+        .iter()
+        .filter(|row| row.symbol.as_str().ends_with("/current"))
+        .collect::<Vec<_>>();
+    assert_eq!(locals.len(), 2, "{label}");
+    for (initializer, usage) in [
+        ("current = 1", "current + 3"),
+        ("current = 2", "current + 4"),
+    ] {
+        let item = module_runtime_range(
+            source.find(initializer).expect("written local"),
+            initializer,
+        );
+        let use_site = module_runtime_range(source.find(usage).expect("written use"), "current");
+        let local = locals
+            .iter()
+            .find(|row| row.range == item && row.source_complete && row.source == initializer)
+            .expect("local declaration");
+        assert!(local.symbol.as_str().contains("/$scope%23"), "{label}");
+        assert!(
+            publication.occurrences.iter().any(|row| {
+                row.symbol == local.symbol && row.unit == local.unit && row.range == use_site
+            }),
+            "{label}: {initializer}"
+        );
+    }
+}
+
+#[test]
 fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
     let analysis = fixture::package_result_with_metadata(
         ShippedLanguage::JavaScript,

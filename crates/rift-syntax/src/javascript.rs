@@ -46,6 +46,25 @@ impl JavaScriptSyntaxProvider {
         ecmascript::commonjs_class_export_initializations(source, limits, initializations)
     }
 
+    /// Checks literal properties written in direct arguments of a JavaScript module-body call.
+    ///
+    /// The statement, call, argument, and property must have independent exact syntax.
+    /// Nested objects, arrays, computed keys, and incomplete units produce no proof.
+    #[must_use]
+    pub fn module_call_argument_properties(
+        source: &str,
+        limits: SyntaxLimits,
+        selected: &BTreeSet<ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        module_object_members(source, limits, selected, |node, _| {
+            node.kind() == "pair"
+                && node
+                    .child_by_field_name("key")
+                    .is_some_and(|key| key.kind() == "property_identifier")
+                && module_call_argument_member(node)
+        })
+    }
+
     /// Checks getter slots in direct module call arguments and keys of short-circuited
     /// `CommonJS` export objects. These keys occupy an object scope.
     #[must_use]
