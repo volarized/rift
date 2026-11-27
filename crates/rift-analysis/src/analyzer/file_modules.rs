@@ -690,7 +690,7 @@ fn checked_expression_loaders<'file, 'edge>(
         let path = file.file.path().as_str();
         let syntax = file.file.syntax();
         let complete_source = syntax.language().name == "javascript"
-            && path.ends_with(".js")
+            && matches!(path.rsplit_once('.'), Some((_, "js")))
             && syntax.declaration_syntax_complete()
             && complete.contains(unit.to_string().as_str())
             && SymbolIdentity::parse(module.as_str()).is_ok_and(|identity| {
