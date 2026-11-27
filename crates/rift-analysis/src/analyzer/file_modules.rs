@@ -34,6 +34,7 @@ impl Records {
                 limits.declarations_max(),
             )?;
             self.retain_ecmascript_file_module_edges(semantics, limits.edges_max());
+            self.retain_ecmascript_callback_calls(owner, analyzed, semantics, limits)?;
         }
         Ok(())
     }
@@ -155,7 +156,7 @@ impl Records {
             let source = file.file.source();
             let path = wire_path(file.file.path());
             let bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
-            if !self.file_module_source_fits(bytes) {
+            if !self.retained_source_fits(bytes) {
                 self.warn(PackageAnalysisWarning::SourceTruncated {
                     path,
                     dropped: bytes,
@@ -198,7 +199,7 @@ impl Records {
         Ok(())
     }
 
-    fn file_module_source_fits(&self, bytes: u64) -> bool {
+    pub(super) fn retained_source_fits(&self, bytes: u64) -> bool {
         self.retained_source
             .map_or(bytes <= u64::from(PACKAGE_SOURCE_BYTES_MAX), |limit| {
                 bytes <= u64::from(limit.record_bytes_max)

@@ -59,6 +59,7 @@ mod coverage_tests;
 mod file_modules;
 #[cfg(test)]
 mod fixture;
+mod javascript_callbacks;
 mod join;
 #[cfg(test)]
 mod join_tests;

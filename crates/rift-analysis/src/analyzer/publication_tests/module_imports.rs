@@ -988,10 +988,12 @@ fn assert_new_runtime_roles_follow_prior_package_edges(
         .filter(|edge| edge.is_file_module_reference())
         .map(crate::Edge::to_protocol)
         .collect::<Vec<_>>();
+    let callbacks = anonymous_callback_ids(&publication);
     let available_before = publication
         .edges
         .iter()
         .filter(|edge| !module_references.contains(edge))
+        .filter(|edge| !callbacks.contains(&edge.from))
         .filter(|edge| {
             edge.from.as_str() != module
                 || match edge.kinds.as_slice() {
@@ -1019,6 +1021,15 @@ fn assert_new_runtime_roles_follow_prior_package_edges(
             .iter()
             .all(|edge| capped.edges.contains(edge))
     );
+}
+
+fn anonymous_callback_ids(publication: &PackagePublication) -> BTreeSet<&SymbolId> {
+    publication
+        .objects
+        .iter()
+        .filter(|row| row.document_local && row.name.starts_with("$callback#"))
+        .filter_map(|row| row.id.as_ref())
+        .collect()
 }
 
 #[test]
@@ -3482,14 +3493,30 @@ fn non_entry_callbacks_keep_properties_in_distinct_call_arguments() {
         .collect::<BTreeSet<_>>();
     assert_eq!(calls, written);
     let bounded = non_entry_lexical_binding_analysis(SOURCE, 2);
-    assert_eq!(bounded.publication().declarations, found.declarations);
-    assert!(
+    let bounded = bounded.publication();
+    let full_callbacks = anonymous_callback_ids(found);
+    let bounded_callbacks = anonymous_callback_ids(bounded);
+    assert_eq!(full_callbacks.len(), 1);
+    assert!(bounded_callbacks.is_subset(&full_callbacks));
+    assert_eq!(
         bounded
-            .publication()
+            .declarations
+            .iter()
+            .filter(|row| !bounded_callbacks.contains(&row.symbol))
+            .collect::<Vec<_>>(),
+        found
+            .declarations
+            .iter()
+            .filter(|row| !full_callbacks.contains(&row.symbol))
+            .collect::<Vec<_>>()
+    );
+    assert!(bounded_callbacks.iter().all(|callback| {
+        bounded
             .edges
             .iter()
-            .all(|edge| found.edges.contains(edge))
-    );
+            .any(|edge| &edge.from == *callback && edge.kinds == [EdgeKind::Calls])
+    }));
+    assert!(bounded.edges.iter().all(|edge| found.edges.contains(edge)));
 }
 
 #[test]
@@ -4328,5 +4355,186 @@ fn javascript_direct_literal_returns_keep_their_checked_object_and_initializer_o
             .declarations
             .iter()
             .all(|row| !row.source.starts_with("hidden:"))
+    );
+}
+
+const CALLBACK_CALL_SOURCE: &str = concat!(
+    "export function leaf() { return 1; }\n",
+    "function schedule(task) { return task(); }\n",
+    "schedule(() => leaf());\n",
+    "schedule(function () { return leaf(); });\n",
+    "export function enclosing() {\n",
+    "  return schedule((() => leaf())) + schedule(function () { return leaf(); });\n",
+    "}\n",
+    "export const stable = () => leaf();\n",
+    "schedule(stable);\n",
+    "schedule(function named() { return leaf(); });\n",
+    "schedule(() => (() => leaf()));\n",
+    "schedule(() => missing());\n",
+);
+
+#[test]
+fn ecmascript_anonymous_arguments_own_their_exact_inner_calls() {
+    for (language, file, selector) in [
+        (ShippedLanguage::JavaScript, "index.js", "main"),
+        (ShippedLanguage::TypeScript, "index.ts", "types"),
+    ] {
+        let manifest = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","{selector}":"./{file}"}}"#
+        );
+        let analysis = fixture::package_result_with_metadata(
+            language,
+            vec![(file, CALLBACK_CALL_SOURCE)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked ECMAScript source");
+        let (found, files, semantics, _) = analysis.into_parts();
+        found.validate_facts().expect("valid callback call facts");
+        let unit = &found.units[0].unit;
+        let ranges = CALLBACK_CALL_SOURCE
+            .match_indices("leaf()")
+            .skip(1)
+            .map(|(start, text)| TextRange {
+                start: u64::try_from(start).expect("source byte offset"),
+                end: u64::try_from(start + text.len()).expect("source byte end"),
+            })
+            .collect::<Vec<_>>();
+        let calls_at = |range: &TextRange| {
+            found
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::Calls]
+                        && edge.to.as_str().ends_with("/leaf")
+                        && edge
+                            .occurrence
+                            .as_ref()
+                            .is_some_and(|site| site.unit == *unit && site.range == *range)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges.len(), 7);
+        let mut callers = BTreeSet::new();
+        for range in &ranges[..4] {
+            let calls = calls_at(range);
+            let [call] = calls.as_slice() else {
+                panic!("one inner Call at {range:?} in {file}: {calls:?}");
+            };
+            assert!(callers.insert(call.from.clone()));
+            let callback = found
+                .declarations
+                .iter()
+                .find(|declaration| declaration.symbol == call.from)
+                .expect("anonymous argument declaration");
+            assert_eq!(&callback.unit, unit);
+            assert!(
+                callback.source.starts_with("() =>") || callback.source.starts_with("function (")
+            );
+            assert!(callback.range.start < range.start && range.end <= callback.range.end);
+            let object = found
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&call.from))
+                .expect("callback object");
+            assert!(object.document_local && object.kinds.contains(&SymbolKind::Callable));
+        }
+        assert!(
+            calls_at(&ranges[4])
+                .iter()
+                .any(|call| call.from.as_str().ends_with("/stable"))
+        );
+        for range in &ranges[5..] {
+            assert!(
+                calls_at(range)
+                    .iter()
+                    .all(|call| !callers.contains(&call.from))
+            );
+        }
+        assert_eq!(
+            found
+                .objects
+                .iter()
+                .filter(|object| object.name.starts_with("$callback#")
+                    && object.kinds.contains(&SymbolKind::Callable))
+                .count(),
+            callers.len()
+        );
+        assert!(
+            found
+                .edges
+                .iter()
+                .all(|edge| !edge.to.as_str().ends_with("/missing"))
+        );
+        assert_callback_edge_capacity(&found, &files, &semantics, &callers, ranges[2].start);
+    }
+}
+
+fn assert_callback_edge_capacity(
+    found: &PackagePublication,
+    files: &[AnalyzedFile],
+    semantics: &WorkspaceSemantics,
+    callers: &BTreeSet<SymbolId>,
+    first_enclosed: u64,
+) {
+    let enclosing = found
+        .objects
+        .iter()
+        .find_map(|row| {
+            row.id
+                .as_ref()
+                .filter(|id| id.as_str().ends_with("/enclosing"))
+        })
+        .expect("named enclosing callable");
+    let owner = SymbolIdentity::parse(enclosing.as_str()).expect("callable identity");
+    let admitted = found
+        .edges
+        .iter()
+        .filter(|edge| {
+            !callers.contains(&edge.from)
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range.start >= first_enclosed)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut earlier = admitted.clone();
+    for edge in &mut earlier {
+        if callers.contains(&edge.from) {
+            edge.from.clone_from(enclosing);
+        }
+    }
+    let mut records = Records {
+        units: found.units.clone(),
+        objects: found
+            .objects
+            .iter()
+            .filter(|row| row.id.as_ref().is_none_or(|id| !callers.contains(id)))
+            .cloned()
+            .collect(),
+        declarations: found
+            .declarations
+            .iter()
+            .filter(|row| !callers.contains(&row.symbol))
+            .cloned()
+            .collect(),
+        edges: earlier,
+        ..Records::default()
+    };
+    let limits = ExactPackageLimits::new(4096, 4096)
+        .with_edges(admitted.len())
+        .expect("edge bound");
+    records
+        .retain_ecmascript_callback_calls(owner.owner(), files, semantics, limits)
+        .expect("bounded calls");
+    assert_eq!(records.edges, admitted);
+    assert_eq!(
+        records
+            .declarations
+            .iter()
+            .filter(|row| callers.contains(&row.symbol))
+            .count(),
+        2
     );
 }
