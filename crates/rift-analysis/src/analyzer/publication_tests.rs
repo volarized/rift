@@ -587,3 +587,72 @@ fn assert_archive_script_facts(publication: &PackagePublication, text: &str) {
             .any(|row| row.unit == outside_unit.unit)
     );
 }
+
+#[test]
+fn a_selected_python_script_under_an_import_root_retains_its_written_path() {
+    const BODY: &str = "def leaf() -> int:\n    return 1\n\n\
+        def execute() -> int:\n    return leaf()\n";
+    let publication = publication(
+        &[
+            ("src/runner/__init__.py", ""),
+            ("src/runner/hooks/__init__.py", ""),
+            ("src/runner/hooks/hook-run.py", BODY),
+            ("src/runner/hooks/hook_run.py", BODY),
+            ("src/runner/hooks/hook-run.extra.py", BODY),
+            ("src/runner/hooks/hook-run.pyi", BODY),
+            ("src/other/hook-run.py", BODY),
+        ],
+        Some("src"),
+        &["runner"],
+    );
+    for (path, owner) in [
+        (
+            "src/runner/hooks/hook-run.py",
+            "./src/runner/hooks/hook-run.py",
+        ),
+        ("src/runner/hooks/hook_run.py", "runner"),
+        (
+            "src/runner/hooks/hook-run.extra.py",
+            "./src/runner/hooks/hook-run.extra.py",
+        ),
+    ] {
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("selected source");
+        let declared = |name: &str| {
+            let row = publication
+                .declarations
+                .iter()
+                .find(|row| row.unit == unit.unit && row.symbol.as_str().ends_with(name))
+                .expect("written function declaration");
+            let identity = SymbolIdentity::parse(row.symbol.as_str()).expect("function identity");
+            assert_eq!(identity.qualified_path()[0], owner);
+            &row.symbol
+        };
+        let (leaf, execute) = (declared("/leaf"), declared("/execute"));
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && &edge.from == execute
+                && &edge.to == leaf
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit.unit)
+        }));
+    }
+    for path in ["src/runner/hooks/hook-run.pyi", "src/other/hook-run.py"] {
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("retained source");
+        assert!(
+            !publication
+                .declarations
+                .iter()
+                .any(|row| row.unit == unit.unit)
+        );
+    }
+}
