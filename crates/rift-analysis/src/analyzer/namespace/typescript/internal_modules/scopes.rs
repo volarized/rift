@@ -16,6 +16,7 @@ use super::super::conflicting_assignment_name;
 use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
+mod conditional_types;
 mod mixed_shorthand;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
