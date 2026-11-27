@@ -37,6 +37,7 @@ impl Records {
                 semantics,
                 limits.edges_max(),
                 &[EdgeKind::Imports, EdgeKind::Reads],
+                false,
             );
             self.retain_ecmascript_callback_edges(
                 owner,
@@ -49,6 +50,7 @@ impl Records {
                 semantics,
                 limits.edges_max(),
                 &[EdgeKind::References],
+                false,
             );
             self.retain_ecmascript_callback_edges(
                 owner,
@@ -57,6 +59,12 @@ impl Records {
                 limits,
                 EdgeKind::Reads,
             )?;
+            self.retain_ecmascript_file_module_edges(
+                semantics,
+                limits.edges_max(),
+                &[EdgeKind::Imports],
+                true,
+            );
         }
         Ok(())
     }
@@ -67,15 +75,17 @@ impl Records {
         semantics: &WorkspaceSemantics,
         edge_limit: usize,
         kinds: &[EdgeKind],
+        deferred_exports: bool,
     ) {
         let mut references = kinds
             .iter()
             .copied()
             .flat_map(|kind| {
-                semantics
-                    .edges()
-                    .edges()
-                    .filter(move |edge| edge.is_file_module_reference() && edge.kind() == kind)
+                semantics.edges().edges().filter(move |edge| {
+                    edge.is_file_module_reference()
+                        && edge.kind() == kind
+                        && edge.is_deferred_commonjs_export_import() == deferred_exports
+                })
             })
             .peekable();
         if references.peek().is_none() {

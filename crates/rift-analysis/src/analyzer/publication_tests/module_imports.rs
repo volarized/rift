@@ -4,6 +4,79 @@ use super::*;
 use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
+#[test]
+fn checked_commonjs_export_object_values_keep_their_literal_imports() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.cjs"}"#;
+    const SOURCE: &str = concat!(
+        "const stable = require('./stable.cjs');\n",
+        "module.exports = { part: require( './leaf.cjs' ), stable };\n"
+    );
+    let collect = |source| {
+        internal_modules::analyze(
+            MANIFEST,
+            &[
+                ("index.cjs", source),
+                (
+                    "leaf.cjs",
+                    "exports.convert = function convert(value) { return value + 1; };",
+                ),
+                (
+                    "stable.cjs",
+                    "exports.stable = function stable(value) { return value + 1; };",
+                ),
+            ],
+        )
+    };
+    let supported = collect(SOURCE);
+    let publication = supported.publication();
+    let source_module = publication
+        .declarations
+        .iter()
+        .find(|row| row.source_complete && row.source == SOURCE)
+        .expect("complete module source owner");
+
+    let edges = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Imports]);
+    for specifier in ["'./leaf.cjs'", "'./stable.cjs'"] {
+        let offset = SOURCE.find(specifier).expect("written specifier");
+        assert!(
+            edges.clone().any(|edge| {
+                let Some(occurrence) = &edge.occurrence else {
+                    return false;
+                };
+                occurrence.range == module_runtime_range(offset, specifier)
+                    && edge.from == source_module.symbol
+                    && publication
+                        .units
+                        .iter()
+                        .any(|unit| unit.unit == occurrence.unit && unit.path.0 == "index.cjs")
+                    && edge
+                        .to
+                        .as_str()
+                        .ends_with(specifier.trim_matches('\'').trim_start_matches("./"))
+            }),
+            "missing import at {specifier}"
+        );
+    }
+    for source in [
+        "module.exports = { part: require('./missing.cjs') };",
+        "const specifier = './leaf.cjs'; module.exports = { part: require(specifier) };",
+        "const require = () => ({}); module.exports = { part: require('./leaf.cjs') };",
+        "module.exports = { part: require('./leaf.cjs', sideEffect()) };",
+        "module.exports = make({ part: require('./leaf.cjs') });",
+    ] {
+        let unsupported = collect(source);
+        assert!(
+            unsupported.publication().edges.iter().all(|edge| {
+                !edge.kinds.contains(&EdgeKind::Imports) || !edge.to.as_str().ends_with("leaf.cjs")
+            }),
+            "unproved import in {source}"
+        );
+    }
+}
+
 const NON_ENTRY_ARGUMENT_PROPERTIES: &str = r#"
 import { receive } from "../index.mjs";
 receive({ action: "first" });

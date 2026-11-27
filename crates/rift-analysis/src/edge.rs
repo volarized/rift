@@ -39,6 +39,13 @@ use crate::static_resolution::{ExternalOccurrence, StaticOccurrence, StaticResol
 /// against a graph built outside those limits.
 pub const EDGES_MAX: usize = 10_000_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileModuleReference {
+    None,
+    Binding,
+    CommonJsExportImport,
+}
+
 /// One resolved reference edge: the enclosing definition a reference occurred in, the
 /// established symbol it resolved to, and the reference's portable category.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +57,7 @@ pub struct Edge {
     static_callee: Option<rift_syntax::ByteRange>,
     derivation: rift_protocol::read::EdgeDerivation,
     from_graph: bool,
-    file_module_reference: bool,
+    file_module_reference: FileModuleReference,
 }
 
 impl Edge {
@@ -61,7 +68,14 @@ impl Edge {
 
     /// Whether this reference needs two admitted ECMAScript file modules.
     pub(crate) const fn is_file_module_reference(&self) -> bool {
-        self.file_module_reference
+        !matches!(self.file_module_reference, FileModuleReference::None)
+    }
+
+    pub(crate) const fn is_deferred_commonjs_export_import(&self) -> bool {
+        matches!(
+            self.file_module_reference,
+            FileModuleReference::CommonJsExportImport
+        )
     }
 
     /// Projects this resolved reference with its physical occurrence.
@@ -278,7 +292,7 @@ fn reference_edges<'graph>(
             static_callee: None,
             derivation: rift_protocol::read::EdgeDerivation::Resolution,
             from_graph: false,
-            file_module_reference: false,
+            file_module_reference: FileModuleReference::None,
         })
     })
 }
@@ -404,7 +418,7 @@ fn admit_external<'a>(
             static_callee: (occurrence.role == ReferenceRole::Call)
                 .then_some(occurrence.callee_range),
             from_graph: false,
-            file_module_reference: false,
+            file_module_reference: FileModuleReference::None,
             derivation: if occurrence.declared {
                 rift_protocol::read::EdgeDerivation::Resolution
             } else {
@@ -420,7 +434,7 @@ fn admit_occurrences<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     admitted: &mut BTreeMap<&'a SymbolId, Vec<Edge>>,
-    file_module_reference: bool,
+    file_module_reference: FileModuleReference,
 ) {
     for occurrence in occurrences {
         if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
@@ -461,7 +475,7 @@ fn static_tail_starts(
     resolution: &mut StaticResolution,
     alias: Option<usize>,
     value_qualifier: Option<usize>,
-) -> [Option<usize>; 50] {
+) -> [Option<usize>; 51] {
     [
         resolution.late_supplemental_start.take(),
         resolution.python_reassignment_start.take(),
@@ -515,6 +529,7 @@ fn static_tail_starts(
         resolution.python_wildcard_module_start.take(),
         resolution.python_legacy_annotation_qualifier_start.take(),
         resolution.python_loop_read_start.take(),
+        resolution.commonjs_export_import_start.take(),
     ]
 }
 
@@ -522,7 +537,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 52] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 53] {
     let supplemental_start = resolution.supplemental_start.take();
     let (value_qualifier, value_qualifier_external) = resolution
         .python_value_qualifier_start
@@ -537,10 +552,10 @@ fn static_admission_batches<'a>(
             (Some(internal), external)
         });
     let tail_starts = static_tail_starts(resolution, alias, value_qualifier);
-    let mut boundaries = [0; 53];
+    let mut boundaries = [0; 54];
     let mut next = resolution.occurrences.len();
-    boundaries[52] = next;
-    for (boundary, start) in boundaries[2..52].iter_mut().zip(tail_starts).rev() {
+    boundaries[53] = next;
+    for (boundary, start) in boundaries[2..53].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }
@@ -558,7 +573,11 @@ fn static_admission_batches<'a>(
             spans,
             edge_modules,
             &mut edges,
-            matches!(index, 10 | 11 | 42),
+            match index {
+                10 | 11 | 42 => FileModuleReference::Binding,
+                52 => FileModuleReference::CommonJsExportImport,
+                _ => FileModuleReference::None,
+            },
         );
         edges
     });
@@ -747,7 +766,7 @@ impl EdgeStore {
                         static_callee: None,
                         derivation,
                         from_graph: true,
-                        file_module_reference: false,
+                        file_module_reference: FileModuleReference::None,
                     };
                     outgoing.entry(from.clone()).or_default().push(edge.clone());
                     incoming.entry(to.clone()).or_default().push(edge);

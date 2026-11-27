@@ -86,6 +86,8 @@ pub(crate) struct StaticResolution {
     pub(crate) file_module_start: Option<usize>,
     /// First qualifier reference after the file module specifiers.
     pub(crate) file_module_qualifier_start: Option<usize>,
+    /// First import in a checked `CommonJS` default export object.
+    pub(crate) commonjs_export_import_start: Option<usize>,
     /// First containment edge of a physically scoped literal declaration.
     pub(crate) literal_start: Option<usize>,
     /// Containment awaiting the capacity left by existing references.
@@ -390,6 +392,7 @@ fn resolve_by<'source>(
     index.resolve_python_wildcard_modules(&mut work, &mut resolution);
     index.resolve_python_legacy_annotation_qualifiers(&mut work, &mut resolution);
     index.resolve_python_loop_reads(&mut work, &mut resolution);
+    index.resolve_commonjs_export_imports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

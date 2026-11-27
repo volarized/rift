@@ -1,12 +1,14 @@
 //! ECMAScript containment, access, type usage, and override facts.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rift_core::{ReferenceRole, SourceLocation, SourceRange, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    ByteRange, StaticBinding, StaticBindingKind, StaticReference, SyntaxExportBinding,
-    SyntaxExportKind, SyntaxSymbol,
+    ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticReference,
+    SyntaxExportBinding, SyntaxExportKind, SyntaxSymbol,
 };
 
 use super::javascript::{AssignedMemberSite, MemberMode, ModuleMode, js_binding};
@@ -903,6 +905,102 @@ impl<'source> Index<'source> {
             rift_protocol::identity::SymbolOwner::Package { manager, .. } if manager == "npm"
         ) && file.document.placement.logical_identity(".").is_some()
             && !file.document.facts.has_errors()
+    }
+
+    /// Retains literal requires written directly in a checked `CommonJS` export object.
+    pub(super) fn resolve_commonjs_export_imports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.commonjs_export_import_start = Some(result.occurrences.len());
+        for file in self.files.values().filter(|file| {
+            file.document.facts.language().name == "javascript"
+                && self.javascript_has_file_module(file)
+                && file.document.facts.declaration_syntax_complete()
+        }) {
+            let Some(export) = file.facts.commonjs_export() else {
+                continue;
+            };
+            let Some(literal) = export.literal else {
+                continue;
+            };
+            let mut pairs = BTreeSet::new();
+            for member in file.facts.body_members() {
+                if !work.charge() {
+                    return;
+                }
+                if member.body == literal && member.holder == export.assignment {
+                    pairs.insert(member.member);
+                }
+            }
+            if pairs.is_empty() {
+                continue;
+            }
+            let mut calls = BTreeMap::new();
+            for call in file.facts.calls() {
+                if !work.charge() {
+                    return;
+                }
+                if literal.encloses(call.range) {
+                    calls
+                        .entry(call.range)
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(call));
+                }
+            }
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    return;
+                }
+                if symbol.syntax_element_kind == Some("pair")
+                    && pairs.contains(&symbol.item_range)
+                    && let Some(Some(call)) = symbol.body_range.and_then(|body| calls.get(&body))
+                    && let Some(module) = Self::commonjs_literal_require(file, call)
+                    && self.builtin_require(file, call.callee_range.start, work)
+                    && let Some(imported) =
+                        self.javascript_module_specifier(file, module, true, work)
+                {
+                    result.record(Some(imported));
+                }
+            }
+        }
+    }
+
+    /// The unquoted relative specifier in a captured direct call with one string argument.
+    fn commonjs_literal_require(file: &File<'source>, call: &StaticCall) -> Option<ByteRange> {
+        if call.callee != StaticCallee::Direct || file.text(call.callee_range)? != "require" {
+            return None;
+        }
+        let start = call.callee_range.end;
+        let tail = file.text(ByteRange {
+            start,
+            end: call.range.end,
+        })?;
+        let arguments = tail
+            .trim_ascii_start()
+            .strip_prefix('(')?
+            .strip_suffix(')')?;
+        let value = arguments.trim_ascii();
+        let [quote, bytes @ .., close] = value.as_bytes() else {
+            return None;
+        };
+        if quote != close
+            || !matches!(quote, b'\'' | b'"')
+            || !(bytes.starts_with(b"./") || bytes.starts_with(b"../"))
+            || bytes
+                .iter()
+                .any(|byte| byte == quote || *byte == b'\\' || byte.is_ascii_control())
+        {
+            return None;
+        }
+        let opening =
+            tail.len() - arguments.len() + arguments.len() - arguments.trim_ascii_start().len();
+        let start = start.checked_add(u64::try_from(opening).ok()?)?;
+        Some(ByteRange {
+            start,
+            end: start.checked_add(u64::try_from(bytes.len()).ok()?)?,
+        })
     }
 
     /// Retains a checked relative import at the written module specifier.
