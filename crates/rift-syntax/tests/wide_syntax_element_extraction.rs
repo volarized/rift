@@ -119,9 +119,8 @@ const REFERENCE_DEFINITIONS_MIN: usize = 10_000;
 /// so for them this shape checks linear extraction only.
 fn wide_line(language: &Language) -> &'static str {
     match language.name.as_str() {
-        "rust" | "javascript" | "typescript" | "json" | "jsonc" | "c" | "cpp" => {
-            "// wide syntax element comment line\n"
-        }
+        "rust" | "javascript" | "typescript" | "json" | "jsonc" | "c" | "cpp" | "java"
+        | "kotlin" => "// wide syntax element comment line\n",
         "python" | "cython" | "yaml" | "toml" => "# wide syntax element comment line\n",
         "markdown" => "***\n\n",
         "html" | "vue" | "svelte" => "<!-- wide syntax element comment line -->\n",
@@ -133,15 +132,21 @@ fn wide_line(language: &Language) -> &'static str {
     }
 }
 
-/// One doc comment line and the declaration it attaches to for `language`; `None` for a
-/// language whose grammar attaches no preceding comment to a declaration. Panics when a
-/// registered provider names a language this table has no entry for.
-fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
+/// A doc comment prefix, one repeated line, and the declaration it attaches to for
+/// `language`. JVM providers attach one block comment, so their repeated lines go inside
+/// that comment. Panics when a registered provider names a language with no entry.
+fn attached_run(language: &Language) -> Option<(&'static str, &'static str, &'static str)> {
     match language.name.as_str() {
-        "rust" => Some(("/// wide syntax element doc line\n", "fn wide() {}\n")),
+        "rust" => Some(("", "/// wide syntax element doc line\n", "fn wide() {}\n")),
         "javascript" | "typescript" => Some((
+            "",
             "/** wide syntax element doc line */\n",
             "function wide() {}\n",
+        )),
+        "java" | "kotlin" => Some((
+            "/**\n",
+            " * wide syntax element doc line\n",
+            " */\nclass Wide {}\n",
         )),
         "python" | "json" | "jsonc" | "yaml" | "toml" | "markdown" | "html" | "css" | "vue"
         | "svelte" | "c" | "cpp" | "cython" => None,
@@ -330,10 +335,10 @@ fn native_function_prototypes_analyze_in_linear_time() {
 fn a_declaration_after_many_attached_doc_lines_attaches_in_linear_time() {
     for provider in registry::providers() {
         let language = provider.language();
-        let Some((doc_line, declaration)) = attached_run(language) else {
+        let Some((prefix, doc_line, declaration)) = attached_run(language) else {
             continue;
         };
-        let build = |count| format!("{}{declaration}", doc_line.repeat(count));
+        let build = |count| format!("{prefix}{}{declaration}", doc_line.repeat(count));
         let (document, _) = analyze_linearly(provider, build, ATTACHED_DOC_LINES_MIN);
         let symbol = document
             .symbols()

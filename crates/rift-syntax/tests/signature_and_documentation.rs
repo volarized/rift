@@ -69,6 +69,16 @@ fn fixtures_for(language: &Language) -> ProviderFixtures {
             header: Some("def beacon():\n    return 1\n"),
             documentation: Some("def beacon():\n    \"Beacon docs.\"\n    return 1\n"),
         },
+        ("java", _) => ProviderFixtures {
+            neither: "class Beacon {}\n",
+            header: Some("class Beacon { int beacon() { return 1; } }\n"),
+            documentation: Some("/** Beacon docs. */\nclass Beacon {}\n"),
+        },
+        ("kotlin", _) => ProviderFixtures {
+            neither: "val beacon = 1\n",
+            header: Some("fun beacon(): Int { return 1 }\n"),
+            documentation: Some("/** Beacon docs. */\nfun beacon(): Int { return 1 }\n"),
+        },
         ("html", _) => ProviderFixtures {
             neither: "<main></main>",
             header: None,
@@ -170,7 +180,11 @@ fn every_provider_fixture_with_an_attached_declaration_header_returns_a_signatur
             continue;
         };
         let document = analyze(provider, header);
-        let symbol = declared_symbol(&document);
+        let symbol = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "beacon")
+            .expect("header fixture must declare the beacon callable");
         assert!(
             !symbol.signatures.is_empty(),
             "language={:?} fixture={header:?}: a callable declaration with a body must \

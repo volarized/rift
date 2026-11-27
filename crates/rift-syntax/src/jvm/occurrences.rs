@@ -115,7 +115,12 @@ pub(super) fn collect(
         if matches!(kind, Some(NodeKind::Field | NodeKind::Property))
             || (!matches!(
                 kind,
-                Some(NodeKind::InstanceOf | NodeKind::PatternVariable | NodeKind::LocalBinding)
+                Some(
+                    NodeKind::InstanceOf
+                        | NodeKind::PatternVariable
+                        | NodeKind::LocalBinding
+                        | NodeKind::Catch
+                )
             ) && declaration.is_some()
                 && rules.name_node(node).is_some())
         {

@@ -138,12 +138,13 @@ impl SyntaxProvider for JvmSyntaxProvider {
                 | Node::TypeAlias
                 | Node::Field
                 | Node::Property
+                | Node::Accessor
                 | Node::Variable
                 | Node::TypeParameter,
             ) => {
                 vec![Syntax::Declaration]
             }
-            Some(Node::Parameter | Node::ClassParameter | Node::SpreadParameter) => {
+            Some(Node::Parameter | Node::ClassParameter | Node::SpreadParameter | Node::Catch) => {
                 vec![Syntax::Declaration, Syntax::Parameter]
             }
             Some(Node::ClassBody | Node::EnumBody | Node::Body) => vec![Syntax::Body],

@@ -146,7 +146,7 @@ impl Rules {
             | Kind::InstanceOf
             | Kind::LocalBinding => named(Field::Name),
             Kind::Identifier => Some(Name::Authored(node)),
-            Kind::PatternVariable => identifier(Kind::Identifier),
+            Kind::PatternVariable | Kind::Catch => identifier(Kind::Identifier),
             Kind::EnumConstant | Kind::Variable | Kind::Parameter | Kind::ClassParameter => {
                 named(Field::Name).or_else(|| identifier(Kind::Identifier))
             }
@@ -159,6 +159,11 @@ impl Rules {
                     .map(Name::Authored)
             }),
             Kind::TypeAlias => named(Field::Type),
+            Kind::Accessor => self
+                .kinds
+                .token(node, Keyword::Get)
+                .or_else(|| self.kinds.token(node, Keyword::Set))
+                .map(Name::Authored),
             Kind::Companion => named(Field::Name).or_else(|| {
                 self.kinds
                     .token(node, Keyword::Companion)
@@ -191,7 +196,7 @@ impl Rules {
             Kind::Enum => Declaration::Enum,
             Kind::EnumConstant => Declaration::Variant,
             Kind::Module => Declaration::Module,
-            Kind::Method => Declaration::Method,
+            Kind::Method | Kind::Accessor => Declaration::Method,
             Kind::Function if parent_kind.is_some_and(Self::is_class_body) => Declaration::Method,
             Kind::Function => Declaration::Function,
             Kind::Constructor | Kind::PrimaryConstructor => Declaration::Constructor,
@@ -209,7 +214,7 @@ impl Rules {
                 Declaration::Variable
             }
             Kind::Identifier
-                if parent_kind == Some(Kind::LambdaParameters)
+                if matches!(parent_kind, Some(Kind::Accessor | Kind::LambdaParameters))
                     || (parent_kind == Some(Kind::Lambda)
                         && parent
                             .and_then(|lambda| self.kinds.field(lambda, Field::Parameters))
@@ -225,7 +230,7 @@ impl Rules {
             {
                 Declaration::Property
             }
-            Kind::Parameter | Kind::ClassParameter => Declaration::Parameter,
+            Kind::Parameter | Kind::ClassParameter | Kind::Catch => Declaration::Parameter,
             _ => return None,
         };
         Some(kind)
@@ -246,6 +251,14 @@ impl Rules {
     fn is_property_parameter(&self, node: Node<'_>) -> bool {
         self.kinds.token(node, Keyword::Val).is_some()
             || self.kinds.token(node, Keyword::Var).is_some()
+    }
+
+    fn property_with_accessor<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if self.kinds.kind(node) != Some(NodeKind::Property) {
+            return None;
+        }
+        self.kinds.child(node, NodeKind::Accessor)?;
+        self.kinds.child(node, NodeKind::Variable)
     }
 
     fn is_class_body(kind: NodeKind) -> bool {
@@ -291,7 +304,10 @@ impl Rules {
     }
 
     fn body<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        if self.kinds.kind(node) == Some(NodeKind::LocalBinding) {
+        if matches!(
+            self.kinds.kind(node),
+            Some(NodeKind::Catch | NodeKind::LocalBinding)
+        ) {
             return None;
         }
         self.kinds.field(node, Field::Body).or_else(|| {
@@ -413,7 +429,10 @@ impl GrammarRules for Rules {
             return Ok(None);
         }
         let carrier = self.carrier(visited);
-        let scope = carrier.parent();
+        let property = (self.kinds.kind(node) == Some(NodeKind::Accessor))
+            .then(|| visited.parent())
+            .flatten();
+        let scope = property.unwrap_or(carrier).parent();
         let parent_kind = scope.and_then(|scope| self.kinds.kind(scope.syntax_element()));
         let owner_kind = scope
             .and_then(Visited::parent)
@@ -451,8 +470,20 @@ impl GrammarRules for Rules {
         {
             kinds.push(SymbolKind::Member);
         }
-        if self.public(kind, visibility, parent_kind, owner_kind) {
+        let property_visible = property.is_none_or(|property| {
+            let node = property.syntax_element();
+            !self.has_modifier(node, Keyword::Private)
+                && !self.has_modifier(node, Keyword::Internal)
+        });
+        if property_visible && self.public(kind, visibility, parent_kind, owner_kind) {
             kinds.push(SymbolKind::Public);
+        }
+        if kind == DeclarationKind::Property
+            && self
+                .property_with_accessor(carrier.syntax_element())
+                .is_some()
+        {
+            kinds.push(SymbolKind::MemberContainer);
         }
         if (self.language == JvmLanguage::Kotlin
             && self
@@ -482,7 +513,25 @@ impl GrammarRules for Rules {
         }))
     }
 
+    fn declaration_qualification(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &str,
+        qualification: &str,
+    ) -> Option<String> {
+        let property = self.property_with_accessor(visited.parent()?.syntax_element())?;
+        if property != visited.syntax_element() {
+            return None;
+        }
+        let property_name = self.name(property)?.text(source)?;
+        let container = qualification.strip_suffix(property_name)?;
+        Some(container.strip_suffix('.').unwrap_or(container).to_owned())
+    }
+
     fn container_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        if let Some(property) = self.property_with_accessor(node) {
+            return self.name(property)?.text(source).map(str::to_owned);
+        }
         if self.kinds.kind(node) == Some(NodeKind::Root) {
             let header = self.kinds.child(node, NodeKind::Package)?;
             let name = self

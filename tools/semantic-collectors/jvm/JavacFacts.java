@@ -185,32 +185,28 @@ public final class JavacFacts {
             return super.visitMethodInvocation(tree, owner);
         }
 
-        @Override
-        public Void visitVariable(VariableTree tree, Facts.Range owner) {
-            if (facts.category == Facts.Category.REFERENCES
-                    && tree.getInitializer() instanceof NewClassTree initializer) {
-                var path = getCurrentPath();
-                var constant = trees.getElement(path);
-                if (constant != null && constant.getKind() == ElementKind.ENUM_CONSTANT) {
-                    recordEnumConstructor(tree, initializer, path, constant.getEnclosingElement(), owner);
-                }
+        private boolean recordEnumConstructor(NewClassTree initializer, Facts.Range owner) {
+            var path = getCurrentPath();
+            var parent = path.getParentPath();
+            if (!(parent.getLeaf() instanceof VariableTree tree) || tree.getInitializer() != initializer) {
+                return false;
             }
-            return super.visitVariable(tree, owner);
-        }
-
-        private void recordEnumConstructor(VariableTree tree, NewClassTree initializer,
-                TreePath path, Element enumType, Facts.Range owner) {
-            var constructor = trees.getElement(new TreePath(path, initializer));
+            var constant = trees.getElement(parent);
+            if (constant == null || constant.getKind() != ElementKind.ENUM_CONSTANT) {
+                return false;
+            }
+            var enumType = constant.getEnclosingElement();
+            var constructor = trees.getElement(path);
             if (constructor == null || constructor.getKind() != ElementKind.CONSTRUCTOR
                     || !enumType.equals(constructor.getEnclosingElement())) {
-                return;
+                return false;
             }
 
             // Javac places the initializer's type tree at the authored constant name.
             long start = trees.getSourcePositions().getStartPosition(unit, initializer.getIdentifier());
             String name = tree.getName().toString();
             if (start < 0 || start > text.length() - name.length() || !text.startsWith(name, (int) start)) {
-                return;
+                return false;
             }
 
             var binding = target(constructor);
@@ -218,11 +214,13 @@ public final class JavacFacts {
                 binding = target(enumType);
             }
             facts.add(new Facts.Range((int) start, (int) start + name.length()), owner, binding);
+            return true;
         }
 
         @Override
         public Void visitNewClass(NewClassTree tree, Facts.Range owner) {
-            if (facts.category == Facts.Category.CALLS) {
+            boolean enumConstructor = facts.category != Facts.Category.IMPORTS && recordEnumConstructor(tree, owner);
+            if (facts.category == Facts.Category.CALLS && !enumConstructor) {
                 record(tree, owner, getCurrentPath());
             }
             return super.visitNewClass(tree, owner);

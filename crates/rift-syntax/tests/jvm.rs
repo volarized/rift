@@ -363,3 +363,68 @@ class Sample {
         3
     );
 }
+
+#[test]
+fn kotlin_declares_authored_accessors_and_catch_parameters() {
+    let text = r"
+package sample
+
+class Options {
+    var count = 0
+        get() {
+            val current = field
+            return current
+        }
+        private set(next) { field = next }
+
+    private val hidden: Int
+        get() = 1
+
+    val automatic = 0
+
+    fun read(): Int = try {
+        count
+    } catch (caught: IllegalStateException) {
+        caught.hashCode()
+    }
+}
+";
+    let document = analyze("Options.kt", text);
+    for (name, token, public) in [
+        ("count", "count", true),
+        ("count.get", "get", true),
+        ("count.get.current", "current", false),
+        ("count.set", "set", false),
+        ("count.set.next", "next", false),
+        ("hidden.get", "get", false),
+        ("automatic", "automatic", true),
+        ("read.caught", "caught", false),
+    ] {
+        let qualified = format!("sample.Options.{name}");
+        let symbol = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing declaration {qualified}"));
+        let range = symbol.name_range.expect("authored name");
+        let start = usize::try_from(range.start).expect("fixture offset");
+        let end = usize::try_from(range.end).expect("fixture offset");
+        assert_eq!(text.get(start..end), Some(token));
+        assert_eq!(
+            symbol.kinds.contains(&SymbolKind::Public),
+            public,
+            "{qualified}"
+        );
+    }
+    assert!(
+        !document
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.qualified_name == "sample.Options.automatic.get")
+    );
+    let (_, references) = occurrences(text, JvmLanguage::Kotlin, JvmOccurrenceKind::Reference, 128);
+    assert_eq!(
+        references.iter().filter(|&&name| name == "caught").count(),
+        1
+    );
+}

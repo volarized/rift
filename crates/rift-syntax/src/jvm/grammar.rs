@@ -41,6 +41,8 @@ pub(super) enum NodeKind {
     Field,
     Variable,
     Property,
+    Accessor,
+    Catch,
     VariableList,
     Parameter,
     ClassParameter,
@@ -142,6 +144,9 @@ const KOTLIN: &[(NodeKind, &str)] = &[
     (NodeKind::AnonymousClass, "object_literal"),
     (NodeKind::TypeAlias, "type_alias"),
     (NodeKind::Property, "property_declaration"),
+    (NodeKind::Accessor, "getter"),
+    (NodeKind::Accessor, "setter"),
+    (NodeKind::Catch, "catch_block"),
     (NodeKind::VariableList, "multi_variable_declaration"),
     (NodeKind::Variable, "variable_declaration"),
     (NodeKind::Parameter, "parameter"),
@@ -169,6 +174,7 @@ pub(super) enum Keyword {
     Constructor,
     Enum,
     Final,
+    Get,
     Internal,
     Interface,
     Object,
@@ -177,6 +183,7 @@ pub(super) enum Keyword {
     Protected,
     Public,
     Sealed,
+    Set,
     Static,
     Super,
     This,
@@ -191,9 +198,11 @@ impl Keyword {
             Self::Annotation
             | Self::Companion
             | Self::Constructor
+            | Self::Get
             | Self::Internal
             | Self::Object
             | Self::Open
+            | Self::Set
             | Self::Val
             | Self::Var => language == JvmLanguage::Kotlin,
             _ => true,
