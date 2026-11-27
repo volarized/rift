@@ -255,6 +255,7 @@ pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const MAPPED_TYPE_PARAMETER_KIND: &str = "typescript_mapped_type_parameter";
 pub(crate) const FUNCTION_TYPE_PARAMETER_KIND: &str = "typescript_function_type_parameter";
 pub(crate) const SIGNATURE_TYPE_PARAMETER_KIND: &str = "typescript_signature_type_parameter";
 pub(crate) const INFERENCE_PARAMETER_KIND: &str = "typescript_inference_type_parameter";
@@ -1653,6 +1654,10 @@ impl EcmaScriptRules<'_> {
         type_parameters::declared_name(visited)
             .map(|name| (name, TYPE_PARAMETER_KIND))
             .or_else(|| {
+                type_signature_parameters::mapped_parameter_name(visited.syntax_element())
+                    .map(|name| (name, MAPPED_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
                 type_parameters::named_owner(visited, type_parameters::function)
                     .map(|name| (name, FUNCTION_TYPE_PARAMETER_KIND))
             })
@@ -1714,6 +1719,7 @@ impl EcmaScriptRules<'_> {
         let type_parameter = matches!(
             kind,
             TYPE_PARAMETER_KIND
+                | MAPPED_TYPE_PARAMETER_KIND
                 | METHOD_TYPE_PARAMETER_KIND
                 | FUNCTION_TYPE_PARAMETER_KIND
                 | SIGNATURE_TYPE_PARAMETER_KIND
@@ -2578,6 +2584,7 @@ fn append_package_parameters(
         signature_types,
         declared_signature_types,
         inferred_types,
+        mapped_types,
         typed_patterns,
     } = candidates;
     let scoped = if language.name == "typescript" {
@@ -2649,6 +2656,7 @@ fn append_package_parameters(
         facts,
         wrapped_parameters::accepted_owner,
     );
+    type_signature_parameters::append_mapped_types(root, symbols, mapped_types);
 }
 
 #[derive(Default)]
@@ -2663,6 +2671,7 @@ struct ParameterDeclarations {
     signature_types: Vec<crate::SyntaxSymbol>,
     declared_signature_types: Vec<crate::SyntaxSymbol>,
     inferred_types: Vec<crate::SyntaxSymbol>,
+    mapped_types: Vec<crate::SyntaxSymbol>,
     typed_patterns: Vec<crate::SyntaxSymbol>,
     method_types: Vec<crate::SyntaxSymbol>,
 }
@@ -2691,6 +2700,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.declared_signature_types
         } else if symbol.is_typescript_inference_parameter() {
             &mut candidates.inferred_types
+        } else if symbol.is_typescript_mapped_type_parameter() {
+            &mut candidates.mapped_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut candidates.typed_patterns
         } else {
@@ -2932,6 +2943,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);
+    }
+    if name == MAPPED_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(MAPPED_TYPE_PARAMETER_KIND);
     }
     kinds
         .declarations

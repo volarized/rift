@@ -53,6 +53,7 @@ pub struct PackageBindingSlots {
     typescript_signature_type_parameter: usize,
     typescript_declared_signature_type_parameter: usize,
     typescript_inference_parameter: usize,
+    typescript_mapped_type_parameter: usize,
     typescript_destructured_parameter: usize,
     typescript_method_type_parameter: usize,
     rust_macro_method: usize,
@@ -103,6 +104,7 @@ impl PackageBindingSlots {
             typescript_signature_type_parameter: 0,
             typescript_declared_signature_type_parameter: 0,
             typescript_inference_parameter: 0,
+            typescript_mapped_type_parameter: 0,
             typescript_destructured_parameter: 0,
             typescript_method_type_parameter: 0,
             rust_macro_method: 0,
@@ -330,6 +332,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Reserves slots for checked TypeScript mapped type parameters.
+    #[must_use]
+    pub const fn with_typescript_mapped_type_parameters(mut self, count: usize) -> Self {
+        self.typescript_mapped_type_parameter = count;
+        self
+    }
+
     /// Holds slots left for written TypeScript parameter pattern bindings.
     #[must_use]
     pub const fn with_typescript_destructured_parameters(mut self, count: usize) -> Self {
@@ -387,6 +396,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_signature_type_parameter)
             .saturating_add(self.typescript_declared_signature_type_parameter)
             .saturating_add(self.typescript_inference_parameter)
+            .saturating_add(self.typescript_mapped_type_parameter)
             .saturating_add(self.typescript_destructured_parameter)
             .saturating_add(self.typescript_method_type_parameter)
             .saturating_add(self.rust_macro_method)
@@ -435,6 +445,8 @@ impl PackageBindingSlots {
             &mut self.typescript_declared_signature_type_parameter
         } else if symbol.is_typescript_inference_parameter() {
             &mut self.typescript_inference_parameter
+        } else if symbol.is_typescript_mapped_type_parameter() {
+            &mut self.typescript_mapped_type_parameter
         } else if symbol.is_typescript_destructured_parameter() {
             &mut self.typescript_destructured_parameter
         } else if matches!(language, "javascript" | "typescript")

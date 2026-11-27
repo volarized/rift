@@ -290,6 +290,12 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::TYPE_PARAMETER_KIND
     }
 
+    /// Whether this is the parameter declared by a TypeScript mapped type.
+    #[must_use]
+    pub fn is_typescript_mapped_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::MAPPED_TYPE_PARAMETER_KIND
+    }
+
     /// Whether this ECMAScript binding uses a package declaration reservation.
     #[must_use]
     pub fn is_ecmascript_package_binding(&self) -> bool {
@@ -300,6 +306,7 @@ impl SyntaxSymbol {
             || self.is_typescript_signature_type_parameter()
             || self.is_typescript_declared_signature_type_parameter()
             || self.is_typescript_inference_parameter()
+            || self.is_typescript_mapped_type_parameter()
     }
 
     /// Whether this is the written type parameter of a TypeScript method.

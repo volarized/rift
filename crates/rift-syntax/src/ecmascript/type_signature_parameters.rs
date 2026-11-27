@@ -184,6 +184,93 @@ pub(super) fn append_indexes(
     });
 }
 
+/// The written binder of a single mapped object body.
+pub(super) fn mapped_parameter_name(clause: Node<'_>) -> Option<Node<'_>> {
+    if clause.kind() != "mapped_type_clause" || clause.has_error() {
+        return None;
+    }
+    let index = clause
+        .parent()
+        .filter(|node| node.kind() == "index_signature")?;
+    let object = index.parent().filter(|node| node.kind() == "object_type")?;
+    if object.has_error() || index.child_by_field_name("type").is_none() {
+        return None;
+    }
+    let mut cursor = object.walk();
+    if !object
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .eq(std::iter::once(index))
+    {
+        return None;
+    }
+    clause
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "type_identifier" && !name.is_missing())
+}
+
+/// Places mapped parameters in the written type alias that contains each body.
+pub(super) fn append_mapped_types(
+    root: Node<'_>,
+    symbols: &mut Vec<SyntaxSymbol>,
+    parameters: Vec<SyntaxSymbol>,
+) {
+    if parameters.is_empty() {
+        return;
+    }
+    let mut names = BTreeMap::<_, usize>::new();
+    for symbol in symbols
+        .iter()
+        .filter(|symbol| !symbol.is_ecmascript_package_binding())
+    {
+        *names.entry(symbol.qualified_name.as_str()).or_default() += 1;
+    }
+    let owners = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("type_alias_declaration")
+                && names.get(symbol.qualified_name.as_str()) == Some(&1)
+        })
+        .map(|symbol| (symbol.item_range, symbol.qualified_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut scopes = BTreeMap::new();
+    let admitted = parameters
+        .into_iter()
+        .filter_map(|mut parameter| {
+            let range = parameter.name_range?;
+            let written = written_name(root, range)?;
+            let clause = written.parent()?;
+            if mapped_parameter_name(clause) != Some(written) {
+                return None;
+            }
+            let body = clause.parent()?.parent()?;
+            let alias = enclosing_alias(body)?;
+            let owner = owners.get(&extract::byte_range(alias).ok()?)?;
+            scopes.insert(range, extract::byte_range(body).ok()?);
+            parameter.container = Some((*owner).to_owned());
+            Some(parameter)
+        })
+        .collect();
+    append_scoped(symbols, admitted, "$mapped", |name| {
+        scopes.get(&name).copied()
+    });
+}
+
+fn enclosing_alias(mut node: Node<'_>) -> Option<Node<'_>> {
+    // The syntax walk admitted the complete body and its ancestor depths.
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "type_alias_declaration" => return Some(parent),
+            "class_declaration"
+            | "interface_declaration"
+            | "function_signature"
+            | "function_declaration" => return None,
+            _ => node = parent,
+        }
+    }
+    None
+}
+
 fn append_scoped(
     symbols: &mut Vec<SyntaxSymbol>,
     mut parameters: Vec<SyntaxSymbol>,

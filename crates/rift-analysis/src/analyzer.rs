@@ -795,6 +795,7 @@ struct EcmaScriptBindingDemand {
     typescript_signature_types: BindingDemand,
     typescript_declared_signature_types: BindingDemand,
     typescript_inferred_types: BindingDemand,
+    typescript_mapped_types: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -839,6 +840,7 @@ impl EcmaScriptBindingDemand {
             declared_signature_type_slots,
             inferred_type_slots,
             property_receiver_slots,
+            mapped_type_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -866,6 +868,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_declared_signature_types,
                 &self.typescript_inferred_types,
                 python_property_receivers,
+                &self.typescript_mapped_types,
             ],
             &mut slots,
             &mut bytes,
@@ -896,6 +899,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_declared_signature_type_parameters(declared_signature_type_slots)
             .with_typescript_inference_parameters(inferred_type_slots)
             .with_python_property_receivers(property_receiver_slots)
+            .with_typescript_mapped_type_parameters(mapped_type_slots)
     }
 
     fn classify(
@@ -938,6 +942,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_declared_signature_types
         } else if symbol.is_typescript_inference_parameter() {
             &mut self.typescript_inferred_types
+        } else if symbol.is_typescript_mapped_type_parameter() {
+            &mut self.typescript_mapped_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut self.typescript_patterns
         } else if javascript {
@@ -973,6 +979,7 @@ impl EcmaScriptBindingDemand {
             + self.typescript_function_types.count
             + self.typescript_patterns.count
             + self.typescript_signature_types.count
+            + self.typescript_mapped_types.count
     }
 }
 
