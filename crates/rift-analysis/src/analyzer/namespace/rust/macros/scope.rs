@@ -20,6 +20,10 @@ pub(super) struct Tokens<'a> {
 
 impl<'a> Tokens<'a> {
     pub(super) fn new(file: &'a SelectedFile<'a>) -> Option<Self> {
+        Self::with_capture(file, None)
+    }
+
+    pub(super) fn with_capture(file: &'a SelectedFile<'a>, selected: Option<&str>) -> Option<Self> {
         let limits = file.syntax.syntax_limits()?;
         let mut rows = Vec::new();
         let range = ByteRange {
@@ -67,7 +71,7 @@ impl<'a> Tokens<'a> {
                 result.complete = false;
                 continue;
             }
-            result.invocation_names(*range)?;
+            result.invocation_names(*range, selected)?;
         }
         Some(result)
     }
@@ -88,6 +92,76 @@ impl<'a> Tokens<'a> {
         Some(rows.iter().map(|(_, token)| *token).collect())
     }
 
+    pub(super) fn outward_bindings(
+        &self,
+        child: &SelectedFile<'_>,
+        name: &str,
+        scope: &Scope,
+        library: bool,
+    ) -> Option<BTreeSet<String>> {
+        let (_, children) = child.syntax.scope()?.first()?;
+        let mut bindings = BTreeSet::new();
+        for &range in children.as_ref()? {
+            if super::macro_export_attribute(child, range) {
+                self.charge(child.syntax.symbols().len())?;
+                continue;
+            }
+            let input = self.range(range)?;
+            if super::invocation_name(child.source, range) == Some(name) {
+                let body = super::chain::invocation_body(&input)?;
+                let (predicate, body) = super::chain::captured_predicate_body(body)?;
+                self.charge(predicate.len().checked_mul(self.depth)?)?;
+                super::cfg(predicate, library, self.depth)?;
+                items(body, self.depth, |item| {
+                    self.outward_item(item, scope, library, &mut bindings)
+                })?;
+            } else {
+                self.outward_item(&input, scope, library, &mut bindings)?;
+            }
+        }
+        (!bindings.contains(name)).then_some(bindings)
+    }
+
+    fn outward_item(
+        &self,
+        mut input: &[&str],
+        scope: &Scope,
+        library: bool,
+        bindings: &mut BTreeSet<String>,
+    ) -> Option<()> {
+        while consume(&mut input, &["#"]) {
+            let _ = consume(&mut input, &["!"]);
+            let attribute = group(&mut input, "[", "]")?;
+            let complete = match attribute {
+                ["derive", "(", names @ .., ")"] => self.derives(names, scope, true),
+                _ => self.attribute(attribute, scope, library, self.depth, true),
+            };
+            if attribute.contains(&"macro_use") || !complete {
+                return None;
+            }
+        }
+        visibility(&mut input)?;
+        match input {
+            ["use", ..] => {
+                bindings.extend(named_imports(input, self.depth)?);
+                Some(())
+            }
+            ["macro_rules", "!", rest @ ..] => {
+                let mut rest = rest;
+                bindings.insert(identifier(&mut rest)?);
+                Some(())
+            }
+            ["extern", "crate", ..] => None,
+            []
+            | [
+                "mod" | "fn" | "impl" | "struct" | "enum" | "union" | "trait" | "type" | "const"
+                | "static" | "unsafe" | "async" | "extern",
+                ..,
+            ] => Some(()),
+            _ => None,
+        }
+    }
+
     fn charge(&self, count: usize) -> Option<()> {
         let work = self.work.get().checked_add(count)?;
         if work > self.work_max {
@@ -102,13 +176,13 @@ impl<'a> Tokens<'a> {
         self.names_tokens(&tokens)
     }
 
-    fn invocation_names(&mut self, range: ByteRange) -> Option<()> {
+    fn invocation_names(&mut self, range: ByteRange, captured: Option<&str>) -> Option<()> {
         let tokens = self.range(range)?;
         if compile_error_tokens(&tokens) {
             return Some(());
         }
         let mut input = tokens.as_slice();
-        identifier(&mut input)?;
+        let name = identifier(&mut input)?;
         if !consume(&mut input, &["!"]) {
             return None;
         }
@@ -124,6 +198,11 @@ impl<'a> Tokens<'a> {
             return None;
         }
         self.charge(body.len().checked_mul(2)?)?;
+        let body = if captured == Some(name.as_str()) {
+            super::chain::captured_predicate_body(body)?.1
+        } else {
+            body
+        };
         items(body, self.depth, |item| self.names_tokens(item))
     }
 
@@ -202,38 +281,7 @@ impl<'a> Tokens<'a> {
                     && self.attribute(&body[split + 1..], scope, library, depth - 1, validate)
             }
             ["derive", "(", names @ .., ")"] => {
-                if validate && (!library || !self.complete) {
-                    return false;
-                }
-                let mut input = names;
-                while !input.is_empty() {
-                    let Some(name) = identifier(&mut input) else {
-                        return false;
-                    };
-                    if ![
-                        "Clone",
-                        "Copy",
-                        "Debug",
-                        "Default",
-                        "Eq",
-                        "Hash",
-                        "Ord",
-                        "PartialEq",
-                        "PartialOrd",
-                    ]
-                    .contains(&name.as_str())
-                        || (validate
-                            && (self.bindings.contains(&name)
-                                || !scope.complete
-                                || scope.contains_key(&name)))
-                    {
-                        return false;
-                    }
-                    if !input.is_empty() && !consume(&mut input, &[","]) {
-                        return false;
-                    }
-                }
-                true
+                (!validate || library) && self.derives(names, scope, validate)
             }
             // The built-in doc attribute only takes the included text as its value.
             ["doc", "=", "include_str", "!", "(", path, ")"] => {
@@ -258,6 +306,41 @@ impl<'a> Tokens<'a> {
                 .any(|token| ["!", "$", "{", "}"].contains(token)),
             _ => false,
         }
+    }
+
+    fn derives(&self, names: &[&str], scope: &Scope, validate: bool) -> bool {
+        if validate && !self.complete {
+            return false;
+        }
+        let mut input = names;
+        while !input.is_empty() {
+            let Some(name) = identifier(&mut input) else {
+                return false;
+            };
+            if ![
+                "Clone",
+                "Copy",
+                "Debug",
+                "Default",
+                "Eq",
+                "Hash",
+                "Ord",
+                "PartialEq",
+                "PartialOrd",
+            ]
+            .contains(&name.as_str())
+                || (validate
+                    && (self.bindings.contains(&name)
+                        || !scope.complete
+                        || scope.contains_key(&name)))
+            {
+                return false;
+            }
+            if !input.is_empty() && !consume(&mut input, &[","]) {
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {

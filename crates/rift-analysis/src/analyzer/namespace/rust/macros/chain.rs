@@ -16,6 +16,10 @@ pub(super) type ModuleBranches<'a> = Vec<(&'a str, Vec<&'a str>)>;
 
 pub(super) enum ScopeAfter {
     CheckedImports(BTreeSet<String>),
+    CheckedSiblingGlobs {
+        bindings: BTreeSet<String>,
+        modules: BTreeSet<String>,
+    },
     Unknown,
 }
 
@@ -186,14 +190,7 @@ pub(super) fn captured_predicate_modules<'a>(
     depth: usize,
     selected: impl FnOnce(&[&str]) -> Option<bool>,
 ) -> Option<CheckedBranches<'a>> {
-    let mut body = invocation_body(tokens)?;
-    if !consume(&mut body, &["#", "!"]) {
-        return None;
-    }
-    let predicate = group(&mut body, "[", "]")?;
-    if predicate.last() == Some(&",") || metas(predicate)?.len() != 1 {
-        return None;
-    }
+    let (predicate, body) = captured_predicate_body(invocation_body(tokens)?)?;
     let selection = selected(predicate);
     let mut modules = Vec::new();
     let active_scope = branch_modules(body, depth, |name| {
@@ -209,7 +206,20 @@ pub(super) fn captured_predicate_modules<'a>(
     Some((modules, scope))
 }
 
-fn invocation_body<'tokens, 'source>(
+pub(super) fn captured_predicate_body<'tokens, 'source>(
+    mut body: &'tokens [&'source str],
+) -> Option<(&'tokens [&'source str], &'tokens [&'source str])> {
+    if !consume(&mut body, &["#", "!"]) {
+        return None;
+    }
+    let predicate = group(&mut body, "[", "]")?;
+    if predicate.last() == Some(&",") || metas(predicate)?.len() != 1 {
+        return None;
+    }
+    Some((predicate, body))
+}
+
+pub(super) fn invocation_body<'tokens, 'source>(
     mut input: &'tokens [&'source str],
 ) -> Option<&'tokens [&'source str]> {
     super::super::source_identifier(input.first()?)?;
@@ -283,6 +293,7 @@ fn branch_modules<'a>(
 ) -> Option<ScopeAfter> {
     let mut distinct = BTreeSet::new();
     let mut bindings = BTreeSet::new();
+    let mut globs = BTreeSet::new();
     let mut complete = true;
     super::scope::items(items, depth, |item| {
         let mut input = item;
@@ -294,6 +305,10 @@ fn branch_modules<'a>(
         {
             complete &= distinct.insert(*name);
             module(name);
+        } else if let ["use", "self", ":", ":", name, ":", ":", "*", ";"] = input
+            && super::super::source_identifier(name).as_deref() == Some(*name)
+        {
+            complete &= globs.insert(*name);
         } else if let Some(named) = super::scope::named_imports(input, depth) {
             for name in named {
                 complete &= name != "cfg" && name != "cfg_attr" && bindings.insert(name);
@@ -303,10 +318,15 @@ fn branch_modules<'a>(
         }
         Some(())
     })?;
-    Some(if complete {
+    Some(if !complete || !globs.is_subset(&distinct) {
+        ScopeAfter::Unknown
+    } else if globs.is_empty() {
         ScopeAfter::CheckedImports(bindings)
     } else {
-        ScopeAfter::Unknown
+        ScopeAfter::CheckedSiblingGlobs {
+            bindings,
+            modules: globs.into_iter().map(str::to_owned).collect(),
+        }
     })
 }
 

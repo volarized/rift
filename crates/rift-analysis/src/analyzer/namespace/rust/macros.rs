@@ -1184,22 +1184,16 @@ impl Context<'_, '_> {
         let Some((modules, certainty)) = modules else {
             return false;
         };
-        let mut inherited = scope.clone();
-        let preserved = if let chain::ScopeAfter::CheckedImports(bindings) = certainty
-            && modules.iter().all(|(module, _)| {
-                child_path(module, directory, self.inventory)
-                    .and_then(|path| self.inventory.get(path.as_str()))
-                    .is_some_and(|child| self.outline_keeps_macro_scope(child))
-            }) {
-            for name in bindings {
-                inherited.insert(name, false);
-            }
+        let checked = self.chain_scope((name, directory), (&modules, certainty), scope);
+        let preserved = checked.is_some();
+        let inherited = checked.unwrap_or_else(|| {
+            let mut unknown = scope.clone();
+            unknown.clear();
+            unknown
+        });
+        if preserved {
             *scope = inherited.clone();
-            true
-        } else {
-            inherited.clear();
-            false
-        };
+        }
         for (module, condition) in modules {
             if let Some(path) = child_path(module, directory, self.inventory) {
                 children.push((path.clone(), vec![module.to_owned()], inherited.clone()));
@@ -1207,6 +1201,38 @@ impl Context<'_, '_> {
             }
         }
         preserved
+    }
+
+    fn chain_scope(
+        &self,
+        (name, directory): (&str, &str),
+        (modules, certainty): (&chain::ModuleBranches<'_>, chain::ScopeAfter),
+        scope: &Scope,
+    ) -> Option<Scope> {
+        let (mut bindings, globs) = match certainty {
+            chain::ScopeAfter::CheckedImports(bindings) => (bindings, BTreeSet::new()),
+            chain::ScopeAfter::CheckedSiblingGlobs { bindings, modules } => (bindings, modules),
+            chain::ScopeAfter::Unknown => return None,
+        };
+        for (module, _) in modules {
+            let path = child_path(module, directory, self.inventory)?;
+            let child = self.inventory.get(path.as_str())?;
+            if !self.outline_keeps_macro_scope(child) {
+                return None;
+            }
+            if globs.contains(*module) {
+                let tokens = scope::Tokens::with_capture(child, Some(name))?;
+                bindings.extend(tokens.outward_bindings(child, name, scope, self.library)?);
+            }
+        }
+        if !globs.is_empty() && bindings.contains(name) {
+            return None;
+        }
+        let mut inherited = scope.clone();
+        for binding in bindings {
+            inherited.insert(binding, false);
+        }
+        Some(inherited)
     }
 
     fn outline_keeps_macro_scope(&self, file: &SelectedFile<'_>) -> bool {
