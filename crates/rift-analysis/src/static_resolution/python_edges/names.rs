@@ -66,7 +66,11 @@ impl<'source> Index<'source> {
         let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
             let target = match file.python_parameters.get(&name) {
-                Some(&Some(symbol)) if parameters && !symbol.is_python_overload_parameter() => {
+                Some(&Some(symbol))
+                    if parameters
+                        && !symbol.is_python_overload_parameter()
+                        && !symbol.is_python_property_receiver() =>
+                {
                     Some(Target {
                         file: file.document,
                         symbol,
@@ -144,8 +148,46 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if let Some(target) = file.python_receiver_read_target(read, name, work) {
+            if !file.is_python_property_receiver(name)
+                && let Some(target) = file.python_receiver_read_target(read, name, work)
+            {
                 self.record_python_local_read(file, read, target, result);
+            }
+        }
+    }
+
+    /// Resolves the new property receivers after the earlier work and edge stages.
+    pub(in crate::static_resolution) fn resolve_python_property_receivers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for file in self
+            .python_files()
+            .filter(|file| file.has_python_property_receiver)
+        {
+            result
+                .python_property_receiver_start
+                .get_or_insert(result.occurrences.len());
+            for &(read, name) in file.facts.python_local_reads() {
+                if !work.charge() {
+                    return;
+                }
+                if file.is_python_property_receiver(name)
+                    && let Some(target) = file.python_parameter_read_target(read, name, work)
+                {
+                    self.record_python_local_read(file, read, target, result);
+                }
+            }
+            for &(read, name) in file.facts.python_receiver_reads() {
+                if !work.charge() {
+                    return;
+                }
+                if file.is_python_property_receiver(name)
+                    && let Some(target) = file.python_receiver_read_target(read, name, work)
+                {
+                    self.record_python_local_read(file, read, target, result);
+                }
             }
         }
     }
@@ -682,6 +724,14 @@ impl<'source> File<'source> {
                 .get(&binding.name)
                 .copied()?,
         })
+    }
+
+    fn is_python_property_receiver(&self, name: ByteRange) -> bool {
+        self.has_python_property_receiver
+            && self
+                .python_parameters
+                .get(&name)
+                .is_some_and(|symbol| symbol.is_some_and(SyntaxSymbol::is_python_property_receiver))
     }
 
     fn python_receiver_read_target(

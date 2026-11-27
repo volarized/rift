@@ -461,7 +461,7 @@ fn static_admission_batches<'a>(
     spans: &'a DefinitionSpans,
     edge_modules: &'a BTreeMap<SourceUnitId, SymbolId>,
     resolution: &'a mut StaticResolution,
-) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 46] {
+) -> [BTreeMap<&'a SymbolId, Vec<Edge>>; 47] {
     let supplemental_start = resolution.supplemental_start.take();
     let (value_qualifier, value_qualifier_external) = resolution
         .python_value_qualifier_start
@@ -522,11 +522,12 @@ fn static_admission_batches<'a>(
             .typescript_declared_signature_type_parameter_start
             .take(),
         resolution.typescript_inference_parameter_start.take(),
+        resolution.python_property_receiver_start.take(),
     ];
-    let mut boundaries = [0; 47];
+    let mut boundaries = [0; 48];
     let mut next = resolution.occurrences.len();
-    boundaries[46] = next;
-    for (boundary, start) in boundaries[2..46].iter_mut().zip(tail_starts).rev() {
+    boundaries[47] = next;
+    for (boundary, start) in boundaries[2..47].iter_mut().zip(tail_starts).rev() {
         next = start.unwrap_or(next);
         *boundary = next;
     }

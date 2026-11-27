@@ -30,6 +30,7 @@ pub struct PackageBindingSlots {
     python_comprehension_binding: usize,
     python_variadic_parameter: usize,
     python_overload_parameter: usize,
+    python_property_receiver: usize,
     javascript_parameter: usize,
     javascript_callback_parameter: usize,
     javascript_callback_pattern: usize,
@@ -80,6 +81,7 @@ impl PackageBindingSlots {
             python_comprehension_binding: 0,
             python_variadic_parameter: 0,
             python_overload_parameter: 0,
+            python_property_receiver: 0,
             javascript_callback_parameter: 0,
             javascript_callback_pattern: 0,
             typescript_overload_parameter: 0,
@@ -140,6 +142,13 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_python_overload_parameter_slots(mut self, slots: usize) -> Self {
         self.python_overload_parameter = slots;
+        self
+    }
+
+    /// Reserves the remaining declaration slots for Python property receivers.
+    #[must_use]
+    pub const fn with_python_property_receivers(mut self, slots: usize) -> Self {
+        self.python_property_receiver = slots;
         self
     }
 
@@ -446,6 +455,8 @@ impl PackageBindingSlots {
             &mut self.python_variadic_parameter
         } else if symbol.is_python_overload_parameter() {
             &mut self.python_overload_parameter
+        } else if symbol.is_python_property_receiver() {
+            &mut self.python_property_receiver
         } else if symbol.is_python_parameter() {
             if symbol
                 .name_range

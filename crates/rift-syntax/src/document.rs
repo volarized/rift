@@ -145,6 +145,7 @@ impl SyntaxSymbol {
         self.kind == crate::python::PARAMETER_KIND_WORD
             || self.is_python_variadic_parameter()
             || self.is_python_overload_parameter()
+            || self.is_python_property_receiver()
     }
 
     /// Whether this parameter captures an argument list or a keyword dictionary.
@@ -157,6 +158,12 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_python_overload_parameter(&self) -> bool {
         self.kind == crate::python::OVERLOAD_PARAMETER_KIND_WORD
+    }
+
+    /// Whether this parameter belongs to one facet of a Python property.
+    #[must_use]
+    pub fn is_python_property_receiver(&self) -> bool {
+        self.kind == crate::python::PROPERTY_RECEIVER_KIND_WORD
     }
 
     /// Whether this is the physical name of an authored Python loop target.

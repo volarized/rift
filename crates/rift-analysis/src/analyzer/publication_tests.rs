@@ -790,3 +790,131 @@ fn python_qualified_member_calls_keep_class_and_runtime_reads() {
         }));
     }
 }
+
+#[test]
+fn python_property_accessors_retain_each_written_receiver() {
+    use rift_protocol::read::EdgeKind;
+
+    let source = concat!(
+        "class Box:\n",
+        "    def __init__(self, initial: int):\n        self._amount = initial\n",
+        "    @property\n    def amount(self) -> int:\n        return self._amount\n",
+        "    @amount.setter\n    def amount(self, value: int):\n        self._amount = value\n",
+        "    @amount.deleter\n    def amount(self):\n        del self._amount\n",
+        "    def control(self, checked: int):\n        self._amount = checked\n",
+    );
+    let files = [("demo/__init__.py", source)];
+    let result = publication(&files, None, &["demo"]);
+    let property_receiver = |id: &str| id.ends_with("/Box/amount/self");
+    let offsets = |needle: &str| -> Vec<u64> {
+        source
+            .match_indices(needle)
+            .map(|(offset, text)| {
+                u64::try_from(offset + text.find("self").expect("written receiver"))
+                    .expect("receiver range")
+            })
+            .collect()
+    };
+    let declarations = |suffix: &str| -> Vec<u64> {
+        let mut starts = result
+            .declarations
+            .iter()
+            .filter(|entry| entry.symbol.as_str().ends_with(suffix))
+            .map(|entry| entry.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_unstable();
+        starts
+    };
+    assert_eq!(declarations("/Box/amount/self"), offsets("def amount(self"));
+    for receiver in result
+        .declarations
+        .iter()
+        .filter(|entry| property_receiver(entry.symbol.as_str()))
+    {
+        assert_eq!(receiver.source, "self");
+        assert_eq!(receiver.range.end - receiver.range.start, 4);
+    }
+    assert_eq!(declarations("/Box/amount").len(), 3);
+    assert_eq!(declarations("/Box/amount/value").len(), 1);
+    assert_eq!(
+        declarations("/Box/control/self"),
+        offsets("def control(self")
+    );
+    let mut reads = result
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/Box/amount/self")
+        })
+        .map(|edge| edge.occurrence.as_ref().expect("authored read").range.start)
+        .collect::<Vec<_>>();
+    reads.sort_unstable();
+    assert!(reads.contains(&offsets("return self._amount")[0]));
+
+    assert_python_property_receiver_priority(&files, &result, property_receiver);
+
+    for refused in [
+        source.replace("@amount.setter", "@other.setter"),
+        source.replace("@amount.setter", "@amount.setter()"),
+        source.replace("class Box:", "property = custom\nclass Box:"),
+        source.replace("@amount.setter", "amount = replacement\n    @amount.setter"),
+        source.replace("@amount.setter", "del amount\n    @amount.setter"),
+        source.replace("class Box:", "del property\nclass Box:"),
+        source.replace("@amount.deleter", "@amount.setter"),
+    ] {
+        let result = publication(&[("demo/__init__.py", &refused)], None, &["demo"]);
+        assert!(
+            result
+                .declarations
+                .iter()
+                .all(|entry| { !entry.symbol.as_str().ends_with("/Box/amount/self") })
+        );
+        assert!(
+            result
+                .declarations
+                .iter()
+                .any(|entry| { entry.symbol.as_str().ends_with("/Box/control/self") })
+        );
+    }
+}
+
+fn assert_python_property_receiver_priority(
+    files: &[(&str, &str)],
+    result: &PackagePublication,
+    property_receiver: impl Fn(&str) -> bool,
+) {
+    use rift_protocol::configuration::PackageConfiguration;
+
+    let prior_declarations = result
+        .declarations
+        .iter()
+        .filter(|entry| !property_receiver(entry.symbol.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let prior_edges = result
+        .edges
+        .iter()
+        .filter(|edge| !property_receiver(edge.to.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let limited = python_publication_with_limits(
+        files,
+        None,
+        &["demo"],
+        PackageConfiguration::default(),
+        Some(prior_edges.len()),
+    );
+    assert_eq!(limited.declarations, result.declarations);
+    assert_eq!(limited.edges, prior_edges);
+    let limited = publication_with_configuration(
+        files,
+        None,
+        &["demo"],
+        PackageConfiguration {
+            symbols: u32::try_from(prior_declarations.len()).expect("fixture count"),
+            ..PackageConfiguration::default()
+        },
+    );
+    assert_eq!(limited.declarations, prior_declarations);
+    assert_eq!(limited.edges, prior_edges);
+}
