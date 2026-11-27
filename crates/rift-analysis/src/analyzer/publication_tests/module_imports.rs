@@ -5355,3 +5355,78 @@ fn typescript_inferred_names_only_bind_their_checked_true_branches() {
             .any(|row| row.symbol.as_str().ends_with("/Kept/Value"))
     );
 }
+
+#[test]
+fn javascript_assignments_keep_distinct_checked_member_literal_owners() {
+    const SOURCE: &str = concat!(
+        "export function set(key) {\n",
+        "    const state = { errors: [] };\n",
+        "    const check = [{ found: 1, visible: { member: 2 } }];\n",
+        "    state.errors = [{ params: { additionalProperty: 3 } }];\n",
+        "    state[key] = [{ params: { additionalProperty: 5 } }];\n",
+        "    return (state.errors = [{ params: { additionalProperty: 4 } }], check);\n",
+        "}\n",
+        "export function replaced(value) {\n",
+        "    let holder = { errors: [] };\n",
+        "    holder = value;\n",
+        "    holder.errors = [{ withheld: 6 }];\n",
+        "    return (holder.errors = [{ withheld: 7 }], holder);\n",
+        "}\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export { set } from './data.js';"),
+            ("data.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#,
+        )),
+    )
+    .expect("checked local member assignments");
+    let found = analysis.publication();
+    found.validate_facts().expect("valid literal owners");
+    let unit = &found
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "data.js")
+        .expect("written module")
+        .unit;
+    let declaration = |written: &str| {
+        let range = module_runtime_range(SOURCE.find(written).expect("written site"), written);
+        found
+            .declarations
+            .iter()
+            .find(|row| &row.unit == unit && row.range == range && row.source == written)
+            .unwrap_or_else(|| panic!("missing checked literal property {written}"))
+    };
+    let first = declaration("params: { additionalProperty: 3 }");
+    let second = declaration("params: { additionalProperty: 4 }");
+    assert_ne!(first.symbol, second.symbol);
+    for (written, parent) in [
+        ("additionalProperty: 3", first),
+        ("additionalProperty: 4", second),
+    ] {
+        let child = declaration(written);
+        let symbol = found
+            .objects
+            .iter()
+            .find(|symbol| symbol.id.as_ref() == Some(&child.symbol))
+            .expect("authored nested property");
+        assert_eq!(symbol.container.as_ref(), Some(&parent.symbol));
+    }
+    assert!(
+        declaration("errors: []")
+            .symbol
+            .as_str()
+            .ends_with("/set/state/errors")
+    );
+    declaration("found: 1");
+    declaration("member: 2");
+    assert!(found.declarations.iter().all(|row| !matches!(
+        row.source.as_str(),
+        "additionalProperty: 5" | "withheld: 6" | "withheld: 7"
+    )));
+}

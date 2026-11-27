@@ -1,5 +1,7 @@
 //! Names one file declares in more than one scope.
 
+mod assigned_literals;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
@@ -1060,6 +1062,7 @@ struct LiteralOwners<'source> {
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
     array_initializers: BTreeMap<&'source str, ByteRange>,
+    assigned_arrays: BTreeMap<ByteRange, &'source str>,
 }
 
 impl<'source> LiteralOwners<'source> {
@@ -1134,6 +1137,8 @@ impl<'source> LiteralOwners<'source> {
         for call in facts.calls() {
             calls.entry(call.range.end).or_default().push(call);
         }
+        let assigned_arrays =
+            assigned_literals::array_owners(file, facts, anchors, &unique, &enclosing);
         Self {
             enclosing,
             callbacks: facts
@@ -1156,6 +1161,7 @@ impl<'source> LiteralOwners<'source> {
                 .collect(),
             returned: returned_literal_owners(&functions, &object_methods, facts),
             array_initializers,
+            assigned_arrays,
         }
     }
 
@@ -1167,7 +1173,8 @@ impl<'source> LiteralOwners<'source> {
         let container = property.container.as_deref();
         if let Some(owner) = container
             && (self.returned.get(&member.body) == Some(&Some(owner))
-                || self.array_initializers.get(owner) == Some(&member.holder))
+                || self.array_initializers.get(owner) == Some(&member.holder)
+                || self.assigned_arrays.get(&member.holder) == Some(&owner))
         {
             return true;
         }
