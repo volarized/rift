@@ -1332,8 +1332,7 @@ fn publish(
         semantics,
         &mut records,
     )?;
-    records.retain_ecmascript_modules(package, analyzed, semantics, limits)?;
-    records.retain_javascript_callback_argument_properties(package, analyzed, limits)?;
+    records.retain_selected_ecmascript_facts(package, analyzed, semantics, limits)?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));

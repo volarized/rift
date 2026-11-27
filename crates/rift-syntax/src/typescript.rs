@@ -79,6 +79,26 @@ impl TypeScriptSyntaxProvider {
             language: dialect.language(),
         }
     }
+
+    /// Checks the written statement and target item of local export selectors using
+    /// the same complete retained source that produced the candidates.
+    ///
+    /// # Errors
+    /// Returns the registered syntax refusal if the source, query count or parse
+    /// exceeds its accepted bounds.
+    pub fn checked_local_export_selectors(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        candidates: &[(&crate::SyntaxExportBinding, &crate::SyntaxSymbol)],
+    ) -> Result<std::collections::BTreeSet<crate::ByteRange>, RiftError> {
+        ecmascript::checked_local_export_selectors(
+            &self.dialect.grammar(),
+            source,
+            limits,
+            candidates,
+        )
+    }
 }
 
 impl SyntaxProvider for TypeScriptSyntaxProvider {

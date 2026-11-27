@@ -2437,6 +2437,81 @@ fn parser_for_ranges(
     Ok(parser)
 }
 
+pub(crate) fn checked_local_export_selectors(
+    grammar: &tree_sitter::Language,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    candidates: &[(&SyntaxExportBinding, &crate::SyntaxSymbol)],
+) -> Result<BTreeSet<ByteRange>, RiftError> {
+    limits.admit_source(source)?;
+    if candidates.len() > limits.syntax_elements_max() {
+        return errors::syntax::too_many_syntax_elements()
+            .path(source.path)
+            .syntax_elements_max(limits.syntax_elements_max())
+            .fail();
+    }
+    let mut parser = parser_for_ranges(grammar, &[])?;
+    let tree = parser
+        .parse(source.text, None)
+        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    let root = tree.root_node();
+    if root.kind() != "program" || root.is_error() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(candidates
+        .iter()
+        .filter_map(|(binding, target)| complete_local_selector(root, binding, target))
+        .collect())
+}
+
+fn complete_local_selector(
+    root: Node<'_>,
+    binding: &SyntaxExportBinding,
+    target: &crate::SyntaxSymbol,
+) -> Option<ByteRange> {
+    let range = binding.local?;
+    let local = complete_region(root, range)?;
+    let specifier = local.parent()?;
+    if specifier.kind() != EXPORT_SPECIFIER_KIND
+        || specifier.child_by_field_name("name") != Some(local)
+    {
+        return None;
+    }
+    let clause = specifier.parent()?;
+    let statement = clause.parent()?;
+    if clause.kind() != "export_clause"
+        || statement.kind() != EXPORT_STATEMENT_KIND
+        || statement.parent() != Some(root)
+        || statement.has_error()
+        || statement.child_by_field_name("source").is_some()
+        || extract::byte_range(statement).ok()? != binding.range
+    {
+        return None;
+    }
+    let declaration = complete_region(root, target.item_range)?;
+    if Some(declaration.kind()) != target.syntax_element_kind {
+        return None;
+    }
+    let mut parent = declaration.parent()?;
+    while matches!(
+        parent.kind(),
+        "ambient_declaration" | "export_statement" | "lexical_declaration" | "variable_declaration"
+    ) {
+        if parent.has_error() {
+            return None;
+        }
+        parent = parent.parent()?;
+    }
+    (parent == root).then_some(range)
+}
+
+fn complete_region(root: Node<'_>, range: ByteRange) -> Option<Node<'_>> {
+    let start = usize::try_from(range.start).ok()?;
+    let end = usize::try_from(range.end).ok()?;
+    let node = root.named_descendant_for_byte_range(start, end)?;
+    (start < end && node.byte_range() == (start..end) && !node.has_error()).then_some(node)
+}
+
 fn append_package_parameters(
     language: &Language,
     root: Node<'_>,

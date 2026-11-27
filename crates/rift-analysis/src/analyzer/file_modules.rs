@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::{SourceKind, SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId};
 
-use crate::WorkspaceSemantics;
+use crate::{Edge, WorkspaceSemantics};
 use rift_error::RiftError;
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
@@ -19,6 +19,23 @@ use super::{
 };
 
 impl Records {
+    pub(super) fn retain_selected_ecmascript_facts(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+    ) -> Result<(), RiftError> {
+        self.retain_ecmascript_modules(owner, analyzed, semantics, limits)?;
+        self.retain_javascript_callback_argument_properties(owner, analyzed, limits)?;
+        if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
+            let candidates = self.checked_local_export_module_candidates(analyzed, semantics);
+            self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
+            self.retain_incomplete_local_export_references(semantics, limits.edges_max());
+        }
+        Ok(())
+    }
+
     pub(super) fn retain_ecmascript_modules(
         &mut self,
         owner: &SymbolOwner,
@@ -69,6 +86,67 @@ impl Records {
         Ok(())
     }
 
+    fn checked_local_export_module_candidates<'file>(
+        &self,
+        analyzed: &'file [AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+    ) -> FileModuleCandidates<'file> {
+        let edges = semantics.edges();
+        let mut selectors = edges
+            .edges()
+            .filter(|edge| edge.is_incomplete_local_export_reference())
+            .peekable();
+        if selectors.peek().is_none() {
+            return BTreeMap::new();
+        }
+        let declared = self
+            .declarations
+            .iter()
+            .map(|row| (row.symbol.as_str(), row.unit.as_str()))
+            .collect::<BTreeSet<_>>();
+        let sources = selectors
+            .filter_map(|edge| {
+                let unit = edge.occurrence().unit();
+                declared
+                    .contains(&(edge.to().as_str(), unit.to_string().as_str()))
+                    .then_some((edge.from(), unit))
+            })
+            .collect::<BTreeSet<_>>();
+        let complete = self
+            .units
+            .iter()
+            .filter(|unit| unit.source_complete)
+            .map(|unit| unit.unit.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut modules = FileModuleCandidates::new();
+        for file in analyzed {
+            let Some(module) = file.placement.logical_identity(".") else {
+                continue;
+            };
+            let unit = file.placement.unit();
+            let proven = sources.contains(&(module, unit))
+                && complete.contains(unit.to_string().as_str())
+                && file.file.syntax().left_out_declaration_count() == 0;
+            modules
+                .entry(module)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert_with(|| proven.then_some((file, false)));
+        }
+        modules
+    }
+
+    pub(super) fn retain_incomplete_local_export_references(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        edge_limit: usize,
+    ) {
+        let references = semantics
+            .edges()
+            .edges()
+            .filter(|edge| edge.is_incomplete_local_export_reference());
+        self.retain_file_module_edge_rows(references, edge_limit);
+    }
+
     /// Adds references with a retained authored module and target.
     fn retain_ecmascript_file_module_edges(
         &mut self,
@@ -77,20 +155,39 @@ impl Records {
         kinds: &[EdgeKind],
         deferred_exports: bool,
     ) {
-        let mut references = kinds
-            .iter()
-            .copied()
-            .flat_map(|kind| {
-                semantics.edges().edges().filter(move |edge| {
-                    edge.is_file_module_reference()
-                        && edge.kind() == kind
-                        && edge.is_deferred_commonjs_export_import() == deferred_exports
-                })
+        let references = kinds.iter().copied().flat_map(|kind| {
+            semantics.edges().edges().filter(move |edge| {
+                edge.is_file_module_reference()
+                    && !edge.is_incomplete_local_export_reference()
+                    && edge.kind() == kind
+                    && edge.is_deferred_commonjs_export_import() == deferred_exports
             })
-            .peekable();
-        if references.peek().is_none() {
+        });
+        self.retain_file_module_edge_rows(references, edge_limit);
+    }
+
+    fn retain_file_module_edge_rows<'a>(
+        &mut self,
+        references: impl Iterator<Item = &'a Edge>,
+        edge_limit: usize,
+    ) {
+        let mut references = references.peekable();
+        let Some(first) = references.peek() else {
             return;
-        }
+        };
+        let complete_units = first.is_incomplete_local_export_reference().then(|| {
+            self.units
+                .iter()
+                .filter(|unit| unit.source_complete)
+                .map(|unit| unit.unit.as_str())
+                .collect::<BTreeSet<_>>()
+        });
+        let local_targets = complete_units.as_ref().map(|_| {
+            self.declarations
+                .iter()
+                .map(|row| (row.symbol.as_str(), row.unit.as_str()))
+                .collect::<BTreeSet<_>>()
+        });
         let modules = self
             .objects
             .iter()
@@ -117,6 +214,15 @@ impl Records {
             let unit = edge.occurrence().unit().to_string();
             let from = edge.from().as_str();
             let to = edge.to().as_str();
+            if complete_units
+                .as_ref()
+                .is_some_and(|units| !units.contains(unit.as_str()))
+                || local_targets
+                    .as_ref()
+                    .is_some_and(|targets| !targets.contains(&(to, unit.as_str())))
+            {
+                continue;
+            }
             let retained = if edge.kind() == EdgeKind::References {
                 declared.get(from).copied() == Some(unit.as_str()) && objects.contains(to)
             } else {
@@ -150,6 +256,18 @@ impl Records {
             return Ok(());
         }
         let modules = file_module_candidates(owner, analyzed, &self.units, semantics);
+        self.retain_file_module_candidates(owner, &modules, declaration_limit)
+    }
+
+    fn retain_file_module_candidates(
+        &mut self,
+        owner: &SymbolOwner,
+        modules: &FileModuleCandidates<'_>,
+        declaration_limit: usize,
+    ) -> Result<(), RiftError> {
+        if self.symbols_truncated {
+            return Ok(());
+        }
         let declared = self
             .declarations
             .iter()
@@ -258,12 +376,15 @@ impl Records {
     }
 }
 
+type FileModuleCandidates<'file> =
+    BTreeMap<&'file CoreSymbolId, Option<(&'file AnalyzedFile, bool)>>;
+
 fn file_module_candidates<'file>(
     owner: &SymbolOwner,
     analyzed: &'file [AnalyzedFile],
     units: &[PackageSourceUnit],
     semantics: &WorkspaceSemantics,
-) -> BTreeMap<&'file CoreSymbolId, Option<(&'file AnalyzedFile, bool)>> {
+) -> FileModuleCandidates<'file> {
     let proven_receivers = commonjs_module_source_units(semantics);
     let complete = units
         .iter()

@@ -155,6 +155,8 @@ pub(crate) struct StaticResolution {
     /// First qualifier backed by an established legacy alias type occurrence.
     pub(crate) python_legacy_annotation_qualifier_start: Option<usize>,
     pub(crate) python_loop_read_start: Option<usize>,
+    /// First independently checked local selector in an incomplete declaration file.
+    pub(crate) typescript_incomplete_local_export_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -393,6 +395,7 @@ fn resolve_by<'source>(
     index.resolve_python_legacy_annotation_qualifiers(&mut work, &mut resolution);
     index.resolve_python_loop_reads(&mut work, &mut resolution);
     index.resolve_commonjs_export_imports(&mut work, &mut resolution);
+    index.resolve_incomplete_typescript_local_exports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
