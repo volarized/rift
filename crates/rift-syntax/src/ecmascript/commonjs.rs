@@ -310,17 +310,8 @@ pub(super) fn record<'tree>(
         })
         .transpose()?;
     let mut exports = exported(&body, &captured, bindings);
-    exports.expression_export = allow_literal
-        && closed_export.is_none()
-        && !captured.blocked.contains(&root.id())
-        && captured.direct_default.is_some_and(|assignment| {
-            !captured.bound.contains_key("Object")
-                && !captured.rebound.contains("Object")
-                && kinds
-                    .assigned_value(assignment)
-                    .is_some_and(|value| written_callable_composite(value, source.text, kinds))
-                && closed_wrapper_uses(root, None, assignment, source.text, kinds)
-        });
+    exports.expression_export =
+        allow_literal && closed_export.is_none() && body.is_closed_callable_composite(&captured);
     exports.closed_export = closed_export.or_else(|| {
         direct_function.map(|assignment| StaticCommonJsExport {
             assignment,
@@ -394,6 +385,19 @@ impl<'tree> ModuleBody<'_, 'tree> {
             .child(assignment, EcmaScriptGrammarField::Right)
             .filter(|value| value.kind_id() == self.kinds.object_literal)
             .filter(|_| closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds))
+    }
+
+    /// Whether one direct assignment uses the unshadowed callable composite constructor.
+    fn is_closed_callable_composite(&self, captured: &CapturedAssignments<'_>) -> bool {
+        !captured.blocked.contains(&self.root.id())
+            && !captured.bound.contains_key("Object")
+            && !captured.rebound.contains("Object")
+            && captured.direct_default.is_some_and(|assignment| {
+                self.kinds
+                    .assigned_value(assignment)
+                    .is_some_and(|value| written_callable_composite(value, self.source, self.kinds))
+                    && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
+            })
     }
 
     /// The written function that a closed module assigns directly to its default export.
