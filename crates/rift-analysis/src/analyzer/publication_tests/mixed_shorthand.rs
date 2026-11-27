@@ -229,3 +229,75 @@ fn bounded(retained_bytes: u64) -> PackagePublication {
         .into_parts()
         .0
 }
+
+#[test]
+fn returned_pairs_keep_written_properties_beside_destructured_bindings() {
+    const ENTRY: &str = "export { build } from './worker.mjs';";
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.mjs"}"#;
+    let write = |body| {
+        format!(
+            "function normalize(value) {{ return value; }}\nexport function build(options) {{\n  const {{ color, width, flag }} = options;\n  {body}\n}}"
+        )
+    };
+    for (body, color, width) in [
+        (
+            "return { color: normalize(color), width: width + 1, flag, kept: true };",
+            true,
+            true,
+        ),
+        (
+            "{ const color = false; return { color: normalize(color), width: width + 1, flag, kept: true }; }",
+            false,
+            true,
+        ),
+        (
+            "return normalize({ color: normalize(color), width: width + 1, flag, kept: true });",
+            false,
+            false,
+        ),
+    ] {
+        let source = write(body);
+        let found = publish(
+            vec![("index.mjs", ENTRY), ("worker.mjs", &source)],
+            MANIFEST,
+        );
+        let unit = found
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == "worker.mjs")
+            .expect("complete written module");
+        assert_eq!(unit.source, source);
+        for (name, spelling, expected) in [
+            ("color", "color: normalize(color)", color),
+            ("width", "width: width + 1", width),
+        ] {
+            let [local, property] = [name, spelling].map(|written| {
+                let start = u64::try_from(source.find(written).expect("written declaration"))
+                    .expect("small source");
+                let end = start + u64::try_from(written.len()).expect("small declaration");
+                found.declarations.iter().find(|row| {
+                    row.unit == unit.unit
+                        && row.range == TextRange { start, end }
+                        && row.source_complete
+                        && row.source == written
+                })
+            });
+            assert_eq!(property.is_some(), expected, "{spelling}");
+            if let Some(property) = property {
+                let local = local.expect("authored destructured binding");
+                assert_ne!(local.symbol, property.symbol);
+                assert_eq!(property.syntax_element_kind.as_deref(), Some("pair"));
+                assert_eq!(
+                    local.syntax_element_kind.as_deref(),
+                    Some("shorthand_property_identifier_pattern")
+                );
+            }
+        }
+        assert!(
+            found.declarations.iter().any(|row| row.unit == unit.unit
+                && row.source == "kept: true"
+                && row.source_complete)
+        );
+    }
+}
