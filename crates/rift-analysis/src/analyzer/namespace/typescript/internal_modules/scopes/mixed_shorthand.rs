@@ -19,6 +19,12 @@ struct MixedLiteralEvidence<'source> {
     value_accesses: BTreeMap<ByteRange, ReferenceRole>,
 }
 
+impl MixedLiteralEvidence<'_> {
+    fn direct_return(&self, body: ByteRange, owner: &str) -> bool {
+        self.returned.contains(&body) && self.owners.returned.get(&body) == Some(&Some(owner))
+    }
+}
+
 impl<'source> FileScopes<'source> {
     /// Keeps separate identities for a checked binding and its same-named literal properties.
     pub(in crate::analyzer::namespace::typescript::internal_modules) fn place_mixed_shorthand(
@@ -147,10 +153,7 @@ impl<'source> FileScopes<'source> {
         } else {
             prior_owner
         };
-        let Some(owner) = owner else {
-            return false;
-        };
-        let Some(body) = owner.body_range else {
+        let Some((owner, body)) = owner.zip(owner.and_then(|owner| owner.body_range)) else {
             return false;
         };
         let lexical_body = body.encloses(scope);
@@ -179,8 +182,7 @@ impl<'source> FileScopes<'source> {
             let Some(row) = self.body_members.get(&member.item_range) else {
                 return false;
             };
-            let direct_return = evidence.returned.contains(&row.body)
-                && owners.returned.get(&row.body) == Some(&Some(owner.qualified_name.as_str()));
+            let direct_return = evidence.direct_return(row.body, &owner.qualified_name);
             let shorthand = member.syntax_element_kind == Some("shorthand_property_identifier");
             let checked_call_pair = variable
                 && owner.syntax_element_kind == Some("function_declaration")
@@ -198,7 +200,8 @@ impl<'source> FileScopes<'source> {
             let in_scope = scope.encloses(row.body);
             scoped_shorthand |= shorthand && direct_return && in_scope;
             separate_return |= admitted_return && !in_scope;
-            let admissible = argument || (initializer.is_none() && (shorthand || admitted_return));
+            let ordinary_literal = initializer.is_none() && (shorthand || admitted_return);
+            let admissible = argument || ordinary_literal || (shorthand && direct_return);
             let same_owner = if initializer.is_some() || object_method {
                 let expected = initializer.map_or(owner.item_range, |(range, _)| range);
                 owners
