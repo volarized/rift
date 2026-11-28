@@ -5,11 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_core::SymbolId;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
-    ByteRange, ScopedIdentityAnchors, StaticBinding, StaticBindingKind, SyntaxSymbol,
+    ByteRange, ScopedIdentityAnchors, StaticBinding, StaticBindingKind, StaticBodyMember,
+    StaticCallee, SyntaxSymbol,
 };
 
 use super::{
-    FileScopes, LiteralOwners, Scope, SelectedFile, local_group_identity,
+    FileScopes, LiteralOwners, Scope, SelectedFile, callable_variable, local_group_identity,
     ordinary_private_property, private_variable_declaration,
 };
 
@@ -118,8 +119,13 @@ impl<'source> FileScopes<'source> {
         };
         let variable = local.syntax_element_kind == Some("variable_declarator");
         let prior_owner = placed_function(owners, local.item_range, variable);
-        let object_method = variable && prior_owner.is_none();
-        let owner = if object_method {
+        let initializer = variable
+            .then(|| placed_initializer(owners, local.item_range))
+            .flatten();
+        let object_method = variable && prior_owner.is_none() && initializer.is_none();
+        let owner = if let Some((_, callable)) = initializer {
+            Some(callable)
+        } else if object_method {
             owners
                 .enclosing
                 .resolve(local.item_range.start, local.item_range.end)
@@ -158,9 +164,23 @@ impl<'source> FileScopes<'source> {
             let direct_return = returned.contains(&row.body)
                 && owners.returned.get(&row.body) == Some(&Some(owner.qualified_name.as_str()));
             let shorthand = member.syntax_element_kind == Some("shorthand_property_identifier");
-            let admissible = shorthand
-                || (!object_method && member.syntax_element_kind == Some("pair") && direct_return);
-            let same_owner = if object_method {
+            let initializer_argument = initializer.is_some_and(|(range, _)| {
+                shorthand && direct_callable_argument(owners, row, range)
+            });
+            let admissible = if initializer.is_some() {
+                initializer_argument
+            } else {
+                shorthand
+                    || (!object_method
+                        && member.syntax_element_kind == Some("pair")
+                        && direct_return)
+            };
+            let same_owner = if let Some((range, _)) = initializer {
+                owners
+                    .enclosing
+                    .resolve(row.body.start, row.body.end)
+                    .is_some_and(|(nearest, _)| *nearest == range)
+            } else if object_method {
                 owners
                     .enclosing
                     .resolve(row.body.start, row.body.end)
@@ -170,16 +190,45 @@ impl<'source> FileScopes<'source> {
                     .is_some_and(|retained| retained.item_range == owner.item_range)
             };
             admissible
-                && (!variable || direct_return)
+                && (!variable || direct_return || initializer_argument)
                 && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start
                 && scope.encloses(row.body)
                 && same_owner
                 && self.of(member, file) == Scope::Body(row.body, false)
-                && owners.proves_body(member, row)
+                && (initializer_argument || owners.proves_body(member, row))
                 && literals.insert(row.body)
         })
     }
+}
+
+fn placed_initializer<'source>(
+    owners: &LiteralOwners<'source>,
+    range: ByteRange,
+) -> Option<(ByteRange, &'source SyntaxSymbol)> {
+    let (scope, owner) = owners.enclosing.resolve(range.start, range.end)?;
+    let owner = owner
+        .filter(|symbol| callable_variable(symbol))
+        .or_else(|| owners.function_initializers.get(scope).copied())?;
+    Some((*scope, owner))
+}
+
+fn direct_callable_argument(
+    owners: &LiteralOwners<'_>,
+    member: &StaticBodyMember,
+    scope: ByteRange,
+) -> bool {
+    owners.calls.get(&member.holder.end).is_some_and(|calls| {
+        calls.iter().any(|call| {
+            matches!(
+                call.callee,
+                StaticCallee::Direct | StaticCallee::Member { .. }
+            ) && call.callee_range.end <= member.holder.start
+                && call.range.encloses(member.holder)
+                && scope.encloses(call.range)
+                && !owners.bound_calls.contains(&call.range)
+        })
+    })
 }
 
 fn placed_function<'source>(

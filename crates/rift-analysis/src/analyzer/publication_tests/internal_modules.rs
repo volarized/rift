@@ -1480,3 +1480,83 @@ fn repeated_typescript_bindings_refuse_incomplete_callback_groups() {
         );
     }
 }
+
+#[test]
+fn checked_callable_initializers_keep_written_argument_shorthands() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    for initializer in ["function (input)", "(input) =>"] {
+        let source = format!(
+            "const inspect = input => input.width;\n\
+             export const renderer = {initializer} {{\n\
+                 const width = input.width;\n\
+                 const height = input.height;\n\
+                 return inspect({{ width, height }});\n\
+             }};\n"
+        );
+        let indexed = analyze(META, &[("index.js", ENTRY), ("impl.js", &source)]);
+        let graph = indexed.publication();
+        graph
+            .validate_facts()
+            .expect("checked callable initializer");
+        let owner = graph
+            .declarations
+            .iter()
+            .find(|row| row.source.starts_with(&format!("renderer = {initializer}")))
+            .expect("written callable initializer");
+        for (name, written) in [
+            ("width", "width = input.width"),
+            ("height", "height = input.height"),
+        ] {
+            let binding = graph
+                .declarations
+                .iter()
+                .find(|row| row.source == written)
+                .expect("written binding");
+            let property = graph
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.source == name
+                        && row.syntax_element_kind.as_deref()
+                            == Some("shorthand_property_identifier")
+                })
+                .expect("written direct argument property");
+            assert_ne!(binding.symbol, property.symbol);
+            assert_eq!(
+                property.range.start,
+                u64::try_from(source.rfind(name).expect("written key")).expect("source offset")
+            );
+            assert!(graph.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&property.symbol)
+                    && object.container.as_ref() == Some(&owner.symbol)
+            }));
+            assert!(graph.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to == binding.symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == property.unit && site.range == property.range
+                    })
+            }));
+        }
+
+        for altered in [
+            source.replace("{ width, height }", "{ width, width, height, height }"),
+            source.replace(
+                "inspect({ width, height })",
+                "inspect(function () { return inspect({ width, height }); })",
+            ),
+        ] {
+            let indexed = analyze(META, &[("index.js", ENTRY), ("impl.js", &altered)]);
+            let publication = indexed.publication();
+            assert!(!publication.declarations.iter().any(|row| {
+                ["width", "height"].contains(&row.source.as_str())
+                    && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+                    && publication.objects.iter().any(|object| {
+                        object.id.as_ref() == Some(&row.symbol)
+                            && object.container.as_ref() == Some(&owner.symbol)
+                    })
+            }));
+        }
+    }
+}
