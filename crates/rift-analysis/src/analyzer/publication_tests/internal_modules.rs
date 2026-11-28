@@ -1644,3 +1644,83 @@ fn checked_commonjs_argument_pair_keeps_the_written_key_beside_its_binding() {
         }));
     }
 }
+
+#[test]
+fn checked_instance_method_keeps_distinct_return_property_and_local_identities() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { Renderer } from './worker.js';\n";
+    const BODY: &str = concat!(
+        "const width = value.width;\n",
+        "if (value.first) return { width };\n",
+        "return { width: width };\n",
+    );
+    let collect = |method: &str, body: &str| {
+        let source = format!("export class Renderer {{ {method}(value) {{ {body} }} }}\n");
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![("index.js", ENTRY), ("worker.js", &source)],
+            None,
+            Some(("package.json", META)),
+        )
+        .expect("checked class fixture");
+        (analysis, source)
+    };
+    for method in ["select", "static select"] {
+        let (analysis, source) = collect(method, BODY);
+        let graph = analysis.publication();
+        graph.validate_facts().expect("checked method publication");
+        let owner = graph
+            .declarations
+            .iter()
+            .find(|row| row.syntax_element_kind.as_deref() == Some("method_definition"))
+            .expect("written method");
+        let binding = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == "width = value.width")
+            .expect("written local binding");
+        let properties = ["width", "width: width"].map(|text| {
+            graph
+                .declarations
+                .iter()
+                .find(|row| row.source == text)
+                .expect("written return property")
+        });
+        assert_ne!(properties[0].symbol, properties[1].symbol);
+        for (property, occurrence) in properties.into_iter().zip(["width };", "width: width };"]) {
+            assert_ne!(binding.symbol, property.symbol);
+            assert!(graph.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&property.symbol)
+                    && object.container.as_ref() == Some(&owner.symbol)
+            }));
+            let start = source.find(occurrence).expect("written value occurrence")
+                + occurrence.find(':').map_or(0, |separator| separator + 2);
+            assert!(graph.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Reads]
+                    && edge.to == binding.symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == property.unit && usize::try_from(site.range.start) == Ok(start)
+                    })
+            }));
+        }
+    }
+
+    let (analysis, _) = collect(
+        "select",
+        "const width = value.width; const inner = () => {return { width };}; return inner();",
+    );
+    let graph = analysis.publication();
+    let method = graph
+        .declarations
+        .iter()
+        .find(|row| row.syntax_element_kind.as_deref() == Some("method_definition"))
+        .expect("written enclosing method");
+    assert!(!graph.declarations.iter().any(|row| {
+        row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+            && row.source == "width"
+            && graph.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&row.symbol)
+                    && object.container.as_ref() == Some(&method.symbol)
+            })
+    }));
+}

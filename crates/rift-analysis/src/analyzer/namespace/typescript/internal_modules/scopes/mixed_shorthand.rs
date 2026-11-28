@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
-use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, ScopedIdentityAnchors, StaticBinding, StaticBindingKind, StaticBodyMember,
     StaticCallee, SyntaxSymbol,
@@ -282,14 +281,12 @@ fn same_name_argument_pair(
 fn placed_function<'source>(
     owners: &LiteralOwners<'source>,
     range: ByteRange,
-    allow_static_method: bool,
+    allow_class_method: bool,
 ) -> Option<&'source SyntaxSymbol> {
     let (_, owner) = owners.enclosing.resolve(range.start, range.end)?;
     owner.filter(|symbol| {
         symbol.syntax_element_kind == Some("function_declaration")
-            || (allow_static_method
-                && symbol.syntax_element_kind == Some("method_definition")
-                && symbol.kinds.contains(&SymbolKind::Static))
+            || (allow_class_method && symbol.syntax_element_kind == Some("method_definition"))
     })
 }
 
