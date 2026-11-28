@@ -86,6 +86,7 @@ mod checked_parameters;
 mod commonjs;
 pub(crate) use commonjs::commonjs_class_export_initializations;
 mod conditional_type_members;
+mod indexed_accesses;
 mod inline_import_types;
 mod members;
 mod overload_parameters;
@@ -98,6 +99,8 @@ mod variance;
 mod wrapped_parameters;
 
 pub(crate) use conditional_type_members::check as checked_conditional_type_members;
+pub use indexed_accesses::CheckedIndexedAccess;
+pub(crate) use indexed_accesses::check as checked_indexed_accesses;
 pub use inline_import_types::CheckedInlineTypeImport;
 pub(crate) use inline_import_types::check as checked_inline_import_types;
 pub(crate) use wrapped_parameters::arrow_body_with_wrapped_parameters;

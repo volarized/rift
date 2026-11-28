@@ -3,6 +3,77 @@
 use super::*;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider};
 
+#[test]
+fn declaration_indexed_access_preserves_written_property_reference() {
+    const TYPE: &str = "export interface Preferences { transport: string; }\n";
+    const USE: &str = concat!(
+        "export type Transport = Preferences[\"transport\"];\n",
+        "export type Missing = Preferences[\"absent\"];\n",
+        "export type Key = 'transport';\n",
+        "export type Computed = Preferences[Key];\n",
+    );
+    for (prefix, declaration) in [
+        (TYPE, "index.d.ts"),
+        ("import { Preferences } from './leaf.js';\n", "leaf.d.ts"),
+    ] {
+        let source = format!("{prefix}{USE}");
+        let mut files = vec![("index.d.ts", source.as_str())];
+        if declaration == "leaf.d.ts" {
+            files.push((declaration, TYPE));
+        }
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+            )),
+        )
+        .expect("written declaration files");
+        let graph = result.publication();
+        graph.validate_facts().expect("checked publication");
+        let source_unit = graph
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == "index.d.ts")
+            .expect("indexed access source");
+        let references = |at: &str, within: usize, size: usize, suffix: &str| {
+            let start = source.find(at).expect("written access") + within;
+            let range = TextRange {
+                start: u64::try_from(start).expect("source start"),
+                end: u64::try_from(start + size).expect("source end"),
+            };
+            graph.edges.iter().any(|edge| {
+                edge.to.as_str().ends_with(suffix)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.unit == source_unit.unit && site.range == range)
+            })
+        };
+        assert!(references(
+            "Preferences[\"transport\"]",
+            0,
+            "Preferences".len(),
+            "/Preferences"
+        ));
+        assert!(references("[Key]", 1, "Key".len(), "/Key"));
+        assert!(!references(
+            "[\"absent\"]",
+            2,
+            "absent".len(),
+            "/Preferences/transport"
+        ));
+        assert!(references(
+            "[\"transport\"]",
+            2,
+            "transport".len(),
+            "/Preferences/transport"
+        ));
+    }
+}
+
 const ORDINARY: &str = concat!(
     "declare function prepare(item: string, optional?: number): string;\n",
     "declare class Shelf { open(entry: string): string; }\n",

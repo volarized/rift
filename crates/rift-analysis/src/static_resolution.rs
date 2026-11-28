@@ -15,6 +15,7 @@ mod python_edges;
 mod rust;
 #[cfg(test)]
 mod tests;
+mod typescript_indexed_accesses;
 mod typescript_inline_imports;
 
 use javascript_parameters::{ParameterReads, ScopedParameterReads};
@@ -178,6 +179,8 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_incomplete_local_export_start: Option<usize>,
     /// First checked type occurrence at a relative inline import qualifier.
     pub(crate) typescript_inline_import_type_start: Option<usize>,
+    /// First appended written property selector of a TypeScript indexed access type.
+    pub(crate) typescript_indexed_access_start: Option<usize>,
     /// First module edge at a checked inline import specifier.
     pub(crate) typescript_inline_import_module_start: Option<usize>,
     /// First checked reference at a TypeScript enum qualifier.
@@ -436,6 +439,7 @@ fn resolve_by<'source>(
     index.resolve_typescript_namespace_local_exports(&mut work, &mut resolution);
     index.resolve_python_dataclass_keywords(&mut work, &mut resolution);
     index.resolve_python_assignment_expression_reads(&mut work, &mut resolution);
+    index.resolve_typescript_indexed_accesses(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
