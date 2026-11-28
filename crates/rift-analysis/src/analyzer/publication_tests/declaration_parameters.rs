@@ -19,10 +19,10 @@ const CONTROLS: &str = concat!(
 
 #[test]
 fn checked_named_declaration_parameters_survive_a_separate_import_type() {
-    for (path, types, expected) in [
-        ("lib/typed.d.ts", "./index.d.ts", 3),
-        ("lib/typed.d.ts", "./lib/typed.d.ts", 3),
-        ("lib/typed.ts", "./index.d.ts", 0),
+    for (path, types) in [
+        ("lib/typed.d.ts", "./index.d.ts"),
+        ("lib/typed.d.ts", "./lib/typed.d.ts"),
+        ("lib/typed.ts", "./index.d.ts"),
     ] {
         let source = format!("{ORDINARY}{CONTROLS}");
         let manifest =
@@ -47,7 +47,7 @@ fn checked_named_declaration_parameters_survive_a_separate_import_type() {
             .iter()
             .find(|file| file.file().path().as_str() == path)
             .expect("authored source");
-        assert!(held.file().syntax().has_errors());
+        assert!(!held.file().syntax().has_errors());
         let unit = publication
             .units
             .iter()
@@ -66,21 +66,21 @@ fn checked_named_declaration_parameters_survive_a_separate_import_type() {
                 object.kinds.contains(&SymbolKind::Parameter).then_some(row)
             })
             .collect::<Vec<_>>();
-        assert_eq!(parameters.len(), expected, "{path}");
-        if expected != 0 {
-            for (owner, name) in [
-                ("prepare", "item"),
-                ("prepare", "optional"),
-                ("Shelf/open", "entry"),
-            ] {
-                let start =
-                    u64::try_from(source.find(name).expect("written identifier")).expect("offset");
-                let end = start + u64::try_from(name.len()).expect("length");
-                assert!(parameters.iter().any(|row| {
-                    row.symbol.as_str().ends_with(&format!("/{owner}/{name}"))
-                        && row.range == (TextRange { start, end })
-                }));
-            }
+        assert_eq!(parameters.len(), 8, "{path}");
+        for (owner, name) in [
+            ("prepare", "item"),
+            ("prepare", "optional"),
+            ("Shelf/open", "entry"),
+            ("predicate", "unknownItem"),
+            ("lookup", "unknownKey"),
+        ] {
+            let start =
+                u64::try_from(source.find(name).expect("written identifier")).expect("byte offset");
+            let end = start + u64::try_from(name.len()).expect("length");
+            assert!(parameters.iter().any(|row| {
+                row.symbol.as_str().ends_with(&format!("/{owner}/{name}"))
+                    && row.range == (TextRange { start, end })
+            }));
         }
     }
 }
@@ -105,8 +105,8 @@ const SELECTORS: &str = concat!(
 #[test]
 fn checked_local_export_selectors_survive_a_separate_import_type() {
     for (path, types, expected) in [
-        ("lib/typed.d.ts", "./index.d.ts", 3),
-        ("lib/typed.d.ts", "./lib/typed.d.ts", 3),
+        ("lib/typed.d.ts", "./index.d.ts", 4),
+        ("lib/typed.d.ts", "./lib/typed.d.ts", 4),
         ("lib/typed.ts", "./index.d.ts", 0),
     ] {
         let manifest =
@@ -166,6 +166,7 @@ fn checked_local_export_selectors_survive_a_separate_import_type() {
             ("prepare as outward", "prepare"),
             ("Shelf };", "Shelf"),
             ("LocalType };", "LocalType"),
+            ("uncertain };", "uncertain"),
         ] {
             let start = u64::try_from(SELECTORS.find(statement).expect("written selector"))
                 .expect("byte offset");

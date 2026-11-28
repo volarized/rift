@@ -37,7 +37,7 @@ fn inline_import_type_qualifiers_use_checked_relative_declarations() {
     let wrong_space =
         CONTRACT.replace("interface Shape { width: number; }", "const Shape: number;");
     let nested = INLINE.replace("'./contract.js').Shape", "'./contract.js').Shape.Width");
-    let unplaced_owner = INLINE.replace(").Shape): number", ").Shape | null): number");
+    let union_parameter = INLINE.replace(").Shape): number", ").Shape | null): number");
     let malformed = INLINE.replace(").Shape", ", undefined).Shape");
     let competing = format!("{INLINE}export declare function read(value: number): number;\n");
     let type_query = INLINE.replace("import('./contract.js')", "typeof import('./contract.js')");
@@ -52,7 +52,7 @@ fn inline_import_type_qualifiers_use_checked_relative_declarations() {
         (&missing, CONTRACT, ").Shape", 0),
         (INLINE, &wrong_space, ").Shape", 0),
         (&nested, CONTRACT, ").Shape", 0),
-        (&unplaced_owner, CONTRACT, ").Shape", 0),
+        (&union_parameter, CONTRACT, ").Shape", 1),
         (&malformed, CONTRACT, ").Shape", 0),
         (&competing, CONTRACT, ").Shape", 0),
         (&type_query, CONTRACT, ").Shape", 0),
@@ -298,12 +298,7 @@ fn checked_inline_import_type_alias_keeps_the_full_written_declaration() {
             None,
         ),
     ] {
-        assert_checked_inline_alias(
-            &written,
-            resolved,
-            canonical,
-            canonical != Some(NAMED_ALIAS),
-        );
+        assert_checked_inline_alias(&written, resolved, canonical, canonical.is_none());
     }
 }
 
@@ -311,7 +306,7 @@ fn assert_checked_inline_alias(
     written: &str,
     resolved: bool,
     canonical: Option<&str>,
-    needs_syntax_recovery: bool,
+    syntax_has_errors: bool,
 ) {
     let (publication, files, _, _) = analyze(written, CONTRACT).into_parts();
     publication
@@ -327,7 +322,7 @@ fn assert_checked_inline_alias(
         .iter()
         .find(|file| file.file().path().as_str() == "lib/consumer.d.ts")
         .expect("syntax source");
-    assert_eq!(source.file().syntax().has_errors(), needs_syntax_recovery);
+    assert_eq!(source.file().syntax().has_errors(), syntax_has_errors);
     let physical = |name: &str| {
         publication.declarations.iter().find(|row| {
             row.unit == unit.unit
@@ -407,7 +402,13 @@ fn checked_inline_import_type_alias_does_not_recover_a_competing_owner() {
         })
         .map(|row| row.source.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(original, ["type Public = import", "type Public = number;"]);
+    assert_eq!(
+        original,
+        [
+            "type Public = import('./contract.js').Shape;",
+            "type Public = number;",
+        ],
+    );
     assert!(!publication.publication().edges.iter().any(|edge| {
         edge.kinds == [EdgeKind::HasType] && edge.from.as_str().ends_with("consumer.d.ts/Public")
     }));

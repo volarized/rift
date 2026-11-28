@@ -1012,3 +1012,277 @@ fn dual_commonjs_getter_keys_keep_checked_bindings_and_children() {
             })
     );
 }
+
+#[test]
+fn restored_esm_callable_keeps_its_exact_argument_members_and_local_binding() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str =
+        "import { registry } from './helper.js';\nexport const result = registry;\n";
+    const SOURCE: &str = concat!(
+        "const registry = {};\n",
+        "publish(registry, { visit: () => visit });\n",
+        "function visit(parser) {\n",
+        "    const index = 1;\n",
+        "    parser.collect({ type: 'head', index, token: { option: index } });\n",
+        "    parser.collect({ type: 'tail', index, token: { option: index } });\n",
+        "    parser.collect({ type: 'duplicate', type: 'competing' });\n",
+        "    defer(() => { parser.collect({ type: 'deferred' }); });\n",
+        "}\n",
+        "export { registry };\n",
+    );
+    let result = analyze(MANIFEST, &[("index.js", ENTRY), ("helper.js", SOURCE)]);
+    let graph = result.publication();
+    graph
+        .validate_facts()
+        .expect("separate literal and binding facts");
+    let owner = graph
+        .declarations
+        .iter()
+        .find(|row| row.source.starts_with("function visit(") && row.source_complete)
+        .expect("checked visit owner");
+    let container = |symbol: &rift_protocol::read::SymbolId| {
+        graph
+            .objects
+            .iter()
+            .find(|row| row.id.as_ref() == Some(symbol))
+            .and_then(|row| row.container.as_ref())
+    };
+    let direct = graph
+        .declarations
+        .iter()
+        .filter(|row| row.unit == owner.unit && container(&row.symbol) == Some(&owner.symbol))
+        .collect::<Vec<_>>();
+    for written in ["type: 'head'", "type: 'tail'"] {
+        assert!(direct.iter().any(|row| row.source == written));
+    }
+    assert_eq!(
+        direct
+            .iter()
+            .filter(|row| {
+                row.source == "index"
+                    && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+            })
+            .count(),
+        2
+    );
+    for token in direct
+        .iter()
+        .filter(|row| row.source == "token: { option: index }")
+    {
+        assert!(graph.declarations.iter().any(|row| {
+            row.source == "option: index"
+                && container(&row.symbol) == Some(&token.symbol)
+                && token.range.start < row.range.start
+                && row.range.end < token.range.end
+        }));
+    }
+    assert_eq!(
+        direct
+            .iter()
+            .filter(|row| row.source == "token: { option: index }")
+            .count(),
+        2
+    );
+    assert!(direct.iter().all(|row| !matches!(
+        row.source.as_str(),
+        "type: 'duplicate'" | "type: 'competing'" | "type: 'deferred'"
+    )));
+    assert!(
+        !graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == owner.symbol && edge.kinds == [EdgeKind::Calls])
+    );
+    let local = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "index = 1")
+        .expect("authored local binding");
+    let refused = SOURCE.replace("() => visit", "() => 0");
+    let open = analyze(MANIFEST, &[("index.js", ENTRY), ("helper.js", &refused)]);
+    let before = open
+        .publication()
+        .declarations
+        .iter()
+        .find(|row| row.source == local.source)
+        .expect("existing local binding");
+    assert_eq!(before.symbol, local.symbol);
+    assert!(
+        !open
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| row.symbol == owner.symbol || row.source == "type: 'head'")
+    );
+}
+
+#[test]
+fn checked_object_method_returns_keep_both_written_binding_and_shorthand() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    const SOURCE: &str = concat!(
+        "export const renderer = {\n",
+        "    build(value) {\n",
+        "        const width = value;\n",
+        "        const height = value + 1;\n",
+        "        return { width, height };\n",
+        "    }\n",
+        "};\n",
+    );
+    let result = analyze(META, &[("index.js", ENTRY), ("impl.js", SOURCE)]);
+    let graph = result.publication();
+    graph
+        .validate_facts()
+        .expect("written method and returned keys");
+    let method = graph
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source.starts_with("build(value)")
+                && row.syntax_element_kind.as_deref() == Some("method_definition")
+        })
+        .expect("written method");
+    let mut property_ids = BTreeSet::new();
+    for (name, written_local) in [("width", "width = value"), ("height", "height = value + 1")] {
+        let binding = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written_local)
+            .expect("written local");
+        let property = graph
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source == name
+                    && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+            })
+            .expect("written shorthand");
+        assert_ne!(property.symbol, binding.symbol);
+        property_ids.insert(property.symbol.clone());
+        let first =
+            u64::try_from(SOURCE.rfind(name).expect("written shorthand")).expect("written offset");
+        assert_eq!(property.range.start, first);
+        assert_eq!(
+            property.range.end,
+            first + u64::try_from(name.len()).expect("name length")
+        );
+        assert!(graph.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&method.symbol)
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to == binding.symbol
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == property.unit && site.range == property.range)
+        }));
+    }
+    let unrelated = SOURCE.replace("return { width, height };", "inspect({ width, height });");
+    let competing = SOURCE.replace(
+        "return { width, height };",
+        "return { width, width, height, height };",
+    );
+    for source in [unrelated, competing] {
+        assert!(
+            !analyze(META, &[("index.js", ENTRY), ("impl.js", &source)])
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| property_ids.contains(&row.symbol))
+        );
+    }
+}
+
+#[test]
+fn checked_method_return_pairs_survive_same_named_unproved_call_arguments() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    const SOURCE: &str = concat!(
+        "export const renderer = {\n",
+        "    build(input) {\n",
+        "        if (input) inspect({ width: 1, height: 2 });\n",
+        "        return { width: input.width, height: input.height };\n",
+        "    }\n",
+        "};\n",
+    );
+    let result = analyze(META, &[("index.js", ENTRY), ("impl.js", SOURCE)]);
+    let graph = result.publication();
+    graph.validate_facts().expect("checked method return");
+    let method = graph
+        .declarations
+        .iter()
+        .find(|row| row.syntax_element_kind.as_deref() == Some("method_definition"))
+        .expect("written method");
+    for property in ["width: input.width", "height: input.height"] {
+        let declaration = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == property)
+            .expect("written returned property");
+        let start = u64::try_from(SOURCE.find(property).expect("written property")).expect("start");
+        assert_eq!(declaration.range.start, start);
+        assert!(graph.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&declaration.symbol)
+                && object.container.as_ref() == Some(&method.symbol)
+        }));
+    }
+    assert!(
+        !graph
+            .declarations
+            .iter()
+            .any(|row| ["width: 1", "height: 2"].contains(&row.source.as_str()))
+    );
+    let ambiguous = SOURCE.replace(
+        "width: input.width, height: input.height",
+        "width: input.width, width: input.height",
+    );
+    let ambiguous_result = analyze(META, &[("index.js", ENTRY), ("impl.js", &ambiguous)]);
+    let ambiguous = ambiguous_result.publication();
+    assert!(
+        !ambiguous
+            .declarations
+            .iter()
+            .any(|row| ["width: input.width", "width: input.height"].contains(&row.source.as_str()))
+    );
+}
+
+#[test]
+fn checked_method_return_pair_keeps_the_separate_read_local() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    const SOURCE: &str = concat!(
+        "export const renderer = {\n",
+        "    build(input) {\n",
+        "        const width = input.width;\n",
+        "        return { width: width + 1 };\n",
+        "    }\n",
+        "};\n",
+    );
+    let result = analyze(META, &[("index.js", ENTRY), ("impl.js", SOURCE)]);
+    let graph = result.publication();
+    graph.validate_facts().expect("checked return and local");
+    let binding = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "width = input.width")
+        .expect("written local");
+    let property = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "width: width + 1")
+        .expect("written return pair");
+    assert_ne!(binding.symbol, property.symbol);
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from == property.symbol
+            && edge.to == binding.symbol
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == property.unit
+                    && property.range.start <= site.range.start
+                    && site.range.end <= property.range.end
+            })
+    }));
+}

@@ -1,5 +1,7 @@
 //! Written arguments of Calls owned by admitted anonymous JavaScript callbacks.
 
+mod quoted;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::PortableSymbolFacts;
@@ -114,7 +116,9 @@ impl Records {
             let file = files_by_unit[unit];
             if let Some(placed) = placed.get(&file.unit) {
                 let caller = |range| calls.get(&range).and_then(Option::as_ref);
-                for (property, name, callback, _) in argument_properties(file, caller, placed) {
+                for (property, name, callback, _) in
+                    argument_properties(file, caller, placed, false)
+                {
                     candidates.push(ArgumentProperty {
                         file,
                         property,
@@ -166,7 +170,9 @@ impl Records {
             let mut callers = BTreeMap::<_, Option<SymbolId>>::new();
             let mut retained_callers = BTreeMap::<_, Option<SymbolId>>::new();
             let caller = |range| written_callback(file, range);
-            for (property, name, callback, member) in argument_properties(file, caller, placed) {
+            for (property, name, callback, member) in
+                argument_properties(file, caller, placed, false)
+            {
                 if self.symbols_truncated {
                     return Ok(());
                 }
@@ -235,17 +241,11 @@ impl Records {
             callback,
         } in candidates
         {
-            let parent = SymbolIdentity::parse(callback.as_str())?;
-            let mut path = parent.qualified_path().to_vec();
-            path.push(format!(
-                "{}#{}",
-                property.name, property.declaration_ordinal
-            ));
-            let language = parent.language();
-            let Ok(identity) = SymbolIdentity::new(owner.clone(), language.clone(), path) else {
+            let Some(identity) = argument_property_identity(owner, property, &callback)? else {
                 continue;
             };
             let id = SymbolId(identity.wire_identity());
+            let language = identity.language();
             if !occupied.insert(id.clone()) {
                 continue;
             }
@@ -326,6 +326,20 @@ impl Records {
     }
 }
 
+fn argument_property_identity(
+    owner: &SymbolOwner,
+    property: &SyntaxSymbol,
+    container: &SymbolId,
+) -> Result<Option<SymbolIdentity>, RiftError> {
+    let parent = SymbolIdentity::parse(container.as_str())?;
+    let mut path = parent.qualified_path().to_vec();
+    path.push(format!(
+        "{}#{}",
+        property.name, property.declaration_ordinal
+    ));
+    Ok(SymbolIdentity::new(owner.clone(), parent.language().clone(), path).ok())
+}
+
 fn written_callback(file: &CallbackFile<'_>, range: ByteRange) -> Option<Callback> {
     let callback = *file.scopes.resolve(range.start, range.end)?.as_ref()?;
     source_text(file.file.file.source(), callback.range)?
@@ -337,6 +351,7 @@ fn argument_properties<'file, Owner: Copy>(
     file: &'file CallbackFile<'_>,
     caller: impl Fn(ByteRange) -> Option<Owner>,
     placed: &BTreeSet<ByteRange>,
+    quoted: bool,
 ) -> Vec<(&'file SyntaxSymbol, ByteRange, Owner, bool)> {
     let syntax = file.file.file.syntax();
     let Some(facts) = syntax.static_facts() else {
@@ -386,12 +401,18 @@ fn argument_properties<'file, Owner: Copy>(
             || !source_text(source, member.holder)
                 .is_some_and(|text| text.starts_with('(') && text.ends_with(')'))
             || source_text(source, name) != Some(property.name.as_str())
-            || property.name.contains(['\'', '"', '`', '['])
+            || (property.name.contains(['\'', '"', '`', '['])
+                && (!quoted || !quoted::is_simple_quoted_name(&property.name)))
         {
             continue;
         }
+        let key = if quoted {
+            quoted::unquoted_name(&property.name)
+        } else {
+            &property.name
+        };
         fields
-            .entry((member.body, property.name.as_str()))
+            .entry((member.body, key))
             .and_modify(|candidate| *candidate = None)
             .or_insert(Some((
                 property,
@@ -400,11 +421,29 @@ fn argument_properties<'file, Owner: Copy>(
                 matches!(call.callee, StaticCallee::Member { .. }),
             )));
     }
+    let ordinary_bodies = if quoted {
+        fields
+            .iter()
+            .filter_map(|(&(body, _), candidate)| {
+                let (property, _, _, _) = candidate.as_ref()?;
+                (!quoted::is_simple_quoted_name(&property.name) && placed.contains(&property.range))
+                    .then_some(body)
+            })
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     fields
-        .into_values()
-        .flatten()
-        .filter(|(property, _, _, _)| {
-            names[property.qualified_name.as_str()] > 1 && !placed.contains(&property.range)
+        .into_iter()
+        .filter_map(|((body, _), candidate)| {
+            let (property, name, callback, member) = candidate?;
+            let shaped = if quoted {
+                quoted::is_simple_quoted_name(&property.name) && ordinary_bodies.contains(&body)
+            } else {
+                names[property.qualified_name.as_str()] > 1
+            };
+            (shaped && !placed.contains(&property.range))
+                .then_some((property, name, callback, member))
         })
         .collect()
 }

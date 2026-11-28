@@ -21,9 +21,11 @@ mod conditional_types;
 mod default_array_properties;
 mod disjoint_properties;
 mod function_arguments;
+mod method_return_pairs;
 mod mixed_shorthand;
 mod module_assignment_shorthand;
 mod private_return_functions;
+mod restored_arguments;
 mod scoped_initializer_children;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
@@ -1267,6 +1269,7 @@ struct LiteralOwners<'source> {
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
+    object_methods: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     array_initializers: BTreeMap<&'source str, ByteRange>,
     assigned_arrays: BTreeMap<ByteRange, &'source str>,
     assigned_literal_bodies: BTreeMap<ByteRange, &'source str>,
@@ -1368,6 +1371,10 @@ impl<'source> LiteralOwners<'source> {
                 .map(|&(_, _, call)| call)
                 .collect(),
             returned: returned_literal_owners(&functions, &object_methods, facts),
+            object_methods: object_methods
+                .into_values()
+                .map(|method| (method.item_range, method))
+                .collect(),
             array_initializers,
             assigned_arrays,
             assigned_literal_bodies,

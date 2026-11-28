@@ -44,6 +44,10 @@
         "named": true
       },
       {
+        "type": "member_expression",
+        "named": true
+      },
+      {
         "type": "nested_type_identifier",
         "named": true
       },
@@ -680,6 +684,10 @@
         },
         {
           "type": "spread_element",
+          "named": true
+        },
+        {
+          "type": "string",
           "named": true
         }
       ]
@@ -2834,6 +2842,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "member_expression",
+            "named": true
+          },
           {
             "type": "nested_type_identifier",
             "named": true
@@ -5699,10 +5711,6 @@
           "named": true
         },
         {
-          "type": "member_expression",
-          "named": true
-        },
-        {
           "type": "readonly_type",
           "named": true
         }
@@ -5735,10 +5743,6 @@
         },
         {
           "type": "infer_type",
-          "named": true
-        },
-        {
-          "type": "member_expression",
           "named": true
         },
         {

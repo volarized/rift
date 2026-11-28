@@ -58,6 +58,7 @@ impl Records {
                 Some(&checked_callback_modules),
             )?;
         }
+        self.retain_quoted_callback_argument_properties(owner, analyzed, limits)?;
         Ok(())
     }
 

@@ -95,20 +95,39 @@ impl<'source> FileScopes<'source> {
             }
         }
         self.place_disjoint_class_members(symbols, &classes, repeated, anchors, placed);
-        if !restored.is_empty()
-            && std::path::Path::new(file.path.as_str())
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("cjs"))
-        {
+        self.place_disjoint_children(file, facts, restored, repeated, anchors, placed);
+    }
+
+    fn place_disjoint_children(
+        &self,
+        file: &SelectedFile<'source>,
+        facts: &'source StaticFacts,
+        restored: BTreeMap<&'source str, &'source SyntaxSymbol>,
+        repeated: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+        placed: &mut ScopedIdentityAnchors,
+    ) {
+        let module = facts.has_javascript_module_statement();
+        let commonjs = std::path::Path::new(file.path.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cjs"));
+        if !restored.is_empty() && (module || commonjs) {
             let retained_anchors = anchors
                 .iter()
                 .filter(|(name, _)| !conflicting_assignment_name(name, repeated))
                 .map(|(name, id)| (name.clone(), id.clone()))
                 .collect();
             let fallback = self.unplaced_lexical_bindings(file, &retained_anchors, placed);
-            self.place_disjoint_owned_declarations(
-                file, facts, restored, anchors, &fallback, placed,
-            );
+            if module {
+                self.place_restored_argument_members(
+                    file, facts, &restored, anchors, &fallback, placed,
+                );
+            }
+            if commonjs {
+                self.place_disjoint_owned_declarations(
+                    file, facts, restored, anchors, &fallback, placed,
+                );
+            }
         }
     }
 

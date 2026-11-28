@@ -8729,3 +8729,93 @@ fn checked_local_reads_keep_prior_callback_argument_properties() {
         }
     }
 }
+
+#[test]
+fn checked_callback_arguments_keep_distinct_written_quote_and_nested_pairs() {
+    const ENTRY: &str = "module.exports = function helper() {};\n";
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    const SOURCE: &str = concat!(
+        "var check = require('checks');\n",
+        "check('first', function () {\n",
+        "    inspect({ ordinary: 1, 'detail': { nested: 1 }, [dynamic]: 1 });\n",
+        "    inspect({ ordinary: 2, \"ambiguous\": 1, 'ambiguous': 2 });\n",
+        "});\n",
+        "check('second', function () {\n",
+        "    inspect({ ordinary: 3, 'detail': { nested: 2 } });\n",
+        "});\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", ENTRY), ("test/options.cjs", SOURCE)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("quoted arguments in selected callbacks");
+    let graph = result.publication();
+    graph
+        .validate_facts()
+        .expect("exact authored argument properties");
+    let written = |source: &str| {
+        let start = SOURCE.find(source).expect("written source");
+        graph
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source == source
+                    && row.source_complete
+                    && row.range == module_runtime_range(start, source)
+            })
+            .expect("exact written property retained")
+    };
+    let parent = |id: &rift_protocol::read::SymbolId| {
+        graph
+            .objects
+            .iter()
+            .find(|row| row.id.as_ref() == Some(id))
+            .and_then(|row| row.container.as_ref())
+            .expect("property owner")
+    };
+    for (ordinal, quote, nested) in [
+        (0, "'detail': { nested: 1 }", "nested: 1"),
+        (1, "'detail': { nested: 2 }", "nested: 2"),
+    ] {
+        let quoted = written(quote);
+        let child = written(nested);
+        assert!(
+            parent(&quoted.symbol)
+                .as_str()
+                .ends_with(&format!("$callback%23{ordinal}"))
+        );
+        assert_eq!(parent(&child.symbol), &quoted.symbol);
+        assert_eq!(
+            parent(
+                &written(if ordinal == 0 {
+                    "ordinary: 1"
+                } else {
+                    "ordinary: 3"
+                })
+                .symbol
+            ),
+            parent(&quoted.symbol)
+        );
+    }
+    for declined in graph.declarations.iter().filter(|row| {
+        matches!(
+            row.source.as_str(),
+            "\"ambiguous\": 1" | "'ambiguous': 2" | "[dynamic]: 1"
+        )
+    }) {
+        let object = graph
+            .objects
+            .iter()
+            .find(|row| row.id.as_ref() == Some(&declined.symbol))
+            .expect("existing unscoped property");
+        assert!(object.container.is_none());
+    }
+    assert!(
+        !graph
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/inspect"))
+    );
+}
