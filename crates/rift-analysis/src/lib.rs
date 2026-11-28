@@ -32,8 +32,8 @@ pub use analyzer::{
     AnalyzedFile, PackageAnalysis, PackageAnalyzer, PackageLanguage, RustLspDeclaration,
     RustLspDeclarationAdmission, RustLspDeclarationFile, RustLspMacroAdmission,
     RustLspMacroDefinition, RustLspMacroDependency, RustLspMacroFile, RustLspMacroItems,
-    RustLspMacroSite, RustLspOperatorDefinition, RustLspOperatorEdges, RustLspOperatorSite,
-    StubForm, public_qualified_names,
+    RustLspMacroReference, RustLspMacroReferenceEdges, RustLspMacroSite, RustLspOperatorDefinition,
+    RustLspOperatorEdges, RustLspOperatorSite, StubForm, public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
 #[cfg(feature = "collector")]

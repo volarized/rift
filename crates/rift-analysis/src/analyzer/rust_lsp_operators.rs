@@ -284,24 +284,24 @@ fn method_names(source: &str, limit: usize) -> Result<BTreeSet<SourceRange>, Rif
         .collect())
 }
 
-struct Callable<'a> {
+pub(super) struct Callable<'a> {
     object: &'a Symbol,
-    declaration: &'a PackageSymbol,
+    pub(super) declaration: &'a PackageSymbol,
 }
 
-struct CheckedUnit<'a> {
-    unit: &'a PackageSourceUnit,
-    digest: FileDigest,
+pub(super) struct CheckedUnit<'a> {
+    pub(super) unit: &'a PackageSourceUnit,
+    pub(super) digest: FileDigest,
     callables: EnclosingDefinitions<Option<Callable<'a>>>,
 }
 
 impl CheckedUnit<'_> {
-    fn callable(&self, range: SourceRange) -> Option<&Callable<'_>> {
+    pub(super) fn callable(&self, range: SourceRange) -> Option<&Callable<'_>> {
         self.callables.resolve(range.start(), range.end())?.as_ref()
     }
 }
 
-fn checked_units<'a>(
+pub(super) fn checked_units<'a>(
     publication: &'a PackagePublication,
     paths: &BTreeSet<&str>,
 ) -> BTreeMap<&'a str, CheckedUnit<'a>> {

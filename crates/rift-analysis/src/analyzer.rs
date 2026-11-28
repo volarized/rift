@@ -77,6 +77,8 @@ pub use rust_lsp_macro_items::{
     RustLspMacroAdmission, RustLspMacroDefinition, RustLspMacroDependency, RustLspMacroFile,
     RustLspMacroItems, RustLspMacroSite,
 };
+mod rust_lsp_macro_references;
+pub use rust_lsp_macro_references::{RustLspMacroReference, RustLspMacroReferenceEdges};
 mod rust_lsp_operators;
 
 use join::ModuleRole;
