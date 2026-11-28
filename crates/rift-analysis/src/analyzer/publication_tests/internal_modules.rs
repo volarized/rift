@@ -1560,3 +1560,87 @@ fn checked_callable_initializers_keep_written_argument_shorthands() {
         }
     }
 }
+
+#[test]
+fn checked_commonjs_argument_pair_keeps_the_written_key_beside_its_binding() {
+    const META: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const ENTRY: &str = "module.exports = require('./holder.js');\n";
+    const SOURCE: &str = concat!(
+        "(function () {\n",
+        "    function keep(value, marker) { return value; }\n",
+        "    function collect(limit) {\n",
+        "        var values, marker = 0;\n",
+        "        values = [];\n",
+        "        if (limit > 0) values.push(limit);\n",
+        "        return keep({ kind: 1, values: values }, marker);\n",
+        "    }\n",
+        "    exports.collect = collect;\n",
+        "}());\n",
+    );
+    let collect = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![("index.js", ENTRY), ("holder.js", source)],
+            None,
+            Some(("package.json", META)),
+        )
+        .expect("selected CommonJS package")
+    };
+    let indexed = collect(SOURCE);
+    let graph = indexed.publication();
+    graph
+        .validate_facts()
+        .expect("exact CommonJS argument identity");
+    let owner = graph
+        .declarations
+        .iter()
+        .find(|row| row.source.starts_with("function collect(limit)"))
+        .expect("written function declaration");
+    let binding = graph
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source == "values"
+                && row.syntax_element_kind.as_deref() == Some("variable_declarator")
+        })
+        .expect("written local binding");
+    let property = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "values: values")
+        .expect("written argument pair");
+    assert_ne!(binding.symbol, property.symbol);
+    assert!(graph.objects.iter().any(|object| {
+        object.id.as_ref() == Some(&property.symbol)
+            && object.container.as_ref() == Some(&owner.symbol)
+    }));
+    let read =
+        u64::try_from(SOURCE.rfind("values").expect("written pair value")).expect("source offset");
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.to == binding.symbol
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == property.unit && site.range.start == read)
+    }));
+
+    for altered in [
+        SOURCE.replace("values: values", "values: values, values: values"),
+        SOURCE.replace(
+            "keep({ kind: 1, values: values }, marker)",
+            "keep(function () { return keep({ kind: 1, values: values }, marker); }, marker)",
+        ),
+    ] {
+        let indexed = collect(&altered);
+        let publication = indexed.publication();
+        assert!(!publication.declarations.iter().any(|row| {
+            row.source == "values: values"
+                && publication.objects.iter().any(|object| {
+                    object.id.as_ref() == Some(&row.symbol)
+                        && object.container.as_ref() == Some(&owner.symbol)
+                })
+        }));
+    }
+}

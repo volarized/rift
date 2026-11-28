@@ -137,8 +137,16 @@ impl<'source> FileScopes<'source> {
         let Some(owner) = owner else {
             return false;
         };
+        let Some(body) = owner.body_range else {
+            return false;
+        };
+        let lexical_body = body.encloses(scope);
+        let function_scoped_variable = variable
+            && owner.syntax_element_kind == Some("function_declaration")
+            && scope == owner.item_range
+            && body.encloses(local.item_range);
         if local.container.as_deref() != Some(owner.qualified_name.as_str())
-            || !owner.body_range.is_some_and(|body| body.encloses(scope))
+            || !(lexical_body || function_scoped_variable)
         {
             return false;
         }
@@ -164,6 +172,9 @@ impl<'source> FileScopes<'source> {
             let direct_return = returned.contains(&row.body)
                 && owners.returned.get(&row.body) == Some(&Some(owner.qualified_name.as_str()));
             let shorthand = member.syntax_element_kind == Some("shorthand_property_identifier");
+            let checked_call_pair = variable
+                && owner.syntax_element_kind == Some("function_declaration")
+                && same_name_argument_pair(file.source, owner, local, member, row, owners);
             let initializer_argument = initializer.is_some_and(|(range, _)| {
                 shorthand && direct_callable_argument(owners, row, range)
             });
@@ -174,6 +185,7 @@ impl<'source> FileScopes<'source> {
                     || (!object_method
                         && member.syntax_element_kind == Some("pair")
                         && direct_return)
+                    || checked_call_pair
             };
             let same_owner = if let Some((range, _)) = initializer {
                 owners
@@ -190,7 +202,8 @@ impl<'source> FileScopes<'source> {
                     .is_some_and(|retained| retained.item_range == owner.item_range)
             };
             admissible
-                && (!variable || direct_return || initializer_argument)
+                && (lexical_body || checked_call_pair)
+                && (!variable || direct_return || initializer_argument || checked_call_pair)
                 && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start
                 && scope.encloses(row.body)
@@ -226,6 +239,41 @@ fn direct_callable_argument(
             ) && call.callee_range.end <= member.holder.start
                 && call.range.encloses(member.holder)
                 && scope.encloses(call.range)
+                && !owners.bound_calls.contains(&call.range)
+        })
+    })
+}
+
+fn same_name_argument_pair(
+    source: &str,
+    owner: &SyntaxSymbol,
+    local: &SyntaxSymbol,
+    property: &SyntaxSymbol,
+    member: &StaticBodyMember,
+    owners: &LiteralOwners<'_>,
+) -> bool {
+    if property.syntax_element_kind != Some("pair") || property.name != local.name {
+        return false;
+    }
+    let item = property.item_range;
+    let written = usize::try_from(item.start)
+        .ok()
+        .zip(usize::try_from(item.end).ok())
+        .and_then(|(start, end)| source.get(start..end));
+    if !written
+        .and_then(|pair| pair.split_once(':'))
+        .is_some_and(|(key, value)| key.trim() == local.name && value.trim() == local.name)
+    {
+        return false;
+    }
+    owners.calls.get(&member.holder.end).is_some_and(|calls| {
+        calls.iter().any(|call| {
+            call.callee == StaticCallee::Direct
+                && call.callee_range.end <= member.holder.start
+                && call.range.encloses(member.holder)
+                && owner
+                    .body_range
+                    .is_some_and(|body| body.encloses(call.range))
                 && !owners.bound_calls.contains(&call.range)
         })
     })
