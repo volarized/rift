@@ -74,6 +74,55 @@ fn declaration_indexed_access_preserves_written_property_reference() {
     }
 }
 
+#[test]
+fn declaration_destructured_parameter_references_written_type_properties() {
+    const SOURCE: &str = concat!(
+        "declare const computed: unique symbol;\n",
+        "export declare function unpack(\n",
+        "  { transport, enabled: use, absent, [computed]: other }: { transport?: string; enabled: boolean },\n",
+        "): void;\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("written declaration file");
+    let graph = analysis.publication();
+    graph.validate_facts().expect("checked publication");
+    let declared_properties = graph
+        .declarations
+        .iter()
+        .filter(|row| row.syntax_element_kind.as_deref() == Some("property_signature"))
+        .map(|row| &row.symbol)
+        .collect::<BTreeSet<_>>();
+    let property_reference = |needle: &str, prefix: usize, size: usize| {
+        let offset = SOURCE.find(needle).expect("written selector") + prefix;
+        let start = u64::try_from(offset).expect("byte offset");
+        let end = start + u64::try_from(size).expect("name bytes");
+        let range = TextRange { start, end };
+        graph.edges.iter().find(|edge| {
+            declared_properties.contains(&edge.to)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range == range)
+        })
+    };
+    for property in ["transport", "enabled"] {
+        let edge = property_reference(property, 0, property.len())
+            .unwrap_or_else(|| panic!("missing selector {property}"));
+        assert!(edge.to.as_str().ends_with(&format!("/{property}")));
+    }
+    assert!(property_reference("enabled: use", "enabled: ".len(), "use".len()).is_none());
+    assert!(property_reference("absent", 0, "absent".len()).is_none());
+    assert!(property_reference("[computed]", 1, "computed".len()).is_none());
+}
+
 const ORDINARY: &str = concat!(
     "declare function prepare(item: string, optional?: number): string;\n",
     "declare class Shelf { open(entry: string): string; }\n",

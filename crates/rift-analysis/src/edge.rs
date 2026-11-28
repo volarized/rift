@@ -593,7 +593,7 @@ fn static_tail_starts(
         resolution.typescript_namespace_local_export_start.take(),
         resolution.python_dataclass_initializer_start.take(),
         resolution.python_assignment_expression_start.take(),
-        resolution.typescript_indexed_access_start.take(),
+        resolution.typescript_property_selector_start.take(),
     ]
 }
 

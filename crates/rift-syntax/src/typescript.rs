@@ -113,17 +113,17 @@ impl TypeScriptSyntaxProvider {
         ecmascript::checked_inline_import_types(&self.dialect.grammar(), source, limits)
     }
 
-    /// Checks the written name and literal of a TypeScript indexed access type.
+    /// Checks written property selectors in TypeScript declaration types.
     ///
     /// # Errors
     /// Returns a syntax refusal when the source is outside the accepted bounds or
     /// the parser cannot read it.
-    pub fn checked_indexed_accesses(
+    pub fn checked_property_selectors(
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<Vec<crate::CheckedIndexedAccess>, RiftError> {
-        ecmascript::checked_indexed_accesses(&self.dialect.grammar(), source, limits)
+    ) -> Result<Vec<crate::CheckedPropertySelector>, RiftError> {
+        ecmascript::checked_property_selectors(&self.dialect.grammar(), source, limits)
     }
 
     /// Checks captured property ranges against conditional type positions in their aliases.
