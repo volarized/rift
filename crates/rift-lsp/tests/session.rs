@@ -2750,7 +2750,7 @@ const BAD_RUST_DECLARATION_TOKENS: [[u32; 5]; 19] = [
     [1, 0, 0, 2, 12],  // Attribute string marked as a declaration.
     [1, 0, 0, 1, 8],   // Empty variable with the attribute modifier.
     [10, 0, 0, 2, 8],  // Attribute string outside the source.
-    [1, 0, 0, 2, 128], // String with a modifier outside the legend.
+    [1, 0, 0, 2, 256], // String with a modifier outside the legend.
     [5, 2, 0, 3, 16],  // Documentation comment before the line end.
     [5, 0, 0, 3, 0],   // Empty ordinary comment on a nonempty line.
     [6, 1, 0, 3, 16],  // Documentation comment past an empty line.
@@ -2765,8 +2765,8 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             "semanticTokensProvider": {
                 "full": true,
                 "legend": {
-                    "tokenTypes": ["parameter", "variable", "string", "comment", "function", "const"],
-                    "tokenModifiers": ["macro", "definition", "declaration", "attribute", "documentation", "constant", "associated"]
+                    "tokenTypes": ["parameter", "variable", "string", "comment", "function", "const", "method"],
+                    "tokenModifiers": ["macro", "definition", "declaration", "attribute", "documentation", "constant", "associated", "trait"]
                 }
             }
         }))
@@ -2784,34 +2784,35 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             .unwrap_or_default()
             .ends_with("/lib.rs")
     );
-    engine
-        .respond(
-            &id,
-            json!({"data": [
-                0, 4, 5, 0, 4,
-                0, 6, 4, 4, 5,
-                0, 4, 0, 2, 1,
-                1, 0, 0, 2, 0,
-                1, 0, 0, 2, 1,
-                1, 0, 0, 2, 8,
-                1, 1, 4, 2, 8,
-                0, 4, 0, 2, 8,
-                1, 1, 5, 1, 2,
-                0, 6, 5, 0, 5,
-                1, 0, 0, 3, 0,
-                1, 0, 0, 3, 16,
-                1, 1, 6, 3, 16,
-                0, 6, 0, 3, 16,
-                1, 1, 5, 1, 2,
-                1, 0, 3, 5, 37,
-                0, 4, 5, 5, 101,
-                0, 6, 3, 5, 36,
-                0, 4, 3, 5, 5,
-                0, 4, 3, 5, 45,
-                0, 4, 3, 5, 33
-            ]}),
-        )
-        .await;
+    let tokens = [
+        [0, 4, 5, 0, 4],
+        [0, 6, 4, 4, 5],
+        [0, 4, 0, 2, 1],
+        [1, 0, 0, 2, 0],
+        [1, 0, 0, 2, 1],
+        [1, 0, 0, 2, 8],
+        [1, 1, 4, 2, 8],
+        [0, 4, 0, 2, 8],
+        [1, 1, 5, 1, 2],
+        [0, 6, 5, 0, 5],
+        [1, 0, 0, 3, 0],
+        [1, 0, 0, 3, 16],
+        [1, 1, 6, 3, 16],
+        [0, 6, 0, 3, 16],
+        [1, 1, 5, 1, 2],
+        [1, 0, 3, 5, 37],
+        [0, 4, 5, 5, 101],
+        [0, 6, 3, 5, 36],
+        [0, 4, 3, 5, 5],
+        [0, 4, 3, 5, 45],
+        [0, 4, 3, 5, 33],
+        [1, 0, 5, 6, 197],
+        [0, 6, 8, 6, 69],
+        [0, 9, 6, 6, 133],
+        [0, 7, 5, 6, 196],
+        [0, 6, 4, 6, 193],
+    ];
+    engine.respond(&id, json!({"data": tokens.concat()})).await;
     for bad_token in BAD_RUST_DECLARATION_TOKENS {
         let (id, _) = engine
             .expect_request("textDocument/semanticTokens/full")
@@ -2836,6 +2837,7 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
     const SOURCE: &str = concat!(
         "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma delta",
         "\r\n\r\n\r\n fenced\r\n after\r\nTOP FIELD RAW NOT TAG USE",
+        "\r\ntrait inherent orphan plain used",
     );
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
@@ -2905,6 +2907,11 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
         })
         .collect::<Vec<_>>();
     assert_eq!(constants, [("TOP", false), ("FIELD", true)]);
+    let methods = observations.macro_trait_methods();
+    assert_eq!(methods.len(), 1);
+    let start = usize::try_from(methods[0].start()).expect("start");
+    let end = usize::try_from(methods[0].end()).expect("end");
+    assert_eq!(&SOURCE[start..end], "trait");
     for _ in BAD_RUST_DECLARATION_TOKENS {
         assert_eq!(
             session

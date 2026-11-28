@@ -14,6 +14,7 @@ const MACRO: SemanticTokenModifier = SemanticTokenModifier::new("macro");
 const ATTRIBUTE: SemanticTokenModifier = SemanticTokenModifier::new("attribute");
 const CONSTANT: SemanticTokenModifier = SemanticTokenModifier::new("constant");
 const ASSOCIATED: SemanticTokenModifier = SemanticTokenModifier::new("associated");
+const TRAIT: SemanticTokenModifier = SemanticTokenModifier::new("trait");
 const RUST_CONST: SemanticTokenType = SemanticTokenType::new("const");
 const TOKENS_MAX: usize = 262_144;
 
@@ -61,6 +62,7 @@ pub struct RustDeclarationTokens {
     tokens: Vec<RustDeclarationToken>,
     macro_tokens: Vec<RustMacroDeclarationToken>,
     macro_constants: Vec<RustMacroConstantToken>,
+    macro_trait_methods: Vec<SourceRange>,
 }
 
 impl RustDeclarationTokens {
@@ -93,6 +95,12 @@ impl RustDeclarationTokens {
     pub fn macro_constants(&self) -> &[RustMacroConstantToken] {
         &self.macro_constants
     }
+
+    /// Macro-tagged associated trait method names pending original owner and expansion proof.
+    #[must_use]
+    pub fn macro_trait_methods(&self) -> &[SourceRange] {
+        &self.macro_trait_methods
+    }
 }
 
 pub(crate) fn offered() -> SemanticTokensClientCapabilities {
@@ -105,6 +113,7 @@ pub(crate) fn offered() -> SemanticTokensClientCapabilities {
             SemanticTokenType::VARIABLE,
             SemanticTokenType::PARAMETER,
             SemanticTokenType::FUNCTION,
+            SemanticTokenType::METHOD,
             RUST_CONST,
         ],
         token_modifiers: vec![
@@ -114,6 +123,7 @@ pub(crate) fn offered() -> SemanticTokensClientCapabilities {
             ATTRIBUTE,
             CONSTANT,
             ASSOCIATED,
+            TRAIT,
         ],
         formats: vec![TokenFormat::RELATIVE],
         overlapping_token_support: Some(false),
@@ -131,6 +141,7 @@ pub(crate) struct RustTokenLegend<'legend> {
     documentation: u32,
     constant: u32,
     associated: u32,
+    trait_method: u32,
     all_modifiers: u32,
 }
 
@@ -144,6 +155,7 @@ impl<'legend> RustTokenLegend<'legend> {
         let mut documentation = 0;
         let mut constant = 0;
         let mut associated = 0;
+        let mut trait_method = 0;
         for (index, modifier) in legend.token_modifiers.iter().enumerate() {
             let bit = 1_u32.checked_shl(u32::try_from(index).ok()?)?;
             if *modifier == MACRO {
@@ -152,6 +164,8 @@ impl<'legend> RustTokenLegend<'legend> {
                 attribute |= bit;
             } else if *modifier == CONSTANT {
                 constant |= bit;
+            } else if *modifier == TRAIT {
+                trait_method |= bit;
             } else if *modifier == ASSOCIATED {
                 associated |= bit;
             } else if *modifier == SemanticTokenModifier::DOCUMENTATION {
@@ -170,6 +184,7 @@ impl<'legend> RustTokenLegend<'legend> {
             documentation,
             constant,
             associated,
+            trait_method,
             all_modifiers,
         })
     }
@@ -210,6 +225,7 @@ impl<'legend> RustTokenLegend<'legend> {
         let mut tokens = Vec::new();
         let mut macro_tokens = Vec::new();
         let mut macro_constants = Vec::new();
+        let mut macro_trait_methods = Vec::new();
         for token in data {
             let token_type = self.types.get(usize::try_from(token.token_type).ok()?)?;
             let modifiers = token.token_modifiers_bitset;
@@ -238,6 +254,11 @@ impl<'legend> RustTokenLegend<'legend> {
                             range,
                             associated: modifiers & self.associated != 0,
                         });
+                    } else if token_type == &SemanticTokenType::METHOD
+                        && modifiers & self.associated != 0
+                        && modifiers & self.trait_method != 0
+                    {
+                        macro_trait_methods.push(range);
                     }
                 }
                 continue;
@@ -255,6 +276,7 @@ impl<'legend> RustTokenLegend<'legend> {
             tokens,
             macro_tokens,
             macro_constants,
+            macro_trait_methods,
         })
     }
 }
