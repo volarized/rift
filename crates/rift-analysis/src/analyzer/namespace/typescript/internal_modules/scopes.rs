@@ -23,6 +23,7 @@ mod disjoint_properties;
 mod function_arguments;
 mod mixed_shorthand;
 mod private_return_functions;
+mod scoped_initializer_children;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
 /// only when they bind it in the same place: overloads, merged interfaces and namespaces,

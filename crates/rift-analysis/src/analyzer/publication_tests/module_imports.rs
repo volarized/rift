@@ -8126,3 +8126,71 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
         );
     }
 }
+
+#[test]
+fn initializer_members_stay_with_the_separately_placed_local_binding() {
+    const SOURCE: &str = concat!(
+        "export function make() {\n",
+        "  const changes = { updated: 1, deleted: 2 };\n",
+        "  return { changes };\n",
+        "}\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#;
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.mjs", "export const keep = 0;"),
+            ("body.mjs", SOURCE),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("placed initializer and shorthand");
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("checked initializer facts");
+    let variable = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source_complete
+                && row.source.starts_with("changes = {")
+                && row.syntax_element_kind.as_deref() == Some("variable_declarator")
+        })
+        .expect("written local binding");
+    let shorthand = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source_complete
+                && row.source == "changes"
+                && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+        })
+        .expect("separately written returned property");
+    assert_ne!(variable.symbol, shorthand.symbol);
+
+    for (key, source) in [("updated", "updated: 1"), ("deleted", "deleted: 2")] {
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.symbol.as_str() == format!("{}/{key}", variable.symbol.as_str())
+            })
+            .expect("written member of variable initializer");
+        assert_eq!(
+            row.range,
+            module_runtime_range(SOURCE.find(source).expect("physical member"), source),
+        );
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&variable.symbol)
+        }));
+        assert!(!publication.declarations.iter().any(|child| {
+            child.symbol.as_str() == format!("{}/{key}", shorthand.symbol.as_str())
+        }));
+    }
+}
