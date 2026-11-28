@@ -42,10 +42,15 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+mod assignment_expressions;
 mod declared_exports;
 mod overload;
 mod property;
 mod variable_scopes;
+
+pub(crate) use assignment_expressions::{
+    KIND as ASSIGNMENT_EXPRESSION_BINDING_KIND, direct_owner as direct_assignment_expression_owner,
+};
 
 #[cfg(test)]
 mod declaration_tests;
@@ -1258,7 +1263,8 @@ impl GrammarRules for PythonRules {
                 .parameter_declaration(visited, text)
                 .or_else(|| self.pattern_declaration(visited, text))
                 .or_else(|| self.loop_declaration(visited, text))
-                .or_else(|| self.comprehension_declaration(visited, text)));
+                .or_else(|| self.comprehension_declaration(visited, text))
+                .or_else(|| assignment_expressions::declaration(visited, text)));
         }
         if id == self.kinds.attribute {
             let Some(_) = self.attribute_method(visited, text) else {
@@ -1436,6 +1442,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         retain_comprehension_bindings(&mut symbols, &static_facts);
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         retain_loop_bindings(&mut symbols, &static_facts, source.text);
+        assignment_expressions::retain(&mut symbols, &mut static_facts, source.text);
         retain_parameters(
             &mut symbols,
             &mut static_facts,
@@ -1555,7 +1562,9 @@ fn retain_loop_bindings(
         .collect::<BTreeMap<_, _>>();
     let incumbent = symbols
         .iter()
-        .filter(|symbol| !symbol.is_python_loop_binding())
+        .filter(|symbol| {
+            !symbol.is_python_loop_binding() && !symbol.is_python_assignment_expression_binding()
+        })
         .map(|symbol| symbol.qualified_name.as_str())
         .collect::<BTreeSet<_>>();
     let withheld = symbols
@@ -1657,6 +1666,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
         LOOP_BINDING_KIND_WORD,
+        ASSIGNMENT_EXPRESSION_BINDING_KIND,
         COMPREHENSION_BINDING_KIND,
         METHOD_KIND_WORD,
         TYPE_ALIAS_KIND_WORD,
