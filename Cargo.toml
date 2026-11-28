@@ -161,7 +161,7 @@ toasty-driver-sqlite = { version = "=0.11.0", path = "vendor/toasty-driver-sqlit
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 toml_edit = { version = "=0.25.15", default-features = false, features = ["parse", "display"] }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
-syn = { version = "2.0.119", features = ["full"] }
+syn = { version = "3.0.3", features = ["full"] }
 # The process sampler reads one process: its resident and virtual memory, CPU time and usage,
 # open files, and disk bytes. `system` alone; 0.39 builds against the `windows` 0.62 the
 # lock already holds.
