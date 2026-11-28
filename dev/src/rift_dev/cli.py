@@ -302,9 +302,26 @@ def release(tag: Annotated[str, typer.Argument()]) -> None:
 
 
 @test_app.command("unit")
-def unit_tests(archive: ArchiveArgument = None) -> None:
-    """Run the unit suite under coverage, held to the line floor."""
-    suites.unit(archive)
+def unit_tests(
+    archive: ArchiveArgument = None,
+    report: Annotated[
+        bool,
+        typer.Option("--report/--no-report", help="Write and check the LCOV report."),
+    ] = True,
+) -> None:
+    """Run the unit suite under coverage."""
+    suites.unit(archive, report=report)
+
+
+@test_app.command("unit-report")
+def unit_report(
+    archive: Annotated[
+        Path | None,
+        typer.Argument(help="The nextest archive already used by the unit suite."),
+    ] = None,
+) -> None:
+    """Write the unit LCOV report and enforce its line coverage floor."""
+    suites.unit_report(archive)
 
 
 @test_app.command("doctest")

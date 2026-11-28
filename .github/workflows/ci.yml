@@ -240,9 +240,9 @@ jobs:
     needs: rust-build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    # Allow the measured 22m42s archive delivery plus 14m17s for the other steps.
-    # The test step and nextest keep their own execution deadlines.
-    timeout-minutes: 40
+    # Allow the measured 22m42s archive delivery, 12 minutes for the tests,
+    # and 5 minutes for the coverage report, with time for setup and uploads.
+    timeout-minutes: 45
     permissions:
       contents: read
 
@@ -277,16 +277,17 @@ jobs:
           rustup toolchain install 1.98 --profile minimal
           --component rustfmt,clippy,llvm-tools-preview,rust-src
 
-      # Test binaries come from this revision's build archive. Nextest bounds the
-      # run at the `ci` profile's 480 s global timeout; the step adds what runs
-      # outside that bound, measured on six runs (2026-10-28/29) that still ran a
-      # second clean: up to 82 s for that clean, which resolves the registry index
-      # on a fresh runner, 70 s before the first test (cargo-llvm-cov's own clean
-      # and archive extraction) and 38 s of report. 480 s plus 190 s leaves 50 s
-      # in 12 minutes.
-      - run: just test target/fast.tar.zst
+      # Nextest bounds the tests at the `ci` profile's 480 s global timeout.
+      # The test step also covers the coverage clean and archive extraction.
+      - name: Run Rust tests
+        run: just test target/fast.tar.zst --no-report
         id: rust_tests
         timeout-minutes: 12
+        env:
+          NEXTEST_PROFILE: ci
+      - name: Report Rust coverage
+        run: uv run --locked --project dev rift-dev test unit-report target/fast.tar.zst
+        timeout-minutes: 5
         env:
           NEXTEST_PROFILE: ci
       - name: Preserve Rust coverage and test results

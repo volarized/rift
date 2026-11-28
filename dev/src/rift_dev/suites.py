@@ -186,8 +186,8 @@ def coverage_percentage(report: str) -> float:
     return covered * 100 / count if count else 0.0
 
 
-def unit(archive: Path | None) -> None:
-    """Run the unit suite once under one coverage report.
+def unit(archive: Path | None, *, report: bool = True) -> None:
+    """Run the unit suite once and optionally write and check its report.
 
     Unit tests use local fixtures and require no language servers or model
     downloads. `cargo llvm-cov nextest` cleans before it runs: cargo-llvm-cov 0.8.7
@@ -211,16 +211,22 @@ def unit(archive: Path | None) -> None:
         )
     )
 
-    report_arguments = (
-        "llvm-cov",
-        "report",
+    if report:
+        unit_report(archive)
+
+
+def unit_report(archive: Path | None) -> None:
+    """Write the unit LCOV report and enforce its line coverage floor."""
+    arguments = [
         "--ignore-filename-regex",
         GENERATED_CLIENT,
-    )
-    report = CargoCommand(*report_arguments, "--lcov", "--output-path", "lcov.info")
+        "--lcov",
+        "--output-path",
+        "lcov.info",
+    ]
     if archive is not None:
-        report.with_args("--nextest-archive-file", archive)
-    report.run()
+        arguments.extend(("--nextest-archive-file", str(archive)))
+    coverage_report(arguments)
     percentage = coverage_percentage((REPOSITORY / "lcov.info").read_text())
     if percentage < float(COVERAGE_FLOOR):
         raise ValueError(f"line coverage {percentage:.2f}% is below {COVERAGE_FLOOR}%")
