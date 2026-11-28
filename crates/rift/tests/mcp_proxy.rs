@@ -1006,16 +1006,7 @@ fn text_of(result: &CallToolResult) -> TestResult<&str> {
 /// Checks the one generated blank node alongside every fixed term in the fixture.
 fn assert_term_kind_text(text: &str) -> TestResult {
     let mut lines = text.lines();
-    let max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
-    assert_eq!(
-        lines.next(),
-        Some(
-            format!(
-                "Query finished: 1 results found on 1/1 pages with {max_results} results per page."
-            )
-            .as_str()
-        )
-    );
+    assert_eq!(lines.next(), Some("Row 1 | page 1/1"));
     assert_eq!(lines.next(), Some(""));
     assert!(
         lines
@@ -1177,9 +1168,8 @@ async fn assert_paged_index_text(
 ) -> TestResult {
     let max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
     let total = max_results + 1;
-    let mut expected = format!(
-        "Query finished: {total} results found on 1/2 pages with {max_results} results per page.\n\n| ?index |\n| ------ |\n"
-    );
+    let mut expected =
+        format!("Rows 1-{max_results} of {total} | page 1/2\n\n| ?index |\n| ------ |\n");
     for index in 0..max_results {
         writeln!(expected, "| {index:<6} |")?;
     }
@@ -1204,7 +1194,7 @@ async fn assert_paged_index_text(
     assert_eq!(
         text_of(&held)?,
         format!(
-            "Query finished: {total} results found on 2/2 pages with {max_results} results per page.\n\n| ?index |\n| ------ |\n| {max_results:<6} |\n"
+            "Row {total} of {total} | page 2/2\n\n| ?index |\n| ------ |\n| {max_results:<6} |\n"
         )
     );
     Ok(())

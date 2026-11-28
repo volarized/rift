@@ -114,9 +114,9 @@ bindings and projected variable order follow SPARQL. Graph answers use RDF set s
 
 ### Search result text [#search-result-text]
 
-Search text for a nonempty result set starts with a summary of the total count, current page,
-page count, and page size. It uses `pagination.total`, `pagination.page`, `pagination.pages`,
-and `pagination.max_results`. A blank line separates the summary from the Markdown table.
+Search text for a nonempty result set starts with the rows on the current page, numbered from
+one across the result set. The heading gives the total when the result set has multiple rows and
+shows the current page and page count. A blank line separates it from the Markdown table.
 
 A `SELECT` table has one column per projected variable, in projection order, with `?` before
 each variable name. An unbound variable leaves an empty cell. A graph table has `subject`,
@@ -130,7 +130,8 @@ A query with zero results returns one sentence that points to the query examples
 
 <ReadExample name="empty-search" />
 
-A page past the last page of a nonempty result set keeps the counts and has a table with no rows.
+A page past the last page of a nonempty result set shows `0 rows` with the total and page numbers.
+Its table has no rows.
 
 ### Full-text search [#search-fulltext]
 

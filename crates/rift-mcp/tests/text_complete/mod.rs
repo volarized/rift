@@ -311,18 +311,26 @@ fn query_heading(
     lines: &mut std::str::Lines<'_>,
     structured: &serde_json::Value,
 ) -> Result<bool, String> {
-    let pagination = &structured["pagination"];
-    let (total, page, pages, max_results) = if structured["answer"]["result"] == "boolean" {
-        (1, 1, 1, 1)
-    } else {
+    let answer = &structured["answer"];
+    let rows = match answer["result"].as_str() {
+        Some("boolean") => 1,
+        Some("bindings") => answer["bindings"].as_array().ok_or("binding rows")?.len() as u64,
+        Some("graph") => answer["triples"].as_array().ok_or("query triples")?.len() as u64,
+        _ => return Err("unknown query result".into()),
+    };
+    let (total, page, pages, offset) = if let Some(pagination) = structured.get("pagination") {
+        let page = pagination["page"].as_u64().ok_or("query page")?;
+        let size = pagination["max_results"]
+            .as_u64()
+            .ok_or("query results per page")?;
         (
             pagination["total"].as_u64().ok_or("query total")?,
-            pagination["page"].as_u64().ok_or("query page")?,
+            page,
             pagination["pages"].as_u64().ok_or("query total pages")?,
-            pagination["max_results"]
-                .as_u64()
-                .ok_or("query results per page")?,
+            page.saturating_sub(1).saturating_mul(size),
         )
+    } else {
+        (rows, 1, 1, 0)
     };
     if total == 0 {
         if lines.next()
@@ -333,9 +341,17 @@ fn query_heading(
         }
         return Ok(false);
     }
-    let heading = format!(
-        "Query finished: {total} results found on {page}/{pages} pages with {max_results} results per page."
-    );
+    let range = match rows {
+        0 => format!("0 rows of {total}"),
+        1 if total == 1 => "Row 1".to_owned(),
+        1 => format!("Row {} of {total}", offset.saturating_add(1)),
+        _ => format!(
+            "Rows {}-{} of {total}",
+            offset.saturating_add(1),
+            offset.saturating_add(rows)
+        ),
+    };
+    let heading = format!("{range} | page {page}/{pages}");
     if lines.next() != Some(heading.as_str()) || lines.next() != Some("") {
         return Err("query heading differs".into());
     }
@@ -444,7 +460,7 @@ mod tests {
     use super::*;
 
     const ASK_TRUE: &str = concat!(
-        "Query finished: 1 results found on 1/1 pages with 1 results per page.\n\n",
+        "Row 1 | page 1/1\n\n",
         "| result |\n| ------ |\n| true   |\n",
     );
 
@@ -464,7 +480,7 @@ mod tests {
             "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 1}
         });
         let text = concat!(
-            "Query finished: 1 results found on 1/1 pages with 10 results per page.\n\n",
+            "Row 1 | page 1/1\n\n",
             "| ?edge                                    |\n| ---------------------------------------- |\n| \\_:edge (providers: engine, lsp, static) |\n",
         );
         let included = result_of(text, answer.clone());

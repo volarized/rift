@@ -150,17 +150,17 @@ fn render_result(
     result: &QueryResult,
     display: &QueryDisplay,
 ) -> Result<(), TextError> {
-    let (total, page, pages, max_results) = result.pagination.as_ref().map_or_else(
-        || {
-            let total = match &result.answer {
-                QueryAnswer::Bindings { bindings, .. } => bindings.len() as u64,
-                QueryAnswer::Graph { triples } => triples.len() as u64,
-                QueryAnswer::Boolean { .. } => 1,
-            };
-            (total, 1, 1, total)
-        },
-        |page| (page.total, page.page, page.pages, page.max_results),
-    );
+    let rows = match &result.answer {
+        QueryAnswer::Bindings { bindings, .. } => bindings.len(),
+        QueryAnswer::Graph { triples } => triples.len(),
+        QueryAnswer::Boolean { .. } => 1,
+    };
+    let (total, page, pages, offset) = result
+        .pagination
+        .as_ref()
+        .map_or((rows as u64, 1, 1, 0), |page| {
+            (page.total, page.page, page.pages, page.offset())
+        });
     if total == 0 {
         return out.raw_line(
             0,
@@ -168,12 +168,17 @@ fn render_result(
         );
     }
 
-    out.raw_line(
-        0,
-        &format!(
-            "Query finished: {total} results found on {page}/{pages} pages with {max_results} results per page."
-        ),
-    )?;
+    let first = offset.saturating_add(1);
+    let range = match (rows, total) {
+        (0, _) => format!("0 rows of {total}"),
+        (1, 1) => "Row 1".to_owned(),
+        (1, _) => format!("Row {first} of {total}"),
+        _ => {
+            let last = offset.saturating_add(rows);
+            format!("Rows {first}-{last} of {total}")
+        }
+    };
+    out.raw_line(0, &format!("{range} | page {page}/{pages}"))?;
     out.blank_line()?;
 
     let terms = Terms {
@@ -406,7 +411,7 @@ mod tests {
         assert_eq!(
             output,
             concat!(
-                "Query finished: 3 results found on 1/1 pages with 10 results per page.\n\n",
+                "Rows 1-3 of 3 | page 1/1\n\n",
                 "| ?blank          | ?value | ?typed                         | ?predicate |\n",
                 "| --------------- | ------ | ------------------------------ | ---------- |\n",
                 "| \\_:first-retain | 42     | \"invalid boolean\"^^xsd:boolean | :name      |\n",
@@ -444,7 +449,7 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                "Query finished: 4 results found on 2/2 pages with 2 results per page.\n\n",
+                "Rows 3-4 of 4 | page 2/2\n\n",
                 "| subject                                       | predicate | object |\n",
                 "| --------------------------------------------- | --------- | ------ |\n",
                 "| \\_:anonymous (providers: engine, lsp, static) | :name     | \"Rift\" |\n",
@@ -479,7 +484,7 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                "Query finished: 1 results found on 1/1 pages with 1 results per page.\n\n",
+                "Row 1 | page 1/1\n\n",
                 "| ?source                 | ?rank               | ?symbol                               |\n",
                 "| ----------------------- | ------------------- | ------------------------------------- |\n",
                 "| \"a\\|b\\\\\\\\c\\\\n\\<t>\\*x\\*\" | \"1.0E0\"^^xsd:double | \\<rift://symbol/local/rust/app/retry> |\n",
@@ -496,9 +501,7 @@ mod tests {
             }))?;
             assert_eq!(
                 text,
-                format!(
-                    "Query finished: 1 results found on 1/1 pages with 1 results per page.\n\n| result |\n| ------ |\n| {value:<6} |\n"
-                )
+                format!("Row 1 | page 1/1\n\n| result |\n| ------ |\n| {value:<6} |\n")
             );
         }
         Ok(())
@@ -519,12 +522,34 @@ mod tests {
         );
         assert_eq!(
             text(1, 1, serde_json::json!([]))?,
-            "Query finished: 1 results found on 2/1 pages with 1 results per page.\n\n| result |\n| ------ |\n"
+            "0 rows of 1 | page 2/1\n\n| result |\n| ------ |\n"
         );
         assert_eq!(
             text(2, 2, serde_json::json!([{}]))?,
-            "Query finished: 2 results found on 2/2 pages with 1 results per page.\n\n| result |\n| ------ |\n|        |\n"
+            "Row 2 of 2 | page 2/2\n\n| result |\n| ------ |\n|        |\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn row_heading_uses_actual_page_rows() -> Result<(), Box<dyn std::error::Error>> {
+        for (page, total, rows, heading) in [
+            (2, 24, 10, "Rows 11-20 of 24 | page 2/3"),
+            (3, 24, 4, "Rows 21-24 of 24 | page 3/3"),
+            (3, 21, 1, "Row 21 of 21 | page 3/3"),
+            (4, 24, 0, "0 rows of 24 | page 4/3"),
+        ] {
+            let text = raw_answer(serde_json::json!({
+                "answer": {
+                    "result": "bindings",
+                    "variables": ["value"],
+                    "bindings": vec![serde_json::json!({}); rows]
+                },
+                "pagination": rift_protocol::read::Pagination::new(page, 10, total),
+            }))?;
+            assert_eq!(text.lines().next(), Some(heading));
+            assert_eq!(text.lines().count(), 4 + rows);
+        }
         Ok(())
     }
 

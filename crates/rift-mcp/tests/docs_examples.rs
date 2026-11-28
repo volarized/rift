@@ -220,11 +220,7 @@ fn check_search_examples(examples: &Map<String, Value>) -> TestResult<()> {
     let selected = &examples["select-symbols"];
     let table = selected["text"].as_str().ok_or("search text")?;
     let mut lines = table.lines();
-    assert_eq!(
-        lines.next(),
-        Some("Query finished: 5 results found on 1/1 pages with 10 results per page."),
-        "{table}"
-    );
+    assert_eq!(lines.next(), Some("Rows 1-5 of 5 | page 1/1"), "{table}");
     assert_eq!(lines.next(), Some(""), "{table}");
     let header = lines.next().ok_or("search table header")?;
     assert_eq!(
@@ -251,6 +247,15 @@ fn check_search_examples(examples: &Map<String, Value>) -> TestResult<()> {
         rows.iter()
             .all(|row| row.starts_with("| ") && row.ends_with(" |")),
         "{table}"
+    );
+
+    let boolean = &examples["edge-provider"];
+    assert_eq!(
+        boolean["text"]
+            .as_str()
+            .and_then(|text| text.lines().next()),
+        Some("Row 1 | page 1/1"),
+        "{boolean}"
     );
 
     let empty = &examples["empty-search"];
