@@ -7946,3 +7946,90 @@ fn secondary_default_array_keeps_each_written_property_tree() {
             .any(|row| { row.symbol.as_str() == format!("{}/beta", right.symbol.as_str()) })
     );
 }
+
+#[test]
+fn typescript_class_methods_keep_repeated_direct_argument_properties() {
+    const SOURCE: &str = concat!(
+        "interface Command { kind: string; line: number; }\n",
+        "export class Reader {\n",
+        "  choose(ready: boolean) {\n",
+        "    const keep = (value: Command) => value;\n",
+        "    if (ready) return keep({ kind: 'ready', line: 1 } as Command);\n",
+        "    return keep({ kind: 'pending', line: 2 });\n",
+        "  }\n",
+        "}\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.ts"}"#;
+    let analyze = |text: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.ts", "export { Reader } from './worker.js';"),
+                ("worker.ts", text),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("analyzed written method")
+    };
+    let result = analyze(SOURCE);
+    let found = result.publication();
+    found.validate_facts().expect("exact written arguments");
+    let method = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/Reader/choose"))
+        .expect("checked method");
+    let mut identities = BTreeSet::new();
+    for written in ["kind: 'ready'", "line: 1", "kind: 'pending'", "line: 2"] {
+        let start = SOURCE.find(written).expect("property source");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == method.unit
+                    && row.source_complete
+                    && row.source == written
+                    && row.range == module_runtime_range(start, written)
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("written property");
+        assert!(identities.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&method.symbol)
+        }));
+    }
+    assert!(found.declarations.iter().any(|row| {
+        row.source == "kind: string"
+            && row.syntax_element_kind.as_deref() == Some("property_signature")
+            && !identities.contains(&row.symbol)
+    }));
+
+    let computed = SOURCE.replace("return keep(", "return registry[dynamic](");
+    let detached = SOURCE.replace("export class Reader {", "export const Reader = {");
+    for negative in [&computed, &detached] {
+        assert!(
+            !analyze(negative)
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| {
+                    row.source == "kind: 'ready'"
+                        && row.syntax_element_kind.as_deref() == Some("pair")
+                })
+        );
+    }
+
+    let unknown = SOURCE.replace("return keep(", "return missing(");
+    let control = analyze(&unknown);
+    assert!(
+        !control.publication().edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/missing")
+        })
+    );
+    assert!(control.publication().declarations.iter().any(|row| {
+        row.source == "kind: 'ready'" && row.syntax_element_kind.as_deref() == Some("pair")
+    }));
+}

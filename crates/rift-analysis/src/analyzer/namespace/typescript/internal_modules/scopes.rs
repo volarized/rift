@@ -381,8 +381,10 @@ impl<'source> FileScopes<'source> {
         repeated: &BTreeSet<&str>,
         anchors: &BTreeMap<String, SymbolId>,
     ) -> ScopedIdentityAnchors {
+        let language = file.syntax.language().name.as_str();
+        let typed = language == "typescript";
         if repeated.is_empty()
-            || file.syntax.language().name != "javascript"
+            || !matches!(language, "javascript" | "typescript")
             || file.syntax.has_errors()
             || file.syntax.left_out_declaration_count() != 0
         {
@@ -397,9 +399,10 @@ impl<'source> FileScopes<'source> {
             }
         }
         candidates.retain(|_, group| {
-            group
-                .iter()
-                .all(|symbol| ordinary_private_property(symbol, file.source))
+            group.iter().all(|symbol| {
+                (!typed || symbol.syntax_element_kind == Some("pair"))
+                    && ordinary_private_property(symbol, file.source)
+            })
         });
         let Some(facts) = file
             .syntax
@@ -417,9 +420,15 @@ impl<'source> FileScopes<'source> {
                 let Some(row) = self.body_members.get(&declaration.item_range) else {
                     continue;
                 };
-                if self.of(declaration, file) != Scope::Body(row.body, false)
-                    || !owners.proves_body(declaration, row)
-                {
+                if self.of(declaration, file) != Scope::Body(row.body, false) {
+                    continue;
+                }
+                let proven = if typed {
+                    owners.proves_typed_method_argument(declaration, row)
+                } else {
+                    owners.proves_body(declaration, row)
+                };
+                if !proven {
                     continue;
                 }
                 groups
@@ -451,23 +460,25 @@ impl<'source> FileScopes<'source> {
                 scoped.insert(name.to_owned(), overrides);
             }
         }
-        self.scope_initialized_properties(
-            file,
-            facts,
-            anchors,
-            &owners,
-            &mut occupied,
-            &mut scoped,
-        );
-        self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
-        self.scope_named_function_arguments(
-            file,
-            repeated,
-            anchors,
-            &owners,
-            &mut occupied,
-            &mut scoped,
-        );
+        if !typed {
+            self.scope_initialized_properties(
+                file,
+                facts,
+                anchors,
+                &owners,
+                &mut occupied,
+                &mut scoped,
+            );
+            self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
+            self.scope_named_function_arguments(
+                file,
+                repeated,
+                anchors,
+                &owners,
+                &mut occupied,
+                &mut scoped,
+            );
+        }
         scoped
     }
 
@@ -1359,6 +1370,31 @@ impl<'source> LiteralOwners<'source> {
             assigned_arrays,
             assigned_literal_bodies,
         }
+    }
+
+    /// Requires the direct argument and its nearest placed class method.
+    fn proves_typed_method_argument(
+        &self,
+        property: &SyntaxSymbol,
+        member: &StaticBodyMember,
+    ) -> bool {
+        let Some((_, Some(method))) = self.enclosing.resolve(member.body.start, member.body.end)
+        else {
+            return false;
+        };
+        method.syntax_element_kind == Some("method_definition")
+            && property.container.as_deref() == Some(method.qualified_name.as_str())
+            && self.calls.get(&member.holder.end).is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call.callee == StaticCallee::Direct
+                        && call.callee_range.end <= member.holder.start
+                        && call.range.encloses(member.holder)
+                        && method
+                            .body_range
+                            .is_some_and(|body| body.encloses(call.range))
+                        && !self.bound_calls.contains(&call.range)
+                })
+            })
     }
 
     fn proves_body(&self, property: &SyntaxSymbol, member: &StaticBodyMember) -> bool {
