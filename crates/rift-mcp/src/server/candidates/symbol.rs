@@ -238,10 +238,8 @@ mod tests {
         let source = declaration.source.as_ref().ok_or("source is selected")?;
         assert_eq!(source.span.unit.as_str(), "rift://source/project/index.ts");
         assert_eq!(source.span.range, declaration.binding.range);
-        assert_eq!(
-            source.text,
-            "export function known(x: number) { return x; }"
-        );
+        assert_eq!(source.span.range.start, "export ".len() as u64);
+        assert_eq!(source.text, "function known(x: number) { return x; }");
         assert!(found.edges.is_none());
         assert_eq!(accepted, server.read_mcp_symbol(params.clone()).await?.0);
 
@@ -323,11 +321,11 @@ mod tests {
             found.revision.point(),
             rift_protocol::revision::RevisionPoint::Commit(_)
         ));
-        let source = found.declarations[0]
-            .source
-            .as_ref()
-            .ok_or("committed source")?;
-        assert_eq!(source.text, "export function known() { return 1; }");
+        let declaration = &found.declarations[0];
+        let source = declaration.source.as_ref().ok_or("committed source")?;
+        assert_eq!(source.span.range, declaration.binding.range);
+        assert_eq!(source.span.range.start, "export ".len() as u64);
+        assert_eq!(source.text, "function known() { return 1; }");
         Ok(())
     }
 

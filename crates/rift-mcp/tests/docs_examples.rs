@@ -537,7 +537,7 @@ async fn capture_local_search_examples(
     let providers = capture_query(
         client,
         json!({
-            "query": "SELECT ?edge { ?symbol a :Symbol; :name 'load_config'; :calls ?target . ?edge a :Edge; :from ?symbol; :to ?target; :kinds :calls }",
+            "query": "SELECT ?edge { ?symbol a :Symbol; :name 'load_config'; :calls ?target . ?edge a :Edge; :from ?symbol; :to ?target; :kinds :calls } ORDER BY ?target",
             "include": ["providers"],
         }),
     )
