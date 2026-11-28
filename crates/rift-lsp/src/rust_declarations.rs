@@ -32,12 +32,22 @@ pub struct RustDeclarationToken {
     pub kind: RustDeclarationKind,
 }
 
+/// One macro-tagged declaration token, retained separately from ordinary Rust bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustMacroDeclarationToken {
+    /// Physical UTF-8 byte range in the opened Rust unit.
+    pub range: SourceRange,
+    /// Whether the server identified a function name rather than a parameter.
+    pub function: bool,
+}
+
 /// Declaration observations for the exact source opened in one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustDeclarationTokens {
     path: ProjectPath,
     digest: FileDigest,
     tokens: Vec<RustDeclarationToken>,
+    macro_tokens: Vec<RustMacroDeclarationToken>,
 }
 
 impl RustDeclarationTokens {
@@ -58,6 +68,12 @@ impl RustDeclarationTokens {
     pub fn tokens(&self) -> &[RustDeclarationToken] {
         &self.tokens
     }
+
+    /// Macro-tagged functions and parameters in source order, pending separate syntax proof.
+    #[must_use]
+    pub fn macro_tokens(&self) -> &[RustMacroDeclarationToken] {
+        &self.macro_tokens
+    }
 }
 
 pub(crate) fn offered() -> SemanticTokensClientCapabilities {
@@ -66,7 +82,11 @@ pub(crate) fn offered() -> SemanticTokensClientCapabilities {
             full: Some(SemanticTokensFullOptions::Bool(true)),
             ..SemanticTokensClientCapabilitiesRequests::default()
         },
-        token_types: vec![SemanticTokenType::VARIABLE, SemanticTokenType::PARAMETER],
+        token_types: vec![
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::FUNCTION,
+        ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
             SemanticTokenModifier::DEFINITION,
@@ -156,6 +176,7 @@ impl<'legend> RustTokenLegend<'legend> {
         let index = LineIndex::new(source);
         let mut lines = TokenLines::default();
         let mut tokens = Vec::new();
+        let mut macro_tokens = Vec::new();
         for token in data {
             let token_type = self.types.get(usize::try_from(token.token_type).ok()?)?;
             let modifiers = token.token_modifiers_bitset;
@@ -171,7 +192,16 @@ impl<'legend> RustTokenLegend<'legend> {
             else {
                 continue;
             };
-            if modifiers & self.declarations == 0 || modifiers & self.macro_expansion != 0 {
+            if modifiers & self.declarations == 0 {
+                continue;
+            }
+            if modifiers & self.macro_expansion != 0 {
+                if modifiers & self.attribute == 0 {
+                    let function = token_type == &SemanticTokenType::FUNCTION;
+                    if function || token_type == &SemanticTokenType::PARAMETER {
+                        macro_tokens.push(RustMacroDeclarationToken { range, function });
+                    }
+                }
                 continue;
             }
             let kind = match token_type.as_str() {
@@ -185,6 +215,7 @@ impl<'legend> RustTokenLegend<'legend> {
             path,
             digest,
             tokens,
+            macro_tokens,
         })
     }
 }

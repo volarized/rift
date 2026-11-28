@@ -2765,7 +2765,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             "semanticTokensProvider": {
                 "full": true,
                 "legend": {
-                    "tokenTypes": ["parameter", "variable", "string", "comment"],
+                    "tokenTypes": ["parameter", "variable", "string", "comment", "function"],
                     "tokenModifiers": ["macro", "definition", "declaration", "attribute", "documentation"]
                 }
             }
@@ -2789,7 +2789,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             &id,
             json!({"data": [
                 0, 4, 5, 0, 4,
-                0, 6, 4, 1, 5,
+                0, 6, 4, 4, 5,
                 0, 4, 0, 2, 1,
                 1, 0, 0, 2, 0,
                 1, 0, 0, 2, 1,
@@ -2797,6 +2797,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
                 1, 1, 4, 2, 8,
                 0, 4, 0, 2, 8,
                 1, 1, 5, 1, 2,
+                0, 6, 5, 0, 5,
                 1, 0, 0, 3, 0,
                 1, 0, 0, 3, 16,
                 1, 1, 6, 3, 16,
@@ -2827,7 +2828,7 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
 #[tokio::test]
 async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
     const SOURCE: &str =
-        "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma\r\n\r\n\r\n fenced\r\n after";
+        "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma delta\r\n\r\n\r\n fenced\r\n after";
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
     let file = path("lib.rs");
@@ -2876,6 +2877,16 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
             ("after", rift_lsp::RustDeclarationKind::Local),
         ]
     );
+    let macro_bindings = observations
+        .macro_tokens()
+        .iter()
+        .map(|token| {
+            let start = usize::try_from(token.range.start()).expect("start");
+            let end = usize::try_from(token.range.end()).expect("end");
+            (&SOURCE[start..end], token.function)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(macro_bindings, [("beta", true), ("delta", false)]);
     for _ in BAD_RUST_DECLARATION_TOKENS {
         assert_eq!(
             session

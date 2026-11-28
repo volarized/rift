@@ -194,14 +194,14 @@ fn authored_fields(
     fields
 }
 
-struct Token<'source> {
-    text: &'source str,
-    range: SourceRange,
-    parent: Option<usize>,
+pub(super) struct Token<'source> {
+    pub(super) text: &'source str,
+    pub(super) range: SourceRange,
+    pub(super) parent: Option<usize>,
     close: Option<usize>,
 }
 
-struct TokenGroups<'source>(Vec<Token<'source>>);
+pub(super) struct TokenGroups<'source>(pub(super) Vec<Token<'source>>);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Delimiter {
@@ -231,7 +231,7 @@ impl GroupToken {
 }
 
 impl<'source> TokenGroups<'source> {
-    fn capture(
+    pub(super) fn capture(
         source: &'source str,
         invocation: SourceRange,
         limits: SyntaxLimits,

@@ -21,6 +21,7 @@ use super::{PackageAnalyzer, bound, digest_of, file_digest, line_of, line_starts
 use crate::ExactPackageLimits;
 
 mod associated_members;
+mod foreign_declarations;
 mod variant_fields;
 
 /// A Rust macro invocation whose selected owner can be checked through a language server.
@@ -76,6 +77,15 @@ pub struct RustLspMacroFile<'source> {
     pub digest: FileDigest,
     /// Expansions tied to that source.
     pub expansions: &'source [RustLspMacroItems<'source>],
+}
+
+/// Macro-tagged native declaration evidence for one opened Rust unit.
+#[derive(Debug, Clone, Copy)]
+pub struct RustLspForeignDeclarationFile<'source> {
+    /// Selected complete macro expansions in the same opened source bytes.
+    pub macros: RustLspMacroFile<'source>,
+    /// Exact original byte range and whether the engine labeled a function rather than a parameter.
+    pub declarations: &'source [(SourceRange, bool)],
 }
 
 /// Counts authored declaration facets added under the existing limits.
@@ -225,7 +235,46 @@ impl PackageAnalyzer {
         producer: &FactProducer,
         limits: ExactPackageLimits,
     ) -> Result<RustLspMacroAdmission, RiftError> {
-        if observed.is_empty() {
+        Self::admit_rust_lsp_expansions(
+            publication,
+            ExpansionFiles::Items(observed),
+            dependencies,
+            producer,
+            limits,
+        )
+    }
+
+    /// Adds checked original foreign signatures and parameters from selected local Rust macros.
+    ///
+    /// The original signature must independently match a complete emitted ABI signature.
+    /// Exact same-source semantic declaration roles confirm the function and its written
+    /// parameters. Call this after established macro and local declaration admissions.
+    ///
+    /// # Errors
+    /// Returns an error if an admitted declaration cannot be represented canonically.
+    pub fn admit_rust_lsp_foreign_declarations(
+        publication: &mut PackagePublication,
+        observed: &[RustLspForeignDeclarationFile<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) -> Result<RustLspMacroAdmission, RiftError> {
+        Self::admit_rust_lsp_expansions(
+            publication,
+            ExpansionFiles::Foreign(observed),
+            &[],
+            producer,
+            limits,
+        )
+    }
+
+    fn admit_rust_lsp_expansions(
+        publication: &mut PackagePublication,
+        observed: ExpansionFiles<'_>,
+        dependencies: &[RustLspMacroDependency<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) -> Result<RustLspMacroAdmission, RiftError> {
+        if observed.len() == 0 {
             return Ok(RustLspMacroAdmission::default());
         }
         if observed.len() > bound(limits.files_max()) {
@@ -235,11 +284,11 @@ impl PackageAnalyzer {
             });
         }
         let mut selected = BTreeMap::new();
-        for file in observed {
+        for (file, tokens) in observed.files() {
             selected
                 .entry(file.path.as_str())
                 .and_modify(|row| *row = None)
-                .or_insert(Some(file));
+                .or_insert(Some((file, tokens)));
         }
         let mut output = BTreeMap::new();
         let objects = publication
@@ -254,10 +303,23 @@ impl PackageAnalyzer {
                 .or_default()
                 .push(declaration);
         }
-        let definitions =
-            selected_macro_definitions(publication, observed, &declarations, dependencies, limits);
+        let definitions = selected_macro_definitions(
+            publication,
+            selected.values().flatten().map(|(file, _)| *file),
+            &declarations,
+            dependencies,
+            limits,
+        );
+        let imports = match observed {
+            ExpansionFiles::Items(_) => foreign_declarations::ImportedOwners::default(),
+            ExpansionFiles::Foreign(_) => foreign_declarations::ImportedOwners::capture(
+                publication,
+                &declarations,
+                limits.syntax(),
+            ),
+        };
         for unit in &publication.units {
-            let Some(file) = selected.get(unit.path.0.as_str()).copied().flatten() else {
+            let Some((file, tokens)) = selected.get(unit.path.0.as_str()).copied().flatten() else {
                 continue;
             };
             if !same_source(publication, file.path, file.digest, unit) {
@@ -271,7 +333,11 @@ impl PackageAnalyzer {
                 file,
                 unit,
                 existing,
-                (&objects, &definitions),
+                (
+                    &objects,
+                    &definitions,
+                    tokens.map(|tokens| (tokens, &imports)),
+                ),
                 limits.syntax(),
                 &mut output,
             );
@@ -293,6 +359,42 @@ impl PackageAnalyzer {
             });
         }
         Ok(report)
+    }
+}
+
+type ForeignTokens<'source> = &'source [(SourceRange, bool)];
+
+#[derive(Clone, Copy)]
+enum ExpansionFiles<'source> {
+    Items(&'source [RustLspMacroFile<'source>]),
+    Foreign(&'source [RustLspForeignDeclarationFile<'source>]),
+}
+
+impl<'source> ExpansionFiles<'source> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Items(files) => files.len(),
+            Self::Foreign(files) => files.len(),
+        }
+    }
+
+    fn files(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &'source RustLspMacroFile<'source>,
+            Option<ForeignTokens<'source>>,
+        ),
+    > {
+        let (items, foreign) = match self {
+            Self::Items(files) => (*files, &[][..]),
+            Self::Foreign(files) => (&[][..], *files),
+        };
+        items.iter().map(|file| (file, None)).chain(
+            foreign
+                .iter()
+                .map(|file| (&file.macros, Some(file.declarations))),
+        )
     }
 }
 
@@ -662,9 +764,9 @@ type DefinitionRequests<'source> =
     BTreeMap<&'source str, BTreeMap<SourceRange, BTreeSet<FileDigest>>>;
 type Observations<'source> = BTreeMap<(bool, SymbolId), Option<Observed<'source>>>;
 
-fn selected_macro_definitions<'publication>(
+fn selected_macro_definitions<'publication, 'source>(
     publication: &'publication PackagePublication,
-    observed: &[RustLspMacroFile<'_>],
+    observed: impl Iterator<Item = &'source RustLspMacroFile<'source>>,
     declarations: &BTreeMap<&str, Vec<&PackageSymbol>>,
     dependencies: &[RustLspMacroDependency<'publication>],
     limits: ExactPackageLimits,
@@ -836,17 +938,25 @@ fn collect_file<'a>(
     file: &RustLspMacroFile<'_>,
     unit: &'a PackageSourceUnit,
     existing: &[&'a PackageSymbol],
-    inventory: (&Objects<'_>, &Definitions<'a>),
+    inventory: (
+        &Objects<'_>,
+        &Definitions<'a>,
+        Option<(ForeignTokens<'_>, &foreign_declarations::ImportedOwners<'_>)>,
+    ),
     limits: SyntaxLimits,
     output: &mut Observations<'a>,
 ) {
+    let (objects, definitions, foreign) = inventory;
+    let labels = foreign.map(|(tokens, _)| foreign_declarations::labels(tokens, limits));
+    if labels.as_ref().is_some_and(BTreeMap::is_empty) {
+        return;
+    }
     let Some(original) = parse(file.path, &unit.source, limits) else {
         return;
     };
     let sites = sites(&original, true, None);
     let scopes = member_scopes(file, &unit.source, &sites, limits);
     let members = sites_in_members(&original, &scopes);
-    let (objects, definitions) = inventory;
     let starts = line_starts(&unit.source);
     let mut work = limits.source_bytes_max();
     for observation in file.expansions.iter().take(limits.syntax_elements_max()) {
@@ -892,50 +1002,107 @@ fn collect_file<'a>(
         if module.owner() != &publication.owner || module.language() != &unit.language {
             continue;
         }
-        if !selected_in_scope(definition, unit, &original, site, &module) {
-            continue;
-        }
-        let dependency = definition.identity.owner() != module.owner();
-        let names = if associated && dependency {
-            associated_members::candidates(
-                file.path,
-                &unit.source,
-                site.invocation,
-                observation.expansion,
-                limits,
-            )
-        } else if associated {
-            continue;
-        } else {
-            candidates(
-                file.path,
-                &unit.source,
-                site.invocation,
-                observation.expansion,
-                limits,
-                true,
-            )
+        let scope = ObservedScope {
+            unit,
+            owner,
+            dependency: definition.identity.owner() != module.owner(),
+            definition,
+            expansion_digest,
+            starts: &starts,
+            needs_type_witness: associated
+                && objects
+                    .get(&owner.symbol)
+                    .is_some_and(|object| object.kind.0 == "impl_item"),
         };
-        collect_names(
-            output,
-            names,
+        let Some((names, confirmed)) = expansion_candidates(
+            file.path,
+            &original,
             observation,
             &module,
-            objects,
-            ObservedScope {
-                unit,
-                owner,
-                dependency,
-                definition,
-                expansion_digest,
-                starts: &starts,
-                needs_type_witness: associated
-                    && objects
-                        .get(&owner.symbol)
-                        .is_some_and(|object| object.kind.0 == "impl_item"),
+            scope,
+            foreign.map(|(_, imports)| imports).zip(labels.as_ref()),
+            limits,
+        ) else {
+            continue;
+        };
+        let observation = RustLspMacroItems {
+            names: if foreign.is_some() {
+                &confirmed
+            } else {
+                observation.names
             },
-        );
+            ..*observation
+        };
+        collect_names(output, names, &observation, &module, objects, scope);
     }
+}
+
+type ForeignLabels = BTreeMap<SourceRange, Option<foreign_declarations::Role>>;
+type ExpansionCandidates = (BTreeMap<SourceRange, Candidate>, Vec<SourceRange>);
+
+fn expansion_candidates(
+    path: &ProjectPath,
+    original: &SyntaxDocument,
+    observation: &RustLspMacroItems<'_>,
+    module: &SymbolIdentity,
+    scope: ObservedScope<'_, '_>,
+    foreign: Option<(&foreign_declarations::ImportedOwners<'_>, &ForeignLabels)>,
+    limits: SyntaxLimits,
+) -> Option<ExpansionCandidates> {
+    let ObservedScope {
+        unit,
+        owner,
+        dependency,
+        definition,
+        ..
+    } = scope;
+    let site = &observation.site;
+    let associated = owner.syntax_element_kind.as_deref() == Some("impl_item");
+    let local_scope = selected_in_scope(definition, unit, original, site, module);
+    let mut confirmed = Vec::new();
+    let names = if let Some((imports, labels)) = foreign {
+        if associated
+            || dependency
+            || (!local_scope
+                && (!imports.allows(definition, site, owner)
+                    || local_macro_shadows(original, definition, site.invocation)))
+        {
+            return None;
+        }
+        foreign_declarations::confirm(
+            foreign_declarations::candidates(
+                path,
+                &unit.source,
+                site.invocation,
+                observation.expansion,
+                limits,
+            ),
+            labels,
+            &mut confirmed,
+        )
+    } else if !local_scope {
+        return None;
+    } else if associated && dependency {
+        associated_members::candidates(
+            path,
+            &unit.source,
+            site.invocation,
+            observation.expansion,
+            limits,
+        )
+    } else if associated {
+        return None;
+    } else {
+        candidates(
+            path,
+            &unit.source,
+            site.invocation,
+            observation.expansion,
+            limits,
+            true,
+        )
+    };
+    Some((names, confirmed))
 }
 
 fn sites_in_members(
@@ -2305,6 +2472,209 @@ mod shadow {
                 Some(placeholder),
             );
         }
+    }
+
+    #[test]
+    fn foreign_declarations_keep_verified_same_source_and_imported_callable_owners() {
+        const DEFINITION: &str =
+            "macro_rules! declare_abi { ($($tokens:tt)*) => { $($tokens)* }; }";
+        const WRITTEN: &str =
+            "declare_abi! { pub fn first(item: u32) -> i32, pub fn second(item: u8) -> i32, }";
+        const EMITTED: &str =
+            "unsafe extern \"C\" { pub fn first(item:u32)->i32; pub fn second(item:u8)->i32; }";
+        let producer = FactProducer {
+            name: ProducerName::parse("rust-analyzer").expect("producer"),
+            revision: ProducerRevision::parse("1").expect("revision"),
+        };
+        let limits = ExactPackageLimits::new(16, 2 * 1024 * 1024);
+        let local = format!("{DEFINITION}\n{WRITTEN}");
+        let direct = "unsafe extern \"C\" { pub fn stable(item: u8) -> i32; }";
+        for (root, source, consumer, definition, authorized) in [
+            ("", local.as_str(), "src/lib.rs", "src/lib.rs", true),
+            (
+                "#[macro_use] mod definitions; pub mod api;",
+                WRITTEN,
+                "src/api.rs",
+                "src/definitions.rs",
+                true,
+            ),
+            (
+                "mod definitions; pub mod api;",
+                WRITTEN,
+                "src/api.rs",
+                "src/definitions.rs",
+                false,
+            ),
+            (
+                "pub mod api; #[macro_use] mod definitions;",
+                WRITTEN,
+                "src/api.rs",
+                "src/definitions.rs",
+                false,
+            ),
+        ] {
+            let owned_root = format!("{root}\n{direct}");
+            let fixture = if consumer == "src/lib.rs" {
+                vec![("src/lib.rs", source)]
+            } else {
+                vec![
+                    ("src/lib.rs", owned_root.as_str()),
+                    ("src/definitions.rs", DEFINITION),
+                    (consumer, source),
+                ]
+            };
+            let base = authored_macro_fixture(fixture);
+            let path = ProjectPath::new(consumer).expect("consumer");
+            let defining = ProjectPath::new(definition).expect("definition");
+            let defining_source = if definition == consumer {
+                source
+            } else {
+                DEFINITION
+            };
+            let definition_offset = u64::try_from(
+                defining_source
+                    .find("declare_abi")
+                    .expect("definition token"),
+            )
+            .expect("offset");
+            let site = PackageAnalyzer::rust_lsp_macro_sites(&path, source, limits.syntax())[0];
+            let expansion = RustLspMacroItems {
+                site,
+                definition: RustLspMacroDefinition {
+                    path: &defining,
+                    digest: FileDigest::of(defining_source.as_bytes()),
+                    range: SourceRange::new(definition_offset, definition_offset + 11)
+                        .expect("definition range"),
+                },
+                expansion: EMITTED,
+                names: &[],
+            };
+            let tokens = foreign_declarations::candidates(
+                &path,
+                source,
+                site.invocation,
+                EMITTED,
+                limits.syntax(),
+            );
+            assert_eq!(tokens.len(), 4);
+            let exact = tokens
+                .into_iter()
+                .map(|(range, (role, _))| (range, role == foreign_declarations::Role::Function))
+                .collect::<Vec<_>>();
+            let file = RustLspForeignDeclarationFile {
+                macros: RustLspMacroFile {
+                    path: &path,
+                    digest: FileDigest::of(source.as_bytes()),
+                    expansions: &[expansion],
+                },
+                declarations: &exact,
+            };
+            assert_foreign_labels(&base, file, authorized, &producer, limits);
+            if authorized {
+                assert_foreign_capacity(&base, file, &producer, limits);
+            }
+        }
+    }
+
+    fn assert_foreign_labels(
+        base: &PackagePublication,
+        file: RustLspForeignDeclarationFile<'_>,
+        authorized: bool,
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) {
+        let mut missing = file.declarations.to_vec();
+        missing.pop();
+        let mut duplicate = file.declarations.to_vec();
+        duplicate.push(file.declarations[1]);
+        let mut wrong_role = file.declarations.to_vec();
+        wrong_role[0].1 = false;
+        for (labels, accepted) in [
+            (file.declarations, 4),
+            (&missing, 2),
+            (&duplicate, 2),
+            (&wrong_role, 2),
+        ] {
+            let mut graph = base.clone();
+            let admission = PackageAnalyzer::admit_rust_lsp_foreign_declarations(
+                &mut graph,
+                &[RustLspForeignDeclarationFile {
+                    declarations: labels,
+                    ..file
+                }],
+                producer,
+                limits,
+            )
+            .expect("valid foreign proof");
+            assert_eq!(admission.admitted, if authorized { accepted } else { 0 });
+            assert_eq!(graph.edges, base.edges);
+            graph.validate_facts().expect("valid authored graph");
+            if authorized && accepted == 4 {
+                let names = graph
+                    .declarations
+                    .iter()
+                    .filter(|row| row.source == "item")
+                    .map(|row| row.symbol.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    names
+                        .iter()
+                        .any(|name| name.ends_with("/first/item%23parameter0"))
+                );
+                assert!(
+                    names
+                        .iter()
+                        .any(|name| name.ends_with("/second/item%23parameter0"))
+                );
+            }
+        }
+    }
+
+    fn assert_foreign_capacity(
+        base: &PackagePublication,
+        file: RustLspForeignDeclarationFile<'_>,
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) {
+        let limited = limits
+            .with_declarations(
+                u32::try_from(base.declarations.len() + 1).expect("fixture allowance"),
+            )
+            .expect("valid declaration allowance");
+        let mut graph = base.clone();
+        let refused = RustLspForeignDeclarationFile {
+            macros: RustLspMacroFile {
+                digest: FileDigest::of(b"changed"),
+                ..file.macros
+            },
+            ..file
+        };
+        assert_eq!(
+            PackageAnalyzer::admit_rust_lsp_foreign_declarations(
+                &mut graph,
+                &[refused],
+                producer,
+                limits,
+            )
+            .expect("wrong digest fallback")
+            .admitted,
+            0
+        );
+        let capped = PackageAnalyzer::admit_rust_lsp_foreign_declarations(
+            &mut graph,
+            &[file],
+            producer,
+            limited,
+        )
+        .expect("bounded publication");
+        assert_eq!(capped.admitted, 1);
+        assert!(capped.dropped_at_limit > 0);
+        assert!(
+            base.declarations
+                .iter()
+                .all(|row| graph.declarations.contains(row))
+        );
+        assert_eq!(graph.edges, base.edges);
     }
 
     fn authored_macro_fixture(files: Vec<(&str, &str)>) -> PackagePublication {
