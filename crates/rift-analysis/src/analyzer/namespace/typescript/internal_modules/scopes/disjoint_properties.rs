@@ -3,11 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
+use rift_protocol::identity::SymbolIdentity;
 use rift_syntax::{
-    ByteRange, JavaScriptSyntaxProvider, ScopedIdentityAnchors, StaticBindingKind, SyntaxSymbol,
+    ByteRange, JavaScriptSyntaxProvider, ScopedIdentityAnchors, StaticBindingKind, StaticFacts,
+    SyntaxSymbol,
 };
 
-use super::{FileScopes, SelectedFile, binding_name};
+use super::{
+    FileScopes, SelectedFile, binding_name, conflicting_assignment_name, literal_property_identity,
+    ordinary_private_property, unique_declarations,
+};
 
 impl<'source> FileScopes<'source> {
     /// Keeps a checked lexical declaration and its class members at their written ordinals.
@@ -71,6 +76,7 @@ impl<'source> FileScopes<'source> {
             &selected,
         );
         let mut classes = BTreeMap::new();
+        let mut restored = BTreeMap::new();
         for (name, binding, properties) in candidates {
             if !properties.iter().all(|range| checked.contains(range)) {
                 continue;
@@ -84,9 +90,26 @@ impl<'source> FileScopes<'source> {
             );
             if binding.syntax_element_kind == Some("class_declaration") {
                 classes.insert(name, binding.item_range);
+            } else {
+                restored.insert(name, binding);
             }
         }
         self.place_disjoint_class_members(symbols, &classes, repeated, anchors, placed);
+        if !restored.is_empty()
+            && std::path::Path::new(file.path.as_str())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cjs"))
+        {
+            let retained_anchors = anchors
+                .iter()
+                .filter(|(name, _)| !conflicting_assignment_name(name, repeated))
+                .map(|(name, id)| (name.clone(), id.clone()))
+                .collect();
+            let fallback = self.unplaced_lexical_bindings(file, &retained_anchors, placed);
+            self.place_disjoint_owned_declarations(
+                file, facts, restored, anchors, &fallback, placed,
+            );
+        }
     }
 
     fn disjoint_group<'symbol>(
@@ -110,7 +133,7 @@ impl<'source> FileScopes<'source> {
                         return None;
                     }
                 }
-                "method_definition" | "pair"
+                "method_definition" | "pair" | "shorthand_property_identifier"
                     if self.body_members.contains_key(&symbol.item_range) =>
                 {
                     if properties.insert(kind, symbol.item_range).is_some() {
@@ -121,6 +144,98 @@ impl<'source> FileScopes<'source> {
             }
         }
         (!properties.is_empty()).then_some((owner?, properties.into_values().collect()))
+    }
+
+    fn place_disjoint_owned_declarations(
+        &self,
+        file: &SelectedFile<'source>,
+        facts: &StaticFacts,
+        roots: BTreeMap<&'source str, &'source SyntaxSymbol>,
+        anchors: &BTreeMap<String, SymbolId>,
+        fallback: &ScopedIdentityAnchors,
+        placed: &mut ScopedIdentityAnchors,
+    ) {
+        let symbols = file.syntax.symbols();
+        let unique = unique_declarations(symbols);
+        let bindings = facts
+            .bindings()
+            .iter()
+            .map(|binding| binding.name)
+            .collect::<BTreeSet<_>>();
+        let mut owners = roots
+            .into_iter()
+            .filter_map(|(name, symbol)| Some((name, (symbol, anchors.get(name)?.clone()))))
+            .collect::<BTreeMap<_, _>>();
+        // The syntax facts visit a written declaration before the declarations in its body.
+        for symbol in symbols {
+            let name = symbol.qualified_name.as_str();
+            let Some((parent, parent_id)) = symbol
+                .container
+                .as_deref()
+                .and_then(|name| owners.get(name))
+            else {
+                continue;
+            };
+            if !unique.get(name).is_some_and(Option::is_some)
+                || placed.contains_key(name)
+                || !anchors.contains_key(name)
+                || !parent.item_range.encloses(symbol.item_range)
+                || !self.disjoint_child(file.source, parent, symbol, &bindings)
+            {
+                continue;
+            }
+            let identity = if let Some(id) = fallback
+                .get(name)
+                .and_then(|ids| ids.get(&symbol.declaration_ordinal))
+            {
+                Some(id.clone())
+            } else if symbol.kind == "property" {
+                SymbolIdentity::parse(parent_id.as_str())
+                    .ok()
+                    .and_then(|identity| literal_property_identity(&identity, &symbol.name))
+            } else {
+                anchors.get(name).cloned()
+            };
+            let Some(identity) = identity else {
+                continue;
+            };
+            placed.insert(
+                name.to_owned(),
+                BTreeMap::from([(symbol.declaration_ordinal, identity.clone())]),
+            );
+            owners.insert(name, (symbol, identity));
+        }
+    }
+
+    fn disjoint_child(
+        &self,
+        source: &str,
+        parent: &SyntaxSymbol,
+        symbol: &SyntaxSymbol,
+        bindings: &BTreeSet<ByteRange>,
+    ) -> bool {
+        if matches!(
+            symbol.syntax_element_kind,
+            Some(
+                "function_declaration"
+                    | "variable_declarator"
+                    | "identifier"
+                    | "shorthand_property_identifier_pattern"
+            )
+        ) && symbol
+            .name_range
+            .is_some_and(|name| bindings.contains(&name))
+        {
+            return !symbol.is_ecmascript_package_binding();
+        }
+        if !ordinary_private_property(symbol, source) {
+            return false;
+        }
+        self.body_members
+            .get(&symbol.item_range)
+            .is_some_and(|member| {
+                parent.body_range == Some(member.body) && parent.item_range == member.holder
+            })
     }
 
     fn place_disjoint_class_members(

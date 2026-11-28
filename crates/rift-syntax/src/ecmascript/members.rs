@@ -19,6 +19,7 @@ struct Bindings<'source> {
     symbols: BTreeMap<ByteRange, Option<usize>>,
     members: BTreeMap<ByteRange, &'source StaticMember>,
     replaced: BTreeSet<&'source str>,
+    prototype_writes: BTreeMap<(&'source str, &'source str), usize>,
     blocked: BTreeSet<ByteRange>,
 }
 
@@ -49,9 +50,21 @@ impl<'source> Bindings<'source> {
             .map(|member| (member.range, member))
             .collect::<BTreeMap<_, _>>();
         let mut replaced = BTreeSet::new();
+        let mut prototype_writes = BTreeMap::new();
         for &range in facts.assignments() {
             if let Some(member) = members.get(&range) {
                 let property = member.member.and_then(|range| text(source, range));
+                if let Some((receiver, property)) = property
+                    .zip(members.get(&member.receiver))
+                    .and_then(|(property, base)| {
+                        (base.member.and_then(|name| text(source, name)) == Some("prototype"))
+                            .then_some((text(source, base.receiver)?, property))
+                    })
+                {
+                    *prototype_writes
+                        .entry((receiver, property))
+                        .or_insert(0_usize) += 1;
+                }
                 if (property.is_none() || property == Some("prototype"))
                     && let Some(name) = text(source, member.receiver)
                 {
@@ -66,6 +79,7 @@ impl<'source> Bindings<'source> {
             symbols: names,
             members,
             replaced,
+            prototype_writes,
             blocked: facts.unsupported_bindings().iter().copied().collect(),
         }
     }
@@ -89,6 +103,28 @@ impl<'source> Bindings<'source> {
             direct_constructor_initializer(rules, visits, binding, function)?;
         }
         Some(owner)
+    }
+
+    fn prototype_target(
+        &self,
+        method: MemberFunction<'_, '_>,
+        source: &str,
+        symbols: &[SyntaxSymbol],
+    ) -> Option<ByteRange> {
+        let name = source.get(method.value.byte_range())?;
+        let constructor = source.get(method.receiver.byte_range())?;
+        let property = source.get(method.name.byte_range())?;
+        if self.replaced.contains(name)
+            || self.prototype_writes.get(&(constructor, property)) != Some(&1)
+        {
+            return None;
+        }
+        let (binding, target) = self.lexical_owner(method.visited, name)?;
+        let target = &symbols[target];
+        (target.syntax_element_kind == Some("function_declaration")
+            && target.kinds.contains(&SymbolKind::Callable)
+            && binding.available_from <= extract::byte_range(method.assignment).ok()?.start)
+            .then_some(binding.name)
     }
 
     fn lexical_owner(
@@ -176,9 +212,8 @@ fn member_function<'walk, 'tree>(
         return None;
     }
     let value = kinds.expression_value(kinds.child(assignment, EcmaScriptGrammarField::Right)?);
-    kinds
-        .function_values
-        .contains(&value.kind_id())
+    (kinds.function_values.contains(&value.kind_id())
+        || (prototype && value.kind_id() == kinds.identifier))
         .then_some(MemberFunction {
             visited,
             assignment,
@@ -298,6 +333,7 @@ pub(super) fn record<'tree>(
     let mut declarations = DeclarationNames::new(visits, rules, facts, symbols);
     let mut containers = BTreeMap::new();
     let mut aliases = Vec::new();
+    let mut prototype_aliases = Vec::new();
     // Assignments and declarations share the admitted syntax count. Renaming touches only
     // declarations in a callable's source interval, at most once per admitted ancestor depth.
     for function in functions {
@@ -316,6 +352,14 @@ pub(super) fn record<'tree>(
         {
             continue;
         }
+        let target = if function.prototype && function.value.kind_id() == rules.kinds.identifier {
+            let Some(target) = bindings.prototype_target(function, source, symbols) else {
+                continue;
+            };
+            Some(target)
+        } else {
+            None
+        };
         let container = symbols[owner].qualified_name.clone();
         let Some(name) = source.get(function.name.byte_range()) else {
             continue;
@@ -329,6 +373,7 @@ pub(super) fn record<'tree>(
             !function.prototype
                 && !function.this_member
                 && matches!(symbols[owner].kind, "function" | "class"),
+            target.is_some(),
         )?;
         let parent = qualification(rules, function.visited, source, &containers);
         declarations
@@ -355,9 +400,19 @@ pub(super) fn record<'tree>(
         if let Some(alias) = assignment_alias(rules, source, &bindings, function, owner) {
             aliases.push((alias, owner, symbols.len()));
         }
+        if let Some(target) = target {
+            prototype_aliases.push(StaticMemberAlias {
+                name: extract::byte_range(function.name)?,
+                target,
+            });
+        }
         symbols.push(method);
     }
-    record_aliases(source, facts, &bindings, visits, &aliases, symbols)
+    prototype_aliases.extend(record_aliases(
+        source, facts, &bindings, visits, &aliases, symbols,
+    )?);
+    prototype_aliases.sort_by_key(|alias| alias.name);
+    Ok(prototype_aliases)
 }
 
 /// The outer assignment in `object.alias = object.method = function ...`.
@@ -670,19 +725,20 @@ fn method_declaration(
     function: MemberFunction<'_, '_>,
     name: &str,
     static_member: bool,
+    named_callable: bool,
 ) -> Result<Declaration, RiftError> {
     // A function value declares a method; any other value a field, whose body is the
     // object literal it holds.
-    let callable = rules
+    let inline_callable = rules
         .kinds
         .function_values
         .contains(&function.value.kind_id());
-    let symbol_kind = if callable {
+    let symbol_kind = if inline_callable || named_callable {
         EcmaScriptSymbolKind::Method
     } else {
         EcmaScriptSymbolKind::Field
     };
-    let body_range = if callable {
+    let body_range = if inline_callable {
         function
             .value
             .child_by_field_name("body")

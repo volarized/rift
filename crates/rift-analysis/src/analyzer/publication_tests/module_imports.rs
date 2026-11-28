@@ -8252,6 +8252,302 @@ fn nested_array_initializers_keep_properties_under_their_written_variable() {
 }
 
 #[test]
+fn written_prototype_alias_uses_the_checked_local_function() {
+    const SOURCE: &str = concat!(
+        "function Cache() {}\n",
+        "function clear() { this.entries = []; }\n",
+        "Cache.prototype.clear = clear;\n",
+        "Cache.prototype.touch = function () { return this.entries.length; };\n",
+        "module.exports = Cache;\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("checked prototype ownership")
+    };
+    let result = analyze(SOURCE);
+    let found = result.publication();
+    found.validate_facts().expect("exact method facts");
+    let local = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("function_declaration")
+                && row.source.starts_with("function clear(")
+        })
+        .expect("separate authored function");
+    let written = "Cache.prototype.clear = clear";
+    let method = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("assignment_expression")
+                && row.symbol.as_str().ends_with("/Cache/clear")
+        })
+        .expect("written prototype property");
+    assert_eq!(
+        method.range,
+        module_runtime_range(SOURCE.find(written).expect("written assignment"), written),
+    );
+    assert_ne!(method.symbol, local.symbol);
+    assert!(found.edges.iter().any(|edge| {
+        edge.from == method.symbol && edge.to == local.symbol && edge.kinds == [EdgeKind::Aliases]
+    }));
+
+    for changed in [
+        SOURCE.replace(" = clear;", " = missing;"),
+        SOURCE.replace(written, &format!("clear = elsewhere;\n{written}")),
+        SOURCE.replace(written, &format!("Cache.prototype = elsewhere;\n{written}")),
+    ] {
+        let compared = analyze(&changed);
+        assert!(
+            !compared
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/Cache/clear") })
+        );
+    }
+}
+
+#[test]
+fn named_function_value_keeps_checked_assigned_local_properties() {
+    const SOURCE: &str = concat!(
+        "var parser;\n",
+        "(function (exports) {\n",
+        "  function Parser() {}\n",
+        "  Parser.prototype.scan = function scan() {\n",
+        "    var settings;\n",
+        "    settings = { 'enabled': true, 'precision': 2 };\n",
+        "    return settings;\n",
+        "  };\n",
+        "  exports.Parser = Parser;\n",
+        "}(parser = {}));\n",
+        "module.exports = parser;\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("assigned local owner")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("exact assigned properties");
+    let settings = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("variable_declarator")
+                && row.source == "settings"
+        })
+        .expect("written local declaration");
+    for source in ["'enabled': true", "'precision': 2"] {
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == source && row.source_complete)
+            .expect("complete property definition");
+        assert_eq!(
+            row.range,
+            module_runtime_range(SOURCE.find(source).expect("pair location"), source),
+        );
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&settings.symbol)
+        }));
+    }
+
+    for refused in [
+        SOURCE.replace("    var settings;\n", ""),
+        SOURCE.replace("function scan() {", "function () {"),
+    ] {
+        let other = analyze(&refused);
+        assert!(
+            !other
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/settings/'enabled'") })
+        );
+    }
+}
+
+#[test]
+fn checked_commonjs_relative_imports_keep_independently_admitted_peers() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const ENTRY: &str = "function load() { return 1; }\nmodule.exports = load;\n";
+    const FIRST: &str = "const load = require('../');\nconst helper = require('./second.js');\nload();\nhelper();\n";
+    const PEER: &str = "const load = require('../');\nload();\n";
+    const AUTHORED: &str = "module.exports = { handle() { return 1; } };\n";
+    const AUTHORED_FIRST: &str = concat!(
+        "const helper = require('./second.js');\n",
+        "function handle() { return helper(); }\n",
+        "module.exports = { handle };\n",
+    );
+    const UNSEEDED: &str = "const helper = require('./second.js');\nhelper();\n";
+    const SHADOWED: &str = "const require = name => name;\nrequire('./second.js');\n";
+    const MISSING: &str = "const load = require('../');\nconst other = require('./missing.js');\n";
+
+    for (first, second) in [(FIRST, PEER), (FIRST, AUTHORED), (AUTHORED_FIRST, PEER)] {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.js", ENTRY),
+                ("test/first.js", first),
+                ("test/second.js", second),
+                ("test/unseeded.js", UNSEEDED),
+                ("test/shadowed.js", SHADOWED),
+                ("test/missing.js", MISSING),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected sources");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let module_at = |path: &str| {
+            let unit = publication.units.iter().find(|unit| unit.path.0 == path)?;
+            let declaration = publication.declarations.iter().find(|row| {
+                row.unit == unit.unit
+                    && row.range.start == 0
+                    && row.source_complete
+                    && row.source == unit.source
+                    && publication.objects.iter().any(|object| {
+                        object.id.as_ref() == Some(&row.symbol)
+                            && object.kinds == [rift_protocol::read::SymbolKind::Module]
+                    })
+            })?;
+            Some((&declaration.symbol, &unit.unit))
+        };
+        let (from, first_unit) = module_at("test/first.js").expect("first module");
+        let (to, _) = module_at("test/second.js").expect("checked peer module");
+        let source = first
+            .find("'./second.js'")
+            .expect("written relative import");
+        let written = module_runtime_range(source, "'./second.js'");
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::Imports]
+                        && &edge.from == from
+                        && &edge.to == to
+                        && edge
+                            .occurrence
+                            .as_ref()
+                            .is_some_and(|span| &span.unit == first_unit && span.range == written)
+                })
+                .count(),
+            1
+        );
+        assert!(module_at("test/shadowed.js").is_none());
+        assert!(module_at("test/unseeded.js").is_none() || second == AUTHORED);
+        let (missing, _) = module_at("test/missing.js").expect("independent known import");
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .filter(|edge| edge.kinds == [EdgeKind::Imports] && &edge.from == missing)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn assigned_shorthand_keeps_distinct_module_and_initializer_owners() {
+    const SOURCE: &str = concat!(
+        "let output;\n",
+        "export function make() {\n",
+        "    const changes = { updated: 1, deleted: 2 };\n",
+        "    output = { changes };\n",
+        "    return output;\n",
+        "}\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const keep = 1;\n"),
+                ("config.mjs", source),
+            ],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+            )),
+        )
+        .expect("selected module assignment")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("distinct declaration ownership");
+    let written = |source: &str, kind: &str| {
+        publication
+            .declarations
+            .iter()
+            .find(|row| row.source == source && row.syntax_element_kind.as_deref() == Some(kind))
+            .expect("exact authored declaration")
+    };
+    let output = written("output", "variable_declarator");
+    let change = written(
+        "changes = { updated: 1, deleted: 2 }",
+        "variable_declarator",
+    );
+    let shorthand = written("changes", "shorthand_property_identifier");
+    assert_ne!(change.symbol, shorthand.symbol);
+    assert_eq!(
+        shorthand.range,
+        module_runtime_range(
+            SOURCE.rfind("changes").expect("shorthand position"),
+            "changes"
+        )
+    );
+    for (row, owner) in [
+        (shorthand, &output.symbol),
+        (written("updated: 1", "pair"), &change.symbol),
+        (written("deleted: 2", "pair"), &change.symbol),
+    ] {
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol) && object.container.as_ref() == Some(owner)
+        }));
+    }
+    let unknown = SOURCE.replace("let output;\n", "");
+    let shadowed = SOURCE.replace("    const changes", "    let output;\n    const changes");
+    let competing = SOURCE.replace("    return output;", "    output = {};\n    return output;");
+    for source in [unknown, shadowed, competing] {
+        let other = analyze(&source);
+        assert!(
+            !other
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with("/output/changes"))
+        );
+    }
+}
+
+#[test]
 fn retained_callback_keeps_independently_written_argument_properties() {
     const ENTRY: &str = "function helper(value) { return value; }\nmodule.exports = helper;\n";
     const SELECTED: &str = concat!(

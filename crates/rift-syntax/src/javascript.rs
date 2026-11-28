@@ -130,8 +130,10 @@ impl JavaScriptSyntaxProvider {
                     "pair" => {
                         node.child_by_field_name("key")
                             .is_some_and(|key| key.kind() == "property_identifier")
-                            && short_circuited_export_member(node, source)
+                            && (short_circuited_export_member(node, source)
+                                || direct_arrow_getter(root, node))
                     }
+                    "shorthand_property_identifier" => short_circuited_export_member(node, source),
                     _ => false,
                 }
             },
@@ -181,8 +183,10 @@ fn module_object_members(
         {
             return BTreeSet::new();
         }
-        if matches!(node.kind(), "pair" | "method_definition")
-            && let Ok(range) = crate::extract::byte_range(node)
+        if matches!(
+            node.kind(),
+            "pair" | "method_definition" | "shorthand_property_identifier"
+        ) && let Ok(range) = crate::extract::byte_range(node)
             && accepts(root, node, range, source)
         {
             accepted.insert(range);
@@ -192,6 +196,27 @@ fn module_object_members(
         });
     }
     accepted
+}
+
+fn direct_arrow_getter(root: tree_sitter::Node<'_>, pair: tree_sitter::Node<'_>) -> bool {
+    let Some(arrow) = pair
+        .child_by_field_name("value")
+        .filter(|value| value.kind() == "arrow_function")
+    else {
+        return false;
+    };
+    arrow
+        .child_by_field_name("body")
+        .is_some_and(|body| body.kind() == "identifier")
+        && arrow
+            .child_by_field_name("parameters")
+            .is_some_and(|formals| {
+                let mut cursor = formals.walk();
+                formals
+                    .named_children(&mut cursor)
+                    .all(|formal| formal.is_extra())
+            })
+        && direct_argument_statement(pair).and_then(|statement| statement.parent()) == Some(root)
 }
 
 fn direct_argument_statement(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {

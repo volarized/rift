@@ -22,6 +22,7 @@ mod default_array_properties;
 mod disjoint_properties;
 mod function_arguments;
 mod mixed_shorthand;
+mod module_assignment_shorthand;
 mod private_return_functions;
 mod scoped_initializer_children;
 
