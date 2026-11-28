@@ -228,7 +228,7 @@ fn prepare_anchors(
     mut anchors: BTreeMap<String, SymbolId>,
     prepared: &mut PreparedNamespace,
 ) -> bool {
-    let scoped = internal_modules::private_local_identities(file, &anchors);
+    let mut scoped = internal_modules::private_local_identities(file, &anchors);
     if input.release_version().is_some()
         && matches!(
             input.owner(),
