@@ -63,7 +63,7 @@ impl Records {
             self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
         }
         let targets = self.complete_require_targets();
-        if targets.is_empty() {
+        if !targets.values().any(Option::is_some) {
             return Ok(());
         }
         let (loaders, loads) =
@@ -75,6 +75,43 @@ impl Records {
             .filter(|row| row.source_complete)
             .map(|row| row.symbol.as_str().to_owned())
             .collect::<BTreeSet<_>>();
+        let written = self
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && (admitted.contains(edge.from.as_str())
+                        || admitted.contains(edge.to.as_str()))
+            })
+            .filter_map(|edge| {
+                let site = edge.occurrence.as_ref()?;
+                Some((
+                    edge.from.as_str(),
+                    edge.to.as_str(),
+                    site.range.start,
+                    site.range.end,
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        let loads = loads
+            .into_iter()
+            .filter_map(|load| {
+                let edge = load.edge;
+                let new_source = admitted.contains(edge.from().as_str());
+                let new_target = admitted.contains(edge.to().as_str());
+                let checked = (new_source && (load.target_complete || new_target))
+                    || (new_target && load.source_complete);
+                let range = edge.occurrence().range();
+                (checked
+                    && !written.contains(&(
+                        edge.from().as_str(),
+                        edge.to().as_str(),
+                        range.start(),
+                        range.end(),
+                    )))
+                .then_some(edge)
+            })
+            .collect::<Vec<_>>();
         self.retain_file_module_edge_rows(loads.into_iter(), limits.edges_max());
         if !admitted.is_empty() {
             self.retain_ecmascript_callback_edges(
@@ -107,7 +144,7 @@ impl Records {
         self.retain_javascript_callback_argument_properties(owner, analyzed, limits)
     }
 
-    fn complete_require_targets(&self) -> BTreeSet<String> {
+    fn complete_require_targets(&self) -> BTreeMap<String, Option<String>> {
         let modules = self
             .objects
             .iter()
@@ -130,15 +167,11 @@ impl Records {
                 && row.range.start == 0
                 && units.get(row.unit.as_str()).copied() == Some(row.source.as_str());
             targets
-                .entry(row.symbol.as_str())
-                .and_modify(|previous| *previous = false)
-                .or_insert(complete);
+                .entry(row.symbol.as_str().to_owned())
+                .and_modify(|previous| *previous = None)
+                .or_insert_with(|| complete.then(|| row.unit.as_str().to_owned()));
         }
         targets
-            .into_iter()
-            .filter(|(_, complete)| *complete)
-            .map(|(id, _)| id.to_owned())
-            .collect()
     }
 
     pub(super) fn retain_ecmascript_modules(
@@ -732,14 +765,23 @@ fn commonjs_expression_entries<'file>(
     candidates
 }
 
+struct CheckedRelativeRequire<'edge> {
+    edge: &'edge Edge,
+    source_complete: bool,
+    target_complete: bool,
+}
+
 /// Admits a complete secondary script through its checked load of a retained module.
 fn checked_relative_require_sources<'file, 'edge>(
     owner: &SymbolOwner,
     analyzed: &'file [AnalyzedFile],
     units: &[PackageSourceUnit],
     semantics: &'edge WorkspaceSemantics,
-    entries: &BTreeSet<String>,
-) -> (FileModuleCandidates<'file>, Vec<&'edge Edge>) {
+    entries: &BTreeMap<String, Option<String>>,
+) -> (
+    FileModuleCandidates<'file>,
+    Vec<CheckedRelativeRequire<'edge>>,
+) {
     let SymbolOwner::Package { name, .. } = owner else {
         return (BTreeMap::new(), Vec::new());
     };
@@ -756,10 +798,15 @@ fn checked_relative_require_sources<'file, 'edge>(
         let unit = file.placement.unit();
         let path = file.file.path().as_str();
         let syntax = file.file.syntax();
+        let physical = unit.to_string();
+        let existing = entries.get(module.as_str());
+        let source_complete =
+            existing.is_some_and(|surface| surface.as_deref() == Some(physical.as_str()));
         let complete_source = syntax.language().name == "javascript"
             && matches!(path.rsplit_once('.'), Some((_, "js")))
             && syntax.declaration_syntax_complete()
-            && complete.contains(unit.to_string().as_str())
+            && (existing.is_none() || source_complete)
+            && complete.contains(physical.as_str())
             && SymbolIdentity::parse(module.as_str()).is_ok_and(|identity| {
                 identity.owner() == owner && identity.qualified_path() == [format!("{name}/{path}")]
             });
@@ -773,7 +820,7 @@ fn checked_relative_require_sources<'file, 'edge>(
                     && load.is_file_module_reference()
                     && !load.is_commonjs_argument_import()
                     && site.unit() == unit
-                    && entries.contains(load.to().as_str())
+                    && load.to() != module
                     && ranges.contains(&range)
                 {
                     loads
@@ -783,17 +830,28 @@ fn checked_relative_require_sources<'file, 'edge>(
                 }
             }
         }
-        let loads = loads.into_values().flatten().collect::<Vec<_>>();
+        let loads = loads
+            .into_values()
+            .flatten()
+            .map(|edge| CheckedRelativeRequire {
+                edge,
+                source_complete,
+                target_complete: entries.get(edge.to().as_str()).is_some_and(Option::is_some),
+            })
+            .collect::<Vec<_>>();
+        let admit = existing.is_none() && loads.iter().any(|load| load.target_complete);
         checked
             .entry(module)
             .and_modify(|candidate| *candidate = None)
-            .or_insert_with(|| (!loads.is_empty()).then_some((file, loads)));
+            .or_insert_with(|| (!loads.is_empty()).then_some((admit, file, loads)));
     }
     let mut candidates = BTreeMap::new();
     let mut loads = Vec::new();
     for (module, checked) in checked {
-        if let Some((file, edges)) = checked {
-            candidates.insert(module, Some((file, false)));
+        if let Some((admit, file, edges)) = checked {
+            if admit {
+                candidates.insert(module, Some((file, false)));
+            }
             loads.extend(edges);
         }
     }

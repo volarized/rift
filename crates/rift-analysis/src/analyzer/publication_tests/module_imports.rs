@@ -8387,3 +8387,87 @@ fn named_function_value_keeps_checked_assigned_local_properties() {
         );
     }
 }
+
+#[test]
+fn checked_commonjs_relative_imports_keep_independently_admitted_peers() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const ENTRY: &str = "function load() { return 1; }\nmodule.exports = load;\n";
+    const FIRST: &str = "const load = require('../');\nconst helper = require('./second.js');\nload();\nhelper();\n";
+    const PEER: &str = "const load = require('../');\nload();\n";
+    const AUTHORED: &str = "module.exports = { handle() { return 1; } };\n";
+    const AUTHORED_FIRST: &str = concat!(
+        "const helper = require('./second.js');\n",
+        "function handle() { return helper(); }\n",
+        "module.exports = { handle };\n",
+    );
+    const UNSEEDED: &str = "const helper = require('./second.js');\nhelper();\n";
+    const SHADOWED: &str = "const require = name => name;\nrequire('./second.js');\n";
+    const MISSING: &str = "const load = require('../');\nconst other = require('./missing.js');\n";
+
+    for (first, second) in [(FIRST, PEER), (FIRST, AUTHORED), (AUTHORED_FIRST, PEER)] {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.js", ENTRY),
+                ("test/first.js", first),
+                ("test/second.js", second),
+                ("test/unseeded.js", UNSEEDED),
+                ("test/shadowed.js", SHADOWED),
+                ("test/missing.js", MISSING),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected sources");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let module_at = |path: &str| {
+            let unit = publication.units.iter().find(|unit| unit.path.0 == path)?;
+            let declaration = publication.declarations.iter().find(|row| {
+                row.unit == unit.unit
+                    && row.range.start == 0
+                    && row.source_complete
+                    && row.source == unit.source
+                    && publication.objects.iter().any(|object| {
+                        object.id.as_ref() == Some(&row.symbol)
+                            && object.kinds == [rift_protocol::read::SymbolKind::Module]
+                    })
+            })?;
+            Some((&declaration.symbol, &unit.unit))
+        };
+        let (from, first_unit) = module_at("test/first.js").expect("first module");
+        let (to, _) = module_at("test/second.js").expect("checked peer module");
+        let source = first
+            .find("'./second.js'")
+            .expect("written relative import");
+        let written = module_runtime_range(source, "'./second.js'");
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::Imports]
+                        && &edge.from == from
+                        && &edge.to == to
+                        && edge
+                            .occurrence
+                            .as_ref()
+                            .is_some_and(|span| &span.unit == first_unit && span.range == written)
+                })
+                .count(),
+            1
+        );
+        assert!(module_at("test/shadowed.js").is_none());
+        assert!(module_at("test/unseeded.js").is_none() || second == AUTHORED);
+        let (missing, _) = module_at("test/missing.js").expect("independent known import");
+        assert_eq!(
+            publication
+                .edges
+                .iter()
+                .filter(|edge| edge.kinds == [EdgeKind::Imports] && &edge.from == missing)
+                .count(),
+            1
+        );
+    }
+}
