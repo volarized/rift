@@ -7495,3 +7495,59 @@ fn typescript_declaration_namespaces_keep_local_export_selector_references() {
             })
     }));
 }
+
+#[test]
+fn typescript_traditional_loops_keep_their_written_local_bindings() {
+    const SOURCE: &str = concat!(
+        "export function scan(values: number[]) {\n",
+        "    const size = values.length;\n",
+        "    let total = 0;\n",
+        "    for (let i = 0; i < size; i++) { total += values[i]; }\n",
+        "    for (let i = size - 1; i >= 0; i--) { total += values[i]; }\n",
+        "    return total;\n",
+        "}\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.ts", "export { scan } from './data.js';"),
+            ("data.ts", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.ts"}"#,
+        )),
+    )
+    .expect("checked loop scopes");
+    let found = result.publication();
+    found.validate_facts().expect("exact loop facts");
+    let [first, second] = ["i = 0", "i = size - 1"].map(|text| {
+        let at = SOURCE.find(text).expect("written loop binding");
+        found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.source == text
+                    && row.range == module_runtime_range(at, text)
+                    && row.syntax_element_kind.as_deref() == Some("variable_declarator")
+            })
+            .expect("distinct loop declaration")
+    });
+    assert_ne!(first.symbol, second.symbol);
+    assert_eq!(first.unit, second.unit);
+    let uses = SOURCE
+        .match_indices("values[i]")
+        .map(|(start, _)| start + "values[".len())
+        .collect::<Vec<_>>();
+    for (target, start) in [first, second].into_iter().zip(uses) {
+        assert!(found.edges.iter().any(|edge| {
+            edge.to == target.symbol
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == target.unit && site.range == module_runtime_range(start, "i")
+                })
+        }));
+    }
+}

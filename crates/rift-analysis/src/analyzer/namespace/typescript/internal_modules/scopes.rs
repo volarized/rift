@@ -804,7 +804,9 @@ impl<'source> FileScopes<'source> {
         withheld: &BTreeSet<&str>,
         anchors: &BTreeMap<String, SymbolId>,
     ) -> ScopedIdentityAnchors {
-        if file.syntax.language().name != "javascript"
+        let language = file.syntax.language().name.as_str();
+        let typed = language == "typescript";
+        if !matches!(language, "javascript" | "typescript")
             || file.syntax.has_errors()
             || file.syntax.left_out_declaration_count() != 0
         {
@@ -829,6 +831,13 @@ impl<'source> FileScopes<'source> {
                 }) {
                     return None;
                 }
+                if typed
+                    && !declarations
+                        .iter()
+                        .any(|declaration| self.checked_for_initializer(file, declaration))
+                {
+                    return None;
+                }
                 let original = anchors.get(name)?;
                 let groups = self.lexical_groups(file, &declarations)?;
                 if groups.len() < 2 {
@@ -847,6 +856,27 @@ impl<'source> FileScopes<'source> {
                 Some((name.to_owned(), exact))
             })
             .collect()
+    }
+
+    /// A lexical binding whose captured scope starts at its traditional loop header.
+    fn checked_for_initializer(
+        &self,
+        file: &SelectedFile<'source>,
+        declaration: &SyntaxSymbol,
+    ) -> bool {
+        if declaration.syntax_element_kind != Some("variable_declarator") {
+            return false;
+        }
+        self.checked_lexical_scope(file, declaration)
+            .filter(|scope| scope.encloses(declaration.item_range))
+            .and_then(|scope| {
+                let start = usize::try_from(scope.start).ok()?;
+                let end = usize::try_from(declaration.item_range.start).ok()?;
+                // The syntax-owned scope includes the header's punctuation.
+                file.source.get(start..end)
+            })
+            .and_then(|prefix| prefix.strip_prefix("for"))
+            .is_some_and(|header| header.trim_start().starts_with('('))
     }
 
     /// Names the same property separately when the source writes distinct union branches.
