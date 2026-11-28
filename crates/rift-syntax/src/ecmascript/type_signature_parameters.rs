@@ -19,6 +19,145 @@ pub(super) fn callable_parameter_name<'tree>(visited: Visited<'_, 'tree>) -> Opt
         .filter(|name| name.kind() == "identifier" && !name.is_missing())
 }
 
+pub(super) fn callable_rest_parameter_name<'tree>(
+    visited: Visited<'_, 'tree>,
+) -> Option<Node<'tree>> {
+    let name = visited.syntax_element();
+    if name.kind() != "identifier" || name.is_missing() {
+        return None;
+    }
+    let rest = visited.parent()?;
+    if rest.syntax_element().kind() != "rest_pattern" {
+        return None;
+    }
+    let parameter = rest.parent()?;
+    let list = parameter.parent()?;
+    let scope = list.parent()?;
+    checked_rest_scope(
+        name,
+        rest.syntax_element(),
+        parameter.syntax_element(),
+        list.syntax_element(),
+        scope.syntax_element(),
+    )?;
+    Some(name)
+}
+
+fn callable_rest_scope(name: Node<'_>) -> Option<Node<'_>> {
+    if name.kind() != "identifier" || name.is_missing() {
+        return None;
+    }
+    let rest = name.parent().filter(|node| node.kind() == "rest_pattern")?;
+    let parameter = rest.parent()?;
+    let list = parameter.parent()?;
+    checked_rest_scope(name, rest, parameter, list, list.parent()?)
+}
+
+fn checked_rest_scope<'tree>(
+    name: Node<'tree>,
+    rest: Node<'tree>,
+    parameter: Node<'tree>,
+    list: Node<'tree>,
+    scope: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if rest.named_child(0) != Some(name)
+        || parameter.kind() != "required_parameter"
+        || parameter.child_by_field_name("pattern") != Some(rest)
+        || parameter.child_by_field_name("value").is_some()
+        || parameter.has_error()
+        || !checked_callable_type_scope(list, scope)
+    {
+        return None;
+    }
+    // Only the remaining siblings of a checked rest formal can disqualify it.
+    let mut following = parameter.next_named_sibling();
+    while let Some(next) = following {
+        if !next.is_extra() {
+            return None;
+        }
+        following = next.next_named_sibling();
+    }
+    Some(scope)
+}
+
+pub(super) fn callable_pattern_parameter_name<'tree>(
+    visited: Visited<'_, 'tree>,
+) -> Option<Node<'tree>> {
+    let name = visited.syntax_element();
+    if name.is_missing() {
+        return None;
+    }
+    let pattern = match name.kind() {
+        "shorthand_property_identifier_pattern" => visited.parent()?,
+        "identifier" => {
+            let pair = visited.parent()?;
+            if !checked_renamed_pattern_binding(name, pair.syntax_element()) {
+                return None;
+            }
+            pair.parent()?
+        }
+        _ => return None,
+    };
+    if pattern.syntax_element().kind() != "object_pattern" {
+        return None;
+    }
+    let parameter = pattern.parent()?;
+    let list = parameter.parent()?;
+    let scope = list.parent()?;
+    checked_pattern_scope(
+        pattern.syntax_element(),
+        parameter.syntax_element(),
+        list.syntax_element(),
+        scope.syntax_element(),
+    )?;
+    Some(name)
+}
+
+/// A simple written binding of the object pattern of one exact callable type.
+fn callable_pattern_scope(name: Node<'_>) -> Option<Node<'_>> {
+    if name.is_missing() {
+        return None;
+    }
+    let pattern = match name.kind() {
+        "shorthand_property_identifier_pattern" => name.parent()?,
+        "identifier" => name
+            .parent()
+            .filter(|pair| checked_renamed_pattern_binding(name, *pair))?
+            .parent()?,
+        _ => return None,
+    };
+    if pattern.kind() != "object_pattern" {
+        return None;
+    }
+    let parameter = pattern.parent()?;
+    let list = parameter.parent()?;
+    checked_pattern_scope(pattern, parameter, list, list.parent()?)
+}
+
+fn checked_renamed_pattern_binding(name: Node<'_>, pair: Node<'_>) -> bool {
+    pair.kind() == "pair_pattern"
+        && pair.child_by_field_name("value") == Some(name)
+        && pair
+            .child_by_field_name("key")
+            .is_some_and(|key| key.kind() == "property_identifier" && !key.is_missing())
+}
+
+fn checked_pattern_scope<'tree>(
+    pattern: Node<'tree>,
+    parameter: Node<'tree>,
+    list: Node<'tree>,
+    scope: Node<'tree>,
+) -> Option<Node<'tree>> {
+    (matches!(
+        parameter.kind(),
+        "required_parameter" | "optional_parameter"
+    ) && parameter.child_by_field_name("pattern") == Some(pattern)
+        && parameter.child_by_field_name("value").is_none()
+        && checked_callable_type_scope(list, scope)
+        && !parameter.has_error())
+    .then_some(scope)
+}
+
 fn callable_type_scope(parameter: Node<'_>) -> Option<Node<'_>> {
     if !matches!(
         parameter.kind(),
@@ -26,11 +165,15 @@ fn callable_type_scope(parameter: Node<'_>) -> Option<Node<'_>> {
     ) {
         return None;
     }
-    let list = parameter
-        .parent()
-        .filter(|node| node.kind() == "formal_parameters")?;
+    let list = parameter.parent()?;
     let scope = list.parent()?;
-    callable_signature(scope.kind()).then_some(scope)
+    (list.kind() == "formal_parameters" && callable_signature(scope.kind())).then_some(scope)
+}
+
+fn checked_callable_type_scope(list: Node<'_>, scope: Node<'_>) -> bool {
+    list.kind() == "formal_parameters"
+        && callable_signature(scope.kind())
+        && scope.child_by_field_name("parameters") == Some(list)
 }
 
 pub(super) fn callable_signature(kind: &str) -> bool {
@@ -54,8 +197,31 @@ pub(super) fn append_callable_types(
         .iter()
         .map(|site| (site.name, site.function))
         .collect::<BTreeMap<_, _>>();
+    let pattern_bindings = parameters
+        .iter()
+        .any(|parameter| {
+            parameter.is_typescript_callable_type_rest_parameter()
+                || parameter.is_typescript_callable_type_pattern_parameter()
+        })
+        .then(|| {
+            facts
+                .bindings()
+                .iter()
+                .filter(|site| site.kind == StaticBindingKind::Shadow)
+                .map(|binding| (binding.name, binding.scope))
+                .collect::<BTreeSet<_>>()
+        });
     append_scoped(symbols, parameters, "$signature", |name| {
         let written = written_name(root, name)?;
+        if let Some(scope) =
+            callable_rest_scope(written).or_else(|| callable_pattern_scope(written))
+        {
+            let scope = extract::byte_range(scope).ok()?;
+            return pattern_bindings
+                .as_ref()?
+                .contains(&(name, scope))
+                .then_some(scope);
+        }
         let scope = extract::byte_range(callable_type_scope(written.parent()?)?).ok()?;
         (sites.get(&name) == Some(&scope)).then_some(scope)
     });
@@ -295,8 +461,14 @@ fn append_scoped(
         .collect::<BTreeSet<_>>();
     let mut next = BTreeMap::<String, usize>::new();
     let mut scopes = BTreeMap::<ByteRange, usize>::new();
-    let mut retained = BTreeMap::new();
-    parameters.sort_unstable_by_key(|parameter| parameter.item_range.start);
+    let mut retained = BTreeMap::<String, Option<SyntaxSymbol>>::new();
+    parameters.sort_unstable_by_key(|parameter| {
+        (
+            parameter.is_typescript_callable_type_pattern_parameter(),
+            parameter.is_typescript_callable_type_rest_parameter(),
+            parameter.item_range.start,
+        )
+    });
     for mut parameter in parameters {
         let Some(name) = parameter.name_range else {
             continue;
@@ -324,9 +496,18 @@ fn append_scoped(
             continue;
         }
         parameter.qualified_name.clone_from(&qualified);
+        let pattern = parameter.is_typescript_callable_type_pattern_parameter();
         retained
             .entry(qualified)
-            .and_modify(|entry| *entry = None)
+            .and_modify(|entry| {
+                if !pattern
+                    || entry
+                        .as_ref()
+                        .is_some_and(SyntaxSymbol::is_typescript_callable_type_pattern_parameter)
+                {
+                    *entry = None;
+                }
+            })
             .or_insert(Some(parameter));
     }
     symbols.extend(retained.into_values().flatten());

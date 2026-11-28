@@ -116,6 +116,8 @@ pub(crate) struct StaticResolution {
         BTreeMap<rift_core::SourceUnitId, Vec<StaticCall>>,
     /// First member reference through a checked call-result assignment.
     pub(crate) javascript_assigned_member_start: Option<usize>,
+    /// First read of a property selected from a returned JavaScript object.
+    pub(crate) javascript_call_object_selector_start: Option<usize>,
     /// Member sites that the ordinary pass could not place.
     pub(crate) javascript_assigned_members:
         BTreeMap<rift_core::SourceUnitId, Vec<javascript::AssignedMemberSite>>,
@@ -147,6 +149,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_parent_module_start: Option<usize>,
     /// First reference from a written TypeScript export selector to a local declaration.
     pub(crate) typescript_local_export_start: Option<usize>,
+    /// First checked local export selector inside a declaration namespace.
+    pub(crate) typescript_namespace_local_export_start: Option<usize>,
     /// First internal and external Read of an established Python call receiver.
     pub(crate) python_value_qualifier_start: Option<(usize, usize)>,
     /// Class qualifier Reads awaiting remaining edge capacity.
@@ -422,6 +426,8 @@ fn resolve_by<'source>(
     index.resolve_typescript_namespace_type_uses(&mut work, &mut resolution);
     index.resolve_javascript_wrapped_arrow_reads(&mut work, &mut resolution);
     index.resolve_typescript_enum_qualifiers(&mut work, &mut resolution);
+    index.resolve_javascript_call_object_selectors(&mut work, &mut resolution);
+    index.resolve_typescript_namespace_local_exports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

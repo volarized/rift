@@ -264,6 +264,10 @@ pub(crate) const DECLARED_SIGNATURE_TYPE_PARAMETER_KIND: &str =
     "typescript_declared_signature_type_parameter";
 pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_parameter";
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
+pub(crate) const CALLABLE_TYPE_REST_PARAMETER_KIND: &str =
+    "typescript_callable_type_rest_parameter";
+pub(crate) const CALLABLE_TYPE_PATTERN_PARAMETER_KIND: &str =
+    "typescript_callable_type_pattern_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
 pub(crate) const ARROW_WRAPPED_PARAMETER_KIND: &str = "javascript_arrow_wrapped_parameter";
@@ -1684,6 +1688,17 @@ impl EcmaScriptRules<'_> {
                     .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
             })
             .or_else(|| {
+                if self.kinds.formal_parameter_kinds.is_empty() {
+                    return None;
+                }
+                type_signature_parameters::callable_rest_parameter_name(visited)
+                    .map(|name| (name, CALLABLE_TYPE_REST_PARAMETER_KIND))
+                    .or_else(|| {
+                        type_signature_parameters::callable_pattern_parameter_name(visited)
+                            .map(|name| (name, CALLABLE_TYPE_PATTERN_PARAMETER_KIND))
+                    })
+            })
+            .or_else(|| {
                 type_signature_parameters::index_parameter_name(visited)
                     .map(|name| (name, INDEX_SIGNATURE_PARAMETER_KIND))
             })
@@ -2929,6 +2944,12 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == CALLABLE_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(CALLABLE_TYPE_PARAMETER_KIND);
+    }
+    if name == CALLABLE_TYPE_REST_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(CALLABLE_TYPE_REST_PARAMETER_KIND);
+    }
+    if name == CALLABLE_TYPE_PATTERN_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(CALLABLE_TYPE_PATTERN_PARAMETER_KIND);
     }
     if name == INDEX_SIGNATURE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(INDEX_SIGNATURE_PARAMETER_KIND);

@@ -797,25 +797,25 @@ struct EcmaScriptBindingDemand {
     typescript_inferred_types: BindingDemand,
     typescript_mapped_types: BindingDemand,
     javascript_arrow_wrapped: BindingDemand,
+    typescript_callable_rest: BindingDemand,
+    typescript_callable_pattern: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
     fn reserve_late_bindings(
         &self,
         documents: &[AnalyzedFile],
-        rust: [&BindingDemand; 4],
-        [python_comprehensions, python_property_receivers]: [&BindingDemand; 2],
-        capacity: (usize, u64),
-        record: u64,
-        established: &rift_syntax::PackageBindingSlots,
-    ) -> rift_syntax::PackageBindingSlots {
-        let [
+        [
             rust_modules,
             rust_shorthand,
             rust_macro_methods,
             rust_disjoint,
-        ] = rust;
-        let (mut slots, mut bytes) = capacity;
+        ]: [&BindingDemand; 4],
+        [python_comprehensions, python_property_receivers]: [&BindingDemand; 2],
+        (mut slots, mut bytes): (usize, u64),
+        record: u64,
+        established: &rift_syntax::PackageBindingSlots,
+    ) -> rift_syntax::PackageBindingSlots {
         let [
             callback_slots,
             overload_slots,
@@ -843,6 +843,8 @@ impl EcmaScriptBindingDemand {
             property_receiver_slots,
             mapped_type_slots,
             arrow_wrapped_slots,
+            callable_rest_slots,
+            callable_pattern_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -872,6 +874,8 @@ impl EcmaScriptBindingDemand {
                 python_property_receivers,
                 &self.typescript_mapped_types,
                 &self.javascript_arrow_wrapped,
+                &self.typescript_callable_rest,
+                &self.typescript_callable_pattern,
             ],
             &mut slots,
             &mut bytes,
@@ -904,6 +908,8 @@ impl EcmaScriptBindingDemand {
             .with_python_property_receivers(property_receiver_slots)
             .with_typescript_mapped_type_parameters(mapped_type_slots)
             .with_javascript_arrow_wrapped_parameters(arrow_wrapped_slots)
+            .with_typescript_callable_type_rest_parameters(callable_rest_slots)
+            .with_typescript_callable_type_pattern_parameters(callable_pattern_slots)
     }
 
     fn classify(
@@ -928,6 +934,10 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_types
         } else if symbol.is_javascript_shorthand_parameter() {
             &mut self.javascript_shorthand
+        } else if symbol.is_typescript_callable_type_pattern_parameter() {
+            &mut self.typescript_callable_pattern
+        } else if symbol.is_typescript_callable_type_rest_parameter() {
+            &mut self.typescript_callable_rest
         } else if symbol.is_typescript_callable_type_parameter() {
             &mut self.typescript_callable_types
         } else if symbol.is_typescript_index_signature_parameter() {
@@ -978,6 +988,8 @@ impl EcmaScriptBindingDemand {
             + self.typescript_types.count
             + self.javascript_shorthand.count
             + self.typescript_callable_types.count
+            + self.typescript_callable_rest.count
+            + self.typescript_callable_pattern.count
             + self.typescript_index_signatures.count
             + self.javascript_wrapped.count
             + self.javascript_destructured.count

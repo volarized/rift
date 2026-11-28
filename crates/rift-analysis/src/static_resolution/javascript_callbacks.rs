@@ -1,14 +1,16 @@
 //! Types an unannotated callback parameter from the function type written for it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::ReferenceRole;
+use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    ByteRange, StaticBinding, StaticCall, StaticFacts, StaticFunctionContext, StaticMemberCallback,
+    ByteRange, StaticBinding, StaticCall, StaticCallee, StaticFacts, StaticFunctionContext,
+    StaticMemberCallback,
 };
 
 use super::javascript_members::DECLARED_TYPE_DEPTH_MAX;
-use super::{File, Index, Target, Work};
+use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
 /// One entry of a declared return type: the member of an inline object type, or none for
 /// a named type, and the type written for it.
@@ -43,6 +45,7 @@ pub(super) struct Callbacks<'source> {
     /// Owning declaration name to what each `return` of its function returns: the object
     /// literal, or none for any other value.
     returned_objects: BTreeMap<ByteRange, Vec<Option<ByteRange>>>,
+    plain_return_objects: BTreeSet<ByteRange>,
 }
 
 /// What a standard array method gives one of its callback's parameters.
@@ -217,6 +220,12 @@ impl<'source> Callbacks<'source> {
                 return None;
             }
             self.returned_objects.entry(owner).or_default().push(object);
+        }
+        for &object in facts.plain_return_objects() {
+            if !work.charge() {
+                return None;
+            }
+            self.plain_return_objects.insert(object);
         }
         for &(owner, element) in facts.element_returns() {
             if !work.charge() {
@@ -601,6 +610,94 @@ impl<'source> Index<'source> {
         Some((file, found?))
     }
 
+    /// Reads each authored JavaScript destructuring key answered by one returned literal.
+    pub(super) fn resolve_javascript_call_object_selectors(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values() {
+            if file.document.facts.language().name != "javascript"
+                || !file.document.facts.declaration_syntax_complete()
+            {
+                continue;
+            }
+            for &(key, call) in file.facts.call_object_selectors() {
+                if !work.charge() {
+                    break 'files;
+                }
+                result.record(self.javascript_call_object_selector(file, key, call, work));
+            }
+        }
+        result.javascript_call_object_selector_start =
+            (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn javascript_call_object_selector(
+        &self,
+        file: &File<'source>,
+        key: ByteRange,
+        call: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let call = file.callbacks.calls.get(&call).copied()?;
+        if !matches!(
+            call.callee,
+            StaticCallee::Direct | StaticCallee::Member { .. }
+        ) {
+            return None;
+        }
+        let target = work.javascript_lookup(|work| {
+            let (callee, declared, objects) =
+                self.javascript_call_returned_objects(file, call, work)?;
+            let [Some(object)] = objects else {
+                return None;
+            };
+            if declared.document.facts.language().name != "javascript"
+                || !declared.document.facts.declaration_syntax_complete()
+                || !declared.callbacks.plain_return_objects.contains(object)
+            {
+                return None;
+            }
+            let name = callee.symbol.name_range?;
+            let header = declared.text(ByteRange {
+                start: callee.symbol.item_range.start,
+                end: name.start,
+            })?;
+            match (callee.symbol.syntax_element_kind, header.trim_ascii()) {
+                (Some("function_declaration"), "function")
+                | (Some("method_definition"), "static") => {}
+                _ => return None,
+            }
+            Self::javascript_literal_member(declared, *object, file.text(key)?, work)
+        })?;
+        let mut occurrence = self.occurrence(file, key, key, ReferenceRole::Read, target)?;
+        if !matches!(occurrence.target, NormalizedTarget::Symbol(_)) {
+            return None;
+        }
+        occurrence.edge_from = Some(self.javascript_call_from(file, key, work)?);
+        Some(occurrence)
+    }
+
+    fn javascript_call_returned_objects(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+    ) -> Option<(Target<'source>, &File<'source>, &[Option<ByteRange>])> {
+        let callee = self.javascript_call(file, call, work)?;
+        let declared = self.files.get(callee.file.path.as_str())?;
+        let owner = callee.symbol.name_range?;
+        if declared.callbacks.returns.contains_key(&owner)
+            || declared.callbacks.element_returns.contains_key(&owner)
+        {
+            return None;
+        }
+        let objects = declared.callbacks.returned_objects.get(&owner)?;
+        Some((callee, declared, objects))
+    }
+
     /// The member `member` of the value a name bound to a call holds, read from the object
     /// literals the callee returns (D38): the callee declares no return type, every one of
     /// its `return`s returns an object literal, and each of them writes the member. The
@@ -638,15 +735,7 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         let call = file.callbacks.calls.get(&call).copied()?;
         work.javascript_lookup(|work| {
-            let callee = self.javascript_call(file, call, work)?;
-            let declared = self.files.get(callee.file.path.as_str())?;
-            let owner = callee.symbol.name_range?;
-            if declared.callbacks.returns.contains_key(&owner)
-                || declared.callbacks.element_returns.contains_key(&owner)
-            {
-                return None;
-            }
-            let objects = declared.callbacks.returned_objects.get(&owner)?;
+            let (_, declared, objects) = self.javascript_call_returned_objects(file, call, work)?;
             let mut first = None;
             let mut pair_target: Option<Target<'source>> = None;
             let mut resolve_pair = pair_unchanged

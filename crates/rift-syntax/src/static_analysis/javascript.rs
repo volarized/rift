@@ -584,11 +584,15 @@ impl Kinds {
         };
         let owner = byte_range(owner)?;
         let value = self.written_return_value(value);
-        let object = value
-            .filter(|node| node.kind_id() == self.object_literal[0])
-            .map(byte_range)
-            .transpose()?;
+        let literal = value.filter(|node| node.kind_id() == self.object_literal[0]);
+        let object = literal.map(byte_range).transpose()?;
         facts.returned_objects.push((owner, object));
+        if self.type_shapes.is_none()
+            && let Some((literal, range)) = literal.zip(object)
+            && self.plain_return_object(literal)
+        {
+            facts.plain_return_objects.push(range);
+        }
         if self.type_shapes.is_none()
             && self.function.contains(&function_element.kind_id())
             && let Some(value) =
@@ -2214,6 +2218,20 @@ impl Kinds {
         Ok(true)
     }
 
+    fn plain_return_object(&self, object: Node<'_>) -> bool {
+        let mut cursor = object.walk();
+        object
+            .named_children(&mut cursor)
+            .filter(|member| !member.is_extra())
+            .all(|member| {
+                member.kind_id() == self.shorthand
+                    || (member.kind_id() == self.object_literal[1]
+                        && member
+                            .child_by_field_name("key")
+                            .is_some_and(|key| key.kind_id() == self.property_identifier))
+            })
+    }
+
     /// Records the names an object pattern takes from a call, each with its key.
     fn record_destructured(
         &self,
@@ -2221,14 +2239,14 @@ impl Kinds {
         declarator: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(shapes) = &self.type_shapes else {
-            return Ok(());
-        };
         let call = declarator
             .child_by_field_id(self.value)
             .filter(|value| value.kind_id() == self.call);
         let Some(call) = call.filter(|_| pattern.kind_id() == self.patterns[0]) else {
             return Ok(());
+        };
+        let Some(shapes) = &self.type_shapes else {
+            return self.record_call_object_selectors(pattern, call, facts);
         };
         let mut cursor = pattern.walk();
         for entry in pattern.named_children(&mut cursor) {
@@ -2253,6 +2271,48 @@ impl Kinds {
                     Some(byte_range(key)?),
                     byte_range(call)?,
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_call_object_selectors(
+        &self,
+        pattern: Node<'_>,
+        call: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        if call.child_by_field_name("optional_chain").is_some() {
+            return Ok(());
+        }
+        let invocation = byte_range(call)?;
+        let mut cursor = pattern.walk();
+        for entry in pattern.named_children(&mut cursor) {
+            let key = if entry.kind_id() == self.shorthand_pattern {
+                Some(entry)
+            } else if entry.kind_id() == self.default_patterns[1] {
+                entry
+                    .child_by_field_id(self.left)
+                    .filter(|key| key.kind_id() == self.shorthand_pattern)
+            } else if entry.kind_id() == self.pair_pattern {
+                let local = entry.child_by_field_id(self.value).and_then(|value| {
+                    if value.kind_id() == self.default_patterns[0] {
+                        value.child_by_field_id(self.left)
+                    } else {
+                        Some(value)
+                    }
+                });
+                entry.child_by_field_name("key").filter(|key| {
+                    key.kind_id() == self.property_identifier
+                        && local.is_some_and(|local| local.kind_id() == self.identifier)
+                })
+            } else {
+                None
+            };
+            if let Some(key) = key {
+                facts
+                    .call_object_selectors
+                    .push((byte_range(key)?, invocation));
             }
         }
         Ok(())

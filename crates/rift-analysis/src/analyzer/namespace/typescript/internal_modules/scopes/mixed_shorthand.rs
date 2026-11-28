@@ -1,8 +1,9 @@
-//! Placement of a destructured binding and object properties that share its written name.
+//! Placement of a lexical binding and object properties that share its written name.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
+use rift_protocol::read::SymbolKind;
 use rift_syntax::{
     ByteRange, ScopedIdentityAnchors, StaticBinding, StaticBindingKind, SyntaxSymbol,
 };
@@ -37,7 +38,7 @@ impl<'source> FileScopes<'source> {
             }
         }
         groups.retain(|_, group| {
-            group.iter().any(|symbol| destructured_local(symbol))
+            group.iter().any(|symbol| mixed_local(symbol))
                 && group
                     .iter()
                     .any(|symbol| ordinary_private_property(symbol, file.source))
@@ -48,7 +49,7 @@ impl<'source> FileScopes<'source> {
         let names = groups
             .values()
             .flatten()
-            .filter(|symbol| destructured_local(symbol))
+            .filter(|symbol| mixed_local(symbol))
             .map(|symbol| symbol.name.as_str())
             .collect::<BTreeSet<_>>();
         let mut bindings = BTreeMap::<&str, Vec<&StaticBinding>>::new();
@@ -77,7 +78,7 @@ impl<'source> FileScopes<'source> {
         for (name, declarations) in groups {
             let (locals, members): (Vec<_>, Vec<_>) = declarations
                 .into_iter()
-                .partition(|symbol| destructured_local(symbol));
+                .partition(|symbol| mixed_local(symbol));
             let [local] = locals.as_slice() else { continue };
             let Some(written) = bindings.get(local.name.as_str()) else {
                 continue;
@@ -115,7 +116,8 @@ impl<'source> FileScopes<'source> {
         else {
             return false;
         };
-        let Some(owner) = placed_function(owners, local.item_range) else {
+        let variable = local.syntax_element_kind == Some("variable_declarator");
+        let Some(owner) = placed_function(owners, local.item_range, variable) else {
             return false;
         };
         if local.container.as_deref() != Some(owner.qualified_name.as_str())
@@ -126,10 +128,13 @@ impl<'source> FileScopes<'source> {
         let mut candidates = written
             .iter()
             .filter(|binding| owner.item_range.encloses(binding.name));
+        let binding_kind = if variable {
+            StaticBindingKind::Local
+        } else {
+            StaticBindingKind::Shadow
+        };
         if !candidates.next().is_some_and(|binding| {
-            binding.kind == StaticBindingKind::Shadow
-                && binding.name == name
-                && binding.scope == scope
+            binding.kind == binding_kind && binding.name == name && binding.scope == scope
         }) || candidates.next().is_some()
         {
             return false;
@@ -139,14 +144,15 @@ impl<'source> FileScopes<'source> {
             let Some(row) = self.body_members.get(&member.item_range) else {
                 return false;
             };
-            let direct_return = member.syntax_element_kind == Some("pair")
-                && returned.contains(&row.body)
+            let direct_return = returned.contains(&row.body)
                 && owners.returned.get(&row.body) == Some(&Some(owner.qualified_name.as_str()));
-            (member.syntax_element_kind == Some("shorthand_property_identifier") || direct_return)
+            (member.syntax_element_kind == Some("shorthand_property_identifier")
+                || (member.syntax_element_kind == Some("pair") && direct_return))
+                && (!variable || direct_return)
                 && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start
                 && scope.encloses(row.body)
-                && placed_function(owners, row.body)
+                && placed_function(owners, row.body, variable)
                     .is_some_and(|function| function.item_range == owner.item_range)
                 && self.of(member, file) == Scope::Body(row.body, false)
                 && owners.proves_body(member, row)
@@ -158,12 +164,21 @@ impl<'source> FileScopes<'source> {
 fn placed_function<'source>(
     owners: &LiteralOwners<'source>,
     range: ByteRange,
+    allow_static_method: bool,
 ) -> Option<&'source SyntaxSymbol> {
     let (_, owner) = owners.enclosing.resolve(range.start, range.end)?;
-    owner.filter(|symbol| symbol.syntax_element_kind == Some("function_declaration"))
+    owner.filter(|symbol| {
+        symbol.syntax_element_kind == Some("function_declaration")
+            || (allow_static_method
+                && symbol.syntax_element_kind == Some("method_definition")
+                && symbol.kinds.contains(&SymbolKind::Static))
+    })
 }
 
-fn destructured_local(symbol: &SyntaxSymbol) -> bool {
+fn mixed_local(symbol: &SyntaxSymbol) -> bool {
     private_variable_declaration(symbol)
-        && symbol.syntax_element_kind == Some("shorthand_property_identifier_pattern")
+        && matches!(
+            symbol.syntax_element_kind,
+            Some("shorthand_property_identifier_pattern" | "variable_declarator")
+        )
 }
