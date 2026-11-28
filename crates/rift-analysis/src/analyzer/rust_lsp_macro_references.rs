@@ -10,12 +10,15 @@ use rift_protocol::read::{
     EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, ExtensionKey, Extensions, SourceKind,
     SourceUnitId, SourceUnitSpan, Symbol, SymbolId, TextRange,
 };
-use rift_syntax::{ByteRange, RustSyntaxProvider, SyntaxLimits, SyntaxProvider, SyntaxSource};
+use rift_syntax::{
+    ByteRange, RustSyntaxProvider, StaticBinding, StaticBindingKind, StaticFacts, SyntaxLimits,
+    SyntaxProvider, SyntaxSource,
+};
 
 use super::{PackageAnalyzer, file_digest, rust_lsp_operators::checked_units};
 use crate::ExactPackageLimits;
 
-/// A written occurrence whose unique Rust language-server definition is an original macro name.
+/// A written occurrence with one independently identified original macro member.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RustLspMacroReference<'source> {
     /// Package-relative path of the original occurrence.
@@ -30,6 +33,8 @@ pub struct RustLspMacroReference<'source> {
     pub target_digest: FileDigest,
     /// Exact range of the original macro name declaration.
     pub target_name: SourceRange,
+    /// Additional same-unit lexical definition returned for a shorthand field token.
+    pub lexical_companion: Option<SourceRange>,
 }
 
 /// Supplemental checked edges and the number left out at a bound.
@@ -73,7 +78,26 @@ impl PackageAnalyzer {
         let mut shapes = BTreeMap::new();
         let incumbent = incumbent_edges(publication);
         let room = maximum.saturating_sub(publication.edges.len());
-        for row in unique_uses(observed).into_values().flatten() {
+        let singleton = unique_uses(
+            observed
+                .iter()
+                .filter(|row| row.lexical_companion.is_none()),
+        );
+        let shorthand = unique_uses(
+            observed
+                .iter()
+                .filter(|row| row.lexical_companion.is_some()),
+        );
+        let checked_shorthand = shorthand
+            .into_iter()
+            .filter(|(site, _)| !singleton.contains_key(site))
+            .filter_map(|(_, row)| row);
+        for row in singleton
+            .values()
+            .copied()
+            .flatten()
+            .chain(checked_shorthand)
+        {
             let Some(source) = sources
                 .get(row.source.as_str())
                 .filter(|unit| unit.digest == row.source_digest)
@@ -100,7 +124,7 @@ impl PackageAnalyzer {
             else {
                 continue;
             };
-            let Some(kind) = shape.kind(source.unit, row.occurrence, target.object) else {
+            let Some(kind) = shape.kind(source.unit, row, target.object) else {
                 continue;
             };
             let span = row.occurrence;
@@ -134,7 +158,7 @@ impl PackageAnalyzer {
 
 type Uses<'a> = BTreeMap<(&'a ProjectPath, SourceRange), Option<&'a RustLspMacroReference<'a>>>;
 
-fn unique_uses<'a>(observed: &'a [RustLspMacroReference<'a>]) -> Uses<'a> {
+fn unique_uses<'a>(observed: impl Iterator<Item = &'a RustLspMacroReference<'a>>) -> Uses<'a> {
     let mut uses = Uses::new();
     for row in observed {
         uses.entry((row.source, row.occurrence))
@@ -232,6 +256,8 @@ fn macro_targets<'a>(
 struct SourceShapes {
     names: BTreeSet<ByteRange>,
     field_roles: BTreeMap<ByteRange, EdgeKind>,
+    shorthand_fields: BTreeSet<ByteRange>,
+    lexical_bindings: BTreeMap<ByteRange, Vec<StaticBinding>>,
     callees: BTreeSet<u64>,
 }
 
@@ -249,8 +275,10 @@ impl SourceShapes {
         let facts = document.facts().static_facts()?;
         let mut names = BTreeSet::new();
         let mut real_calls = BTreeSet::new();
+        let mut shorthand_fields = BTreeSet::new();
         let mut unavailable = Vec::new();
-        for element in document.syntax_elements() {
+        let elements = document.syntax_elements();
+        for element in elements {
             let blocked = matches!(
                 element.kind,
                 "ERROR" | "macro_definition" | "macro_invocation"
@@ -262,6 +290,14 @@ impl SourceShapes {
             unavailable.push(blocked);
             if blocked || element.has_error {
                 continue;
+            }
+            if element.kind == "shorthand_field_identifier"
+                || element
+                    .parent
+                    .and_then(|index| elements.get(index))
+                    .is_some_and(|parent| parent.kind == "shorthand_field_initializer")
+            {
+                shorthand_fields.insert(element.range);
             }
             if matches!(
                 element.kind,
@@ -298,9 +334,16 @@ impl SourceShapes {
                     .then_some(call.callee_range.end)
             })
             .collect();
+        let lexical_bindings = if shorthand_fields.is_empty() {
+            BTreeMap::new()
+        } else {
+            checked_lexical_bindings(facts, &names)
+        };
         Some(Self {
             names,
             field_roles,
+            shorthand_fields,
+            lexical_bindings,
             callees,
         })
     }
@@ -308,15 +351,25 @@ impl SourceShapes {
     fn kind(
         &self,
         unit: &PackageSourceUnit,
-        range: SourceRange,
+        row: &RustLspMacroReference<'_>,
         target: &Symbol,
     ) -> Option<EdgeKind> {
+        let range = row.occurrence;
         let bytes = ByteRange {
             start: range.start(),
             end: range.end(),
         };
         if !self.names.contains(&bytes) || !matches_written(unit, range, &target.name) {
             return None;
+        }
+        if let Some(companion) = row.lexical_companion {
+            if target.kind.0 != "field_declaration" || !self.shorthand_fields.contains(&bytes) {
+                return None;
+            }
+            let role = self.field_roles.get(&bytes).copied()?;
+            return self
+                .shorthand_companion(unit, &target.name, range, companion, role)
+                .then_some(role);
         }
         if target.kind.0 == "field_declaration" {
             Some(
@@ -331,6 +384,64 @@ impl SourceShapes {
             Some(EdgeKind::References)
         }
     }
+
+    fn shorthand_companion(
+        &self,
+        unit: &PackageSourceUnit,
+        name: &str,
+        use_range: SourceRange,
+        companion: SourceRange,
+        role: EdgeKind,
+    ) -> bool {
+        let binding = ByteRange {
+            start: companion.start(),
+            end: companion.end(),
+        };
+        let occurrence = ByteRange {
+            start: use_range.start(),
+            end: use_range.end(),
+        };
+        let Some(bindings) = self.lexical_bindings.get(&binding) else {
+            return false;
+        };
+        matches_written(unit, companion, name)
+            && match role {
+                EdgeKind::Reads => binding == occurrence,
+                EdgeKind::Writes => {
+                    binding != occurrence
+                        && bindings.iter().any(|binding| {
+                            binding.scope.encloses(occurrence)
+                                && binding.available_from <= occurrence.start
+                        })
+                }
+                _ => false,
+            }
+    }
+}
+
+fn checked_lexical_bindings(
+    facts: &StaticFacts,
+    names: &BTreeSet<ByteRange>,
+) -> BTreeMap<ByteRange, Vec<StaticBinding>> {
+    let mut checked = BTreeMap::<_, Vec<_>>::new();
+    for &binding in facts.bindings() {
+        if names.contains(&binding.name)
+            && matches!(
+                binding.kind,
+                StaticBindingKind::Local
+                    | StaticBindingKind::Shadow
+                    | StaticBindingKind::RustValue { .. }
+                    | StaticBindingKind::RustReceiver { .. }
+            )
+            && !facts
+                .unsupported_bindings()
+                .iter()
+                .any(|range| range.encloses(binding.name))
+        {
+            checked.entry(binding.name).or_default().push(binding);
+        }
+    }
+    checked
 }
 
 fn matches_written(unit: &PackageSourceUnit, range: SourceRange, name: &str) -> bool {
@@ -418,24 +529,41 @@ mod tests {
     const MANIFEST: &str = "[package]\nname='beacon'\nversion='1.0.0'\nedition='2024'\n";
     const SOURCE: &str = r"
 macro_rules! define {
-    ($name:ident { $variant:ident { $field:ident : $ty:ty }, $count:ident }) => {
-        pub enum $name { $variant { $field: $ty }, $count(u8) }
+    ($name:ident { $variant:ident { $field:ident : $ty:ty }, $count:ident, $other:ident { $other_field:ident : $other_ty:ty } }) => {
+        pub enum $name { $variant { $field: $ty }, $count(u8), $other { $other_field: $other_ty } }
     };
 }
-define!(Node { Leaf { value: u8 }, Count });
+define!(Node { Leaf { value: u8 }, Count, Branch { value: u16 } });
 
 pub enum Ordinary { Plain { value: u8 } }
 
 pub fn use_nodes(node: Node) -> u8 {
+    let value = 9;
+    let _incumbent = value;
+    let _shorthand = Node::Leaf { value };
     let _leaf = Node::Leaf { value: 7 };
     let _count = Node::Count(1);
     let _plain = Ordinary::Plain { value: 3 };
     match node {
         Node::Leaf { value: written } => written,
         Node::Count(value) => value,
+        Node::Branch { value: longer } => longer as u8,
     }
+}
+
+pub fn inspect(node: Node) -> u8 {
+    match node {
+        Node::Leaf { value } => value,
+        _ => 0,
+    }
+}
+
+pub fn unrelated() -> u8 {
+    let value = 4;
+    value
 }";
-    const EXPANSION: &str = "pub enum Node { Leaf { value: u8 }, Count(u8) }";
+    const EXPANSION: &str =
+        "pub enum Node { Leaf { value: u8 }, Count(u8), Branch { value: u16 } }";
 
     fn range(context: &str, name: &str) -> SourceRange {
         let start = SOURCE.find(context).expect("written context")
@@ -498,7 +626,7 @@ pub fn use_nodes(node: Node) -> u8 {
             limits,
         )
         .expect("macro declarations checked");
-        assert_eq!(admission.admitted, 4);
+        assert_eq!(admission.admitted, 6);
         publication
     }
 
@@ -516,6 +644,7 @@ pub fn use_nodes(node: Node) -> u8 {
             target: path,
             target_digest: digest,
             target_name: range(target_context, name),
+            lexical_companion: None,
         }
     }
 
@@ -672,6 +801,145 @@ pub fn use_nodes(node: Node) -> u8 {
             PackageAnalyzer::rust_lsp_macro_reference_edges(
                 &publication,
                 &[written, written],
+                &producer(),
+                limits,
+            )
+            .edges
+            .len(),
+            1
+        );
+    }
+    #[test]
+    fn shorthand_fields_use_independent_members_and_keep_the_lexical_role() {
+        let path = ProjectPath::new("src/lib.rs").expect("fixture path");
+        let limits = ExactPackageLimits::new(1024, 2 * 1024 * 1024);
+        let publication = checked_package(&path, limits);
+        let known = "Leaf { value: u8";
+        let write = RustLspMacroReference {
+            lexical_companion: Some(range("let value = 9", "value")),
+            ..observation(
+                &path,
+                "let _shorthand = Node::Leaf { value }",
+                known,
+                "value",
+            )
+        };
+        let read = observation(&path, "Node::Leaf { value } =>", known, "value");
+        let read = RustLspMacroReference {
+            lexical_companion: Some(read.occurrence),
+            ..read
+        };
+        let report = PackageAnalyzer::rust_lsp_macro_reference_edges(
+            &publication,
+            &[write, read],
+            &producer(),
+            limits,
+        );
+        assert_eq!(report.edges.len(), 2);
+        for (edge, (role, observed)) in report
+            .edges
+            .iter()
+            .zip([(EdgeKind::Writes, write), (EdgeKind::Reads, read)])
+        {
+            assert!(edge.to.as_str().ends_with("/Node/Leaf/value"));
+            assert_eq!(edge.kinds, [role]);
+            let span = edge.occurrence.as_ref().expect("original field token");
+            assert_eq!(
+                (span.range.start, span.range.end),
+                (observed.occurrence.start(), observed.occurrence.end())
+            );
+        }
+        let tight = limits
+            .with_edges(publication.edges.len() + 1)
+            .expect("incumbent edge capacity");
+        let explicit = observation(&path, "Node::Leaf { value: 7", known, "value");
+        assert!(write.occurrence.start() < explicit.occurrence.start());
+        let incumbent = PackageAnalyzer::rust_lsp_macro_reference_edges(
+            &publication,
+            &[explicit],
+            &producer(),
+            limits,
+        );
+        let capped = PackageAnalyzer::rust_lsp_macro_reference_edges(
+            &publication,
+            &[write, read, explicit],
+            &producer(),
+            tight,
+        );
+        assert_eq!(capped.edges, incumbent.edges);
+        assert_eq!(capped.dropped_at_limit, 2);
+    }
+
+    #[test]
+    fn shorthand_refuses_explicit_labels_other_scopes_and_competing_members() {
+        let path = ProjectPath::new("src/lib.rs").expect("fixture path");
+        let limits = ExactPackageLimits::new(1024, 2 * 1024 * 1024);
+        let publication = checked_package(&path, limits);
+        let known = "Leaf { value: u8";
+        let use_context = "let _shorthand = Node::Leaf { value }";
+        let binding = range("let value = 9", "value");
+        let write = RustLspMacroReference {
+            lexical_companion: Some(binding),
+            ..observation(&path, use_context, known, "value")
+        };
+        let explicit = RustLspMacroReference {
+            lexical_companion: Some(binding),
+            ..observation(&path, "Node::Leaf { value: 7", known, "value")
+        };
+        let other_field = range("Branch { value: u16", "value");
+        let rejected = [
+            explicit,
+            RustLspMacroReference {
+                lexical_companion: Some(range("let value = 4", "value")),
+                ..write
+            },
+            RustLspMacroReference {
+                lexical_companion: Some(other_field),
+                ..write
+            },
+            RustLspMacroReference {
+                lexical_companion: Some(write.target_name),
+                ..write
+            },
+            RustLspMacroReference {
+                lexical_companion: Some(range("let _incumbent = value", "value")),
+                ..write
+            },
+        ];
+        for row in rejected {
+            assert!(
+                PackageAnalyzer::rust_lsp_macro_reference_edges(
+                    &publication,
+                    &[row],
+                    &producer(),
+                    limits,
+                )
+                .edges
+                .is_empty(),
+                "{row:?}"
+            );
+        }
+        let ambiguous = RustLspMacroReference {
+            target_name: other_field,
+            ..write
+        };
+        assert!(
+            PackageAnalyzer::rust_lsp_macro_reference_edges(
+                &publication,
+                &[write, ambiguous],
+                &producer(),
+                limits,
+            )
+            .edges
+            .is_empty()
+        );
+        assert_eq!(
+            PackageAnalyzer::rust_lsp_macro_reference_edges(
+                &publication,
+                &[RustLspMacroReference {
+                    lexical_companion: None,
+                    ..explicit
+                }],
                 &producer(),
                 limits,
             )
