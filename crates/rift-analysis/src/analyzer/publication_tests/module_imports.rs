@@ -7860,3 +7860,93 @@ fn secondary_commonjs_callbacks_keep_separate_private_return_functions() {
         row.source.starts_with("function configure(") && row.symbol.as_str().contains("/configure")
     }));
 }
+
+#[test]
+fn retained_callback_keeps_independently_written_argument_properties() {
+    const ENTRY: &str = "function helper(value) { return value; }\nmodule.exports = helper;\n";
+    const SELECTED: &str = concat!(
+        "var check = require('checks');\n",
+        "var helper = require('../');\n",
+        "check('first', function () {\n",
+        "    helper('first');\n",
+        "    opaque({ visible: 'direct' });\n",
+        "    JSON.stringify({ visible: 'first' });\n",
+        "});\n",
+        "check('second', function () {\n",
+        "    opaque('second');\n",
+        "    JSON.stringify({ visible: 'second' });\n",
+        "});\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", ENTRY), ("test/options.cjs", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("written callbacks with independently checked calls")
+    };
+    let unresolved = SELECTED.replace("helper('first')", "opaque('first')");
+    let first = analyze(&unresolved);
+    let second = analyze(SELECTED);
+    let mut property_ids = Vec::new();
+    for (analysis, calls) in [(&first, 0), (&second, 1)] {
+        let publication = analysis.publication();
+        publication
+            .validate_facts()
+            .expect("checked callback facts");
+        let mut properties = Vec::new();
+        for (source, ordinal) in [("visible: 'first'", 0), ("visible: 'second'", 1)] {
+            let declared = publication
+                .declarations
+                .iter()
+                .find(|row| row.source == source && row.source_complete)
+                .expect("written visible property");
+            assert_eq!(
+                declared.range,
+                module_runtime_range(SELECTED.find(source).expect("written property"), source),
+            );
+            let callback = publication
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&declared.symbol))
+                .and_then(|object| object.container.as_ref())
+                .expect("written callback owner");
+            assert!(
+                callback
+                    .as_str()
+                    .ends_with(&format!("$callback%23{ordinal}"))
+            );
+            properties.push((callback.clone(), declared.symbol.clone()));
+        }
+
+        let callback_calls = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds.contains(&EdgeKind::Calls) && edge.from == properties[0].0)
+            .collect::<Vec<_>>();
+        assert_eq!(callback_calls.len(), calls);
+        assert_eq!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| row.source == "visible: 'direct'"),
+            calls == 0,
+        );
+        if let [call] = callback_calls.as_slice() {
+            assert!(call.to.as_str().ends_with("/helper"));
+            assert_eq!(
+                call.occurrence.as_ref().expect("written Call").range,
+                module_runtime_range(
+                    SELECTED.find("helper('first')").expect("written call"),
+                    "helper('first')",
+                ),
+            );
+        }
+        property_ids.push(properties);
+    }
+    assert_eq!(property_ids[0], property_ids[1]);
+}
