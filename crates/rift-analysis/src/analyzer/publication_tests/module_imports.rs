@@ -9275,6 +9275,65 @@ fn checked_javascript_command_path_keeps_its_written_module() {
     }
 }
 
+#[test]
+fn checked_typescript_static_callback_call_keeps_its_written_module() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    for (source, expected) in [
+        (
+            "import { Item } from './index.js';\nobserve(() => Item.parse());\n",
+            true,
+        ),
+        (
+            "import { Item as Value } from './index.js';\nobserve(() => Value.parse());\n",
+            true,
+        ),
+        (
+            "import type { Item } from './index.js';\nobserve(() => Item.parse());\n",
+            false,
+        ),
+        (
+            "import { type Item } from './index.js';\nobserve(() => Item.parse());\n",
+            false,
+        ),
+        (
+            "import { Item } from './index.js';\nobserve((Item) => Item.parse());\n",
+            false,
+        ),
+        ("import { Item } from './index.js';\nItem.parse();\n", false),
+        (
+            "import { Item } from './index.js';\nobserve(() => Item.read());\n",
+            false,
+        ),
+    ] {
+        let analysis = internal_modules::analyze(
+            META,
+            &[
+                ("index.ts", "export { Item } from './item.js';\n"),
+                (
+                    "item.ts",
+                    "export class Item { static parse() { return 1; } read() { return 2; } }\n",
+                ),
+                ("check.test.ts", source),
+            ],
+        );
+        let graph = analysis.publication();
+        graph.validate_facts().expect("physical callback module");
+        let module = checked_module_declaration(graph, "check.test.ts", source);
+        assert_eq!(module.is_some(), expected, "{source}");
+        let Some(module) = module else { continue };
+        let start = source.find(".parse()").expect("written static method");
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.to.as_str().ends_with("/Item/parse")
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == module.unit
+                        && site.range.end
+                            == u64::try_from(start + ".parse()".len()).expect("offset")
+                })
+        }));
+    }
+}
+
 fn checked_module_declaration<'graph>(
     graph: &'graph PackagePublication,
     path: &str,

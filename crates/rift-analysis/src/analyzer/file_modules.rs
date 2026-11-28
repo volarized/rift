@@ -990,13 +990,18 @@ fn file_module_candidates<'file>(
                         && syntax.static_facts().is_some_and(|facts| {
                             facts.has_javascript_module_statement() && !facts.reexports().is_empty()
                         })
-                        || callback_sources.contains(file.placement.unit())
+                        || callback_sources.direct.contains(file.placement.unit())
                 }
                 _ => false,
             };
         let supplemental = !file.file.source().is_empty()
-            && language == "javascript"
-            && authored.routes.contains(path);
+            && match language {
+                "javascript" => authored.routes.contains(path),
+                "typescript" => callback_sources
+                    .static_members
+                    .contains(file.placement.unit()),
+                _ => false,
+            };
         let proven = (written || authored_module || supplemental)
             && !syntax.has_errors()
             && syntax.left_out_declaration_count() == 0
