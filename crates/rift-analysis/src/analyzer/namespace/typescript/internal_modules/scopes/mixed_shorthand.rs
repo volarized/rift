@@ -197,9 +197,10 @@ impl<'source> FileScopes<'source> {
                 });
             let admitted_return =
                 !object_method && member.syntax_element_kind == Some("pair") && direct_return;
-            let in_scope = scope.encloses(row.body);
-            scoped_shorthand |= shorthand && direct_return && in_scope;
-            separate_return |= admitted_return && !in_scope;
+            let binding_available =
+                scope.encloses(row.body) && local.item_range.end <= row.body.start;
+            scoped_shorthand |= shorthand && direct_return && binding_available;
+            separate_return |= admitted_return && !binding_available;
             let ordinary_literal = initializer.is_none() && (shorthand || admitted_return);
             let admissible = argument || ordinary_literal || (shorthand && direct_return);
             let same_owner = if initializer.is_some() || object_method {
@@ -218,8 +219,7 @@ impl<'source> FileScopes<'source> {
                     || (function_scoped_variable && direct_return))
                 && (!variable || direct_return || argument)
                 && ordinary_private_property(member, file.source)
-                && local.item_range.end <= row.body.start
-                && (in_scope || admitted_return)
+                && (binding_available || admitted_return)
                 && same_owner
                 && self.of(member, file) == Scope::Body(row.body, false)
                 && ((initializer.is_some() && argument) || owners.proves_body(member, row))
