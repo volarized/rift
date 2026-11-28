@@ -1195,3 +1195,94 @@ fn checked_object_method_returns_keep_both_written_binding_and_shorthand() {
         );
     }
 }
+
+#[test]
+fn checked_method_return_pairs_survive_same_named_unproved_call_arguments() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    const SOURCE: &str = concat!(
+        "export const renderer = {\n",
+        "    build(input) {\n",
+        "        if (input) inspect({ width: 1, height: 2 });\n",
+        "        return { width: input.width, height: input.height };\n",
+        "    }\n",
+        "};\n",
+    );
+    let result = analyze(META, &[("index.js", ENTRY), ("impl.js", SOURCE)]);
+    let graph = result.publication();
+    graph.validate_facts().expect("checked method return");
+    let method = graph
+        .declarations
+        .iter()
+        .find(|row| row.syntax_element_kind.as_deref() == Some("method_definition"))
+        .expect("written method");
+    for property in ["width: input.width", "height: input.height"] {
+        let declaration = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == property)
+            .expect("written returned property");
+        let start = u64::try_from(SOURCE.find(property).expect("written property")).expect("start");
+        assert_eq!(declaration.range.start, start);
+        assert!(graph.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&declaration.symbol)
+                && object.container.as_ref() == Some(&method.symbol)
+        }));
+    }
+    assert!(
+        !graph
+            .declarations
+            .iter()
+            .any(|row| ["width: 1", "height: 2"].contains(&row.source.as_str()))
+    );
+    let ambiguous = SOURCE.replace(
+        "width: input.width, height: input.height",
+        "width: input.width, width: input.height",
+    );
+    let ambiguous_result = analyze(META, &[("index.js", ENTRY), ("impl.js", &ambiguous)]);
+    let ambiguous = ambiguous_result.publication();
+    assert!(
+        !ambiguous
+            .declarations
+            .iter()
+            .any(|row| ["width: input.width", "width: input.height"].contains(&row.source.as_str()))
+    );
+}
+
+#[test]
+fn checked_method_return_pair_keeps_the_separate_read_local() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    const SOURCE: &str = concat!(
+        "export const renderer = {\n",
+        "    build(input) {\n",
+        "        const width = input.width;\n",
+        "        return { width: width + 1 };\n",
+        "    }\n",
+        "};\n",
+    );
+    let result = analyze(META, &[("index.js", ENTRY), ("impl.js", SOURCE)]);
+    let graph = result.publication();
+    graph.validate_facts().expect("checked return and local");
+    let binding = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "width = input.width")
+        .expect("written local");
+    let property = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "width: width + 1")
+        .expect("written return pair");
+    assert_ne!(binding.symbol, property.symbol);
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from == property.symbol
+            && edge.to == binding.symbol
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == property.unit
+                    && property.range.start <= site.range.start
+                    && site.range.end <= property.range.end
+            })
+    }));
+}

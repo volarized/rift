@@ -21,6 +21,7 @@ mod conditional_types;
 mod default_array_properties;
 mod disjoint_properties;
 mod function_arguments;
+mod method_return_pairs;
 mod mixed_shorthand;
 mod module_assignment_shorthand;
 mod private_return_functions;
