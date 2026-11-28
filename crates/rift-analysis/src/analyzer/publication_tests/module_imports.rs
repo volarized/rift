@@ -4,6 +4,279 @@ use super::*;
 use rift_protocol::configuration::PackageConfiguration;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider, SourceLocation};
 
+#[test]
+fn typescript_plain_annotations_use_the_checked_type_facet_of_a_namespace_merge() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const INTERFACE: &str = "export interface Mode { readonly state: string; }\n";
+    const NAMESPACE: &str = "export declare namespace Mode { const Ready: number; }\n";
+    const USE: &str = "export interface Consumer { check(mode: Mode): Mode; }\n";
+    fn collect(source: &str, leaf: &str) -> PackageAnalysis {
+        internal_modules::analyze(MANIFEST, &[("index.d.ts", source), ("leaf.d.ts", leaf)])
+    }
+    for (declaration, namespace_first) in [
+        (INTERFACE, false),
+        (INTERFACE, true),
+        (
+            "export declare class Mode { readonly state: string; }\n",
+            false,
+        ),
+        ("export declare enum Mode { Off = 0 }\n", false),
+        ("export type Mode = { readonly state: string };\n", false),
+    ] {
+        let merged = if namespace_first {
+            format!("{NAMESPACE}{declaration}")
+        } else {
+            format!("{declaration}{NAMESPACE}")
+        };
+        for (source, path) in [
+            (format!("{merged}{USE}"), "index.d.ts"),
+            (
+                format!("import {{ Mode }} from './leaf';\n{USE}"),
+                "leaf.d.ts",
+            ),
+            (
+                format!("import type {{ Mode }} from './leaf';\n{USE}"),
+                "leaf.d.ts",
+            ),
+        ] {
+            let found = collect(&source, &merged);
+            let publication = found.publication();
+            let written_unit = publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == "index.d.ts")
+                .expect("original annotation unit");
+            let target_unit = publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path)
+                .expect("original type unit");
+            let declared = if path == "index.d.ts" {
+                &source
+            } else {
+                &merged
+            };
+            let name_offset = declared.find(declaration).expect("written type item")
+                + declaration.find("Mode").expect("written type name");
+            let name = module_runtime_range(name_offset, "Mode");
+            let type_declaration = publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == target_unit.unit
+                        && row.symbol.as_str().ends_with("/Mode")
+                        && row.range.start <= name.start
+                        && name.end <= row.range.end
+                })
+                .expect("checked type declaration");
+            let annotations = source.find(USE).expect("consumer declaration");
+            let expected = [
+                USE.find("Mode").expect("parameter"),
+                USE.rfind("Mode").expect("return"),
+            ]
+            .map(|offset| module_runtime_range(annotations + offset, "Mode"));
+            let annotation_count = publication
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::HasType]
+                        && edge.to == type_declaration.symbol
+                        && edge.occurrence.as_ref().is_some_and(|site| {
+                            site.unit == written_unit.unit && expected.contains(&site.range)
+                        })
+                })
+                .count();
+            assert_eq!(annotation_count, 2, "{source}");
+        }
+    }
+
+    let unresolved = format!("import type {{ Mode }} from './missing';\n{USE}");
+    let competing =
+        format!("{INTERFACE}export interface Mode {{ other: number; }}\n{NAMESPACE}{USE}");
+    for source in [unresolved, competing] {
+        let found = collect(&source, "");
+        let start = u64::try_from(source.find(USE).expect("consumer declaration"))
+            .expect("bounded fixture offset");
+        assert!(found.publication().edges.iter().all(|edge| {
+            edge.kinds != [EdgeKind::HasType]
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_none_or(|site| site.range.start < start)
+        }));
+    }
+}
+
+#[test]
+fn checked_commonjs_export_object_values_keep_their_literal_imports() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.cjs"}"#;
+    const SOURCE: &str = concat!(
+        "const stable = require('./stable.cjs');\n",
+        "module.exports = { part: require( './leaf.cjs' ), stable };\n"
+    );
+    let collect = |source| {
+        internal_modules::analyze(
+            MANIFEST,
+            &[
+                ("index.cjs", source),
+                (
+                    "leaf.cjs",
+                    "exports.convert = function convert(value) { return value + 1; };",
+                ),
+                (
+                    "stable.cjs",
+                    "exports.stable = function stable(value) { return value + 1; };",
+                ),
+            ],
+        )
+    };
+    let supported = collect(SOURCE);
+    let publication = supported.publication();
+    let source_module = publication
+        .declarations
+        .iter()
+        .find(|row| row.source_complete && row.source == SOURCE)
+        .expect("complete module source owner");
+
+    let edges = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Imports]);
+    for specifier in ["'./leaf.cjs'", "'./stable.cjs'"] {
+        let offset = SOURCE.find(specifier).expect("written specifier");
+        assert!(
+            edges.clone().any(|edge| {
+                let Some(occurrence) = &edge.occurrence else {
+                    return false;
+                };
+                occurrence.range == module_runtime_range(offset, specifier)
+                    && edge.from == source_module.symbol
+                    && publication
+                        .units
+                        .iter()
+                        .any(|unit| unit.unit == occurrence.unit && unit.path.0 == "index.cjs")
+                    && edge
+                        .to
+                        .as_str()
+                        .ends_with(specifier.trim_matches('\'').trim_start_matches("./"))
+            }),
+            "missing import at {specifier}"
+        );
+    }
+    for source in [
+        "module.exports = { part: require('./missing.cjs') };",
+        "const specifier = './leaf.cjs'; module.exports = { part: require(specifier) };",
+        "const require = () => ({}); module.exports = { part: require('./leaf.cjs') };",
+        "module.exports = { part: require('./leaf.cjs', sideEffect()) };",
+        "module.exports = make({ part: require('./leaf.cjs') });",
+    ] {
+        let unsupported = collect(source);
+        assert!(
+            unsupported.publication().edges.iter().all(|edge| {
+                !edge.kinds.contains(&EdgeKind::Imports) || !edge.to.as_str().ends_with("leaf.cjs")
+            }),
+            "unproved import in {source}"
+        );
+    }
+}
+
+#[test]
+fn typescript_selectors_reference_uniquely_imported_declarations() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const LEAF: &str =
+        "export interface Source { mode: string; }\nexport declare function prepare(): Source;\n";
+    const SOURCE: &str = concat!(
+        "import { Source as Local, prepare } from './leaf';\n",
+        "export { Local as Public, prepare };\n",
+        "export type { Local as Typed };\n"
+    );
+    let collect = |source| {
+        internal_modules::analyze(MANIFEST, &[("index.d.ts", source), ("leaf.d.ts", LEAF)])
+    };
+    let found = collect(SOURCE);
+    let publication = found.publication();
+    let source = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("original unit");
+    let complete_owner = publication
+        .declarations
+        .iter()
+        .find(|row| row.unit == source.unit && row.source_complete && row.source == SOURCE)
+        .expect("complete checked type entry");
+    let selectors = [
+        (
+            SOURCE.find("Local as Public").expect("renamed selector"),
+            "Local",
+            "/Source",
+        ),
+        (
+            SOURCE.find("prepare };").expect("value selector"),
+            "prepare",
+            "/prepare",
+        ),
+        (
+            SOURCE.find("Local as Typed").expect("type selector"),
+            "Local",
+            "/Source",
+        ),
+    ];
+    for (offset, name, target) in selectors {
+        let range = module_runtime_range(offset, name);
+        assert!(
+            publication
+                .edges
+                .iter()
+                .any(|edge| edge.kinds == [EdgeKind::References]
+                    && edge.from == complete_owner.symbol
+                    && edge.to.as_str().ends_with(target)
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|occurrence| occurrence.unit == source.unit
+                            && occurrence.range == range)),
+            "missing imported selector {name}"
+        );
+    }
+    for (offset, name) in [
+        (SOURCE.find("Local").expect("written import"), "Local"),
+        (SOURCE.find("prepare").expect("named import"), "prepare"),
+    ] {
+        let range = module_runtime_range(offset, name);
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == source.unit && site.range == range)
+        }));
+    }
+    assert!(
+        publication
+            .edges
+            .iter()
+            .any(|edge| edge.kinds == [EdgeKind::Aliases]
+                && edge.from.as_str().ends_with("/Public")
+                && edge.to.as_str().ends_with("/Source"))
+    );
+    for source in [
+        "import { Source as Local } from './missing'; export { Local as Public };",
+        "import * as Local from './leaf'; export { Local as Public };",
+    ] {
+        let unresolved = collect(source);
+        assert!(
+            unresolved
+                .publication()
+                .edges
+                .iter()
+                .all(|edge| edge.kinds != [EdgeKind::References])
+        );
+    }
+}
+
 const NON_ENTRY_ARGUMENT_PROPERTIES: &str = r#"
 import { receive } from "../index.mjs";
 receive({ action: "first" });
@@ -558,7 +831,13 @@ fn typescript_local_export_references_follow_existing_package_edges() {
             .with_edges(prior.len() + extra)
             .expect("bounded edge count");
         records
-            .retain_ecmascript_modules(&publication.owner, &files, &semantics, limits)
+            .retain_ecmascript_modules(
+                &publication.owner,
+                &files,
+                &semantics,
+                limits,
+                &BTreeSet::new(),
+            )
             .expect("bounded module references");
         assert_eq!(records.edges.len(), prior.len() + extra);
         assert_eq!(&records.edges[..prior.len()], &prior);
@@ -1623,6 +1902,307 @@ export function callbacks(run) {
 "#;
 
 #[test]
+fn secondary_javascript_argument_keys_keep_the_separate_written_module_binding() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./entry.js","module":"./entry.mjs","exports":{"import":{"default":"./entry.mjs"},"require":{"default":"./entry.js"}}}"#;
+    const CLASS: &str = r"
+var Channel = class {
+  run(flag) {
+    let current = 1;
+    if (flag) { let current = 2; void (current + 4); }
+    void (current + 3);
+    return STATES.closed;
+  }
+};
+";
+    for (label, registration, after, expected) in [
+        (
+            "direct arrow",
+            "register(api, { Channel: () => Channel });",
+            "",
+            true,
+        ),
+        (
+            "direct primitive",
+            "register(api, { Channel: 1 });",
+            "",
+            true,
+        ),
+        (
+            "array position",
+            "register(api, [null, { Channel: 1 }, null]);",
+            "",
+            false,
+        ),
+        (
+            "duplicate keys",
+            "register(api, { Channel: 1, Channel: 2 });",
+            "",
+            false,
+        ),
+        (
+            "write to binding",
+            "register(api, { Channel: 1 });",
+            "Channel = replacement;",
+            false,
+        ),
+        (
+            "unknown scope",
+            "if (enabled) { register(api, { Channel: 1 }); }",
+            "",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "const api = {{}};\nfunction register() {{}}\nfunction expose(value) {{ return value; }}\n{registration}\nmodule.exports = expose(api);\nconst STATES = {{ closed: 1 }};\n{CLASS}\n{after}\n"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("entry.js", &source),
+                ("entry.mjs", "export function anchor() { return 1; }"),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("both configured package routes");
+        let publication = analysis.publication();
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/beacon%2Fentry.js/Channel"));
+        let method = publication.declarations.iter().find(|row| {
+            row.symbol
+                .as_str()
+                .ends_with("/beacon%2Fentry.js/Channel/run")
+        });
+        let paired = publication.declarations.iter().find(|row| {
+            row.symbol.as_str().contains("/entry.js/Channel%23")
+                || row.symbol.as_str().contains("%2Fentry.js/Channel%23")
+        });
+        assert_eq!(binding.is_some(), expected, "{label}");
+        assert_eq!(method.is_some(), expected, "{label}");
+        assert_eq!(paired.is_some(), expected, "{label}");
+        if let (Some(binding), Some(method), Some(paired)) = (binding, method, paired) {
+            assert_eq!(
+                binding.syntax_element_kind.as_deref(),
+                Some("variable_declarator")
+            );
+            assert_eq!(paired.syntax_element_kind.as_deref(), Some("pair"));
+            assert_eq!(binding.unit, paired.unit);
+            assert!(paired.range.end < binding.range.start, "{label}");
+            assert_argument_collision_preserves_local_uses(publication, &source, method, label);
+        }
+    }
+}
+
+/// The supplemental class does not change the original checked lexical target of a use.
+fn assert_argument_collision_preserves_local_uses(
+    publication: &PackagePublication,
+    source: &str,
+    method: &PackageSymbol,
+    label: &str,
+) {
+    let mut reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from == method.symbol
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().contains("/STATES")
+        })
+        .map(|edge| edge.to.as_str().rsplit('/').next().expect("written target"))
+        .collect::<Vec<_>>();
+    reads.sort_unstable();
+    assert_eq!(reads, ["STATES", "closed"], "{label}");
+    let locals = publication
+        .declarations
+        .iter()
+        .filter(|row| row.symbol.as_str().ends_with("/current"))
+        .collect::<Vec<_>>();
+    assert_eq!(locals.len(), 2, "{label}");
+    for (initializer, usage) in [
+        ("current = 1", "current + 3"),
+        ("current = 2", "current + 4"),
+    ] {
+        let item = module_runtime_range(
+            source.find(initializer).expect("written local"),
+            initializer,
+        );
+        let use_site = module_runtime_range(source.find(usage).expect("written use"), "current");
+        let local = locals
+            .iter()
+            .find(|row| row.range == item && row.source_complete && row.source == initializer)
+            .expect("local declaration");
+        assert!(local.symbol.as_str().contains("/$scope%23"), "{label}");
+        assert!(
+            publication.occurrences.iter().any(|row| {
+                row.symbol == local.symbol && row.unit == local.unit && row.range == use_site
+            }),
+            "{label}: {initializer}"
+        );
+    }
+}
+
+#[test]
+fn direct_function_body_arguments_keep_sibling_classes_and_written_members() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"commonjs","exports":{".":{"import":"./entry.mjs","require":"./entry.js"}}}"#;
+    const CLASS: &str = "var Channel = class {
+  run(flag) {
+    let current = 1;
+    if (flag) { let current = 2; void (current + 4); }
+    void (current + 3);
+    return STATES.closed;
+  }
+};";
+    for (label, start, end) in [
+        ("arrow initializer", "var Bundle = (() => {", "})();"),
+        (
+            "function initializer",
+            "var Bundle = (function () {",
+            "})();",
+        ),
+        ("named function", "function Bundle() {", "}"),
+    ] {
+        for (statement, expected) in [
+            ("register(api, { Channel: () => Channel });", true),
+            (
+                "if (enabled) { register(api, { Channel: () => Channel }); }",
+                false,
+            ),
+            ("register(api, [{ Channel: () => Channel }]);", false),
+        ] {
+            let source = format!(
+                "{start}
+const api = {{}};
+function register() {{}}
+{statement}
+const STATES = {{ closed: 1 }};
+{CLASS}
+return api;
+{end}
+module.exports = Bundle;
+"
+            );
+            let result = fixture::package_result_with_metadata(
+                ShippedLanguage::JavaScript,
+                vec![
+                    ("entry.js", &source),
+                    ("entry.mjs", "export function anchor() { return 1; }"),
+                ],
+                None,
+                Some(("package.json", MANIFEST)),
+            )
+            .expect("both checked entries");
+            let publication = result.publication();
+            let declarations = &publication.declarations;
+            let item = module_runtime_range(
+                source.find(CLASS).expect("written class") + 4,
+                &CLASS[4..CLASS.len() - 1],
+            );
+            let binding = declarations.iter().find(|row| {
+                row.range == item
+                    && row.source_complete
+                    && row.symbol.as_str().ends_with("/Channel")
+            });
+            let property = "Channel: () => Channel";
+            let site = module_runtime_range(
+                source.find(property).expect("written argument property"),
+                property,
+            );
+            let paired = declarations.iter().find(|row| {
+                row.range == site
+                    && row.source_complete
+                    && row.symbol.as_str().contains("/Channel%23")
+            });
+            assert_eq!(binding.is_some(), expected, "{label}: {statement}");
+            assert_eq!(paired.is_some(), expected, "{label}: {statement}");
+            if let (Some(binding), Some(paired)) = (binding, paired) {
+                assert_eq!(binding.unit, paired.unit);
+                let method = declarations
+                    .iter()
+                    .find(|row| {
+                        row.unit == binding.unit && row.symbol.as_str().ends_with("/Channel/run")
+                    })
+                    .expect("the restored class owns its written method");
+                assert_argument_collision_preserves_local_uses(publication, &source, method, label);
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_named_function_initializers_keep_independent_argument_properties() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./main.mjs"}}"#;
+    for (holder, open, close, count) in [
+        ("function named(input)", "", "", 2),
+        ("function (input)", "", "", 0),
+        (
+            "function named(input)",
+            "return remote.combine(function (item) {",
+            "});",
+            2,
+        ),
+        (
+            "function named(input)",
+            "const other = function (item) {",
+            "}; return other;",
+            0,
+        ),
+    ] {
+        let source = format!(
+            "import * as remote from 'external';
+function emit(value) {{ return value; }}
+export const run = {holder} {{
+  {open}
+  return emit([
+    remote.copy(input, {{ key: 1, first: true }}),
+    remote.copy(input, {{ key: 2, second: false }}),
+  ]);
+  {close}
+}};"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("main.mjs", "export const entry = true;"),
+                ("case.mjs", &source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package");
+        let publication = analysis.publication();
+        let owner = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/case.mjs/run")
+                    || row.symbol.as_str().ends_with("%2Fcase.mjs/run")
+            })
+            .expect("the complete variable declaration remains");
+        let mut repeated = BTreeSet::new();
+        for spelling in ["key: 1", "key: 2", "first: true", "second: false"] {
+            let site =
+                module_runtime_range(source.find(spelling).expect("written property"), spelling);
+            let found = publication
+                .declarations
+                .iter()
+                .find(|row| row.unit == owner.unit && row.source == spelling && row.range == site);
+            if spelling.starts_with("key:") {
+                if let Some(property) = found {
+                    assert!(property.symbol.as_str().starts_with(owner.symbol.as_str()));
+                    repeated.insert(property.symbol.as_str());
+                }
+            } else {
+                assert!(found.is_some(), "incumbent property {spelling}");
+            }
+        }
+        assert_eq!(repeated.len(), count, "{holder}");
+    }
+}
+
+#[test]
 fn package_retains_named_call_argument_properties_without_moving_assigned_keys() {
     let analysis = fixture::package_result_with_metadata(
         ShippedLanguage::JavaScript,
@@ -1911,6 +2491,128 @@ fn package_keeps_initializer_properties_under_their_physical_lexical_bindings() 
             .symbol
             .as_str()
             .ends_with("/initialize/named/code")
+    );
+}
+
+#[test]
+fn non_entry_literal_properties_keep_uniquely_named_descendants() {
+    const SOURCE: &str = concat!(
+        "function receive(value) { return value; }\n",
+        "receive({ details: { first: { score: 1 }, shared: 2 } });\n",
+        "receive({ details: { second: { score: 3 }, shared: 4 } });\n",
+        "const ordinary = { details: { existing: 5 } };\n",
+        "export const marker = ordinary;\n",
+    );
+    let analyzed = non_entry_lexical_binding_analysis(SOURCE, 96);
+    let graph = analyzed.publication();
+    graph.validate_facts().expect("checked owner paths");
+    let declaration = |written: &str| {
+        let start = SOURCE.find(written).expect("written member");
+        graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, written))
+            .expect("physical property")
+    };
+    let mut owners = BTreeSet::new();
+    for (details, child, leaf, kept) in [
+        (
+            "details: { first: { score: 1 }, shared: 2 }",
+            "first: { score: 1 }",
+            "score: 1",
+            "shared: 2",
+        ),
+        (
+            "details: { second: { score: 3 }, shared: 4 }",
+            "second: { score: 3 }",
+            "score: 3",
+            "shared: 4",
+        ),
+    ] {
+        let [details, child, leaf, kept] = [details, child, leaf, kept].map(declaration);
+        assert!(owners.insert(&details.symbol));
+        for (parent, member) in [(details, child), (details, kept), (child, leaf)] {
+            assert_eq!(parent.unit, member.unit);
+            assert!(graph.objects.iter().any(|row| {
+                row.id.as_ref() == Some(&member.symbol)
+                    && row.container.as_ref() == Some(&parent.symbol)
+            }));
+        }
+    }
+    assert!(
+        declaration("existing: 5")
+            .symbol
+            .as_str()
+            .ends_with("/ordinary/details/existing")
+    );
+    let limited = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(limited.publication().declarations, graph.declarations);
+    assert!(
+        limited
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| graph.edges.contains(edge))
+    );
+}
+
+#[test]
+fn object_elements_of_a_written_call_array_keep_distinct_property_declarations() {
+    const SOURCE: &str = concat!(
+        "function keep(label, value) { return value; }\n",
+        "export function build(key) {\n",
+        "  keep('slots', [{ tag: 'first' }, { tag: 'second' }]);\n",
+        "  const rows = [{ tag: 'third' }, { tag: 'fourth' }];\n",
+        "  keep('control', rows);\n",
+        "  keep('computed', [{ [key]: 'other' }]);\n",
+        "}\n",
+    );
+    let analyzed = non_entry_lexical_binding_analysis(SOURCE, 128);
+    let graph = analyzed.publication();
+    graph.validate_facts().expect("written call array");
+    let mut seen = BTreeSet::new();
+    for value in ["first", "second", "third", "fourth"] {
+        let written = format!("tag: '{value}'");
+        let start = SOURCE.find(&written).expect("authored array slot");
+        let declaration = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written && row.range == module_runtime_range(start, &written))
+            .expect("checked property declaration");
+        assert!(seen.insert(&declaration.symbol));
+    }
+    let computed = "[key]: 'other'";
+    let computed_start = SOURCE.find(computed).expect("written computed property");
+    let mut computed_rows = graph
+        .declarations
+        .iter()
+        .filter(|row| row.source == computed);
+    let retained = computed_rows.next().expect("existing computed property");
+    assert!(computed_rows.next().is_none());
+    assert!(retained.symbol.as_str().ends_with("/build/%5Bkey%5D"));
+    assert_eq!(
+        retained.range,
+        module_runtime_range(computed_start, computed)
+    );
+    let call = "keep('slots', [{ tag: 'first' }, { tag: 'second' }])";
+    let start = SOURCE.find(call).expect("written array call");
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/build")
+            && edge.to.as_str().ends_with("/keep")
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.range == module_runtime_range(start, call)
+                    && site.unit.0.ends_with("/reader.mjs")
+            })
+    }));
+    let capped = non_entry_lexical_binding_analysis(SOURCE, 2);
+    assert_eq!(capped.publication().declarations, graph.declarations);
+    assert!(
+        capped
+            .publication()
+            .edges
+            .iter()
+            .all(|edge| graph.edges.contains(edge))
     );
 }
 
@@ -4610,6 +5312,93 @@ fn javascript_array_records_keep_separate_written_properties() {
 }
 
 #[test]
+fn checked_local_assignments_keep_exact_literal_properties_under_the_written_function() {
+    const SOURCE: &str = concat!(
+        "export function build(ready) {\n",
+        "  let token;\n",
+        "  if (ready) token = { kind: 'ready', line: 1 };\n",
+        "  else token = { kind: 'pending', line: 2 };\n",
+        "  token = { settled: true };\n",
+        "  token.entries = [{ kind: 'nested', line: 3 }];\n",
+        "  return token;\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("complete authored declarations");
+    let function = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/build"))
+        .expect("named function");
+    let mut identities = BTreeSet::new();
+    for text in [
+        "kind: 'ready'",
+        "line: 1",
+        "kind: 'pending'",
+        "line: 2",
+        "kind: 'nested'",
+        "line: 3",
+    ] {
+        let start = SOURCE.find(text).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == function.unit
+                    && row.range == module_runtime_range(start, text)
+                    && row.source_complete
+                    && row.source == text
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("exact literal property");
+        assert!(identities.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&function.symbol)
+        }));
+    }
+    assert_eq!(
+        found
+            .declarations
+            .iter()
+            .filter(|row| row.source == "token")
+            .count(),
+        1
+    );
+    assert!(
+        !found
+            .declarations
+            .iter()
+            .any(|row| row.source == "token.entries")
+    );
+    for source in [
+        SOURCE.replace("  let token;\n", ""),
+        SOURCE.replace("token.entries =", "token['entries'] ="),
+        SOURCE.replace("token = { settled: true };", "token = ready;"),
+        SOURCE.replace(
+            "token = { settled: true };",
+            "if (ready) { token = { settled: true }; }",
+        ),
+        SOURCE.replace(
+            "  token.entries = [{ kind: 'nested', line: 3 }];",
+            "  { let token; token.entries = [{ kind: 'nested', line: 3 }]; }",
+        ),
+    ] {
+        let control = non_entry_lexical_binding_analysis(&source, 64);
+        assert!(
+            !control
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| row.source == "kind: 'nested'")
+        );
+    }
+}
+
+#[test]
 fn commonjs_named_export_arrays_keep_properties_under_their_written_slots() {
     const SOURCE: &str = concat!(
         "const control = { preserved: 1 };\n",
@@ -5244,6 +6033,133 @@ fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildca
 }
 
 #[test]
+fn typescript_relative_imports_keep_checked_declarations_beside_runtime_wildcards() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"},"./*.js":"./*.js","./*":"./*.js"}}"#;
+    const ROOT: &str = concat!(
+        "import type { Chosen } from './detail.js';\n",
+        "import type * as settings from './options.js';\n",
+        "import type { Missing } from './missing.js';\n",
+        "import type { Collision } from './collision.js';\n",
+        "export interface Box { item: Chosen; options: settings.Options }\n",
+        "declare module 'ambient' { import type { Unreached } from './unreached.js'; }\n",
+    );
+    const DETAIL: &str =
+        "import type { Leaf } from './leaf.js';\nexport interface Chosen { value: Leaf }";
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.d.ts", ROOT),
+            ("index.js", "export const kept = 1;"),
+            ("detail.d.ts", DETAIL),
+            ("detail.js", "export const kept = 2;"),
+            ("options.d.ts", "export interface Options { value: number }"),
+            ("leaf.d.ts", "export interface Leaf { value: number }"),
+            (
+                "collision.d.ts",
+                "export interface Collision { value: number }",
+            ),
+            (
+                "collision.ts",
+                "export interface Collision { value: string }",
+            ),
+            (
+                "unreached.d.ts",
+                "export interface Unreached { value: number }",
+            ),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = |path| {
+        publication
+            .units
+            .iter()
+            .find(|row| row.path.0 == path && row.source_complete)
+            .expect("retained source")
+    };
+    let edge = |path, source: &str, spelling: &str, from: &str, to: &str, kind| {
+        let start = source.rfind(spelling).expect("written use");
+        let range = module_runtime_range(start, spelling);
+        publication.edges.iter().any(|row| {
+            row.kinds == [kind]
+                && row.from.as_str().ends_with(from)
+                && row.to.as_str().ends_with(to)
+                && row
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit(path).unit && site.range == range)
+        })
+    };
+    for (path, source, specifier, from, to) in [
+        (
+            "index.d.ts",
+            ROOT,
+            "'./detail.js'",
+            "/beacon",
+            "%2Fdetail.d.ts",
+        ),
+        (
+            "index.d.ts",
+            ROOT,
+            "'./options.js'",
+            "/beacon",
+            "%2Foptions.d.ts",
+        ),
+        (
+            "detail.d.ts",
+            DETAIL,
+            "'./leaf.js'",
+            "%2Fdetail.d.ts",
+            "%2Fleaf.d.ts",
+        ),
+    ] {
+        assert!(
+            edge(path, source, specifier, from, to, EdgeKind::Imports),
+            "{path}: {specifier}"
+        );
+    }
+    assert!(edge(
+        "index.d.ts",
+        ROOT,
+        "Chosen",
+        "/Box/item",
+        "%2Fdetail.d.ts/Chosen",
+        EdgeKind::HasType
+    ));
+    assert!(edge(
+        "detail.d.ts",
+        DETAIL,
+        "Leaf",
+        "/Chosen/value",
+        "%2Fleaf.d.ts/Leaf",
+        EdgeKind::HasType
+    ));
+    assert!(edge(
+        "index.d.ts",
+        ROOT,
+        "settings.Options",
+        "/Box/options",
+        "%2Foptions.d.ts/Options",
+        EdgeKind::HasType
+    ));
+    for path in ["collision.d.ts", "unreached.d.ts"] {
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit(path).unit),
+            "{path}"
+        );
+    }
+    assert!(publication.declarations.iter().any(|row| {
+        row.unit == unit("index.js").unit && row.symbol.as_str().ends_with("/beacon/kept")
+    }));
+}
+
+#[test]
 fn npm_package_imports_keep_runtime_calls_and_declared_type_ranges() {
     const RUNTIME: &str = "import { Flags, select } from '#items/state';\nexport function run() { return select(Flags.enabled); }\n";
     const TYPES: &str = "import type { State } from '#items/state';\nexport declare function run(state: State): State;\n";
@@ -5756,4 +6672,618 @@ fn assert_callback_reads_preserve_prior_records_at_the_cap(
     assert_eq!(records.edges, prior_edges);
     assert_eq!(records.objects, prior_objects);
     assert_eq!(records.declarations, prior_declarations);
+}
+
+#[test]
+fn typescript_reexport_only_declaration_files_keep_their_module_imports() {
+    const BARREL: &str = "export * from './leaf.js';\nexport * from './absent.js';\n";
+    const LEGACY: &str = "declare interface LocalOnly { value: number }\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.js", "export const runtime = true;\n"),
+            ("index.d.ts", "export * from './branch/index.js';\n"),
+            ("branch/index.d.ts", BARREL),
+            ("branch/leaf.d.ts", "export interface Reader { value: number }\n"),
+            ("branch/leaf.js", "export const source = 1;\n"),
+            ("branch/legacy.d.ts", LEGACY),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("written declaration barrel");
+    let found = analysis.publication();
+    found.validate_facts().expect("checked typescript module");
+    let owner_suffix = "/typescript/beacon%2Fbranch%2Findex.d.ts";
+    let module = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with(owner_suffix) && row.source == BARREL)
+        .expect("complete declaration barrel owner");
+    let literal = "'./leaf.js'";
+    let occurrence = module_runtime_range(BARREL.find(literal).expect("specifier"), literal);
+    assert!(found.edges.iter().any(|edge| {
+        edge.from == module.symbol
+            && edge.kinds == [EdgeKind::Imports]
+            && edge
+                .to
+                .as_str()
+                .ends_with("/typescript/beacon%2Fbranch%2Fleaf.d.ts")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == module.unit && site.range == occurrence)
+    }));
+    assert!(found.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Aliases]
+            && edge.from.as_str().ends_with("index.d.ts/Reader")
+            && edge.to.as_str().ends_with("leaf.d.ts/Reader")
+    }));
+    assert!(found.declarations.iter().all(|row| row.source != LEGACY));
+    let missing = "'./absent.js'";
+    let missing = module_runtime_range(BARREL.find(missing).expect("missing specifier"), missing);
+    assert!(
+        found
+            .edges
+            .iter()
+            .filter(|edge| edge.from == module.symbol)
+            .all(|edge| {
+                !edge.to.as_str().ends_with("leaf.js")
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_none_or(|site| site.unit != module.unit || site.range != missing)
+            })
+    );
+}
+
+#[test]
+fn checked_commonjs_literals_as_direct_call_arguments_keep_module_imports() {
+    const SOURCE: &str = concat!(
+        "const established = require('./leaf');\n",
+        "function wrap(value) { return value; }\n",
+        "const wrapped = wrap(require('./leaf'));\n",
+        "wrap(require('./leaf'));\n",
+        "wrap(wrap(require('./leaf')));\n",
+        "wrap?.(require('./leaf'));\n",
+        "wrap(require('./leaf', 1));\n",
+        "wrap(require('./le' + 'af'));\n",
+        "wrap(require('./missing'));\n",
+        "wrap([require('./leaf')]);\n",
+        "function shadow(require) { return wrap(require('./leaf')); }\n",
+        "exports.established = established;\n",
+        "exports.wrapped = wrapped;\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const TARGET: &str = "exports.leaf = function leaf() { return 1; };\n";
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE), ("leaf.js", TARGET)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked CommonJS source");
+    let (found, _, semantics, _) = analysis.into_parts();
+    found.validate_facts().expect("valid written imports");
+    let modules = |text| {
+        found
+            .declarations
+            .iter()
+            .find(|row| row.source_complete && row.source == text)
+            .expect("complete physical module")
+    };
+    let entry = modules(SOURCE);
+    let target = modules(TARGET);
+    let quoted = SOURCE
+        .match_indices("'./leaf'")
+        .map(|(start, text)| {
+            let start = u64::try_from(start).expect("bounded fixture offset");
+            let size = u64::try_from(text.len()).expect("bounded literal");
+            TextRange {
+                start,
+                end: start + size,
+            }
+        })
+        .collect::<Vec<_>>();
+    let imports = |edge: &rift_protocol::index::StoredEdge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.from == entry.symbol
+            && edge.to == target.symbol
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.unit == entry.unit)
+    };
+    let mut written = found
+        .edges
+        .iter()
+        .filter(|edge| imports(edge))
+        .filter_map(|edge| edge.occurrence.as_ref().map(|site| site.range.clone()))
+        .collect::<Vec<_>>();
+    written.sort_by_key(|site| (site.start, site.end));
+    assert_eq!(written, quoted[..4]);
+    let mut records = Records {
+        units: found.units.clone(),
+        objects: found.objects.clone(),
+        declarations: found.declarations.clone(),
+        edges: found
+            .edges
+            .into_iter()
+            .filter(|edge| {
+                !imports(edge)
+                    || edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range == quoted[0])
+            })
+            .collect(),
+        ..Records::default()
+    };
+    let earlier = records.edges.clone();
+    records.retain_commonjs_argument_imports(&semantics, earlier.len());
+    assert_eq!(records.edges, earlier, "incumbent capacity");
+}
+
+#[test]
+fn checked_commonjs_expression_entries_keep_the_module_and_relative_load() {
+    for (entry, mode, module, loader) in [
+        (
+            "module.exports = Object.assign(function run(value) { return value; }, { flag: true });",
+            "commonjs",
+            "'../'",
+            true,
+        ),
+        (
+            "if (enabled) module.exports = function run(value) { return value; };",
+            "commonjs",
+            "'..'",
+            false,
+        ),
+        (
+            "module.exports = Object.assign(function run(value) { return value; }, { flag: true });",
+            "commonjs",
+            "'../missing'",
+            false,
+        ),
+        (
+            "const Object = { assign: make }; module.exports = Object.assign(function run() {}, {});",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = make();",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+        ("module.exports = make();", "module", "'../'", false),
+        (
+            "if (enabled) module.exports = make();",
+            "commonjs",
+            "'../'",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "const load = require({module}); function inspect() {{ return load(1); }} inspect();"
+        );
+        let manifest =
+            format!(r#"{{"name":"beacon","version":"1.0.0","type":"{mode}","main":"index.js"}}"#);
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", entry), ("test/check.js", &source)],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked CommonJS source");
+        let publication = analysis.publication();
+        publication.validate_facts().expect("complete module facts");
+        let physical = |source| {
+            publication.declarations.iter().find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.range.start == 0
+                    && publication.objects.iter().any(|object| {
+                        object.id.as_ref() == Some(&row.symbol)
+                            && object.kinds.contains(&SymbolKind::Module)
+                    })
+            })
+        };
+        let target = physical(entry);
+        let load = physical(source.as_str());
+        assert_eq!(
+            load.is_some(),
+            loader || mode == "module",
+            "{entry} {mode} {module}"
+        );
+        let expects_entry = loader || module == "'../missing'" || mode == "module";
+        assert_eq!(target.is_some(), expects_entry, "{entry} {mode} {module}");
+        let imported = target.zip(load).is_some_and(|(target, load)| {
+            let start = u64::try_from(source.find(module).expect("written specifier"))
+                .expect("small source");
+            let end = start + u64::try_from(module.len()).expect("small specifier");
+            publication.edges.iter().any(|edge| {
+                edge.from == load.symbol
+                    && edge.to == target.symbol
+                    && edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == load.unit && site.range == TextRange { start, end }
+                    })
+            })
+        });
+        assert_eq!(imported, loader, "{entry} {mode} {module}");
+    }
+}
+
+#[test]
+fn checked_commonjs_default_function_keeps_the_physical_entry_module() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js","exports":{".":[{"default":"./index.js"},"./index.js"]}}"#;
+    const CLIENT: &str =
+        "const base = require('../');\nfunction local() { return base(); }\nlocal();\n";
+    for (entry, complete) in [
+        ("module.exports = function serve() { return 1; };", true),
+        (
+            "function serve() { return 1; } module.exports = serve;",
+            true,
+        ),
+        (
+            "if (flag) module.exports = function serve() { return 1; };",
+            false,
+        ),
+        (
+            "module.exports = function serve() { return 1; }; module.exports = change;",
+            false,
+        ),
+        (
+            "const module = {}; module.exports = function serve() { return 1; };",
+            false,
+        ),
+        (
+            "module.exports = function serve() { return 1; }; expose(module);",
+            false,
+        ),
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", entry), ("sub/client.js", CLIENT)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected package");
+        let publication = analysis.publication();
+        let source = |path: &str, written: &str| {
+            publication.declarations.iter().any(|row| {
+                row.unit.as_str().ends_with(path)
+                    && row.range.start == 0
+                    && row.source_complete
+                    && row.source == written
+            })
+        };
+        assert_eq!(source("/index.js", entry), complete, "{entry}");
+        assert_eq!(source("/client.js", CLIENT), complete, "{entry}");
+        assert_eq!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit.as_str().ends_with("/client.js")
+                            && CLIENT.get(offset_in(site.range.start)..offset_in(site.range.end))
+                                == Some("'../'")
+                    })
+            }),
+            complete,
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+fn written_argument_properties_keep_the_same_callback_without_a_call_target() {
+    const SOURCE: &str = concat!(
+        "var check = require('checks');\n",
+        "var load = require('../');\n",
+        "check('first', function (observer) {\n",
+        "  var directory = 'first';\n",
+        "  load(directory, { path: directory }, function (error, value) { observer.equal(value, directory); });\n",
+        "  load(directory, { path: directory, flag: true }, function (error, value) { observer.equal(value, directory); });\n",
+        "});\n",
+        "check('second', function (observer) {\n",
+        "  var directory = 'second';\n",
+        "  load(directory, { path: directory }, function (error, value) { observer.equal(value, directory); });\n",
+        "  load(directory, { path: directory, flag: false }, function (error, value) { observer.equal(value, directory); });\n",
+        "});\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#;
+    let check = |implementation, expected_calls| {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", implementation), ("test/options.cjs", SOURCE)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("selected CommonJS source");
+        let found = result.publication();
+        found.validate_facts().expect("valid physical ownership");
+        let unit = found
+            .units
+            .iter()
+            .find(|file| file.path.0 == "test/options.cjs")
+            .expect("complete written source");
+        assert_eq!(unit.source, SOURCE);
+        let mut properties = BTreeMap::new();
+        for (start, written) in SOURCE.match_indices("path: directory") {
+            let start = u64::try_from(start).expect("small source");
+            let insert = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == unit.unit
+                        && row.source_complete
+                        && row.source == written
+                        && row.range.start == start
+                })
+                .expect("written property");
+            let property = found
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&insert.symbol))
+                .expect("property object");
+            let callback = property.container.as_ref().expect("physical callback");
+            let owner = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.symbol == *callback
+                        && row.unit == unit.unit
+                        && row.source_complete
+                        && row.range.start < start
+                        && start < row.range.end
+                })
+                .expect("complete callable containing literal");
+            assert_eq!(
+                owner.syntax_element_kind.as_deref(),
+                Some("function_expression")
+            );
+            properties.insert(start, insert.symbol.clone());
+        }
+        assert_eq!(properties.len(), 4);
+        assert_eq!(properties.values().collect::<BTreeSet<_>>().len(), 4);
+        let calls = found
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::Calls]
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.unit == unit.unit)
+            })
+            .count();
+        assert_eq!(calls, expected_calls);
+        properties
+    };
+    let resolved = check(
+        "function load(path, options, callback) { return options; } module.exports = load;",
+        4,
+    );
+    let unresolved = check(
+        "function retained() { return 1; } exports.marker = retained; module.exports = unknown();",
+        0,
+    );
+    assert_eq!(resolved, unresolved);
+}
+
+#[test]
+fn typescript_enum_members_keep_references_at_their_written_qualifiers() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const SOURCE: &str = concat!(
+        "import { Status as State, Details } from './codes.js';\n",
+        "export type Report = State.Ready | State.Waiting;\n",
+        "export type UnknownMember = State.Missing;\n",
+        "export type UnknownEnum = Other.Ready;\n",
+        "export type Detail = Details.Leaf;\n",
+    );
+    const TARGET: &str = concat!(
+        "export declare enum Status { Ready = 1, Waiting = 2 }\n",
+        "export declare namespace Details { type Leaf = number; }\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE), ("codes.d.ts", TARGET)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("retained source");
+    let qualifiers = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::References])
+        .filter_map(|edge| {
+            let site = edge.occurrence.as_ref()?;
+            (site.unit == unit.unit).then_some((
+                edge.from.as_str(),
+                edge.to.as_str(),
+                site.range.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(qualifiers.len(), 2);
+    for (member, target) in [("State.Ready", "/Ready"), ("State.Waiting", "/Waiting")] {
+        let start = SOURCE.find(member).expect("written type");
+        let range = module_runtime_range(start, "State");
+        assert!(qualifiers.iter().any(|(from, to, site)| {
+            from.ends_with("/Report") && to.ends_with("codes.d.ts/Status") && *site == range
+        }));
+        let range = module_runtime_range(start, member);
+        let target = format!("codes.d.ts/Status{target}");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::HasType]
+                && edge.from.as_str().ends_with("/Report")
+                && edge.to.as_str().ends_with(&target)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit.unit && site.range == range)
+        }));
+    }
+}
+
+#[test]
+fn closed_anonymous_commonjs_callable_keeps_its_exact_literal_properties() {
+    const ENTRY: &str = "const build = require('./worker.js');\nmodule.exports = build;\n";
+    const WORKER: &str = concat!(
+        "module.exports = function (ready) {\n",
+        "    const results = [];\n",
+        "    if (ready) results.push({ kind: 'ready', line: 1 });\n",
+        "    else results.push({ kind: 'pending', line: 2 });\n",
+        "    return results;\n",
+        "};\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let closed = |worker: &str| {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", ENTRY), ("worker.js", worker)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("analyzed source");
+        analysis
+            .publication()
+            .validate_facts()
+            .expect("valid source");
+        analysis.into_parts().0
+    };
+    let publication = closed(WORKER);
+    let module = publication
+        .declarations
+        .iter()
+        .find(|row| row.source_complete && row.source == WORKER)
+        .expect("complete worker module");
+    let callable = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.unit == module.unit
+                && row.syntax_element_kind.as_deref() == Some("assignment_expression")
+                && row.symbol.as_str().ends_with("/default")
+        })
+        .expect("existing physical default callable");
+    let mut properties = BTreeSet::new();
+    for text in ["kind: 'ready'", "line: 1", "kind: 'pending'", "line: 2"] {
+        let start = u64::try_from(WORKER.find(text).expect("written property")).expect("offset");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == module.unit
+                    && row.range.start == start
+                    && row.source_complete
+                    && row.source == text
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("complete written property");
+        assert!(properties.insert(&row.symbol));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&callable.symbol)
+        }));
+    }
+    for worker in [
+        format!("if (enabled) {{ {WORKER} }}"),
+        format!("{WORKER} if (enabled) module.exports = other;"),
+        format!("{WORKER} inspect(module);"),
+        WORKER.replace("function (ready)", "async function (ready)"),
+    ] {
+        assert!(!closed(&worker).declarations.iter().any(|row| {
+            row.source == worker || row.source == "kind: 'ready'" || row.source == "line: 1"
+        }));
+    }
+}
+
+#[test]
+fn checked_commonjs_loads_keep_reads_of_the_required_namespace() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const SOURCE: &str = concat!(
+        "const helper = require('./helper');\n",
+        "function run() { return helper.apply(); }\n",
+        "function shadow(helper) { return helper.apply(); }\n",
+        "let changing = require('./helper');\n",
+        "changing = {};\n",
+        "function ignore() { return changing.apply(); }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "module.exports = require('./helper');\n"),
+            (
+                "helper.js",
+                "function apply() { return 7; }\nmodule.exports = { apply };\n",
+            ),
+            ("secondary.js", SOURCE),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked CommonJS sources");
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid facts");
+    let site = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "secondary.js")
+        .expect("secondary source");
+    let receiver = SOURCE.find("helper.apply").expect("written receiver");
+    let receiver_range = module_runtime_range(receiver, "helper");
+    let reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().ends_with("beacon%2Fhelper.js")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|span| span.unit == site.unit)
+        })
+        .collect::<Vec<_>>();
+    let [read] = reads.as_slice() else {
+        panic!("expected one checked receiver Read, got {reads:?}");
+    };
+    assert!(read.from.as_str().ends_with("secondary.js/run"));
+    assert_eq!(
+        read.occurrence.as_ref().expect("receiver span").range,
+        receiver_range
+    );
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from == read.from
+            && edge.to.as_str().ends_with("secondary.js/helper")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|span| span.unit == site.unit && span.range == receiver_range)
+    }));
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from == read.from
+            && edge.to.as_str().ends_with("helper.js/apply")
+            && edge.occurrence.as_ref().is_some_and(|span| {
+                span.unit == site.unit
+                    && span.range == module_runtime_range(receiver, "helper.apply()")
+            })
+    }));
 }

@@ -4,18 +4,22 @@ mod assigned_literals;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::SymbolId;
+use rift_core::{ReferenceRole, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{
-    ByteRange, ScopedIdentityAnchors, StaticBindingKind, StaticBodyMember, StaticCall,
-    StaticCallee, StaticFacts, StaticFunctionContext, SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
+    ByteRange, JavaScriptSyntaxProvider, ScopedIdentityAnchors, StaticBindingKind,
+    StaticBodyMember, StaticCall, StaticCallee, StaticFacts, StaticFunctionContext,
+    SyntaxExportKind, SyntaxFacts, SyntaxSymbol,
 };
 
 use super::super::conflicting_assignment_name;
 use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
+mod conditional_types;
+mod disjoint_properties;
+mod function_arguments;
 mod mixed_shorthand;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
@@ -112,6 +116,17 @@ pub(in crate::analyzer::namespace::typescript) fn private_local_identities(
         identities_by_name.insert(name.to_owned(), overrides);
     }
     identities_by_name
+}
+
+fn unique_declarations(symbols: &[SyntaxSymbol]) -> BTreeMap<&str, Option<&SyntaxSymbol>> {
+    let mut unique = BTreeMap::new();
+    for symbol in symbols {
+        unique
+            .entry(symbol.qualified_name.as_str())
+            .and_modify(|owner| *owner = None)
+            .or_insert(Some(symbol));
+    }
+    unique
 }
 
 fn private_local_declaration(symbol: &SyntaxSymbol) -> bool {
@@ -253,6 +268,110 @@ impl<'source> FileScopes<'source> {
         repeated
     }
 
+    /// Keeps an authored module binding and scopes a same-named direct argument property.
+    pub(super) fn separate_module_argument_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        repeated: &mut BTreeSet<&'source str>,
+        anchors: &BTreeMap<String, SymbolId>,
+    ) -> ScopedIdentityAnchors {
+        let Some(facts) = file.syntax.static_facts().filter(|_| {
+            !repeated.is_empty()
+                && file.syntax.language().name == "javascript"
+                && !file.syntax.has_errors()
+                && file.syntax.left_out_declaration_count() == 0
+        }) else {
+            return BTreeMap::new();
+        };
+        let mut groups = BTreeMap::<&str, Vec<_>>::new();
+        for symbol in file.syntax.symbols() {
+            let name = symbol.qualified_name.as_str();
+            if repeated.contains(name) && anchors.contains_key(name) {
+                groups.entry(name).or_default().push(symbol);
+            }
+        }
+        let bound = facts
+            .bindings()
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.kind,
+                    StaticBindingKind::Local | StaticBindingKind::JavaScriptClassValue { .. }
+                )
+            })
+            .map(|binding| binding.name)
+            .collect::<BTreeSet<_>>();
+        let written = facts
+            .assignments()
+            .iter()
+            .filter_map(|&range| binding_name(file.source, range))
+            .collect::<BTreeSet<_>>();
+        let candidates = groups
+            .into_iter()
+            .filter_map(|(name, group)| {
+                let [a, b] = group.as_slice() else {
+                    return None;
+                };
+                let (binding, property) = if ordinary_private_property(a, file.source) {
+                    (*b, *a)
+                } else {
+                    (*a, *b)
+                };
+                if !ordinary_private_property(property, file.source)
+                    || property.syntax_element_kind != Some("pair")
+                    || !matches!(
+                        binding.syntax_element_kind,
+                        Some("class_declaration" | "variable_declarator")
+                    )
+                    || binding.is_ecmascript_package_binding()
+                    || !bound.contains(&binding.name_range?)
+                    || written.contains(binding.name.as_str())
+                    || !self.body_members.contains_key(&property.item_range)
+                {
+                    return None;
+                }
+                let nested = (self.lexical(binding, file.source) != self.source)
+                    .then_some(binding.item_range);
+                if nested.is_none() && (binding.container.is_some() || property.container.is_some())
+                {
+                    return None;
+                }
+                let identity =
+                    local_group_identity(anchors.get(name)?, property.declaration_ordinal)?;
+                Some((
+                    property.item_range,
+                    (name, property.declaration_ordinal, identity, nested),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let limits = file.syntax.syntax_limits().unwrap_or_default();
+        let module = candidates
+            .iter()
+            .filter_map(|(&property, (_, _, _, binding))| binding.is_none().then_some(property))
+            .collect();
+        let nested = candidates
+            .iter()
+            .filter_map(|(&property, (_, _, _, binding))| {
+                binding.map(|binding| (property, binding))
+            })
+            .collect();
+        let accepted = JavaScriptSyntaxProvider::scoped_call_argument_properties(
+            file.source,
+            limits,
+            &module,
+            &nested,
+        );
+        let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+        let mut physical = BTreeMap::new();
+        for (range, (name, ordinal, identity, _)) in candidates {
+            if accepted.contains(&range) && occupied.insert(identity.clone()) {
+                repeated.remove(name);
+                physical.insert(name.to_owned(), BTreeMap::from([(ordinal, identity)]));
+            }
+        }
+        physical
+    }
+
     /// Names repeated private keys by their captured literal and physical ordinal.
     pub(super) fn literal_properties(
         &self,
@@ -339,6 +458,14 @@ impl<'source> FileScopes<'source> {
             &mut scoped,
         );
         self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
+        self.scope_named_function_arguments(
+            file,
+            repeated,
+            anchors,
+            &owners,
+            &mut occupied,
+            &mut scoped,
+        );
         scoped
     }
 
@@ -387,7 +514,7 @@ impl<'source> FileScopes<'source> {
                 continue;
             };
             if child.container.as_deref() != Some(parent.qualified_name.as_str())
-                || !repeated.contains(child.qualified_name.as_str())
+                || !conflicting_assignment_name(&child.qualified_name, repeated)
             {
                 continue;
             }
@@ -1091,11 +1218,13 @@ impl<'source> FileScopes<'source> {
 struct LiteralOwners<'source> {
     enclosing: EnclosingDefinitions<(ByteRange, Option<&'source SyntaxSymbol>)>,
     callbacks: BTreeSet<ByteRange>,
+    invoked_initializers: BTreeMap<ByteRange, &'source str>,
     calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
     array_initializers: BTreeMap<&'source str, ByteRange>,
     assigned_arrays: BTreeMap<ByteRange, &'source str>,
+    assigned_literal_bodies: BTreeMap<ByteRange, &'source str>,
 }
 
 impl<'source> LiteralOwners<'source> {
@@ -1117,24 +1246,22 @@ impl<'source> LiteralOwners<'source> {
             .filter(|(function, _)| !receiver_scopes.contains(function))
             .map(|&(function, value)| (value, function))
             .collect::<BTreeMap<_, _>>();
-        let mut unique = BTreeMap::<&str, Option<&SyntaxSymbol>>::new();
-        for symbol in symbols {
-            unique
-                .entry(&symbol.qualified_name)
-                .and_modify(|owner| *owner = None)
-                .or_insert(Some(symbol));
-        }
+        let unique = unique_declarations(symbols);
         let functions = literal_callable_owners(&unique, facts, anchors, &values);
         let object_methods = literal_object_method_owners(&unique, facts, anchors);
         let array_initializers = array_literal_owners(file, &unique, anchors);
         let mut initializers = BTreeMap::new();
-        for function in functions
-            .values()
-            .filter(|owner| owner.syntax_element_kind == Some("variable_declarator"))
-        {
-            if let Some(range) = function.body_range.and_then(|value| values.get(&value)) {
+        for function in functions.values() {
+            let range = match function.syntax_element_kind {
+                Some("variable_declarator") => function
+                    .body_range
+                    .and_then(|value| values.get(&value).copied()),
+                Some("assignment_expression") => closed_callable_scope(facts, function),
+                _ => None,
+            };
+            if let Some(range) = range {
                 initializers
-                    .entry(*range)
+                    .entry(range)
                     .and_modify(|owner| *owner = None)
                     .or_insert(Some(*function));
             }
@@ -1172,6 +1299,8 @@ impl<'source> LiteralOwners<'source> {
         }
         let assigned_arrays =
             assigned_literals::array_owners(file, facts, anchors, &unique, &enclosing);
+        let assigned_literal_bodies =
+            assigned_literals::local_assignment_owners(file, facts, anchors, &unique, &enclosing);
         Self {
             enclosing,
             callbacks: facts
@@ -1186,6 +1315,7 @@ impl<'source> LiteralOwners<'source> {
                     .then_some(function)
                 })
                 .collect(),
+            invoked_initializers: invoked_initializer_owners(file, facts, &unique, anchors),
             calls,
             bound_calls: facts
                 .destructured()
@@ -1195,6 +1325,7 @@ impl<'source> LiteralOwners<'source> {
             returned: returned_literal_owners(&functions, &object_methods, facts),
             array_initializers,
             assigned_arrays,
+            assigned_literal_bodies,
         }
     }
 
@@ -1207,7 +1338,8 @@ impl<'source> LiteralOwners<'source> {
         if let Some(owner) = container
             && (self.returned.get(&member.body) == Some(&Some(owner))
                 || self.array_initializers.get(owner) == Some(&member.holder)
-                || self.assigned_arrays.get(&member.holder) == Some(&owner))
+                || self.assigned_arrays.get(&member.holder) == Some(&owner)
+                || self.assigned_literal_bodies.get(&member.body) == Some(&owner))
         {
             return true;
         }
@@ -1237,6 +1369,15 @@ impl<'source> LiteralOwners<'source> {
                                 && !self.bound_calls.contains(&call.range)
                                 && self.callback_literal_container(scope, container)
                         }
+                        (Some(owner), Some((scope, None))) => {
+                            self.invoked_initializers.get(&scope) == Some(&owner)
+                                && scope.encloses(call.range)
+                                && matches!(
+                                    call.callee,
+                                    StaticCallee::Direct | StaticCallee::Member { .. }
+                                )
+                                && !self.bound_calls.contains(&call.range)
+                        }
                         _ => false,
                     }
             })
@@ -1252,6 +1393,54 @@ impl<'source> LiteralOwners<'source> {
             None | Some((_, None)) => false,
         }
     }
+}
+
+/// Finds the function scope of a uniquely placed variable's immediate invocation.
+fn invoked_initializer_owners<'source>(
+    file: &SelectedFile<'source>,
+    facts: &StaticFacts,
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> BTreeMap<ByteRange, &'source str> {
+    let expressions = facts
+        .function_values()
+        .iter()
+        .map(|&(scope, value)| (value, scope))
+        .collect::<BTreeMap<_, _>>();
+    let invocations = facts
+        .calls()
+        .iter()
+        .filter(|call| {
+            call.callee == StaticCallee::Unsupported && call.range.start == call.callee_range.start
+        })
+        .filter_map(|call| Some((call.range, *expressions.get(&call.callee_range)?)))
+        .collect::<BTreeMap<_, _>>();
+    if invocations.is_empty() {
+        return BTreeMap::new();
+    }
+    let writes = facts
+        .references()
+        .iter()
+        .filter(|reference| reference.role == ReferenceRole::Write)
+        .filter_map(|reference| binding_name(file.source, reference.target))
+        .collect::<BTreeSet<_>>();
+    unique
+        .values()
+        .flatten()
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("variable_declarator")
+                && symbol.kind == "variable"
+                && symbol.container.is_none()
+                && anchors.contains_key(&symbol.qualified_name)
+                && !writes.contains(symbol.name.as_str())
+        })
+        .filter_map(|symbol| {
+            let initializer = symbol.body_range?;
+            let scope = *invocations.get(&initializer)?;
+            (symbol.item_range.encloses(initializer) && initializer.encloses(scope))
+                .then_some((scope, symbol.qualified_name.as_str()))
+        })
+        .collect()
 }
 
 /// Selects placed declarations whose initializer is the written array itself.
@@ -1337,6 +1526,7 @@ fn literal_callable_owners<'source>(
             anchors.contains_key(&symbol.qualified_name)
                 && match symbol.syntax_element_kind {
                     Some("function_declaration") => true,
+                    Some("assignment_expression") => closed_callable_scope(facts, symbol).is_some(),
                     Some("variable_declarator") if symbol.kind == "variable" => {
                         symbol.kinds.contains(&SymbolKind::Callable)
                             && symbol.body_range.is_some_and(|value| {
@@ -1353,6 +1543,17 @@ fn literal_callable_owners<'source>(
         })
         .filter_map(|symbol| Some((symbol.name_range?, symbol)))
         .collect()
+}
+
+/// The unique physical function expression of an already placed anonymous default callable.
+fn closed_callable_scope(facts: &StaticFacts, symbol: &SyntaxSymbol) -> Option<ByteRange> {
+    let export = facts.commonjs_export()?;
+    let callable = export.anonymous_callable?;
+    (symbol.name == "default"
+        && symbol.kind == "function"
+        && symbol.item_range == export.assignment
+        && callable.encloses(symbol.body_range?))
+    .then_some(callable)
 }
 
 /// Names a placed method whose literal is the entire value of one checked declaration.

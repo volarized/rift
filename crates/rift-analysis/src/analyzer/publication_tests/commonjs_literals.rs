@@ -43,6 +43,84 @@ fn analyze_with_manifest(user: &str, owner: &str, manifest: &str) -> PackageAnal
 }
 
 #[test]
+fn constructor_calls_follow_a_checked_placeholder_to_its_written_class() {
+    const CALLER: &str = "const library = require('./literal');
+exports.create = function create() { return new library.Bus(); };";
+    const DECLARATION: &str = "class Bus {}\nexports.Bus = Bus;";
+    for (prefix, expected, prior_read) in [
+        ("", true, true),
+        ("exports.Bus = void 0;", true, true),
+        ("exports.Bus = exports.Other = void 0;", true, true),
+        ("exports.Other = exports.Bus = void 0;", true, true),
+        (
+            r#"Object.defineProperty(exports, "__esModule", { value: true }); exports.Bus = void 0;"#,
+            true,
+            true,
+        ),
+        ("if (enabled) exports.Bus = void 0;", false, true),
+        ("exports.Bus = void effect();", false, false),
+        ("exports.Bus = 1;", false, false),
+        ("exports.Bus = void 0; exports.Bus = void 0;", false, true),
+        ("exports.Bus = void 0; const alias = exports;", false, true),
+        ("exports.Bus = void 0; exports[unknown] = 1;", false, true),
+    ] {
+        let owner = format!("{prefix}\n{DECLARATION}");
+        assert_constructor_export(CALLER, &owner, expected, prior_read);
+    }
+    for source in [
+        format!("{DECLARATION}\nexports.Bus = void 0;"),
+        "exports.Bus = void 0; class Bus {} if (enabled) exports.Bus = Bus;".to_owned(),
+        "exports.Bus = void 0; class Bus {} class Other {} exports.Bus = Bus; exports.Bus = Other;"
+            .to_owned(),
+        format!("exports.Bus = void 0;\n{DECLARATION}\nBus = replacement;"),
+        format!(
+            r#"const Object = unrelated; Object.defineProperty(exports, "__esModule", {{ value: true }}); exports.Bus = void 0; {DECLARATION}"#
+        ),
+    ] {
+        let analysis = analyze_with_manifest(CALLER, &source, ROOT_ONLY_MANIFEST);
+        assert!(
+            !analysis.publication().edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Calls] && occurrence(edge, CALLER, "new library.Bus()")
+            }),
+            "{source}"
+        );
+    }
+    let source = format!("exports.Bus = void 0;\n{DECLARATION}");
+    let shadowed = format!("const require = unrelated;\n{CALLER}");
+    assert_constructor_export(&shadowed, &source, false, false);
+}
+
+fn assert_constructor_export(caller: &str, owner: &str, calls: bool, reads: bool) {
+    let analysis = analyze_with_manifest(caller, owner, ROOT_ONLY_MANIFEST);
+    let publication = analysis.publication();
+    let target = "/beacon%2Fliteral.js/Bus";
+    let found = |kind, written| {
+        publication.edges.iter().any(|edge| {
+            edge.kinds == [kind]
+                && occurrence(edge, caller, written)
+                && edge.to.as_str().ends_with(target)
+        })
+    };
+    assert_eq!(
+        found(EdgeKind::Calls, "new library.Bus()"),
+        calls,
+        "{owner}"
+    );
+    if reads {
+        assert!(
+            found(EdgeKind::Reads, "library.Bus")
+                && publication.declarations.iter().any(|row| {
+                    row.symbol.as_str().ends_with(target)
+                        && row.unit.as_str().ends_with("/literal.js")
+                        && row.source_complete
+                        && row.source == "class Bus {}"
+                }),
+            "{owner}"
+        );
+    }
+}
+
+#[test]
 fn direct_literal_of_a_file_no_entry_names_keeps_its_path_module() {
     let analyzed = analyze_with_manifest(USER, OWNER, ROOT_ONLY_MANIFEST);
     for (kind, written, target) in [

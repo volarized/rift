@@ -795,6 +795,8 @@ struct EcmaScriptBindingDemand {
     typescript_signature_types: BindingDemand,
     typescript_declared_signature_types: BindingDemand,
     typescript_inferred_types: BindingDemand,
+    typescript_mapped_types: BindingDemand,
+    javascript_arrow_wrapped: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -839,6 +841,8 @@ impl EcmaScriptBindingDemand {
             declared_signature_type_slots,
             inferred_type_slots,
             property_receiver_slots,
+            mapped_type_slots,
+            arrow_wrapped_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -866,6 +870,8 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_declared_signature_types,
                 &self.typescript_inferred_types,
                 python_property_receivers,
+                &self.typescript_mapped_types,
+                &self.javascript_arrow_wrapped,
             ],
             &mut slots,
             &mut bytes,
@@ -896,6 +902,8 @@ impl EcmaScriptBindingDemand {
             .with_typescript_declared_signature_type_parameters(declared_signature_type_slots)
             .with_typescript_inference_parameters(inferred_type_slots)
             .with_python_property_receivers(property_receiver_slots)
+            .with_typescript_mapped_type_parameters(mapped_type_slots)
+            .with_javascript_arrow_wrapped_parameters(arrow_wrapped_slots)
     }
 
     fn classify(
@@ -926,6 +934,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_index_signatures
         } else if symbol.is_javascript_wrapped_parameter() {
             &mut self.javascript_wrapped
+        } else if symbol.is_javascript_arrow_wrapped_parameter() {
+            &mut self.javascript_arrow_wrapped
         } else if symbol.is_javascript_destructured_parameter() {
             &mut self.javascript_destructured
         } else if symbol.is_typescript_method_type_parameter() {
@@ -938,6 +948,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_declared_signature_types
         } else if symbol.is_typescript_inference_parameter() {
             &mut self.typescript_inferred_types
+        } else if symbol.is_typescript_mapped_type_parameter() {
+            &mut self.typescript_mapped_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut self.typescript_patterns
         } else if javascript {
@@ -973,6 +985,8 @@ impl EcmaScriptBindingDemand {
             + self.typescript_function_types.count
             + self.typescript_patterns.count
             + self.typescript_signature_types.count
+            + self.typescript_mapped_types.count
+            + self.javascript_arrow_wrapped.count
     }
 }
 
@@ -1332,8 +1346,7 @@ fn publish(
         semantics,
         &mut records,
     )?;
-    records.retain_ecmascript_modules(package, analyzed, semantics, limits)?;
-    records.retain_javascript_callback_argument_properties(package, analyzed, limits)?;
+    records.retain_selected_ecmascript_facts(input, analyzed, semantics)?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));

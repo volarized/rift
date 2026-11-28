@@ -9,11 +9,16 @@ use rift_core::ProjectPath;
 
 mod aliases;
 mod annotations;
+mod arrow_parameters;
 mod commonjs_literals;
+mod conditional_types;
+mod declaration_parameters;
 mod facts;
 mod forwarded_names;
 mod graph;
+mod initializer_argument_properties;
 mod initializers;
+mod inline_import_types;
 mod internal_modules;
 mod mixed_shorthand;
 mod module_imports;

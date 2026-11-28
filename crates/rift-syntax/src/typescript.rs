@@ -79,6 +79,61 @@ impl TypeScriptSyntaxProvider {
             language: dialect.language(),
         }
     }
+
+    /// Checks the written statement and target item of local export selectors using
+    /// the same complete retained source that produced the candidates.
+    ///
+    /// # Errors
+    /// Returns the registered syntax refusal if the source, query count or parse
+    /// exceeds its accepted bounds.
+    pub fn checked_local_export_selectors(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        candidates: &[(&crate::SyntaxExportBinding, &crate::SyntaxSymbol)],
+    ) -> Result<std::collections::BTreeSet<crate::ByteRange>, RiftError> {
+        ecmascript::checked_local_export_selectors(
+            &self.dialect.grammar(),
+            source,
+            limits,
+            candidates,
+        )
+    }
+
+    /// Checks written relative import qualifiers in TypeScript type declarations.
+    ///
+    /// # Errors
+    /// Returns the registered syntax refusal if the source, candidate count or parse
+    /// exceeds its accepted bounds.
+    pub fn checked_inline_import_types(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<Vec<crate::CheckedInlineTypeImport>, RiftError> {
+        ecmascript::checked_inline_import_types(&self.dialect.grammar(), source, limits)
+    }
+
+    /// Checks captured property ranges against conditional type positions in their aliases.
+    ///
+    /// Candidates carry the written alias range and the retained member, body and holder
+    /// ranges. The result contains the member ranges that match the checked source.
+    ///
+    /// # Errors
+    /// Returns the registered syntax refusal if source or candidate count exceeds its
+    /// bounds or the parser cannot read the source.
+    pub fn checked_conditional_type_members(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        candidates: &[(crate::ByteRange, crate::StaticBodyMember)],
+    ) -> Result<std::collections::BTreeSet<crate::ByteRange>, RiftError> {
+        ecmascript::checked_conditional_type_members(
+            &self.dialect.grammar(),
+            source,
+            limits,
+            candidates,
+        )
+    }
 }
 
 impl SyntaxProvider for TypeScriptSyntaxProvider {

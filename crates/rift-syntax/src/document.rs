@@ -192,6 +192,7 @@ impl SyntaxSymbol {
             || self.is_typescript_callable_type_parameter()
             || self.is_typescript_index_signature_parameter()
             || self.is_javascript_wrapped_parameter()
+            || self.is_javascript_arrow_wrapped_parameter()
             || self.is_javascript_destructured_parameter()
             || self.is_typescript_destructured_parameter()
     }
@@ -272,6 +273,12 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::WRAPPED_PARAMETER_KIND
     }
 
+    /// Whether this is a written defaulted or rest parameter of a named JavaScript arrow.
+    #[must_use]
+    pub fn is_javascript_arrow_wrapped_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::ARROW_WRAPPED_PARAMETER_KIND
+    }
+
     /// Whether this is a named JavaScript object or array parameter binding.
     #[must_use]
     pub fn is_javascript_destructured_parameter(&self) -> bool {
@@ -290,6 +297,12 @@ impl SyntaxSymbol {
         self.kind == crate::ecmascript::TYPE_PARAMETER_KIND
     }
 
+    /// Whether this is the parameter declared by a TypeScript mapped type.
+    #[must_use]
+    pub fn is_typescript_mapped_type_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::MAPPED_TYPE_PARAMETER_KIND
+    }
+
     /// Whether this ECMAScript binding uses a package declaration reservation.
     #[must_use]
     pub fn is_ecmascript_package_binding(&self) -> bool {
@@ -300,6 +313,7 @@ impl SyntaxSymbol {
             || self.is_typescript_signature_type_parameter()
             || self.is_typescript_declared_signature_type_parameter()
             || self.is_typescript_inference_parameter()
+            || self.is_typescript_mapped_type_parameter()
     }
 
     /// Whether this is the written type parameter of a TypeScript method.

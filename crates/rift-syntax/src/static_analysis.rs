@@ -8,6 +8,7 @@ pub use heritage_edges::HeritageEdge;
 
 use rift_core::ReferenceRole;
 use rift_error::{RiftError, errors};
+use std::collections::BTreeSet;
 use tree_sitter::{Language, Node};
 
 use crate::extract::{Visited, byte_range};
@@ -170,6 +171,17 @@ pub struct StaticAssignedCall {
     pub block: ByteRange,
 }
 
+/// One direct object literal assigned to a local name in an ECMAScript statement block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticAssignedObject {
+    /// The written lexical target.
+    pub target: ByteRange,
+    /// The complete object literal assigned to the target.
+    pub object: ByteRange,
+    /// The authored statement block that contains the assignment directly.
+    pub block: ByteRange,
+}
+
 /// One member of an ECMAScript object literal, type literal or class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticBodyMember {
@@ -179,7 +191,8 @@ pub struct StaticBodyMember {
     pub body: ByteRange,
     /// Syntax element holding the whole literal or class after reading through parentheses,
     /// assertions and annotations. For a property with consecutive array elements, the
-    /// containing array is the property's whole value.
+    /// containing array is the property's whole value. For direct object elements of an
+    /// array written as a call argument, the call's argument list holds their array.
     pub holder: ByteRange,
 }
 
@@ -467,6 +480,23 @@ pub struct StaticCommonJsExport {
     pub initialized: Vec<ByteRange>,
     /// The physical right-hand side of a checked direct object literal assignment.
     pub literal: Option<ByteRange>,
+    /// The physical function expression of a checked direct anonymous callable assignment.
+    pub anonymous_callable: Option<ByteRange>,
+}
+
+impl StaticCommonJsExport {
+    fn ranges_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
+        valid(self.assignment)
+            && self.anonymous_callable.is_none_or(|callable| {
+                valid(callable)
+                    && contains(self.assignment, callable)
+                    && !self.synchronized
+                    && self.literal.is_none()
+                    && self.initialized.is_empty()
+            })
+            && self.initialized.iter().copied().all(valid)
+            && self.initialized.windows(2).all(|pair| pair[0] < pair[1])
+    }
 }
 
 /// A direct type annotation use with its written generic binding.
@@ -493,8 +523,12 @@ pub struct StaticFactsParts {
     pub skippable: Vec<ByteRange>,
     /// Whether an ECMAScript import or export statement stands directly in the source file.
     pub javascript_module_statement: bool,
+    /// Quoted relative specifiers of TypeScript imports with a clause in the source file.
+    pub typescript_module_imports: Vec<ByteRange>,
     /// The single direct default write in a file with closed `CommonJS` wrapper uses.
     pub commonjs_export: Option<StaticCommonJsExport>,
+    /// Whether an unshadowed wrapper assigns an expression directly at the file root.
+    pub commonjs_expression_export: bool,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
     /// Receiver and property spans for member expressions.
@@ -527,6 +561,8 @@ pub struct StaticFactsParts {
     pub destructured: Vec<(ByteRange, Option<ByteRange>, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
+    /// Direct JavaScript arrow initializers with written defaulted or rest parameters.
+    pub javascript_wrapped_arrow_bodies: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
     pub function_scopes: Vec<ByteRange>,
     /// Static class initialization blocks.
@@ -543,6 +579,8 @@ pub struct StaticFactsParts {
     pub assignments: Vec<ByteRange>,
     /// Direct call-result assignments and the blocks that contain them.
     pub assigned_calls: Vec<StaticAssignedCall>,
+    /// Direct object assignments and the blocks that contain them.
+    pub assigned_objects: Vec<StaticAssignedObject>,
     /// Name and member targets of assignments whose value is a function written in place.
     pub function_writes: Vec<ByteRange>,
     /// Plain assignments copying a member from `this`.
@@ -664,6 +702,12 @@ impl StaticFacts {
         self.0.javascript_module_statement
     }
 
+    /// Quoted relative specifiers of TypeScript imports outside every ambient module and namespace.
+    #[must_use]
+    pub fn typescript_module_imports(&self) -> &[ByteRange] {
+        &self.0.typescript_module_imports
+    }
+
     /// Assignments to `module.exports` or a computed key of `module` that run while the file
     /// does, in no function called later, and whether no condition encloses them.
     #[must_use]
@@ -681,6 +725,12 @@ impl StaticFacts {
     #[must_use]
     pub const fn commonjs_export(&self) -> Option<&StaticCommonJsExport> {
         self.0.commonjs_export.as_ref()
+    }
+
+    /// Whether a closed `module.exports` write assigns a checked callable.
+    #[must_use]
+    pub const fn has_commonjs_expression_export(&self) -> bool {
+        self.0.commonjs_expression_export
     }
 
     /// Captured value accesses and type references.
@@ -836,6 +886,12 @@ impl StaticFacts {
         &self.0.function_values
     }
 
+    /// The direct arrow's span and the expression or block in its body.
+    #[must_use]
+    pub fn javascript_wrapped_arrow_bodies(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.javascript_wrapped_arrow_bodies
+    }
+
     /// Function expressions that establish their own receiver.
     #[must_use]
     pub fn function_scopes(&self) -> &[ByteRange] {
@@ -897,6 +953,12 @@ impl StaticFacts {
     #[must_use]
     pub fn assigned_calls(&self) -> &[StaticAssignedCall] {
         &self.0.assigned_calls
+    }
+
+    /// Object assignments whose written local target and direct block are known.
+    #[must_use]
+    pub fn assigned_objects(&self) -> &[StaticAssignedObject] {
+        &self.0.assigned_objects
     }
 
     /// Name and member targets of assignments whose value is a function written in place.
@@ -1125,6 +1187,7 @@ impl StaticFacts {
         [
             self.commonjs_export()
                 .map_or(0, |export| vector_capacity(&export.initialized)),
+            vector_capacity(&self.0.typescript_module_imports),
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
             vector_capacity(&self.0.member_aliases),
@@ -1140,6 +1203,7 @@ impl StaticFacts {
             vector_capacity(&self.0.declared_returns),
             vector_capacity(&self.0.destructured),
             vector_capacity(&self.0.function_values),
+            vector_capacity(&self.0.javascript_wrapped_arrow_bodies),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
             vector_capacity(&self.0.heritage_edges),
@@ -1148,6 +1212,7 @@ impl StaticFacts {
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
             vector_capacity(&self.0.assigned_calls),
+            vector_capacity(&self.0.assigned_objects),
             vector_capacity(&self.0.function_writes),
             vector_capacity(&self.0.member_copies),
             vector_capacity(&self.0.element_types),
@@ -1221,6 +1286,7 @@ impl StaticFacts {
         let lengths = [
             self.commonjs_export()
                 .map_or(0, |export| export.initialized.len()),
+            self.typescript_module_imports().len(),
             self.references().len(),
             self.members().len(),
             self.member_aliases().len(),
@@ -1236,6 +1302,7 @@ impl StaticFacts {
             self.declared_returns().len(),
             self.destructured().len(),
             self.function_values().len(),
+            self.javascript_wrapped_arrow_bodies().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
             self.heritage_edges().len(),
@@ -1244,6 +1311,7 @@ impl StaticFacts {
             self.reexports().len(),
             self.assignments().len(),
             self.assigned_calls().len(),
+            self.assigned_objects().len(),
             self.function_writes().len(),
             self.member_copies().len(),
             self.element_types().len(),
@@ -1457,6 +1525,18 @@ impl StaticFacts {
                 .assigned_calls()
                 .windows(2)
                 .all(|pair| pair[0].target.start < pair[1].target.start)
+            && self.assigned_objects().iter().all(|row| {
+                valid(row.target)
+                    && valid(row.object)
+                    && valid(row.block)
+                    && row.target.end < row.object.start
+                    && row.block.encloses(row.target)
+                    && row.block.encloses(row.object)
+            })
+            && self
+                .assigned_objects()
+                .windows(2)
+                .all(|pair| pair[0].target.start < pair[1].target.start)
             && self.member_copies().iter().all(|copy| {
                 valid(copy.assignment)
                     && valid(copy.target)
@@ -1504,6 +1584,18 @@ impl StaticFacts {
                 .all(|(name, spread)| valid(*name) && valid(*spread))
     }
 
+    fn function_ranges_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.function_values()
+            .iter()
+            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
+            && self
+                .javascript_wrapped_arrow_bodies()
+                .iter()
+                .all(|(scope, body)| valid(*scope) && valid(*body) && contains(*scope, *body))
+            && self.function_scopes().iter().copied().all(valid)
+            && self.static_blocks().iter().copied().all(valid)
+    }
+
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
@@ -1513,11 +1605,11 @@ impl StaticFacts {
                 .zip(end)
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
-        if self.commonjs_export().is_some_and(|export| {
-            !valid(export.assignment)
-                || !export.initialized.iter().copied().all(valid)
-                || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
-        }) {
+        if !self.typescript_module_imports().iter().copied().all(valid)
+            || self
+                .commonjs_export()
+                .is_some_and(|export| !export.ranges_valid(valid))
+        {
             return errors::syntax::facts_range_invalid().fail();
         }
         let edges = self.heritage_edges().iter().all(|edge| {
@@ -1530,21 +1622,17 @@ impl StaticFacts {
                 )
         });
         let calls = self.calls().iter().all(|call| call.valid(valid));
+        let mut argument_requires = BTreeSet::new();
         let references = self.references().iter().all(|reference| {
             valid(reference.target)
-                && matches!(
-                    reference.role,
-                    rift_core::ReferenceRole::Read
-                        | rift_core::ReferenceRole::Write
-                        | rift_core::ReferenceRole::Type
-                )
-        });
-        let functions = self
-            .function_values()
-            .iter()
-            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
-            && self.function_scopes().iter().copied().all(valid)
-            && self.static_blocks().iter().copied().all(valid);
+                && match reference.role {
+                    ReferenceRole::Read | ReferenceRole::Write | ReferenceRole::Type => true,
+                    ReferenceRole::Import => argument_requires.insert(reference.target),
+                    _ => false,
+                }
+        }) && (argument_requires.is_empty()
+            || self.checked_argument_requires(source, limits, argument_requires));
+        let functions = self.function_ranges_valid(valid);
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
             .reexports()
@@ -1602,6 +1690,21 @@ impl StaticFacts {
             return errors::syntax::facts_range_invalid().fail();
         }
         Ok(())
+    }
+
+    fn checked_argument_requires(
+        &self,
+        source: &str,
+        limits: SyntaxLimits,
+        ranges: BTreeSet<ByteRange>,
+    ) -> bool {
+        let captured = self
+            .calls()
+            .iter()
+            .filter(|call| call.callee == StaticCallee::Direct && ranges.contains(&call.range))
+            .map(|call| call.range)
+            .collect::<BTreeSet<_>>();
+        captured == ranges && javascript::checked_argument_require_ranges(source, limits, ranges)
     }
 
     fn python_initializers_valid(
@@ -1899,8 +2002,13 @@ impl<'source> Capture<'source> {
         Ok((self.facts, invalid_default))
     }
 
-    pub(crate) fn record_commonjs_export(&mut self, export: Option<StaticCommonJsExport>) {
-        self.facts.0.commonjs_export = export;
+    pub(crate) fn record_commonjs_exports(
+        &mut self,
+        closed: Option<StaticCommonJsExport>,
+        expression: bool,
+    ) {
+        self.facts.0.commonjs_export = closed;
+        self.facts.0.commonjs_expression_export = expression;
     }
 }
 
@@ -1967,6 +2075,89 @@ fn call(
         callee_range: byte_range(callee)?,
         callee: shape,
     })
+}
+
+#[cfg(test)]
+mod commonjs_argument_require_tests {
+    use super::{ReferenceRole, StaticFacts, StaticReference};
+    use crate::javascript::JavaScriptSyntaxProvider;
+    use crate::{SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxProvider, SyntaxSource};
+
+    #[test]
+    fn direct_argument_require_evidence_restores_only_its_original_checked_shape() {
+        const SOURCE: &str = "const first = require('./leaf');\nwrap(require('./leaf'));\n";
+        const LEGACY: &str = "import './leaf';";
+        let path = rift_core::ProjectPath::new("index.js").expect("path");
+        let limits = SyntaxLimits::default();
+        let capture = |source| {
+            JavaScriptSyntaxProvider::default()
+                .analyze(
+                    SyntaxSource {
+                        path: &path,
+                        text: source,
+                    },
+                    limits,
+                )
+                .expect("original JavaScript")
+        };
+        let document = capture(SOURCE);
+        let captured = document.facts();
+        let facts = captured.static_facts().expect("captured facts");
+        let restored = StaticFacts::from_parts(SOURCE, limits, facts.0.clone())
+            .expect("checked source range restores");
+        assert_eq!(&restored, facts);
+        let parts = SyntaxFactsParts {
+            origin: captured.origin(),
+            language: captured.language().clone(),
+            symbols: captured.symbols().to_vec(),
+            left_out_symbols: captured.left_out_symbols().to_vec(),
+            export_bindings: captured.export_bindings().map(<[_]>::to_vec),
+            macro_invocations: None,
+            scope: None,
+            static_facts: Some(restored.clone()),
+            has_errors: captured.has_errors(),
+            variance_errors_only: false,
+            left_out_declarations: captured.left_out_declaration_count(),
+            markdown_facts: None,
+            source_digest: rift_core::FileDigest::of(SOURCE.as_bytes()),
+        };
+        let whole =
+            SyntaxFacts::from_parts(SOURCE, limits, parts).expect("checked JavaScript facts");
+        assert_eq!(whole.static_facts(), Some(facts));
+        let requires = restored
+            .references()
+            .iter()
+            .filter(|reference| reference.role == ReferenceRole::Import)
+            .collect::<Vec<_>>();
+        assert_eq!(requires.len(), 1);
+        let first = facts.calls().first().expect("standalone initialization");
+        let mut wrong = facts.0.clone();
+        wrong.references.push(StaticReference {
+            target: first.range,
+            role: ReferenceRole::Import,
+        });
+        assert!(StaticFacts::from_parts(SOURCE, limits, wrong).is_err());
+        let mut no_call = facts.0.clone();
+        no_call
+            .calls
+            .retain(|call| call.range != requires[0].target);
+        assert!(StaticFacts::from_parts(SOURCE, limits, no_call).is_err());
+        let mut duplicate = facts.0.clone();
+        duplicate.references.push(*requires[0]);
+        assert!(StaticFacts::from_parts(SOURCE, limits, duplicate).is_err());
+
+        let document = capture(LEGACY);
+        let legacy = document.facts().static_facts().expect("legacy facts");
+        let restored = StaticFacts::from_parts(LEGACY, limits, legacy.0.clone())
+            .expect("ordinary side-effect import facts restore");
+        assert_eq!(&restored, legacy);
+        let mut wrong_role = legacy.0.clone();
+        wrong_role.references.push(StaticReference {
+            target: crate::ByteRange { start: 8, end: 14 },
+            role: ReferenceRole::Import,
+        });
+        assert!(StaticFacts::from_parts(LEGACY, limits, wrong_role).is_err());
+    }
 }
 
 #[cfg(test)]

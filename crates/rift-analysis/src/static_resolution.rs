@@ -15,6 +15,7 @@ mod python_edges;
 mod rust;
 #[cfg(test)]
 mod tests;
+mod typescript_inline_imports;
 
 use javascript_parameters::{ParameterReads, ScopedParameterReads};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -86,6 +87,16 @@ pub(crate) struct StaticResolution {
     pub(crate) file_module_start: Option<usize>,
     /// First qualifier reference after the file module specifiers.
     pub(crate) file_module_qualifier_start: Option<usize>,
+    /// First import in a checked `CommonJS` default export object.
+    pub(crate) commonjs_export_import_start: Option<usize>,
+    /// First import written as a `CommonJS` call argument, after established edges.
+    pub(crate) commonjs_argument_import_start: Option<usize>,
+    /// First checked selector reference to a declaration in a relative imported module.
+    pub(crate) typescript_imported_export_start: Option<usize>,
+    /// First type use of a declaration merged with a namespace, after established edges.
+    pub(crate) typescript_namespace_type_start: Option<usize>,
+    /// Unresolved plain type names that can have two checked declaration facets.
+    pub(crate) typescript_namespace_type_sites: BTreeMap<rift_core::SourceUnitId, Vec<ByteRange>>,
     /// First containment edge of a physically scoped literal declaration.
     pub(crate) literal_start: Option<usize>,
     /// Containment awaiting the capacity left by existing references.
@@ -153,6 +164,14 @@ pub(crate) struct StaticResolution {
     /// First qualifier backed by an established legacy alias type occurrence.
     pub(crate) python_legacy_annotation_qualifier_start: Option<usize>,
     pub(crate) python_loop_read_start: Option<usize>,
+    /// First independently checked local selector in an incomplete declaration file.
+    pub(crate) typescript_incomplete_local_export_start: Option<usize>,
+    /// First checked type occurrence at a relative inline import qualifier.
+    pub(crate) typescript_inline_import_type_start: Option<usize>,
+    /// First module edge at a checked inline import specifier.
+    pub(crate) typescript_inline_import_module_start: Option<usize>,
+    /// First checked reference at a TypeScript enum qualifier.
+    pub(crate) typescript_enum_qualifier_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -213,6 +232,8 @@ pub(crate) struct StaticResolution {
     /// First appended type use of a conditional inference parameter.
     pub(crate) typescript_inference_parameter_start: Option<usize>,
     pub(crate) deferred_typescript_inference_parameters: Vec<StaticOccurrence>,
+    /// First checked body Read of a defaulted or rest parameter in a JavaScript arrow.
+    pub(crate) javascript_wrapped_arrow_read_start: Option<usize>,
     /// Occurrences whose target a dependency or a standard library owns.
     pub(crate) external: Vec<ExternalOccurrence>,
     /// Edge kinds of sites left without a target.
@@ -390,6 +411,17 @@ fn resolve_by<'source>(
     index.resolve_python_wildcard_modules(&mut work, &mut resolution);
     index.resolve_python_legacy_annotation_qualifiers(&mut work, &mut resolution);
     index.resolve_python_loop_reads(&mut work, &mut resolution);
+    index.resolve_commonjs_export_imports(&mut work, &mut resolution);
+    index.resolve_incomplete_typescript_local_exports(&mut work, &mut resolution);
+    index.resolve_typescript_imported_export_selectors(&mut work, &mut resolution);
+    let mut inline_modules =
+        index.resolve_typescript_inline_import_types(&mut work, &mut resolution);
+    index.resolve_commonjs_argument_imports(&mut work, &mut resolution);
+    resolution.typescript_inline_import_module_start =
+        append_late_occurrences(&mut resolution.occurrences, &mut inline_modules);
+    index.resolve_typescript_namespace_type_uses(&mut work, &mut resolution);
+    index.resolve_javascript_wrapped_arrow_reads(&mut work, &mut resolution);
+    index.resolve_typescript_enum_qualifiers(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -842,6 +874,7 @@ struct File<'source> {
     scoped_javascript_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     typescript_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    javascript_arrow_wrapped_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     javascript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_destructured_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     typescript_function_type_parameters: BTreeMap<ByteRange, &'source SyntaxSymbol>,
@@ -889,6 +922,8 @@ struct File<'source> {
     callbacks: javascript_callbacks::Callbacks<'source>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
+    commonjs_class_initializations:
+        BTreeMap<&'source str, &'source rift_syntax::SyntaxExportBinding>,
     /// The writes of `module.exports` and what they leave the module with.
     module_value: javascript_exports::ModuleValues<'source>,
     /// Names written as computed keys of the module's exports: `name` and its position in
@@ -1032,6 +1067,7 @@ impl<'source> File<'source> {
             scoped_javascript_parameters: BTreeMap::new(),
             typescript_type_parameters: BTreeMap::new(),
             javascript_wrapped_parameters: BTreeMap::new(),
+            javascript_arrow_wrapped_parameters: BTreeMap::new(),
             javascript_destructured_parameters: BTreeMap::new(),
             typescript_destructured_parameters: BTreeMap::new(),
             typescript_function_type_parameters: BTreeMap::new(),
@@ -1066,6 +1102,7 @@ impl<'source> File<'source> {
             callbacks: javascript_callbacks::Callbacks::default(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
+            commonjs_class_initializations: BTreeMap::new(),
             module_value: javascript_exports::ModuleValues::default(),
             export_keys: Vec::new(),
             exports: None,
@@ -1360,6 +1397,9 @@ impl<'source> File<'source> {
                 self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && symbol.is_javascript_wrapped_parameter() {
                 self.javascript_wrapped_parameters.insert(name, symbol);
+            } else if admitted && symbol.is_javascript_arrow_wrapped_parameter() {
+                self.javascript_arrow_wrapped_parameters
+                    .insert(name, symbol);
             } else if admitted && symbol.is_javascript_destructured_parameter() {
                 self.javascript_destructured_parameters.insert(name, symbol);
             } else if admitted && symbol.is_typescript_method_type_parameter() {
@@ -3151,6 +3191,8 @@ impl StaticResolution {
             .append(&mut apart.javascript_lexical_alias_candidates);
         self.javascript_assigned_members
             .append(&mut apart.javascript_assigned_members);
+        self.typescript_namespace_type_sites
+            .append(&mut apart.typescript_namespace_type_sites);
         for (kind, count) in apart.omitted {
             let total = self.omitted.entry(kind).or_default();
             *total = total.saturating_add(count);

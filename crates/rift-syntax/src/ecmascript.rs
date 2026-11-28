@@ -84,6 +84,9 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKi
 mod callback_parameters;
 mod checked_parameters;
 mod commonjs;
+pub(crate) use commonjs::commonjs_class_export_initializations;
+mod conditional_type_members;
+mod inline_import_types;
 mod members;
 mod overload_parameters;
 pub(crate) mod recovery;
@@ -93,6 +96,11 @@ pub(crate) mod type_parameters;
 mod type_signature_parameters;
 mod variance;
 mod wrapped_parameters;
+
+pub(crate) use conditional_type_members::check as checked_conditional_type_members;
+pub use inline_import_types::CheckedInlineTypeImport;
+pub(crate) use inline_import_types::check as checked_inline_import_types;
+pub(crate) use wrapped_parameters::arrow_body_with_wrapped_parameters;
 
 use tree_sitter::{Node, Parser};
 
@@ -248,6 +256,7 @@ pub(crate) const METHOD_PARAMETER_KIND: &str = "method_parameter";
 pub(crate) const SIGNATURE_PARAMETER_KIND: &str = "typescript_signature_parameter";
 pub(crate) const SCOPED_FUNCTION_PARAMETER_KIND: &str = "javascript_scoped_function_parameter";
 pub(crate) const TYPE_PARAMETER_KIND: &str = "typescript_type_parameter";
+pub(crate) const MAPPED_TYPE_PARAMETER_KIND: &str = "typescript_mapped_type_parameter";
 pub(crate) const FUNCTION_TYPE_PARAMETER_KIND: &str = "typescript_function_type_parameter";
 pub(crate) const SIGNATURE_TYPE_PARAMETER_KIND: &str = "typescript_signature_type_parameter";
 pub(crate) const INFERENCE_PARAMETER_KIND: &str = "typescript_inference_type_parameter";
@@ -257,6 +266,7 @@ pub(crate) const METHOD_TYPE_PARAMETER_KIND: &str = "typescript_method_type_para
 pub(crate) const CALLABLE_TYPE_PARAMETER_KIND: &str = "typescript_callable_type_parameter";
 pub(crate) const INDEX_SIGNATURE_PARAMETER_KIND: &str = "typescript_index_signature_parameter";
 pub(crate) const WRAPPED_PARAMETER_KIND: &str = "javascript_wrapped_parameter";
+pub(crate) const ARROW_WRAPPED_PARAMETER_KIND: &str = "javascript_arrow_wrapped_parameter";
 pub(crate) const DESTRUCTURED_PARAMETER_KIND: &str = "javascript_destructured_parameter";
 pub(crate) const TYPED_DESTRUCTURED_PARAMETER_KIND: &str = "typescript_destructured_parameter";
 pub(crate) const SHORTHAND_PARAMETER_KIND: &str = "javascript_shorthand_parameter";
@@ -1646,6 +1656,10 @@ impl EcmaScriptRules<'_> {
         type_parameters::declared_name(visited)
             .map(|name| (name, TYPE_PARAMETER_KIND))
             .or_else(|| {
+                type_signature_parameters::mapped_parameter_name(visited.syntax_element())
+                    .map(|name| (name, MAPPED_TYPE_PARAMETER_KIND))
+            })
+            .or_else(|| {
                 type_parameters::named_owner(visited, type_parameters::function)
                     .map(|name| (name, FUNCTION_TYPE_PARAMETER_KIND))
             })
@@ -1679,6 +1693,10 @@ impl EcmaScriptRules<'_> {
                     wrapped_parameters::declared_name(written)
                         .map(|name| (name, WRAPPED_PARAMETER_KIND))
                         .or_else(|| {
+                            wrapped_parameters::arrow_parameter_name(written)
+                                .map(|name| (name, ARROW_WRAPPED_PARAMETER_KIND))
+                        })
+                        .or_else(|| {
                             wrapped_parameters::destructured_name(written, false)
                                 .map(|name| (name, DESTRUCTURED_PARAMETER_KIND))
                         })
@@ -1707,6 +1725,7 @@ impl EcmaScriptRules<'_> {
         let type_parameter = matches!(
             kind,
             TYPE_PARAMETER_KIND
+                | MAPPED_TYPE_PARAMETER_KIND
                 | METHOD_TYPE_PARAMETER_KIND
                 | FUNCTION_TYPE_PARAMETER_KIND
                 | SIGNATURE_TYPE_PARAMETER_KIND
@@ -2019,7 +2038,10 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .kinds
             .formal_parameter_kinds
             .is_empty()
-            .then(|| wrapped_parameters::declared_name(syntax_element))
+            .then(|| {
+                wrapped_parameters::declared_name(syntax_element)
+                    .or_else(|| wrapped_parameters::arrow_parameter_name(syntax_element))
+            })
             .flatten();
         let name = self
             .kinds
@@ -2346,24 +2368,14 @@ pub(crate) fn analyze_included(
         &mut rules.exports.bindings,
     )?;
     rules.exports.add_commonjs(&commonjs, source.text);
-    let mut capture = ranges.is_empty().then(|| {
-        if language.name == "typescript" {
-            crate::static_analysis::Capture::for_edge_typescript(
-                source.text,
-                match language.dialect.as_deref() {
-                    Some("tsx") => crate::typescript::TypeScriptDialect::Tsx,
-                    _ => crate::typescript::TypeScriptDialect::TypeScript,
-                },
-            )
-        } else {
-            crate::static_analysis::Capture::for_javascript(source.text)
-        }
-    });
+    let mut capture = ranges
+        .is_empty()
+        .then(|| package_capture(language, source.text));
     if let Some(capture) = &mut capture
         && !recovered
         && !tree.root_node().has_error()
     {
-        capture.record_commonjs_export(commonjs.closed_export);
+        capture.record_commonjs_exports(commonjs.closed_export, commonjs.expression_export);
     }
     let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),
@@ -2386,23 +2398,27 @@ pub(crate) fn analyze_included(
             &mut symbols,
         )?;
         facts.set_member_aliases(aliases);
-        if !recovered && !tree.root_node().has_error() {
+        if !recovered {
             append_package_parameters(
                 language,
                 tree.root_node(),
-                source.text,
+                source,
                 &mut symbols,
                 parameters,
                 facts,
             );
         }
     }
+    let variance_errors_only = finish_package_type_recovery(
+        language,
+        &mut parser,
+        tree.root_node(),
+        source,
+        limits,
+        ranges.is_empty() && !recovered,
+        &mut symbols,
+    );
     symbols.sort_by_key(|symbol| symbol.range.start);
-    let variance_errors_only = language.name == "typescript"
-        && ranges.is_empty()
-        && !recovered
-        && tree.root_node().has_error()
-        && variance::accounts_for_parse_errors(&mut parser, tree.root_node(), source.text, limits);
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
@@ -2416,6 +2432,44 @@ pub(crate) fn analyze_included(
     .with_export_bindings(export_bindings)
     .with_static_facts(static_facts)
     .with_syntax_limits(limits))
+}
+
+fn package_capture<'source>(
+    language: &Language,
+    text: &'source str,
+) -> crate::static_analysis::Capture<'source> {
+    if language.name == "typescript" {
+        crate::static_analysis::Capture::for_edge_typescript(
+            text,
+            match language.dialect.as_deref() {
+                Some("tsx") => crate::typescript::TypeScriptDialect::Tsx,
+                _ => crate::typescript::TypeScriptDialect::TypeScript,
+            },
+        )
+    } else {
+        crate::static_analysis::Capture::for_javascript(text)
+    }
+}
+
+fn finish_package_type_recovery(
+    language: &Language,
+    parser: &mut Parser,
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    original_unit: bool,
+    symbols: &mut [crate::SyntaxSymbol],
+) -> bool {
+    if !original_unit || language.name != "typescript" || !root.has_error() {
+        return false;
+    }
+    if [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| source.path.as_str().ends_with(suffix))
+    {
+        let _ = inline_import_types::recover_type_aliases(parser, root, source, limits, symbols);
+    }
+    variance::accounts_for_parse_errors(parser, root, source.text, limits)
 }
 
 fn parser_for_ranges(
@@ -2437,26 +2491,110 @@ fn parser_for_ranges(
     Ok(parser)
 }
 
+pub(crate) fn checked_local_export_selectors(
+    grammar: &tree_sitter::Language,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    candidates: &[(&SyntaxExportBinding, &crate::SyntaxSymbol)],
+) -> Result<BTreeSet<ByteRange>, RiftError> {
+    limits.admit_source(source)?;
+    if candidates.len() > limits.syntax_elements_max() {
+        return errors::syntax::too_many_syntax_elements()
+            .path(source.path)
+            .syntax_elements_max(limits.syntax_elements_max())
+            .fail();
+    }
+    let mut parser = parser_for_ranges(grammar, &[])?;
+    let tree = parser
+        .parse(source.text, None)
+        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    let root = tree.root_node();
+    if root.kind() != "program" || root.is_error() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(candidates
+        .iter()
+        .filter_map(|(binding, target)| complete_local_selector(root, binding, target))
+        .collect())
+}
+
+fn complete_local_selector(
+    root: Node<'_>,
+    binding: &SyntaxExportBinding,
+    target: &crate::SyntaxSymbol,
+) -> Option<ByteRange> {
+    let range = binding.local?;
+    let local = complete_region(root, range)?;
+    let specifier = local.parent()?;
+    if specifier.kind() != EXPORT_SPECIFIER_KIND
+        || specifier.child_by_field_name("name") != Some(local)
+    {
+        return None;
+    }
+    let clause = specifier.parent()?;
+    let statement = clause.parent()?;
+    if clause.kind() != "export_clause"
+        || statement.kind() != EXPORT_STATEMENT_KIND
+        || statement.parent() != Some(root)
+        || statement.has_error()
+        || statement.child_by_field_name("source").is_some()
+        || extract::byte_range(statement).ok()? != binding.range
+    {
+        return None;
+    }
+    let declaration = complete_region(root, target.item_range)?;
+    if Some(declaration.kind()) != target.syntax_element_kind {
+        return None;
+    }
+    let mut parent = declaration.parent()?;
+    while matches!(
+        parent.kind(),
+        "ambient_declaration" | "export_statement" | "lexical_declaration" | "variable_declaration"
+    ) {
+        if parent.has_error() {
+            return None;
+        }
+        parent = parent.parent()?;
+    }
+    (parent == root).then_some(range)
+}
+
+fn complete_region(root: Node<'_>, range: ByteRange) -> Option<Node<'_>> {
+    let start = usize::try_from(range.start).ok()?;
+    let end = usize::try_from(range.end).ok()?;
+    let node = root.named_descendant_for_byte_range(start, end)?;
+    (start < end && node.byte_range() == (start..end) && !node.has_error()).then_some(node)
+}
+
 fn append_package_parameters(
     language: &Language,
     root: Node<'_>,
-    source: &str,
+    source: SyntaxSource<'_>,
     symbols: &mut Vec<crate::SyntaxSymbol>,
     candidates: ParameterDeclarations,
     facts: &crate::StaticFacts,
 ) {
+    if root.has_error() {
+        if language.name == "typescript" && source.path.as_str().ends_with(".d.ts") {
+            append_parameters(symbols, candidates.values, facts, Some(root));
+        }
+        return;
+    }
+    let source = source.text;
     let ParameterDeclarations {
         values: parameters,
         types: type_parameters,
         callable_types,
         index_signatures,
         wrapped,
+        arrow_wrapped,
         destructured,
         method_types,
         function_types,
         signature_types,
         declared_signature_types,
         inferred_types,
+        mapped_types,
         typed_patterns,
     } = candidates;
     let scoped = if language.name == "typescript" {
@@ -2469,7 +2607,7 @@ fn append_package_parameters(
     } else {
         Vec::new()
     };
-    append_parameters(symbols, parameters, facts);
+    append_parameters(symbols, parameters, facts, None);
     symbols.extend(scoped);
     symbols.extend(shorthand);
     callback_parameters::append(symbols, facts, source, language.name == "javascript");
@@ -2528,6 +2666,10 @@ fn append_package_parameters(
         facts,
         wrapped_parameters::accepted_owner,
     );
+    type_signature_parameters::append_mapped_types(root, symbols, mapped_types);
+    checked_parameters::append_under_checked_owner(symbols, arrow_wrapped, facts, |owner, name| {
+        wrapped_parameters::arrow_binding_scope(root, owner, name)
+    });
 }
 
 #[derive(Default)]
@@ -2537,11 +2679,13 @@ struct ParameterDeclarations {
     callable_types: Vec<crate::SyntaxSymbol>,
     index_signatures: Vec<crate::SyntaxSymbol>,
     wrapped: Vec<crate::SyntaxSymbol>,
+    arrow_wrapped: Vec<crate::SyntaxSymbol>,
     destructured: Vec<crate::SyntaxSymbol>,
     function_types: Vec<crate::SyntaxSymbol>,
     signature_types: Vec<crate::SyntaxSymbol>,
     declared_signature_types: Vec<crate::SyntaxSymbol>,
     inferred_types: Vec<crate::SyntaxSymbol>,
+    mapped_types: Vec<crate::SyntaxSymbol>,
     typed_patterns: Vec<crate::SyntaxSymbol>,
     method_types: Vec<crate::SyntaxSymbol>,
 }
@@ -2558,6 +2702,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.index_signatures
         } else if symbol.is_javascript_wrapped_parameter() {
             &mut candidates.wrapped
+        } else if symbol.is_javascript_arrow_wrapped_parameter() {
+            &mut candidates.arrow_wrapped
         } else if symbol.is_javascript_destructured_parameter() {
             &mut candidates.destructured
         } else if symbol.is_typescript_method_type_parameter() {
@@ -2570,6 +2716,8 @@ fn take_parameters(symbols: &mut Vec<crate::SyntaxSymbol>) -> ParameterDeclarati
             &mut candidates.declared_signature_types
         } else if symbol.is_typescript_inference_parameter() {
             &mut candidates.inferred_types
+        } else if symbol.is_typescript_mapped_type_parameter() {
+            &mut candidates.mapped_types
         } else if symbol.is_typescript_destructured_parameter() {
             &mut candidates.typed_patterns
         } else {
@@ -2585,6 +2733,7 @@ fn append_parameters(
     symbols: &mut Vec<crate::SyntaxSymbol>,
     parameters: Vec<crate::SyntaxSymbol>,
     facts: &crate::StaticFacts,
+    incomplete_declaration: Option<Node<'_>>,
 ) {
     if parameters.is_empty() {
         return;
@@ -2617,9 +2766,13 @@ fn append_parameters(
         })
         .filter(|symbol| rift_core::is_portable_name(&symbol.qualified_name))
         .filter(|symbol| {
-            symbol
-                .name_range
-                .is_some_and(|name| anchors.contains_key(&name))
+            symbol.name_range.is_some_and(|name| {
+                anchors.get(&name).is_some_and(|&owner| {
+                    incomplete_declaration.is_none_or(|root| {
+                        complete_declaration_parameter(root, name, owner).is_some()
+                    })
+                })
+            })
         })
         .filter(|symbol| rift_core::is_portable_name(&symbol.name))
         .map(|symbol| symbol.name_range)
@@ -2633,6 +2786,61 @@ fn append_parameters(
         }
         Some(symbol)
     }));
+}
+
+/// A declaration file may have an unrelated parse error. Only a complete named
+/// signature can own one of its ordinary parameters in that case.
+fn complete_declaration_parameter(
+    root: Node<'_>,
+    name: ByteRange,
+    expected_owner: ByteRange,
+) -> Option<()> {
+    let start = usize::try_from(name.start).ok()?;
+    let end = usize::try_from(name.end).ok()?;
+    let identifier = root.named_descendant_for_byte_range(start, end)?;
+    if start >= end || identifier.kind() != "identifier" || identifier.byte_range() != (start..end)
+    {
+        return None;
+    }
+    let parameter = identifier.parent()?;
+    if !matches!(
+        parameter.kind(),
+        "required_parameter" | "optional_parameter"
+    ) || parameter.child_by_field_name("pattern") != Some(identifier)
+        || parameter.has_error()
+    {
+        return None;
+    }
+    let list = parameter.parent()?;
+    let signature = list.parent()?;
+    if list.kind() != "formal_parameters"
+        || signature.has_error()
+        || extract::byte_range(signature.child_by_field_name("name")?).ok()? != expected_owner
+    {
+        return None;
+    }
+    let mut container = signature.parent()?;
+    match signature.kind() {
+        FUNCTION_SIGNATURE_KIND => {
+            while matches!(container.kind(), "ambient_declaration" | "export_statement") {
+                container = container.parent()?;
+            }
+            (container == root).then_some(())
+        }
+        METHOD_SIGNATURE_KIND | ABSTRACT_METHOD_SIGNATURE_KIND
+            if container.kind() == "class_body" =>
+        {
+            let class = container.parent()?;
+            (matches!(
+                class.kind(),
+                CLASS_DECLARATION_KIND | ABSTRACT_CLASS_DECLARATION_KIND
+            ) && class
+                .child_by_field_name("name")
+                .is_some_and(|name| !name.is_missing()))
+            .then_some(())
+        }
+        _ => None,
+    }
 }
 
 /// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
@@ -2728,6 +2936,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     if name == WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(WRAPPED_PARAMETER_KIND);
     }
+    if name == ARROW_WRAPPED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
+        return Some(ARROW_WRAPPED_PARAMETER_KIND);
+    }
     if name == DESTRUCTURED_PARAMETER_KIND && kinds.formal_parameter_kinds.is_empty() {
         return Some(DESTRUCTURED_PARAMETER_KIND);
     }
@@ -2751,6 +2962,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
     }
     if name == TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
         return Some(TYPE_PARAMETER_KIND);
+    }
+    if name == MAPPED_TYPE_PARAMETER_KIND && !kinds.formal_parameter_kinds.is_empty() {
+        return Some(MAPPED_TYPE_PARAMETER_KIND);
     }
     kinds
         .declarations

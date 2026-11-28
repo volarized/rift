@@ -872,6 +872,49 @@ fn explicit_export_subpaths_establish_independent_captured_modules() {
 }
 
 #[test]
+fn false_main_keeps_written_subpaths_without_guessing_an_entry() {
+    for (language, entry, implementation, declaration) in [
+        (
+            ShippedLanguage::JavaScript,
+            "run.js",
+            "function run() { return 1; } module.exports = run;",
+            "function hidden() { return 0; } module.exports = hidden;",
+        ),
+        (
+            ShippedLanguage::TypeScript,
+            "run.d.ts",
+            "declare function run(): number; export = run;",
+            "declare function hidden(): number; export = hidden;",
+        ),
+    ] {
+        let suffix = entry.split_once('.').expect("source suffix").1;
+        let index = format!("index.{suffix}");
+        let target = format!(
+            r#"{{"name":"prettier","version":"3.8.5","main":false,"exports":{{"./run":"./{entry}"}}}}"#
+        );
+        let files = [(entry, implementation), (index.as_str(), declaration)];
+        let selected = prepared(language, &[("package.json", &target)], &files);
+        let id = SymbolIdentity::parse(selected.anchors[entry]["run"].as_str())
+            .expect("written subpath");
+        assert_eq!(id.qualified_path(), &["prettier/run", "run"]);
+        for metadata in [
+            r#"{"name":"prettier","version":"3.8.5","main":false}"#,
+            r#"{"name":"prettier","version":"3.8.5","main":true,"exports":{"./run":"./run.js"}}"#,
+            r#"{"name":"prettier","version":"3.8.5","main":false,"exports":"./run.js"}"#,
+        ] {
+            let refused = prepared(language, &[("package.json", metadata)], &files);
+            assert!(refused.anchors.get(entry).is_none_or(BTreeMap::is_empty));
+            assert!(
+                refused
+                    .anchors
+                    .get(index.as_str())
+                    .is_none_or(BTreeMap::is_empty)
+            );
+        }
+    }
+}
+
+#[test]
 fn missing_conditional_and_pattern_exports_leave_sources_unresolved() {
     for target in [
         r#"{"./hub":{"browser":"./hub.ts"}}"#,

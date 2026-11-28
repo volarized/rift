@@ -1651,6 +1651,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         CLASS_KIND_WORD,
         VARIABLE_KIND_WORD,
         LOOP_BINDING_KIND_WORD,
+        COMPREHENSION_BINDING_KIND,
         METHOD_KIND_WORD,
         TYPE_ALIAS_KIND_WORD,
         MODULE_KIND,
@@ -1677,6 +1678,30 @@ mod tests {
         PythonSyntaxProvider::default()
             .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
             .expect("Python fixture must parse")
+    }
+
+    #[test]
+    fn restores_written_comprehension_and_ordinary_binding_kinds() {
+        let source = "def collect(values):\n    for value in values:\n        pass\n    return [item for item in values]\n";
+        let document = analyze(source);
+        let names = crate::SyntaxNames::new(document.language()).expect("Python kinds");
+        for (name, kind) in [
+            ("collect", FUNCTION_KIND_WORD),
+            ("value", LOOP_BINDING_KIND_WORD),
+            ("item", COMPREHENSION_BINDING_KIND),
+        ] {
+            let binding = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind == kind && symbol.name == name)
+                .expect("authored declaration");
+            assert_eq!(
+                text_at(source, binding.name_range.expect("written name")),
+                name
+            );
+            assert_eq!(names.symbol_kind(binding.kind), Some(kind));
+        }
+        assert_eq!(names.symbol_kind("unknown_python_kind"), None);
     }
 
     fn symbol<'document>(

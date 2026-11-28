@@ -39,6 +39,7 @@ pub use document::{
     SyntaxElement, SyntaxExportBinding, SyntaxExportKind, SyntaxFacts, SyntaxHolder, SyntaxMatch,
     SyntaxOrigin, SyntaxPlace, SyntaxSymbol,
 };
+pub use ecmascript::CheckedInlineTypeImport;
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;
@@ -53,10 +54,10 @@ pub use provider::{SyntaxBound, SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use static_analysis::{
-    HeritageEdge, PythonDeletion, PythonPosition, StaticAssignedCall, StaticBinding,
-    StaticBindingKind, StaticBodyMember, StaticCall, StaticCallee, StaticCommonJsExport,
-    StaticConditionalItem, StaticDeclaredReturn, StaticFacts, StaticFactsParts,
-    StaticFunctionContext, StaticInherentImpl, StaticMember, StaticMemberAlias,
+    HeritageEdge, PythonDeletion, PythonPosition, StaticAssignedCall, StaticAssignedObject,
+    StaticBinding, StaticBindingKind, StaticBodyMember, StaticCall, StaticCallee,
+    StaticCommonJsExport, StaticConditionalItem, StaticDeclaredReturn, StaticFacts,
+    StaticFactsParts, StaticFunctionContext, StaticInherentImpl, StaticMember, StaticMemberAlias,
     StaticMemberCallback, StaticMemberCopy, StaticParameter, StaticPythonInitializer,
     StaticPythonInitializerField, StaticReexport, StaticReference, StaticRustFieldSite,
     StaticRustGenericReference, StaticRustMacroCall, StaticRustMacroDefinition, StaticRustUse,

@@ -518,6 +518,66 @@ fn selected_source_is_valid(input: &NamespaceInput<'_>, file: &SelectedFile<'_>)
             .any(|source| source.path() == file.path && source.text().len() == file.source.len())
 }
 
+/// Whether the selected package manifest permits `CommonJS` resolution of `.js` files.
+pub(crate) fn checked_commonjs_package(input: &NamespaceInput<'_>) -> bool {
+    captured_metadata(input)
+        .is_some_and(|metadata| matches!(metadata.module_type.as_deref(), None | Some("commonjs")))
+}
+
+/// JavaScript files whose nearest captured package scope explicitly declares ESM.
+pub(crate) fn checked_javascript_module_paths<'input>(
+    input: &'input NamespaceInput<'_>,
+) -> BTreeSet<&'input str> {
+    #[derive(Deserialize)]
+    struct NestedMode {
+        name: Option<String>,
+        #[serde(rename = "type")]
+        module_type: Option<String>,
+    }
+
+    let Some(metadata) = captured_metadata(input) else {
+        return BTreeSet::new();
+    };
+    let mut scopes = BTreeMap::new();
+    for source in input.files().iter().chain(input.context_sources()) {
+        let Some(directory) = source.path().as_str().strip_suffix("/package.json") else {
+            continue;
+        };
+        let mode = (source.text().len() <= input.syntax().source_bytes_max())
+            .then(|| serde_json::from_str::<NestedMode>(source.text()).ok())
+            .flatten()
+            .filter(|manifest| {
+                manifest
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| name == metadata.name)
+            })
+            .map(|manifest| manifest.module_type.as_deref() == Some("module"));
+        scopes
+            .entry(directory)
+            .and_modify(|previous| *previous = None)
+            .or_insert(mode);
+    }
+    let root = metadata.module_type.as_deref() == Some("module");
+    input
+        .files()
+        .iter()
+        .map(|source| source.path().as_str())
+        .filter(|path| matches!(path.rsplit_once('.'), Some((_, "js"))))
+        .filter(|path| {
+            let mut module = root;
+            for (end, _) in path.match_indices('/') {
+                match scopes.get(&path[..end]) {
+                    Some(Some(nested)) => module = *nested,
+                    Some(None) => return false,
+                    None => {}
+                }
+            }
+            module
+        })
+        .collect()
+}
+
 fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     let mut sources = input
         .files()
@@ -528,7 +588,7 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     if source.text().len() > input.syntax().source_bytes_max() || sources.next().is_some() {
         return None;
     }
-    let metadata: PackageMetadata = serde_json::from_str(source.text()).ok()?;
+    let metadata = PackageMetadata::parse(source.text())?;
     let accepted = match input.owner() {
         SymbolOwner::Package { manager, name, .. } => {
             manager == "npm"
@@ -668,7 +728,8 @@ fn map_declared_types(
         return;
     }
     // Two written implementations leave open which one the types describe.
-    if matches!((&metadata.main, &metadata.module), (Some(main), Some(module)) if main != module) {
+    if matches!((metadata.main(), metadata.module.as_deref()), (Some(main), Some(module)) if main != module)
+    {
         return;
     }
     let Entry::File(types_path) = entry::resolve(files, metadata, "typescript") else {
@@ -841,7 +902,7 @@ fn entry_target<'metadata>(
     }
     match language {
         "typescript" => metadata.types.as_deref().or(metadata.typings.as_deref()),
-        "javascript" => match (&metadata.main, &metadata.module) {
+        "javascript" => match (metadata.main(), metadata.module.as_deref()) {
             (Some(main), Some(module)) if main != module => None,
             (Some(main), _) => Some(main),
             (_, Some(module)) => Some(module),
@@ -857,7 +918,7 @@ struct PackageMetadata {
     version: String,
     types: Option<String>,
     typings: Option<String>,
-    main: Option<String>,
+    main: Option<CapturedMain>,
     module: Option<String>,
     exports: Option<Exports>,
     imports: Option<CapturedPackageImports>,
@@ -865,6 +926,32 @@ struct PackageMetadata {
     types_versions: Option<serde_json::Value>,
     #[serde(rename = "type")]
     module_type: Option<String>,
+}
+
+impl PackageMetadata {
+    fn parse(source: &str) -> Option<Self> {
+        let metadata: Self = serde_json::from_str(source).ok()?;
+        match metadata.main {
+            Some(CapturedMain::Disabled(disabled)) => (!disabled
+                && matches!(metadata.exports, Some(Exports::Subpaths(_))))
+            .then_some(metadata),
+            _ => Some(metadata),
+        }
+    }
+
+    fn main(&self) -> Option<&str> {
+        match self.main.as_ref()? {
+            CapturedMain::Path(path) => Some(path),
+            CapturedMain::Disabled(_) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CapturedMain {
+    Path(String),
+    Disabled(bool),
 }
 
 /// Import targets selected in the same declared condition order as package exports.
@@ -1567,6 +1654,7 @@ fn supplemental_parameter_scope(symbol: &SyntaxSymbol) -> Option<&str> {
         || symbol.is_typescript_signature_type_parameter()
         || symbol.is_typescript_declared_signature_type_parameter()
         || symbol.is_typescript_inference_parameter()
+        || symbol.is_typescript_mapped_type_parameter()
         || symbol.is_typescript_index_signature_parameter()
     {
         symbol
