@@ -8250,3 +8250,69 @@ fn nested_array_initializers_keep_properties_under_their_written_variable() {
             && (row.source == "present: 3" || row.source == "present: 4")
     }));
 }
+
+#[test]
+fn written_prototype_alias_uses_the_checked_local_function() {
+    const SOURCE: &str = concat!(
+        "function Cache() {}\n",
+        "function clear() { this.entries = []; }\n",
+        "Cache.prototype.clear = clear;\n",
+        "Cache.prototype.touch = function () { return this.entries.length; };\n",
+        "module.exports = Cache;\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("checked prototype ownership")
+    };
+    let result = analyze(SOURCE);
+    let found = result.publication();
+    found.validate_facts().expect("exact method facts");
+    let local = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("function_declaration")
+                && row.source.starts_with("function clear(")
+        })
+        .expect("separate authored function");
+    let written = "Cache.prototype.clear = clear";
+    let method = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("assignment_expression")
+                && row.symbol.as_str().ends_with("/Cache/clear")
+        })
+        .expect("written prototype property");
+    assert_eq!(
+        method.range,
+        module_runtime_range(SOURCE.find(written).expect("written assignment"), written),
+    );
+    assert_ne!(method.symbol, local.symbol);
+    assert!(found.edges.iter().any(|edge| {
+        edge.from == method.symbol && edge.to == local.symbol && edge.kinds == [EdgeKind::Aliases]
+    }));
+
+    for changed in [
+        SOURCE.replace(" = clear;", " = missing;"),
+        SOURCE.replace(written, &format!("clear = elsewhere;\n{written}")),
+        SOURCE.replace(written, &format!("Cache.prototype = elsewhere;\n{written}")),
+    ] {
+        let compared = analyze(&changed);
+        assert!(
+            !compared
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/Cache/clear") })
+        );
+    }
+}
