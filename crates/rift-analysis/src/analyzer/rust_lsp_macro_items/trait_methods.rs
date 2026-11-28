@@ -40,8 +40,9 @@ pub(super) fn owner<'a>(
     let mut retained = existing.iter().copied().filter(|row| {
         row.origin.source_kind == SourceKind::Authored
             && row.syntax_element_kind.as_deref() == Some("trait_item")
-            && row.range.start == selected.range.start
-            && row.range.end == selected.range.end
+            && [selected.range, selected.item_range]
+                .iter()
+                .any(|range| (row.range.start, row.range.end) == (range.start, range.end))
             && objects.get(&row.symbol).is_some_and(|object| {
                 object.kind.0 == "trait"
                     && object.name == selected.name

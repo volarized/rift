@@ -2749,30 +2749,38 @@ mod shadow {
 
     #[test]
     fn typed_trait_methods_require_the_checked_owner_and_complete_default_head() {
-        const SOURCE: &str = r"
-            macro_rules! methods {
-                ($first:ident, $second:ident, $ty:ty) => {
-                    fn $first(&self) -> Option<$ty> { None }
-                    fn $second(&self) -> Option<$ty> { None }
-                };
-            }
-            pub struct Local;
-            pub trait Reader {
-                methods!(written_first, written_second, u16);
-                fn explicit(&self) -> u8 { 2 }
-            }
-            impl Local { methods!(other_first, other_second, u16); }
-        ";
-        const EXPANSION: &str = "fn written_first(&self) -> Option<u16> { None }
-                                 fn written_second(&self) -> Option<u16> { None }";
+        assert_typed_trait_method_admission("");
+        assert_typed_trait_method_admission("/// A checked reader.\n#[allow(dead_code)]\n");
+    }
+
+    const TRAIT_METHOD_SOURCE: &str = r"
+        macro_rules! methods {
+            ($first:ident, $second:ident, $ty:ty) => {
+                fn $first(&self) -> Option<$ty> { None }
+                fn $second(&self) -> Option<$ty> { None }
+            };
+        }
+        pub struct Local;
+        pub trait Reader {
+            methods!(written_first, written_second, u16);
+            fn explicit(&self) -> u8 { 2 }
+        }
+        impl Local { methods!(other_first, other_second, u16); }
+    ";
+    const TRAIT_METHOD_EXPANSION: &str = "fn written_first(&self) -> Option<u16> { None }
+                             fn written_second(&self) -> Option<u16> { None }";
+
+    fn assert_typed_trait_method_admission(prefix: &str) {
+        let source =
+            TRAIT_METHOD_SOURCE.replace("pub trait Reader", &format!("{prefix}pub trait Reader"));
         let path = ProjectPath::new("src/lib.rs").expect("fixture unit");
         let limits = ExactPackageLimits::new(16, 2 * 1024 * 1024);
-        let digest = FileDigest::of(SOURCE.as_bytes());
+        let digest = FileDigest::of(source.as_bytes());
         let token = |name: &str| {
-            let offset = SOURCE.find(name).expect("written fixture token");
+            let offset = source.find(name).expect("written fixture token");
             SourceRange::new(offset as u64, (offset + name.len()) as u64).expect("range")
         };
-        let sites = PackageAnalyzer::rust_lsp_trait_macro_sites(&path, SOURCE, limits.syntax());
+        let sites = PackageAnalyzer::rust_lsp_trait_macro_sites(&path, &source, limits.syntax());
         assert_eq!(sites.len(), 1);
         let observation = RustLspMacroItems {
             site: sites[0],
@@ -2781,14 +2789,14 @@ mod shadow {
                 digest,
                 range: token("methods"),
             },
-            expansion: EXPANSION,
+            expansion: TRAIT_METHOD_EXPANSION,
             names: &[],
         };
         let producer = FactProducer {
             name: ProducerName::parse("rust-analyzer").expect("producer"),
             revision: ProducerRevision::parse("1").expect("revision"),
         };
-        let base = authored_macro_fixture(vec![(path.as_str(), SOURCE)]);
+        let base = authored_macro_fixture(vec![(path.as_str(), source.as_str())]);
         let good = [
             token("written_first"),
             token("written_second"),
@@ -2814,11 +2822,25 @@ mod shadow {
             .expect("bounded trait method proof")
         };
         let mut graph = base.clone();
-        assert_eq!(claimed(&mut graph, &good, EXPANSION, limits).admitted, 2);
+        assert_eq!(
+            claimed(&mut graph, &good, TRAIT_METHOD_EXPANSION, limits).admitted,
+            2
+        );
         assert_typed_trait_facets(&graph, &base, &good[..2]);
+        let mut shifted = base.clone();
+        let trait_row = shifted
+            .declarations
+            .iter_mut()
+            .find(|row| row.symbol.as_str().ends_with("/Reader"))
+            .expect("retained trait");
+        trait_row.range.start += 1;
+        assert_eq!(
+            claimed(&mut shifted, &good, TRAIT_METHOD_EXPANSION, limits).admitted,
+            0
+        );
         for (tokens, expansion, count) in [
-            (&good[..1], EXPANSION, 1),
-            (&[good[0], good[0], good[1]][..], EXPANSION, 1),
+            (&good[..1], TRAIT_METHOD_EXPANSION, 1),
+            (&[good[0], good[0], good[1]][..], TRAIT_METHOD_EXPANSION, 1),
             (
                 &good[..],
                 "fn written_first(&self); fn written_second(&self) { let =; }",
@@ -2839,7 +2861,7 @@ mod shadow {
             .with_declarations(u32::try_from(base.declarations.len() + 1).expect("capacity"))
             .expect("one remaining");
         assert_eq!(
-            claimed(&mut base.clone(), &good, EXPANSION, limited),
+            claimed(&mut base.clone(), &good, TRAIT_METHOD_EXPANSION, limited),
             RustLspMacroAdmission {
                 admitted: 1,
                 dropped_at_limit: 1
