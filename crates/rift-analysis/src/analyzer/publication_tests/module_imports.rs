@@ -6341,6 +6341,108 @@ fn typescript_relative_imports_keep_checked_declarations_beside_runtime_wildcard
 }
 
 #[test]
+fn checked_package_import_reaches_its_private_embedded_declaration_modules() {
+    const MANIFEST: &str = r##"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js","imports":{"#private":"./embedded/lib/index.js"}}"##;
+    const EMBEDDED: &str = r#"{"name":"embedded","type":"module"}"#;
+    const IMPORTER: &str =
+        "import { recover } from '#private';\nexport const read = () => recover();\n";
+    const TYPES: &str = concat!(
+        "export { Options } from './options.js';\n",
+        "export { Isolated } from './isolated/index.js';\n",
+        "export declare function recover(): boolean;\n",
+    );
+    const OPTIONS: &str = "export interface Options { ready: boolean }\n";
+    for (entry, manifest, admitted) in [
+        (IMPORTER, EMBEDDED, true),
+        (IMPORTER, "{", false),
+        ("export const read = true;", EMBEDDED, false),
+        (
+            "export { read } from './delegate/index.js';",
+            EMBEDDED,
+            false,
+        ),
+    ] {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.js", entry),
+                (
+                    "delegate/package.json",
+                    r#"{"name":"beacon","type":"module"}"#,
+                ),
+                ("delegate/index.js", IMPORTER),
+                ("embedded/package.json", manifest),
+                (
+                    "embedded/lib/index.js",
+                    "export function recover() { return true; }",
+                ),
+                ("embedded/lib/index.d.ts", TYPES),
+                ("embedded/lib/options.d.ts", OPTIONS),
+                (
+                    "embedded/lib/unused.d.ts",
+                    "export interface Unused { hidden: number }",
+                ),
+                ("embedded/lib/isolated/package.json", EMBEDDED),
+                (
+                    "embedded/lib/isolated/index.d.ts",
+                    "export interface Isolated { hidden: number }",
+                ),
+                (
+                    "adjacent/package.json",
+                    r#"{"name":"adjacent","type":"module"}"#,
+                ),
+                (
+                    "adjacent/index.d.ts",
+                    "export interface Adjacent { hidden: number }",
+                ),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package sources");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            publication
+                .units
+                .iter()
+                .find(|row| row.path.0 == path && row.source_complete)
+                .expect("retained physical source")
+        };
+        let selected = unit("embedded/lib/options.d.ts");
+        let options = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == selected.unit && row.symbol.as_str().ends_with("/Options"));
+        assert_eq!(options.is_some(), admitted);
+        if let Some(row) = options {
+            assert!(row.source_complete && !row.public);
+            assert!(
+                row.symbol
+                    .as_str()
+                    .ends_with("beacon%2Fembedded%2Flib%2Foptions.d.ts/Options")
+            );
+            let start = OPTIONS.find("interface").expect("written declaration");
+            let written = OPTIONS[start..].trim_end();
+            assert_eq!(row.source, written);
+            assert_eq!(row.range, module_runtime_range(start, written));
+        }
+        for unrelated in [
+            "embedded/lib/unused.d.ts",
+            "embedded/lib/isolated/index.d.ts",
+            "adjacent/index.d.ts",
+        ] {
+            assert!(
+                publication
+                    .declarations
+                    .iter()
+                    .all(|row| row.unit != unit(unrelated).unit)
+            );
+        }
+    }
+}
+
+#[test]
 fn npm_package_imports_keep_runtime_calls_and_declared_type_ranges() {
     const RUNTIME: &str = "import { Flags, select } from '#items/state';\nexport function run() { return select(Flags.enabled); }\n";
     const TYPES: &str = "import type { State } from '#items/state';\nexport declare function run(state: State): State;\n";

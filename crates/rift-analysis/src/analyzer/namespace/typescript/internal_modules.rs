@@ -10,6 +10,7 @@ use crate::static_resolution::is_declaration_file;
 use rift_syntax::ScopedIdentityAnchors;
 use serde::Deserialize;
 
+mod private_imports;
 mod scopes;
 pub(super) use scopes::{class_member_identities, private_local_identities};
 
@@ -32,6 +33,7 @@ pub(super) fn prepare(
         return;
     }
     let foreign = foreign_directories(input, &metadata.name);
+    let private = private_imports::declaration_modules(input, files, selected, &foreign);
     let mut modules = held_modules(prepared);
     let relative_types = metadata
         .exports
@@ -56,7 +58,7 @@ pub(super) fn prepare(
         if !supported
             || entries.contains(&(language.name.as_str(), file.path.clone()))
             || !selected_source_is_valid(input, file)
-            || is_foreign(file.path.as_str(), &foreign)
+            || (is_foreign(file.path.as_str(), &foreign) && !private.contains(file.path))
         {
             continue;
         }
@@ -100,7 +102,7 @@ pub(super) fn prepare(
                     .extend(physical);
             }
             modules.insert((language.name.clone(), module), Some(path.to_owned()));
-            if metadata.exports.is_some() || script {
+            if metadata.exports.is_some() || script || private.contains(file.path) {
                 prepared
                     .unreached_modules
                     .insert(path.to_owned(), ambient.into_keys().collect());
@@ -242,26 +244,7 @@ fn relative_type_modules(
         if !visited.insert(file.path) {
             continue;
         }
-        let reexports = file
-            .syntax
-            .export_bindings()
-            .unwrap_or_default()
-            .iter()
-            .filter(|binding| binding.container.is_none())
-            .filter_map(|binding| binding.source);
-        let imports = file
-            .syntax
-            .static_facts()
-            .into_iter()
-            .flat_map(rift_syntax::StaticFacts::typescript_module_imports)
-            .copied();
-        for range in reexports.chain(imports).collect::<BTreeSet<_>>() {
-            let Some(specifier) = observations::literal_module_name(file.source, range) else {
-                continue;
-            };
-            let Some(path) = files.relative_declaration(file.path, &specifier) else {
-                continue;
-            };
+        for path in declaration_targets(file, files) {
             let Some(next) = declarations.get(&path).copied() else {
                 continue;
             };
@@ -279,6 +262,33 @@ fn relative_type_modules(
         }
     }
     relative
+}
+
+fn declaration_targets<'a>(
+    file: &'a SelectedFile<'_>,
+    files: &'a PackageFiles<'_>,
+) -> impl Iterator<Item = ProjectPath> + 'a {
+    let reexports = file
+        .syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter(|binding| binding.container.is_none())
+        .filter_map(|binding| binding.source);
+    let imports = file
+        .syntax
+        .static_facts()
+        .into_iter()
+        .flat_map(rift_syntax::StaticFacts::typescript_module_imports)
+        .copied();
+    reexports
+        .chain(imports)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|range| {
+            let specifier = observations::literal_module_name(file.source, range)?;
+            files.relative_declaration(file.path, &specifier)
+        })
 }
 
 /// Whether a TypeScript file is no module: what it declares belongs to the global scope and
