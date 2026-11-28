@@ -1724,3 +1724,95 @@ fn checked_instance_method_keeps_distinct_return_property_and_local_identities()
             })
     }));
 }
+
+#[test]
+fn checked_compound_argument_preserves_the_property_and_bare_value_read() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './worker.js';\n";
+    let collect = |source: &str| analyze(META, &[("index.js", ENTRY), ("worker.js", source)]);
+    for (owner_source, value, sibling) in [
+        ("function renderer(input)", "[...plugins, input]", ""),
+        ("function renderer(input)", "input ? plugins : []", ""),
+        (
+            "const renderer = (input) =>",
+            "[...plugins, input]",
+            "inspect({ plugins });",
+        ),
+    ] {
+        let source = format!(
+            "const inspect = value => value;\n\
+             export {owner_source} {{ let plugins = [input]; {sibling}\
+             return inspect({{ plugins: {value}, ready: true }}); }}\n"
+        );
+        let analysis = collect(&source);
+        let graph = analysis.publication();
+        graph
+            .validate_facts()
+            .expect("checked compound pair publication");
+        let owner = graph
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source
+                    .starts_with(owner_source.trim_start_matches("const "))
+            })
+            .expect("checked callable");
+        let binding = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == "plugins = [input]")
+            .expect("written local");
+        let text = format!("plugins: {value}");
+        let property = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == text)
+            .expect("written compound pair");
+        assert_ne!(property.symbol, binding.symbol);
+        assert!(graph.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&owner.symbol)
+        }));
+        let start = source.find(&text).expect("pair source")
+            + "plugins: ".len()
+            + value.find("plugins").expect("bare read source");
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to == binding.symbol
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == property.unit && usize::try_from(site.range.start) == Ok(start)
+                })
+        }));
+        if !sibling.is_empty() {
+            let shorthand = graph
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.source == "plugins"
+                        && row.syntax_element_kind.as_deref()
+                            == Some("shorthand_property_identifier")
+                })
+                .expect("separate written shorthand");
+            assert_ne!(shorthand.symbol, property.symbol);
+            assert_ne!(shorthand.symbol, binding.symbol);
+        }
+    }
+
+    for value in [
+        "(plugins = [])",
+        "input.plugins",
+        "(function () { return plugins; })()",
+        "[...plugins], plugins: [...plugins]",
+    ] {
+        let source = format!(
+            "const inspect = value => value;\n\
+             export function renderer(input) {{ let plugins = [input];\
+             return inspect({{ plugins: {value}, ready: true }}); }}\n"
+        );
+        let analysis = collect(&source);
+        assert!(analysis.publication().declarations.iter().all(|row| {
+            row.syntax_element_kind.as_deref() != Some("pair")
+                || !row.source.starts_with("plugins:")
+        }));
+    }
+}
