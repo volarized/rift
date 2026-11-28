@@ -164,12 +164,9 @@ impl Records {
                 continue;
             };
             let mut callers = BTreeMap::<_, Option<SymbolId>>::new();
+            let mut retained_callers = BTreeMap::<_, Option<SymbolId>>::new();
             let caller = |range| written_callback(file, range);
             for (property, name, callback, member) in argument_properties(file, caller, placed) {
-                let retained = placed.contains(&callback.range);
-                if retained && !member {
-                    continue;
-                }
                 if self.symbols_truncated {
                     return Ok(());
                 }
@@ -182,9 +179,26 @@ impl Records {
                             callback,
                             &occupied,
                             declaration_limit,
-                            retained,
+                            false,
                         )?)
                     }
+                };
+                let id = if id.is_none() && member && placed.contains(&callback.range) {
+                    match retained_callers.entry(callback.range) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(self.publish_ecmascript_callback(
+                                owner,
+                                file,
+                                callback,
+                                &occupied,
+                                declaration_limit,
+                                true,
+                            )?)
+                        }
+                    }
+                } else {
+                    id
                 };
                 if let Some(id) = id {
                     occupied.insert(id.clone());
