@@ -4200,6 +4200,59 @@ fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
 }
 
 #[test]
+fn quoted_indirect_argument_key_keeps_the_module_binding_and_its_read() {
+    const SOURCE: &str = concat!(
+        "var local = require('./');\n",
+        "var worker = require('worker-fixture');\n",
+        "jobs.add('check', function () { worker.read(); })\n",
+        "    .finish({ 'worker': true });\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    let independent = SOURCE.replace("'worker':", "'enabled':");
+    for source in [&independent, SOURCE] {
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", "exports.ready = true;"), ("runner.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let binding = "worker = require('worker-fixture')";
+        let start = source.find(binding).expect("written local");
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/worker")
+                    && row.source == binding
+                    && row.range == module_runtime_range(start, binding)
+            })
+            .expect("original exact local identity");
+        let start = source.find("worker.read()").expect("written receiver");
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.to == declaration.symbol
+                    && edge.kinds == [EdgeKind::Reads]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == declaration.unit
+                            && site.range == module_runtime_range(start, "worker")
+                    })
+            }),
+            "missing receiver read in {source}"
+        );
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| { row.symbol != declaration.symbol || row.source == binding })
+        );
+    }
+}
+
+#[test]
 fn class_method_arguments_keep_written_properties_beside_local_names() {
     const SOURCE: &str = concat!(
         "export class Builder {\n",
