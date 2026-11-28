@@ -182,6 +182,88 @@ fn checked_commonjs_export_object_values_keep_their_literal_imports() {
 }
 
 #[test]
+fn declaration_imports_follow_a_written_typescript_extension_to_its_declaration() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const SOURCE: &str = concat!(
+        "import type { Item as Local } from './relay.ts';\n",
+        "import type { Entry } from './actual.ts';\n",
+        "import type { View } from './view.tsx';\n",
+        "import type { Module } from './typed.mts';\n",
+        "import type { Common } from './typed.cts';\n",
+        "import type { Mismatch } from './mismatch.mts';\n",
+        "export type Result = Local | Entry | View | Module | Common | Mismatch;\n",
+    );
+    let collected = internal_modules::analyze(
+        MANIFEST,
+        &[
+            ("index.d.ts", SOURCE),
+            ("relay.d.ts", "export * from './leaf.ts';"),
+            ("leaf.d.ts", "export interface Item { size: number; }"),
+            ("actual.ts", "export interface Entry { actual: true; }"),
+            ("actual.d.ts", "export interface Entry { actual: false; }"),
+            ("view.d.ts", "export interface View { kind: 0; }"),
+            ("typed.d.mts", "export interface Module { kind: 1; }"),
+            ("typed.d.cts", "export interface Common { kind: 2; }"),
+            ("mismatch.d.ts", "export interface Mismatch { kind: 3; }"),
+        ],
+    );
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    let source = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("chosen type entry");
+    for (selector, target, name) in [
+        ("Local", "leaf.d.ts", "/Item"),
+        ("Entry", "actual.ts", "/Entry"),
+        ("View", "view.d.ts", "/View"),
+        ("Module", "typed.d.mts", "/Module"),
+        ("Common", "typed.d.cts", "/Common"),
+    ] {
+        let target_unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == target)
+            .expect("shipped target");
+        let target = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == target_unit.unit && row.symbol.as_str().ends_with(name))
+            .expect("exact target declaration");
+        let start = SOURCE.find(selector).expect("written import selector");
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && edge.to == target.symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == source.unit
+                            && site.range == module_runtime_range(start, selector)
+                    })
+            }),
+            "missing import selector {selector}"
+        );
+    }
+    let literal = "'./relay.ts'";
+    let start = SOURCE.find(literal).expect("written import specifier");
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.to.as_str().ends_with("relay.d.ts")
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == source.unit && site.range == module_runtime_range(start, literal)
+            })
+    }));
+    let start = SOURCE.find("Mismatch").expect("wrong extension");
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == source.unit && site.range == module_runtime_range(start, "Mismatch")
+            })
+    }));
+}
+
+#[test]
 fn typescript_selectors_reference_uniquely_imported_declarations() {
     const MANIFEST: &str =
         r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;

@@ -788,9 +788,9 @@ pub(crate) fn is_declaration_file(path: &str) -> bool {
         .any(|extension| path.ends_with(extension))
 }
 
-/// The file a specifier of a declaration file names: the TypeScript source in place of the
-/// written runtime file, else the declaration file. Two of one rank name none. A folder names
-/// what its manifest writes as types or as `main`, else its index.
+/// The file a declaration specifier names. Prefer the exact TypeScript source, the source
+/// substituted for a runtime spelling, or the corresponding shipped declaration. Two of one
+/// rank name none. A folder names its manifest's types or `main` entry, else its index.
 pub(super) fn declared_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
@@ -804,6 +804,21 @@ pub(super) fn declared_file<'index, 'source>(
         }
         if let Some((stem, sources, declarations)) = declared_extensions(path) {
             return first_declared(files, &[stem.to_owned()], sources, declarations);
+        }
+        if !is_declaration_file(path)
+            && let Some(file) = [
+                (".ts", ".d.ts"),
+                (".tsx", ".d.ts"),
+                (".mts", ".d.mts"),
+                (".cts", ".d.cts"),
+            ]
+            .into_iter()
+            .find_map(|(source, declaration)| {
+                let stem = path.strip_suffix(source)?;
+                typed_file(files, &format!("{stem}{declaration}"))
+            })
+        {
+            return Some(file);
         }
         stems.push(path.to_owned());
     }
