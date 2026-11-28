@@ -95,6 +95,14 @@ impl Records {
                 }),
                 limits.edges_max(),
             );
+            self.retain_ecmascript_callback_edges_in(
+                owner,
+                analyzed,
+                semantics,
+                limits,
+                EdgeKind::Reads,
+                Some(&admitted),
+            )?;
         }
         self.retain_javascript_callback_argument_properties(owner, analyzed, limits)
     }

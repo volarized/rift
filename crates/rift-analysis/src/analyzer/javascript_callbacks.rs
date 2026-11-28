@@ -7,7 +7,7 @@ use rift_error::RiftError;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::{PackageAnalysisWarning, PackageSymbol, StoredEdge};
 use rift_protocol::read::{
-    Digest, EdgeKind, EdgeProvider, ExactKind, SymbolId, SymbolKind, TextRange,
+    Digest, EdgeKind, EdgeProvider, ExactKind, SourceKind, SymbolId, SymbolKind, TextRange,
 };
 use rift_provider::AssembledSymbol;
 use rift_syntax::{ByteRange, StaticFunctionContext};
@@ -70,7 +70,11 @@ impl Records {
             .collect::<BTreeSet<_>>();
         let mut edges = checked_callback_edges(&files, semantics, &objects, kind);
         if kind == EdgeKind::Reads {
-            retain_checked_member_reads(&mut edges);
+            if modules.is_some() {
+                self.retain_checked_callback_local_reads(&mut edges);
+            } else {
+                retain_checked_member_reads(&mut edges);
+            }
         }
         for (index, edge) in self.edges.iter().enumerate() {
             if let Some(key) = stored_callback_edge_key(edge, kind)
@@ -125,6 +129,43 @@ impl Records {
             }
         }
         Ok(())
+    }
+
+    /// A checked callback can read a local name even when the enclosing call or
+    /// a member on that value has no resolved target.
+    fn retain_checked_callback_local_reads(
+        &self,
+        edges: &mut BTreeMap<CallbackEdgeKey<'_>, CallbackEdge<'_, '_>>,
+    ) {
+        let variables = self
+            .objects
+            .iter()
+            .filter(|object| object.kind.0 == "variable")
+            .filter_map(|object| Some((object.id.as_ref()?.as_str(), object.name.as_str())))
+            .collect::<BTreeMap<_, _>>();
+        let mut locals = BTreeMap::new();
+        for row in self.declarations.iter().filter(|row| {
+            row.source_complete
+                && row.origin.source_kind == SourceKind::Authored
+                && row.syntax_element_kind.as_deref() == Some("variable_declarator")
+        }) {
+            if let Some(&name) = variables.get(row.symbol.as_str()) {
+                locals
+                    .entry((row.unit.as_str(), row.symbol.as_str()))
+                    .and_modify(|known| *known = None)
+                    .or_insert(Some(name));
+            }
+        }
+        edges.retain(|&(unit, start, end, _, target), edge| {
+            locals
+                .get(&(unit, target))
+                .copied()
+                .flatten()
+                .is_some_and(|name| {
+                    source_text(edge.file.file.file.source(), ByteRange { start, end })
+                        == Some(name)
+                })
+        });
     }
 
     fn ecmascript_callback_files<'file>(

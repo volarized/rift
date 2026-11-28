@@ -7709,3 +7709,83 @@ fn returned_properties_keep_their_distinct_private_function_owners() {
             .any(|row| { row.symbol.as_str() == format!("{}/folder", last.symbol.as_str()) })
     );
 }
+
+#[test]
+fn checked_commonjs_callbacks_keep_same_file_variable_reads() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"index.js"}"#;
+    const ENTRY: &str = "function load() { return 1; }\nmodule.exports = load;\n";
+    const CONSUMER: &str = concat!(
+        "const load = require('../');\n",
+        "const values = [];\n",
+        "external.deliver(() => {\n",
+        "    sink(values);\n",
+        "    values.push(2);\n",
+        "    sink(missing);\n",
+        "});\n",
+        "function named() { sink(values); }\n",
+        "external.deliver(named);\n",
+        "const assigned = () => { sink(values); };\n",
+        "external.deliver(assigned);\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", ENTRY), ("test/check.js", CONSUMER)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("selected sources");
+    let doc = result.publication();
+    doc.validate_facts().expect("valid package facts");
+    let unit = doc
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "test/check.js")
+        .expect("secondary source");
+    let callbacks = doc
+        .declarations
+        .iter()
+        .filter(|row| {
+            row.unit == unit.unit
+                && row.symbol.as_str().contains("$callback")
+                && row.syntax_element_kind.as_deref() == Some("arrow_function")
+        })
+        .collect::<Vec<_>>();
+    let [callback] = callbacks.as_slice() else {
+        panic!("expected one declared direct callback");
+    };
+    assert!(callback.source_complete && callback.source.starts_with("() => {"));
+    let reads = doc
+        .edges
+        .iter()
+        .filter(|edge| edge.from == callback.symbol)
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2);
+    let name = "values";
+    for start in [
+        CONSUMER.find("sink(values)").expect("direct argument") + "sink(".len(),
+        CONSUMER.find("values.push").expect("written receiver"),
+    ] {
+        assert!(reads.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().ends_with("/values")
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == unit.unit && site.range == module_runtime_range(start, name)
+                })
+        }));
+    }
+    for owner in ["/named", "/assigned"] {
+        assert!(doc.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.from.as_str().ends_with(owner)
+                && edge.to.as_str().ends_with("/values")
+        }));
+    }
+    assert!(!doc.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|span| span.unit == unit.unit)
+    }));
+}
