@@ -210,7 +210,9 @@ impl<'source> FileScopes<'source> {
                     .is_some_and(|retained| retained.item_range == owner.item_range)
             };
             admissible
-                && (lexical_body || checked_call_pair)
+                && (lexical_body
+                    || checked_call_pair
+                    || (function_scoped_variable && direct_return))
                 && (!variable || direct_return || argument)
                 && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start

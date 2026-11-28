@@ -303,6 +303,16 @@ fn returned_pairs_keep_written_properties_beside_destructured_bindings() {
 }
 
 #[test]
+fn returned_shorthand_keeps_function_scoped_binding() {
+    for keyword in ["let", "var"] {
+        let source = format!(
+            "export function collect(input) {{\n    {keyword} data = {{}}, log = [];\n    if (input) log.push(input);\n    return {{ data }};\n}}\n"
+        );
+        assert_return_shorthand(&source, None);
+    }
+}
+
+#[test]
 fn returned_pairs_keep_checked_lexical_binding_inside_its_scope() {
     const SOURCE: &str = concat!(
         "export function collect(input) {\n",
