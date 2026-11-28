@@ -198,7 +198,7 @@ tree-sitter-rust = { path = "vendor/tree-sitter-rust", version = "=0.24.2" }
 tree-sitter-toml-ng = "=0.7.0"
 tree-sitter-typescript = { path = "vendor/tree-sitter-typescript", version = "=0.21.1" }
 tree-sitter-yaml = "=0.7.2"
-jsonschema = { version = "0.58.5", default-features = false }
+jsonschema = { version = "0.61.2", default-features = false }
 tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
 unicode-ident = "1.0.24"
