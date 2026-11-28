@@ -56,6 +56,7 @@ pub struct PackageBindingSlots {
     typescript_inference_parameter: usize,
     typescript_mapped_type_parameter: usize,
     typescript_callable_type_rest_parameter: usize,
+    typescript_callable_type_pattern_parameter: usize,
     typescript_destructured_parameter: usize,
     typescript_method_type_parameter: usize,
     rust_macro_method: usize,
@@ -109,6 +110,7 @@ impl PackageBindingSlots {
             typescript_inference_parameter: 0,
             typescript_mapped_type_parameter: 0,
             typescript_callable_type_rest_parameter: 0,
+            typescript_callable_type_pattern_parameter: 0,
             typescript_destructured_parameter: 0,
             typescript_method_type_parameter: 0,
             rust_macro_method: 0,
@@ -347,6 +349,16 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_typescript_mapped_type_parameters(mut self, count: usize) -> Self {
         self.typescript_mapped_type_parameter = count;
+        self
+    }
+
+    /// Uses the remaining declaration capacity for object-pattern bindings in callable types.
+    #[must_use]
+    pub const fn with_typescript_callable_type_pattern_parameters(mut self, count: usize) -> Self {
+        self.typescript_callable_type_pattern_parameter = count;
+        self
+    }
+
     /// Uses the remaining declaration capacity for rest parameters in TypeScript callable types.
     #[must_use]
     pub const fn with_typescript_callable_type_rest_parameters(mut self, count: usize) -> Self {
@@ -414,6 +426,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_inference_parameter)
             .saturating_add(self.typescript_mapped_type_parameter)
             .saturating_add(self.typescript_callable_type_rest_parameter)
+            .saturating_add(self.typescript_callable_type_pattern_parameter)
             .saturating_add(self.typescript_destructured_parameter)
             .saturating_add(self.typescript_method_type_parameter)
             .saturating_add(self.rust_macro_method)
@@ -444,6 +457,8 @@ impl PackageBindingSlots {
             &mut self.typescript_type_parameter
         } else if symbol.is_javascript_shorthand_parameter() {
             &mut self.javascript_shorthand_parameter
+        } else if symbol.is_typescript_callable_type_pattern_parameter() {
+            &mut self.typescript_callable_type_pattern_parameter
         } else if symbol.is_typescript_callable_type_rest_parameter() {
             &mut self.typescript_callable_type_rest_parameter
         } else if symbol.is_typescript_callable_type_parameter() {

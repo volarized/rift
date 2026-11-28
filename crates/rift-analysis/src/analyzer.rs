@@ -798,6 +798,7 @@ struct EcmaScriptBindingDemand {
     typescript_mapped_types: BindingDemand,
     javascript_arrow_wrapped: BindingDemand,
     typescript_callable_rest: BindingDemand,
+    typescript_callable_pattern: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -845,6 +846,7 @@ impl EcmaScriptBindingDemand {
             mapped_type_slots,
             arrow_wrapped_slots,
             callable_rest_slots,
+            callable_pattern_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -875,6 +877,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_mapped_types,
                 &self.javascript_arrow_wrapped,
                 &self.typescript_callable_rest,
+                &self.typescript_callable_pattern,
             ],
             &mut slots,
             &mut bytes,
@@ -908,6 +911,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_mapped_type_parameters(mapped_type_slots)
             .with_javascript_arrow_wrapped_parameters(arrow_wrapped_slots)
             .with_typescript_callable_type_rest_parameters(callable_rest_slots)
+            .with_typescript_callable_type_pattern_parameters(callable_pattern_slots)
     }
 
     fn classify(
@@ -932,6 +936,8 @@ impl EcmaScriptBindingDemand {
             &mut self.typescript_types
         } else if symbol.is_javascript_shorthand_parameter() {
             &mut self.javascript_shorthand
+        } else if symbol.is_typescript_callable_type_pattern_parameter() {
+            &mut self.typescript_callable_pattern
         } else if symbol.is_typescript_callable_type_rest_parameter() {
             &mut self.typescript_callable_rest
         } else if symbol.is_typescript_callable_type_parameter() {
@@ -985,6 +991,7 @@ impl EcmaScriptBindingDemand {
             + self.javascript_shorthand.count
             + self.typescript_callable_types.count
             + self.typescript_callable_rest.count
+            + self.typescript_callable_pattern.count
             + self.typescript_index_signatures.count
             + self.javascript_wrapped.count
             + self.javascript_destructured.count
