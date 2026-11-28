@@ -50,7 +50,8 @@ impl PackageAnalyzer {
     /// Builds written Rust macro-use edges after the original targets have been admitted.
     ///
     /// The language server must independently identify the exact original name in a retained
-    /// unit. Source syntax distinguishes a call, a field write, a field read, and a reference.
+    /// unit. Source syntax distinguishes a call, a field write, a field read, and a reference
+    /// to a checked macro-authored item such as a constant.
     /// Established edges consume capacity first.
     #[must_use]
     pub fn rust_lsp_macro_reference_edges(
@@ -196,7 +197,7 @@ fn macro_targets<'a>(
                 && object.language.name == "rust"
                 && matches!(
                     object.kind.0.as_str(),
-                    "enum" | "variant" | "field_declaration"
+                    "enum" | "variant" | "field_declaration" | "constant"
                 )
                 && object
                     .extensions
@@ -809,6 +810,150 @@ pub fn unrelated() -> u8 {
             1
         );
     }
+    const CONSTANT_SOURCE: &str = r"
+        pub struct Board;
+        macro_rules! table {
+            ($module:ident, $associated:ident) => {
+                pub const $module: u8 = 1;
+                impl Board { pub const $associated: u8 = 2; }
+            };
+        }
+        table!(BASE, SLOT);
+        pub const ORDINARY: u8 = 4;
+        pub fn use_constants() -> u8 {
+            let _opaque = unknown!(BASE);
+            BASE + Board::SLOT + ORDINARY
+        }
+    ";
+
+    #[test]
+    fn checked_uses_keep_exact_module_and_associated_constant_anchors() {
+        let path = ProjectPath::new("src/lib.rs").expect("authored path");
+        let limits = ExactPackageLimits::new(1024, 2 * 1024 * 1024);
+        let digest = FileDigest::of(CONSTANT_SOURCE.as_bytes());
+        let publication = checked_constant_package(&path, digest, limits);
+        let use_of = |context, name| RustLspMacroReference {
+            source: &path,
+            source_digest: digest,
+            occurrence: constant_range(context, name),
+            target: &path,
+            target_digest: digest,
+            target_name: constant_range("table!(BASE, SLOT)", name),
+            lexical_companion: None,
+        };
+        let base = use_of("BASE + Board::SLOT", "BASE");
+        let slot = use_of("Board::SLOT + ORDINARY", "SLOT");
+        let opaque = use_of("unknown!(BASE)", "BASE");
+        let report = PackageAnalyzer::rust_lsp_macro_reference_edges(
+            &publication,
+            &[base, base, slot, opaque],
+            &producer(),
+            limits,
+        );
+        assert_eq!(report.edges.len(), 2);
+        for (edge, (row, suffix)) in report
+            .edges
+            .iter()
+            .zip([(base, "/BASE"), (slot, "/Board/SLOT")])
+        {
+            assert!(edge.from.as_str().ends_with("/use_constants"));
+            assert!(edge.to.as_str().ends_with(suffix));
+            assert_eq!(edge.kinds, [EdgeKind::References]);
+            let occurrence = edge.occurrence.as_ref().expect("original use");
+            assert_eq!(
+                (occurrence.range.start, occurrence.range.end),
+                (row.occurrence.start(), row.occurrence.end())
+            );
+        }
+        for refusal in [
+            RustLspMacroReference {
+                target_digest: FileDigest::of(b"stale"),
+                ..base
+            },
+            RustLspMacroReference {
+                target_name: slot.target_name,
+                ..base
+            },
+            RustLspMacroReference {
+                lexical_companion: Some(base.occurrence),
+                ..base
+            },
+            opaque,
+        ] {
+            assert!(
+                PackageAnalyzer::rust_lsp_macro_reference_edges(
+                    &publication,
+                    &[refusal],
+                    &producer(),
+                    limits,
+                )
+                .edges
+                .is_empty()
+            );
+        }
+        let tight = limits
+            .with_edges(publication.edges.len() + 1)
+            .expect("one remaining edge");
+        let report = PackageAnalyzer::rust_lsp_macro_reference_edges(
+            &publication,
+            &[base, slot],
+            &producer(),
+            tight,
+        );
+        assert_eq!((report.edges.len(), report.dropped_at_limit), (1, 1));
+    }
+
+    fn constant_range(context: &str, name: &str) -> SourceRange {
+        let start = CONSTANT_SOURCE.find(context).expect("authored context")
+            + context.find(name).expect("authored name");
+        SourceRange::new(start as u64, (start + name.len()) as u64).expect("exact source range")
+    }
+
+    fn checked_constant_package(
+        path: &ProjectPath,
+        digest: FileDigest,
+        limits: ExactPackageLimits,
+    ) -> PackagePublication {
+        let mut graph = fixture::package_result_with_metadata(
+            ShippedLanguage::Rust,
+            vec![(path.as_str(), CONSTANT_SOURCE)],
+            None,
+            Some(("Cargo.toml", MANIFEST)),
+        )
+        .expect("authored fixture")
+        .publication()
+        .clone();
+        let site = PackageAnalyzer::rust_lsp_macro_sites(path, CONSTANT_SOURCE, limits.syntax())[0];
+        let admitted = PackageAnalyzer::admit_rust_lsp_macro_constants(
+            &mut graph,
+            &[crate::RustLspMacroConstantFile {
+                macros: RustLspMacroFile {
+                    path,
+                    digest,
+                    expansions: &[RustLspMacroItems {
+                        site,
+                        definition: RustLspMacroDefinition {
+                            path,
+                            digest,
+                            range: constant_range("macro_rules! table", "table"),
+                        },
+                        expansion: "pub const BASE: u8 = 1; impl Board { pub const SLOT: u8 = 2; }",
+                        names: &[],
+                    }],
+                },
+                declarations: &[
+                    (constant_range("table!(BASE, SLOT)", "BASE"), false),
+                    (constant_range("table!(BASE, SLOT)", "SLOT"), true),
+                ],
+            }],
+            &producer(),
+            limits,
+        )
+        .expect("checked declarations");
+        assert_eq!(admitted.admitted, 2);
+        graph
+    }
+
     #[test]
     fn shorthand_fields_use_independent_members_and_keep_the_lexical_role() {
         let path = ProjectPath::new("src/lib.rs").expect("fixture path");
