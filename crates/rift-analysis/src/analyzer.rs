@@ -74,8 +74,8 @@ mod retained_tests;
 mod rust_lsp_declarations;
 mod rust_lsp_macro_items;
 pub use rust_lsp_macro_items::{
-    RustLspMacroAdmission, RustLspMacroDefinition, RustLspMacroFile, RustLspMacroItems,
-    RustLspMacroSite,
+    RustLspMacroAdmission, RustLspMacroDefinition, RustLspMacroDependency, RustLspMacroFile,
+    RustLspMacroItems, RustLspMacroSite,
 };
 mod rust_lsp_operators;
 

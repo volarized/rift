@@ -31,9 +31,9 @@ mod traversal;
 pub use analyzer::{
     AnalyzedFile, PackageAnalysis, PackageAnalyzer, PackageLanguage, RustLspDeclaration,
     RustLspDeclarationAdmission, RustLspDeclarationFile, RustLspMacroAdmission,
-    RustLspMacroDefinition, RustLspMacroFile, RustLspMacroItems, RustLspMacroSite,
-    RustLspOperatorDefinition, RustLspOperatorEdges, RustLspOperatorSite, StubForm,
-    public_qualified_names,
+    RustLspMacroDefinition, RustLspMacroDependency, RustLspMacroFile, RustLspMacroItems,
+    RustLspMacroSite, RustLspOperatorDefinition, RustLspOperatorEdges, RustLspOperatorSite,
+    StubForm, public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
 #[cfg(feature = "collector")]

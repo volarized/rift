@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::{FileDigest, ProjectPath, SourceRange, SourceUnitId};
 use rift_error::RiftError;
-use rift_protocol::identity::SymbolIdentity;
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::{PackagePublication, PackageSourceUnit, PackageSymbol};
 use rift_protocol::producer::FactProducer;
 use rift_protocol::read::{
     Digest, ExactKind, ExtensionKey, ExtensionValue, Extensions, SourceKind,
     SourceUnitId as PublishedUnitId, Symbol, SymbolId, SymbolKind, TextRange,
 };
+use rift_protocol::revision::Revision;
 use rift_syntax::{
     ByteRange, RustSyntaxProvider, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource,
     SyntaxSymbol,
@@ -39,6 +40,17 @@ pub struct RustLspMacroDefinition<'source> {
     pub digest: FileDigest,
     /// Original name token reported by the server.
     pub range: SourceRange,
+}
+
+/// An independently admitted dependency unit addressed by a selected Rust macro definition.
+#[derive(Debug, Clone, Copy)]
+pub struct RustLspMacroDependency<'source> {
+    /// Normalized locator that the caller assigned to the checked engine source.
+    pub locator: &'source ProjectPath,
+    /// Package-relative path in the dependency's retained publication.
+    pub unit: &'source ProjectPath,
+    /// Publication establishing the dependency's package identity and exported declaration.
+    pub publication: &'source PackagePublication,
 }
 
 /// An emitted item shape and the independently confirmed original names it selected.
@@ -82,13 +94,20 @@ impl PackageAnalyzer {
         source: &str,
         limits: SyntaxLimits,
     ) -> Vec<RustLspMacroSite> {
-        if !source.contains('!') {
-            return Vec::new();
-        }
-        let Some(document) = parse(path, source, limits) else {
-            return Vec::new();
-        };
-        sites(&document).into_values().collect()
+        macro_sites(path, source, limits, false)
+    }
+
+    /// Finds module-item macro sites for an independently selected dependency.
+    ///
+    /// Both a bare import and the terminal name of a qualified invocation can supply a
+    /// definition position. The caller still has to verify its selected dependency source.
+    #[must_use]
+    pub fn rust_lsp_dependency_macro_sites(
+        path: &ProjectPath,
+        source: &str,
+        limits: SyntaxLimits,
+    ) -> Vec<RustLspMacroSite> {
+        macro_sites(path, source, limits, true)
     }
 
     /// Finds exact original candidate names for definition checks in one macro invocation.
@@ -144,6 +163,28 @@ impl PackageAnalyzer {
         producer: &FactProducer,
         limits: ExactPackageLimits,
     ) -> Result<RustLspMacroAdmission, RiftError> {
+        Self::admit_rust_lsp_macro_items_with_dependencies(
+            publication,
+            observed,
+            &[],
+            producer,
+            limits,
+        )
+    }
+
+    /// Adds verified authored expansion names with checked dependency definition sources.
+    ///
+    /// Dependency locators identify exact selected units. Their exported macro and the written
+    /// name in the consuming unit are checked separately. Local admissions retain capacity first.
+    /// # Errors
+    /// Returns an error if an admitted declaration cannot be represented canonically.
+    pub fn admit_rust_lsp_macro_items_with_dependencies(
+        publication: &mut PackagePublication,
+        observed: &[RustLspMacroFile<'_>],
+        dependencies: &[RustLspMacroDependency<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) -> Result<RustLspMacroAdmission, RiftError> {
         if observed.is_empty() {
             return Ok(RustLspMacroAdmission::default());
         }
@@ -174,7 +215,7 @@ impl PackageAnalyzer {
                 .push(declaration);
         }
         let definitions =
-            selected_macro_definitions(publication, observed, &declarations, limits.syntax());
+            selected_macro_definitions(publication, observed, &declarations, dependencies, limits);
         for unit in &publication.units {
             let Some(file) = selected.get(unit.path.0.as_str()).copied().flatten() else {
                 continue;
@@ -240,17 +281,43 @@ fn text_at(source: &str, value: SourceRange) -> Option<&str> {
     source.get(usize::try_from(value.start()).ok()?..usize::try_from(value.end()).ok()?)
 }
 
-fn sites(document: &SyntaxDocument) -> BTreeMap<SourceRange, RustLspMacroSite> {
+fn macro_sites(
+    path: &ProjectPath,
+    source: &str,
+    limits: SyntaxLimits,
+    qualified: bool,
+) -> Vec<RustLspMacroSite> {
+    if !source.contains('!') {
+        return Vec::new();
+    }
+    let Some(document) = parse(path, source, limits) else {
+        return Vec::new();
+    };
+    sites(&document, qualified).into_values().collect()
+}
+
+fn sites(document: &SyntaxDocument, qualified: bool) -> BTreeMap<SourceRange, RustLspMacroSite> {
     let elements = document.syntax_elements();
     let mut sites = BTreeMap::new();
     for element in elements {
         if element.kind != "identifier" {
             continue;
         }
-        let Some(invocation) = element.parent.and_then(|index| elements.get(index)) else {
+        let Some(parent) = element.parent.and_then(|index| elements.get(index)) else {
             continue;
         };
-        if invocation.kind != "macro_invocation" || invocation.range.start != element.range.start {
+        let (invocation, head_start) = if qualified
+            && parent.kind == "scoped_identifier"
+            && parent.range.end == element.range.end
+        {
+            let Some(invocation) = parent.parent.and_then(|index| elements.get(index)) else {
+                continue;
+            };
+            (invocation, parent.range.start)
+        } else {
+            (parent, element.range.start)
+        };
+        if invocation.kind != "macro_invocation" || invocation.range.start != head_start {
             continue;
         }
         let Some(mut scope) = invocation.parent.and_then(|index| elements.get(index)) else {
@@ -514,29 +581,30 @@ struct Definition<'publication> {
     unit: &'publication PackageSourceUnit,
     digest: FileDigest,
     identity: SymbolIdentity,
+    revision: &'publication Revision,
 }
 
 type Definitions<'publication> =
     BTreeMap<&'publication str, BTreeMap<SourceRange, Definition<'publication>>>;
 type Objects<'publication> = BTreeMap<&'publication SymbolId, &'publication Symbol>;
+type DefinitionRequests<'source> =
+    BTreeMap<&'source str, BTreeMap<SourceRange, BTreeSet<FileDigest>>>;
+type Observations<'source> = BTreeMap<(bool, SymbolId), Option<Observed<'source>>>;
 
 fn selected_macro_definitions<'publication>(
     publication: &'publication PackagePublication,
     observed: &[RustLspMacroFile<'_>],
     declarations: &BTreeMap<&str, Vec<&PackageSymbol>>,
-    limits: SyntaxLimits,
+    dependencies: &[RustLspMacroDependency<'publication>],
+    limits: ExactPackageLimits,
 ) -> Definitions<'publication> {
-    let mut requested = BTreeMap::new();
+    let syntax = limits.syntax();
+    let mut requested = DefinitionRequests::new();
     for file in observed {
-        for observation in file.expansions.iter().take(limits.syntax_elements_max()) {
+        for observation in file.expansions.iter().take(syntax.syntax_elements_max()) {
             let site = observation.definition;
-            let digests = requested
-                .entry(site.path.as_str())
-                .or_insert_with(BTreeMap::new);
-            digests
-                .entry(site.range)
-                .or_insert_with(BTreeSet::new)
-                .insert(site.digest);
+            let digests = requested.entry(site.path.as_str()).or_default();
+            digests.entry(site.range).or_default().insert(site.digest);
         }
     }
     let mut output = BTreeMap::new();
@@ -544,64 +612,135 @@ fn selected_macro_definitions<'publication>(
         let Some(names) = requested.get(unit.path.0.as_str()) else {
             continue;
         };
-        let Ok(path) = ProjectPath::new(&unit.path.0) else {
-            continue;
-        };
-        let digest = FileDigest::of(unit.source.as_bytes());
-        if !same_source(publication, &path, digest, unit) {
-            continue;
-        }
         let Some(existing) = declarations.get(unit.unit.as_str()) else {
             continue;
         };
-        let Some(source) = parse(&path, &unit.source, limits) else {
-            continue;
-        };
-        let mut found = BTreeMap::new();
-        for symbol in source.facts().symbols() {
-            let Some(name) = symbol.name_range.and_then(range) else {
-                continue;
-            };
-            if symbol.kind != "macro"
-                || symbol.syntax_element_kind != Some("macro_definition")
-                || !names
-                    .get(&name)
-                    .is_some_and(|digests| digests.contains(&digest))
-            {
-                continue;
-            }
-            let Some(retained) = retained_macro(existing, symbol) else {
-                continue;
-            };
-            let Ok(identity) = SymbolIdentity::parse(retained.symbol.as_str()) else {
-                continue;
-            };
-            if identity.owner() != &publication.owner
-                || identity.language() != &unit.language
-                || identity.qualified_path().last() != Some(&symbol.name)
-            {
-                continue;
-            }
-            found
-                .entry(name)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(Definition {
-                    name: symbol.name.clone(),
-                    item_end: symbol.item_range.end,
-                    unit,
-                    digest,
-                    identity,
-                }));
-        }
         output.insert(
             unit.path.0.as_str(),
-            found
-                .into_iter()
-                .filter_map(|(name, def)| Some((name, def?)))
-                .collect(),
+            unit_definitions(publication, unit, existing, names, syntax),
         );
     }
+    if !dependencies.is_empty() && dependencies.len() <= bound(limits.files_max()) {
+        dependency_definitions(publication, dependencies, &requested, syntax, &mut output);
+    }
     output
+}
+
+fn dependency_definitions<'publication>(
+    primary: &PackagePublication,
+    dependencies: &[RustLspMacroDependency<'publication>],
+    requested: &DefinitionRequests<'_>,
+    limits: SyntaxLimits,
+    output: &mut Definitions<'publication>,
+) {
+    let mut selected = BTreeMap::new();
+    for dependency in dependencies {
+        let locator = dependency.locator.as_str();
+        if requested.contains_key(locator) {
+            selected
+                .entry(locator)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(dependency));
+        }
+    }
+    let local_paths = primary
+        .units
+        .iter()
+        .map(|unit| unit.path.0.as_str())
+        .collect::<BTreeSet<_>>();
+    for (locator, dependency) in selected {
+        let Some(dependency) = dependency else {
+            continue;
+        };
+        let publication = dependency.publication;
+        if publication.owner == primary.owner
+            || local_paths.contains(locator)
+            || !matches!(&publication.owner, SymbolOwner::Package { manager, .. } if manager == "cargo")
+            || !publication.revision.answers_for(&publication.owner)
+            || publication.revision.release_version().is_none()
+        {
+            continue;
+        }
+        let mut units = publication
+            .units
+            .iter()
+            .filter(|unit| unit.path.0 == dependency.unit.as_str());
+        let (Some(unit), None) = (units.next(), units.next()) else {
+            continue;
+        };
+        let Some(names) = requested.get(locator) else {
+            continue;
+        };
+        let declarations = publication
+            .declarations
+            .iter()
+            .filter(|row| row.public && row.unit == unit.unit)
+            .collect::<Vec<_>>();
+        output.insert(
+            locator,
+            unit_definitions(publication, unit, &declarations, names, limits),
+        );
+    }
+}
+
+fn unit_definitions<'publication>(
+    publication: &'publication PackagePublication,
+    unit: &'publication PackageSourceUnit,
+    existing: &[&PackageSymbol],
+    names: &BTreeMap<SourceRange, BTreeSet<FileDigest>>,
+    limits: SyntaxLimits,
+) -> BTreeMap<SourceRange, Definition<'publication>> {
+    let Ok(path) = ProjectPath::new(&unit.path.0) else {
+        return BTreeMap::new();
+    };
+    let digest = FileDigest::of(unit.source.as_bytes());
+    if !same_source(publication, &path, digest, unit) {
+        return BTreeMap::new();
+    }
+    let Some(source) = parse(&path, &unit.source, limits) else {
+        return BTreeMap::new();
+    };
+    let mut found = BTreeMap::new();
+    for symbol in source.facts().symbols() {
+        let Some(name) = symbol.name_range.and_then(range) else {
+            continue;
+        };
+        if symbol.kind != "macro"
+            || symbol.syntax_element_kind != Some("macro_definition")
+            || !names
+                .get(&name)
+                .is_some_and(|digests| digests.contains(&digest))
+        {
+            continue;
+        }
+        let Some(retained) = retained_macro(existing, symbol) else {
+            continue;
+        };
+        let Ok(identity) = SymbolIdentity::parse(retained.symbol.as_str()) else {
+            continue;
+        };
+        if identity.owner() != &publication.owner
+            || identity.language() != &unit.language
+            || identity.qualified_path().last() != Some(&symbol.name)
+        {
+            continue;
+        }
+        found
+            .entry(name)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(Definition {
+                name: symbol.name.clone(),
+                item_end: symbol.item_range.end,
+                unit,
+                digest,
+                identity,
+                revision: &publication.revision,
+            }));
+    }
+    found
+        .into_iter()
+        .filter_map(|(name, definition)| Some((name, definition?)))
+        .collect()
 }
 
 struct Observed<'a> {
@@ -613,6 +752,7 @@ struct Observed<'a> {
     invocation: SourceRange,
     definition: SourceRange,
     definition_unit: &'a PackageSourceUnit,
+    dependency_definition: Option<(&'a Revision, FileDigest)>,
     expansion_digest: FileDigest,
     parent: SymbolId,
     symbol: SymbolId,
@@ -625,12 +765,12 @@ fn collect_file<'a>(
     existing: &[&'a PackageSymbol],
     inventory: (&Objects<'_>, &Definitions<'a>),
     limits: SyntaxLimits,
-    output: &mut BTreeMap<SymbolId, Option<Observed<'a>>>,
+    output: &mut Observations<'a>,
 ) {
     let Some(original) = parse(file.path, &unit.source, limits) else {
         return;
     };
-    let sites = sites(&original);
+    let sites = sites(&original, true);
     let (objects, definitions) = inventory;
     let starts = line_starts(&unit.source);
     let mut work = limits.source_bytes_max();
@@ -670,9 +810,10 @@ fn collect_file<'a>(
         if module.owner() != &publication.owner || module.language() != &unit.language {
             continue;
         }
-        if !selected_in_scope(definition, unit, site.invocation, &module) {
+        if !selected_in_scope(definition, unit, &original, site, &module) {
             continue;
         }
+        let dependency = definition.identity.owner() != module.owner();
         let mut names = candidates(
             file.path,
             &unit.source,
@@ -703,7 +844,7 @@ fn collect_file<'a>(
                 continue;
             }
             output
-                .entry(symbol.clone())
+                .entry((dependency, symbol.clone()))
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(Observed {
                     unit,
@@ -714,6 +855,8 @@ fn collect_file<'a>(
                     invocation: site.invocation,
                     definition: observation.definition.range,
                     definition_unit: definition.unit,
+                    dependency_definition: dependency
+                        .then_some((definition.revision, definition.digest)),
                     expansion_digest,
                     parent,
                     symbol,
@@ -722,14 +865,44 @@ fn collect_file<'a>(
     }
 }
 
+fn local_macro_shadows(
+    original: &SyntaxDocument,
+    definition: &Definition<'_>,
+    invocation: SourceRange,
+) -> bool {
+    let symbols = original.facts().symbols();
+    symbols.iter().any(|macro_symbol| {
+        macro_symbol.syntax_element_kind == Some("macro_definition")
+            && macro_symbol.name == definition.name
+            && macro_symbol.item_range.end <= invocation.start()
+            && macro_symbol.container.as_deref().is_none_or(|container| {
+                symbols.iter().any(|module| {
+                    module.kind == "module"
+                        && module.qualified_name == container
+                        && module
+                            .body_range
+                            .is_some_and(|range| range.encloses(bytes(invocation)))
+                })
+            })
+    })
+}
+
 fn selected_in_scope(
     definition: &Definition<'_>,
     invocation_unit: &PackageSourceUnit,
-    invocation: SourceRange,
+    original: &SyntaxDocument,
+    site: &RustLspMacroSite,
     module: &SymbolIdentity,
 ) -> bool {
+    let bare = site.name.start() == site.invocation.start();
+    if definition.identity.owner() != module.owner() {
+        return !bare || !local_macro_shadows(original, definition, site.invocation);
+    }
+    if !bare {
+        return false;
+    }
     if definition.unit.unit == invocation_unit.unit {
-        return definition.item_end <= invocation.start();
+        return definition.item_end <= site.invocation.start();
     }
     let Some((_, declaring_module)) = definition.identity.qualified_path().split_last() else {
         return false;
@@ -813,7 +986,7 @@ fn records(
     publication: &PackagePublication,
     producer: &FactProducer,
     limits: ExactPackageLimits,
-    output: BTreeMap<SymbolId, Option<Observed<'_>>>,
+    output: Observations<'_>,
 ) -> Result<(Vec<Symbol>, Vec<PackageSymbol>, RustLspMacroAdmission), RiftError> {
     let mut known = publication
         .objects
@@ -843,13 +1016,24 @@ fn records(
             )
         },
     );
-    let (fields, primary): (Vec<_>, Vec<_>) = output
-        .into_values()
-        .flatten()
-        .partition(|row| row.name.variant_owner.is_some());
-    let has_fields = !fields.is_empty();
-    let mut variant_anchors = retained_variant_anchors(publication, &fields);
-    for row in primary.into_iter().chain(fields) {
+    let local_symbols = output
+        .keys()
+        .take_while(|(dependency, _)| !dependency)
+        .map(|(_, symbol)| symbol.clone())
+        .collect::<BTreeSet<_>>();
+    let mut admitted = output
+        .into_iter()
+        .filter_map(|((dependency, symbol), row)| {
+            (!dependency || !local_symbols.contains(&symbol)).then_some((dependency, row?))
+        })
+        .collect::<Vec<_>>();
+    // Keep incumbent local items and fields ahead of the independent dependency stage.
+    admitted.sort_by_key(|(dependency, row)| (*dependency, row.name.variant_owner.is_some()));
+    let has_fields = admitted
+        .iter()
+        .any(|(_, row)| row.name.variant_owner.is_some());
+    let mut variant_anchors = retained_variant_anchors(publication, has_fields);
+    for (_, row) in admitted {
         if !known.contains(&row.parent)
             || row.name.variant_owner.as_ref().is_some_and(|owner| {
                 !variant_anchors.contains(&(row.parent.clone(), row.unit.unit.clone(), owner.name))
@@ -882,9 +1066,9 @@ fn records(
 
 fn retained_variant_anchors(
     publication: &PackagePublication,
-    fields: &[Observed<'_>],
+    has_fields: bool,
 ) -> BTreeSet<(SymbolId, PublishedUnitId, SourceRange)> {
-    if fields.is_empty() {
+    if !has_fields {
         return BTreeSet::new();
     }
     let variants = publication
@@ -941,6 +1125,19 @@ fn append(
     if declaration.public {
         kinds.push(SymbolKind::Public);
     }
+    let mut provenance = serde_json::json!({
+        "producer": producer,
+        "invocation": [row.invocation.start(), row.invocation.end()],
+        "definition": [row.definition.start(), row.definition.end()],
+        "definition_unit": row.definition_unit.unit,
+        "expansion_digest": row.expansion_digest.as_bytes(),
+    });
+    if let Some((revision, digest)) = row.dependency_definition {
+        provenance["dependency_definition"] = serde_json::json!({
+            "revision": revision,
+            "source_digest": digest.as_bytes(),
+        });
+    }
     objects.push(Symbol {
         id: Some(row.symbol),
         language: row.unit.language.clone(),
@@ -958,13 +1155,7 @@ fn append(
             ExtensionKey("org.lsp.rust-macro-name".to_owned()),
             ExtensionValue {
                 version: 1,
-                data: serde_json::json!({
-                    "producer": producer,
-                    "invocation": [row.invocation.start(), row.invocation.end()],
-                    "definition": [row.definition.start(), row.definition.end()],
-                    "definition_unit": row.definition_unit.unit,
-                    "expansion_digest": row.expansion_digest.as_bytes(),
-                }),
+                data: provenance,
             },
         )])),
         document_local: false,
@@ -1358,6 +1549,260 @@ pub enum Node<'a> {
                 .all(|row| !row.symbol.as_str().ends_with("/generated"))
         );
         complete.validate_facts().expect("validated publication");
+    }
+
+    const DEPENDENCY_SOURCE: &str = r"
+#[macro_export]
+macro_rules! define { ($name:ident) => { pub struct $name; }; }
+";
+    const CONSUMER_SOURCE: &str = r"
+use support::define;
+define!(Bare);
+support::define!(Qualified);
+pub mod shadow {
+    macro_rules! define { ($name:ident) => { pub struct $name; }; }
+    define!(Shadowed);
+    support::define!(StillQualified);
+}
+";
+
+    struct DependencyCase {
+        base: PackagePublication,
+        dependency: PackagePublication,
+        unit: ProjectPath,
+        locator: ProjectPath,
+        limits: ExactPackageLimits,
+    }
+
+    impl DependencyCase {
+        fn new() -> Self {
+            let mut package = fixture::identity();
+            package.name = "support".to_owned();
+            let owner = package.owner().expect("fixture owner");
+            let origin = fixture::origin(&package);
+            let language = fixture::language(ShippedLanguage::Rust);
+            let unit = ProjectPath::new("src/lib.rs").expect("fixture unit");
+            let manifest = ProjectPath::new("Cargo.toml").expect("fixture manifest");
+            let metadata = [crate::PackageSource::new(
+                &manifest,
+                "[package]\nname='support'\nversion='1.0.0'\nedition='2024'\n",
+            )];
+            let sources = [crate::PackageSource::new(&unit, DEPENDENCY_SOURCE)];
+            let limits = ExactPackageLimits::new(8, 16_384);
+            let input = crate::ExactPackageInput::new(&owner, &language, &origin, &sources, limits)
+                .expect("checked dependency input")
+                .with_framework_context(&metadata, &[])
+                .expect("checked dependency metadata");
+            let dependency = PackageAnalyzer::analyze_with_syntax(input, 1, |_| None)
+                .expect("authored dependency")
+                .publication()
+                .clone();
+            Self {
+                base: authored_macro_fixture(vec![("src/lib.rs", CONSUMER_SOURCE)]),
+                dependency,
+                unit,
+                locator: ProjectPath::new("support/src/lib.rs").expect("engine locator"),
+                limits,
+            }
+        }
+
+        fn authority(&self) -> RustLspMacroDependency<'_> {
+            RustLspMacroDependency {
+                locator: &self.locator,
+                unit: &self.unit,
+                publication: &self.dependency,
+            }
+        }
+
+        fn observe(
+            &self,
+            dependencies: &[RustLspMacroDependency<'_>],
+            digest: FileDigest,
+            limits: ExactPackageLimits,
+            select_local: bool,
+        ) -> PackagePublication {
+            let sites = PackageAnalyzer::rust_lsp_dependency_macro_sites(
+                &self.unit,
+                CONSUMER_SOURCE,
+                limits.syntax(),
+            );
+            assert_eq!(sites.len(), 4);
+            assert_eq!(PackageAnalyzer::rust_lsp_macro_sites(
+                &self.unit, CONSUMER_SOURCE, limits.syntax(),
+            ).len(), 2);
+            let generated = [
+                "pub struct Bare;",
+                "pub struct Qualified;",
+                "pub struct Shadowed;",
+                "pub struct StillQualified;",
+            ];
+            let names = sites
+                .iter()
+                .zip(generated)
+                .map(|(site, expansion)| {
+                    let names = PackageAnalyzer::rust_lsp_macro_name_sites(
+                        &self.unit,
+                        CONSUMER_SOURCE,
+                        site.invocation,
+                        expansion,
+                        limits.syntax(),
+                    );
+                    assert_eq!(names.len(), 1);
+                    names
+                })
+                .collect::<Vec<_>>();
+            let start = DEPENDENCY_SOURCE.find("define").expect("export name") as u64;
+            let mut observations = sites
+                .iter()
+                .copied()
+                .zip(generated)
+                .zip(&names)
+                .map(|((site, expansion), names)| RustLspMacroItems {
+                    site,
+                    definition: RustLspMacroDefinition {
+                        path: &self.locator,
+                        digest,
+                        range: SourceRange::new(start, start + 6).expect("export range"),
+                    },
+                    expansion,
+                    names,
+                })
+                .collect::<Vec<_>>();
+            if select_local {
+                let local = CONSUMER_SOURCE
+                    .find("macro_rules! define")
+                    .expect("shadowing macro") as u64
+                    + 13;
+                observations.push(RustLspMacroItems {
+                    definition: RustLspMacroDefinition {
+                        path: &self.unit,
+                        digest: FileDigest::of(CONSUMER_SOURCE.as_bytes()),
+                        range: SourceRange::new(local, local + 6).expect("local macro range"),
+                    },
+                    ..observations[2]
+                });
+            }
+            let producer = FactProducer {
+                name: ProducerName::parse("rust-analyzer").expect("fixture producer"),
+                revision: ProducerRevision::parse("1").expect("fixture revision"),
+            };
+            let mut result = self.base.clone();
+            PackageAnalyzer::admit_rust_lsp_macro_items_with_dependencies(
+                &mut result,
+                &[RustLspMacroFile {
+                    path: &self.unit,
+                    digest: FileDigest::of(CONSUMER_SOURCE.as_bytes()),
+                    expansions: &observations,
+                }],
+                dependencies,
+                &producer,
+                limits,
+            )
+            .expect("checked macro admissions");
+            result
+        }
+    }
+
+    #[test]
+    fn dependency_macro_names_keep_consumer_identity_and_definition_provenance() {
+        let fixture = DependencyCase::new();
+        let digest = FileDigest::of(DEPENDENCY_SOURCE.as_bytes());
+        let accepted = fixture.observe(&[fixture.authority()], digest, fixture.limits, true);
+        for name in ["Bare", "Qualified", "StillQualified", "Shadowed"] {
+            let declaration = accepted
+                .declarations
+                .iter()
+                .find(|row| row.source == name)
+                .expect("authored macro name");
+            assert!(declaration.unit.as_str().contains("/beacon/src/lib.rs"));
+            let object = accepted
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&declaration.symbol))
+                .expect("consumer object");
+            let provenance =
+                &object.extensions.0[&ExtensionKey("org.lsp.rust-macro-name".to_owned())].data;
+            let expected_owner = if name == "Shadowed" {
+                "beacon"
+            } else {
+                "support"
+            };
+            assert!(
+                provenance["definition_unit"]
+                    .as_str()
+                    .expect("definition provenance")
+                    .ends_with(&format!("/{expected_owner}/src/lib.rs"))
+            );
+            if name == "Shadowed" {
+                assert!(provenance.get("dependency_definition").is_none());
+            } else {
+                assert_eq!(
+                    provenance["dependency_definition"],
+                    serde_json::json!({
+                        "revision": fixture.dependency.revision,
+                        "source_digest": digest.as_bytes(),
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            accepted.declarations.len(),
+            fixture.base.declarations.len() + 4
+        );
+        assert_eq!(accepted.edges, fixture.base.edges);
+        accepted
+            .validate_facts()
+            .expect("published source and owned identities");
+        let dependency_only =
+            fixture.observe(&[fixture.authority()], digest, fixture.limits, false);
+        assert_eq!(
+            dependency_only.declarations.len(),
+            fixture.base.declarations.len() + 3
+        );
+        assert!(
+            dependency_only
+                .declarations
+                .iter()
+                .all(|row| row.source != "Shadowed")
+        );
+    }
+
+    #[test]
+    fn dependency_definition_refusals_and_caps_preserve_local_macro_names() {
+        let fixture = DependencyCase::new();
+        let digest = FileDigest::of(DEPENDENCY_SOURCE.as_bytes());
+        let local = fixture.observe(&[], digest, fixture.limits, true);
+        assert_eq!(
+            local.declarations.len(),
+            fixture.base.declarations.len() + 1
+        );
+        for (dependencies, asserted_digest) in [
+            (vec![fixture.authority(), fixture.authority()], digest),
+            (vec![fixture.authority()], FileDigest::of(b"changed")),
+            (
+                vec![RustLspMacroDependency {
+                    locator: &fixture.unit,
+                    ..fixture.authority()
+                }],
+                digest,
+            ),
+        ] {
+            assert_eq!(
+                fixture.observe(&dependencies, asserted_digest, fixture.limits, true),
+                local
+            );
+        }
+        let limits = fixture
+            .limits
+            .with_declarations(
+                u32::try_from(fixture.base.declarations.len() + 1)
+                    .expect("fixture declaration count"),
+            )
+            .expect("one supplemental record");
+        assert_eq!(
+            fixture.observe(&[fixture.authority()], digest, limits, true),
+            local
+        );
     }
 
     fn authored_macro_fixture(files: Vec<(&str, &str)>) -> PackagePublication {
