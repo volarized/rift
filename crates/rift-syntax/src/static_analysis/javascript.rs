@@ -764,7 +764,7 @@ impl Kinds {
         }
     }
 
-    /// A written property can hold objects through consecutive array element positions.
+    /// A written initializer can hold objects through consecutive array element positions.
     fn array_property_holder<'walk, 'tree>(
         &self,
         holder: Visited<'walk, 'tree>,
@@ -792,7 +792,7 @@ impl Kinds {
         }
         if array.parent().is_some_and(|parent| {
             let pair = parent.syntax_element();
-            pair.kind_id() == self.object_literal[1]
+            [self.object_literal[1], self.variable].contains(&pair.kind_id())
                 && pair.child_by_field_name("value") == Some(array.syntax_element())
         }) {
             array

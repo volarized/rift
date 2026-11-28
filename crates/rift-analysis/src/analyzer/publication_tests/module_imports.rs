@@ -7862,6 +7862,396 @@ fn secondary_commonjs_callbacks_keep_separate_private_return_functions() {
 }
 
 #[test]
+fn secondary_default_array_keeps_each_written_property_tree() {
+    const SOURCE: &str = concat!(
+        "const presets = [];\n",
+        "export default [\n",
+        "  { once: true }, { rules: { alpha: true, 'max-size': [2, { maximum: 8 }] } },\n",
+        "  ...presets,\n",
+        "  { rules: { beta: false, 'max-size': [3, { maximum: 12 }] } },\n",
+        "];\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const keep = 'value';"),
+                ("config.mjs", source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked secondary default array")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("checked property anchors");
+    let mut groups = publication
+        .declarations
+        .iter()
+        .filter(|row| {
+            row.source_complete
+                && row.source.starts_with("rules: {")
+                && row.syntax_element_kind.as_deref() == Some("pair")
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by_key(|row| row.range.start);
+    let [left, right] = groups.as_slice() else {
+        panic!("separate literal property roots");
+    };
+    assert_ne!(left.symbol, right.symbol);
+    for (root, extrema, rank) in [(left, "maximum: 8", 2), (right, "maximum: 12", 3)] {
+        let scope = format!("{}/'max-size'", root.symbol.as_str());
+        let child = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.symbol.as_str() == scope
+                    && row.source.starts_with(&format!("'max-size': [{rank}, "))
+            })
+            .expect("quoted child belongs to its written rules slot");
+        let grandchild = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.symbol.as_str() == format!("{scope}/maximum")
+                    && row.source == extrema
+            })
+            .expect("exact option in the written list");
+        assert!(root.range.start <= child.range.start && child.range.end <= root.range.end);
+        assert!(
+            child.range.start <= grandchild.range.start && grandchild.range.end <= child.range.end
+        );
+    }
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str().ends_with("/once") && row.source == "once: true" })
+    );
+
+    let ambiguous = SOURCE.replace("{ beta: false,", "{ beta: false, beta: true,");
+    let made = analyze(&ambiguous);
+    assert!(
+        !made
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str() == format!("{}/beta", right.symbol.as_str()) })
+    );
+}
+
+#[test]
+fn typescript_class_methods_keep_repeated_direct_argument_properties() {
+    const SOURCE: &str = concat!(
+        "interface Command { kind: string; line: number; }\n",
+        "export class Reader {\n",
+        "  choose(ready: boolean) {\n",
+        "    const keep = (value: Command) => value;\n",
+        "    if (ready) return keep({ kind: 'ready', line: 1 } as Command);\n",
+        "    return keep({ kind: 'pending', line: 2 });\n",
+        "  }\n",
+        "}\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.ts"}"#;
+    let analyze = |text: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.ts", "export { Reader } from './worker.js';"),
+                ("worker.ts", text),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("analyzed written method")
+    };
+    let result = analyze(SOURCE);
+    let found = result.publication();
+    found.validate_facts().expect("exact written arguments");
+    let method = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/Reader/choose"))
+        .expect("checked method");
+    let mut identities = BTreeSet::new();
+    for written in ["kind: 'ready'", "line: 1", "kind: 'pending'", "line: 2"] {
+        let start = SOURCE.find(written).expect("property source");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == method.unit
+                    && row.source_complete
+                    && row.source == written
+                    && row.range == module_runtime_range(start, written)
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("written property");
+        assert!(identities.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&method.symbol)
+        }));
+    }
+    assert!(found.declarations.iter().any(|row| {
+        row.source == "kind: string"
+            && row.syntax_element_kind.as_deref() == Some("property_signature")
+            && !identities.contains(&row.symbol)
+    }));
+
+    let computed = SOURCE.replace("return keep(", "return registry[dynamic](");
+    let detached = SOURCE.replace("export class Reader {", "export const Reader = {");
+    for negative in [&computed, &detached] {
+        assert!(
+            !analyze(negative)
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| {
+                    row.source == "kind: 'ready'"
+                        && row.syntax_element_kind.as_deref() == Some("pair")
+                })
+        );
+    }
+
+    let unknown = SOURCE.replace("return keep(", "return missing(");
+    let control = analyze(&unknown);
+    assert!(
+        !control.publication().edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/missing")
+        })
+    );
+    assert!(control.publication().declarations.iter().any(|row| {
+        row.source == "kind: 'ready'" && row.syntax_element_kind.as_deref() == Some("pair")
+    }));
+}
+
+#[test]
+fn inline_assigned_literal_properties_keep_their_written_local_owner() {
+    const SOURCE: &str = concat!(
+        "var parser;\n",
+        "(function (exports) {\n",
+        "  var rules, last;\n",
+        "  rules = { 'alpha': ['parseAlpha'], 'beta': ['parseBeta'] };\n",
+        "  function get(key) { last = key; return rules[key]; }\n",
+        "  exports.get = get;\n",
+        "}(parser = {}));\n",
+        "exports.get = parser.get;\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("assigned literal package")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("exact written properties");
+    let owner = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("variable_declarator")
+                && row.source == "rules"
+        })
+        .expect("earlier local binding");
+    for (key, text) in [
+        ("'alpha'", "'alpha': ['parseAlpha']"),
+        ("'beta'", "'beta': ['parseBeta']"),
+    ] {
+        let identity = format!("{}/{key}", owner.symbol.as_str());
+        let property = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str() == identity && row.source == text && row.source_complete
+            })
+            .expect("same authored property span");
+        assert_eq!(
+            property.range,
+            module_runtime_range(SOURCE.find(text).expect("written property"), text),
+        );
+        assert!(publication.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&property.symbol)
+                && row.container.as_ref() == Some(&owner.symbol)
+        }));
+    }
+    let sibling =
+        format!("(function (outside) {{ outside = {{ 'alpha': ['other'] }}; }}({{}}));\n{SOURCE}");
+    let separated = analyze(&sibling);
+    for (owner, source) in [
+        ("/rules/'alpha'", "'alpha': ['parseAlpha']"),
+        ("/beacon/'alpha'", "'alpha': ['other']"),
+    ] {
+        assert!(
+            separated
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with(owner) && row.source == source })
+        );
+    }
+
+    let shadow = SOURCE
+        .replace("function (exports)", "function (exports, rules)")
+        .replace("var rules, last;", "var last;");
+    let outer = SOURCE
+        .replace("var parser;", "var parser, rules;")
+        .replace("var rules, last;", "var last;");
+    for control in [shadow, outer] {
+        let other = analyze(&control);
+        assert!(other.publication().declarations.iter().any(|row| {
+            row.symbol.as_str().ends_with("/'alpha'") && row.source == "'alpha': ['parseAlpha']"
+        }));
+        assert!(
+            !other
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/rules/'alpha'") })
+        );
+    }
+}
+
+#[test]
+fn initializer_members_stay_with_the_separately_placed_local_binding() {
+    const SOURCE: &str = concat!(
+        "export function make() {\n",
+        "  const changes = { updated: 1, deleted: 2 };\n",
+        "  return { changes };\n",
+        "}\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#;
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.mjs", "export const keep = 0;"),
+            ("body.mjs", SOURCE),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("placed initializer and shorthand");
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("checked initializer facts");
+    let variable = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source_complete
+                && row.source.starts_with("changes = {")
+                && row.syntax_element_kind.as_deref() == Some("variable_declarator")
+        })
+        .expect("written local binding");
+    let shorthand = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source_complete
+                && row.source == "changes"
+                && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+        })
+        .expect("separately written returned property");
+    assert_ne!(variable.symbol, shorthand.symbol);
+
+    for (key, source) in [("updated", "updated: 1"), ("deleted", "deleted: 2")] {
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.symbol.as_str() == format!("{}/{key}", variable.symbol.as_str())
+            })
+            .expect("written member of variable initializer");
+        assert_eq!(
+            row.range,
+            module_runtime_range(SOURCE.find(source).expect("physical member"), source),
+        );
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&variable.symbol)
+        }));
+        assert!(!publication.declarations.iter().any(|child| {
+            child.symbol.as_str() == format!("{}/{key}", shorthand.symbol.as_str())
+        }));
+    }
+}
+
+#[test]
+fn nested_array_initializers_keep_properties_under_their_written_variable() {
+    const SOURCE: &str = concat!(
+        "export const values = [[{ present: 1 }], [{ present: 2 }]];\n",
+        "export const generated = build([[{ present: 3 }], [{ present: 4 }]]);\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.mjs", "export const keep = 0;"),
+            ("values.mjs", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked array source");
+    let found = result.publication();
+    found.validate_facts().expect("exact written array keys");
+    let values = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("variable_declarator")
+                && row.symbol.as_str().ends_with("/values")
+        })
+        .expect("physical literal initializer holder");
+    let mut ids = BTreeSet::new();
+    for source in ["present: 1", "present: 2"] {
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("written property declaration");
+        assert_eq!(
+            row.range,
+            module_runtime_range(SOURCE.find(source).expect("property byte range"), source),
+        );
+        assert!(ids.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&values.symbol)
+        }));
+    }
+    assert!(!found.declarations.iter().any(|row| {
+        row.symbol.as_str().contains("/generated/present")
+            && (row.source == "present: 3" || row.source == "present: 4")
+    }));
+}
+
+#[test]
 fn retained_callback_keeps_independently_written_argument_properties() {
     const ENTRY: &str = "function helper(value) { return value; }\nmodule.exports = helper;\n";
     const SELECTED: &str = concat!(

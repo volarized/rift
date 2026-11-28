@@ -800,6 +800,29 @@ impl DocumentPlacement {
             .or_else(|| self.syntax_identity_anchor(symbol))
     }
 
+    // The scoped identity names an already placed bare local declaration.
+    fn scoped_local_property_owner<'facts>(
+        &self,
+        symbol: &crate::SyntaxSymbol,
+        earlier: &HashMap<&str, &'facts crate::SyntaxSymbol>,
+    ) -> Option<&'facts crate::SyntaxSymbol> {
+        if symbol.kind != "property" {
+            return None;
+        }
+        let scoped = self
+            .scoped_identity_anchors
+            .get(&symbol.qualified_name)?
+            .get(&symbol.declaration_ordinal)?;
+        let (parent, _) = scoped.as_str().rsplit_once('/')?;
+        let (_, name) = parent.rsplit_once('/')?;
+        let owner = *earlier.get(name)?;
+        (owner.syntax_element_kind == Some("variable_declarator")
+            && owner.kind == "variable"
+            && owner.container.is_none()
+            && self.logical_identity_for_symbol(owner)?.as_str() == parent)
+            .then_some(owner)
+    }
+
     fn syntax_identity_anchor(&self, symbol: &crate::SyntaxSymbol) -> Option<&SymbolId> {
         self.scoped_identity_anchors
             .get(&symbol.qualified_name)
@@ -1003,8 +1026,20 @@ impl SyntaxPublicationBuilder {
                 .cloned();
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
             let mut facts = symbol.placed_facts(language, anchor.as_ref());
-            if let Some(container) = &symbol.container {
-                let ordinal = enclosing_ordinal(latest.get(container.as_str()).copied(), symbol);
+            let container = symbol.container.as_deref().map_or_else(
+                || {
+                    placement
+                        .scoped_local_property_owner(symbol, &latest)
+                        .map(|owner| (owner.qualified_name.as_str(), owner.declaration_ordinal))
+                },
+                |container| {
+                    Some((
+                        container,
+                        enclosing_ordinal(latest.get(container).copied(), symbol),
+                    ))
+                },
+            );
+            if let Some((container, ordinal)) = container {
                 let container_address = declaration_address(
                     &language_segment,
                     placement.identity_path(),
