@@ -128,7 +128,6 @@ fn module_scoped_anchors(
         super::scoped_returns::place(file, anchors, &mut physical);
     }
     scopes.place_scoped_call_argument_properties(file, &withheld, anchors, &mut physical);
-    scopes.place_scoped_initializer_children(file, anchors, &mut physical);
     scopes.place_default_array_properties(file, &withheld, anchors, &mut physical);
     physical.extend(scopes.withheld_union_properties(file, &withheld, anchors));
     physical.extend(scopes.withheld_conditional_properties(
@@ -139,6 +138,7 @@ fn module_scoped_anchors(
         input.syntax(),
     ));
     scopes.place_mixed_shorthand(file, &withheld, anchors, &mut physical);
+    scopes.place_scoped_initializer_children(file, anchors, &mut physical);
     scopes.place_disjoint_module_bindings(file, &withheld, anchors, &mut physical);
     anchors.retain(|name, _| {
         ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
