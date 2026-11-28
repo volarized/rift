@@ -919,3 +919,96 @@ fn non_entry_lexical_declarations_keep_separate_object_slot_names() {
             .any(|row| row.source == DECLARATIONS[0])
     );
 }
+
+#[test]
+fn dual_commonjs_getter_keys_keep_checked_bindings_and_children() {
+    const RUNTIME: &str = concat!(
+        "var table = {};\n",
+        "fill(table, { choose: () => choose, options: () => options, Entry: () => Entry });\n",
+        "module.exports = table;\n",
+        "var options = { safe: 1 };\n",
+        "function choose(value) {\n",
+        "    const flags = { found: void 0 };\n",
+        "    return value + options.safe + Number(flags.found);\n",
+        "}\n",
+        "var Constructor = class {};\n",
+        "var Entry = Constructor;\n",
+    );
+    const GUARD: &str = "0 && (module.exports = { choose, options, Entry });\n";
+    const ESM: &str = "export function choose(value) { return value; }\nexport const options = { safe: 1 };\nexport class Entry {}\n";
+    const TYPES: &str = "export declare function choose(value: number): number;\nexport declare const options: { safe: number };\nexport declare class Entry {}\n";
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./dist/index.cjs","exports":{"import":{"types":"./dist/index.d.ts","import":"./dist/index.js"},"require":{"types":"./dist/index.d.cts","require":"./dist/index.cjs"}}}"#;
+    let analyze = |runtime: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("dist/index.cjs", runtime),
+                ("dist/index.js", ESM),
+                ("dist/index.d.ts", TYPES),
+                ("dist/index.d.cts", TYPES),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("separate runtime variants")
+    };
+    let source = format!("{RUNTIME}{GUARD}");
+    let captured = analyze(&source);
+    let publication = captured.publication();
+    publication
+        .validate_facts()
+        .expect("physical CommonJS owners");
+    let written = |text: &str, kind: &str| {
+        publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit.as_str().ends_with("dist/index.cjs")
+                    && row.syntax_element_kind.as_deref() == Some(kind)
+                    && row.source == text
+            })
+            .expect("authored CommonJS declaration")
+    };
+    let options = written("options = { safe: 1 }", "variable_declarator");
+    let flags = written("flags = { found: void 0 }", "variable_declarator");
+    let entry = written("Entry = Constructor", "variable_declarator");
+    assert!(!entry.public);
+    for (member, parent) in [
+        (written("safe: 1", "pair"), &options.symbol),
+        (written("found: void 0", "pair"), &flags.symbol),
+    ] {
+        assert!(publication.objects.iter().any(|symbol| {
+            symbol.id.as_ref() == Some(&member.symbol) && symbol.container.as_ref() == Some(parent)
+        }));
+    }
+    assert!(publication.declarations.iter().any(|row| {
+        row.unit.as_str().ends_with("dist/index.cjs")
+            && row.syntax_element_kind.as_deref() == Some("function_declaration")
+            && row.range.start
+                == u64::try_from(source.find("function choose").expect("function"))
+                    .expect("function offset")
+    }));
+    let suppressed = analyze(&source.replace("0 &&", "condition &&"));
+    let earlier_flags = suppressed
+        .publication()
+        .declarations
+        .iter()
+        .find(|row| {
+            row.unit.as_str().ends_with("dist/index.cjs")
+                && row.source == "flags = { found: void 0 }"
+        })
+        .expect("earlier local binding");
+    assert_eq!(flags.symbol, earlier_flags.symbol);
+    let unsupported = source.replace("0 &&", "condition &&");
+    assert!(
+        !analyze(&unsupported)
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| {
+                row.unit.as_str().ends_with("dist/index.cjs")
+                    && row.syntax_element_kind.as_deref() == Some("function_declaration")
+                    && row.source.starts_with("function choose")
+            })
+    );
+}
