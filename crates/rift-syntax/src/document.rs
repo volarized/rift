@@ -145,9 +145,16 @@ impl SyntaxSymbol {
     #[must_use]
     pub fn is_python_parameter(&self) -> bool {
         self.kind == crate::python::PARAMETER_KIND_WORD
+            || self.is_python_lambda_parameter()
             || self.is_python_variadic_parameter()
             || self.is_python_overload_parameter()
             || self.is_python_property_receiver()
+    }
+
+    /// Whether this parameter is declared by a Python lambda.
+    #[must_use]
+    pub fn is_python_lambda_parameter(&self) -> bool {
+        self.kind == crate::python::LAMBDA_PARAMETER_KIND_WORD
     }
 
     /// Whether this parameter captures an argument list or a keyword dictionary.

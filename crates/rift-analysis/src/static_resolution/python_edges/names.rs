@@ -58,6 +58,7 @@ enum LocalReadScope {
 enum SupplementalLocalBinding {
     Loop,
     AssignmentExpression,
+    LambdaParameter,
 }
 
 impl<'source> Index<'source> {
@@ -72,6 +73,7 @@ impl<'source> Index<'source> {
         let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
             if file.python_loop_bindings.contains_key(&name)
+                || file.python_lambda_parameters.contains_key(&name)
                 || file
                     .python_assignment_expression_bindings
                     .contains_key(&name)
@@ -184,6 +186,7 @@ impl<'source> Index<'source> {
                 .get_or_insert(result.occurrences.len());
             for &(read, name) in file.facts.python_local_reads() {
                 if file.python_loop_bindings.contains_key(&name)
+                    || file.python_lambda_parameters.contains_key(&name)
                     || file
                         .python_assignment_expression_bindings
                         .contains_key(&name)
@@ -311,6 +314,20 @@ impl<'source> Index<'source> {
         );
     }
 
+    /// Resolves source-backed Python lambda parameters after the established edge work.
+    pub(in crate::static_resolution) fn resolve_python_lambda_parameter_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_lambda_parameter_start = Some(result.occurrences.len());
+        self.resolve_python_supplemental_local_reads(
+            SupplementalLocalBinding::LambdaParameter,
+            work,
+            result,
+        );
+    }
+
     fn resolve_python_supplemental_local_reads(
         &self,
         kind: SupplementalLocalBinding,
@@ -323,6 +340,7 @@ impl<'source> Index<'source> {
                 SupplementalLocalBinding::AssignmentExpression => {
                     &file.python_assignment_expression_bindings
                 }
+                SupplementalLocalBinding::LambdaParameter => &file.python_lambda_parameters,
             };
             if bindings.is_empty() {
                 continue;
@@ -338,7 +356,11 @@ impl<'source> Index<'source> {
                     file: file.document,
                     symbol,
                 };
-                if matches!(
+                if matches!(kind, SupplementalLocalBinding::LambdaParameter) {
+                    if file.python_lambda_read_selects(read, name, work) {
+                        result.record(self.python_access(file, read, ReferenceRole::Read, target));
+                    }
+                } else if matches!(
                     file.python_local_read_scope(read, name, target, work),
                     Some(LocalReadScope::Single)
                 ) {
@@ -792,6 +814,21 @@ impl<'source> File<'source> {
         read: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        let binding = self.checked_python_expression_read(read, work)?;
+        Some(Target {
+            file: self.document,
+            symbol: self
+                .python_comprehension_bindings
+                .get(&binding.name)
+                .copied()?,
+        })
+    }
+
+    fn checked_python_expression_read(
+        &self,
+        read: ByteRange,
+        work: &mut Work,
+    ) -> Option<&'source StaticBinding> {
         if self.blocked(read.start, work) {
             return None;
         }
@@ -801,16 +838,17 @@ impl<'source> File<'source> {
             .into_iter()
             .filter(|binding| Scope::of(self, binding) == scope);
         let binding = bindings.next()?;
-        if bindings.next().is_some() || binding.available_from > read.start {
-            return None;
-        }
-        Some(Target {
-            file: self.document,
-            symbol: self
-                .python_comprehension_bindings
-                .get(&binding.name)
-                .copied()?,
-        })
+        (bindings.next().is_none() && binding.available_from <= read.start).then_some(binding)
+    }
+
+    fn python_lambda_read_selects(
+        &self,
+        read: ByteRange,
+        name: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        self.checked_python_expression_read(read, work)
+            .is_some_and(|binding| binding.name == name)
     }
 
     fn is_python_property_receiver(&self, name: ByteRange) -> bool {

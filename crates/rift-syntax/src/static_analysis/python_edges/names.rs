@@ -95,7 +95,7 @@ pub(in crate::static_analysis) struct Names<'source> {
     comprehensions: BTreeSet<ByteRange>,
     reads: Vec<ByteRange>,
     direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
-    loop_locals: BTreeMap<&'source str, BTreeMap<ByteRange, LoopLocal>>,
+    body_locals: BTreeMap<&'source str, BTreeMap<ByteRange, BodyLocal>>,
     assignment_expressions: BTreeMap<&'source str, BTreeMap<ByteRange, AssignmentExpressionLocal>>,
     receivers: BTreeMap<ByteRange, ByteRange>,
     /// Written names with the scope that holds the target.
@@ -124,7 +124,7 @@ impl<'source> Names<'source> {
         self.receivers.insert(scope, name);
     }
 
-    pub(super) fn loop_binding(
+    pub(super) fn body_binding(
         &mut self,
         source: &'source str,
         name: ByteRange,
@@ -132,11 +132,11 @@ impl<'source> Names<'source> {
         body: ByteRange,
     ) {
         if let Some(spelling) = text(source, name) {
-            self.loop_locals
+            self.body_locals
                 .entry(spelling)
                 .or_default()
                 .entry(scope)
-                .or_insert(LoopLocal { name, body });
+                .or_insert(BodyLocal { name, body });
         }
     }
 
@@ -163,8 +163,8 @@ struct AssignmentExpressionLocal {
     end: u64,
 }
 
-/// A loop target and the written suite where it already has its item.
-struct LoopLocal {
+/// A binding available in the body of its statement or expression.
+struct BodyLocal {
     name: ByteRange,
     body: ByteRange,
 }
@@ -369,7 +369,7 @@ impl EdgePythonKinds {
         Ok(())
     }
 
-    /// A plain value is read in its nearest function, outside a class or an expression scope.
+    /// A plain value is read in its nearest named function or lambda body.
     fn direct_local_read_scope<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let mut value = visited;
         while let Some(parent) = value.parent() {
@@ -385,13 +385,13 @@ impl EdgePythonKinds {
             }
             break;
         }
-        self.function_body_scope(visited)
+        self.callable_body_scope(visited)
     }
 
-    fn function_body_scope<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+    fn callable_body_scope<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let scope = edge_enclosing(visited, &self.scopes)?;
         let body = scope.child_by_field_id(self.body)?;
-        (scope.kind_id() == self.definitions[0]
+        ([self.definitions[0], self.scopes[3]].contains(&scope.kind_id())
             && byte_range(body)
                 .ok()?
                 .encloses(byte_range(visited.syntax_element()).ok()?))
@@ -421,16 +421,16 @@ impl EdgePythonKinds {
             return Ok(());
         };
         let assignments = names.direct_locals.get(spelling);
-        let loops = names.loop_locals.get(spelling);
+        let body_bindings = names.body_locals.get(spelling);
         let expressions = names.assignment_expressions.get(spelling);
-        if assignments.is_none() && loops.is_none() && expressions.is_none() {
+        if assignments.is_none() && body_bindings.is_none() && expressions.is_none() {
             return Ok(());
         }
         let Some(scope) = self.direct_local_read_scope(visited) else {
             return Ok(());
         };
         let inner = byte_range(scope)?;
-        if let Some(local) = loops.and_then(|loops| loops.get(&inner))
+        if let Some(local) = body_bindings.and_then(|bindings| bindings.get(&inner))
             && local.body.encloses(range)
         {
             facts.python_local_reads.push((range, local.name));
@@ -473,7 +473,8 @@ impl EdgePythonKinds {
         if names.receivers.is_empty() {
             return Ok(());
         }
-        if let Some(scope) = self.function_body_scope(visited)
+        if let Some(scope) = self.callable_body_scope(visited)
+            && scope.kind_id() == self.definitions[0]
             && let Some(&name) = names.receivers.get(&byte_range(scope)?)
             && text(source, read) == text(source, name)
         {

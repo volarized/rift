@@ -574,6 +574,7 @@ struct BindingDemands {
     rust_macro_methods: BindingDemand,
     rust_disjoint: BindingDemand,
     python_parameters: BindingDemand,
+    python_lambda_parameters: BindingDemand,
     python_receivers: BindingDemand,
     python_loop_bindings: BindingDemand,
     python_assignment_expression_bindings: BindingDemand,
@@ -622,6 +623,8 @@ impl BindingDemands {
                     &mut demands.python_overload_parameters
                 } else if symbol.is_python_property_receiver() {
                     &mut demands.python_property_receivers
+                } else if symbol.is_python_lambda_parameter() {
+                    &mut demands.python_lambda_parameters
                 } else if symbol.is_python_parameter() {
                     if symbol
                         .name_range
@@ -669,6 +672,7 @@ impl BindingDemands {
             + self.python_receivers.count
             + self.python_loop_bindings.count
             + self.python_assignment_expression_bindings.count
+            + self.python_lambda_parameters.count
             + self.python_comprehension_bindings.count
             + self.python_variadic_parameters.count
             + self.python_overload_parameters.count
@@ -772,6 +776,7 @@ fn binding_capacity(
                 &demands.python_comprehension_bindings,
                 &demands.python_property_receivers,
                 &demands.python_assignment_expression_bindings,
+                &demands.python_lambda_parameters,
             ],
             (slots, bytes),
             record,
@@ -811,6 +816,10 @@ struct EcmaScriptBindingDemand {
 }
 
 impl EcmaScriptBindingDemand {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered reservation table preserves declaration priority across languages"
+    )]
     fn reserve_late_bindings(
         &self,
         documents: &[AnalyzedFile],
@@ -824,7 +833,8 @@ impl EcmaScriptBindingDemand {
             python_comprehensions,
             python_property_receivers,
             python_assignment_expressions,
-        ]: [&BindingDemand; 3],
+            python_lambda_parameters,
+        ]: [&BindingDemand; 4],
         (mut slots, mut bytes): (usize, u64),
         record: u64,
         established: &rift_syntax::PackageBindingSlots,
@@ -860,6 +870,7 @@ impl EcmaScriptBindingDemand {
             callable_pattern_slots,
             typed_arrow_argument_slots,
             assignment_expression_slots,
+            lambda_parameter_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -893,6 +904,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_callable_pattern,
                 &self.typescript_argument_callbacks,
                 python_assignment_expressions,
+                python_lambda_parameters,
             ],
             &mut slots,
             &mut bytes,
@@ -929,6 +941,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_callable_type_pattern_parameters(callable_pattern_slots)
             .with_typescript_argument_callback_parameters(typed_arrow_argument_slots)
             .with_python_assignment_expression_binding_slots(assignment_expression_slots)
+            .with_python_lambda_parameter_slots(lambda_parameter_slots)
     }
 
     fn classify(

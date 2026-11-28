@@ -87,6 +87,8 @@ pub(crate) struct StaticResolution {
     pub(crate) pending_dataclass_calls: Vec<(ProjectPath, usize, python_edges::InitializerCalls)>,
     /// First Read of a target written in a Python assignment expression.
     pub(crate) python_assignment_expression_start: Option<usize>,
+    /// First Read of a parameter declared by a Python lambda.
+    pub(crate) python_lambda_parameter_start: Option<usize>,
     /// First reference inside a compound Python string annotation.
     pub(crate) python_quoted_type_start: Option<usize>,
     pub(crate) python_overload_parameter_start: Option<usize>,
@@ -440,6 +442,7 @@ fn resolve_by<'source>(
     index.resolve_python_dataclass_keywords(&mut work, &mut resolution);
     index.resolve_python_assignment_expression_reads(&mut work, &mut resolution);
     index.resolve_typescript_property_selectors(&mut work, &mut resolution);
+    index.resolve_python_lambda_parameter_reads(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -903,6 +906,7 @@ struct File<'source> {
     javascript_shorthand_parameters: BTreeMap<ByteRange, EcmaScriptParameter<'source>>,
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
+    python_lambda_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     python_loop_bindings: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     python_assignment_expression_bindings: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     has_python_property_receiver: bool,
@@ -1096,6 +1100,7 @@ impl<'source> File<'source> {
             typescript_method_type_parameters: BTreeMap::new(),
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
+            python_lambda_parameters: BTreeMap::new(),
             python_loop_bindings: BTreeMap::new(),
             python_assignment_expression_bindings: BTreeMap::new(),
             has_python_property_receiver: false,
@@ -1381,6 +1386,34 @@ impl<'source> File<'source> {
         Some(())
     }
 
+    fn index_python_package_binding(
+        &mut self,
+        symbol: &'source SyntaxSymbol,
+        name: ByteRange,
+        admitted: bool,
+    ) -> bool {
+        if symbol.is_python_lambda_parameter() {
+            self.python_lambda_parameters
+                .insert(name, admitted.then_some(symbol));
+        } else if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
+            self.has_python_property_receiver |= admitted && symbol.is_python_property_receiver();
+            self.python_parameters
+                .insert(name, admitted.then_some(symbol));
+        } else if symbol.is_python_loop_binding() {
+            self.python_loop_bindings
+                .insert(name, admitted.then_some(symbol));
+        } else if symbol.is_python_assignment_expression_binding() {
+            self.python_assignment_expression_bindings
+                .insert(name, admitted.then_some(symbol));
+        } else if symbol.is_python_comprehension_binding() {
+            self.python_comprehension_bindings
+                .extend(admitted.then_some((name, symbol)));
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn index_package_binding(
         &mut self,
         symbol: &'source SyntaxSymbol,
@@ -1403,20 +1436,10 @@ impl<'source> File<'source> {
             self.rust_local_count +=
                 usize::from(admitted && !symbol.is_rust_explicit_local_binding());
         } else if let Some(name) = symbol.name_range {
-            if self.document.facts.language().name == "python" && symbol.is_python_parameter() {
-                self.has_python_property_receiver |=
-                    admitted && symbol.is_python_property_receiver();
-                self.python_parameters
-                    .insert(name, admitted.then_some(symbol));
-            } else if symbol.is_python_loop_binding() {
-                self.python_loop_bindings
-                    .insert(name, admitted.then_some(symbol));
-            } else if symbol.is_python_assignment_expression_binding() {
-                self.python_assignment_expression_bindings
-                    .insert(name, admitted.then_some(symbol));
-            } else if admitted && symbol.is_python_comprehension_binding() {
-                self.python_comprehension_bindings.insert(name, symbol);
-            } else if admitted && symbol.is_typescript_type_parameter() {
+            if self.index_python_package_binding(symbol, name, admitted) {
+                return;
+            }
+            if admitted && symbol.is_typescript_type_parameter() {
                 self.typescript_type_parameters.insert(name, symbol);
             } else if admitted && symbol.is_javascript_wrapped_parameter() {
                 self.javascript_wrapped_parameters.insert(name, symbol);
@@ -1711,6 +1734,7 @@ impl<'source> File<'source> {
     fn has_python_local_reads(&self) -> bool {
         self.facts.python_local_reads().iter().any(|(_, name)| {
             if self.python_loop_bindings.contains_key(name)
+                || self.python_lambda_parameters.contains_key(name)
                 || self
                     .python_assignment_expression_bindings
                     .contains_key(name)

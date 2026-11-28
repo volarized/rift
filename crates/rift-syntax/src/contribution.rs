@@ -24,6 +24,7 @@ pub struct PackageBindingSlots {
     rust_receiver: usize,
     rust_generic: usize,
     python_parameter: usize,
+    python_lambda_parameter: usize,
     typescript_parameter: usize,
     python_receiver: usize,
     python_loop_binding: usize,
@@ -80,6 +81,7 @@ impl PackageBindingSlots {
             rust_receiver: 0,
             rust_generic: 0,
             python_parameter,
+            python_lambda_parameter: 0,
             typescript_parameter,
             javascript_parameter: 0,
             python_receiver: 0,
@@ -140,6 +142,13 @@ impl PackageBindingSlots {
     #[must_use]
     pub const fn with_python_assignment_expression_binding_slots(mut self, slots: usize) -> Self {
         self.python_assignment_expression_binding = slots;
+        self
+    }
+
+    /// Reserves slots left for parameters declared by Python lambdas.
+    #[must_use]
+    pub const fn with_python_lambda_parameter_slots(mut self, slots: usize) -> Self {
+        self.python_lambda_parameter = slots;
         self
     }
 
@@ -413,6 +422,7 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_receiver)
             .saturating_add(self.rust_generic)
             .saturating_add(self.python_parameter)
+            .saturating_add(self.python_lambda_parameter)
             .saturating_add(self.typescript_parameter)
             .saturating_add(self.javascript_parameter)
             .saturating_add(self.python_receiver)
@@ -536,6 +546,8 @@ impl PackageBindingSlots {
             &mut self.python_overload_parameter
         } else if symbol.is_python_property_receiver() {
             &mut self.python_property_receiver
+        } else if symbol.is_python_lambda_parameter() {
+            &mut self.python_lambda_parameter
         } else if symbol.is_python_parameter() {
             if symbol
                 .name_range
