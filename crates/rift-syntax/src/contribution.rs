@@ -433,6 +433,25 @@ impl PackageBindingSlots {
             .saturating_add(self.rust_disjoint)
     }
 
+    fn ecmascript_parameter_slots(
+        &mut self,
+        symbol: &crate::SyntaxSymbol,
+        language: &str,
+        methods: &BTreeSet<&str>,
+    ) -> &mut usize {
+        if language == "javascript" {
+            &mut self.javascript_parameter
+        } else if symbol
+            .container
+            .as_deref()
+            .is_some_and(|owner| methods.contains(owner))
+        {
+            &mut self.typescript_method_parameter
+        } else {
+            &mut self.typescript_parameter
+        }
+    }
+
     fn admit(
         &mut self,
         symbol: &crate::SyntaxSymbol,
@@ -488,17 +507,7 @@ impl PackageBindingSlots {
         } else if matches!(language, "javascript" | "typescript")
             && symbol.is_ecmascript_parameter()
         {
-            if language == "javascript" {
-                &mut self.javascript_parameter
-            } else if symbol
-                .container
-                .as_deref()
-                .is_some_and(|owner| methods.contains(owner))
-            {
-                &mut self.typescript_method_parameter
-            } else {
-                &mut self.typescript_parameter
-            }
+            self.ecmascript_parameter_slots(symbol, language, methods)
         } else if symbol.is_python_variadic_parameter() {
             &mut self.python_variadic_parameter
         } else if symbol.is_python_overload_parameter() {

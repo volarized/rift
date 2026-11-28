@@ -276,8 +276,8 @@ pub(super) fn record<'tree>(
             closed_export = Some((binding.range, synchronized == Some(syntax_element), None));
         } else if allow_literal && direct {
             direct_callable = body.checked_direct_callable(syntax_element, &binding)?;
-            if direct_callable.is_none() && body.is_closed_written_arrow(syntax_element, &binding) {
-                direct_arrow = Some(binding.range);
+            if direct_callable.is_none() {
+                direct_arrow = body.closed_written_arrow(syntax_element, &binding);
             }
         }
         if declares_taken_name(
@@ -317,15 +317,7 @@ pub(super) fn record<'tree>(
             .as_ref()
             .is_some_and(|export| export.anonymous_callable.is_none())
             || body.is_closed_callable(&captured, closed_export.is_some()));
-    exports.closed_export = closed_export.or(direct_callable).or_else(|| {
-        direct_arrow.map(|assignment| StaticCommonJsExport {
-            assignment,
-            synchronized: false,
-            initialized: Vec::new(),
-            literal: None,
-            anonymous_callable: None,
-        })
-    });
+    exports.closed_export = closed_export.or(direct_callable).or(direct_arrow);
     exports.shadowing = shadowing;
     exports.assignments = captured.assignments;
     Ok(exports)
@@ -488,15 +480,24 @@ impl<'tree> ModuleBody<'_, 'tree> {
     }
 
     /// The written arrow that a closed module assigns directly to its default export.
-    fn is_closed_written_arrow(&self, assignment: Node<'_>, binding: &SyntaxExportBinding) -> bool {
-        let Some((property, value)) = self.kinds.export_definition(assignment, self.source) else {
-            return false;
-        };
-        binding.kind == SyntaxExportKind::Default
+    fn closed_written_arrow(
+        &self,
+        assignment: Node<'_>,
+        binding: &SyntaxExportBinding,
+    ) -> Option<StaticCommonJsExport> {
+        let (property, value) = self.kinds.export_definition(assignment, self.source)?;
+        (binding.kind == SyntaxExportKind::Default
             && value.kind() == ARROW_FUNCTION_KIND
             && self.kinds.child(assignment, EcmaScriptGrammarField::Right) == Some(value)
             && extract::byte_range(property).is_ok_and(|range| binding.local == Some(range))
-            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds)
+            && closed_wrapper_uses(self.root, None, assignment, self.source, self.kinds))
+        .then_some(StaticCommonJsExport {
+            assignment: binding.range,
+            synchronized: false,
+            initialized: Vec::new(),
+            literal: None,
+            anonymous_callable: None,
+        })
     }
 
     /// Whether the default export names a declaration and the file uses its wrapper names
