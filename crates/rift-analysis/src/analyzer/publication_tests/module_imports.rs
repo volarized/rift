@@ -8471,3 +8471,78 @@ fn checked_commonjs_relative_imports_keep_independently_admitted_peers() {
         );
     }
 }
+
+#[test]
+fn assigned_shorthand_keeps_distinct_module_and_initializer_owners() {
+    const SOURCE: &str = concat!(
+        "let output;\n",
+        "export function make() {\n",
+        "    const changes = { updated: 1, deleted: 2 };\n",
+        "    output = { changes };\n",
+        "    return output;\n",
+        "}\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const keep = 1;\n"),
+                ("config.mjs", source),
+            ],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+            )),
+        )
+        .expect("selected module assignment")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("distinct declaration ownership");
+    let written = |source: &str, kind: &str| {
+        publication
+            .declarations
+            .iter()
+            .find(|row| row.source == source && row.syntax_element_kind.as_deref() == Some(kind))
+            .expect("exact authored declaration")
+    };
+    let output = written("output", "variable_declarator");
+    let change = written(
+        "changes = { updated: 1, deleted: 2 }",
+        "variable_declarator",
+    );
+    let shorthand = written("changes", "shorthand_property_identifier");
+    assert_ne!(change.symbol, shorthand.symbol);
+    assert_eq!(
+        shorthand.range,
+        module_runtime_range(
+            SOURCE.rfind("changes").expect("shorthand position"),
+            "changes"
+        )
+    );
+    for (row, owner) in [
+        (shorthand, &output.symbol),
+        (written("updated: 1", "pair"), &change.symbol),
+        (written("deleted: 2", "pair"), &change.symbol),
+    ] {
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol) && object.container.as_ref() == Some(owner)
+        }));
+    }
+    let unknown = SOURCE.replace("let output;\n", "");
+    let shadowed = SOURCE.replace("    const changes", "    let output;\n    const changes");
+    let competing = SOURCE.replace("    return output;", "    output = {};\n    return output;");
+    for source in [unknown, shadowed, competing] {
+        let other = analyze(&source);
+        assert!(
+            !other
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with("/output/changes"))
+        );
+    }
+}

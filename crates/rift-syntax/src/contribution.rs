@@ -806,7 +806,10 @@ impl DocumentPlacement {
         symbol: &crate::SyntaxSymbol,
         earlier: &HashMap<&str, &'facts crate::SyntaxSymbol>,
     ) -> Option<&'facts crate::SyntaxSymbol> {
-        if symbol.kind != "property" {
+        if symbol.kind != "property"
+            || (symbol.container.is_some()
+                && symbol.syntax_element_kind != Some("shorthand_property_identifier"))
+        {
             return None;
         }
         let scoped = self
@@ -1026,19 +1029,16 @@ impl SyntaxPublicationBuilder {
                 .cloned();
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
             let mut facts = symbol.placed_facts(language, anchor.as_ref());
-            let container = symbol.container.as_deref().map_or_else(
-                || {
-                    placement
-                        .scoped_local_property_owner(symbol, &latest)
-                        .map(|owner| (owner.qualified_name.as_str(), owner.declaration_ordinal))
-                },
-                |container| {
+            let container = placement
+                .scoped_local_property_owner(symbol, &latest)
+                .map(|owner| (owner.qualified_name.as_str(), owner.declaration_ordinal))
+                .or_else(|| {
+                    let container = symbol.container.as_deref()?;
                     Some((
                         container,
                         enclosing_ordinal(latest.get(container).copied(), symbol),
                     ))
-                },
-            );
+                });
             if let Some((container, ordinal)) = container {
                 let container_address = declaration_address(
                     &language_segment,
