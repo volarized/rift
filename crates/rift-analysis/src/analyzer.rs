@@ -805,19 +805,17 @@ impl EcmaScriptBindingDemand {
     fn reserve_late_bindings(
         &self,
         documents: &[AnalyzedFile],
-        rust: [&BindingDemand; 4],
-        [python_comprehensions, python_property_receivers]: [&BindingDemand; 2],
-        capacity: (usize, u64),
-        record: u64,
-        established: &rift_syntax::PackageBindingSlots,
-    ) -> rift_syntax::PackageBindingSlots {
-        let [
+        [
             rust_modules,
             rust_shorthand,
             rust_macro_methods,
             rust_disjoint,
-        ] = rust;
-        let (mut slots, mut bytes) = capacity;
+        ]: [&BindingDemand; 4],
+        [python_comprehensions, python_property_receivers]: [&BindingDemand; 2],
+        (mut slots, mut bytes): (usize, u64),
+        record: u64,
+        established: &rift_syntax::PackageBindingSlots,
+    ) -> rift_syntax::PackageBindingSlots {
         let [
             callback_slots,
             overload_slots,
