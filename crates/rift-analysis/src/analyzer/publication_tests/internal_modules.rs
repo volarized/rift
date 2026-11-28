@@ -1354,6 +1354,101 @@ fn repeated_typescript_bindings_keep_their_admitted_callback_scopes() {
 }
 
 #[test]
+fn typescript_callback_locals_coexist_with_same_spelled_formals() {
+    let source = r#"
+import { prepare } from "../index.js";
+suite(() => {
+    check(() => { const marker = prepare(); return marker; });
+    check(() => { const marker = prepare() + 1; return marker; });
+    check((marker: number) => {
+        consume(marker);
+        {
+            const marker = prepare() + 2;
+            return marker;
+        }
+    });
+});
+"#;
+    let found = analyze(
+        CALLBACK_MANIFEST,
+        &[
+            ("index.js", "export function prepare() { return 3; }"),
+            ("lib/check.ts", source),
+        ],
+    );
+    let publication = found.publication();
+    publication
+        .validate_facts()
+        .expect("valid callback bindings");
+    let bindings = publication
+        .objects
+        .iter()
+        .filter_map(|object| {
+            (object.name == "marker")
+                .then_some(object.id.as_ref())
+                .flatten()
+                .map(|id| (object, id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bindings.len(), 4);
+    let mut owners = BTreeSet::new();
+    let mut shadow_owner = None;
+    for (ordinal, expression) in ["prepare()", "prepare() + 1", "prepare() + 2"]
+        .into_iter()
+        .enumerate()
+    {
+        let written = format!("const marker = {expression}");
+        let expected = format!("marker#{ordinal}");
+        let (object, id) = bindings
+            .iter()
+            .find(|(_, id)| spelled(id.as_str()).last() == Some(&expected))
+            .expect("separate private binding");
+        let facets = publication
+            .declarations
+            .iter()
+            .filter(|row| &row.symbol == *id)
+            .collect::<Vec<_>>();
+        assert_eq!(facets.len(), 1);
+        let binding = facets[0];
+        let start = source.find(&written).expect("written binding");
+        assert_eq!(
+            binding.range.start,
+            u64::try_from(start).expect("source offset")
+        );
+        assert_eq!(binding.source, written);
+        assert!(binding.source_complete && !binding.public && object.document_local);
+        let owner = object.container.as_ref().expect("physical callback");
+        assert!(owners.insert(owner));
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol == *owner
+                && row.unit == binding.unit
+                && row.range.start < binding.range.start
+                && binding.range.end < row.range.end
+                && row.syntax_element_kind.as_deref() == Some("arrow_function")
+        }));
+        shadow_owner = Some(owner);
+    }
+    let formal = bindings
+        .iter()
+        .find(|(object, _)| object.kinds.contains(&SymbolKind::Parameter))
+        .expect("written arrow formal");
+    let mut expected_formal_path = spelled(shadow_owner.expect("shadowing callback").as_str());
+    expected_formal_path.push("marker".to_owned());
+    assert_eq!(spelled(formal.1.as_str()), expected_formal_path);
+    let facets = publication
+        .declarations
+        .iter()
+        .filter(|row| &row.symbol == formal.1)
+        .collect::<Vec<_>>();
+    assert_eq!(facets.len(), 1);
+    assert_eq!(facets[0].source, "marker");
+    assert_eq!(
+        facets[0].range.start,
+        u64::try_from(source.find("marker:").expect("written parameter")).expect("source offset")
+    );
+}
+
+#[test]
 fn repeated_typescript_bindings_refuse_incomplete_callback_groups() {
     let missing_owner = CALLBACK_BINDINGS.replace("prepare() + 1", "4");
     let unsupported = CALLBACK_BINDINGS.replace(

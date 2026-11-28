@@ -106,7 +106,10 @@ impl Records {
         }
         let mut groups = BTreeMap::<_, Vec<_>>::new();
         for symbol in syntax.symbols() {
-            groups.entry(symbol.name.as_str()).or_default().push(symbol);
+            // Argument formals already have callback-qualified identities.
+            if !symbol.is_typescript_argument_callback_parameter() {
+                groups.entry(symbol.name.as_str()).or_default().push(symbol);
+            }
         }
         groups
             .into_values()
