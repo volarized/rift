@@ -2750,7 +2750,7 @@ const BAD_RUST_DECLARATION_TOKENS: [[u32; 5]; 19] = [
     [1, 0, 0, 2, 12],  // Attribute string marked as a declaration.
     [1, 0, 0, 1, 8],   // Empty variable with the attribute modifier.
     [10, 0, 0, 2, 8],  // Attribute string outside the source.
-    [1, 0, 0, 2, 32],  // String with a modifier outside the legend.
+    [1, 0, 0, 2, 128], // String with a modifier outside the legend.
     [5, 2, 0, 3, 16],  // Documentation comment before the line end.
     [5, 0, 0, 3, 0],   // Empty ordinary comment on a nonempty line.
     [6, 1, 0, 3, 16],  // Documentation comment past an empty line.
@@ -2765,8 +2765,8 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
             "semanticTokensProvider": {
                 "full": true,
                 "legend": {
-                    "tokenTypes": ["parameter", "variable", "string", "comment", "function"],
-                    "tokenModifiers": ["macro", "definition", "declaration", "attribute", "documentation"]
+                    "tokenTypes": ["parameter", "variable", "string", "comment", "function", "const"],
+                    "tokenModifiers": ["macro", "definition", "declaration", "attribute", "documentation", "constant", "associated"]
                 }
             }
         }))
@@ -2803,6 +2803,12 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
                 1, 1, 6, 3, 16,
                 0, 6, 0, 3, 16,
                 1, 1, 5, 1, 2,
+                1, 0, 3, 5, 37,
+                0, 4, 5, 5, 101,
+                0, 6, 3, 5, 36,
+                0, 4, 3, 5, 5,
+                0, 4, 3, 5, 45,
+                0, 4, 3, 5, 33
             ]}),
         )
         .await;
@@ -2827,8 +2833,10 @@ async fn answer_rust_declaration_requests(mut engine: ScriptedEngine<DuplexStrea
 
 #[tokio::test]
 async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiated_legend() {
-    const SOURCE: &str =
-        "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma delta\r\n\r\n\r\n fenced\r\n after";
+    const SOURCE: &str = concat!(
+        "é🪿 alpha beta\r\n\r\n\r\n\r\n hold\r\n gamma delta",
+        "\r\n\r\n\r\n fenced\r\n after\r\nTOP FIELD RAW NOT TAG USE",
+    );
     let (_workspace, mut session, task) = started(answer_rust_declaration_requests).await;
 
     let file = path("lib.rs");
@@ -2887,6 +2895,16 @@ async fn rust_declarations_require_the_exact_open_source_and_decode_the_negotiat
         })
         .collect::<Vec<_>>();
     assert_eq!(macro_bindings, [("beta", true), ("delta", false)]);
+    let constants = observations
+        .macro_constants()
+        .iter()
+        .map(|token| {
+            let start = usize::try_from(token.range.start()).expect("start");
+            let end = usize::try_from(token.range.end()).expect("end");
+            (&SOURCE[start..end], token.associated)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(constants, [("TOP", false), ("FIELD", true)]);
     for _ in BAD_RUST_DECLARATION_TOKENS {
         assert_eq!(
             session

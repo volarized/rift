@@ -12,6 +12,9 @@ use crate::position::LineIndex;
 
 const MACRO: SemanticTokenModifier = SemanticTokenModifier::new("macro");
 const ATTRIBUTE: SemanticTokenModifier = SemanticTokenModifier::new("attribute");
+const CONSTANT: SemanticTokenModifier = SemanticTokenModifier::new("constant");
+const ASSOCIATED: SemanticTokenModifier = SemanticTokenModifier::new("associated");
+const RUST_CONST: SemanticTokenType = SemanticTokenType::new("const");
 const TOKENS_MAX: usize = 262_144;
 
 /// Which source-local declaration kind Rust reported.
@@ -41,6 +44,15 @@ pub struct RustMacroDeclarationToken {
     pub function: bool,
 }
 
+/// One macro-tagged constant declaration in the original Rust unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustMacroConstantToken {
+    /// Physical UTF-8 byte range in the opened Rust unit.
+    pub range: SourceRange,
+    /// Whether the engine placed the constant under an associated owner.
+    pub associated: bool,
+}
+
 /// Declaration observations for the exact source opened in one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustDeclarationTokens {
@@ -48,6 +60,7 @@ pub struct RustDeclarationTokens {
     digest: FileDigest,
     tokens: Vec<RustDeclarationToken>,
     macro_tokens: Vec<RustMacroDeclarationToken>,
+    macro_constants: Vec<RustMacroConstantToken>,
 }
 
 impl RustDeclarationTokens {
@@ -74,6 +87,12 @@ impl RustDeclarationTokens {
     pub fn macro_tokens(&self) -> &[RustMacroDeclarationToken] {
         &self.macro_tokens
     }
+
+    /// Macro-tagged constant names in source order, pending separate expansion and owner proof.
+    #[must_use]
+    pub fn macro_constants(&self) -> &[RustMacroConstantToken] {
+        &self.macro_constants
+    }
 }
 
 pub(crate) fn offered() -> SemanticTokensClientCapabilities {
@@ -86,12 +105,15 @@ pub(crate) fn offered() -> SemanticTokensClientCapabilities {
             SemanticTokenType::VARIABLE,
             SemanticTokenType::PARAMETER,
             SemanticTokenType::FUNCTION,
+            RUST_CONST,
         ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
             SemanticTokenModifier::DEFINITION,
             MACRO,
             ATTRIBUTE,
+            CONSTANT,
+            ASSOCIATED,
         ],
         formats: vec![TokenFormat::RELATIVE],
         overlapping_token_support: Some(false),
@@ -107,6 +129,8 @@ pub(crate) struct RustTokenLegend<'legend> {
     macro_expansion: u32,
     attribute: u32,
     documentation: u32,
+    constant: u32,
+    associated: u32,
     all_modifiers: u32,
 }
 
@@ -118,12 +142,18 @@ impl<'legend> RustTokenLegend<'legend> {
         let mut macro_expansion = 0;
         let mut attribute = 0;
         let mut documentation = 0;
+        let mut constant = 0;
+        let mut associated = 0;
         for (index, modifier) in legend.token_modifiers.iter().enumerate() {
             let bit = 1_u32.checked_shl(u32::try_from(index).ok()?)?;
             if *modifier == MACRO {
                 macro_expansion |= bit;
             } else if *modifier == ATTRIBUTE {
                 attribute |= bit;
+            } else if *modifier == CONSTANT {
+                constant |= bit;
+            } else if *modifier == ASSOCIATED {
+                associated |= bit;
             } else if *modifier == SemanticTokenModifier::DOCUMENTATION {
                 documentation |= bit;
             } else if *modifier == SemanticTokenModifier::DECLARATION
@@ -138,6 +168,8 @@ impl<'legend> RustTokenLegend<'legend> {
             macro_expansion,
             attribute,
             documentation,
+            constant,
+            associated,
             all_modifiers,
         })
     }
@@ -177,6 +209,7 @@ impl<'legend> RustTokenLegend<'legend> {
         let mut lines = TokenLines::default();
         let mut tokens = Vec::new();
         let mut macro_tokens = Vec::new();
+        let mut macro_constants = Vec::new();
         for token in data {
             let token_type = self.types.get(usize::try_from(token.token_type).ok()?)?;
             let modifiers = token.token_modifiers_bitset;
@@ -200,6 +233,11 @@ impl<'legend> RustTokenLegend<'legend> {
                     let function = token_type == &SemanticTokenType::FUNCTION;
                     if function || token_type == &SemanticTokenType::PARAMETER {
                         macro_tokens.push(RustMacroDeclarationToken { range, function });
+                    } else if token_type == &RUST_CONST && modifiers & self.constant != 0 {
+                        macro_constants.push(RustMacroConstantToken {
+                            range,
+                            associated: modifiers & self.associated != 0,
+                        });
                     }
                 }
                 continue;
@@ -216,6 +254,7 @@ impl<'legend> RustTokenLegend<'legend> {
             digest,
             tokens,
             macro_tokens,
+            macro_constants,
         })
     }
 }
