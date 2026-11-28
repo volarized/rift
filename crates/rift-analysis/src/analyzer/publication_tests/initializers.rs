@@ -4,6 +4,80 @@ use super::*;
 use rift_protocol::read::EdgeKind;
 
 #[test]
+fn package_python_dataclass_keywords_reference_generated_fields() {
+    const SOURCE: &str = concat!(
+        "import dataclasses as dc\n",
+        "from dataclasses import dataclass as generated\n",
+        "from attrs import define\n",
+        "@generated\nclass Base:\n    label: str\n",
+        "@dc.dataclass(kw_only=True)\nclass Options(Base):\n    value: int\n",
+        "@generated(init=False)\nclass Disabled:\n    value: int\n",
+        "@generated\nclass Custom:\n    value: int\n",
+        "    def __init__(self, value): pass\n",
+        "@generated\nclass Replaced:\n    value: int\n",
+        "Replaced.__init__ = Custom.__init__\n",
+        "@define\nclass Existing:\n    value: int\n",
+        "def make(): return Options(label='name', value=1)\n",
+        "def existing(): return Existing(value=2)\n",
+        "def refused(): return Disabled(value=1), Custom(value=2), Replaced(value=3)\n",
+    );
+    let publication = publication(&[("click.py", SOURCE)], None, &["click"]);
+    let keyword_reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.from.as_str().ends_with("/make")
+                && ["/Base/label", "/Options/value"]
+                    .iter()
+                    .any(|suffix| edge.to.as_str().ends_with(suffix))
+        })
+        .map(|edge| {
+            let site = edge.occurrence.as_ref().expect("written keyword");
+            let start = usize::try_from(site.range.start).expect("start");
+            let end = usize::try_from(site.range.end).expect("end");
+            (&SOURCE[start..end], edge.to.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keyword_reads,
+        [
+            (
+                "label",
+                "rift://symbol/pypi/pypi.org/click/python/click/Base/label"
+            ),
+            (
+                "value",
+                "rift://symbol/pypi/pypi.org/click/python/click/Options/value"
+            ),
+        ],
+    );
+    assert!(publication.edges.iter().all(|edge| {
+        !(edge.kinds == [EdgeKind::Reads]
+            && edge.from.as_str().ends_with("/refused")
+            && edge.to.as_str().ends_with("/value"))
+    }));
+    let remaining = publication
+        .edges
+        .iter()
+        .filter(|edge| !(edge.kinds == [EdgeKind::Reads] && edge.from.as_str().ends_with("/make")))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(remaining.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/Existing/value")
+    }));
+    let capped = python_publication_with_limits(
+        &[("click.py", SOURCE)],
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(remaining.len()),
+    );
+    assert_eq!(capped.declarations, publication.declarations);
+    assert_eq!(capped.edges, remaining);
+}
+
+#[test]
 fn package_python_attrs_keywords_reference_the_declaring_fields() {
     const MODEL: &str = concat!(
         "from attrs import define\n",

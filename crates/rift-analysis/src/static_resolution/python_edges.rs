@@ -15,7 +15,7 @@ mod slots;
 pub(super) use aliases::{ClassAliases, ModuleAliases};
 pub(super) use annotations::quoted_type_text;
 pub(super) use classes::{ClassOrders, MemberOwners};
-pub(super) use initializers::InitializerCalls;
+pub(super) use initializers::{InitializerCalls, InitializerLibrary};
 pub(super) use names::ReassignedLocalRead;
 pub(super) use references::PythonNameSites;
 

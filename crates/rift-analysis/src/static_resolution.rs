@@ -80,6 +80,10 @@ pub(crate) struct StaticResolution {
     pub(crate) python_variadic_start: Option<usize>,
     /// First generated initializer keyword reference, after earlier references.
     pub(crate) python_initializer_start: Option<usize>,
+    /// First keyword reference to a generated dataclass field.
+    pub(crate) python_dataclass_initializer_start: Option<usize>,
+    /// Primary Calls retained for the last initializer pass.
+    pub(crate) pending_dataclass_calls: Vec<(ProjectPath, usize, python_edges::InitializerCalls)>,
     /// First reference inside a compound Python string annotation.
     pub(crate) python_quoted_type_start: Option<usize>,
     pub(crate) python_overload_parameter_start: Option<usize>,
@@ -428,6 +432,7 @@ fn resolve_by<'source>(
     index.resolve_typescript_enum_qualifiers(&mut work, &mut resolution);
     index.resolve_javascript_call_object_selectors(&mut work, &mut resolution);
     index.resolve_typescript_namespace_local_exports(&mut work, &mut resolution);
+    index.resolve_python_dataclass_keywords(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -1991,6 +1996,7 @@ struct Index<'source> {
     /// The classes that declare a member, by the member's name.
     python_members: python_edges::MemberOwners<'source>,
     python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
+    has_dataclass_import: bool,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
     /// Budget every file pass consumed, joined or not.
@@ -2055,6 +2061,7 @@ impl<'source> Index<'source> {
         }
         let edge_python = python_edges::EdgePythonModules::build_edge(&files, work)?;
         let mut python_writes = BTreeMap::<_, Vec<_>>::new();
+        let mut has_dataclass_import = false;
         for file in files
             .values()
             .filter(|file| file.document.facts.language().name == "python")
@@ -2068,6 +2075,8 @@ impl<'source> Index<'source> {
                         .entry(file.text(binding.name)?)
                         .or_default()
                         .push((file.document.path.as_str(), receiver));
+                } else if let StaticBindingKind::PythonImport { module, .. } = binding.kind {
+                    has_dataclass_import |= file.text(module) == Some("dataclasses");
                 }
             }
         }
@@ -2090,6 +2099,7 @@ impl<'source> Index<'source> {
             python_aliases: python_edges::ClassAliases::default(),
             python_members: python_edges::MemberOwners::default(),
             python_writes,
+            has_dataclass_import,
             syntax_publication: syntax_publication?,
             unavailable_sources,
             #[cfg(test)]
@@ -2358,18 +2368,29 @@ impl<'source> Index<'source> {
                 continue;
             };
             Self::resolve_python_shared_file_work(
-                site,
+                site.file,
+                &mut site.remaining,
                 work,
                 resolution,
                 |file, work, resolution| {
-                    self.python_initializer_keywords(file, &calls, work, resolution);
+                    self.python_initializer_keywords(
+                        file,
+                        &calls,
+                        python_edges::InitializerLibrary::Attrs,
+                        work,
+                        resolution,
+                    );
                 },
             );
+            if self.has_dataclass_import {
+                site.initializers = Some(calls);
+            }
         }
         resolution.python_quoted_type_start = Some(resolution.occurrences.len());
         for site in pending.values_mut().filter(|site| site.quoted_types) {
             Self::resolve_python_shared_file_work(
-                site,
+                site.file,
+                &mut site.remaining,
                 work,
                 resolution,
                 |file, work, resolution| {
@@ -2380,13 +2401,25 @@ impl<'source> Index<'source> {
         resolution.python_overload_parameter_start = Some(resolution.occurrences.len());
         for site in pending.values_mut().filter(|site| site.overload_reads) {
             Self::resolve_python_shared_file_work(
-                site,
+                site.file,
+                &mut site.remaining,
                 work,
                 resolution,
                 |file, work, resolution| {
                     self.python_overload_parameter_reads(file, work, resolution);
                 },
             );
+        }
+        if self.has_dataclass_import {
+            resolution
+                .pending_dataclass_calls
+                .extend(pending.into_values().filter_map(|site| {
+                    Some((
+                        site.file.document.path.clone(),
+                        site.remaining,
+                        site.initializers?,
+                    ))
+                }));
         }
         #[cfg(test)]
         self.performed.fetch_add(
@@ -2396,18 +2429,19 @@ impl<'source> Index<'source> {
     }
 
     fn resolve_python_shared_file_work(
-        site: &mut PendingPythonReferences<'_, 'source>,
+        file: &File<'source>,
+        remaining: &mut usize,
         work: &mut Work,
         resolution: &mut StaticResolution,
         resolve: impl FnOnce(&File<'source>, &mut Work, &mut StaticResolution),
     ) {
         let left = work.budget.remaining();
-        let budget = left.min(site.remaining);
+        let budget = left.min(*remaining);
         let mut pending_work = Work::new(budget);
-        resolve(site.file, &mut pending_work, resolution);
+        resolve(file, &mut pending_work, resolution);
         let used = budget.saturating_sub(pending_work.budget.remaining());
         work.budget = LoopBudget::new(left.saturating_sub(used));
-        site.remaining = site.remaining.saturating_sub(used);
+        *remaining = remaining.saturating_sub(used);
         resolution.ended |= pending_work.exhausted;
     }
 
