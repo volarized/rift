@@ -836,7 +836,7 @@ fn typescript_local_export_references_follow_existing_package_edges() {
                 &files,
                 &semantics,
                 limits,
-                &BTreeSet::new(),
+                &super::super::namespace::typescript::JavaScriptModulePaths::default(),
             )
             .expect("bounded module references");
         assert_eq!(records.edges.len(), prior.len() + extra);
@@ -9200,4 +9200,59 @@ fn checked_typescript_callback_body_keeps_its_selected_file_module() {
                     .is_some_and(|site| site.unit == module.unit)
         }));
     }
+}
+
+#[test]
+fn checked_javascript_export_subpath_keeps_forwarding_module() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./index.mjs","./config":"./config.mjs"}}"#;
+    for source in [
+        "import { helper as selected } from './worker.mjs';\nexport { selected as helper };\n",
+        "export { helper } from './worker.mjs';\n",
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const ready = 1;\n"),
+                ("worker.mjs", "export const helper = 2;\n"),
+                ("config.mjs", source),
+                ("unselected.mjs", source),
+            ],
+            None,
+            Some(("package.json", META)),
+        )
+        .expect("captured JavaScript export subpath");
+        let graph = analysis.publication();
+        graph.validate_facts().expect("physical export module");
+        let module = checked_module_declaration(graph, "config.mjs", source)
+            .expect("whole written export module");
+        assert!(module.symbol.as_str().ends_with("/beacon%2Fconfig"));
+        assert!(checked_module_declaration(graph, "unselected.mjs", source).is_none());
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge.from == module.symbol
+                && edge.to.as_str().ends_with("/beacon%2Fworker.mjs")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == module.unit)
+        }));
+    }
+}
+
+fn checked_module_declaration<'graph>(
+    graph: &'graph PackagePublication,
+    path: &str,
+    source: &str,
+) -> Option<&'graph PackageSymbol> {
+    let unit = graph.units.iter().find(|unit| unit.path.0 == path)?;
+    graph.declarations.iter().find(|row| {
+        row.unit == unit.unit
+            && row.range.start == 0
+            && row.source == source
+            && row.source_complete
+            && graph.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&row.symbol)
+                    && object.kinds.contains(&SymbolKind::Module)
+            })
+    })
 }
