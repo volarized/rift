@@ -8316,3 +8316,74 @@ fn written_prototype_alias_uses_the_checked_local_function() {
         );
     }
 }
+
+#[test]
+fn named_function_value_keeps_checked_assigned_local_properties() {
+    const SOURCE: &str = concat!(
+        "var parser;\n",
+        "(function (exports) {\n",
+        "  function Parser() {}\n",
+        "  Parser.prototype.scan = function scan() {\n",
+        "    var settings;\n",
+        "    settings = { 'enabled': true, 'precision': 2 };\n",
+        "    return settings;\n",
+        "  };\n",
+        "  exports.Parser = Parser;\n",
+        "}(parser = {}));\n",
+        "module.exports = parser;\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("assigned local owner")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("exact assigned properties");
+    let settings = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("variable_declarator")
+                && row.source == "settings"
+        })
+        .expect("written local declaration");
+    for source in ["'enabled': true", "'precision': 2"] {
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == source && row.source_complete)
+            .expect("complete property definition");
+        assert_eq!(
+            row.range,
+            module_runtime_range(SOURCE.find(source).expect("pair location"), source),
+        );
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&settings.symbol)
+        }));
+    }
+
+    for refused in [
+        SOURCE.replace("    var settings;\n", ""),
+        SOURCE.replace("function scan() {", "function () {"),
+    ] {
+        let other = analyze(&refused);
+        assert!(
+            !other
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/settings/'enabled'") })
+        );
+    }
+}

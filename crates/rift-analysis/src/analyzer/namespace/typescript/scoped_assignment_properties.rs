@@ -1,4 +1,4 @@
-//! Physical local owners of literal properties written by an inline assignment.
+//! Physical local owners of literal properties written by a direct assignment.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -122,15 +122,23 @@ fn assigned_literal_owners(
         .iter()
         .map(|call| call.callee_range)
         .collect::<BTreeSet<_>>();
-    let invocations = facts
+    let writes = facts
+        .function_writes()
+        .iter()
+        .map(|target| target.end)
+        .collect::<BTreeSet<_>>();
+    let functions = facts
         .function_values()
         .iter()
-        .filter_map(|&(function, value)| callees.contains(&value).then_some(function))
+        .filter_map(|&(function, value)| {
+            (callees.contains(&value) || written_assigned_named_function(source, function, &writes))
+                .then_some(function)
+        })
         .collect::<BTreeSet<_>>();
-    if invocations.is_empty() {
+    if functions.is_empty() {
         return BTreeMap::new();
     }
-    let functions = physical_function_ranges(file, facts);
+    let physical = physical_function_ranges(file, facts);
     let mut named = BTreeMap::<&str, Vec<&StaticBinding>>::new();
     for binding in facts.bindings() {
         if let Some(name) = text(source, binding.name) {
@@ -155,8 +163,8 @@ fn assigned_literal_owners(
         .filter_map(|write| {
             let name = text(source, write.target)?;
             let binding = checked_binding(write, named.get(name)?)?;
-            let function = functions.resolve(write.target.start, write.object.end)?;
-            if *function != binding.scope || !invocations.contains(function) {
+            let function = physical.resolve(write.target.start, write.object.end)?;
+            if *function != binding.scope || !functions.contains(function) {
                 return None;
             }
             let declared = declarations.get(&binding.name)?;
@@ -167,6 +175,39 @@ fn assigned_literal_owners(
             Some((write.object, SymbolIdentity::parse(owner.as_str()).ok()?))
         })
         .collect()
+}
+
+/// Requires the direct written name of the exact assignment's function value.
+fn written_assigned_named_function(
+    source: &str,
+    function: ByteRange,
+    writes: &BTreeSet<u64>,
+) -> bool {
+    let checked = || {
+        let body = text(source, function)?.strip_prefix("function")?;
+        if !body.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let (name, _) = body.split_once('(')?;
+        let name = name.trim();
+        let target_end = *writes.range(..function.start).next_back()?;
+        let operator = text(
+            source,
+            ByteRange {
+                start: target_end,
+                end: function.start,
+            },
+        )?;
+        let mut characters = name.bytes();
+        let initial = characters.next()?;
+        ((initial.is_ascii_alphabetic() || matches!(initial, b'_' | b'$'))
+            && characters.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, b'_' | b'$')
+            })
+            && operator.trim() == "=")
+            .then_some(())
+    };
+    checked().is_some()
 }
 
 fn physical_function_ranges(
