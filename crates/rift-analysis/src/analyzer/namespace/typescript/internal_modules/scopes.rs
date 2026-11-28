@@ -1361,6 +1361,7 @@ struct LiteralOwners<'source> {
     bound_calls: BTreeSet<ByteRange>,
     returned: BTreeMap<ByteRange, Option<&'source str>>,
     object_methods: BTreeMap<ByteRange, &'source SyntaxSymbol>,
+    function_initializers: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     array_initializers: BTreeMap<&'source str, ByteRange>,
     assigned_arrays: BTreeMap<ByteRange, &'source str>,
     assigned_literal_bodies: BTreeMap<ByteRange, &'source str>,
@@ -1388,7 +1389,6 @@ impl<'source> LiteralOwners<'source> {
         let unique = unique_declarations(symbols);
         let functions = literal_callable_owners(&unique, facts, anchors, &values);
         let object_methods = literal_object_method_owners(&unique, facts, anchors);
-        let array_initializers = array_literal_owners(file, &unique, anchors);
         let mut initializers = BTreeMap::new();
         for function in functions.values() {
             let range = match function.syntax_element_kind {
@@ -1466,7 +1466,12 @@ impl<'source> LiteralOwners<'source> {
                 .into_values()
                 .map(|method| (method.item_range, method))
                 .collect(),
-            array_initializers,
+            function_initializers: literal_receiver_initializers(
+                &unique,
+                anchors,
+                &receiver_scopes,
+            ),
+            array_initializers: array_literal_owners(file, &unique, anchors),
             assigned_arrays,
             assigned_literal_bodies,
         }
@@ -1722,6 +1727,33 @@ fn closed_callable_scope(facts: &StaticFacts, symbol: &SyntaxSymbol) -> Option<B
         && symbol.item_range == export.assignment
         && callable.encloses(symbol.body_range?))
     .then_some(callable)
+}
+
+/// Matches a placed callable variable to the parser's exact receiver-bearing initializer.
+fn literal_receiver_initializers<'source>(
+    unique: &BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    anchors: &BTreeMap<String, SymbolId>,
+    scopes: &BTreeSet<ByteRange>,
+) -> BTreeMap<ByteRange, &'source SyntaxSymbol> {
+    unique
+        .values()
+        .flatten()
+        .copied()
+        .filter_map(|owner| {
+            let body = owner.body_range?;
+            (callable_variable(owner)
+                && owner.item_range.encloses(body)
+                && scopes.contains(&body)
+                && anchors.contains_key(&owner.qualified_name))
+            .then_some((body, owner))
+        })
+        .collect()
+}
+
+fn callable_variable(symbol: &SyntaxSymbol) -> bool {
+    symbol.syntax_element_kind == Some("variable_declarator")
+        && symbol.kind == "variable"
+        && symbol.kinds.contains(&SymbolKind::Callable)
 }
 
 /// Names a placed method whose literal is the entire value of one checked declaration.

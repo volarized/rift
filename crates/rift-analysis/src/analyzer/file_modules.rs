@@ -902,6 +902,8 @@ fn file_module_candidates<'file>(
     authored: &BTreeSet<&str>,
 ) -> FileModuleCandidates<'file> {
     let proven_receivers = commonjs_module_source_units(semantics);
+    let callback_sources =
+        super::javascript_callbacks::typescript_callback_module_sources(analyzed, semantics);
     let complete = units
         .iter()
         .filter(|unit| unit.source_complete)
@@ -930,6 +932,7 @@ fn file_module_candidates<'file>(
                         && syntax.static_facts().is_some_and(|facts| {
                             facts.has_javascript_module_statement() && !facts.reexports().is_empty()
                         })
+                        || callback_sources.contains(file.placement.unit())
                 }
                 _ => false,
             };

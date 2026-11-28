@@ -2,15 +2,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::{PortableSymbolFacts, SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId};
+use rift_core::{
+    PortableSymbolFacts, ReferenceRole, SourceUnitId as CoreSourceUnitId, SymbolId as CoreSymbolId,
+};
 use rift_error::RiftError;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::{PackageAnalysisWarning, PackageSymbol, StoredEdge};
 use rift_protocol::read::{
     Digest, EdgeKind, EdgeProvider, ExactKind, SourceKind, SymbolId, SymbolKind, TextRange,
 };
-use rift_provider::AssembledSymbol;
-use rift_syntax::{ByteRange, StaticFunctionContext};
+use rift_provider::{AssembledSymbol, NormalizedTarget};
+use rift_syntax::{
+    ByteRange, StaticBindingKind, StaticFunctionContext, SyntaxProvider, SyntaxSource,
+    TypeScriptDialect,
+};
 
 use crate::{EnclosingDefinitions, ExactPackageLimits, WorkspaceSemantics, edge::Edge};
 
@@ -441,6 +446,150 @@ fn stored_callback_edge_key(edge: &StoredEdge, kind: EdgeKind) -> Option<Callbac
         edge.from.as_str(),
         edge.to.as_str(),
     ))
+}
+
+/// Selects files where a written anonymous callback calls an independently resolved value import.
+pub(super) fn typescript_callback_module_sources<'file>(
+    files: &'file [AnalyzedFile],
+    semantics: &WorkspaceSemantics,
+) -> BTreeSet<&'file CoreSourceUnitId> {
+    let candidates = files
+        .iter()
+        .filter_map(|file| {
+            let syntax = file.file.syntax();
+            if syntax.language().name != "typescript"
+                || crate::static_resolution::is_declaration_file(file.file.path().as_str())
+                || syntax.primary_symbols_len() != 0
+            {
+                return None;
+            }
+            let facts = syntax.static_facts()?;
+            if !facts.has_javascript_module_statement() {
+                return None;
+            }
+            let names = facts
+                .bindings()
+                .iter()
+                .filter_map(|binding| {
+                    let StaticBindingKind::JavaScriptImport {
+                        module,
+                        export: Some(export),
+                    } = binding.kind
+                    else {
+                        return None;
+                    };
+                    let specifier = source_text(file.file.source(), module)?;
+                    (specifier.starts_with("./") || specifier.starts_with("../"))
+                        .then_some([(binding.name, export.start), (export, export.start)])
+                })
+                .flatten()
+                .collect::<BTreeMap<_, _>>();
+            if names.is_empty() {
+                return None;
+            }
+            let scopes = callback_scopes(file)?;
+            Some((file.placement.unit(), (file, names, scopes)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut imports = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut calls = BTreeSet::new();
+    for occurrence in semantics.static_occurrences() {
+        let unit = occurrence.binding.unit();
+        let Some((&unit, (_, names, scopes))) = candidates.get_key_value(unit) else {
+            continue;
+        };
+        let NormalizedTarget::Symbol(target) = &occurrence.target else {
+            continue;
+        };
+        let source = occurrence.binding.range();
+        if occurrence.role == ReferenceRole::Import
+            && let Some(&selector) = names.get(&ByteRange {
+                start: source.start(),
+                end: source.end(),
+            })
+        {
+            imports.entry((unit, target)).or_default().insert(selector);
+        } else if occurrence.role == ReferenceRole::Call
+            && scopes
+                .containing(source.start(), source.end())
+                .is_some_and(|mut scopes| {
+                    scopes.next().is_some_and(Option::is_some) && scopes.all(Option::is_some)
+                })
+        {
+            calls.insert((unit, target));
+        }
+    }
+    let mut witnesses = BTreeMap::<_, BTreeSet<_>>::new();
+    for (unit, target) in calls {
+        if let Some(selectors) = imports.get(&(unit, target)) {
+            witnesses
+                .entry(unit)
+                .or_default()
+                .extend(selectors.iter().copied());
+        }
+    }
+    witnesses
+        .into_iter()
+        .filter_map(|(unit, names)| {
+            let (file, _, _) = candidates.get(unit)?;
+            has_checked_value_import(file, &names).then_some(unit)
+        })
+        .collect()
+}
+
+/// Checks the original value selectors only after a resolved invocation supplies a witness.
+fn has_checked_value_import(file: &AnalyzedFile, names: &BTreeSet<u64>) -> bool {
+    let facts = file.file.syntax();
+    let Some(limits) = facts.syntax_limits() else {
+        return false;
+    };
+    let dialect = if facts.language().dialect.as_deref() == Some("tsx") {
+        TypeScriptDialect::Tsx
+    } else {
+        TypeScriptDialect::TypeScript
+    };
+    let source = file.file.source();
+    let Ok(document) = dialect.provider().analyze(
+        SyntaxSource {
+            path: file.file.path(),
+            text: source,
+        },
+        limits,
+    ) else {
+        return false;
+    };
+    if document.facts().has_errors() {
+        return false;
+    }
+    let nodes = document.syntax_elements();
+    nodes.iter().any(|selector| {
+        if selector.kind != "import_specifier" || !names.contains(&selector.range.start) {
+            return false;
+        }
+        let Some((list, clause, statement)) = selector
+            .parent
+            .and_then(|index| nodes.get(index))
+            .and_then(|list| Some((list, nodes.get(list.parent?)?)))
+            .and_then(|(list, clause)| Some((list, clause, nodes.get(clause.parent?)?)))
+        else {
+            return false;
+        };
+        list.kind == "named_imports"
+            && clause.kind == "import_clause"
+            && statement.kind == "import_statement"
+            && statement.parent == Some(0)
+            && source_text(
+                source,
+                ByteRange {
+                    start: statement.range.start,
+                    end: clause.range.start,
+                },
+            )
+            .is_some_and(|prefix| prefix.trim_end() == "import")
+    })
 }
 
 fn callback_scopes(file: &AnalyzedFile) -> Option<EnclosingDefinitions<Option<Callback>>> {

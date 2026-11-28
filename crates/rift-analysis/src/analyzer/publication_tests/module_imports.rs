@@ -9123,3 +9123,81 @@ fn checked_typescript_source_reexport_retains_its_module_and_specifier() {
         );
     }
 }
+
+#[test]
+fn checked_typescript_callback_body_keeps_its_selected_file_module() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const PATH: &str = "check.test.ts";
+    const SOURCE: &str = "import { describe, test } from '@jest/globals';\n\
+        import { Item } from './index.js';\n\
+        describe('suite', () => { test('reads', () => new Item().read()); });\n";
+    for (source, expected) in [
+        (Some(SOURCE), true),
+        (None, false),
+        (Some("import { Item } from './index.js';\n"), false),
+        (Some("import './index.js';\n"), false),
+        (Some("import type { Item } from './index.js';\n"), false),
+        (
+            Some("import type { Item } from './index.js';\nrun(() => new Item().read());\n"),
+            false,
+        ),
+        (
+            Some("import { type Item } from './index.js';\nrun(() => new Item().read());\n"),
+            false,
+        ),
+        (
+            Some("import { Item } from './index.js';\nnew Item().read();\n"),
+            false,
+        ),
+        (
+            Some("import { Item } from './index.js';\nrun(() => 1);\n"),
+            false,
+        ),
+        (
+            Some("import { Item } from './index.js';\nrun((Item) => new Item().read());\n"),
+            false,
+        ),
+    ] {
+        let mut files = vec![
+            ("index.ts", "export { Item } from './item.js';\n"),
+            ("item.ts", "export class Item { read() { return 1; } }\n"),
+        ];
+        files.extend(source.map(|source| (PATH, source)));
+        let analysis = internal_modules::analyze(META, &files);
+        let graph = analysis.publication();
+        graph.validate_facts().expect("published package");
+        let module = graph.declarations.iter().find(|row| {
+            graph
+                .units
+                .iter()
+                .any(|unit| unit.path.0 == PATH && unit.unit == row.unit)
+                && row.range.start == 0
+                && source == Some(row.source.as_str())
+        });
+        assert_eq!(module.is_some(), expected, "{source:?}");
+        let Some(module) = module else {
+            continue;
+        };
+        let specifier = "'./index.js'";
+        let start = SOURCE.find(specifier).expect("written specifier");
+        let end = start + specifier.len();
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge.from == module.symbol
+                && edge.to.0.ends_with("%2Findex.ts")
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == module.unit
+                        && usize::try_from(site.range.start) == Ok(start)
+                        && usize::try_from(site.range.end) == Ok(end)
+                })
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.to.0.ends_with("/Item/read")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == module.unit)
+        }));
+    }
+}
