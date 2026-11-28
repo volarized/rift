@@ -56,10 +56,25 @@ impl Records {
         limits: ExactPackageLimits,
         kind: EdgeKind,
     ) -> Result<(), RiftError> {
+        self.retain_ecmascript_callback_edges_in(owner, analyzed, semantics, limits, kind, None)
+    }
+
+    pub(super) fn retain_ecmascript_callback_edges_in(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+        kind: EdgeKind,
+        modules: Option<&BTreeSet<String>>,
+    ) -> Result<(), RiftError> {
         if self.symbols_truncated {
             return Ok(());
         }
-        let files = self.ecmascript_callback_files(analyzed, kind);
+        let mut files = self.ecmascript_callback_files(analyzed, kind);
+        if let Some(modules) = modules {
+            files.retain(|_, file| modules.contains(file.module.as_str()));
+        }
         if files.is_empty() {
             return Ok(());
         }
