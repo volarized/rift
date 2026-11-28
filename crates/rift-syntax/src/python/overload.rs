@@ -8,23 +8,32 @@ use crate::{
     ByteRange, PythonOverload, StaticBindingKind, StaticFacts, SyntaxLimits, SyntaxSymbol,
 };
 
-use super::PARAMETER_KIND_WORD;
+use super::{PARAMETER_KIND_WORD, python_kinds};
 
 #[derive(Debug, Clone)]
-struct ImportedOverload {
+struct TypingImport {
     statement: ByteRange,
     module: ByteRange,
     imported: Option<ByteRange>,
     binding: ByteRange,
+    name: TypingName,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypingName {
+    Module,
+    Overload,
+    TypeChecking,
 }
 
 /// Bounded import bindings from the existing Python parse.
 #[derive(Debug, Default)]
 pub(super) struct OverloadContext {
-    imports: BTreeMap<String, ImportedOverload>,
+    imports: BTreeMap<String, TypingImport>,
     shadowed: BTreeSet<String>,
     unknown: bool,
     stub_signatures: BTreeSet<ByteRange>,
+    guarded_members: BTreeMap<ByteRange, (ByteRange, PythonOverload)>,
 }
 
 impl OverloadContext {
@@ -44,6 +53,8 @@ impl OverloadContext {
             context.import(statement, source)?;
         }
         let mut work = vec![(root, 0_usize)];
+        let mut guarded = Vec::new();
+        let mut writes_guard = false;
         let mut visited = 0_usize;
         while let Some((syntax_element, depth)) = work.pop() {
             if visited >= limits.syntax_elements_max() || depth > limits.syntax_depth_max() {
@@ -55,14 +66,21 @@ impl OverloadContext {
                 "assignment" | "augmented_assignment" => {
                     if let Some(left) = syntax_element.child_by_field_name("left") {
                         context.shadow(left, source);
+                        writes_guard |= left
+                            .child_by_field_id(python_kinds().attribute_name.get())
+                            .is_some_and(|name| {
+                                source.get(name.byte_range()) == Some("TYPE_CHECKING")
+                            });
                     }
                 }
                 "function_definition" | "class_definition" => {
-                    if stub
-                        && syntax_element.kind() == "function_definition"
-                        && written_stub_signature(syntax_element)
-                    {
-                        context.stub_signatures.insert(byte_range(syntax_element)?);
+                    if syntax_element.kind_id() == python_kinds().function {
+                        if stub && written_stub_signature(syntax_element) {
+                            context.stub_signatures.insert(byte_range(syntax_element)?);
+                        }
+                        if let Some((suite, condition)) = guarded_suite(syntax_element) {
+                            guarded.push((syntax_element, suite, condition));
+                        }
                     }
                     if let Some(name) = syntax_element.child_by_field_name("name") {
                         context.shadow(name, source);
@@ -90,6 +108,16 @@ impl OverloadContext {
                     break;
                 }
                 work.push((child, depth.saturating_add(1)));
+            }
+        }
+        if !context.unknown && !writes_guard {
+            for (function, suite, condition) in guarded {
+                if context.type_checking(condition, source) {
+                    let state = context.decorated_state(function, wrapper(function), source)?;
+                    context
+                        .guarded_members
+                        .insert(byte_range(function)?, (byte_range(suite)?, state));
+                }
             }
         }
         Ok(context)
@@ -154,19 +182,24 @@ impl OverloadContext {
                 source.get(module.byte_range()),
                 Some("typing" | "typing_extensions")
             );
-            let valid =
-                valid_module && (!from || source.get(imported.byte_range()) == Some("overload"));
-            if !valid || self.imports.contains_key(bound_name) {
+            let name = match (valid_module, from, source.get(imported.byte_range())) {
+                (true, false, _) => Some(TypingName::Module),
+                (true, true, Some("overload")) => Some(TypingName::Overload),
+                (true, true, Some("TYPE_CHECKING")) => Some(TypingName::TypeChecking),
+                _ => None,
+            };
+            let Some(name) = name.filter(|_| !self.imports.contains_key(bound_name)) else {
                 self.shadowed.insert(bound_name.to_owned());
                 continue;
-            }
+            };
             self.imports.insert(
                 bound_name.to_owned(),
-                ImportedOverload {
+                TypingImport {
                     statement: byte_range(statement)?,
                     module: byte_range(module)?,
                     imported: from.then(|| byte_range(imported)).transpose()?,
                     binding: byte_range(binding)?,
+                    name,
                 },
             );
         }
@@ -178,20 +211,27 @@ impl OverloadContext {
         syntax_element: Node<'_>,
         source: &str,
     ) -> Result<PythonOverload, RiftError> {
-        let parent = syntax_element
-            .parent()
-            .filter(|parent| parent.kind() == "decorated_definition")
-            .unwrap_or(syntax_element);
-        let allowed_scope = parent.parent().is_some_and(|scope| {
-            scope.kind() == "module"
-                || (scope.kind() == "block"
-                    && scope
-                        .parent()
-                        .is_some_and(|outer| outer.kind() == "class_definition"))
-        });
+        let parent = wrapper(syntax_element);
+        let allowed_scope = parent.parent().is_some_and(direct_suite);
         if !allowed_scope || self.unknown {
+            if self
+                .guarded_members
+                .get(&byte_range(syntax_element)?)
+                .is_some_and(|(_, state)| *state == PythonOverload::Ordinary)
+            {
+                return Ok(PythonOverload::GuardedImplementation);
+            }
             return Ok(PythonOverload::Unknown);
         }
+        self.decorated_state(syntax_element, parent, source)
+    }
+
+    fn decorated_state(
+        &self,
+        syntax_element: Node<'_>,
+        parent: Node<'_>,
+        source: &str,
+    ) -> Result<PythonOverload, RiftError> {
         if parent.id() == syntax_element.id() {
             return Ok(PythonOverload::Ordinary);
         }
@@ -213,8 +253,8 @@ impl OverloadContext {
                 }
                 continue;
             }
-            let (binding, qualified) = match expression.kind() {
-                "identifier" => (text, false),
+            let (binding, kind) = match expression.kind() {
+                "identifier" => (text, TypingName::Overload),
                 "attribute" => {
                     let Some(object) = expression.child_by_field_name("object") else {
                         return Ok(PythonOverload::Unknown);
@@ -228,13 +268,13 @@ impl OverloadContext {
                     let Some(binding) = source.get(object.byte_range()) else {
                         return Ok(PythonOverload::Unknown);
                     };
-                    (binding, true)
+                    (binding, TypingName::Module)
                 }
                 _ => return Ok(PythonOverload::Unknown),
             };
             let Some(import) = self.imports.get(binding).filter(|import| {
                 !self.shadowed.contains(binding)
-                    && qualified == import.imported.is_none()
+                    && kind == import.name
                     && import.statement.end <= decorator.start_byte() as u64
             }) else {
                 return Ok(PythonOverload::Unknown);
@@ -252,6 +292,70 @@ impl OverloadContext {
         }
         Ok(found.unwrap_or(PythonOverload::Ordinary))
     }
+
+    fn type_checking(&self, condition: Node<'_>, source: &str) -> bool {
+        let kinds = python_kinds();
+        let (binding, kind) = if condition.kind_id() == kinds.attribute {
+            let Some((object, member)) = condition
+                .child_by_field_id(kinds.object.get())
+                .zip(condition.child_by_field_id(kinds.attribute_name.get()))
+            else {
+                return false;
+            };
+            if source.get(member.byte_range()) != Some("TYPE_CHECKING") {
+                return false;
+            }
+            (object, TypingName::Module)
+        } else {
+            (condition, TypingName::TypeChecking)
+        };
+        binding.kind_id() == kinds.identifier
+            && source.get(binding.byte_range()).is_some_and(|name| {
+                !self.shadowed.contains(name)
+                    && self.imports.get(name).is_some_and(|import| {
+                        import.name == kind && import.statement.end <= condition.start_byte() as u64
+                    })
+            })
+    }
+
+    fn family_state<'family>(
+        &'family self,
+        symbol: &'family SyntaxSymbol,
+    ) -> Option<(Option<ByteRange>, &'family PythonOverload)> {
+        if let Some((suite, state)) = self.guarded_members.get(&symbol.item_range) {
+            return Some((Some(*suite), state));
+        }
+        symbol.python_overload.as_ref().map(|state| (None, state))
+    }
+}
+
+fn wrapper(function: Node<'_>) -> Node<'_> {
+    function
+        .parent()
+        .filter(|parent| parent.kind_id() == python_kinds().decorated)
+        .unwrap_or(function)
+}
+
+fn direct_suite(suite: Node<'_>) -> bool {
+    let kinds = python_kinds();
+    suite.kind_id() == kinds.module
+        || (suite.kind_id() == kinds.block
+            && suite
+                .parent()
+                .is_some_and(|parent| parent.kind_id() == kinds.class))
+}
+
+fn guarded_suite(function: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let kinds = python_kinds();
+    let suite = wrapper(function).parent()?;
+    let guarded = suite.parent()?;
+    (suite.kind_id() == kinds.block
+        && guarded.kind_id() == kinds.if_statement
+        && !guarded.has_error()
+        && guarded.child_by_field_id(kinds.consequence.get()) == Some(suite)
+        && guarded.parent().is_some_and(direct_suite))
+    .then(|| Some((suite, guarded.child_by_field_id(kinds.condition.get())?)))
+    .flatten()
 }
 
 /// Keeps repeated parameter names within distinct physical declarations of
@@ -263,7 +367,7 @@ pub(super) fn repeated_parameters(
     eligible: &BTreeMap<ByteRange, ByteRange>,
     overloads: &OverloadContext,
 ) -> BTreeSet<ByteRange> {
-    let owners = overload_members(symbols, facts, counts, &overloads.stub_signatures);
+    let owners = overload_members(symbols, facts, counts, overloads);
     if owners.is_empty() {
         return BTreeSet::new();
     }
@@ -296,7 +400,7 @@ fn overload_members<'symbols>(
     symbols: &'symbols [SyntaxSymbol],
     facts: &StaticFacts,
     counts: &BTreeMap<&str, usize>,
-    stub_signatures: &BTreeSet<ByteRange>,
+    overloads: &OverloadContext,
 ) -> BTreeMap<ByteRange, &'symbols str> {
     let mut families: BTreeMap<&str, Vec<&SyntaxSymbol>> = BTreeMap::new();
     for callable in symbols.iter().filter(|symbol| {
@@ -330,12 +434,15 @@ fn overload_members<'symbols>(
         let Some(binding) = last.name_range.and_then(|name| bindings.get(&name)) else {
             continue;
         };
-        let signatures = match last.python_overload {
-            Some(PythonOverload::Ordinary) => earlier,
-            Some(PythonOverload::Overload { .. })
+        let Some((suite, state)) = overloads.family_state(last) else {
+            continue;
+        };
+        let signatures = match state {
+            PythonOverload::Ordinary => earlier,
+            PythonOverload::Overload { .. }
                 if family
                     .iter()
-                    .all(|signature| stub_signatures.contains(&signature.item_range)) =>
+                    .all(|signature| overloads.stub_signatures.contains(&signature.item_range)) =>
             {
                 family.as_slice()
             }
@@ -345,19 +452,22 @@ fn overload_members<'symbols>(
             .iter()
             .any(|signature| signature.item_range.end > last.item_range.start)
             || !signatures.iter().all(|signature| {
-                matches!(
-                    signature.python_overload,
-                    Some(PythonOverload::Overload { .. })
-                ) && signature
-                    .name_range
-                    .and_then(|name| bindings.get(&name))
-                    .is_some_and(|signature_binding| {
-                        signature_binding.scope == binding.scope
-                            && matches!(
-                                signature_binding.kind,
-                                StaticBindingKind::Local | StaticBindingKind::PythonFunction { .. }
-                            )
+                overloads
+                    .family_state(signature)
+                    .is_some_and(|(written, state)| {
+                        written == suite && matches!(state, PythonOverload::Overload { .. })
                     })
+                    && signature
+                        .name_range
+                        .and_then(|name| bindings.get(&name))
+                        .is_some_and(|signature_binding| {
+                            signature_binding.scope == binding.scope
+                                && matches!(
+                                    signature_binding.kind,
+                                    StaticBindingKind::Local
+                                        | StaticBindingKind::PythonFunction { .. }
+                                )
+                        })
             })
         {
             continue;

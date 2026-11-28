@@ -149,6 +149,71 @@ fn package_python_overload_parameters_refuse_competing_declarations() {
 }
 
 #[test]
+fn package_python_checked_overload_parameters_keep_their_physical_sites() {
+    const FAMILY: &str = concat!(
+        "        @typing.overload\n",
+        "        def choose(self, value: int) -> int: ...\n",
+        "        @typing.overload\n",
+        "        def choose(self, value: str) -> str: ...\n",
+        "        def choose(self, value):\n",
+        "            return value\n",
+    );
+    for (prefix, condition, tail, expected) in [
+        ("import typing\n", "typing.TYPE_CHECKING", "", 3),
+        (
+            "import typing\nfrom typing import TYPE_CHECKING as checked\n",
+            "checked",
+            "",
+            3,
+        ),
+        ("import typing\n", "enabled", "", 0),
+        (
+            "import typing\ntyping = object()\n",
+            "typing.TYPE_CHECKING",
+            "",
+            0,
+        ),
+        (
+            "import typing\n",
+            "typing.TYPE_CHECKING",
+            "    if typing.TYPE_CHECKING:\n        def choose(self, value): pass\n",
+            0,
+        ),
+    ] {
+        let source = format!("{prefix}class Item:\n    if {condition}:\n{FAMILY}{tail}");
+        let result = publication(&[("click.py", source.as_str())], None, &["click"]);
+        let declarations = result
+            .declarations
+            .iter()
+            .filter(|entry| parameter(entry.symbol.as_str()))
+            .map(|entry| entry.range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), expected, "{source}");
+        if expected == 0 {
+            continue;
+        }
+        assert_eq!(
+            declarations,
+            source
+                .match_indices("def choose(self, ")
+                .map(|(start, prefix)| name_range(start + prefix.len()))
+                .collect::<Vec<_>>(),
+            "{source}"
+        );
+        let read = name_range(source.find("return value").expect("implementation") + 7);
+        assert!(result.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.from.as_str().ends_with("/Item/choose")
+                && parameter(edge.to.as_str())
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.range == read)
+        }));
+    }
+}
+
+#[test]
 fn package_python_stub_overloads_keep_each_written_parameter() {
     const STUB: &str = concat!(
         "from typing import overload\n",

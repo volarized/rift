@@ -236,7 +236,13 @@ impl<'source> Index<'source> {
                 return;
             }
             if file.enclosing_callable(read).is_some_and(|caller| {
-                caller.symbol.python_overload == Some(rift_syntax::PythonOverload::Ordinary)
+                matches!(
+                    caller.symbol.python_overload,
+                    Some(
+                        rift_syntax::PythonOverload::Ordinary
+                            | rift_syntax::PythonOverload::GuardedImplementation
+                    )
+                )
             }) && let Some(target) = file.python_parameter_read_target(read, name, work)
             {
                 self.record_python_local_read(file, read, target, result);
