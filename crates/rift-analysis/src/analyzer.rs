@@ -76,7 +76,7 @@ mod rust_lsp_macro_items;
 pub use rust_lsp_macro_items::{
     RustLspForeignDeclarationFile, RustLspMacroAdmission, RustLspMacroConstantFile,
     RustLspMacroDefinition, RustLspMacroDependency, RustLspMacroFile, RustLspMacroItems,
-    RustLspMacroSite,
+    RustLspMacroSite, RustLspTraitMethodFile,
 };
 mod rust_lsp_macro_references;
 pub use rust_lsp_macro_references::{RustLspMacroReference, RustLspMacroReferenceEdges};

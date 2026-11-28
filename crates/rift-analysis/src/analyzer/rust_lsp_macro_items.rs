@@ -23,6 +23,7 @@ use crate::ExactPackageLimits;
 mod associated_members;
 mod constants;
 mod foreign_declarations;
+mod trait_methods;
 mod variant_fields;
 
 /// A Rust macro invocation whose selected owner can be checked through a language server.
@@ -98,6 +99,15 @@ pub struct RustLspMacroConstantFile<'source> {
     pub declarations: &'source [(SourceRange, bool)],
 }
 
+/// Macro-tagged native default method names for one opened Rust unit.
+#[derive(Debug, Clone, Copy)]
+pub struct RustLspTraitMethodFile<'source> {
+    /// Selected complete macro expansions tied to the original source.
+    pub macros: RustLspMacroFile<'source>,
+    /// Exact byte ranges independently labeled as authored associated trait methods.
+    pub declarations: &'source [SourceRange],
+}
+
 /// Counts authored declaration facets added under the existing limits.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RustLspMacroAdmission {
@@ -148,7 +158,30 @@ impl PackageAnalyzer {
         let Some(document) = parse(path, source, limits) else {
             return Vec::new();
         };
-        sites(&document, true, Some(&scopes))
+        sites(
+            &document,
+            true,
+            Some(MemberScopes::implementations(&scopes)),
+        )
+        .into_values()
+        .collect()
+    }
+
+    /// Finds local Rust macro invocations directly inside retained trait syntax.
+    ///
+    /// An independently selected expansion and exact authored method name remain
+    /// necessary before publishing a method.
+    #[must_use]
+    pub fn rust_lsp_trait_macro_sites(
+        path: &ProjectPath,
+        source: &str,
+        limits: SyntaxLimits,
+    ) -> Vec<RustLspMacroSite> {
+        let Some(document) = parse(path, source, limits) else {
+            return Vec::new();
+        };
+        let scopes = trait_methods::scopes(&document);
+        sites_in_members(&document, MemberScopes::traits(&scopes))
             .into_values()
             .collect()
     }
@@ -300,6 +333,28 @@ impl PackageAnalyzer {
         )
     }
 
+    /// Publishes written default methods of checked local macros under their retained trait.
+    ///
+    /// The selected expansion proves the default method shape. Native roles must independently
+    /// establish the exact original name token. Call this after established declarations.
+    ///
+    /// # Errors
+    /// Returns an error if an admitted declaration cannot be represented canonically.
+    pub fn admit_rust_lsp_trait_methods(
+        publication: &mut PackagePublication,
+        observed: &[RustLspTraitMethodFile<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) -> Result<RustLspMacroAdmission, RiftError> {
+        Self::admit_rust_lsp_expansions(
+            publication,
+            ExpansionFiles::TraitMethods(observed),
+            &[],
+            producer,
+            limits,
+        )
+    }
+
     fn admit_rust_lsp_expansions(
         publication: &mut PackagePublication,
         observed: ExpansionFiles<'_>,
@@ -344,9 +399,9 @@ impl PackageAnalyzer {
             limits,
         );
         let imports = match observed {
-            ExpansionFiles::Items(_) | ExpansionFiles::Constants(_) => {
-                foreign_declarations::ImportedOwners::default()
-            }
+            ExpansionFiles::Items(_)
+            | ExpansionFiles::Constants(_)
+            | ExpansionFiles::TraitMethods(_) => foreign_declarations::ImportedOwners::default(),
             ExpansionFiles::Foreign(_) => foreign_declarations::ImportedOwners::capture(
                 publication,
                 &declarations,
@@ -404,6 +459,7 @@ enum ExpansionFiles<'source> {
     Items(&'source [RustLspMacroFile<'source>]),
     Foreign(&'source [RustLspForeignDeclarationFile<'source>]),
     Constants(&'source [RustLspMacroConstantFile<'source>]),
+    TraitMethods(&'source [RustLspTraitMethodFile<'source>]),
 }
 
 #[derive(Clone, Copy)]
@@ -411,6 +467,7 @@ enum ExpansionTokens<'source> {
     Definitions,
     Foreign(DeclarationTokens<'source>),
     Constants(DeclarationTokens<'source>),
+    TraitMethods(&'source [SourceRange]),
 }
 
 impl<'source> ExpansionFiles<'source> {
@@ -419,16 +476,18 @@ impl<'source> ExpansionFiles<'source> {
             Self::Items(files) => files.len(),
             Self::Foreign(files) => files.len(),
             Self::Constants(files) => files.len(),
+            Self::TraitMethods(files) => files.len(),
         }
     }
 
     fn files(
         &self,
     ) -> impl Iterator<Item = (&'source RustLspMacroFile<'source>, ExpansionTokens<'source>)> {
-        let (items, foreign, constants) = match self {
-            Self::Items(files) => (*files, &[][..], &[][..]),
-            Self::Foreign(files) => (&[][..], *files, &[][..]),
-            Self::Constants(files) => (&[][..], &[][..], *files),
+        let (items, foreign, constants, methods) = match self {
+            Self::Items(files) => (*files, &[][..], &[][..], &[][..]),
+            Self::Foreign(files) => (&[][..], *files, &[][..], &[][..]),
+            Self::Constants(files) => (&[][..], &[][..], *files, &[][..]),
+            Self::TraitMethods(files) => (&[][..], &[][..], &[][..], *files),
         };
         items
             .iter()
@@ -443,6 +502,12 @@ impl<'source> ExpansionFiles<'source> {
                     .iter()
                     .map(|file| (&file.macros, ExpansionTokens::Constants(file.declarations))),
             )
+            .chain(methods.iter().map(|file| {
+                (
+                    &file.macros,
+                    ExpansionTokens::TraitMethods(file.declarations),
+                )
+            }))
     }
 }
 
@@ -486,10 +551,32 @@ fn macro_sites(
     sites(&document, qualified, None).into_values().collect()
 }
 
+#[derive(Clone, Copy)]
+struct MemberScopes<'scope> {
+    kind: &'static str,
+    spans: &'scope BTreeSet<ByteRange>,
+}
+
+impl<'scope> MemberScopes<'scope> {
+    const fn implementations(spans: &'scope BTreeSet<ByteRange>) -> Self {
+        Self {
+            kind: "impl_item",
+            spans,
+        }
+    }
+
+    const fn traits(spans: &'scope BTreeSet<ByteRange>) -> Self {
+        Self {
+            kind: "trait_item",
+            spans,
+        }
+    }
+}
+
 fn sites(
     document: &SyntaxDocument,
     qualified: bool,
-    member_scopes: Option<&BTreeSet<ByteRange>>,
+    member_scopes: Option<MemberScopes<'_>>,
 ) -> BTreeMap<SourceRange, RustLspMacroSite> {
     let elements = document.syntax_elements();
     let mut sites = BTreeMap::new();
@@ -537,7 +624,7 @@ fn sites(
 fn site_scope(
     elements: &[rift_syntax::SyntaxElement],
     scope: &rift_syntax::SyntaxElement,
-    member_scopes: Option<&BTreeSet<ByteRange>>,
+    member_scopes: Option<MemberScopes<'_>>,
 ) -> bool {
     if scope.kind == "source_file" {
         return member_scopes.is_none();
@@ -551,7 +638,7 @@ fn site_scope(
     let Some(scopes) = member_scopes else {
         return owner.kind == "mod_item";
     };
-    if owner.kind != "impl_item" || !scopes.contains(&owner.range) || owner.has_error {
+    if owner.kind != scopes.kind || !scopes.spans.contains(&owner.range) || owner.has_error {
         return false;
     }
     let Some(lexical) = owner.parent.and_then(|index| elements.get(index)) else {
@@ -997,21 +1084,15 @@ fn collect_file<'a>(
     let Some(original) = parse(file.path, &unit.source, limits) else {
         return;
     };
-    let sites = sites(&original, true, None);
-    let scopes = member_scopes(file, &unit.source, &sites, limits);
-    let members = sites_in_members(&original, &scopes);
+    let trait_mode = matches!(&labels, ExpansionLabels::TraitMethods(_));
+    let scopes = MacroScopes::new(file, &original, &unit.source, trait_mode, limits);
     let starts = line_starts(&unit.source);
     let mut work = limits.source_bytes_max();
     for observation in file.expansions.iter().take(limits.syntax_elements_max()) {
         if observation.names.len() > limits.syntax_elements_max() {
             continue;
         }
-        let associated = members.contains_key(&observation.site.invocation);
-        let Some(site) = sites
-            .get(&observation.site.invocation)
-            .or_else(|| members.get(&observation.site.invocation))
-            .filter(|site| site.name == observation.site.name)
-        else {
+        let Some((site, associated)) = scopes.select(observation.site) else {
             continue;
         };
         let selected = observation.definition;
@@ -1031,11 +1112,7 @@ fn collect_file<'a>(
         };
         work = left;
         let expansion_digest = FileDigest::of(observation.expansion.as_bytes());
-        let owner = if associated {
-            associated_members::owner(&original, site.invocation, &scopes, existing, objects)
-        } else {
-            module_owner(&original, site.invocation, existing, objects)
-        };
+        let owner = scopes.owner(&original, site.invocation, associated, existing, objects);
         let Some(owner) = owner else {
             continue;
         };
@@ -1071,7 +1148,9 @@ fn collect_file<'a>(
         let observation = RustLspMacroItems {
             names: match labels {
                 ExpansionLabels::Definitions => observation.names,
-                ExpansionLabels::Foreign(..) | ExpansionLabels::Constants(_) => &confirmed,
+                ExpansionLabels::Foreign(..)
+                | ExpansionLabels::Constants(_)
+                | ExpansionLabels::TraitMethods(_) => &confirmed,
             },
             ..*observation
         };
@@ -1089,6 +1168,7 @@ enum ExpansionLabels<'source> {
         &'source foreign_declarations::ImportedOwners<'source>,
     ),
     Constants(constants::Labels),
+    TraitMethods(BTreeMap<SourceRange, bool>),
 }
 
 impl<'source> ExpansionLabels<'source> {
@@ -1105,6 +1185,13 @@ impl<'source> ExpansionLabels<'source> {
             ExpansionTokens::Constants(tokens) => {
                 Self::Constants(constants::labels(tokens, limits))
             }
+            ExpansionTokens::TraitMethods(tokens) => {
+                Self::TraitMethods(if tokens.len() > limits.syntax_elements_max() {
+                    BTreeMap::new()
+                } else {
+                    unique_claims(tokens)
+                })
+            }
         }
     }
 
@@ -1113,6 +1200,7 @@ impl<'source> ExpansionLabels<'source> {
             Self::Definitions => false,
             Self::Foreign(labels, _) => labels.is_empty(),
             Self::Constants(labels) => labels.is_empty(),
+            Self::TraitMethods(labels) => labels.is_empty(),
         }
     }
 }
@@ -1180,6 +1268,30 @@ fn expansion_candidates(
             confirmed.extend(names.keys().copied());
             names
         }
+        ExpansionLabels::TraitMethods(labels)
+            if local_scope
+                && !dependency
+                && owner.syntax_element_kind.as_deref() == Some("trait_item")
+                && definition
+                    .identity
+                    .qualified_path()
+                    .split_last()
+                    .is_some_and(|(_, parent)| {
+                        module.qualified_path().starts_with(parent)
+                            && module.qualified_path().len() > parent.len()
+                    }) =>
+        {
+            let names = trait_methods::candidates(
+                path,
+                &unit.source,
+                observation,
+                labels,
+                owner.public,
+                limits,
+            );
+            confirmed.extend(names.keys().copied());
+            names
+        }
         ExpansionLabels::Definitions if local_scope && associated && dependency => {
             associated_members::candidates(
                 path,
@@ -1202,11 +1314,75 @@ fn expansion_candidates(
     Some((names, confirmed))
 }
 
+struct MacroScopes {
+    trait_mode: bool,
+    modules: BTreeMap<SourceRange, RustLspMacroSite>,
+    members: BTreeMap<SourceRange, RustLspMacroSite>,
+    member_spans: BTreeSet<ByteRange>,
+}
+
+impl MacroScopes {
+    fn new(
+        file: &RustLspMacroFile<'_>,
+        original: &SyntaxDocument,
+        source: &str,
+        trait_mode: bool,
+        limits: SyntaxLimits,
+    ) -> Self {
+        let (modules, member_spans) = if trait_mode {
+            (BTreeMap::new(), trait_methods::scopes(original))
+        } else {
+            let modules = sites(original, true, None);
+            let member_spans = member_scopes(file, source, &modules, limits);
+            (modules, member_spans)
+        };
+        let spans = if trait_mode {
+            MemberScopes::traits(&member_spans)
+        } else {
+            MemberScopes::implementations(&member_spans)
+        };
+        let members = sites_in_members(original, spans);
+        Self {
+            trait_mode,
+            modules,
+            members,
+            member_spans,
+        }
+    }
+
+    fn select(&self, claimed: RustLspMacroSite) -> Option<(&RustLspMacroSite, bool)> {
+        let associated = self.members.contains_key(&claimed.invocation);
+        let site = self
+            .modules
+            .get(&claimed.invocation)
+            .or_else(|| self.members.get(&claimed.invocation))
+            .filter(|site| site.name == claimed.name)?;
+        Some((site, associated))
+    }
+
+    fn owner<'a>(
+        &self,
+        original: &SyntaxDocument,
+        invocation: SourceRange,
+        associated: bool,
+        existing: &[&'a PackageSymbol],
+        objects: &Objects<'_>,
+    ) -> Option<&'a PackageSymbol> {
+        if self.trait_mode {
+            trait_methods::owner(original, invocation, &self.member_spans, existing, objects)
+        } else if associated {
+            associated_members::owner(original, invocation, &self.member_spans, existing, objects)
+        } else {
+            module_owner(original, invocation, existing, objects)
+        }
+    }
+}
+
 fn sites_in_members(
     original: &SyntaxDocument,
-    scopes: &BTreeSet<ByteRange>,
+    scopes: MemberScopes<'_>,
 ) -> BTreeMap<SourceRange, RustLspMacroSite> {
-    if scopes.is_empty() {
+    if scopes.spans.is_empty() {
         return BTreeMap::new();
     }
     sites(original, true, Some(scopes))
@@ -2569,6 +2745,135 @@ mod shadow {
                 Some(placeholder),
             );
         }
+    }
+
+    #[test]
+    fn typed_trait_methods_require_the_checked_owner_and_complete_default_head() {
+        const SOURCE: &str = r"
+            macro_rules! methods {
+                ($first:ident, $second:ident, $ty:ty) => {
+                    fn $first(&self) -> Option<$ty> { None }
+                    fn $second(&self) -> Option<$ty> { None }
+                };
+            }
+            pub struct Local;
+            pub trait Reader {
+                methods!(written_first, written_second, u16);
+                fn explicit(&self) -> u8 { 2 }
+            }
+            impl Local { methods!(other_first, other_second, u16); }
+        ";
+        const EXPANSION: &str = "fn written_first(&self) -> Option<u16> { None }
+                                 fn written_second(&self) -> Option<u16> { None }";
+        let path = ProjectPath::new("src/lib.rs").expect("fixture unit");
+        let limits = ExactPackageLimits::new(16, 2 * 1024 * 1024);
+        let digest = FileDigest::of(SOURCE.as_bytes());
+        let token = |name: &str| {
+            let offset = SOURCE.find(name).expect("written fixture token");
+            SourceRange::new(offset as u64, (offset + name.len()) as u64).expect("range")
+        };
+        let sites = PackageAnalyzer::rust_lsp_trait_macro_sites(&path, SOURCE, limits.syntax());
+        assert_eq!(sites.len(), 1);
+        let observation = RustLspMacroItems {
+            site: sites[0],
+            definition: RustLspMacroDefinition {
+                path: &path,
+                digest,
+                range: token("methods"),
+            },
+            expansion: EXPANSION,
+            names: &[],
+        };
+        let producer = FactProducer {
+            name: ProducerName::parse("rust-analyzer").expect("producer"),
+            revision: ProducerRevision::parse("1").expect("revision"),
+        };
+        let base = authored_macro_fixture(vec![(path.as_str(), SOURCE)]);
+        let good = [
+            token("written_first"),
+            token("written_second"),
+            token("other_first"),
+        ];
+        let claimed = |graph: &mut PackagePublication, declarations: &[_], expansion, limits| {
+            PackageAnalyzer::admit_rust_lsp_trait_methods(
+                graph,
+                &[RustLspTraitMethodFile {
+                    macros: RustLspMacroFile {
+                        path: &path,
+                        digest,
+                        expansions: &[RustLspMacroItems {
+                            expansion,
+                            ..observation
+                        }],
+                    },
+                    declarations,
+                }],
+                &producer,
+                limits,
+            )
+            .expect("bounded trait method proof")
+        };
+        let mut graph = base.clone();
+        assert_eq!(claimed(&mut graph, &good, EXPANSION, limits).admitted, 2);
+        assert_typed_trait_facets(&graph, &base, &good[..2]);
+        for (tokens, expansion, count) in [
+            (&good[..1], EXPANSION, 1),
+            (&[good[0], good[0], good[1]][..], EXPANSION, 1),
+            (
+                &good[..],
+                "fn written_first(&self); fn written_second(&self) { let =; }",
+                0,
+            ),
+            (
+                &good[..],
+                "fn written_first(&self) {} fn written_first(&self) {}",
+                0,
+            ),
+        ] {
+            assert_eq!(
+                claimed(&mut base.clone(), tokens, expansion, limits).admitted,
+                count
+            );
+        }
+        let limited = limits
+            .with_declarations(u32::try_from(base.declarations.len() + 1).expect("capacity"))
+            .expect("one remaining");
+        assert_eq!(
+            claimed(&mut base.clone(), &good, EXPANSION, limited),
+            RustLspMacroAdmission {
+                admitted: 1,
+                dropped_at_limit: 1
+            }
+        );
+    }
+
+    fn assert_typed_trait_facets(
+        graph: &PackagePublication,
+        baseline: &PackagePublication,
+        labels: &[SourceRange],
+    ) {
+        for (name, label) in ["written_first", "written_second"].into_iter().zip(labels) {
+            let suffix = format!("/Reader/{name}");
+            let row = graph
+                .declarations
+                .iter()
+                .find(|row| row.symbol.as_str().ends_with(&suffix))
+                .expect("authored trait method");
+            assert!(row.public);
+            assert_eq!(row.source, name);
+            assert_eq!(
+                (row.range.start, row.range.end),
+                (label.start(), label.end())
+            );
+        }
+        assert!(
+            baseline
+                .declarations
+                .iter()
+                .all(|row| graph.declarations.contains(row))
+        );
+        assert_eq!(graph.edges, baseline.edges);
+        graph.validate_facts().expect("valid trait publication");
     }
 
     const CONSTANT_SOURCE: &str = r"

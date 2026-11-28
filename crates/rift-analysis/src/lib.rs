@@ -34,7 +34,7 @@ pub use analyzer::{
     RustLspMacroAdmission, RustLspMacroConstantFile, RustLspMacroDefinition,
     RustLspMacroDependency, RustLspMacroFile, RustLspMacroItems, RustLspMacroReference,
     RustLspMacroReferenceEdges, RustLspMacroSite, RustLspOperatorDefinition, RustLspOperatorEdges,
-    RustLspOperatorSite, StubForm, public_qualified_names,
+    RustLspOperatorSite, RustLspTraitMethodFile, StubForm, public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
 #[cfg(feature = "collector")]
