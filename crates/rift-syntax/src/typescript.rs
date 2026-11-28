@@ -126,6 +126,21 @@ impl TypeScriptSyntaxProvider {
         ecmascript::checked_property_selectors(&self.dialect.grammar(), source, limits)
     }
 
+    /// Returns the written members selected across every field of a closed object type.
+    ///
+    /// # Errors
+    ///
+    /// Refuses source beyond the syntax limits or an unavailable parse.
+    pub fn closed_keyof_members(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        owner: crate::ByteRange,
+        member: &str,
+    ) -> Result<Option<Vec<crate::ByteRange>>, RiftError> {
+        ecmascript::closed_keyof_members(&self.dialect.grammar(), source, limits, owner, member)
+    }
+
     /// Checks captured property ranges against conditional type positions in their aliases.
     ///
     /// Candidates carry the written alias range and the retained member, body and holder

@@ -183,6 +183,8 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_inline_import_type_start: Option<usize>,
     /// First appended written TypeScript declaration property selector.
     pub(crate) typescript_property_selector_start: Option<usize>,
+    /// First references emitted by a checked closed object selector.
+    pub(crate) typescript_keyof_member_start: Option<usize>,
     /// First module edge at a checked inline import specifier.
     pub(crate) typescript_inline_import_module_start: Option<usize>,
     /// First checked reference at a TypeScript enum qualifier.
@@ -441,8 +443,9 @@ fn resolve_by<'source>(
     index.resolve_typescript_namespace_local_exports(&mut work, &mut resolution);
     index.resolve_python_dataclass_keywords(&mut work, &mut resolution);
     index.resolve_python_assignment_expression_reads(&mut work, &mut resolution);
-    index.resolve_typescript_property_selectors(&mut work, &mut resolution);
+    let keyof = index.resolve_typescript_property_selectors(&mut work, &mut resolution);
     index.resolve_python_lambda_parameter_reads(&mut work, &mut resolution);
+    index.resolve_keyof_members(keyof, &mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

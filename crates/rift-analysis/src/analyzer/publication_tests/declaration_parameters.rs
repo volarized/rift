@@ -4,6 +4,103 @@ use super::*;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider};
 
 #[test]
+fn declaration_keyof_index_recovers_every_checked_nested_member() {
+    const ROUTES: &str = concat!(
+        "export interface Routes {\n",
+        "  \"/one\": { response: number; parameters: boolean };\n",
+        "  \"/two\": { response: string; parameters: boolean };\n",
+        "}\n",
+        "export interface Other { \"/one\": { response: number }; }\n",
+        "export interface Open { [route: string]: { response: number }; one: { response: number }; }\n",
+        "export interface Incomplete { one: { response: number }; two: { parameters: number }; }\n",
+    );
+    const USE: &str = concat!(
+        "import type { Routes, Other, Open, Incomplete } from './routes.js';\n",
+        "export interface Pager {\n",
+        "  <R extends keyof Routes>(route: R): Promise<Routes[R][\"response\"]>;\n",
+        "}\n",
+        "export type Arguments<R extends keyof Routes> = Routes[R][\"parameters\"];\n",
+        "export type Wrong<R extends keyof Other> = Routes[R][\"response\"];\n",
+        "export type Dynamic<R extends keyof Open> = Open[R][\"response\"];\n",
+        "export type Absent<R extends keyof Incomplete> = Incomplete[R][\"response\"];\n",
+        "export type Shadow<R extends keyof Routes> = { <R extends keyof Other>(): Routes[R][\"response\"]; };\n",
+    );
+    for (prefix, declaration) in [(ROUTES, "index.d.ts"), ("", "routes.d.ts")] {
+        let use_text = if declaration == "index.d.ts" {
+            USE.split_once('\n').expect("relative import line").1
+        } else {
+            USE
+        };
+        let source = format!("{prefix}{use_text}");
+        let mut files = vec![("index.d.ts", source.as_str())];
+        if declaration == "routes.d.ts" {
+            files.push((declaration, ROUTES));
+        }
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+            )),
+        )
+        .expect("checked declarations");
+        let graph = result.publication();
+        graph.validate_facts().expect("checked graph");
+        let unit = &graph
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == "index.d.ts")
+            .expect("use unit")
+            .unit;
+        for (line, member, target_count) in [
+            ("<R extends keyof Routes>(route:", "response", 2),
+            ("export type Arguments<", "parameters", 2),
+            ("export type Wrong<", "response", 0),
+            ("export type Dynamic<", "response", 0),
+            ("export type Absent<", "response", 0),
+            ("export type Shadow<", "response", 0),
+        ] {
+            let start = source.find(line).expect("written declaration");
+            let token = format!("\"{member}\"");
+            let begin = start + source[start..].find(&token).expect("written selector");
+            let range = TextRange {
+                start: u64::try_from(begin).expect("start"),
+                end: u64::try_from(begin + token.len()).expect("end"),
+            };
+            let references = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::References]
+                        && edge
+                            .occurrence
+                            .as_ref()
+                            .is_some_and(|site| &site.unit == unit && site.range == range)
+                        && edge.to.as_str().ends_with(&format!("/{member}"))
+                })
+                .map(|edge| edge.to.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                references.len(),
+                target_count,
+                "{declaration} {line}: {references:?}"
+            );
+            if target_count > 0 {
+                for route in ["%22%2Fone%22", "%22%2Ftwo%22"] {
+                    assert!(
+                        references
+                            .iter()
+                            .any(|target| target.ends_with(&format!("/Routes/{route}/{member}")))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn declaration_indexed_access_preserves_written_property_reference() {
     const TYPE: &str = "export interface Preferences { transport: string; }\n";
     const USE: &str = concat!(
