@@ -220,7 +220,7 @@ fn check_search_examples(examples: &Map<String, Value>) -> TestResult<()> {
     let selected = &examples["select-symbols"];
     let table = selected["text"].as_str().ok_or("search text")?;
     let mut lines = table.lines();
-    assert_eq!(lines.next(), Some("Rows 1-5 of 5 | page 1/1"), "{table}");
+    assert_eq!(lines.next(), Some("rows 1-5 of 5 | page 1/1"), "{table}");
     assert_eq!(lines.next(), Some(""), "{table}");
     let header = lines.next().ok_or("search table header")?;
     assert_eq!(
@@ -254,9 +254,30 @@ fn check_search_examples(examples: &Map<String, Value>) -> TestResult<()> {
         boolean["text"]
             .as_str()
             .and_then(|text| text.lines().next()),
-        Some("Row 1 | page 1/1"),
+        Some("row 1 | page 1/1"),
         "{boolean}"
     );
+
+    let commits = &examples["commits"];
+    let commit_rows = workspace_client::query::rows(&commits["json"])?;
+    let commit_text = commits["text"].as_str().ok_or("commit search text")?;
+    let text_rows: Vec<_> = commit_text.lines().skip(4).collect();
+    assert!(!commit_rows.is_empty(), "{commits}");
+    assert_eq!(commit_rows.len(), text_rows.len(), "{commits}");
+    for (binding, row) in commit_rows.iter().zip(text_rows) {
+        let revision = workspace_client::query::literal(binding, "revision")?;
+        assert!(
+            matches!(revision.len(), 40 | 64)
+                && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{commits}"
+        );
+        let revision_cell = row
+            .rsplit('|')
+            .nth(1)
+            .map(str::trim)
+            .ok_or("commit revision cell")?;
+        assert_eq!(revision_cell, format!("\"{}\"", &revision[..8]), "{row}");
+    }
 
     let empty = &examples["empty-search"];
     assert!(

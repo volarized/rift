@@ -199,9 +199,13 @@ fn query_continuation_text(text: &str, _structured: &serde_json::Value) -> Resul
     Ok(())
 }
 
-fn query_term(term: &serde_json::Value, blank_width: usize) -> Result<String, String> {
+fn query_term(
+    term: &serde_json::Value,
+    blank_width: usize,
+    column: Option<&str>,
+) -> Result<String, String> {
     let value = term["value"].as_str().ok_or("query term value")?;
-    let quoted = || serde_json::to_string(value).map_err(|error| error.to_string());
+    let quoted = |value: &str| serde_json::to_string(value).map_err(|error| error.to_string());
     match term["type"].as_str() {
         Some("iri") => Ok(query_iri(value)),
         Some("blank_node") => {
@@ -225,20 +229,26 @@ fn query_term(term: &serde_json::Value, blank_width: usize) -> Result<String, St
         }
         Some("language_literal") => Ok(format!(
             "{}@{}",
-            quoted()?,
+            quoted(value)?,
             term["language"].as_str().ok_or("term language")?
         )),
         Some("literal") => {
             let datatype = term["datatype"].as_str().ok_or("term datatype")?;
             match datatype {
-                "http://www.w3.org/2001/XMLSchema#string" => quoted(),
+                "http://www.w3.org/2001/XMLSchema#string"
+                    if column == Some("revision")
+                        && rift_protocol::revision::is_commit_id(value) =>
+                {
+                    quoted(&value[..8])
+                }
+                "http://www.w3.org/2001/XMLSchema#string" => quoted(value),
                 "http://www.w3.org/2001/XMLSchema#integer" if value.parse::<i128>().is_ok() => {
                     Ok(value.to_owned())
                 }
                 "http://www.w3.org/2001/XMLSchema#boolean" if matches!(value, "true" | "false") => {
                     Ok(value.to_owned())
                 }
-                _ => Ok(format!("{}^^{}", quoted()?, query_iri(datatype))),
+                _ => Ok(format!("{}^^{}", quoted(value)?, query_iri(datatype))),
             }
         }
         _ => Err("unknown RDF term".into()),
@@ -283,18 +293,20 @@ fn query_cells(line: Option<&str>) -> Result<Vec<String>, String> {
 
 fn query_rdf_row<'a>(
     line: Option<&str>,
-    terms: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
+    terms: impl IntoIterator<Item = (Option<&'a str>, Option<&'a serde_json::Value>)>,
 ) -> Result<(), String> {
     let cells = query_cells(line)?;
     let mut cells = cells.iter();
-    for term in terms {
+    for (column, term) in terms {
         let actual = cells.next().ok_or("missing query cell")?;
         let blank_width = actual
             .strip_prefix("_:")
             .and_then(|label| label.split_ascii_whitespace().next())
             .map_or(12, str::len);
-        let expected =
-            term.map_or_else(|| Ok(String::new()), |term| query_term(term, blank_width))?;
+        let expected = term.map_or_else(
+            || Ok(String::new()),
+            |term| query_term(term, blank_width, column),
+        )?;
         if *actual != expected {
             return Err(format!(
                 "query cell differs: expected {expected}, got {actual}"
@@ -343,10 +355,10 @@ fn query_heading(
     }
     let range = match rows {
         0 => format!("0 rows of {total}"),
-        1 if total == 1 => "Row 1".to_owned(),
-        1 => format!("Row {} of {total}", offset.saturating_add(1)),
+        1 if total == 1 => "row 1".to_owned(),
+        1 => format!("row {} of {total}", offset.saturating_add(1)),
         _ => format!(
-            "Rows {}-{} of {total}",
+            "rows {}-{} of {total}",
             offset.saturating_add(1),
             offset.saturating_add(rows)
         ),
@@ -393,12 +405,15 @@ fn bindings_text(
     if variables.is_empty() {
         query_columns(lines, ["result"])?;
         for _ in rows {
-            query_rdf_row(lines.next(), [None])?;
+            query_rdf_row(lines.next(), [(None, None)])?;
         }
     } else {
         query_columns(lines, variables.iter().map(|name| format!("?{name}")))?;
         for row in rows {
-            query_rdf_row(lines.next(), variables.iter().map(|name| row.get(*name)))?;
+            query_rdf_row(
+                lines.next(),
+                variables.iter().map(|name| (Some(*name), row.get(*name))),
+            )?;
         }
     }
     Ok(())
@@ -418,7 +433,10 @@ fn query_table(lines: &mut std::str::Lines<'_>, answer: &serde_json::Value) -> R
             let columns = ["subject", "predicate", "object"];
             query_columns(lines, columns)?;
             for triple in answer["triples"].as_array().ok_or("query triples")? {
-                query_rdf_row(lines.next(), columns.map(|column| triple.get(column)))?;
+                query_rdf_row(
+                    lines.next(),
+                    columns.map(|column| (None, triple.get(column))),
+                )?;
             }
         }
         _ => return Err("unknown query result".into()),
@@ -460,7 +478,7 @@ mod tests {
     use super::*;
 
     const ASK_TRUE: &str = concat!(
-        "Row 1 | page 1/1\n\n",
+        "row 1 | page 1/1\n\n",
         "| result |\n| ------ |\n| true   |\n",
     );
 
@@ -480,7 +498,7 @@ mod tests {
             "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 1}
         });
         let text = concat!(
-            "Row 1 | page 1/1\n\n",
+            "row 1 | page 1/1\n\n",
             "| ?edge                                    |\n| ---------------------------------------- |\n| \\_:edge (providers: engine, lsp, static) |\n",
         );
         let included = result_of(text, answer.clone());

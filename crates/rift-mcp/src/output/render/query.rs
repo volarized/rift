@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult, RdfTerm};
+use rift_protocol::revision::{REVISION_FIELD, is_commit_id};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_search::sparql::VOCABULARY_NAMESPACE;
 use rmcp::model::MetaObject;
@@ -10,6 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr as _;
 
+use super::facts::cut_hash;
 use super::{Render, TextError, TextWriter};
 use crate::output::text::visible;
 
@@ -171,11 +173,11 @@ fn render_result(
     let first = offset.saturating_add(1);
     let range = match (rows, total) {
         (0, _) => format!("0 rows of {total}"),
-        (1, 1) => "Row 1".to_owned(),
-        (1, _) => format!("Row {first} of {total}"),
+        (1, 1) => "row 1".to_owned(),
+        (1, _) => format!("row {first} of {total}"),
         _ => {
             let last = offset.saturating_add(rows);
-            format!("Rows {first}-{last} of {total}")
+            format!("rows {first}-{last} of {total}")
         }
     };
     out.raw_line(0, &format!("{range} | page {page}/{pages}"))?;
@@ -198,8 +200,10 @@ fn render_result(
                 variables
                     .iter()
                     .map(|variable| {
-                        row.get(variable)
-                            .map_or_else(|| Ok(String::new()), |value| terms.term(value))
+                        row.get(variable).map_or_else(
+                            || Ok(String::new()),
+                            |value| terms.term(value, Some(variable)),
+                        )
                     })
                     .collect()
             }),
@@ -210,7 +214,7 @@ fn render_result(
             triples.iter().map(|triple| {
                 [&triple.subject, &triple.predicate, &triple.object]
                     .into_iter()
-                    .map(|term| terms.term(term))
+                    .map(|term| terms.term(term, None))
                     .collect()
             }),
         ),
@@ -316,7 +320,7 @@ struct Terms {
 }
 
 impl Terms {
-    fn term(&self, term: &RdfTerm) -> Result<String, TextError> {
+    fn term(&self, term: &RdfTerm, column: Option<&str>) -> Result<String, TextError> {
         let quoted = |value: &str| {
             serde_json::to_string(value).map_err(|error| TextError::Custom(error.to_string()))
         };
@@ -338,7 +342,14 @@ impl Terms {
                 };
                 Ok(format!("_:{}{analyses}", &value[..end]))
             }
-            RdfTerm::Literal { value, datatype } if datatype == XSD_STRING => quoted(value),
+            RdfTerm::Literal { value, datatype } if datatype == XSD_STRING => {
+                let text = if column == Some(REVISION_FIELD) && is_commit_id(value) {
+                    cut_hash(value)
+                } else {
+                    value
+                };
+                quoted(text)
+            }
             RdfTerm::Literal { value, datatype }
                 if (datatype == XSD_INTEGER && is_integer(value))
                     || (datatype == XSD_BOOLEAN && matches!(value.as_str(), "true" | "false")) =>
@@ -411,7 +422,7 @@ mod tests {
         assert_eq!(
             output,
             concat!(
-                "Rows 1-3 of 3 | page 1/1\n\n",
+                "rows 1-3 of 3 | page 1/1\n\n",
                 "| ?blank          | ?value | ?typed                         | ?predicate |\n",
                 "| --------------- | ------ | ------------------------------ | ---------- |\n",
                 "| \\_:first-retain | 42     | \"invalid boolean\"^^xsd:boolean | :name      |\n",
@@ -449,7 +460,7 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                "Rows 3-4 of 4 | page 2/2\n\n",
+                "rows 3-4 of 4 | page 2/2\n\n",
                 "| subject                                       | predicate | object |\n",
                 "| --------------------------------------------- | --------- | ------ |\n",
                 "| \\_:anonymous (providers: engine, lsp, static) | :name     | \"Rift\" |\n",
@@ -484,12 +495,55 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                "Row 1 | page 1/1\n\n",
+                "row 1 | page 1/1\n\n",
                 "| ?source                 | ?rank               | ?symbol                               |\n",
                 "| ----------------------- | ------------------- | ------------------------------------- |\n",
                 "| \"a\\|b\\\\\\\\c\\\\n\\<t>\\*x\\*\" | \"1.0E0\"^^xsd:double | \\<rift://symbol/local/rust/app/retry> |\n",
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn only_full_git_commits_in_revision_columns_shorten_in_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sha1 = format!("12345678{}", "a".repeat(32));
+        let sha256 = format!("abcdef01{}", "b".repeat(56));
+        let literal = |value: &str| serde_json::json!({ "type": "literal", "value": value, "datatype": XSD_STRING });
+        let release = "rift://revision/cargo/crates.io/demo@1.0.0";
+        let structured = serde_json::json!({
+            "answer": {
+                "result": "bindings",
+                "variables": ["revision", "message"],
+                "bindings": [
+                    {"revision": literal(&sha1), "message": literal(&sha1)},
+                    {"revision": literal(&sha256)},
+                    {"revision": literal("1234567890")},
+                    {"revision": {"type": "iri", "value": release}},
+                ]
+            }
+        });
+        let output = QueryOutput::from(serde_json::from_value::<QueryReadResult>(
+            structured.clone(),
+        )?);
+        assert_eq!(serde_json::to_value(&output)?, structured);
+        let text = super::super::text_of(&output)?;
+        let cells: Vec<_> = text
+            .lines()
+            .skip(4)
+            .map(|line| line.split('|').nth(1).unwrap_or_default().trim())
+            .collect();
+        assert_eq!(
+            cells,
+            [
+                r#""12345678""#,
+                r#""abcdef01""#,
+                r#""1234567890""#,
+                &format!(r"\<{release}>")
+            ]
+        );
+        assert!(text.contains(&format!("\"{sha1}\"")));
+        assert!(!text.contains(&sha256));
         Ok(())
     }
 
@@ -501,7 +555,7 @@ mod tests {
             }))?;
             assert_eq!(
                 text,
-                format!("Row 1 | page 1/1\n\n| result |\n| ------ |\n| {value:<6} |\n")
+                format!("row 1 | page 1/1\n\n| result |\n| ------ |\n| {value:<6} |\n")
             );
         }
         Ok(())
@@ -526,7 +580,7 @@ mod tests {
         );
         assert_eq!(
             text(2, 2, serde_json::json!([{}]))?,
-            "Row 2 of 2 | page 2/2\n\n| result |\n| ------ |\n|        |\n"
+            "row 2 of 2 | page 2/2\n\n| result |\n| ------ |\n|        |\n"
         );
         Ok(())
     }
@@ -534,9 +588,9 @@ mod tests {
     #[test]
     fn row_heading_uses_actual_page_rows() -> Result<(), Box<dyn std::error::Error>> {
         for (page, total, rows, heading) in [
-            (2, 24, 10, "Rows 11-20 of 24 | page 2/3"),
-            (3, 24, 4, "Rows 21-24 of 24 | page 3/3"),
-            (3, 21, 1, "Row 21 of 21 | page 3/3"),
+            (2, 24, 10, "rows 11-20 of 24 | page 2/3"),
+            (3, 24, 4, "rows 21-24 of 24 | page 3/3"),
+            (3, 21, 1, "row 21 of 21 | page 3/3"),
             (4, 24, 0, "0 rows of 24 | page 4/3"),
         ] {
             let text = raw_answer(serde_json::json!({

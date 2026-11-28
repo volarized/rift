@@ -1,16 +1,14 @@
 import { CodeBlock, Pre } from "fumadocs-ui/components/codeblock";
 import { ExampleTabs } from "@/components/example-tabs";
-import { SearchResponse } from "@/components/search-response";
+import { TypingCode } from "@/components/typing-code";
 import generated from "./workspace-examples.generated.json";
 
 const examples = { ...generated.queries, map: generated.map };
 
-function ExampleCode({ source }: { source: string }) {
+function ExampleCode({ source, typing = false }: { source: string; typing?: boolean }) {
   return (
     <CodeBlock allowCopy={false} className="m-0 rounded-none border-0 bg-transparent">
-      <Pre className="px-4">
-        <code>{source}</code>
-      </Pre>
+      <Pre className="px-4">{typing ? <TypingCode source={source} /> : <code>{source}</code>}</Pre>
     </CodeBlock>
   );
 }
@@ -28,13 +26,7 @@ export function ReadExample({ name }: { name: keyof typeof examples }) {
     <ExampleTabs
       sparql={typeof query === "string" && <ExampleCode source={query} />}
       mcp={<ExampleCode source={JSON.stringify(example.arguments, null, 2)} />}
-      text={
-        typeof query === "string" && example.text.includes("\n\n|") ? (
-          <SearchResponse source={example.text} />
-        ) : (
-          <ExampleCode source={example.text} />
-        )
-      }
+      text={<ExampleCode source={example.text} typing />}
       json={<ExampleCode source={JSON.stringify(example.json, null, 2)} />}
     />
   );

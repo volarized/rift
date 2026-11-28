@@ -226,7 +226,9 @@ fn git_point(body: &str) -> Result<Point, RevisionViolation> {
     Ok(Point::Reference(spelling.0))
 }
 
-fn is_commit_id(value: &str) -> bool {
+/// Whether the spelling is a complete lowercase SHA-1 or SHA-256 Git commit id.
+#[must_use]
+pub fn is_commit_id(value: &str) -> bool {
     is_hex(value, SHA1_HEX_BYTES) || is_hex(value, SHA256_HEX_BYTES)
 }
 

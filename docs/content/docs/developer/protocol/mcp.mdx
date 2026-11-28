@@ -10,8 +10,8 @@ limits, and failures. For an introduction through an agent's workflow, see the
 [MCP guide](/docs/mcp).
 
 The expandable tool properties and examples come from the served [JSON schema](https://volar.sh/rift/mcp.json).
-The Request tab shows the MCP call and offers a SPARQL view for searches. The Response tab shows
-tool text or JSON. [Result content](#result-content) defines both forms.
+The **request** tab shows the MCP call and offers a SPARQL view for searches. The **response**
+tab shows tool text or JSON. [Result content](#result-content) defines both forms.
 
 ## Map [#resource-map]
 
@@ -123,8 +123,9 @@ each variable name. An unbound variable leaves an empty cell. A graph table has 
 `predicate`, and `object` columns. An `ASK` answer uses `1/1` pages and shows `true` or `false`
 in one row under `result`.
 
-Text shortens common RDF namespaces and escapes Markdown syntax in cells. Structured content
-carries the exact RDF terms and identities.
+Text shortens common RDF namespaces and escapes Markdown syntax in cells. A Git commit ID in
+a `?revision` string cell uses its first eight hexadecimal digits. Structured content carries
+the exact RDF terms and identities.
 
 A query with zero results returns one sentence that points to the query examples.
 
