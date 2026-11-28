@@ -9239,6 +9239,42 @@ fn checked_javascript_export_subpath_keeps_forwarding_module() {
     }
 }
 
+#[test]
+fn checked_javascript_command_path_keeps_its_written_module() {
+    const SOURCE: &str = "#!/usr/bin/env node\nawait import('../worker.mjs');\n";
+    for (field, expected) in [
+        (r#"{"runner":"./bin/run.mjs"}"#, true),
+        (r#""bin/run.mjs""#, true),
+        (r#"{"runner":"../bin/run.mjs"}"#, false),
+        (r#"{"runner":"./bin/absent.mjs"}"#, false),
+        ("false", false),
+    ] {
+        let metadata = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs","bin":{field}}}"#,
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const ready = 1;\n"),
+                ("worker.mjs", "export const helper = 2;\n"),
+                ("bin/run.mjs", SOURCE),
+                ("bin/other.mjs", SOURCE),
+            ],
+            None,
+            Some(("package.json", &metadata)),
+        )
+        .expect("captured JavaScript command path");
+        let graph = analysis.publication();
+        graph.validate_facts().expect("physical command module");
+        let module = checked_module_declaration(graph, "bin/run.mjs", SOURCE);
+        assert_eq!(module.is_some(), expected, "{field}");
+        if let Some(module) = module {
+            assert!(module.symbol.as_str().ends_with("/beacon%2Fbin%2Frun.mjs"));
+        }
+        assert!(checked_module_declaration(graph, "bin/other.mjs", SOURCE).is_none());
+    }
+}
+
 fn checked_module_declaration<'graph>(
     graph: &'graph PackagePublication,
     path: &str,

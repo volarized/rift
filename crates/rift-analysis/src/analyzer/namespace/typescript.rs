@@ -540,7 +540,7 @@ pub(crate) struct JavaScriptModulePaths<'input> {
     pub(crate) routes: BTreeSet<&'input str>,
 }
 
-/// JavaScript files whose captured manifest establishes their module scope or export.
+/// JavaScript files whose captured manifest establishes their module scope, export or command.
 pub(crate) fn checked_javascript_module_paths<'input>(
     input: &'input NamespaceInput<'_>,
 ) -> JavaScriptModulePaths<'input> {
@@ -565,6 +565,7 @@ pub(crate) fn checked_javascript_module_paths<'input>(
     } else {
         BTreeMap::new()
     };
+    let commands = metadata.command_paths();
     let mut scopes = BTreeMap::new();
     for source in input.files().iter().chain(input.context_sources()) {
         let Some(directory) = source.path().as_str().strip_suffix("/package.json") else {
@@ -594,10 +595,11 @@ pub(crate) fn checked_javascript_module_paths<'input>(
         };
         if extension == "js" && is_module_scope(path, root, &scopes) {
             paths.scopes.insert(path);
-        } else if exports
-            .get(source.path())
-            .and_then(Option::as_deref)
-            .is_some_and(|module| module != metadata.name)
+        } else if commands.contains(path)
+            || exports
+                .get(source.path())
+                .and_then(Option::as_deref)
+                .is_some_and(|module| module != metadata.name)
         {
             paths.routes.insert(path);
         }
@@ -959,6 +961,7 @@ struct PackageMetadata {
     main: Option<CapturedMain>,
     module: Option<String>,
     exports: Option<Exports>,
+    bin: Option<CapturedCommands>,
     imports: Option<CapturedPackageImports>,
     #[serde(rename = "typesVersions")]
     types_versions: Option<serde_json::Value>,
@@ -983,6 +986,26 @@ impl PackageMetadata {
             CapturedMain::Disabled(_) => None,
         }
     }
+
+    fn command_paths(&self) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        let mut retain = |target: &str| {
+            if let Some(path) = folder_path("", target).filter(|path| export_subpath_is_valid(path))
+            {
+                paths.insert(path);
+            }
+        };
+        match &self.bin {
+            Some(CapturedCommands::Path(path)) => retain(path),
+            Some(CapturedCommands::Paths(commands)) => {
+                for path in commands.values() {
+                    retain(path);
+                }
+            }
+            Some(CapturedCommands::Unresolved(_)) | None => {}
+        }
+        paths
+    }
 }
 
 #[derive(Deserialize)]
@@ -990,6 +1013,14 @@ impl PackageMetadata {
 enum CapturedMain {
     Path(String),
     Disabled(bool),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CapturedCommands {
+    Path(String),
+    Paths(BTreeMap<String, String>),
+    Unresolved(de::IgnoredAny),
 }
 
 /// Import targets selected in the same declared condition order as package exports.
