@@ -1690,12 +1690,15 @@ impl EcmaScriptRules<'_> {
                     .map(|name| (name, CALLABLE_TYPE_PARAMETER_KIND))
             })
             .or_else(|| {
+                if self.kinds.formal_parameter_kinds.is_empty() {
+                    return None;
+                }
                 type_signature_parameters::callable_rest_parameter_name(visited)
                     .map(|name| (name, CALLABLE_TYPE_REST_PARAMETER_KIND))
-            })
-            .or_else(|| {
-                type_signature_parameters::callable_pattern_parameter_name(visited)
-                    .map(|name| (name, CALLABLE_TYPE_PATTERN_PARAMETER_KIND))
+                    .or_else(|| {
+                        type_signature_parameters::callable_pattern_parameter_name(visited)
+                            .map(|name| (name, CALLABLE_TYPE_PATTERN_PARAMETER_KIND))
+                    })
             })
             .or_else(|| {
                 type_signature_parameters::index_parameter_name(visited)
