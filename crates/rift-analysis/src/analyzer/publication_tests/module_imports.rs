@@ -7789,3 +7789,74 @@ fn checked_commonjs_callbacks_keep_same_file_variable_reads() {
                 .is_some_and(|span| span.unit == unit.unit)
     }));
 }
+
+#[test]
+fn secondary_commonjs_callbacks_keep_separate_private_return_functions() {
+    const SOURCE: &str = concat!(
+        "var observe = require('observers');\n",
+        "function top(input) { return { folder: input }; }\n",
+        "module.exports = top;\n",
+        "observe('one', function (input) {\n",
+        "  function configure(root) { return { folder: root }; }\n",
+        "  consume(configure(input));\n",
+        "});\n",
+        "observe('two', function (input) {\n",
+        "  function configure(root) { return { folder: root }; }\n",
+        "  consume(configure(input));\n",
+        "});\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.js", "module.exports = require('./worker');"),
+                ("worker.js", source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked secondary CommonJS module")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication.validate_facts().expect("exact package facts");
+    let mut owners = publication
+        .declarations
+        .iter()
+        .filter(|row| row.source_complete && row.source.starts_with("function configure("))
+        .collect::<Vec<_>>();
+    owners.sort_by_key(|row| row.range.start);
+    let [first, second] = owners.as_slice() else {
+        panic!("both private functions have identities");
+    };
+    assert_ne!(first.symbol, second.symbol);
+    let calls = SOURCE
+        .match_indices("configure(input)")
+        .map(|(start, _)| start);
+    for (owner, start) in [first, second].into_iter().zip(calls) {
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol.as_str() == format!("{}/folder", owner.symbol.as_str())
+                && row.source == "folder: root"
+                && owner.range.start <= row.range.start
+                && row.range.end <= owner.range.end
+        }));
+        assert!(publication.edges.iter().any(|edge| {
+            edge.to == owner.symbol
+                && edge.kinds == [EdgeKind::Calls]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == owner.unit
+                        && site.range.start == u64::try_from(start).expect("call offset")
+                })
+        }));
+    }
+    assert!(publication.declarations.iter().any(|row| {
+        row.symbol.as_str().ends_with("/top/folder") && row.source == "folder: input"
+    }));
+
+    let unproved = SOURCE.replace("return { folder: root };", "return root;");
+    let contrast = analyze(&unproved);
+    assert!(!contrast.publication().declarations.iter().any(|row| {
+        row.source.starts_with("function configure(") && row.symbol.as_str().contains("/configure")
+    }));
+}
