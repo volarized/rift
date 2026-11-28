@@ -16,6 +16,7 @@ pub(crate) mod commonjs;
 mod entry;
 mod internal_modules;
 mod observations;
+mod scoped_returns;
 
 use entry::Entry;
 pub(super) use entry::build_paths;
@@ -235,6 +236,7 @@ fn prepare_anchors(
         )
     {
         place_scoped_function_parameters(file, &mut anchors, &scoped);
+        scoped_returns::place(file, &anchors, &mut scoped);
     }
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;

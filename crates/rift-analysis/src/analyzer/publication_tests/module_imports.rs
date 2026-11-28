@@ -7626,3 +7626,86 @@ fn typescript_written_arrow_arguments_keep_separate_formal_reads() {
         1
     );
 }
+
+#[test]
+fn returned_properties_keep_their_distinct_private_function_owners() {
+    const SOURCE: &str = concat!(
+        "function top(root) { return { folder: root, read: function (name) { return name; } }; }\n",
+        "consume(top('/'));\n",
+        "observe('one', function (input) {\n",
+        "  function configure(root) {\n",
+        "    return { folder: root, 'package': { entry: 'first' }, read: function (name) { return name; } };\n",
+        "  }\n",
+        "  consume(configure(input));\n",
+        "});\n",
+        "observe('two', function (input) {\n",
+        "  function configure(root) {\n",
+        "    return { folder: root, 'package': { entry: 'second' }, read: function (name) { return name; } };\n",
+        "  }\n",
+        "  consume(configure(input));\n",
+        "});\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked returned properties")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication.validate_facts().expect("exact returned facts");
+    let mut owners = publication
+        .declarations
+        .iter()
+        .filter(|row| {
+            row.source_complete
+                && row.source.starts_with("function configure(")
+                && row.syntax_element_kind.as_deref() == Some("function_declaration")
+        })
+        .collect::<Vec<_>>();
+    owners.sort_by_key(|row| row.range.start);
+    let [first, last] = owners.as_slice() else {
+        panic!("separately placed functions")
+    };
+    assert_ne!(first.symbol, last.symbol);
+    for owner in [first, last] {
+        for (suffix, text) in [
+            ("/folder", "folder: root"),
+            ("/read", "read: function"),
+            ("/'package'", "'package':"),
+            ("/'package'/entry", "entry:"),
+        ] {
+            let identity = format!("{}{suffix}", owner.symbol.as_str());
+            let row = publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.symbol.as_str() == identity
+                        && row.source_complete
+                        && row.source.starts_with(text)
+                })
+                .expect("written returned property");
+            assert!(owner.range.start <= row.range.start && row.range.end <= owner.range.end);
+        }
+    }
+    assert!(publication.declarations.iter().any(|row| {
+        row.symbol.as_str().ends_with("/top/folder") && row.source == "folder: root"
+    }));
+    let duplicate = SOURCE.replacen(
+        "folder: root, 'package': { entry: 'second'",
+        "folder: root, folder: input, 'package': { entry: 'second'",
+        1,
+    );
+    let compared = analyze(&duplicate);
+    assert!(
+        !compared
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str() == format!("{}/folder", last.symbol.as_str()) })
+    );
+}
