@@ -243,7 +243,10 @@ impl UnitDefinitions {
                     )
                 });
                 if *is_module {
+                    // The module owns occurrences outside its declarations. An exact
+                    // declaration keeps its owner when its range covers the whole unit.
                     declared_edge_modules.insert(binding.unit().clone(), identity.clone());
+                    continue;
                 }
                 parents
                     .entry(binding.unit().clone())
