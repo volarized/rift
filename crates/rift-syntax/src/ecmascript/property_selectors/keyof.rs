@@ -7,12 +7,41 @@ use tree_sitter::{Language, Node};
 use crate::extract::byte_range;
 use crate::{ByteRange, SyntaxLimits, failure::RiftError};
 
-use super::CheckedPropertySelector;
+use super::{CheckedKeyofBound, CheckedPropertySelector};
+
+enum Witness<'tree> {
+    Parameter(Node<'tree>),
+    TrueBranch {
+        owner: Node<'tree>,
+        test: Node<'tree>,
+    },
+}
+
+impl<'tree> Witness<'tree> {
+    fn owner(&self) -> Node<'tree> {
+        match *self {
+            Self::Parameter(owner) | Self::TrueBranch { owner, .. } => owner,
+        }
+    }
+
+    fn proof(&self) -> Result<CheckedKeyofBound, RiftError> {
+        Ok(match *self {
+            Self::Parameter(_) => CheckedKeyofBound::Parameter,
+            Self::TrueBranch { test, .. } => CheckedKeyofBound::TrueBranch {
+                key: byte_range(test)?,
+            },
+        })
+    }
+}
 
 pub(super) struct Kinds {
     type_identifier: u16,
     type_parameter: u16,
     index_query: u16,
+    conditional: u16,
+    nested_type_identifier: u16,
+    predefined_type: u16,
+    broad_predefined_types: [u16; 3],
     interface: u16,
     interface_body: u16,
     type_alias: u16,
@@ -28,6 +57,9 @@ pub(super) struct Kinds {
     body: u16,
     value: u16,
     annotation: u16,
+    left: u16,
+    right: u16,
+    consequence: u16,
 }
 
 impl Kinds {
@@ -43,6 +75,11 @@ impl Kinds {
             type_identifier: named("type_identifier"),
             type_parameter: named("type_parameter"),
             index_query: named("index_type_query"),
+            conditional: named("conditional_type"),
+            nested_type_identifier: named("nested_type_identifier"),
+            predefined_type: named("predefined_type"),
+            broad_predefined_types: ["string", "unknown", "any"]
+                .map(|kind| grammar.id_for_node_kind(kind, false)),
             interface: named("interface_declaration"),
             interface_body: named("interface_body"),
             type_alias: named("type_alias_declaration"),
@@ -58,6 +95,9 @@ impl Kinds {
             body: field("body"),
             value: field("value"),
             annotation: field("type"),
+            left: field("left"),
+            right: field("right"),
+            consequence: field("consequence"),
         }
     }
 
@@ -82,9 +122,10 @@ impl Kinds {
         {
             return Ok(None);
         }
-        let Some((parameter, bound)) = self.bound(indexed, key, source, depth_max) else {
+        let Some((parameter, witness)) = self.witness(indexed, key, source, depth_max) else {
             return Ok(None);
         };
+        let bound = witness.owner();
         if source.get(owner.byte_range()) != source.get(bound.byte_range()) {
             return Ok(None);
         }
@@ -93,22 +134,28 @@ impl Kinds {
             bound: byte_range(bound)?,
             key: byte_range(key)?,
             parameter: byte_range(parameter)?,
+            proof: witness.proof()?,
             member: byte_range(member)?,
             selector: byte_range(selector)?,
         }))
     }
 
-    fn bound<'tree>(
+    fn witness<'tree>(
         &self,
         indexed: Node<'tree>,
         key: Node<'tree>,
         source: &str,
         depth_max: usize,
-    ) -> Option<(Node<'tree>, Node<'tree>)> {
+    ) -> Option<(Node<'tree>, Witness<'tree>)> {
         let spelling = source.get(key.byte_range())?;
         let mut scope = indexed;
+        let mut conditional = None;
         for _ in 0..depth_max {
+            let child = scope;
             scope = scope.parent()?;
+            if scope.kind_id() == self.conditional && conditional.is_none() {
+                conditional = Some(self.true_branch(scope, child, spelling, source));
+            }
             let Some(parameters) = scope.child_by_field_id(self.type_parameters) else {
                 continue;
             };
@@ -126,15 +173,55 @@ impl Kinds {
                 if matching.next().is_some() {
                     return None;
                 }
-                let constraint = only_child(parameter.child_by_field_id(self.constraint)?)?;
-                if constraint.kind_id() != self.index_query {
-                    return None;
+                if let Some(constraint) = parameter.child_by_field_id(self.constraint) {
+                    let constraint = only_child(constraint)?;
+                    if let Some(owner) = self.keyof_type(constraint) {
+                        return Some((name, Witness::Parameter(owner)));
+                    }
+                    if !self.condition_compatible_bound(constraint) {
+                        return None;
+                    }
                 }
-                let owner = only_child(constraint)?;
-                return (owner.kind_id() == self.type_identifier).then_some((name, owner));
+                return Some((name, conditional.flatten()?));
             }
         }
         None
+    }
+
+    fn true_branch<'tree>(
+        &self,
+        scope: Node<'tree>,
+        child: Node<'tree>,
+        spelling: &str,
+        source: &str,
+    ) -> Option<Witness<'tree>> {
+        if scope.child_by_field_id(self.consequence)? != child {
+            return None;
+        }
+        let test = scope.child_by_field_id(self.left)?;
+        if test.kind_id() != self.type_identifier || source.get(test.byte_range())? != spelling {
+            return None;
+        }
+        let owner = self.keyof_type(scope.child_by_field_id(self.right)?)?;
+        Some(Witness::TrueBranch { owner, test })
+    }
+
+    fn keyof_type<'tree>(&self, query: Node<'tree>) -> Option<Node<'tree>> {
+        if query.kind_id() != self.index_query {
+            return None;
+        }
+        let owner = only_child(query)?;
+        (owner.kind_id() == self.type_identifier).then_some(owner)
+    }
+
+    fn condition_compatible_bound(&self, constraint: Node<'_>) -> bool {
+        let kind = constraint.kind_id();
+        kind == self.type_identifier
+            || kind == self.nested_type_identifier
+            || (kind == self.predefined_type
+                && constraint
+                    .child(0)
+                    .is_some_and(|name| self.broad_predefined_types.contains(&name.kind_id())))
     }
 
     pub(super) fn closed_members(

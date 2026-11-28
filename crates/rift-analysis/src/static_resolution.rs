@@ -185,6 +185,8 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_property_selector_start: Option<usize>,
     /// First references emitted by a checked closed object selector.
     pub(crate) typescript_keyof_member_start: Option<usize>,
+    /// First references emitted from a checked conditional true branch.
+    pub(crate) typescript_conditional_keyof_member_start: Option<usize>,
     /// First module edge at a checked inline import specifier.
     pub(crate) typescript_inline_import_module_start: Option<usize>,
     /// First checked reference at a TypeScript enum qualifier.

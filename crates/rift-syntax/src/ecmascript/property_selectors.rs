@@ -12,6 +12,18 @@ use crate::{ByteRange, SyntaxLimits, SyntaxSource, failure::RiftError};
 
 use super::parser_for_ranges;
 
+/// The syntax that bounds the index to the written object's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedKeyofBound {
+    /// The type parameter declares the bound directly.
+    Parameter,
+    /// A conditional's true branch provides the bound.
+    TrueBranch {
+        /// The read of the type parameter in the conditional test.
+        key: ByteRange,
+    },
+}
+
 /// A property selector with its checked written type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckedPropertySelector {
@@ -22,16 +34,18 @@ pub enum CheckedPropertySelector {
         /// The written property name, excluding its quotes.
         selector: ByteRange,
     },
-    /// A literal member of an object indexed through its own lexical `keyof` type parameter.
+    /// A literal member of an object indexed through its own checked `keyof` bound.
     KeyofIndexedAccess {
         /// The written object type in the indexed access.
         owner: ByteRange,
-        /// The object type stated in the type parameter's bound.
+        /// The object type stated in the bound.
         bound: ByteRange,
         /// The read of the index type parameter.
         key: ByteRange,
         /// The declaration of the index type parameter.
         parameter: ByteRange,
+        /// The source of the checked bound.
+        proof: CheckedKeyofBound,
         /// The property name, excluding its quotes.
         member: ByteRange,
         /// The complete literal at the final index, including its quotes.

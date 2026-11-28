@@ -101,7 +101,7 @@ mod wrapped_parameters;
 pub(crate) use conditional_type_members::check as checked_conditional_type_members;
 pub use inline_import_types::CheckedInlineTypeImport;
 pub(crate) use inline_import_types::check as checked_inline_import_types;
-pub use property_selectors::CheckedPropertySelector;
+pub use property_selectors::{CheckedKeyofBound, CheckedPropertySelector};
 pub(crate) use property_selectors::{check as checked_property_selectors, closed_keyof_members};
 pub(crate) use wrapped_parameters::arrow_body_with_wrapped_parameters;
 

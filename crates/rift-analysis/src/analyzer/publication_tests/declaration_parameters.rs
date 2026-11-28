@@ -101,6 +101,79 @@ fn declaration_keyof_index_recovers_every_checked_nested_member() {
 }
 
 #[test]
+fn conditional_keyof_selectors_follow_the_matching_true_branch() {
+    const SOURCE: &str = concat!(
+        "interface Routes { one: { response: number }; two: { response: string }; }\n",
+        "interface Other { three: { response: number }; }\n",
+        "declare namespace Request { type Route = string; }\n",
+        "export type Positive<R extends string> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+        "export type Opaque<R extends Request.Route> = R extends keyof Routes ? Promise<Routes[R][\"response\"]> : never;\n",
+        "export type False<R> = R extends keyof Routes ? never : Routes[R][\"response\"];\n",
+        "export type WrongObject<R> = R extends keyof Other ? Routes[R][\"response\"] : never;\n",
+        "export type WrongKey<R, S> = S extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+        "export type Shadow<R> = R extends keyof Routes ? { <R>(): Routes[R][\"response\"]; } : never;\n",
+        "export type Impossible<R extends false> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+        "export type Narrow<R extends 'one'> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("checked declarations");
+    let graph = result.publication();
+    graph.validate_facts().expect("checked graph");
+    for (name, count) in [
+        ("Positive", 2),
+        ("Opaque", 2),
+        ("False", 0),
+        ("WrongObject", 0),
+        ("WrongKey", 0),
+        ("Shadow", 0),
+        ("Impossible", 0),
+        ("Narrow", 0),
+    ] {
+        let declaration = SOURCE.find(name).expect("type name");
+        let token = "\"response\"";
+        let start = declaration + SOURCE[declaration..].find(token).expect("selector");
+        let range = TextRange {
+            start: u64::try_from(start).expect("start"),
+            end: u64::try_from(start + token.len()).expect("end"),
+        };
+        let targets = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::References]
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range == range)
+                    && edge.to.as_str().ends_with("/response")
+            })
+            .map(|edge| edge.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(targets.len(), count, "{name}: {targets:?}");
+        if count == 2 {
+            assert!(
+                targets
+                    .iter()
+                    .any(|target| target.ends_with("/Routes/one/response"))
+            );
+            assert!(
+                targets
+                    .iter()
+                    .any(|target| target.ends_with("/Routes/two/response"))
+            );
+        }
+    }
+}
+
+#[test]
 fn declaration_indexed_access_preserves_written_property_reference() {
     const TYPE: &str = "export interface Preferences { transport: string; }\n";
     const USE: &str = concat!(

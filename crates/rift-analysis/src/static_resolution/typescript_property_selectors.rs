@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use rift_core::ReferenceRole;
 use rift_provider::NormalizedTarget;
 use rift_syntax::{
-    ByteRange, CheckedPropertySelector, StaticBindingKind, SyntaxSource, TypeScriptDialect,
+    ByteRange, CheckedKeyofBound, CheckedPropertySelector, StaticBindingKind, SyntaxSource,
+    TypeScriptDialect,
 };
 
 use super::javascript::{MemberMode, js_binding};
@@ -14,7 +15,13 @@ use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work, is_de
 type KeyofMemberCache<'source> =
     BTreeMap<(&'source str, ByteRange, &'source str), Option<Vec<Target<'source>>>>;
 
-type KeyofRequests<'index, 'source> = Vec<(&'index File<'source>, CheckedPropertySelector)>;
+type KeyofRequest<'index, 'source> = (&'index File<'source>, CheckedPropertySelector);
+
+#[derive(Default)]
+pub(super) struct KeyofRequests<'index, 'source> {
+    parameters: Vec<KeyofRequest<'index, 'source>>,
+    conditional: Vec<KeyofRequest<'index, 'source>>,
+}
 
 impl<'source> Index<'source> {
     pub(super) fn resolve_typescript_property_selectors(
@@ -24,7 +31,7 @@ impl<'source> Index<'source> {
     ) -> KeyofRequests<'_, 'source> {
         let start = result.occurrences.len();
         let provider = TypeScriptDialect::TypeScript.provider();
-        let mut keyof = Vec::new();
+        let mut keyof = KeyofRequests::default();
         'files: for file in self.files.values() {
             let document = file.document;
             let facts = document.facts;
@@ -49,8 +56,12 @@ impl<'source> Index<'source> {
                 continue;
             };
             for selector in selectors {
-                if matches!(selector, CheckedPropertySelector::KeyofIndexedAccess { .. }) {
-                    keyof.push((file, selector));
+                if let CheckedPropertySelector::KeyofIndexedAccess { proof, .. } = selector {
+                    match proof {
+                        CheckedKeyofBound::Parameter => &mut keyof.parameters,
+                        CheckedKeyofBound::TrueBranch { .. } => &mut keyof.conditional,
+                    }
+                    .push((file, selector));
                     continue;
                 }
                 if !work.charge() {
@@ -72,12 +83,28 @@ impl<'source> Index<'source> {
     ) {
         let start = result.occurrences.len();
         let mut cache = KeyofMemberCache::new();
+        self.record_keyof_members(requests.parameters, &mut cache, work, result);
+        let conditional = result.occurrences.len();
+        self.record_keyof_members(requests.conditional, &mut cache, work, result);
+        result.typescript_keyof_member_start = (conditional != start).then_some(start);
+        result.typescript_conditional_keyof_member_start =
+            (result.occurrences.len() != conditional).then_some(conditional);
+    }
+
+    fn record_keyof_members(
+        &self,
+        requests: Vec<KeyofRequest<'_, 'source>>,
+        cache: &mut KeyofMemberCache<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
         'requests: for (using, selector) in requests {
             let CheckedPropertySelector::KeyofIndexedAccess {
                 owner,
                 bound,
                 key,
                 parameter,
+                proof,
                 member,
                 selector,
             } = selector
@@ -87,7 +114,13 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 break;
             }
-            let Some(owner) = self.keyof_owner(using, owner, bound, key, parameter, work) else {
+            if !self.type_parameter_matches(using, key, parameter, work)
+                || matches!(proof, CheckedKeyofBound::TrueBranch { key: test }
+                    if !self.type_parameter_matches(using, test, parameter, work))
+            {
+                continue;
+            }
+            let Some(owner) = self.keyof_owner(using, owner, bound, work) else {
                 continue;
             };
             let Some(name) = using.text(member) else {
@@ -113,7 +146,26 @@ impl<'source> Index<'source> {
                 result.record(occurrence);
             }
         }
-        result.typescript_keyof_member_start = (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn type_parameter_matches(
+        &self,
+        using: &File<'source>,
+        key: ByteRange,
+        parameter: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        using.text(key).is_some_and(|name| {
+            js_binding(
+                using,
+                &self.javascript,
+                name,
+                key.start,
+                ReferenceRole::Type,
+                work,
+            )
+            .is_some_and(|local| local.kind == StaticBindingKind::Shadow && local.name == parameter)
+        })
     }
 
     fn keyof_owner(
@@ -121,21 +173,8 @@ impl<'source> Index<'source> {
         using: &File<'source>,
         owner: ByteRange,
         bound: ByteRange,
-        key: ByteRange,
-        parameter: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let local = js_binding(
-            using,
-            &self.javascript,
-            using.text(key)?,
-            key.start,
-            ReferenceRole::Type,
-            work,
-        )?;
-        if local.kind != StaticBindingKind::Shadow || local.name != parameter {
-            return None;
-        }
         let owner = self.javascript_declared_type(using, owner, work)?;
         let bound = self.javascript_declared_type(using, bound, work)?;
         (owner.file.path == bound.file.path && std::ptr::eq(owner.symbol, bound.symbol))
