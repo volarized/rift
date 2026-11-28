@@ -284,7 +284,7 @@ fn declaration_at<'a>(
     }
     let identity = file
         .placement()
-        .logical_identity(&declaration.qualified_name)
+        .logical_identity_for_symbol(declaration)
         .ok_or_else(coverage_failure)?;
     let unit = file.placement().unit().to_string();
     analysis

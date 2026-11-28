@@ -169,19 +169,29 @@ fn an_unnamed_declaration_never_selects_the_named_enclosing_module() -> TestResu
         dialect: None,
     };
     let path = ProjectPath::new("internal.d.ts")?;
-    // A file no entry names is the module of its path. A name two members share and the
-    // declarations of a script keep no identity.
-    for (text, named) in [
+    // The non-entry file is a named module, even when a position names no declaration.
+    let cases: [(_, _, &[_]); 4] = [
         (
             "export declare class Hidden { get(): string; }\n",
-            Some("greeting/internal.d.ts/Hidden/get"),
+            true,
+            &[Some("greeting/internal.d.ts/Hidden/get")],
         ),
         (
             "export declare class Hidden { static get(): string; get(): string; }\n",
-            None,
+            true,
+            &[
+                Some("greeting/internal.d.ts/Hidden/get"),
+                Some("greeting/internal.d.ts/Hidden/get#1"),
+            ],
         ),
-        ("declare class Hidden { get(): string; }\n", None),
-    ] {
+        (
+            "export declare class Hidden { [get: string]: number; }\n",
+            true,
+            &[None],
+        ),
+        ("declare class Hidden { get(): string; }\n", false, &[None]),
+    ];
+    for (text, has_module, expected) in cases {
         let files = [PackageSource::new(&path, text)];
         let manifest = ProjectPath::new("package.json")?;
         let context = [PackageSource::new(
@@ -197,16 +207,29 @@ fn an_unnamed_declaration_never_selects_the_named_enclosing_module() -> TestResu
         )?
         .with_framework_context(&context, &[])?;
         let analysis = PackageAnalyzer::analyze(input, 1)?;
-        let found = declaration_at(
-            &analysis,
-            &path,
-            u64::try_from(text.find("get").ok_or("get")?)?,
+        assert_eq!(
+            analysis.publication().declarations.iter().any(|item| {
+                item.symbol.as_str()
+                    == "rift://symbol/npm/npmjs.org/greeting/typescript/greeting%2Finternal.d.ts"
+            }),
+            has_module,
+            "{text}",
         );
-        let selected = found.ok().map(|found| {
-            SymbolIdentity::parse(found.symbol.as_str())
-                .map(|identity| identity.qualified_path().join("/"))
-        });
-        assert_eq!(selected.transpose()?.as_deref(), named, "{text}");
+        let offsets: Vec<_> = text
+            .match_indices("get")
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(offsets.len(), expected.len(), "{text}");
+        for (offset, expected) in offsets.into_iter().zip(expected) {
+            let selected = declaration_at(&analysis, &path, u64::try_from(offset)?)
+                .ok()
+                .map(|found| {
+                    SymbolIdentity::parse(found.symbol.as_str())
+                        .map(|identity| identity.qualified_path().join("/"))
+                })
+                .transpose()?;
+            assert_eq!(selected.as_deref(), *expected, "{text} at {offset}");
+        }
     }
     Ok(())
 }
