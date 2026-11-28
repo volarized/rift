@@ -21,6 +21,7 @@ use super::{PackageAnalyzer, bound, digest_of, file_digest, line_of, line_starts
 use crate::ExactPackageLimits;
 
 mod associated_members;
+mod constants;
 mod foreign_declarations;
 mod variant_fields;
 
@@ -85,6 +86,15 @@ pub struct RustLspForeignDeclarationFile<'source> {
     /// Selected complete macro expansions in the same opened source bytes.
     pub macros: RustLspMacroFile<'source>,
     /// Exact original byte range and whether the engine labeled a function rather than a parameter.
+    pub declarations: &'source [(SourceRange, bool)],
+}
+
+/// Macro-tagged native constant evidence for one opened Rust unit.
+#[derive(Debug, Clone, Copy)]
+pub struct RustLspMacroConstantFile<'source> {
+    /// Selected complete macro expansions tied to the original source.
+    pub macros: RustLspMacroFile<'source>,
+    /// Exact original byte range and whether the native constant is associated.
     pub declarations: &'source [(SourceRange, bool)],
 }
 
@@ -267,6 +277,29 @@ impl PackageAnalyzer {
         )
     }
 
+    /// Publishes written constants in checked module-item expansions of selected local macros.
+    ///
+    /// Native declaration roles, original tokens and complete emitted declarations must agree.
+    /// Associated constants also require a retained nominal owner in the same authored unit.
+    /// Call this after established declaration admissions.
+    ///
+    /// # Errors
+    /// Returns an error if an admitted declaration cannot be represented canonically.
+    pub fn admit_rust_lsp_macro_constants(
+        publication: &mut PackagePublication,
+        observed: &[RustLspMacroConstantFile<'_>],
+        producer: &FactProducer,
+        limits: ExactPackageLimits,
+    ) -> Result<RustLspMacroAdmission, RiftError> {
+        Self::admit_rust_lsp_expansions(
+            publication,
+            ExpansionFiles::Constants(observed),
+            &[],
+            producer,
+            limits,
+        )
+    }
+
     fn admit_rust_lsp_expansions(
         publication: &mut PackagePublication,
         observed: ExpansionFiles<'_>,
@@ -311,7 +344,9 @@ impl PackageAnalyzer {
             limits,
         );
         let imports = match observed {
-            ExpansionFiles::Items(_) => foreign_declarations::ImportedOwners::default(),
+            ExpansionFiles::Items(_) | ExpansionFiles::Constants(_) => {
+                foreign_declarations::ImportedOwners::default()
+            }
             ExpansionFiles::Foreign(_) => foreign_declarations::ImportedOwners::capture(
                 publication,
                 &declarations,
@@ -336,7 +371,7 @@ impl PackageAnalyzer {
                 (
                     &objects,
                     &definitions,
-                    tokens.map(|tokens| (tokens, &imports)),
+                    ExpansionLabels::new(tokens, &imports, limits.syntax()),
                 ),
                 limits.syntax(),
                 &mut output,
@@ -362,12 +397,20 @@ impl PackageAnalyzer {
     }
 }
 
-type ForeignTokens<'source> = &'source [(SourceRange, bool)];
+type DeclarationTokens<'source> = &'source [(SourceRange, bool)];
 
 #[derive(Clone, Copy)]
 enum ExpansionFiles<'source> {
     Items(&'source [RustLspMacroFile<'source>]),
     Foreign(&'source [RustLspForeignDeclarationFile<'source>]),
+    Constants(&'source [RustLspMacroConstantFile<'source>]),
+}
+
+#[derive(Clone, Copy)]
+enum ExpansionTokens<'source> {
+    Definitions,
+    Foreign(DeclarationTokens<'source>),
+    Constants(DeclarationTokens<'source>),
 }
 
 impl<'source> ExpansionFiles<'source> {
@@ -375,26 +418,31 @@ impl<'source> ExpansionFiles<'source> {
         match self {
             Self::Items(files) => files.len(),
             Self::Foreign(files) => files.len(),
+            Self::Constants(files) => files.len(),
         }
     }
 
     fn files(
         &self,
-    ) -> impl Iterator<
-        Item = (
-            &'source RustLspMacroFile<'source>,
-            Option<ForeignTokens<'source>>,
-        ),
-    > {
-        let (items, foreign) = match self {
-            Self::Items(files) => (*files, &[][..]),
-            Self::Foreign(files) => (&[][..], *files),
+    ) -> impl Iterator<Item = (&'source RustLspMacroFile<'source>, ExpansionTokens<'source>)> {
+        let (items, foreign, constants) = match self {
+            Self::Items(files) => (*files, &[][..], &[][..]),
+            Self::Foreign(files) => (&[][..], *files, &[][..]),
+            Self::Constants(files) => (&[][..], &[][..], *files),
         };
-        items.iter().map(|file| (file, None)).chain(
-            foreign
-                .iter()
-                .map(|file| (&file.macros, Some(file.declarations))),
-        )
+        items
+            .iter()
+            .map(|file| (file, ExpansionTokens::Definitions))
+            .chain(
+                foreign
+                    .iter()
+                    .map(|file| (&file.macros, ExpansionTokens::Foreign(file.declarations))),
+            )
+            .chain(
+                constants
+                    .iter()
+                    .map(|file| (&file.macros, ExpansionTokens::Constants(file.declarations))),
+            )
     }
 }
 
@@ -938,17 +986,12 @@ fn collect_file<'a>(
     file: &RustLspMacroFile<'_>,
     unit: &'a PackageSourceUnit,
     existing: &[&'a PackageSymbol],
-    inventory: (
-        &Objects<'_>,
-        &Definitions<'a>,
-        Option<(ForeignTokens<'_>, &foreign_declarations::ImportedOwners<'_>)>,
-    ),
+    inventory: (&Objects<'_>, &Definitions<'a>, ExpansionLabels<'_>),
     limits: SyntaxLimits,
     output: &mut Observations<'a>,
 ) {
-    let (objects, definitions, foreign) = inventory;
-    let labels = foreign.map(|(tokens, _)| foreign_declarations::labels(tokens, limits));
-    if labels.as_ref().is_some_and(BTreeMap::is_empty) {
+    let (objects, definitions, labels) = inventory;
+    if labels.is_empty() {
         return;
     }
     let Some(original) = parse(file.path, &unit.source, limits) else {
@@ -1020,16 +1063,15 @@ fn collect_file<'a>(
             observation,
             &module,
             scope,
-            foreign.map(|(_, imports)| imports).zip(labels.as_ref()),
+            (&labels, existing, objects),
             limits,
         ) else {
             continue;
         };
         let observation = RustLspMacroItems {
-            names: if foreign.is_some() {
-                &confirmed
-            } else {
-                observation.names
+            names: match labels {
+                ExpansionLabels::Definitions => observation.names,
+                ExpansionLabels::Foreign(..) | ExpansionLabels::Constants(_) => &confirmed,
             },
             ..*observation
         };
@@ -1040,13 +1082,48 @@ fn collect_file<'a>(
 type ForeignLabels = BTreeMap<SourceRange, Option<foreign_declarations::Role>>;
 type ExpansionCandidates = (BTreeMap<SourceRange, Candidate>, Vec<SourceRange>);
 
+enum ExpansionLabels<'source> {
+    Definitions,
+    Foreign(
+        ForeignLabels,
+        &'source foreign_declarations::ImportedOwners<'source>,
+    ),
+    Constants(constants::Labels),
+}
+
+impl<'source> ExpansionLabels<'source> {
+    fn new(
+        tokens: ExpansionTokens<'_>,
+        imports: &'source foreign_declarations::ImportedOwners<'source>,
+        limits: SyntaxLimits,
+    ) -> Self {
+        match tokens {
+            ExpansionTokens::Definitions => Self::Definitions,
+            ExpansionTokens::Foreign(tokens) => {
+                Self::Foreign(foreign_declarations::labels(tokens, limits), imports)
+            }
+            ExpansionTokens::Constants(tokens) => {
+                Self::Constants(constants::labels(tokens, limits))
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Definitions => false,
+            Self::Foreign(labels, _) => labels.is_empty(),
+            Self::Constants(labels) => labels.is_empty(),
+        }
+    }
+}
+
 fn expansion_candidates(
     path: &ProjectPath,
     original: &SyntaxDocument,
     observation: &RustLspMacroItems<'_>,
     module: &SymbolIdentity,
     scope: ObservedScope<'_, '_>,
-    foreign: Option<(&foreign_declarations::ImportedOwners<'_>, &ForeignLabels)>,
+    inventory: (&ExpansionLabels<'_>, &[&PackageSymbol], &Objects<'_>),
     limits: SyntaxLimits,
 ) -> Option<ExpansionCandidates> {
     let ObservedScope {
@@ -1056,51 +1133,71 @@ fn expansion_candidates(
         definition,
         ..
     } = scope;
+    let (labels, existing, objects) = inventory;
     let site = &observation.site;
     let associated = owner.syntax_element_kind.as_deref() == Some("impl_item");
     let local_scope = selected_in_scope(definition, unit, original, site, module);
     let mut confirmed = Vec::new();
-    let names = if let Some((imports, labels)) = foreign {
-        if associated
-            || dependency
-            || (!local_scope
-                && (!imports.allows(definition, site, owner)
-                    || local_macro_shadows(original, definition, site.invocation)))
-        {
-            return None;
+    let names = match labels {
+        ExpansionLabels::Foreign(labels, imports) => {
+            if associated
+                || dependency
+                || (!local_scope
+                    && (!imports.allows(definition, site, owner)
+                        || local_macro_shadows(original, definition, site.invocation)))
+            {
+                return None;
+            }
+            foreign_declarations::confirm(
+                foreign_declarations::candidates(
+                    path,
+                    &unit.source,
+                    site.invocation,
+                    observation.expansion,
+                    limits,
+                ),
+                labels,
+                &mut confirmed,
+            )
         }
-        foreign_declarations::confirm(
-            foreign_declarations::candidates(
+        ExpansionLabels::Constants(labels)
+            if local_scope
+                && !associated
+                && !dependency
+                && definition
+                    .identity
+                    .qualified_path()
+                    .split_last()
+                    .is_some_and(|(_, parent)| module.qualified_path().starts_with(parent)) =>
+        {
+            let owners = constants::Owners {
+                module,
+                existing,
+                objects,
+            };
+            let names =
+                constants::candidates(path, &unit.source, observation, labels, &owners, limits);
+            confirmed.extend(names.keys().copied());
+            names
+        }
+        ExpansionLabels::Definitions if local_scope && associated && dependency => {
+            associated_members::candidates(
                 path,
                 &unit.source,
                 site.invocation,
                 observation.expansion,
                 limits,
-            ),
-            labels,
-            &mut confirmed,
-        )
-    } else if !local_scope {
-        return None;
-    } else if associated && dependency {
-        associated_members::candidates(
-            path,
-            &unit.source,
-            site.invocation,
-            observation.expansion,
-            limits,
-        )
-    } else if associated {
-        return None;
-    } else {
-        candidates(
+            )
+        }
+        ExpansionLabels::Definitions if local_scope && !associated => candidates(
             path,
             &unit.source,
             site.invocation,
             observation.expansion,
             limits,
             true,
-        )
+        ),
+        _ => return None,
     };
     Some((names, confirmed))
 }
@@ -2472,6 +2569,146 @@ mod shadow {
                 Some(placeholder),
             );
         }
+    }
+
+    const CONSTANT_SOURCE: &str = r"
+    pub struct Board;
+    pub const STABLE: u8 = 0;
+    macro_rules! publish_values { ($($tokens:tt)*) => { $($tokens)* }; }
+    publish_values!(TOP, SLOT, SECOND);
+    pub fn read() -> u8 { STABLE }
+    ";
+    const CONSTANT_EXPANSION: &str =
+        "pub const TOP: u8 = 1; impl Board { pub const SLOT: u8 = 2; pub const SECOND: u8 = 3; }";
+
+    #[test]
+    fn macro_constants_require_retained_nominal_and_exact_native_roles() {
+        let path = ProjectPath::new("src/lib.rs").expect("fixture unit");
+        let limits = ExactPackageLimits::new(16, 2 * 1024 * 1024);
+        let digest = FileDigest::of(CONSTANT_SOURCE.as_bytes());
+        let token = |name: &str| {
+            let offset = CONSTANT_SOURCE.find(name).expect("written claim");
+            SourceRange::new(offset as u64, (offset + name.len()) as u64).expect("token range")
+        };
+        let observation = RustLspMacroItems {
+            site: PackageAnalyzer::rust_lsp_macro_sites(&path, CONSTANT_SOURCE, limits.syntax())[0],
+            definition: RustLspMacroDefinition {
+                path: &path,
+                digest,
+                range: token("publish_values"),
+            },
+            expansion: CONSTANT_EXPANSION,
+            names: &[],
+        };
+        let producer = FactProducer {
+            name: ProducerName::parse("rust-analyzer").expect("producer"),
+            revision: ProducerRevision::parse("1").expect("revision"),
+        };
+        let base = authored_macro_fixture(vec![(path.as_str(), CONSTANT_SOURCE)]);
+        let labels = [
+            (token("TOP"), false),
+            (token("SLOT"), true),
+            (token("SECOND"), true),
+        ];
+        let publish =
+            |graph: &mut PackagePublication, observation, labels: &[_], digest, limits| {
+                PackageAnalyzer::admit_rust_lsp_macro_constants(
+                    graph,
+                    &[RustLspMacroConstantFile {
+                        macros: RustLspMacroFile {
+                            path: &path,
+                            digest,
+                            expansions: &[observation],
+                        },
+                        declarations: labels,
+                    }],
+                    &producer,
+                    limits,
+                )
+                .expect("canonical constant admission")
+            };
+        let mut graph = base.clone();
+        let report = publish(&mut graph, observation, &labels, digest, limits);
+        assert_eq!(report.admitted, 3);
+        assert_exact_constant_facets(&graph, &base, &labels);
+        let limited = limits
+            .with_declarations(u32::try_from(base.declarations.len() + 1).expect("capacity"))
+            .expect("one remaining declaration");
+        assert_eq!(
+            publish(&mut base.clone(), observation, &labels, digest, limited),
+            RustLspMacroAdmission {
+                admitted: 1,
+                dropped_at_limit: 2
+            }
+        );
+        assert_eq!(
+            publish(
+                &mut base.clone(),
+                observation,
+                &labels,
+                FileDigest::of(b"stale"),
+                limits
+            )
+            .admitted,
+            0
+        );
+        let mismatched = [
+            (token("TOP"), true),
+            (token("SLOT"), false),
+            (token("SECOND"), true),
+        ];
+        assert_eq!(
+            publish(&mut base.clone(), observation, &mismatched, digest, limits).admitted,
+            1
+        );
+        let duplicate = [labels[0], labels[1], labels[1], labels[2]];
+        assert_eq!(
+            publish(&mut base.clone(), observation, &duplicate, digest, limits).admitted,
+            2
+        );
+    }
+
+    fn assert_exact_constant_facets(
+        graph: &PackagePublication,
+        base: &PackagePublication,
+        labels: &[(SourceRange, bool)],
+    ) {
+        let mut admitted = 0;
+        for (name, suffix, (range, _)) in [
+            ("TOP", "/TOP", labels[0]),
+            ("SLOT", "/Board/SLOT", labels[1]),
+            ("SECOND", "/Board/SECOND", labels[2]),
+        ] {
+            let row = graph
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.symbol.as_str().ends_with(suffix)
+                        && row.range.start == range.start()
+                        && row.range.end == range.end()
+                })
+                .expect("unique complete authored facet");
+            assert_eq!(row.source, name);
+            assert!(row.public);
+            assert!(row.signature_indices.is_empty());
+            if let Some(object) = graph
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&row.symbol))
+            {
+                assert_eq!(object.kind.0, "constant");
+                assert!(object.kinds.contains(&SymbolKind::Value));
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 3);
+        assert!(
+            base.declarations
+                .iter()
+                .all(|row| graph.declarations.contains(row))
+        );
+        assert_eq!(graph.edges, base.edges);
+        graph.validate_facts().expect("valid constant publication");
     }
 
     #[test]
