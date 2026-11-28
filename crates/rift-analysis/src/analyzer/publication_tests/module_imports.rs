@@ -8479,6 +8479,90 @@ fn initializer_members_stay_with_the_separately_placed_local_binding() {
 }
 
 #[test]
+fn scoped_initializer_keeps_nested_objects_and_separate_array_elements() {
+    const SOURCE: &str = concat!(
+        "register('first', () => {\n",
+        "  const settings = { theme: { style: { tone: 1 }, bands: [{ limit: 2 }, { limit: 3 }],\n",
+        "    duplicate: { skipped: 5, skipped: 6 }, generated: build({ guessed: 7 }) } };\n",
+        "  return settings;\n",
+        "});\n",
+        "register('second', () => {\n",
+        "  const settings = { theme: { style: { tone: 9 }, bands: [{ limit: 10 }] } };\n",
+        "  return settings;\n",
+        "});\n",
+    );
+    let collected = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.mjs", "export const fixed = true;"),
+            ("settings.mjs", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked package");
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "settings.mjs")
+        .expect("source");
+    let mut bindings = publication
+        .declarations
+        .iter()
+        .filter(|row| {
+            row.unit == unit.unit && row.source.starts_with("settings = {") && row.source_complete
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| binding.range.start);
+    let [first, second] = bindings.as_slice() else {
+        panic!("two exact scoped bindings")
+    };
+    assert_ne!(first.symbol, second.symbol);
+    let mut named_elements = BTreeSet::new();
+    for (owner, tone, limits) in [
+        (*first, "tone: 1", &["limit: 2", "limit: 3"][..]),
+        (*second, "tone: 9", &["limit: 10"][..]),
+    ] {
+        let written = |text| {
+            let start = SOURCE.find(text).expect("written property");
+            publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == unit.unit
+                        && row.source == text
+                        && row.source_complete
+                        && row.range == module_runtime_range(start, text)
+                })
+                .expect("checked nested property")
+        };
+        assert_eq!(
+            written(tone).symbol.as_str(),
+            format!("{}/theme/style/tone", owner.symbol.as_str())
+        );
+        for limit in limits {
+            let member = written(limit);
+            assert!(
+                member
+                    .symbol
+                    .as_str()
+                    .starts_with(&format!("{}/theme/bands/limit", owner.symbol.as_str()))
+            );
+            assert!(named_elements.insert(&member.symbol));
+        }
+    }
+    assert!(publication.declarations.iter().all(|row| {
+        !row.symbol.as_str().contains("/theme/duplicate/skipped")
+            && !row.symbol.as_str().contains("/theme/generated/guessed")
+    }));
+}
+
+#[test]
 fn nested_array_initializers_keep_properties_under_their_written_variable() {
     const SOURCE: &str = concat!(
         "export const values = [[{ present: 1 }], [{ present: 2 }]];\n",

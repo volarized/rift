@@ -13,6 +13,7 @@ impl<'source> FileScopes<'source> {
     pub(in super::super) fn place_scoped_initializer_children(
         &self,
         file: &SelectedFile<'source>,
+        withheld: &BTreeSet<&str>,
         anchors: &BTreeMap<String, SymbolId>,
         scoped: &mut ScopedIdentityAnchors,
     ) {
@@ -81,6 +82,7 @@ impl<'source> FileScopes<'source> {
                 members.push((property, key, identity));
             }
         }
+        let mut placed_parents = BTreeSet::new();
         for (property, key, owner) in members {
             if counts.get(&key) != Some(&1)
                 || scoped
@@ -93,11 +95,22 @@ impl<'source> FileScopes<'source> {
                 continue;
             };
             if occupied.insert(id.clone()) {
+                placed_parents.insert(property.item_range);
                 scoped
                     .entry(property.qualified_name.clone())
                     .or_default()
                     .insert(property.declaration_ordinal, id);
             }
+        }
+        if !placed_parents.is_empty() {
+            self.scope_nested_properties(
+                file,
+                withheld,
+                anchors,
+                &mut occupied,
+                scoped,
+                Some(&mut placed_parents),
+            );
         }
     }
 }

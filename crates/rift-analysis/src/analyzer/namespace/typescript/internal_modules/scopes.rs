@@ -564,7 +564,7 @@ impl<'source> FileScopes<'source> {
                 &mut occupied,
                 &mut scoped,
             );
-            self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
+            self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped, None);
             self.scope_named_function_arguments(
                 file,
                 repeated,
@@ -585,6 +585,7 @@ impl<'source> FileScopes<'source> {
         anchors: &BTreeMap<String, SymbolId>,
         occupied: &mut BTreeSet<SymbolId>,
         scoped: &mut ScopedIdentityAnchors,
+        mut placed_parents: Option<&mut BTreeSet<ByteRange>>,
     ) {
         let properties = file
             .syntax
@@ -633,7 +634,10 @@ impl<'source> FileScopes<'source> {
         }
         // Parent pairs start before their literal's members.
         for (parent, child, body, array) in members.into_values() {
-            if counts.get(&(body, child.name.as_str())) != Some(&1)
+            if placed_parents
+                .as_ref()
+                .is_some_and(|parents| !parents.contains(&parent.item_range))
+                || counts.get(&(body, child.name.as_str())) != Some(&1)
                 || scoped
                     .get(&child.qualified_name)
                     .is_some_and(|group| group.contains_key(&child.declaration_ordinal))
@@ -663,6 +667,9 @@ impl<'source> FileScopes<'source> {
                 continue;
             };
             if occupied.insert(id.clone()) {
+                if let Some(parents) = placed_parents.as_mut() {
+                    parents.insert(child.item_range);
+                }
                 scoped
                     .entry(child.qualified_name.clone())
                     .or_default()

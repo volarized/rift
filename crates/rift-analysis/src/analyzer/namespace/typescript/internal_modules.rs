@@ -144,7 +144,7 @@ fn module_scoped_anchors(
     scopes.place_mixed_shorthand(file, &withheld, anchors, &mut physical);
     scopes.place_checked_method_return_pairs(file, &withheld, anchors, &mut physical);
     scopes.place_module_assignment_shorthand(file, &withheld, anchors, &mut physical);
-    scopes.place_scoped_initializer_children(file, anchors, &mut physical);
+    scopes.place_scoped_initializer_children(file, &withheld, anchors, &mut physical);
     scopes.place_disjoint_module_bindings(file, &withheld, anchors, &mut physical);
     scopes.place_module_arrow_properties(file, &withheld, anchors, &mut physical);
     anchors.retain(|name, _| {
