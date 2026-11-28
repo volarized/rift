@@ -41,10 +41,23 @@ impl Records {
         self.retain_checked_inline_import_type_edges(semantics, limits.edges_max());
         self.retain_commonjs_argument_imports(semantics, limits.edges_max());
         self.retain_checked_inline_import_modules(semantics, limits.edges_max());
-        if super::namespace::typescript::checked_commonjs_package(&namespace) {
-            self.retain_checked_commonjs_modules(owner, analyzed, semantics, limits)?;
-        }
+        let checked_callback_modules =
+            if super::namespace::typescript::checked_commonjs_package(&namespace) {
+                self.retain_checked_commonjs_modules(owner, analyzed, semantics, limits)?
+            } else {
+                BTreeSet::new()
+            };
         self.retain_written_callback_argument_properties(owner, analyzed, limits)?;
+        if !checked_callback_modules.is_empty() {
+            self.retain_ecmascript_callback_edges_in(
+                owner,
+                analyzed,
+                semantics,
+                limits,
+                EdgeKind::Reads,
+                Some(&checked_callback_modules),
+            )?;
+        }
         Ok(())
     }
 
@@ -54,9 +67,9 @@ impl Records {
         analyzed: &[AnalyzedFile],
         semantics: &WorkspaceSemantics,
         limits: ExactPackageLimits,
-    ) -> Result<(), RiftError> {
+    ) -> Result<BTreeSet<String>, RiftError> {
         if self.symbols_truncated {
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
         let candidates = commonjs_expression_entries(owner, analyzed, &self.units);
         if candidates.values().any(Option::is_some) {
@@ -64,7 +77,7 @@ impl Records {
         }
         let targets = self.complete_require_targets();
         if !targets.values().any(Option::is_some) {
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
         let (loaders, loads) =
             checked_relative_require_sources(owner, analyzed, &self.units, semantics, &targets);
@@ -132,16 +145,9 @@ impl Records {
                 }),
                 limits.edges_max(),
             );
-            self.retain_ecmascript_callback_edges_in(
-                owner,
-                analyzed,
-                semantics,
-                limits,
-                EdgeKind::Reads,
-                Some(&admitted),
-            )?;
         }
-        self.retain_javascript_callback_argument_properties(owner, analyzed, limits)
+        self.retain_javascript_callback_argument_properties(owner, analyzed, limits)?;
+        Ok(admitted)
     }
 
     fn complete_require_targets(&self) -> BTreeMap<String, Option<String>> {

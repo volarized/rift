@@ -8546,3 +8546,186 @@ fn assigned_shorthand_keeps_distinct_module_and_initializer_owners() {
         );
     }
 }
+
+#[test]
+fn retained_callback_keeps_independently_written_argument_properties() {
+    const ENTRY: &str = "function helper(value) { return value; }\nmodule.exports = helper;\n";
+    const SELECTED: &str = concat!(
+        "var check = require('checks');\n",
+        "var helper = require('../');\n",
+        "check('first', function () {\n",
+        "    helper('first');\n",
+        "    opaque({ visible: 'direct' });\n",
+        "    JSON.stringify({ visible: 'first' });\n",
+        "});\n",
+        "check('second', function () {\n",
+        "    opaque('second');\n",
+        "    JSON.stringify({ visible: 'second' });\n",
+        "});\n",
+    );
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", ENTRY), ("test/options.cjs", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("written callbacks with independently checked calls")
+    };
+    let unresolved = SELECTED.replace("helper('first')", "opaque('first')");
+    let first = analyze(&unresolved);
+    let second = analyze(SELECTED);
+    let mut property_ids = Vec::new();
+    for (analysis, calls) in [(&first, 0), (&second, 1)] {
+        let publication = analysis.publication();
+        publication
+            .validate_facts()
+            .expect("checked callback facts");
+        let mut properties = Vec::new();
+        for (source, ordinal) in [("visible: 'first'", 0), ("visible: 'second'", 1)] {
+            let declared = publication
+                .declarations
+                .iter()
+                .find(|row| row.source == source && row.source_complete)
+                .expect("written visible property");
+            assert_eq!(
+                declared.range,
+                module_runtime_range(SELECTED.find(source).expect("written property"), source),
+            );
+            let callback = publication
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&declared.symbol))
+                .and_then(|object| object.container.as_ref())
+                .expect("written callback owner");
+            assert!(
+                callback
+                    .as_str()
+                    .ends_with(&format!("$callback%23{ordinal}"))
+            );
+            properties.push((callback.clone(), declared.symbol.clone()));
+        }
+
+        let callback_calls = publication
+            .edges
+            .iter()
+            .filter(|edge| edge.kinds.contains(&EdgeKind::Calls) && edge.from == properties[0].0)
+            .collect::<Vec<_>>();
+        assert_eq!(callback_calls.len(), calls);
+        assert_eq!(
+            publication
+                .declarations
+                .iter()
+                .any(|row| row.source == "visible: 'direct'"),
+            calls == 0,
+        );
+        if let [call] = callback_calls.as_slice() {
+            assert!(call.to.as_str().ends_with("/helper"));
+            assert_eq!(
+                call.occurrence.as_ref().expect("written Call").range,
+                module_runtime_range(
+                    SELECTED.find("helper('first')").expect("written call"),
+                    "helper('first')",
+                ),
+            );
+        }
+        property_ids.push(properties);
+    }
+    assert_eq!(property_ids[0], property_ids[1]);
+}
+
+#[test]
+fn checked_local_reads_keep_prior_callback_argument_properties() {
+    const ENTRY: &str = "function load() { return 1; }\nmodule.exports = load;\n";
+    const SELECTED: &str = concat!(
+        "const load = require('../');\n",
+        "const values = [];\n",
+        "external.deliver(() => {\n",
+        "    sink(values);\n",
+        "    inspect({ flag: 'first' });\n",
+        "    inspect({ flag: 'second' });\n",
+        "});\n",
+    );
+    let unresolved = SELECTED.replace("sink(values)", "sink(opaque)");
+    let with_call = SELECTED.replace("sink(values);", "sink(values);\n    load();");
+    let mut incumbent = Vec::new();
+    for (source, has_read, has_call) in [
+        (unresolved.as_str(), false, false),
+        (SELECTED, true, false),
+        (with_call.as_str(), true, true),
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", ENTRY), ("test/check.js", source)],
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#,
+            )),
+        )
+        .expect("written callback and local variable");
+        let publication = analysis.publication();
+        publication.validate_facts().expect("exact callback facts");
+        let callback = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("$callback%230"))
+            .expect("written callback");
+        let edge_exists = |kind, target: &str, site: &str, offset| {
+            publication.edges.iter().any(|edge| {
+                edge.from == callback.symbol
+                    && edge.kinds == [kind]
+                    && edge.to.as_str().ends_with(target)
+                    && edge.occurrence.as_ref().is_some_and(|at| {
+                        at.unit == callback.unit && at.range == module_runtime_range(offset, site)
+                    })
+            })
+        };
+        let value = source.find("sink(").expect("consumer") + "sink(".len();
+        assert_eq!(
+            edge_exists(EdgeKind::Reads, "/values", "values", value),
+            has_read
+        );
+        if has_call {
+            let call = source.find("load();").expect("checked local call");
+            assert!(edge_exists(EdgeKind::Calls, "/load", "load()", call));
+        } else {
+            assert!(!publication.edges.iter().any(|edge| {
+                edge.from == callback.symbol && edge.kinds.contains(&EdgeKind::Calls)
+            }));
+        }
+        let mut ids = Vec::new();
+        for written in ["flag: 'first'", "flag: 'second'"] {
+            let field = publication
+                .declarations
+                .iter()
+                .find(|row| row.source == written);
+            if has_call {
+                assert!(field.is_none());
+                continue;
+            }
+            let field = field.expect("prior written property");
+            assert!(field.source_complete);
+            assert_eq!(field.unit, callback.unit);
+            assert_eq!(
+                field.range,
+                module_runtime_range(source.find(written).expect("written property"), written),
+            );
+            let container = publication
+                .objects
+                .iter()
+                .find(|object| object.id.as_ref() == Some(&field.symbol))
+                .and_then(|object| object.container.as_ref());
+            assert_eq!(container, Some(&callback.symbol));
+            ids.push(field.symbol.clone());
+        }
+        if !has_read {
+            incumbent = ids;
+        } else if !has_call {
+            assert_eq!(ids, incumbent);
+        }
+    }
+}
