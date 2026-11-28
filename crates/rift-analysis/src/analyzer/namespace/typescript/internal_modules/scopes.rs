@@ -124,6 +124,97 @@ pub(in crate::analyzer::namespace::typescript) fn private_local_identities(
     identities_by_name
 }
 
+/// Separates the static and instance declarations of one written class member name.
+pub(in crate::analyzer::namespace::typescript) fn class_member_identities(
+    file: &SelectedFile<'_>,
+    anchors: &BTreeMap<String, SymbolId>,
+) -> ScopedIdentityAnchors {
+    if file.syntax.has_errors() || file.syntax.left_out_declaration_count() != 0 {
+        return BTreeMap::new();
+    }
+    let symbols = file.syntax.symbols();
+    let repeated = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.declaration_ordinal > 0
+                && direct_class_member(symbol)
+                && anchors.contains_key(&symbol.qualified_name)
+        })
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let Some(facts) = file.syntax.static_facts().filter(|_| !repeated.is_empty()) else {
+        return BTreeMap::new();
+    };
+    let unique = unique_declarations(symbols);
+    let bodies = facts
+        .body_members()
+        .iter()
+        .map(|member| (member.member, member.body))
+        .collect::<BTreeMap<_, _>>();
+    let mut groups = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
+    for symbol in symbols {
+        let name = symbol.qualified_name.as_str();
+        if repeated.contains(name) {
+            groups.entry(name).or_default().push(symbol);
+        }
+    }
+    let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
+    groups
+        .into_iter()
+        .filter_map(|(name, members)| {
+            let first = members
+                .iter()
+                .min_by_key(|member| member.declaration_ordinal)?;
+            let owner = first.container.as_deref()?;
+            let class = unique.get(owner).copied().flatten()?;
+            if class.syntax_element_kind != Some("class_declaration")
+                || class.kind != "class"
+                || !anchors.contains_key(owner)
+                || !members.iter().all(|member| {
+                    direct_class_member(member)
+                        && member.container.as_deref() == Some(owner)
+                        && bodies.get(&member.item_range) == Some(&class.item_range)
+                })
+            {
+                return None;
+            }
+            let static_first = first.kinds.contains(&SymbolKind::Static);
+            let other = members
+                .iter()
+                .filter(|member| member.kinds.contains(&SymbolKind::Static) != static_first)
+                .map(|member| member.declaration_ordinal)
+                .collect::<Vec<_>>();
+            let identity = local_group_identity(anchors.get(name)?, *other.iter().min()?)?;
+            if !occupied.insert(identity.clone()) {
+                return None;
+            }
+            Some((
+                name.to_owned(),
+                other
+                    .into_iter()
+                    .map(|ordinal| (ordinal, identity.clone()))
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+fn direct_class_member(symbol: &SyntaxSymbol) -> bool {
+    symbol.name_range.is_some()
+        && !symbol.name.starts_with('[')
+        && matches!(
+            symbol.syntax_element_kind,
+            Some(
+                "method_definition"
+                    | "method_signature"
+                    | "abstract_method_signature"
+                    | "field_definition"
+                    | "public_field_definition"
+                    | "property_signature"
+            )
+        )
+}
+
 fn unique_declarations(symbols: &[SyntaxSymbol]) -> BTreeMap<&str, Option<&SyntaxSymbol>> {
     let mut unique = BTreeMap::new();
     for symbol in symbols {

@@ -8819,3 +8819,223 @@ fn checked_callback_arguments_keep_distinct_written_quote_and_nested_pairs() {
             .any(|edge| edge.kinds == [EdgeKind::Calls] && edge.to.as_str().ends_with("/inspect"))
     );
 }
+
+#[test]
+fn ecmascript_class_members_keep_distinct_static_and_instance_scopes() {
+    const BODY: &str = concat!(
+        "function classStep() { return 1; }\n",
+        "function objectStep() { return 2; }\n",
+        "export class Codec {\n",
+        "  static value = 1;\n",
+        "  value = 2;\n",
+        "  static get state() { return 1; }\n",
+        "  get state() { return 2; }\n",
+        "  set state(value) {}\n",
+        "  static encode() { return classStep(); }\n",
+        "  encode() { return objectStep(); }\n",
+        "  static [unknown()]() {}\n",
+        "  [unknown()]() {}\n",
+        "}\n",
+        "export function classUse() { return Codec.encode(); }\n",
+        "export function objectUse() { return new Codec().encode(); }\n",
+        "export function classValue() { return Codec.value; }\n",
+        "export function objectValue() { return new Codec().value; }\n",
+        "export function replaceAlias() {\n",
+        "  let alias = Codec;\n",
+        "  alias = unproved;\n",
+        "  return alias.encode();\n",
+        "}\n",
+    );
+    for (language, entry, inner, selector) in [
+        (
+            ShippedLanguage::JavaScript,
+            "index.mjs",
+            "codec.mjs",
+            "main",
+        ),
+        (
+            ShippedLanguage::TypeScript,
+            "index.mts",
+            "codec.mts",
+            "types",
+        ),
+    ] {
+        let metadata = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","{selector}":"./{entry}"}}"#,
+        );
+        let typed = BODY.replacen(
+            "  static encode() {",
+            "  static encode(): number;\n  static encode() {",
+            1,
+        );
+        let (body, static_declarations) = if language == ShippedLanguage::TypeScript {
+            (typed.as_str(), 2)
+        } else {
+            (BODY, 1)
+        };
+        for non_entry in [false, true] {
+            let source_path = if non_entry { inner } else { entry };
+            let mut files = vec![(source_path, body)];
+            if non_entry {
+                files.push((entry, "export const ready = true;"));
+            }
+            let analysis = fixture::package_result_with_metadata(
+                language,
+                files,
+                None,
+                Some(("package.json", &metadata)),
+            )
+            .expect("checked authored class package");
+            assert_ecmascript_class_member_scopes(
+                analysis.publication(),
+                source_path,
+                static_declarations,
+            );
+        }
+    }
+}
+
+fn assert_ecmascript_class_member_scopes(
+    found: &PackagePublication,
+    source_path: &str,
+    static_declarations: usize,
+) {
+    found.validate_facts().expect("valid class publication");
+    let rows = |name, is_static| {
+        found
+            .objects
+            .iter()
+            .filter(|row| {
+                row.name == name
+                    && row.kinds.contains(&SymbolKind::Static) == is_static
+                    && row.id.is_some()
+                    && row
+                        .container
+                        .as_ref()
+                        .is_some_and(|id| id.as_str().ends_with("/Codec"))
+            })
+            .collect::<Vec<_>>()
+    };
+    let identity = |name, is_static, declaration_count| {
+        let objects = rows(name, is_static);
+        let [object] = objects.as_slice() else {
+            panic!("one placed class member {source_path} {name} {is_static}: {objects:?}");
+        };
+        let id = object.id.as_ref().expect("class member identity");
+        assert_eq!(
+            found
+                .declarations
+                .iter()
+                .filter(|row| &row.symbol == id)
+                .count(),
+            declaration_count,
+        );
+        id
+    };
+    let static_method = identity("encode", true, static_declarations);
+    let instance_method = identity("encode", false, 1);
+    let static_value = identity("value", true, 1);
+    let instance_value = identity("value", false, 1);
+    assert_ne!(static_method, instance_method);
+    assert_ne!(static_value, instance_value);
+    assert_ne!(identity("state", true, 1), identity("state", false, 2));
+    for (from, to, kind) in [
+        ("/classUse", static_method, EdgeKind::Calls),
+        ("/objectUse", instance_method, EdgeKind::Calls),
+        ("/classValue", static_value, EdgeKind::Reads),
+        ("/objectValue", instance_value, EdgeKind::Reads),
+    ] {
+        assert!(
+            found.edges.iter().any(|edge| {
+                edge.from.as_str().ends_with(from) && &edge.to == to && edge.kinds == [kind]
+            }),
+            "{source_path} keeps {from} -> {to:?}"
+        );
+    }
+    for (from, to) in [
+        (static_method, "/classStep"),
+        (instance_method, "/objectStep"),
+    ] {
+        assert!(found.edges.iter().any(|edge| {
+            &edge.from == from && edge.to.as_str().ends_with(to) && edge.kinds == [EdgeKind::Calls]
+        }));
+    }
+    assert!(found.edges.iter().all(|edge| {
+        !edge.from.as_str().ends_with("/replaceAlias")
+            || ![static_method, instance_method].contains(&&edge.to)
+    }));
+    assert!(rows("[unknown()]", true).len() + rows("[unknown()]", false).len() <= 1);
+}
+
+#[test]
+fn non_entry_typescript_class_keeps_overloads_of_each_method_owner() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts"},"./*":"./*.js"}}"#;
+    const INSTANCE: &str = "  write(value: number): void;\n  write(value: string): void;\n";
+    const STATIC: &str =
+        "  static write(value: number): void;\n  static write(value: string): void;\n";
+    const DISTINCT: &str = "  build(value: number): void;\n  build(value: string): void;\n";
+    const FILE: &str = "writer.d.ts";
+    for [first, second] in [[INSTANCE, STATIC], [STATIC, INSTANCE], [INSTANCE, DISTINCT]] {
+        let source = format!(
+            "export declare class Writer {{\n{first}{second}  solo(value: boolean): void;\n}}\n"
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.d.ts", "export { Writer } from './writer.js';"),
+                (FILE, source.as_str()),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked declaration package");
+        let found = analysis.publication();
+        found
+            .validate_facts()
+            .expect("valid declaration publication");
+        let unit = found
+            .units
+            .iter()
+            .find(|row| row.path.0 == FILE)
+            .expect("written declaration unit");
+        let method =
+            |name, is_static, count| {
+                let rows: Vec<_> = found
+                    .objects
+                    .iter()
+                    .filter(|row| {
+                        row.name == name
+                            && row.kinds.contains(&SymbolKind::Static) == is_static
+                            && row
+                                .container
+                                .as_ref()
+                                .is_some_and(|id| id.as_str().ends_with("/Writer"))
+                            && row.id.is_some()
+                    })
+                    .collect();
+                let [object] = rows.as_slice() else {
+                    panic!("one checked method owner for {name} static={is_static}: {rows:?}");
+                };
+                let id = object.id.as_ref().expect("member identity");
+                let facets: Vec<_> = found
+                    .declarations
+                    .iter()
+                    .filter(|row| &row.symbol == id)
+                    .collect();
+                assert_eq!(facets.len(), count, "{name} static={is_static}");
+                assert!(
+                    facets.iter().all(|row| row.unit == unit.unit
+                        && row.source.starts_with("static ") == is_static)
+                );
+                id
+            };
+        let instance = method("write", false, 2);
+        let independent = if second == DISTINCT {
+            method("build", false, 2)
+        } else {
+            method("write", true, 2)
+        };
+        assert_ne!(instance, independent);
+        method("solo", false, 1);
+    }
+}

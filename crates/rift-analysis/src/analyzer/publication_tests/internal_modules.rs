@@ -492,7 +492,6 @@ fn a_name_declared_in_several_scopes_takes_no_identity() {
         "dup/secret",
         "dup/block",
         "dup/twice",
-        "A/x",
         "E/s",
         "option",
         "build/part",
@@ -501,6 +500,8 @@ fn a_name_declared_in_several_scopes_takes_no_identity() {
     }
     for (name, count) in [
         ("A", 1),
+        ("A/x", 1),
+        ("A/x#1", 1),
         ("A/y", 1),
         ("B/v", 2),
         ("pair", 2),
@@ -513,7 +514,7 @@ fn a_name_declared_in_several_scopes_takes_no_identity() {
     ] {
         assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
     }
-    for name in ["helper", "dup", "secret", "block", "x"] {
+    for name in ["helper", "dup", "secret", "block", "s"] {
         assert!(
             analysis
                 .publication()
@@ -654,7 +655,14 @@ export class Overloads { go(a: 1): void; go(a: 2): void; go() {} constructor(rea
 fn an_entry_keeps_the_identities_of_names_in_several_scopes() {
     let analysis = analyze(MAIN, &[("index.js", REPEATED)]);
     let counts = counted(&analysis, "beacon");
-    for (name, count) in [("helper", 1), ("helper#1", 1), ("dup", 2), ("A/x", 2)] {
+    for (name, count) in [
+        ("helper", 1),
+        ("helper#1", 1),
+        ("dup", 2),
+        ("A/x", 1),
+        ("A/x#1", 1),
+        ("E/s", 2),
+    ] {
         assert_eq!(counts.get(name), Some(&count), "{name} {counts:?}");
     }
     let publication = analysis.publication();

@@ -6,7 +6,10 @@ use std::fmt;
 use rift_core::{ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::SymbolKind;
-use rift_syntax::{ByteRange, LogicalDeclaration, SyntaxExportKind, SyntaxFacts, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, LogicalDeclaration, ScopedIdentityAnchors, SyntaxExportKind, SyntaxFacts,
+    SyntaxSymbol,
+};
 use serde::{Deserialize, Deserializer, de};
 
 use super::{ExportBinding, PreparedNamespace, SelectedFile};
@@ -219,7 +222,8 @@ fn prepare_file(
     prepared: &mut PreparedNamespace,
 ) -> bool {
     let anchors = declaration_anchors(input, file, Some(module));
-    prepare_anchors(input, file, module, anchors, prepared)
+    let class_members = internal_modules::class_member_identities(file, &anchors);
+    prepare_anchors(input, file, module, anchors, class_members, prepared)
 }
 
 fn prepare_anchors(
@@ -227,9 +231,11 @@ fn prepare_anchors(
     file: &SelectedFile<'_>,
     module: &str,
     mut anchors: BTreeMap<String, SymbolId>,
+    class_members: ScopedIdentityAnchors,
     prepared: &mut PreparedNamespace,
 ) -> bool {
     let mut scoped = internal_modules::private_local_identities(file, &anchors);
+    scoped.extend(class_members);
     if input.release_version().is_some()
         && matches!(
             input.owner(),
