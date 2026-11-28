@@ -1116,3 +1116,82 @@ fn restored_esm_callable_keeps_its_exact_argument_members_and_local_binding() {
             .any(|row| row.symbol == owner.symbol || row.source == "type: 'head'")
     );
 }
+
+#[test]
+fn checked_object_method_returns_keep_both_written_binding_and_shorthand() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str = "export { renderer } from './impl.js';\n";
+    const SOURCE: &str = concat!(
+        "export const renderer = {\n",
+        "    build(value) {\n",
+        "        const width = value;\n",
+        "        const height = value + 1;\n",
+        "        return { width, height };\n",
+        "    }\n",
+        "};\n",
+    );
+    let result = analyze(META, &[("index.js", ENTRY), ("impl.js", SOURCE)]);
+    let graph = result.publication();
+    graph
+        .validate_facts()
+        .expect("written method and returned keys");
+    let method = graph
+        .declarations
+        .iter()
+        .find(|row| {
+            row.source.starts_with("build(value)")
+                && row.syntax_element_kind.as_deref() == Some("method_definition")
+        })
+        .expect("written method");
+    let mut property_ids = BTreeSet::new();
+    for (name, written_local) in [("width", "width = value"), ("height", "height = value + 1")] {
+        let binding = graph
+            .declarations
+            .iter()
+            .find(|row| row.source == written_local)
+            .expect("written local");
+        let property = graph
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source == name
+                    && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+            })
+            .expect("written shorthand");
+        assert_ne!(property.symbol, binding.symbol);
+        property_ids.insert(property.symbol.clone());
+        let first =
+            u64::try_from(SOURCE.rfind(name).expect("written shorthand")).expect("written offset");
+        assert_eq!(property.range.start, first);
+        assert_eq!(
+            property.range.end,
+            first + u64::try_from(name.len()).expect("name length")
+        );
+        assert!(graph.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&property.symbol)
+                && object.container.as_ref() == Some(&method.symbol)
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to == binding.symbol
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == property.unit && site.range == property.range)
+        }));
+    }
+    let unrelated = SOURCE.replace("return { width, height };", "inspect({ width, height });");
+    let competing = SOURCE.replace(
+        "return { width, height };",
+        "return { width, width, height, height };",
+    );
+    for source in [unrelated, competing] {
+        assert!(
+            !analyze(META, &[("index.js", ENTRY), ("impl.js", &source)])
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| property_ids.contains(&row.symbol))
+        );
+    }
+}

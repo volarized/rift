@@ -117,7 +117,18 @@ impl<'source> FileScopes<'source> {
             return false;
         };
         let variable = local.syntax_element_kind == Some("variable_declarator");
-        let Some(owner) = placed_function(owners, local.item_range, variable) else {
+        let prior_owner = placed_function(owners, local.item_range, variable);
+        let object_method = variable && prior_owner.is_none();
+        let owner = if object_method {
+            owners
+                .enclosing
+                .resolve(local.item_range.start, local.item_range.end)
+                .and_then(|(range, _)| owners.object_methods.get(range))
+                .copied()
+        } else {
+            prior_owner
+        };
+        let Some(owner) = owner else {
             return false;
         };
         if local.container.as_deref() != Some(owner.qualified_name.as_str())
@@ -146,14 +157,24 @@ impl<'source> FileScopes<'source> {
             };
             let direct_return = returned.contains(&row.body)
                 && owners.returned.get(&row.body) == Some(&Some(owner.qualified_name.as_str()));
-            (member.syntax_element_kind == Some("shorthand_property_identifier")
-                || (member.syntax_element_kind == Some("pair") && direct_return))
+            let shorthand = member.syntax_element_kind == Some("shorthand_property_identifier");
+            let admissible = shorthand
+                || (!object_method && member.syntax_element_kind == Some("pair") && direct_return);
+            let same_owner = if object_method {
+                owners
+                    .enclosing
+                    .resolve(row.body.start, row.body.end)
+                    .is_some_and(|(range, _)| *range == owner.item_range)
+            } else {
+                placed_function(owners, row.body, variable)
+                    .is_some_and(|retained| retained.item_range == owner.item_range)
+            };
+            admissible
                 && (!variable || direct_return)
                 && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start
                 && scope.encloses(row.body)
-                && placed_function(owners, row.body, variable)
-                    .is_some_and(|function| function.item_range == owner.item_range)
+                && same_owner
                 && self.of(member, file) == Scope::Body(row.body, false)
                 && owners.proves_body(member, row)
                 && literals.insert(row.body)
