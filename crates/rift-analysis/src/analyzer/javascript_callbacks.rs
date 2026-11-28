@@ -13,8 +13,8 @@ use rift_protocol::read::{
 };
 use rift_provider::{AssembledSymbol, NormalizedTarget};
 use rift_syntax::{
-    ByteRange, StaticBindingKind, StaticFunctionContext, SyntaxProvider, SyntaxSource,
-    TypeScriptDialect,
+    ByteRange, StaticBindingKind, StaticCallee, StaticFunctionContext, SyntaxProvider,
+    SyntaxSource, TypeScriptDialect,
 };
 
 use crate::{EnclosingDefinitions, ExactPackageLimits, WorkspaceSemantics, edge::Edge};
@@ -448,94 +448,185 @@ fn stored_callback_edge_key(edge: &StoredEdge, kind: EdgeKind) -> Option<Callbac
     ))
 }
 
+struct CallbackModuleCandidate<'file> {
+    file: &'file AnalyzedFile,
+    names: BTreeMap<ByteRange, (u64, &'file str)>,
+    scopes: EnclosingDefinitions<Option<Callback>>,
+    member_receivers: BTreeMap<ByteRange, ByteRange>,
+}
+
+impl<'file> CallbackModuleCandidate<'file> {
+    fn new(file: &'file AnalyzedFile) -> Option<Self> {
+        let syntax = file.file.syntax();
+        if syntax.language().name != "typescript"
+            || crate::static_resolution::is_declaration_file(file.file.path().as_str())
+            || syntax.primary_symbols_len() != 0
+        {
+            return None;
+        }
+        let facts = syntax.static_facts()?;
+        if !facts.has_javascript_module_statement() {
+            return None;
+        }
+        let source = file.file.source();
+        let names = facts
+            .bindings()
+            .iter()
+            .filter_map(|binding| {
+                let StaticBindingKind::JavaScriptImport {
+                    module,
+                    export: Some(export),
+                } = binding.kind
+                else {
+                    return None;
+                };
+                let specifier = source_text(source, module)?;
+                let name = source_text(source, binding.name)?;
+                (specifier.starts_with("./") || specifier.starts_with("../")).then_some([
+                    (binding.name, (export.start, name)),
+                    (export, (export.start, name)),
+                ])
+            })
+            .flatten()
+            .collect::<BTreeMap<_, _>>();
+        if names.is_empty() {
+            return None;
+        }
+        let scopes = callback_scopes(file)?;
+        let member_receivers = facts
+            .calls()
+            .iter()
+            .filter_map(|call| match call.callee {
+                StaticCallee::Member { receiver, .. } => Some((call.range, receiver)),
+                _ => None,
+            })
+            .collect();
+        Some(Self {
+            file,
+            names,
+            scopes,
+            member_receivers,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CallbackModuleSources<'file> {
+    pub(super) direct: BTreeSet<&'file CoreSourceUnitId>,
+    pub(super) static_members: BTreeSet<&'file CoreSourceUnitId>,
+}
+
 /// Selects files where a written anonymous callback calls an independently resolved value import.
 pub(super) fn typescript_callback_module_sources<'file>(
     files: &'file [AnalyzedFile],
     semantics: &WorkspaceSemantics,
-) -> BTreeSet<&'file CoreSourceUnitId> {
+) -> CallbackModuleSources<'file> {
     let candidates = files
         .iter()
-        .filter_map(|file| {
-            let syntax = file.file.syntax();
-            if syntax.language().name != "typescript"
-                || crate::static_resolution::is_declaration_file(file.file.path().as_str())
-                || syntax.primary_symbols_len() != 0
-            {
-                return None;
-            }
-            let facts = syntax.static_facts()?;
-            if !facts.has_javascript_module_statement() {
-                return None;
-            }
-            let names = facts
-                .bindings()
-                .iter()
-                .filter_map(|binding| {
-                    let StaticBindingKind::JavaScriptImport {
-                        module,
-                        export: Some(export),
-                    } = binding.kind
-                    else {
-                        return None;
-                    };
-                    let specifier = source_text(file.file.source(), module)?;
-                    (specifier.starts_with("./") || specifier.starts_with("../"))
-                        .then_some([(binding.name, export.start), (export, export.start)])
-                })
-                .flatten()
-                .collect::<BTreeMap<_, _>>();
-            if names.is_empty() {
-                return None;
-            }
-            let scopes = callback_scopes(file)?;
-            Some((file.placement.unit(), (file, names, scopes)))
-        })
+        .filter_map(|file| Some((file.placement.unit(), CallbackModuleCandidate::new(file)?)))
         .collect::<BTreeMap<_, _>>();
     if candidates.is_empty() {
-        return BTreeSet::new();
+        return CallbackModuleSources::default();
     }
     let mut imports = BTreeMap::<_, BTreeSet<_>>::new();
     let mut calls = BTreeSet::new();
+    let mut reads = BTreeSet::new();
     for occurrence in semantics.static_occurrences() {
         let unit = occurrence.binding.unit();
-        let Some((&unit, (_, names, scopes))) = candidates.get_key_value(unit) else {
+        let Some((&unit, candidate)) = candidates.get_key_value(unit) else {
             continue;
         };
         let NormalizedTarget::Symbol(target) = &occurrence.target else {
             continue;
         };
         let source = occurrence.binding.range();
+        let span = ByteRange {
+            start: source.start(),
+            end: source.end(),
+        };
         if occurrence.role == ReferenceRole::Import
-            && let Some(&selector) = names.get(&ByteRange {
-                start: source.start(),
-                end: source.end(),
-            })
+            && let Some(&selector) = candidate.names.get(&span)
         {
             imports.entry((unit, target)).or_default().insert(selector);
         } else if occurrence.role == ReferenceRole::Call
-            && scopes
+            && candidate
+                .scopes
                 .containing(source.start(), source.end())
                 .is_some_and(|mut scopes| {
                     scopes.next().is_some_and(Option::is_some) && scopes.all(Option::is_some)
                 })
         {
-            calls.insert((unit, target));
+            calls.insert((unit, target, candidate.member_receivers.get(&span).copied()));
+        } else if occurrence.role == ReferenceRole::Read {
+            reads.insert((unit, target, span));
         }
     }
-    let mut witnesses = BTreeMap::<_, BTreeSet<_>>::new();
-    for (unit, target) in calls {
+    let member_targets = calls
+        .iter()
+        .filter_map(|&(_, target, receiver)| receiver.map(|_| target))
+        .collect();
+    let containers = checked_static_member_containers(semantics, &member_targets);
+    let mut direct = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut static_members = BTreeMap::<_, BTreeSet<_>>::new();
+    for (unit, target, receiver) in calls {
         if let Some(selectors) = imports.get(&(unit, target)) {
-            witnesses
+            direct
                 .entry(unit)
                 .or_default()
-                .extend(selectors.iter().copied());
+                .extend(selectors.iter().map(|&(position, _)| position));
+        }
+        if let Some(receiver) = receiver
+            && let Some(&class) = containers.get(target)
+            && reads.contains(&(unit, class, receiver))
+            && let Some(selectors) = imports.get(&(unit, class))
+            && let Some(candidate) = candidates.get(unit)
+            && let Some(name) = source_text(candidate.file.file.source(), receiver)
+        {
+            static_members.entry(unit).or_default().extend(
+                selectors
+                    .iter()
+                    .filter_map(|&(position, local)| (local == name).then_some(position)),
+            );
         }
     }
-    witnesses
-        .into_iter()
-        .filter_map(|(unit, names)| {
-            let (file, _, _) = candidates.get(unit)?;
-            has_checked_value_import(file, &names).then_some(unit)
+    let admitted = |witnesses: BTreeMap<_, _>| {
+        witnesses
+            .into_iter()
+            .filter_map(|(unit, names)| {
+                let candidate = candidates.get(unit)?;
+                has_checked_value_import(candidate.file, &names).then_some(unit)
+            })
+            .collect()
+    };
+    CallbackModuleSources {
+        direct: admitted(direct),
+        static_members: admitted(static_members),
+    }
+}
+
+fn checked_static_member_containers<'graph>(
+    semantics: &'graph WorkspaceSemantics,
+    targets: &BTreeSet<&CoreSymbolId>,
+) -> BTreeMap<&'graph CoreSymbolId, &'graph CoreSymbolId> {
+    if targets.is_empty() {
+        return BTreeMap::new();
+    }
+    let graph = semantics.graph();
+    graph
+        .records()
+        .iter()
+        .filter_map(|record| {
+            let id = record.identity().filter(|id| targets.contains(id))?;
+            let mut declarations = record.contributions().iter();
+            let contribution = graph.contribution(declarations.next()?)?;
+            let facts = contribution.facts()?;
+            if declarations.next().is_some()
+                || contribution.source().is_none()
+                || !facts.symbol_kinds().contains(&SymbolKind::Static)
+            {
+                return None;
+            }
+            Some((id, graph.identity_for(facts.container_reference()?)?))
         })
         .collect()
 }

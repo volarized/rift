@@ -544,7 +544,7 @@ impl<'source> Index<'source> {
                 let (owner, spelled) = self.owners.rust(file.document.path.as_str(), &parts)?;
                 self.owners.identity(owner, language, spelled)
             }
-            StaticBindingKind::PythonImport { .. } => {
+            StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. } => {
                 let path = python_binding_path(file, binding, work)?;
                 let owner = self.owners.python(&path)?;
                 self.owners.identity(owner, language, path)
@@ -621,6 +621,12 @@ impl<'source> Index<'source> {
             return None;
         }
         let mut path = match self.python_binding(file, head, position, work) {
+            Binding::Found(binding)
+                if matches!(binding.kind, StaticBindingKind::PythonModule { .. }) =>
+            {
+                // A dotted import without an alias binds only the root name.
+                vec![head.clone()]
+            }
             Binding::Found(binding) => python_binding_path(file, binding, work)?,
             Binding::Missing
                 if names::PYTHON_BUILTINS.binary_search(&head.as_str()).is_ok()
@@ -761,8 +767,10 @@ fn python_binding_path(
     binding: &StaticBinding,
     work: &mut Work,
 ) -> Option<Vec<String>> {
-    let StaticBindingKind::PythonImport { module, export } = binding.kind else {
-        return None;
+    let (module, export) = match binding.kind {
+        StaticBindingKind::PythonImport { module, export } => (module, export),
+        StaticBindingKind::PythonModule { module } => (module, None),
+        _ => return None,
     };
     let module = file.text(module)?;
     if module.starts_with('.') {
@@ -771,12 +779,6 @@ fn python_binding_path(
     let mut path = identifier_path(module, ".", work)?;
     if let Some(export) = export {
         path.push(file.text(export)?.to_owned());
-    } else {
-        // `import a.b` binds `a`; the site spells the rest.
-        let name = file.text(binding.name)?;
-        if path.len() > 1 && path.first().is_some_and(|root| root == name) {
-            path.truncate(1);
-        }
     }
     Some(path)
 }

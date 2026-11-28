@@ -56,7 +56,9 @@ impl<'source> Index<'source> {
                 PythonOverload::Ordinary if implementation.is_none() => {
                     implementation = Some(binding);
                 }
-                PythonOverload::Ordinary | PythonOverload::Unknown => return None,
+                PythonOverload::Ordinary
+                | PythonOverload::GuardedImplementation
+                | PythonOverload::Unknown => return None,
             }
         }
         let implementation = implementation?;

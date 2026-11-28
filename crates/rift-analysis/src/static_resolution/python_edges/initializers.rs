@@ -10,11 +10,15 @@ use rift_syntax::{ByteRange, StaticCall, StaticPythonInitializer};
 
 use super::super::{File, Index, StaticResolution, Target, Work};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::static_resolution) enum InitializerLibrary {
+    Attrs,
+    Dataclasses,
+}
+
 /// Primary Call targets retained for the later keyword pass.
-#[derive(Default)]
-pub(in crate::static_resolution) struct InitializerCalls(
-    BTreeMap<ByteRange, (SymbolId, DeclarationBinding)>,
-);
+#[derive(Debug, Default)]
+pub(crate) struct InitializerCalls(BTreeMap<ByteRange, (SymbolId, DeclarationBinding)>);
 
 impl InitializerCalls {
     pub(in crate::static_resolution) fn capture(
@@ -50,10 +54,49 @@ impl InitializerCalls {
 }
 
 impl<'source> Index<'source> {
+    pub(in crate::static_resolution) fn resolve_python_dataclass_keywords(
+        &self,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        let pending = std::mem::take(&mut resolution.pending_dataclass_calls);
+        if pending.is_empty() || work.exhausted {
+            return;
+        }
+        #[cfg(test)]
+        let initial_work = work.budget.remaining();
+        resolution.python_dataclass_initializer_start = Some(resolution.occurrences.len());
+        for (path, mut remaining, calls) in pending {
+            if let Some(file) = self.files.get(path.as_str()) {
+                Self::resolve_python_shared_file_work(
+                    file,
+                    &mut remaining,
+                    work,
+                    resolution,
+                    |file, work, resolution| {
+                        self.python_initializer_keywords(
+                            file,
+                            &calls,
+                            InitializerLibrary::Dataclasses,
+                            work,
+                            resolution,
+                        );
+                    },
+                );
+            }
+        }
+        #[cfg(test)]
+        self.performed.fetch_add(
+            initial_work.saturating_sub(work.budget.remaining()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub(in crate::static_resolution) fn python_initializer_keywords(
         &self,
         file: &File<'source>,
         observed: &InitializerCalls,
+        library: InitializerLibrary,
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
@@ -72,7 +115,7 @@ impl<'source> Index<'source> {
             }
             if let Some(call) = calls.get(&span)
                 && let Some(field) =
-                    self.python_initializer_keyword(file, observed, call, name, work)
+                    self.python_initializer_keyword(file, observed, call, name, library, work)
             {
                 result.record(self.python_access(file, name, ReferenceRole::Read, field));
             }
@@ -85,6 +128,7 @@ impl<'source> Index<'source> {
         observed: &InitializerCalls,
         call: &StaticCall,
         name: ByteRange,
+        library: InitializerLibrary,
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let (symbol, declaration) = observed.0.get(&call.range)?;
@@ -104,19 +148,20 @@ impl<'source> Index<'source> {
         {
             return None;
         }
-        self.python_attrs_field(class, file.text(name)?, work)
+        self.python_initializer_field(class, file.text(name)?, library, work)
     }
 
-    fn python_attrs_field(
+    fn python_initializer_field(
         &self,
         mut class: Target<'source>,
         name: &str,
+        library: InitializerLibrary,
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let mut selected = None;
         while work.charge() {
             let held = self.files.get(class.file.path.as_str())?;
-            let initializer = self.python_attrs_initializer(held, class, work)?;
+            let initializer = self.python_generated_initializer(held, class, library, work)?;
             if selected.is_none() {
                 for field in &initializer.fields {
                     if !work.charge() {
@@ -147,10 +192,11 @@ impl<'source> Index<'source> {
         None
     }
 
-    fn python_attrs_initializer<'held>(
+    fn python_generated_initializer<'held>(
         &self,
         file: &'held File<'source>,
         class: Target<'source>,
+        library: InitializerLibrary,
         work: &mut Work,
     ) -> Option<&'held StaticPythonInitializer> {
         for initializer in file.facts.python_initializers() {
@@ -162,13 +208,20 @@ impl<'source> Index<'source> {
             }
             let qualified = self.python_library_name(file, initializer.decorator, work)?;
             let (module, generator) = qualified.rsplit_once('.')?;
-            if matches!(module, "attrs" | "attr")
-                && matches!(generator, "define" | "frozen" | "mutable")
-                && self.python_writes.get(generator).is_none_or(Vec::is_empty)
-            {
-                return Some(initializer);
-            }
-            return None;
+            let generated = match library {
+                InitializerLibrary::Attrs => {
+                    matches!(module, "attrs" | "attr")
+                        && matches!(generator, "define" | "frozen" | "mutable")
+                }
+                InitializerLibrary::Dataclasses => {
+                    (module, generator) == ("dataclasses", "dataclass")
+                        && ["__init__", "__new__"]
+                            .into_iter()
+                            .all(|slot| self.python_generated_slot_available(class, slot, work))
+                }
+            };
+            return (generated && self.python_writes.get(generator).is_none_or(Vec::is_empty))
+                .then_some(initializer);
         }
         None
     }

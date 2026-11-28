@@ -15,7 +15,8 @@ use rift_provider::AssembledSymbol;
 
 use super::{
     AnalyzedFile, ExactPackageInput, ExactPackageLimits, Records, bound, digest_of,
-    javascript_module_source, truncation, wire_path, wire_unit,
+    javascript_module_source, namespace::typescript::JavaScriptModulePaths, truncation, wire_path,
+    wire_unit,
 };
 
 impl Records {
@@ -29,7 +30,8 @@ impl Records {
         let limits = input.limits();
         let namespace = input.namespace_input();
         let authored = super::namespace::typescript::checked_javascript_module_paths(&namespace);
-        self.retain_ecmascript_modules(owner, analyzed, semantics, limits, &authored)?;
+        let supplemental =
+            self.retain_ecmascript_modules(owner, analyzed, semantics, limits, &authored)?;
         self.retain_javascript_callback_argument_properties(owner, analyzed, limits)?;
         if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
             let candidates = self.checked_local_export_module_candidates(analyzed, semantics);
@@ -59,7 +61,67 @@ impl Records {
             )?;
         }
         self.retain_quoted_callback_argument_properties(owner, analyzed, limits)?;
-        self.retain_typescript_callback_bindings(owner, analyzed, limits)
+        self.retain_typescript_callback_bindings(owner, analyzed, limits)?;
+        self.retain_supplemental_ecmascript_modules(
+            owner,
+            analyzed,
+            semantics,
+            limits,
+            &supplemental,
+        )
+    }
+
+    fn retain_supplemental_ecmascript_modules(
+        &mut self,
+        owner: &SymbolOwner,
+        analyzed: &[AnalyzedFile],
+        semantics: &WorkspaceSemantics,
+        limits: ExactPackageLimits,
+        modules: &FileModuleCandidates<'_>,
+    ) -> Result<(), RiftError> {
+        if modules.is_empty() || self.symbols_truncated {
+            return Ok(());
+        }
+        let first = self.declarations.len();
+        self.retain_file_module_candidates(owner, modules, limits.declarations_max())?;
+        let admitted = self.declarations[first..]
+            .iter()
+            .map(|declaration| declaration.symbol.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        if admitted.is_empty() {
+            return Ok(());
+        }
+        let store = semantics.edges();
+        let new_endpoint = |edge: &&Edge| {
+            store
+                .edge_module(edge.occurrence().unit())
+                .is_some_and(|module| admitted.contains(module.as_str()))
+                || admitted.contains(edge.to().as_str())
+        };
+        self.retain_file_module_edge_rows(
+            ecmascript_file_module_edges(semantics, &[EdgeKind::Imports, EdgeKind::Reads], false)
+                .filter(new_endpoint),
+            limits.edges_max(),
+        );
+        self.retain_ecmascript_callback_edges_in(
+            owner,
+            analyzed,
+            semantics,
+            limits,
+            EdgeKind::Calls,
+            Some(&admitted),
+        )?;
+        self.retain_file_module_edge_rows(
+            ecmascript_file_module_edges(semantics, &[EdgeKind::References], false)
+                .chain(ecmascript_file_module_edges(
+                    semantics,
+                    &[EdgeKind::Imports],
+                    true,
+                ))
+                .filter(new_endpoint),
+            limits.edges_max(),
+        );
+        Ok(())
     }
 
     fn retain_checked_commonjs_modules(
@@ -181,16 +243,16 @@ impl Records {
         targets
     }
 
-    pub(super) fn retain_ecmascript_modules(
+    pub(super) fn retain_ecmascript_modules<'file>(
         &mut self,
         owner: &SymbolOwner,
-        analyzed: &[AnalyzedFile],
+        analyzed: &'file [AnalyzedFile],
         semantics: &WorkspaceSemantics,
         limits: ExactPackageLimits,
-        authored: &BTreeSet<&str>,
-    ) -> Result<(), RiftError> {
+        authored: &JavaScriptModulePaths<'_>,
+    ) -> Result<FileModuleCandidates<'file>, RiftError> {
         if matches!(owner, SymbolOwner::Package { manager, .. } if manager == "npm") {
-            self.retain_ecmascript_file_modules(
+            let supplemental = self.retain_ecmascript_file_modules(
                 owner,
                 analyzed,
                 semantics,
@@ -229,8 +291,9 @@ impl Records {
                 &[EdgeKind::Imports],
                 true,
             );
+            return Ok(supplemental);
         }
-        Ok(())
+        Ok(BTreeMap::new())
     }
 
     pub(super) fn retain_checked_declaration_specifiers(
@@ -499,18 +562,10 @@ impl Records {
         kinds: &[EdgeKind],
         deferred_exports: bool,
     ) {
-        let references = kinds.iter().copied().flat_map(|kind| {
-            semantics.edges().edges().filter(move |edge| {
-                edge.is_file_module_reference()
-                    && !edge.is_incomplete_local_export_reference()
-                    && !edge.is_imported_export_selector()
-                    && !edge.is_commonjs_argument_import()
-                    && !edge.is_inline_import_module()
-                    && edge.kind() == kind
-                    && edge.is_deferred_commonjs_export_import() == deferred_exports
-            })
-        });
-        self.retain_file_module_edge_rows(references, edge_limit);
+        self.retain_file_module_edge_rows(
+            ecmascript_file_module_edges(semantics, kinds, deferred_exports),
+            edge_limit,
+        );
     }
 
     fn retain_file_module_edge_rows<'a>(
@@ -595,19 +650,21 @@ impl Records {
     }
 
     /// Admits whole-file declarations after the earlier publication rows.
-    fn retain_ecmascript_file_modules(
+    fn retain_ecmascript_file_modules<'file>(
         &mut self,
         owner: &SymbolOwner,
-        analyzed: &[AnalyzedFile],
+        analyzed: &'file [AnalyzedFile],
         semantics: &WorkspaceSemantics,
         declaration_limit: usize,
-        authored: &BTreeSet<&str>,
-    ) -> Result<(), RiftError> {
+        authored: &JavaScriptModulePaths<'_>,
+    ) -> Result<FileModuleCandidates<'file>, RiftError> {
         if self.symbols_truncated {
-            return Ok(());
+            return Ok(BTreeMap::new());
         }
-        let modules = file_module_candidates(owner, analyzed, &self.units, semantics, authored);
-        self.retain_file_module_candidates(owner, &modules, declaration_limit)
+        let (modules, supplemental) =
+            file_module_candidates(owner, analyzed, &self.units, semantics, authored);
+        self.retain_file_module_candidates(owner, &modules, declaration_limit)?;
+        Ok(supplemental)
     }
 
     fn retain_file_module_candidates(
@@ -899,8 +956,8 @@ fn file_module_candidates<'file>(
     analyzed: &'file [AnalyzedFile],
     units: &[PackageSourceUnit],
     semantics: &WorkspaceSemantics,
-    authored: &BTreeSet<&str>,
-) -> FileModuleCandidates<'file> {
+    authored: &JavaScriptModulePaths<'_>,
+) -> (FileModuleCandidates<'file>, FileModuleCandidates<'file>) {
     let proven_receivers = commonjs_module_source_units(semantics);
     let callback_sources =
         super::javascript_callbacks::typescript_callback_module_sources(analyzed, semantics);
@@ -909,7 +966,7 @@ fn file_module_candidates<'file>(
         .filter(|unit| unit.source_complete)
         .map(|unit| unit.unit.as_str())
         .collect::<BTreeSet<_>>();
-    let mut modules = BTreeMap::<_, Option<(&AnalyzedFile, bool)>>::new();
+    let mut modules = BTreeMap::new();
     for file in analyzed {
         let syntax = file.file.syntax();
         let language = syntax.language().name.as_str();
@@ -922,31 +979,66 @@ fn file_module_candidates<'file>(
             ("javascript", Some((_, "mjs" | "cjs"))) | ("typescript", Some((_, "mts" | "cts")))
         );
         let previous = explicit || javascript_module_source(owner, file);
-        let written = syntax.primary_symbols_len() > 0
+        let written = matches!(language, "javascript" | "typescript")
+            && syntax.primary_symbols_len() > 0
             && (previous || proven_receivers.contains(file.placement.unit()));
         let authored_module = !file.file.source().is_empty()
             && match language {
-                "javascript" => authored.contains(path),
+                "javascript" => authored.scopes.contains(path),
                 "typescript" => {
                     !crate::static_resolution::is_declaration_file(path)
                         && syntax.static_facts().is_some_and(|facts| {
                             facts.has_javascript_module_statement() && !facts.reexports().is_empty()
                         })
-                        || callback_sources.contains(file.placement.unit())
+                        || callback_sources.direct.contains(file.placement.unit())
                 }
                 _ => false,
             };
-        let proven = matches!(language, "javascript" | "typescript")
-            && (written || authored_module)
+        let supplemental = !file.file.source().is_empty()
+            && match language {
+                "javascript" => authored.routes.contains(path),
+                "typescript" => callback_sources
+                    .static_members
+                    .contains(file.placement.unit()),
+                _ => false,
+            };
+        let proven = (written || authored_module || supplemental)
             && !syntax.has_errors()
             && syntax.left_out_declaration_count() == 0
             && complete.contains(file.placement.unit().to_string().as_str());
         modules
             .entry(module)
             .and_modify(|file| *file = None)
-            .or_insert(proven.then_some((file, previous)));
+            .or_insert(proven.then_some((file, written || authored_module, previous)));
     }
-    modules
+    let mut established = BTreeMap::new();
+    let mut supplemental = BTreeMap::new();
+    for (id, candidate) in modules {
+        match candidate {
+            Some((file, true, previous)) => established.insert(id, Some((file, previous))),
+            Some((file, false, _)) => supplemental.insert(id, Some((file, false))),
+            None => continue,
+        };
+    }
+    (established, supplemental)
+}
+
+fn ecmascript_file_module_edges<'graph>(
+    semantics: &'graph WorkspaceSemantics,
+    kinds: &'graph [EdgeKind],
+    deferred_exports: bool,
+) -> impl Iterator<Item = &'graph Edge> {
+    kinds.iter().copied().flat_map(move |kind| {
+        semantics.edges().edges().filter(move |edge| {
+            edge.is_file_module_reference()
+                && !edge.is_incomplete_local_export_reference()
+                && !edge.is_imported_export_selector()
+                && !edge.is_commonjs_argument_import()
+                && !edge.is_inline_import_module()
+                && edge.kind() == kind
+                && edge.is_deferred_commonjs_export_import() == deferred_exports
+        })
+    })
 }
 
 fn commonjs_module_source_units(semantics: &WorkspaceSemantics) -> BTreeSet<&CoreSourceUnitId> {

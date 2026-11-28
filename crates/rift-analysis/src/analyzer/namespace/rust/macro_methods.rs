@@ -50,19 +50,42 @@ pub(super) fn retain(
         if !file.source.contains("macro_rules")
             || file.syntax.has_errors()
             || file.syntax.left_out_declaration_count() != 0
-            || !file
-                .syntax
-                .symbols()
-                .iter()
-                .any(|symbol| symbol.kind == "impl_item")
+            || !file.syntax.symbols().iter().any(|symbol| {
+                symbol
+                    .syntax_element_kind
+                    .and_then(OwnerKind::from_grammar)
+                    .is_some()
+            })
             || modules.file(file) != Some(true)
         {
             continue;
         }
         let methods = collect(file, anchors, &nominal, &modules, input.syntax());
         if !methods.is_empty() {
+            let public_traits = file
+                .syntax
+                .symbols()
+                .iter()
+                .filter(|symbol| {
+                    symbol.syntax_element_kind.and_then(OwnerKind::from_grammar)
+                        == Some(OwnerKind::Trait)
+                        && symbol.visibility.as_deref() == Some("pub")
+                })
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<BTreeSet<_>>();
+            let public_methods = prepared
+                .public_names
+                .entry(file.path.as_str().to_owned())
+                .or_default();
             for (method, identity) in &methods {
                 anchors.insert(method.qualified_name.clone(), identity.clone());
+                if method
+                    .container
+                    .as_deref()
+                    .is_some_and(|owner| public_traits.contains(owner))
+                {
+                    public_methods.insert(method.qualified_name.clone());
+                }
             }
             prepared.rust_macro_methods.insert(
                 file.path.as_str().to_owned(),
@@ -78,10 +101,27 @@ enum Pattern<'source> {
     Header { attributes: Option<&'source str> },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnerKind {
+    Impl,
+    Trait,
+}
+
+impl OwnerKind {
+    fn from_grammar(kind: &str) -> Option<Self> {
+        match kind {
+            "impl_item" => Some(Self::Impl),
+            "trait_item" => Some(Self::Trait),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Rule<'source> {
     pattern: Pattern<'source>,
     public: bool,
+    is_const: bool,
     at_least_one: bool,
 }
 
@@ -152,13 +192,7 @@ fn collect(
         limits,
         left: limits.syntax_elements_max(),
     };
-    let implementations = file
-        .syntax
-        .symbols()
-        .iter()
-        .filter(|symbol| symbol.kind == "impl_item")
-        .map(|symbol| (symbol.item_range, symbol))
-        .collect::<BTreeMap<_, _>>();
+    let method_owners = method_owners(file.syntax.symbols());
     let mut definitions = BTreeMap::new();
     let mut methods = BTreeMap::new();
     let mut attributes = Vec::new();
@@ -192,17 +226,18 @@ fn collect(
                 definitions.insert(name, checked);
             }
             "macro_invocation" | "expression_statement" => definitions.clear(),
-            "impl_item" if plain && !definitions.is_empty() => {
-                let Some(implementation) = implementations.get(&row.range).copied() else {
+            grammar if plain && !definitions.is_empty() => {
+                let Some((kind, member_scope)) = method_owners.get(&(row.range, grammar)).copied()
+                else {
                     continue;
                 };
-                let Some(owner) = nominal_owner(implementation, anchors, nominal)
+                let Some(owner) = method_owner(kind, member_scope, anchors, nominal)
                     .filter(|_| modules.declared(file, row.range) == Some(true))
                 else {
                     continue;
                 };
-                retain_impl(
-                    implementation,
+                retain_methods(
+                    (kind, member_scope),
                     &owner,
                     (rows, &children),
                     index,
@@ -227,14 +262,32 @@ fn collect(
         .collect()
 }
 
-fn nominal_owner(
-    implementation: &SyntaxSymbol,
+type MethodOwners<'source> =
+    BTreeMap<(ByteRange, &'static str), (OwnerKind, &'source SyntaxSymbol)>;
+
+fn method_owners(symbols: &[SyntaxSymbol]) -> MethodOwners<'_> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            let grammar = symbol.syntax_element_kind?;
+            let kind = OwnerKind::from_grammar(grammar)?;
+            Some(((symbol.item_range, grammar), (kind, symbol)))
+        })
+        .collect()
+}
+
+fn method_owner(
+    kind: OwnerKind,
+    symbol: &SyntaxSymbol,
     anchors: &BTreeMap<String, SymbolId>,
     nominal: &BTreeSet<SymbolId>,
 ) -> Option<SymbolIdentity> {
-    let owner = anchors.get(&implementation.qualified_name)?;
-    nominal
-        .contains(owner)
+    let owner = anchors.get(&symbol.qualified_name)?;
+    let supported = match kind {
+        OwnerKind::Trait => symbol.kinds.contains(&SymbolKind::MemberContainer),
+        OwnerKind::Impl => nominal.contains(owner),
+    };
+    supported
         .then(|| SymbolIdentity::parse(owner.as_str()).ok())
         .flatten()
 }
@@ -345,10 +398,11 @@ fn rule<'source>(
     if replacement != [*repeat] {
         return None;
     }
-    let public = method_output(output, attributes, written, fields)?;
+    let (public, is_const) = method_output(output, attributes, written, fields)?;
     Some(Rule {
         pattern,
         public,
+        is_const,
         at_least_one: *repeat == "+",
     })
 }
@@ -358,7 +412,7 @@ fn method_output(
     attributes: Option<&str>,
     written: &str,
     fields: Option<(&str, &str)>,
-) -> Option<bool> {
+) -> Option<(bool, bool)> {
     if let Some(name) = attributes
         && !consume(&mut output, &["$", "(", "#", "[", "$", name, "]", ")", "*"])
     {
@@ -378,7 +432,7 @@ fn method_output(
         }
     }
     let public = consume(&mut output, &["pub"]);
-    let _ = consume(&mut output, &["const"]);
+    let is_const = consume(&mut output, &["const"]);
     if !consume(&mut output, &["fn", "$", written]) {
         return None;
     }
@@ -397,11 +451,11 @@ fn method_output(
     source_identifier(result)?;
     let mut rest = rest;
     group(&mut rest, "{", "}")?;
-    rest.is_empty().then_some(public)
+    rest.is_empty().then_some((public, is_const))
 }
 
-fn retain_impl<'source>(
-    implementation: &SyntaxSymbol,
+fn retain_methods<'source>(
+    member_scope: (OwnerKind, &SyntaxSymbol),
     owner: &SymbolIdentity,
     tree: (&[SyntaxElement], &[Vec<usize>]),
     index: usize,
@@ -409,6 +463,7 @@ fn retain_impl<'source>(
     tokens: &mut Tokens<'source>,
     mut publish: impl FnMut(SyntaxSymbol, SymbolId),
 ) {
+    let (kind, member_scope) = member_scope;
     let (rows, children) = tree;
     let Some(&body_index) = children[index]
         .iter()
@@ -421,7 +476,8 @@ fn retain_impl<'source>(
         start: rows[index].range.start,
         end: body.range.start,
     };
-    if !matches!(tokens.values(header).as_deref(), Some(["impl", name]) if source_identifier(name).is_some())
+    if kind == OwnerKind::Impl
+        && !matches!(tokens.values(header).as_deref(), Some(["impl", name]) if source_identifier(name).is_some())
     {
         return;
     }
@@ -460,6 +516,9 @@ fn retain_impl<'source>(
         let Some(Some(rule)) = definitions.get(name) else {
             return;
         };
+        if kind == OwnerKind::Trait && (rule.public || rule.is_const) {
+            continue;
+        }
         let Some(heads) = plain.then(|| invocation_heads(&values, *rule)).flatten() else {
             return;
         };
@@ -475,20 +534,17 @@ fn retain_impl<'source>(
             else {
                 continue;
             };
-            let mut kinds = vec![SymbolKind::Value, SymbolKind::Callable];
-            if rule.public {
-                kinds.push(SymbolKind::Public);
-            }
+            let (kinds, visibility) = method_visibility(kind, member_scope, *rule);
             publish(
                 SyntaxSymbol {
-                    qualified_name: format!("{}::{name}", implementation.qualified_name),
-                    container: Some(implementation.qualified_name.clone()),
+                    qualified_name: format!("{}::{name}", member_scope.qualified_name),
+                    container: Some(member_scope.qualified_name.clone()),
                     name,
                     declaration_ordinal: 0,
                     kind: "function",
                     syntax_element_kind: Some("identifier"),
                     kinds,
-                    visibility: rule.public.then(|| "pub".to_owned()),
+                    visibility,
                     range,
                     item_range: range,
                     name_range: Some(range),
@@ -503,6 +559,22 @@ fn retain_impl<'source>(
             );
         }
     }
+}
+
+fn method_visibility(
+    kind: OwnerKind,
+    member_scope: &SyntaxSymbol,
+    rule: Rule<'_>,
+) -> (Vec<SymbolKind>, Option<String>) {
+    let visibility = match kind {
+        OwnerKind::Trait => member_scope.visibility.clone(),
+        OwnerKind::Impl => rule.public.then(|| "pub".to_owned()),
+    };
+    let mut kinds = vec![SymbolKind::Value, SymbolKind::Callable];
+    if visibility.as_deref() == Some("pub") {
+        kinds.push(SymbolKind::Public);
+    }
+    (kinds, visibility)
 }
 
 fn invocation_heads<'source>(

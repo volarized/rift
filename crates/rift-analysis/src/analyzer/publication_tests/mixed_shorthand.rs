@@ -301,3 +301,80 @@ fn returned_pairs_keep_written_properties_beside_destructured_bindings() {
         );
     }
 }
+
+#[test]
+fn returned_shorthand_keeps_function_scoped_binding() {
+    for keyword in ["let", "var"] {
+        let source = format!(
+            "export function collect(input) {{\n    {keyword} data = {{}}, log = [];\n    if (input) log.push(input);\n    return {{ data }};\n}}\n"
+        );
+        assert_return_shorthand(&source, None);
+    }
+}
+
+#[test]
+fn returned_pairs_keep_checked_lexical_binding_inside_its_scope() {
+    const SOURCE: &str = concat!(
+        "export function collect(input) {\n",
+        "    try {\n",
+        "        const data = JSON.parse(input);\n",
+        "        if (input) return { data };\n",
+        "    } catch {}\n",
+        "    return { data: [] };\n",
+        "}\n",
+    );
+    assert_return_shorthand(SOURCE, Some("data: []"));
+}
+
+fn assert_return_shorthand(source: &str, fallback: Option<&str>) {
+    let publication = publish(
+        vec![
+            ("index.js", "export { collect } from './worker.js';"),
+            ("worker.js", source),
+        ],
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"index.js"}"#,
+    );
+    let unit = &publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "worker.js")
+        .expect("checked worker source")
+        .unit;
+    let at = |needle: &str, prefix: u64| {
+        u64::try_from(source.find(needle).expect("written site")).expect("source offset") + prefix
+    };
+    let binding_start = at("data =", 0);
+    let shorthand_start = at("return { data }", 9);
+    let declaration_at = |start, kind| {
+        publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == *unit
+                    && row.range.start == start
+                    && row.syntax_element_kind.as_deref() == Some(kind)
+            })
+            .unwrap_or_else(|| panic!("missing {kind} at {start}"))
+    };
+    let binding = declaration_at(binding_start, "variable_declarator");
+    let shorthand = declaration_at(shorthand_start, "shorthand_property_identifier");
+    assert_ne!(binding.symbol, shorthand.symbol);
+    let read = |start, end| {
+        publication.edges.iter().any(|edge| {
+            edge.to == binding.symbol
+                && edge.kinds == [EdgeKind::Reads]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == *unit && site.range == TextRange { start, end }
+                })
+        })
+    };
+    assert!(read(shorthand_start, shorthand_start + 4));
+    if let Some(written) = fallback {
+        let start = at(written, 0);
+        let property = declaration_at(start, "pair");
+        assert_eq!(property.source, written);
+        assert_ne!(property.symbol, binding.symbol);
+        assert_ne!(property.symbol, shorthand.symbol);
+        assert!(!read(start, start + 4));
+    }
+}

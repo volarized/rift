@@ -90,4 +90,27 @@ impl<'source> Index<'source> {
                     == Some(false)
             })
     }
+
+    pub(super) fn python_generated_slot_available(
+        &self,
+        class: Target<'source>,
+        name: &str,
+        work: &mut Work,
+    ) -> bool {
+        self.python_own_member(class, name, work).is_none()
+            && self
+                .python_writes
+                .get(name)
+                .into_iter()
+                .flatten()
+                .all(|&(path, range)| {
+                    work.charge()
+                        && !matches!(
+                            self.python_written_receiver(path, range, work),
+                            Some(Value::Symbol(written))
+                                if written.file.path == class.file.path
+                                    && written.symbol.item_range == class.symbol.item_range
+                        )
+                })
+    }
 }

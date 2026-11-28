@@ -160,10 +160,8 @@ impl<'source> FileScopes<'source> {
             && body.encloses(local.item_range);
         if local.container.as_deref() != Some(owner.qualified_name.as_str())
             || !(lexical_body || function_scoped_variable)
+            || !checked_binding(written, owner, name, scope, variable)
         {
-            return false;
-        }
-        if !checked_binding(written, owner, name, scope, variable) {
             return false;
         }
         let compound_scope = variable
@@ -175,7 +173,9 @@ impl<'source> FileScopes<'source> {
             })
             .flatten();
         let mut literals = BTreeSet::new();
-        members.iter().all(|member| {
+        let mut scoped_shorthand = false;
+        let mut separate_return = false;
+        let proven = members.iter().all(|member| {
             let Some(row) = self.body_members.get(&member.item_range) else {
                 return false;
             };
@@ -195,6 +195,9 @@ impl<'source> FileScopes<'source> {
                 });
             let admitted_return =
                 !object_method && member.syntax_element_kind == Some("pair") && direct_return;
+            let in_scope = scope.encloses(row.body);
+            scoped_shorthand |= shorthand && direct_return && in_scope;
+            separate_return |= admitted_return && !in_scope;
             let admissible = argument || (initializer.is_none() && (shorthand || admitted_return));
             let same_owner = if initializer.is_some() || object_method {
                 let expected = initializer.map_or(owner.item_range, |(range, _)| range);
@@ -207,16 +210,19 @@ impl<'source> FileScopes<'source> {
                     .is_some_and(|retained| retained.item_range == owner.item_range)
             };
             admissible
-                && (lexical_body || checked_call_pair)
+                && (lexical_body
+                    || checked_call_pair
+                    || (function_scoped_variable && direct_return))
                 && (!variable || direct_return || argument)
                 && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start
-                && scope.encloses(row.body)
+                && (in_scope || admitted_return)
                 && same_owner
                 && self.of(member, file) == Scope::Body(row.body, false)
                 && ((initializer.is_some() && argument) || owners.proves_body(member, row))
                 && literals.insert(row.body)
-        })
+        });
+        proven && (!separate_return || scoped_shorthand)
     }
 }
 

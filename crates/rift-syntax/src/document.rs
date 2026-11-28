@@ -66,6 +66,8 @@ pub struct SyntaxElement {
 pub enum PythonOverload {
     /// Ordinary function declaration without an overload decorator.
     Ordinary,
+    /// Function body inside a checked typing branch, available to source reads.
+    GuardedImplementation,
     /// Import or decorator association was not established.
     Unknown,
     /// A typing overload import supplies this decorator.

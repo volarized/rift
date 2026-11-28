@@ -836,7 +836,7 @@ fn typescript_local_export_references_follow_existing_package_edges() {
                 &files,
                 &semantics,
                 limits,
-                &BTreeSet::new(),
+                &super::super::namespace::typescript::JavaScriptModulePaths::default(),
             )
             .expect("bounded module references");
         assert_eq!(records.edges.len(), prior.len() + extra);
@@ -9200,4 +9200,154 @@ fn checked_typescript_callback_body_keeps_its_selected_file_module() {
                     .is_some_and(|site| site.unit == module.unit)
         }));
     }
+}
+
+#[test]
+fn checked_javascript_export_subpath_keeps_forwarding_module() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./index.mjs","./config":"./config.mjs"}}"#;
+    for source in [
+        "import { helper as selected } from './worker.mjs';\nexport { selected as helper };\n",
+        "export { helper } from './worker.mjs';\n",
+    ] {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const ready = 1;\n"),
+                ("worker.mjs", "export const helper = 2;\n"),
+                ("config.mjs", source),
+                ("unselected.mjs", source),
+            ],
+            None,
+            Some(("package.json", META)),
+        )
+        .expect("captured JavaScript export subpath");
+        let graph = analysis.publication();
+        graph.validate_facts().expect("physical export module");
+        let module = checked_module_declaration(graph, "config.mjs", source)
+            .expect("whole written export module");
+        assert!(module.symbol.as_str().ends_with("/beacon%2Fconfig"));
+        assert!(checked_module_declaration(graph, "unselected.mjs", source).is_none());
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Imports]
+                && edge.from == module.symbol
+                && edge.to.as_str().ends_with("/beacon%2Fworker.mjs")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == module.unit)
+        }));
+    }
+}
+
+#[test]
+fn checked_javascript_command_path_keeps_its_written_module() {
+    const SOURCE: &str = "#!/usr/bin/env node\nawait import('../worker.mjs');\n";
+    for (field, expected) in [
+        (r#"{"runner":"./bin/run.mjs"}"#, true),
+        (r#""bin/run.mjs""#, true),
+        (r#"{"runner":"../bin/run.mjs"}"#, false),
+        (r#"{"runner":"./bin/absent.mjs"}"#, false),
+        ("false", false),
+    ] {
+        let metadata = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs","bin":{field}}}"#,
+        );
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const ready = 1;\n"),
+                ("worker.mjs", "export const helper = 2;\n"),
+                ("bin/run.mjs", SOURCE),
+                ("bin/other.mjs", SOURCE),
+            ],
+            None,
+            Some(("package.json", &metadata)),
+        )
+        .expect("captured JavaScript command path");
+        let graph = analysis.publication();
+        graph.validate_facts().expect("physical command module");
+        let module = checked_module_declaration(graph, "bin/run.mjs", SOURCE);
+        assert_eq!(module.is_some(), expected, "{field}");
+        if let Some(module) = module {
+            assert!(module.symbol.as_str().ends_with("/beacon%2Fbin%2Frun.mjs"));
+        }
+        assert!(checked_module_declaration(graph, "bin/other.mjs", SOURCE).is_none());
+    }
+}
+
+#[test]
+fn checked_typescript_static_callback_call_keeps_its_written_module() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    for (source, expected) in [
+        (
+            "import { Item } from './index.js';\nobserve(() => Item.parse());\n",
+            true,
+        ),
+        (
+            "import { Item as Value } from './index.js';\nobserve(() => Value.parse());\n",
+            true,
+        ),
+        (
+            "import type { Item } from './index.js';\nobserve(() => Item.parse());\n",
+            false,
+        ),
+        (
+            "import { type Item } from './index.js';\nobserve(() => Item.parse());\n",
+            false,
+        ),
+        (
+            "import { Item } from './index.js';\nobserve((Item) => Item.parse());\n",
+            false,
+        ),
+        ("import { Item } from './index.js';\nItem.parse();\n", false),
+        (
+            "import { Item } from './index.js';\nobserve(() => Item.read());\n",
+            false,
+        ),
+    ] {
+        let analysis = internal_modules::analyze(
+            META,
+            &[
+                ("index.ts", "export { Item } from './item.js';\n"),
+                (
+                    "item.ts",
+                    "export class Item { static parse() { return 1; } read() { return 2; } }\n",
+                ),
+                ("check.test.ts", source),
+            ],
+        );
+        let graph = analysis.publication();
+        graph.validate_facts().expect("physical callback module");
+        let module = checked_module_declaration(graph, "check.test.ts", source);
+        assert_eq!(module.is_some(), expected, "{source}");
+        let Some(module) = module else { continue };
+        let start = source.find(".parse()").expect("written static method");
+        assert!(graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Calls]
+                && edge.to.as_str().ends_with("/Item/parse")
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == module.unit
+                        && site.range.end
+                            == u64::try_from(start + ".parse()".len()).expect("offset")
+                })
+        }));
+    }
+}
+
+fn checked_module_declaration<'graph>(
+    graph: &'graph PackagePublication,
+    path: &str,
+    source: &str,
+) -> Option<&'graph PackageSymbol> {
+    let unit = graph.units.iter().find(|unit| unit.path.0 == path)?;
+    graph.declarations.iter().find(|row| {
+        row.unit == unit.unit
+            && row.range.start == 0
+            && row.source == source
+            && row.source_complete
+            && graph.objects.iter().any(|object| {
+                object.id.as_ref() == Some(&row.symbol)
+                    && object.kinds.contains(&SymbolKind::Module)
+            })
+    })
 }

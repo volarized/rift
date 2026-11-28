@@ -222,6 +222,7 @@ struct PythonKinds {
     string_start: u16,
     import_from: u16,
     aliased_import: u16,
+    if_statement: u16,
     target_patterns: Vec<u16>,
     declaring_statements: Vec<u16>,
     declaring_clauses: Vec<u16>,
@@ -242,6 +243,8 @@ struct PythonKinds {
     parameters: NonZeroU16,
     module_name: NonZeroU16,
     alias: NonZeroU16,
+    condition: NonZeroU16,
+    consequence: NonZeroU16,
 }
 
 impl PythonKinds {
@@ -284,6 +287,7 @@ impl PythonKinds {
             string_start: kind_id(language, STRING_START_KIND),
             import_from: kind_id(language, IMPORT_FROM_KIND),
             aliased_import: kind_id(language, ALIASED_IMPORT_KIND),
+            if_statement: kind_id(language, "if_statement"),
             target_patterns: TARGET_PATTERN_KINDS
                 .map(|kind| kind_id(language, kind))
                 .to_vec(),
@@ -310,6 +314,8 @@ impl PythonKinds {
             parameters: field_id(language, PARAMETERS_FIELD),
             module_name: field_id(language, MODULE_NAME_FIELD),
             alias: field_id(language, ALIAS_FIELD),
+            condition: field_id(language, "condition"),
+            consequence: field_id(language, "consequence"),
         }
     }
 }
