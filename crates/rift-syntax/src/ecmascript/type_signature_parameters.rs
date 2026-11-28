@@ -23,27 +23,53 @@ pub(super) fn callable_rest_parameter_name<'tree>(
     visited: Visited<'_, 'tree>,
 ) -> Option<Node<'tree>> {
     let name = visited.syntax_element();
-    callable_rest_scope(name)?;
+    if name.kind() != "identifier" || name.is_missing() {
+        return None;
+    }
+    let rest = visited.parent()?;
+    if rest.syntax_element().kind() != "rest_pattern" {
+        return None;
+    }
+    let parameter = rest.parent()?;
+    let list = parameter.parent()?;
+    let scope = list.parent()?;
+    checked_rest_scope(
+        name,
+        rest.syntax_element(),
+        parameter.syntax_element(),
+        list.syntax_element(),
+        scope.syntax_element(),
+    )?;
     Some(name)
 }
 
 fn callable_rest_scope(name: Node<'_>) -> Option<Node<'_>> {
-    let rest = name.parent()?;
+    if name.kind() != "identifier" || name.is_missing() {
+        return None;
+    }
+    let rest = name.parent().filter(|node| node.kind() == "rest_pattern")?;
     let parameter = rest.parent()?;
-    let scope = callable_type_scope(parameter)?;
-    if name.kind() != "identifier"
-        || name.is_missing()
-        || rest.kind() != "rest_pattern"
-        || rest.named_child(0) != Some(name)
+    let list = parameter.parent()?;
+    checked_rest_scope(name, rest, parameter, list, list.parent()?)
+}
+
+fn checked_rest_scope<'tree>(
+    name: Node<'tree>,
+    rest: Node<'tree>,
+    parameter: Node<'tree>,
+    list: Node<'tree>,
+    scope: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if rest.named_child(0) != Some(name)
         || parameter.kind() != "required_parameter"
         || parameter.child_by_field_name("pattern") != Some(rest)
         || parameter.child_by_field_name("value").is_some()
         || parameter.has_error()
-        || scope.child_by_field_name("parameters") != parameter.parent()
+        || !checked_callable_type_scope(list, scope)
     {
         return None;
     }
-    // A rest parameter is the last formal. The syntax tree bounds the remaining siblings.
+    // Only the remaining siblings of a checked rest formal can disqualify it.
     let mut following = parameter.next_named_sibling();
     while let Some(next) = following {
         if !next.is_extra() {
@@ -58,38 +84,77 @@ pub(super) fn callable_pattern_parameter_name<'tree>(
     visited: Visited<'_, 'tree>,
 ) -> Option<Node<'tree>> {
     let name = visited.syntax_element();
-    callable_pattern_scope(name)?;
+    if name.is_missing() {
+        return None;
+    }
+    let pattern = match name.kind() {
+        "shorthand_property_identifier_pattern" => visited.parent()?,
+        "identifier" => {
+            let pair = visited.parent()?;
+            if !checked_renamed_pattern_binding(name, pair.syntax_element()) {
+                return None;
+            }
+            pair.parent()?
+        }
+        _ => return None,
+    };
+    if pattern.syntax_element().kind() != "object_pattern" {
+        return None;
+    }
+    let parameter = pattern.parent()?;
+    let list = parameter.parent()?;
+    let scope = list.parent()?;
+    checked_pattern_scope(
+        pattern.syntax_element(),
+        parameter.syntax_element(),
+        list.syntax_element(),
+        scope.syntax_element(),
+    )?;
     Some(name)
 }
 
 /// A simple written binding of the object pattern of one exact callable type.
 fn callable_pattern_scope(name: Node<'_>) -> Option<Node<'_>> {
-    let parent = name.parent()?;
+    if name.is_missing() {
+        return None;
+    }
     let pattern = match name.kind() {
-        "shorthand_property_identifier_pattern" => parent,
-        "identifier"
-            if parent.kind() == "pair_pattern"
-                && parent.child_by_field_name("value") == Some(name)
-                && parent.child_by_field_name("key").is_some_and(|key| {
-                    key.kind() == "property_identifier" && !key.is_missing()
-                }) =>
-        {
-            parent.parent()?
-        }
+        "shorthand_property_identifier_pattern" => name.parent()?,
+        "identifier" => name
+            .parent()
+            .filter(|pair| checked_renamed_pattern_binding(name, *pair))?
+            .parent()?,
         _ => return None,
     };
+    if pattern.kind() != "object_pattern" {
+        return None;
+    }
     let parameter = pattern.parent()?;
-    let scope = callable_type_scope(parameter)?;
-    (pattern.kind() == "object_pattern"
-        && matches!(
-            parameter.kind(),
-            "required_parameter" | "optional_parameter"
-        )
-        && parameter.child_by_field_name("pattern") == Some(pattern)
+    let list = parameter.parent()?;
+    checked_pattern_scope(pattern, parameter, list, list.parent()?)
+}
+
+fn checked_renamed_pattern_binding(name: Node<'_>, pair: Node<'_>) -> bool {
+    pair.kind() == "pair_pattern"
+        && pair.child_by_field_name("value") == Some(name)
+        && pair
+            .child_by_field_name("key")
+            .is_some_and(|key| key.kind() == "property_identifier" && !key.is_missing())
+}
+
+fn checked_pattern_scope<'tree>(
+    pattern: Node<'tree>,
+    parameter: Node<'tree>,
+    list: Node<'tree>,
+    scope: Node<'tree>,
+) -> Option<Node<'tree>> {
+    (matches!(
+        parameter.kind(),
+        "required_parameter" | "optional_parameter"
+    ) && parameter.child_by_field_name("pattern") == Some(pattern)
         && parameter.child_by_field_name("value").is_none()
-        && scope.child_by_field_name("parameters") == parameter.parent()
-        && !parameter.has_error()
-        && !name.is_missing())
+        && checked_callable_type_scope(list, scope)
+        && !parameter.has_error())
     .then_some(scope)
 }
 
@@ -100,11 +165,15 @@ fn callable_type_scope(parameter: Node<'_>) -> Option<Node<'_>> {
     ) {
         return None;
     }
-    let list = parameter
-        .parent()
-        .filter(|node| node.kind() == "formal_parameters")?;
+    let list = parameter.parent()?;
     let scope = list.parent()?;
-    callable_signature(scope.kind()).then_some(scope)
+    (list.kind() == "formal_parameters" && callable_signature(scope.kind())).then_some(scope)
+}
+
+fn checked_callable_type_scope(list: Node<'_>, scope: Node<'_>) -> bool {
+    list.kind() == "formal_parameters"
+        && callable_signature(scope.kind())
+        && scope.child_by_field_name("parameters") == Some(list)
 }
 
 pub(super) fn callable_signature(kind: &str) -> bool {
