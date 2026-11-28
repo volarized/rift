@@ -7551,3 +7551,78 @@ fn typescript_traditional_loops_keep_their_written_local_bindings() {
         }));
     }
 }
+
+#[test]
+fn typescript_written_arrow_arguments_keep_separate_formal_reads() {
+    const SOURCE: &str = concat!(
+        "export class Reader {\n",
+        "  choose(items: number[]) {\n",
+        "    const size = items.length;\n",
+        "    const selected = items.map((value: number, index: number) => value + index + size);\n",
+        "    return selected.filter((value: number, index: number) => value > index);\n",
+        "  }\n",
+        "}\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.ts"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.ts", "export { Reader } from './data.js';"),
+                ("data.ts", source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked TypeScript arrow scopes")
+    };
+    let result = analyze(SOURCE);
+    let found = result.publication();
+    found.validate_facts().expect("exact callback facts");
+    let mut seen = BTreeSet::new();
+    for name in ["value", "index"] {
+        let formal = format!("{name}: number");
+        let declarations = SOURCE.match_indices(&formal).map(|(start, _)| start);
+        let uses = SOURCE
+            .match_indices(if name == "value" {
+                "=> value"
+            } else {
+                " index"
+            })
+            .map(|(start, text)| start + text.len() - name.len())
+            .filter(|&start| !SOURCE[start + name.len()..].starts_with(':'));
+        for (declaration, read) in declarations.zip(uses) {
+            let row = found
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.source == name
+                        && row.source_complete
+                        && row.range == module_runtime_range(declaration, name)
+                })
+                .expect("written arrow formal");
+            assert!(seen.insert(&row.symbol));
+            assert!(found.edges.iter().any(|edge| {
+                edge.to == row.symbol
+                    && edge.kinds == [EdgeKind::Reads]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == row.unit && site.range == module_runtime_range(read, name)
+                    })
+            }));
+        }
+    }
+    assert_eq!(seen.len(), 4);
+
+    let computed = SOURCE.replace("items.map(", "items[selector](");
+    let control = analyze(&computed);
+    assert_eq!(
+        control
+            .publication()
+            .declarations
+            .iter()
+            .filter(|row| { row.source == "value" && row.symbol.as_str().contains("/$callback") })
+            .count(),
+        1
+    );
+}

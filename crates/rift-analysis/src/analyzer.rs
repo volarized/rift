@@ -799,6 +799,7 @@ struct EcmaScriptBindingDemand {
     javascript_arrow_wrapped: BindingDemand,
     typescript_callable_rest: BindingDemand,
     typescript_callable_pattern: BindingDemand,
+    typescript_argument_callbacks: BindingDemand,
 }
 
 impl EcmaScriptBindingDemand {
@@ -845,6 +846,7 @@ impl EcmaScriptBindingDemand {
             arrow_wrapped_slots,
             callable_rest_slots,
             callable_pattern_slots,
+            typed_arrow_argument_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -876,6 +878,7 @@ impl EcmaScriptBindingDemand {
                 &self.javascript_arrow_wrapped,
                 &self.typescript_callable_rest,
                 &self.typescript_callable_pattern,
+                &self.typescript_argument_callbacks,
             ],
             &mut slots,
             &mut bytes,
@@ -910,6 +913,7 @@ impl EcmaScriptBindingDemand {
             .with_javascript_arrow_wrapped_parameters(arrow_wrapped_slots)
             .with_typescript_callable_type_rest_parameters(callable_rest_slots)
             .with_typescript_callable_type_pattern_parameters(callable_pattern_slots)
+            .with_typescript_argument_callback_parameters(typed_arrow_argument_slots)
     }
 
     fn classify(
@@ -918,7 +922,9 @@ impl EcmaScriptBindingDemand {
         javascript: bool,
         methods: &BTreeSet<&str>,
     ) -> &mut BindingDemand {
-        if symbol.is_ecmascript_callback_parameter() {
+        if symbol.is_typescript_argument_callback_parameter() {
+            &mut self.typescript_argument_callbacks
+        } else if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callbacks
         } else if symbol.is_javascript_callback_pattern_parameter() {
             &mut self.javascript_callback_patterns
@@ -990,6 +996,7 @@ impl EcmaScriptBindingDemand {
             + self.typescript_callable_types.count
             + self.typescript_callable_rest.count
             + self.typescript_callable_pattern.count
+            + self.typescript_argument_callbacks.count
             + self.typescript_index_signatures.count
             + self.javascript_wrapped.count
             + self.javascript_destructured.count

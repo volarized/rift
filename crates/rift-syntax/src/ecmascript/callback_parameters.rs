@@ -1,13 +1,16 @@
-//! Authored bindings of JavaScript function values.
+//! Authored bindings of ECMAScript function values.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rift_protocol::read::SymbolKind;
 
-use crate::{ByteRange, StaticFacts, SyntaxSymbol};
+use crate::{ByteRange, StaticCallee, StaticFacts, StaticFunctionContext, SyntaxSymbol};
 
-use super::{CALLBACK_PARAMETER_KIND, CALLBACK_PATTERN_PARAMETER_KIND};
+use super::{
+    CALLBACK_PARAMETER_KIND, CALLBACK_PATTERN_PARAMETER_KIND,
+    TYPED_ARGUMENT_CALLBACK_PARAMETER_KIND,
+};
 
 pub(super) fn append(
     symbols: &mut Vec<SyntaxSymbol>,
@@ -15,9 +18,13 @@ pub(super) fn append(
     source: &str,
     javascript: bool,
 ) {
-    if !javascript
-        || (facts.parameters().is_empty() && facts.callback_pattern_parameters().is_empty())
+    if facts.parameters().is_empty()
+        && (!javascript || facts.callback_pattern_parameters().is_empty())
     {
+        return;
+    }
+    let typed = (!javascript).then(|| typed_arrow_arguments(facts));
+    if typed.as_ref().is_some_and(BTreeSet::is_empty) {
         return;
     }
     let callbacks = facts
@@ -43,17 +50,32 @@ pub(super) fn append(
         .map(|symbol| symbol.qualified_name.as_str())
         .collect::<BTreeSet<_>>();
     let mut captured = BTreeMap::new();
+    let ordinary_kind = if javascript {
+        CALLBACK_PARAMETER_KIND
+    } else {
+        TYPED_ARGUMENT_CALLBACK_PARAMETER_KIND
+    };
+    let patterns = if javascript {
+        facts.callback_pattern_parameters()
+    } else {
+        &[]
+    };
     let sites = facts
         .parameters()
         .iter()
-        .map(|site| (site, CALLBACK_PARAMETER_KIND))
+        .map(|site| (site, ordinary_kind))
         .chain(
-            facts
-                .callback_pattern_parameters()
+            patterns
                 .iter()
                 .map(|site| (site, CALLBACK_PATTERN_PARAMETER_KIND)),
         );
     for (site, kind) in sites {
+        if typed
+            .as_ref()
+            .is_some_and(|checked| !checked.contains(&site.function))
+        {
+            continue;
+        }
         let Some(ordinal) = ordinals.get(&site.function) else {
             continue;
         };
@@ -86,6 +108,40 @@ pub(super) fn append(
             .or_insert_with(|| Some(parameter(name, qualified, container, site.name, kind)));
     }
     symbols.extend(captured.into_values().flatten());
+}
+
+/// Finds physically written arrow arguments without resolving their call targets.
+fn typed_arrow_arguments(facts: &StaticFacts) -> BTreeSet<ByteRange> {
+    let non_arrows = facts
+        .function_scopes()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let calls = facts
+        .calls()
+        .iter()
+        .filter(|call| {
+            matches!(
+                call.callee,
+                StaticCallee::Direct | StaticCallee::Member { .. }
+            )
+        })
+        .map(|call| (call.range, call.callee_range))
+        .collect::<BTreeMap<_, _>>();
+    facts
+        .function_contexts()
+        .iter()
+        .filter_map(|&(function, context)| {
+            let StaticFunctionContext::Argument { call, .. } = context else {
+                return None;
+            };
+            let callee = calls.get(&call)?;
+            (callee.end <= function.start
+                && call.encloses(function)
+                && !non_arrows.contains(&function))
+            .then_some(function)
+        })
+        .collect()
 }
 
 fn text(source: &str, range: ByteRange) -> Option<&str> {
