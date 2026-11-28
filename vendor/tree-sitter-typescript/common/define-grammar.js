@@ -71,6 +71,8 @@ module.exports = function defineGrammar(dialect) {
     ]),
 
     conflicts: ($, previous) => previous.concat([
+      [$.primary_expression, $._inline_import_type_arguments],
+      [$._primary_type, $._inline_import_type_member],
       [$.primary_expression, $.global_namespace],
       [$.call_expression, $.instantiation_expression, $.binary_expression],
       [$.call_expression, $.instantiation_expression, $.binary_expression, $.unary_expression],
@@ -746,6 +748,7 @@ module.exports = function defineGrammar(dialect) {
         $._type_identifier,
         $.nested_type_identifier,
         $.generic_type,
+        alias($._inline_import_type_member, $.member_expression),
         $.object_type,
         $.array_type,
         $.tuple_type,
@@ -797,9 +800,27 @@ module.exports = function defineGrammar(dialect) {
         field('name', choice(
           $._type_identifier,
           $.nested_type_identifier,
+          alias($._inline_import_type_member, $.member_expression),
         )),
         field('type_arguments', $.type_arguments),
       )),
+
+      // A qualified inline import names a type without evaluating a member call.
+      _inline_import_type_member: ($) => prec('member', seq(
+        field('object', choice(
+          alias($._inline_import_type_call, $.call_expression),
+          alias($._inline_import_type_member, $.member_expression),
+        )),
+        '.',
+        field('property', alias($.identifier, $.property_identifier)),
+      )),
+
+      _inline_import_type_call: ($) => seq(
+        field('function', $.import),
+        field('arguments', alias($._inline_import_type_arguments, $.arguments)),
+      ),
+
+      _inline_import_type_arguments: ($) => seq('(', $.string, ')'),
 
       type_predicate: ($) => seq(
         field('name', choice(

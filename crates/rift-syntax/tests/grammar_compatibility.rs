@@ -531,3 +531,84 @@ fn test_newline_separated_generic_call_signatures_keep_their_spans() {
         assert!(!multiline.has_errors());
     }
 }
+
+#[test]
+fn test_generic_inline_import_types_keep_following_declarations() {
+    let path = ProjectPath::new("index.d.ts").expect("syntax fixture path");
+    let source = concat!(
+        "type Local = import('./payload.js').Plain;\n",
+        "export declare function carry<T>(value: import('./payload.js').Payload<T>): ",
+        "import('./payload.js').ns.Payload<T>;\n",
+        "export type Carried<T> = import('./payload.js').Payload<Array<T>>;\n",
+        "export type Following = { name: string; prior: Local };\n",
+    );
+    for dialect in [TypeScriptDialect::TypeScript, TypeScriptDialect::Tsx] {
+        let provider = dialect.provider();
+        let parse = |text| {
+            provider
+                .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
+                .expect("generic inline import fixture")
+        };
+        let document = parse(source);
+        assert!(!document.has_errors());
+        let generic = document
+            .syntax_elements()
+            .iter()
+            .filter(|element| element.kind == "generic_type")
+            .map(|element| {
+                let start = usize::try_from(element.range.start).expect("generic start");
+                let end = usize::try_from(element.range.end).expect("generic end");
+                &source[start..end]
+            })
+            .filter(|spelling| spelling.starts_with("import("))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generic,
+            [
+                "import('./payload.js').Payload<T>",
+                "import('./payload.js').ns.Payload<T>",
+                "import('./payload.js').Payload<Array<T>>",
+            ]
+        );
+        let local = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "Local")
+            .expect("plain inline import alias");
+        let start = usize::try_from(local.item_range.start).expect("plain start");
+        let end = usize::try_from(local.item_range.end).expect("plain end");
+        assert_eq!(
+            &source[start..end],
+            "type Local = import('./payload.js').Plain;"
+        );
+        let following = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "Following")
+            .expect("following declaration");
+        let begin = usize::try_from(following.item_range.start).expect("alias start");
+        let end = usize::try_from(following.item_range.end).expect("alias end");
+        assert_eq!(
+            &source[begin..end],
+            "type Following = { name: string; prior: Local };"
+        );
+        assert!(document.symbols().iter().any(|symbol| {
+            symbol.name == "name" && symbol.container.as_deref() == Some("Following")
+        }));
+        for valid in [
+            "declare function plain(value: import('./payload.js').Payload): void;",
+            "import type { Payload } from './payload.js'; type Item<T> = Payload<T>;",
+            "const result = import('./payload.js').then(convert);",
+        ] {
+            assert!(!parse(valid).has_errors(), "{valid}");
+        }
+        for malformed in [
+            "type Item = read().Payload<string>;",
+            "type Item = import(source).Payload<string>;",
+            "type Item = import('./payload.js').read().Payload<string>;",
+            "type Item = import('./payload.js').Payload<>;",
+        ] {
+            assert!(parse(malformed).has_errors(), "{malformed}");
+        }
+    }
+}
