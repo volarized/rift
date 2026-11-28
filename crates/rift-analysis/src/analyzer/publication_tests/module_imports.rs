@@ -8033,3 +8033,96 @@ fn typescript_class_methods_keep_repeated_direct_argument_properties() {
         row.source == "kind: 'ready'" && row.syntax_element_kind.as_deref() == Some("pair")
     }));
 }
+
+#[test]
+fn inline_assigned_literal_properties_keep_their_written_local_owner() {
+    const SOURCE: &str = concat!(
+        "var parser;\n",
+        "(function (exports) {\n",
+        "  var rules, last;\n",
+        "  rules = { 'alpha': ['parseAlpha'], 'beta': ['parseBeta'] };\n",
+        "  function get(key) { last = key; return rules[key]; }\n",
+        "  exports.get = get;\n",
+        "}(parser = {}));\n",
+        "exports.get = parser.get;\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("assigned literal package")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("exact written properties");
+    let owner = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("variable_declarator")
+                && row.source == "rules"
+        })
+        .expect("earlier local binding");
+    for (key, text) in [
+        ("'alpha'", "'alpha': ['parseAlpha']"),
+        ("'beta'", "'beta': ['parseBeta']"),
+    ] {
+        let identity = format!("{}/{key}", owner.symbol.as_str());
+        let property = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str() == identity && row.source == text && row.source_complete
+            })
+            .expect("same authored property span");
+        assert_eq!(
+            property.range,
+            module_runtime_range(SOURCE.find(text).expect("written property"), text),
+        );
+        assert!(publication.objects.iter().any(|row| {
+            row.id.as_ref() == Some(&property.symbol)
+                && row.container.as_ref() == Some(&owner.symbol)
+        }));
+    }
+    let sibling =
+        format!("(function (outside) {{ outside = {{ 'alpha': ['other'] }}; }}({{}}));\n{SOURCE}");
+    let separated = analyze(&sibling);
+    for (owner, source) in [
+        ("/rules/'alpha'", "'alpha': ['parseAlpha']"),
+        ("/beacon/'alpha'", "'alpha': ['other']"),
+    ] {
+        assert!(
+            separated
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with(owner) && row.source == source })
+        );
+    }
+
+    let shadow = SOURCE
+        .replace("function (exports)", "function (exports, rules)")
+        .replace("var rules, last;", "var last;");
+    let outer = SOURCE
+        .replace("var parser;", "var parser, rules;")
+        .replace("var rules, last;", "var last;");
+    for control in [shadow, outer] {
+        let other = analyze(&control);
+        assert!(other.publication().declarations.iter().any(|row| {
+            row.symbol.as_str().ends_with("/'alpha'") && row.source == "'alpha': ['parseAlpha']"
+        }));
+        assert!(
+            !other
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| { row.symbol.as_str().ends_with("/rules/'alpha'") })
+        );
+    }
+}
