@@ -542,9 +542,10 @@ async fn static_edge_provider_filters_captured_calls() -> TestResult {
     for included in [false, true, false] {
         let request = rift_protocol::query::QueryParams {
             query: text.clone(),
-            include: rift_protocol::query::QueryInclude {
-                providers: included,
-            },
+            include: included
+                .then_some(rift_protocol::query::QuerySection::Providers)
+                .into_iter()
+                .collect(),
             revision: revision.clone(),
             ..Default::default()
         };

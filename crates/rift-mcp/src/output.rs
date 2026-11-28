@@ -37,15 +37,18 @@ impl<T: Render + Serialize> IntoCallToolResult for Json<T> {
 
 impl<T: Render + Serialize> Json<T> {
     fn encode(self) -> Result<CallToolResponse, ErrorData> {
-        let text = match text_of(&self.0) {
-            Ok(text) => text,
-            Err(error) => return refused(AnswerFault::Text(error)),
+        let content = if self.0.has_text() {
+            match text_of(&self.0) {
+                Ok(text) => vec![ContentBlock::text(text)],
+                Err(error) => return refused(AnswerFault::Text(error)),
+            }
+        } else {
+            Vec::new()
         };
         let structured = match serde_json::to_value(&self.0) {
             Ok(structured) => structured,
             Err(error) => return refused(AnswerFault::Structured(error)),
         };
-        let content = vec![ContentBlock::text(text)];
         let mut result = if self.0.is_error() {
             CallToolResult::error(content)
         } else {

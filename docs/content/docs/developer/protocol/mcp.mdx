@@ -116,16 +116,15 @@ bindings and projected variable order follow SPARQL. Graph answers use RDF set s
 
 Search text for a nonempty result set starts with the rows on the current page, numbered from
 one across the result set. The heading gives the total when the result set has multiple rows and
-shows the current page and page count. A blank line separates it from the Markdown table.
+shows the current page and page count. A blank line separates it from the aligned plain-text table.
 
 A `SELECT` table has one column per projected variable, in projection order, with `?` before
 each variable name. An unbound variable leaves an empty cell. A graph table has `subject`,
 `predicate`, and `object` columns. An `ASK` answer uses `1/1` pages and shows `true` or `false`
 in one row under `result`.
 
-Text shortens common RDF namespaces and escapes Markdown syntax in cells. A Git commit ID in
-a `?revision` string cell uses its first eight hexadecimal digits. Structured content carries
-the exact RDF terms and identities.
+Text shortens common RDF namespaces. A Git commit ID in a `?revision` string cell uses its
+first eight hexadecimal digits. Structured content carries the exact RDF terms and identities.
 
 A query with zero results returns one sentence that points to the query examples.
 
@@ -145,8 +144,10 @@ filters the acquired records:
 `:query`, `:pattern`, `:scope`, `:target`, `:order`, `:rev`, `:paths`, `:packages`, `:include`,
 `:change`, `:max_results`, `:page`, and `:view` retain their producer meanings inside the service. Structured inputs
 use `rdf:JSON` literals. Conflicting constant inputs refuse. Portable categories use `:kinds`. The language-specific string uses `:kind`.
-Requesting `:source` and `:score` projects the corresponding producer payload. Service input triples select records rather than
-require those input values as stored facts on every result.
+The `:include` input accepts an `rdf:JSON` array of `source`, `score`, and `providers`
+selections. For example, `:include '["source"]'^^rdf:JSON` requests source from the producer.
+If `:include` is absent, `:source` and `:score` projections also request their producer payload.
+Service input triples select the records the producer supplies.
 
 `:max_results` and `:page` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
 SPARQL result after evaluation. Missing producer coverage can make the query unavailable. A
@@ -231,7 +232,7 @@ between the same steps contribute evidence to the same path.
 
 The server scores each path by the strongest matched symbol and adds a quarter of the second
 strongest score when a distinct matched symbol is present. Step order follows the direction
-of the calls in the graph. The Markdown table follows the projected variables, so callers can
+of the calls in the graph. The plain-text table follows the projected variables, so callers can
 include each step's index and symbol.
 
 The service applies `:max_results` to whole flows before SPARQL evaluates the outer query. Outer
@@ -348,37 +349,41 @@ repeated definitions, overloads, and `cfg` variants of one symbol together.
 
 <ReadExample name="local-symbol" />
 
-`outcome` distinguishes `found`, `missing`, and `unavailable`. `found` contains one
-`symbol` and its declaration bindings, including an empty declaration list for a source-less
-object. A runtime symbol's answer names the runtime release it read as `revision`:
+A successful lookup returns one `symbol` and its declaration bindings. A source-less object can
+have an empty declaration list. A runtime symbol's answer names the runtime release it read as
+`revision`:
 
 <ReadExample name="runtime-symbol" />
 
-`missing` means the exact selection was searched completely. `symbol_not_found`
-names the requested identity and up to three actual structural alternatives. An incomplete
-selection answers `unavailable` with a typed reason.
+An incomplete lookup returns the requested `id`, a typed `reason`, and the `revision` when
+one was established. Its text marks the read as unavailable.
 
 A Rust identity names a path inside a library crate. A declaration in a binary, example,
 integration test, benchmark, or build script, or in a module one of these declares, carries no
-identity, so a Cargo package with a binary still answers a miss with `missing`. A library file
+identity, so a Cargo package with a binary can still establish that a library symbol is absent. A library file
 that failed analysis, or a Rust file neither the library nor another Cargo target declares,
 keeps Rust misses `unavailable` with `insufficient_coverage`.
 
-For `missing`, the server **MUST** set MCP `isError` to `true` and retain the same typed
-answer in `structuredContent` under `--output all`. The `--output text` policy removes
-`structuredContent` while retaining the error flag and compact text.
-
-The [search configuration](/docs/developer/configuration#search) bounds optional alternative
-work through `symbol_alternatives_work` and `symbol_alternatives_lowercase_work`. Reached
-bounds retain the definite miss and report incomplete alternative work.
+A lookup that establishes the symbol is absent succeeds with empty `content` and
+`structuredContent: {}` under `--output all`. The default text policy forwards the empty
+`content`.
 
 <ReadExample name="missing-symbol" />
 
-`include` is an object of boolean members that selects projections: `documentation` adds
-bounded referring documentation, and `history` adds the logical symbol's history edges. An
-omitted member is `false`, and an omitted `include` requests none. The server refuses any other
-member, `source` included, as an invalid request. A declaration's source is read by
-[`facets`](#tool-facets) with `symbol`.
+`include` and `exclude` are arrays of `documentation`, `source`, `history`, and `edges`.
+The default selection is `["documentation", "source"]`. The server adds every item in
+`include`, then removes every item in `exclude`.
+
+`documentation` selects attached declaration documentation and bounded referring context.
+`source` selects the available excerpt for each declaration. `history` selects the logical
+symbol's history edges. `edges` selects outgoing edges as `{kind, target}` entries, where
+`target` is the destination symbol IRI.
+
+Text starts with the symbol IRI and uses `facets X/Y:` for each declaration on the page.
+`X` counts from one across all `Y` declarations. Each section shows the selected available
+`source:` and `doc:` blocks. An `edges:` section groups target IRIs by edge kind.
+
+Use [`facets`](#tool-facets) to read the declaration's syntax elements.
 
 `max_results` defaults to 10 and accepts 1 through 10000. `page` selects declarations at the
 revision the answer names. The server refuses a tree revision once the index serves another tree.
@@ -486,6 +491,8 @@ symbol and revision for later pages.
 
 ## Feedback [#tool-feedback]
 
+<McpTool name="feedback" />
+
 `feedback` submits one report to the HTTPS intake named by the server process's
 `RIFT_FEEDBACK_URL`. When the variable is unset, the server submits to
 `https://feedback.volar.sh/rift/feedback/v1/reports`. The URL carries no credentials, query,
@@ -496,9 +503,9 @@ The server never falls back to the default intake for such a value, so an empty 
 submission off.
 
 The server sends `text` verbatim. It MUST contain at least one non-whitespace character
-and fit within 4,096 UTF-8 bytes. The optional `include` object takes two boolean members:
-`os` sends the server's operating system name, and `rift_version` its package version. An
-omitted member is `false`. Omit `include` or set both members to `false` to send only `text`.
+and fit within 4,096 UTF-8 bytes. The optional `include` array selects diagnostic fields.
+`os` sends the server's operating system name, and `rift_version` sends its package version.
+Omit `include` or pass `[]` to send only `text`.
 The server reads no workspace files, logs, or conversation history to construct the report.
 
 The caller MUST redact secrets, personal data, and private source material before sending
@@ -690,8 +697,8 @@ The caller selects the representations when it starts the proxy with `rift mcp -
 The proxy **MUST** keep the selected output for its lifetime. Direct HTTP access to
 `rift server` carries both tool representations.
 
-Search uses [Markdown result text](#search-result-text). An exact read states its outcome and
-selected object. Use `rift server logs` for diagnostic codes and details.
+Search uses an [aligned result table](#search-result-text). A successful exact symbol read starts
+with its symbol IRI. Use `rift server logs` for diagnostic codes and details.
 The [tool execution failure](#tool-execution-failures) form applies when `isError` is set.
 
 ### Revision-addressed reads [#revision-reads]
@@ -709,7 +716,7 @@ that names one point on the history axis:
 - `rift://revision/tree/<digest>` - the working tree the index serves, by its complete SHA-256
   digest
 
-A `get_symbol` or `facets` answer carries the `revision` it read. The answer names a commit, a
+A successful `get_symbol` or `facets` read carries the `revision` it read. The answer names a commit, a
 release, or a tree. A caller **MAY** send that revision to pin a later exact read to the same point.
 
 A git revision reads committed bytes. The server resolves it in place from the workspace's git
@@ -855,8 +862,8 @@ carry `structuredContent` under either output selection. The MCP specification
 [reports tool execution errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
 in the result, where the model can read the failure and adjust its request.
 
-The advertised `outputSchema` describes typed tool answers, including the `get_symbol`
-`missing` outcome. Registered operating failures carry no such answer. A proxy started
+The advertised `outputSchema` describes typed tool answers, including the empty
+`get_symbol` answer for an absent symbol. Registered operating failures carry no such answer. A proxy started
 with `--output text` forwards the failure unchanged: it keeps `isError` and `content`, and the
 result had no `structuredContent` to remove.
 

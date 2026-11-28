@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::symbol_read::GetSymbolResult;
+use rift_protocol::mcp_symbol::GetSymbolResult;
 use serde_json::json;
 
 use crate::workspace_client::query;
@@ -145,14 +145,11 @@ async fn assert_exact_profile_reads(
 ) -> TestResult {
     let found = proxied_call(client, "get_symbol", &json!({"id":profile_id})).await?;
     let found: GetSymbolResult = serde_json::from_value(found)?;
-    let GetSymbolResult::Found {
-        symbol,
-        declarations,
-        ..
-    } = found
-    else {
+    let GetSymbolResult::Found(found) = found else {
         return Err("extra profile symbol unavailable".into());
     };
+    let symbol = &found.symbol;
+    let declarations = &found.declarations;
     assert_eq!(
         symbol
             .id

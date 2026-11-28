@@ -88,7 +88,7 @@ optional `language`, whose default is `sparql`:
 
 <ReadExample name="select-symbols" />
 
-The **response** tab shows the Markdown in a code block.
+The **response** tab shows an aligned table in a code block.
 See [search result text](/docs/developer/protocol/mcp#search-result-text) for the format.
 
 The empty prefix names `urn:rift:vocabulary:`. `r:`, `rdf:`, `rdfs:`, and `xsd:` are also
@@ -168,9 +168,12 @@ They omit the [analyses that produced each edge](/docs/developer/protocol/core#e
 by default. The edge's `derivation` records how it was established, and optional `producer`
 names an external producer.
 
-`include: { providers: true }` attaches the sorted `providers` set to returned edge terms
-and call steps. `SELECT` projects the edge or call step identity to carry that set. Explicit SPARQL bindings and filters on `:provider` keep their
-selected producer facts.
+`include: ["providers"]` attaches the sorted `providers` set to returned edge terms
+and call steps. Project the edge or call step identity in `SELECT` to return that set.
+
+<ReadExample name="edge-provider-set" />
+
+Explicit SPARQL bindings and filters on `:provider` keep their selected producer facts.
 
 A query can check for edges from static analysis with `:provider`:
 
@@ -239,25 +242,32 @@ crate and declaration, rather than the physical file:
 
 <ReadExample name="local-symbol" />
 
-The result carries `outcome: "found"`, one `symbol`, the `revision` it was read at, and
-`declarations` in deterministic source order. Each declaration keeps its own origin,
-source address, byte range, and indices into the symbol's signatures, types, and documentation.
-Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
-be found with no declarations. A runtime symbol, such as `len` in Python's builtins, reads
-the same way, and its `revision` names the runtime release:
+Text starts with the symbol IRI. Each `facets X/Y:` section shows one declaration's
+available source and documentation, where `X` is its position among the `Y` declarations.
+Structured content carries one `symbol`, the `revision` it was read at, and
+`declarations` in source order. Each declaration keeps its own origin, source address,
+byte range, and indices into the symbol's signatures, types, and documentation.
+Every declaration of one qualified path, such as two `cfg` variants of a Rust function,
+belongs to that symbol. A source-less object can have an empty declaration list.
+A runtime symbol, such as `len` in Python's builtins, has a `revision` that names its release:
 
 <ReadExample name="runtime-symbol" />
 
-Use the `include` object to select optional projections, such as
-`"include": {"documentation": true, "history": true}`:
+The default selection is `["documentation", "source"]`. Use `include` to add selections
+and `exclude` to remove them. If both arrays name a field, `exclude` wins.
 
-| Member | Adds when `true` |
+| Selection | Result |
 | --- | --- |
-| `documentation` | Bounded documentation referring to the exact declaration |
-| `history` | The logical symbol's history edges: the commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
+| `documentation` | Attached documentation and bounded documentation that refers to the symbol |
+| `source` | A source excerpt from each declaration |
+| `history` | The commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
+| `edges` | Outgoing edges from the symbol, grouped by kind in text |
 
-The members combine. An omitted member is `false`, and an omitted `include` adds neither. A
-declaration's source comes from [`facets`](#tool-facets) with the symbol's `id`.
+This request adds outgoing edges and excludes source.
+
+<ReadExample name="local-symbol-selection" />
+
+Use [`facets`](#tool-facets) with the symbol's `id` to read the declaration's syntax elements.
 
 `history` answers edges from the symbol. The commit edges come first, newest first, each naming
 its commit as a `rift://revision/git/<commit>` revision with the commit's author and the path the
@@ -322,10 +332,8 @@ at the same revision:
 For a package or runtime symbol, `revision` can only name a release of the symbol's owner. Released source units remain physical addresses separate from
 logical symbol identities.
 
-A valid absent identity returns MCP `isError: true` and `outcome: "missing"` with
-`symbol_not_found` and bounded structural alternatives. Its compact text starts with
-`error: symbol_not_found` and lists alternatives under `closest matches:`. The
-`--output all` policy retains the typed answer in `structuredContent`:
+A valid identity whose lookup establishes absence returns empty text.
+With `--output all`, structured content is `{}`.
 
 <ReadExample name="missing-symbol" />
 
@@ -333,7 +341,7 @@ A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
 
-An incomplete exact selection returns `outcome: "unavailable"` with its typed reason.
+An incomplete exact selection returns the requested `id` and a typed `reason`.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
 ## Facets [#tool-facets]
@@ -367,15 +375,10 @@ Describe the Rift behavior and what the caller expected. A report can include a 
 redacted Rift error or response excerpt. Before including an exact excerpt from the
 conversation, show the user that excerpt and get approval to send it in this report.
 
-```json
-{
-  "text": "The facets tool returned an empty result for a symbol it found.",
-  "include": {"os": true, "rift_version": true}
-}
-```
-
-The server sends the diagnostic fields set to `true` in `include`. Omit it to send the text alone.
-See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for the payload and failure behavior.
+The `include` array names the diagnostic fields to send. Pass `["os", "rift_version"]` to
+send both diagnostics. Omit it or pass `[]` to send the text alone.
+See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for a request example
+and failure behavior.
 
 ## Edits and index updates [#edit-and-index-updates]
 
@@ -407,7 +410,7 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-Every `get_symbol` and `facets` answer names the revision it was read at, such as
+Successful `get_symbol` and `facets` reads name the revision they were read at, such as
 `rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
 project code by adding `revision` to either tool. For example, this reads the function from
 `main` without changing the working tree:

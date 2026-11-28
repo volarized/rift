@@ -8,9 +8,10 @@ This page goes into how Rift is built. It's developer-oriented - if you just wan
 check the [main documentation](/docs).
 
 <FlatDiagram
+  variant="architecture"
   alt="rift mcp forwards requests over Streamable HTTP to the Axum server on Tokio. Providers build an in-memory index and persist search data through Toasty over SQLite into the index and vectors databases. The server writes its logs into the metrics database through rusqlite."
   chart={`
-    flowchart LR
+    flowchart TB
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
       mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "acceptance" --> server

@@ -25,6 +25,8 @@ pub mod identity;
 pub mod index;
 pub mod lock;
 pub mod map;
+mod mcp_projection;
+pub mod mcp_symbol;
 pub mod message;
 pub mod producer;
 pub mod query;

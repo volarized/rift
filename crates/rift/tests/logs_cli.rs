@@ -616,7 +616,7 @@ async fn repository_beacon(
         &serde_json::json!({"id":identity,"revision":revision}),
     )
     .await?;
-    assert_eq!(lookup["outcome"], "found", "{lookup}");
+    assert!(lookup.get("outcome").is_none(), "{lookup}");
     assert_eq!(lookup["symbol"]["id"], identity.as_str(), "{lookup}");
     assert_eq!(lookup["symbol"]["name"], "beacon", "{lookup}");
     assert_eq!(lookup["revision"], revision.as_str(), "{lookup}");

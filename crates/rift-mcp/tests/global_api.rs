@@ -148,6 +148,15 @@ pub(crate) enum SymbolFixture {
     InvalidIdentity,
 }
 
+/// Raw edge operations the fixture advertises.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeFixture {
+    /// The API advertises no raw edge operation.
+    Unavailable,
+    /// The API answers outgoing edges of a symbol.
+    Outgoing,
+}
+
 /// An answer the fixture holds before it sends it, and for how long.
 #[derive(Clone, Copy)]
 pub(crate) enum Hold {
@@ -178,6 +187,8 @@ pub(crate) struct FixtureOptions {
     /// The features the capabilities leave out of `supported_features`. Without both
     /// documentation features they carry no `documentation_revision` either.
     pub(crate) withheld_features: &'static [&'static str],
+    /// Raw edge operations the fixture advertises.
+    pub(crate) edges: EdgeFixture,
     /// Whether the collection also holds [`PYTHON_STANDARD_LIBRARY`] and [`GREETING`].
     pub(crate) python_collection: bool,
     /// The status of the problem the resolution endpoint answers in place of a resolution.
@@ -194,6 +205,7 @@ impl Default for FixtureOptions {
             stopped_at_body_bound: false,
             query_narrowed: true,
             withheld_features: &[],
+            edges: EdgeFixture::Unavailable,
             python_collection: false,
             resolution_problem: None,
         }
@@ -374,6 +386,9 @@ async fn global_handler(
     }
     if path.ends_with("/search") {
         state.hold_read().await;
+        if options.edges == EdgeFixture::Outgoing && body.get("edges").is_some() {
+            return state.response(symbol_edges(&body));
+        }
         let mut page = search_page(
             options.symbol,
             &body,
@@ -394,7 +409,7 @@ async fn global_handler(
     }
     if path.ends_with("/facets") {
         state.hold_read().await;
-        return symbol_kinds(&body).map_or_else(
+        return symbol_kinds(options.symbol, &body).map_or_else(
             || problem_response(StatusCode::NOT_FOUND),
             |syntax_elements| {
                 state.response(numbered_result(
@@ -456,6 +471,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
         "facets",
     ]
     .into_iter()
+    .chain((options.edges == EdgeFixture::Outgoing).then_some("edges"))
     .filter(|feature| !withheld.contains(feature))
     .collect();
     let mut advertised = json!({
@@ -492,7 +508,37 @@ fn capabilities(options: &FixtureOptions) -> Value {
     if !documented && let Some(fields) = advertised.as_object_mut() {
         fields.remove("documentation_revision");
     }
+    if options.edges == EdgeFixture::Outgoing {
+        advertised["edge_capabilities"] = json!([{
+            "direction": "outgoing", "kinds": ["contains"],
+            "bounds": {
+                "max_seeds": 16, "max_kinds": 16, "max_edges": 100,
+                "max_occurrences": 100, "max_symbols": 100, "max_sources": 100
+            }
+        }]);
+    }
     advertised
+}
+
+fn symbol_edges(request: &Value) -> Value {
+    let seed = &request["edges"]["seeds"][0];
+    let target = collected_identity(SymbolFixture::Valid, "helper_beacon");
+    let symbol = |id: &Value, name: &str| {
+        json!({
+            "symbol": {"id": id, "name": name, "language": "rust", "kind": "function",
+                       "origin": {"source_kind": "synthetic"}},
+            "declarations": []
+        })
+    };
+    json!({
+        "groups": [{"seed": seed, "complete": true, "edges": [{
+            "id": "1".repeat(64), "edge": {"from": seed, "to": target,
+                "kind": "contains", "kinds": ["contains"], "derivation": "resolution"}
+        }]}],
+        "symbols": [symbol(seed, "beacon"), symbol(&json!(target), "helper_beacon")],
+        "analyzer_revision": "analyzer-v1", "corpus_revision": "corpus-v1",
+        "view": {"id": "a".repeat(64), "expires_at": "2099-10-10T10:05:00Z"}
+    })
 }
 
 /// The resolution of `requested`. The collected release answers an exact `demo` entry at
@@ -737,16 +783,35 @@ fn release_revision(id: &str) -> Value {
 /// The syntax elements of the collected declaration `request` names, as a symbol read of
 /// [`COLLECTED_SOURCE`] lists them: the item syntax element, then its visibility, name, parameters,
 /// and body, in the fixture's view when the request names one. `None` for any other symbol.
-fn symbol_kinds(request: &Value) -> Option<Value> {
+fn symbol_kinds(fixture: SymbolFixture, request: &Value) -> Option<Value> {
     let id = request["symbol"].as_str()?;
     if id == named_identity(&NAMED_POSITIONS[0]) {
         return Some(runtime_facets(request));
     }
-    let name = DECLARATIONS
-        .into_iter()
-        .find(|name| collected_identity(SymbolFixture::Valid, name) == id)?;
+    if id == named_identity(&NAMED_POSITIONS[1]) {
+        let source = GREETING_SOURCE.split("\n\n").next()?;
+        return Some(facet_answer(
+            id,
+            &release_revision(id),
+            &[json!({
+                "declaration": 0, "index": 0,
+                "unit": named_unit(&NAMED_POSITIONS[1]), "language": "python",
+                "kind": "function_definition", "kinds": ["declaration", "definition"],
+                "range": {"start": 0, "end": source.len()}, "source": source,
+            })],
+        ));
+    }
+    let name = fixture_declarations(fixture)
+        .iter()
+        .copied()
+        .find(|name| collected_identity(fixture, name) == id)?;
+    let source = if matches!(fixture, SymbolFixture::CasePairs) {
+        CASE_SOURCE
+    } else {
+        COLLECTED_SOURCE
+    };
     let item = format!("pub fn {name}() {{}}");
-    let start = COLLECTED_SOURCE.find(&item)?;
+    let start = source.find(&item)?;
     let parts = [
         ("function_item", 0, item.as_str()),
         ("visibility_modifier", 0, "pub"),

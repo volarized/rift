@@ -1217,13 +1217,13 @@ journal_size_limit = "64mb"
   indexed chunks, 1kb to 16mb
 - `results` caps results collected by one local search or symbol lookup, 1 to 10000, default
   `1000`. The server logs `results_truncated` when a read reaches the cap
-- `symbol_alternatives_work` bounds one complete closest-declaration ranking, 1 to 1073741824,
+- `symbol_alternatives_work` bounds one complete closest-declaration ranking where alternatives
+  are requested, 1 to 1073741824,
   default `16777216`. Every visited file and declaration costs one work unit, including
   language exclusions. Lowercase allocation reserves the configured weight per input byte.
   A distance comparison reserves `(Q + 1) * L` units for the lowercase query and candidate
   character counts. Stable ordering reserves three times the sum of qualified-name bytes,
-  path bytes, and one byte. Exhaustion discards all alternatives. `symbol_not_found.detail`
-  reports the configured bound, required work, remaining work, and recovery action
+  path bytes, and one byte. Exhaustion discards all alternatives
 - `symbol_alternatives_lowercase_work` sets that reservation weight, 12 to 1024, default `12`.
   Rust lowercase mappings return at most three characters, each at most four UTF-8 bytes.
   Values below 12 are refused. Larger values reserve more work without changing Unicode

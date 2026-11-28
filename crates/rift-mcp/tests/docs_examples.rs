@@ -113,6 +113,7 @@ LIMIT 3"#,
         r#"SELECT ?path ?start ?end ?source {
   SERVICE :search {
     ?hit :pattern "tokio::[A-Za-z_]+"; :target "file";
+         :include '["source"]'^^rdf:JSON;
          :path ?path; :start ?start; :end ?end; :source ?source .
   }
 }
@@ -245,6 +246,11 @@ fn check_search_examples(examples: &Map<String, Value>) -> TestResult<()> {
     assert_eq!(rows.len(), 5, "{table}");
     assert!(
         rows.iter()
+            .any(|row| row.contains("<rift://symbol/local/rust/example_project/config/Config>")),
+        "{table}"
+    );
+    assert!(
+        rows.iter()
             .all(|row| row.starts_with("| ") && row.ends_with(" |")),
         "{table}"
     );
@@ -299,12 +305,20 @@ async fn capture_tool(
     expected_error: bool,
 ) -> TestResult<Value> {
     let response = client.call_tool(tool_request(tool, &arguments)).await?;
-    let text = &response
+    let text = match response
         .content
         .first()
         .and_then(rmcp::model::ContentBlock::as_text)
-        .ok_or("tool response is missing its compact text")?
-        .text;
+    {
+        Some(block) => block.text.as_str(),
+        None if tool == "get_symbol"
+            && response.content.is_empty()
+            && response.structured_content.as_ref() == Some(&json!({})) =>
+        {
+            ""
+        }
+        None => return Err("tool response is missing its compact text".into()),
+    };
     assert_eq!(
         response.is_error.unwrap_or(false),
         expected_error,
@@ -318,17 +332,19 @@ async fn capture_tool(
     if let Some(fields) = answer.as_object_mut() {
         fields.remove("view");
     }
+    if tool == "get_symbol" {
+        assert!(answer.get("outcome").is_none(), "{answer}");
+    }
     Ok(json!({ "tool": tool, "arguments": arguments, "text": text, "json": answer }))
 }
 
-async fn capture_query(client: &RunningService<RoleClient, ()>, query: &str) -> TestResult<Value> {
-    let arguments = json!({ "query": query });
+async fn capture_query(
+    client: &RunningService<RoleClient, ()>,
+    arguments: Value,
+) -> TestResult<Value> {
     query_after_population(client, &serde_json::from_value(arguments.clone())?).await?;
     let example = capture_tool(client, "search", arguments, false).await?;
-    assert!(
-        example["json"].get("answer").is_some(),
-        "{query}: {example}"
-    );
+    assert!(example["json"].get("answer").is_some(), "{example}");
     Ok(example)
 }
 
@@ -379,7 +395,7 @@ async fn capture_routed_examples(examples: &mut Map<String, Value>) -> TestResul
     let collected = global_api::collected_identity(SymbolFixture::Valid, "beacon");
     let local = captured_seed(&client, "beacon", "lib.rs").await?;
     for &(name, query) in PACKAGE_QUERIES {
-        let example = capture_query(&client, query).await?;
+        let example = capture_query(&client, json!({ "query": query })).await?;
         let rows = workspace_client::query::rows(&example["json"])?;
         assert!(
             rows.iter()
@@ -403,12 +419,11 @@ async fn capture_routed_examples(examples: &mut Map<String, Value>) -> TestResul
             json!({
                 "id": collected,
                 "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
-                "include": {"documentation": true},
             }),
         ),
         (
             "global-symbol-history",
-            json!({"id": collected, "include": {"history": true}}),
+            json!({"id": collected, "include": ["history"]}),
         ),
         (
             "runtime-symbol",
@@ -419,7 +434,10 @@ async fn capture_routed_examples(examples: &mut Map<String, Value>) -> TestResul
         ),
     ] {
         let example = capture_tool(&client, "get_symbol", arguments, false).await?;
-        assert_eq!(example["json"]["outcome"], "found", "{name}: {example}");
+        assert_eq!(
+            example["json"]["symbol"]["id"], example["arguments"]["id"],
+            "{name}: {example}"
+        );
         examples.insert(name.to_owned(), example);
     }
     assert!(examples["global-symbol-documentation"]["json"]["documentation"].is_object());
@@ -454,6 +472,12 @@ async fn capture_paged_examples(
     )
     .await?;
     assert_eq!(next["json"]["pagination"]["page"], 2, "{next}");
+    assert!(
+        next["text"]
+            .as_str()
+            .is_some_and(|text| text.lines().any(|line| line == "facets 2/2:")),
+        "{next}"
+    );
     for (name, example) in [
         ("multi-declaration-full", all),
         ("multi-declaration-first", first),
@@ -475,14 +499,11 @@ async fn capture_missing_examples(
         client,
         "get_symbol",
         json!({"id": format!("{prefix}/beacn")}),
-        true,
+        false,
     )
     .await?;
-    assert_eq!(missing["json"]["outcome"], "missing", "{missing}");
-    assert_eq!(
-        missing["json"]["symbol_not_found"]["alternatives"][0]["id"], anchor,
-        "{missing}"
-    );
+    assert_eq!(missing["json"], json!({}), "{missing}");
+    assert_eq!(missing["text"], "", "{missing}");
     examples.insert("missing-symbol".to_owned(), missing);
     let mut unavailable = capture_tool(
         client,
@@ -499,6 +520,115 @@ async fn capture_missing_examples(
     unavailable["text"] = json!(text.replace(workspace.as_ref(), "example-project"));
     unavailable["json"]["content"][0]["text"] = unavailable["text"].clone();
     examples.insert("revision-unavailable".to_owned(), unavailable);
+    Ok(())
+}
+
+async fn capture_local_search_examples(
+    client: &RunningService<RoleClient, ()>,
+    queries: &mut Map<String, Value>,
+) -> TestResult<()> {
+    for &(name, query) in QUERIES {
+        queries.insert(
+            name.to_owned(),
+            capture_query(client, json!({ "query": query })).await?,
+        );
+    }
+    check_search_examples(queries)?;
+    let providers = capture_query(
+        client,
+        json!({
+            "query": "SELECT ?edge { ?symbol a :Symbol; :name 'load_config'; :calls ?target . ?edge a :Edge; :from ?symbol; :to ?target; :kinds :calls }",
+            "include": ["providers"],
+        }),
+    )
+    .await?;
+    assert!(
+        workspace_client::query::rows(&providers["json"])?
+            .iter()
+            .any(|row| row["edge"]["providers"] == json!(["static"])),
+        "{providers}"
+    );
+    assert!(
+        providers["text"]
+            .as_str()
+            .is_some_and(|text| text.lines().skip(4).any(|row| row.starts_with("| _:"))),
+        "{providers}"
+    );
+    queries.insert("edge-provider-set".to_owned(), providers);
+    Ok(())
+}
+
+async fn capture_local_symbol_examples(
+    client: &RunningService<RoleClient, ()>,
+    queries: &mut Map<String, Value>,
+) -> TestResult<()> {
+    let symbol = captured_seed(client, "load_config", "src/config.rs").await?;
+    for (name, tool, arguments, expected_error) in [
+        ("local-symbol", "get_symbol", json!({"id": symbol}), false),
+        (
+            "local-symbol-selection",
+            "get_symbol",
+            json!({"id": symbol, "include": ["source", "edges"], "exclude": ["source"]}),
+            false,
+        ),
+        ("symbol-facets", "facets", json!({"symbol": symbol}), false),
+        (
+            "malformed-symbol",
+            "get_symbol",
+            json!({"id": "load_config"}),
+            true,
+        ),
+    ] {
+        let example = capture_tool(client, tool, arguments, expected_error).await?;
+        queries.insert(name.to_owned(), example);
+    }
+    let local = &queries["local-symbol"];
+    let local_text = local["text"].as_str().ok_or("local symbol text")?;
+    assert_eq!(local_text.lines().next(), Some(symbol.as_str()), "{local}");
+    assert!(
+        local_text.contains("facets 1/1:\n")
+            && local_text.contains("source:")
+            && local_text.contains("doc:"),
+        "{local}"
+    );
+    let source = &local["json"]["declarations"][0]["source"];
+    assert!(source.is_object(), "{local}");
+    assert_eq!(
+        source, &queries["symbol-facets"]["json"]["declarations"][0]["source"],
+        "{local}"
+    );
+    assert_eq!(
+        local["json"]["symbol"]["documentation"][0]["text"],
+        "Loads the workspace configuration from `rift.toml`.",
+        "{local}"
+    );
+    assert!(local["json"].get("edges").is_none(), "{local}");
+    let projected = &queries["local-symbol-selection"];
+    assert!(
+        projected["json"]["declarations"][0].get("source").is_none(),
+        "{projected}"
+    );
+    assert_eq!(
+        projected["json"]["symbol"]["documentation"], local["json"]["symbol"]["documentation"],
+        "{projected}"
+    );
+    assert!(
+        projected["json"]["edges"].as_array().is_some_and(|edges| {
+            edges.iter().any(|edge| {
+                edge["kind"] == "calls"
+                    && edge["target"]
+                        .as_str()
+                        .is_some_and(|target| target.ends_with("/config/parse_config"))
+            })
+        }),
+        "{projected}"
+    );
+    assert!(
+        projected["text"]
+            .as_str()
+            .is_some_and(|text| text.lines().any(|line| line == "edges:")),
+        "{projected}"
+    );
     Ok(())
 }
 
@@ -539,24 +669,8 @@ async fn capture_docs_examples() -> TestResult {
     .await?;
 
     let mut queries = Map::new();
-    for &(name, query) in QUERIES {
-        queries.insert(name.to_owned(), capture_query(&client, query).await?);
-    }
-    check_search_examples(&queries)?;
-    let symbol = captured_seed(&client, "load_config", "src/config.rs").await?;
-    for (name, tool, arguments, expected_error) in [
-        ("local-symbol", "get_symbol", json!({"id": symbol}), false),
-        ("symbol-facets", "facets", json!({"symbol": symbol}), false),
-        (
-            "malformed-symbol",
-            "get_symbol",
-            json!({"id": "load_config"}),
-            true,
-        ),
-    ] {
-        let example = capture_tool(&client, tool, arguments, expected_error).await?;
-        queries.insert(name.to_owned(), example);
-    }
+    capture_local_search_examples(&client, &mut queries).await?;
+    capture_local_symbol_examples(&client, &mut queries).await?;
 
     let map = capture_resource(&client, MAP_URI).await?;
     queries.insert(

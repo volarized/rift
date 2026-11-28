@@ -722,7 +722,7 @@ async fn live_walk(
                 "search_retrieval",
                 &json!({
                     "traversal": {"seed": seed, "direction": direction, "kinds": kinds},
-                    "include": {"providers": true},
+                    "include": ["providers"],
                 }),
             ),
         )
@@ -759,7 +759,7 @@ fn direct_incoming(hit: &Value, seed: &str) -> TestResult<Value> {
     Ok(hop["edge"].clone())
 }
 
-/// Whether a merged edge, read with `include.providers`, names `provider` among its
+/// Whether a merged edge, read with `include: ["providers"]`, names `provider` among its
 /// producers (D29: the singular `provider` field left the wire).
 fn provided_by(edge: &Value, provider: &str) -> bool {
     edge["providers"]
@@ -791,7 +791,7 @@ async fn assert_static_incoming(
             "search_retrieval",
             &json!({
                 "traversal": {"seed": seed, "direction": "incoming"},
-                "include": {"providers": true},
+                "include": ["providers"],
             }),
         ),
     )
@@ -2081,7 +2081,7 @@ async fn read_dependency_hit(
         tool_request("get_symbol", &json!({"id":hit["hit"]["symbol"]["id"]})),
     )
     .await?;
-    assert_eq!(symbol["outcome"], "found", "{symbol}");
+    assert!(symbol.get("outcome").is_none(), "{symbol}");
     assert_eq!(symbol["declarations"][0]["unit"], hit["unit"], "{symbol}");
     assert_eq!(symbol["declarations"][0]["range"]["start"], 0, "{symbol}");
     assert!(

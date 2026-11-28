@@ -187,7 +187,9 @@ async fn assert_javascript_evidence(
             .iter()
             .all(|row| row["step"].get("providers").is_none())
     );
-    query.include.providers = true;
+    query
+        .include
+        .insert(rift_protocol::query::QuerySection::Providers);
     let included = query_after_population(client, &query).await?;
     let included = rows(&included)?;
     assert_eq!(included.len(), bindings.len());

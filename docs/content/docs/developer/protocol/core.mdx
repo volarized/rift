@@ -84,10 +84,10 @@ between symbols, resolved types, diagnostics, and history. A family no provider 
 refuses with `capability_unavailable`. Signatures and documentation travel on the symbol itself,
 covered under the `types` family.
 
-A search result carries the answer and `pagination` for paged results. An exact symbol read
-carries an `outcome` and the `revision` it was read at. A paged symbol answer also carries
-declaration `pagination`. See [Reads](/docs/developer/protocol/mcp#reads) for paging and the
-diagnostic records available through `rift server logs`.
+A search result carries the answer and `pagination` for paged results. A successful exact
+symbol lookup carries the `symbol` and the `revision` it was read at. A paged symbol answer
+also carries declaration `pagination`. See [Reads](/docs/developer/protocol/mcp#reads) for
+paging and the diagnostic records available through `rift server logs`.
 
 [`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin) keeps source location separate from
 source kind. A synthetic symbol carries neither a location nor a package. Dependency and
@@ -105,7 +105,7 @@ through LSP. Read answers merge rows with the same `from`, `kind`, `to`, and `oc
 Their `derivation` records resolution, syntax, or heuristic analysis. Optional `producer` names
 an external producer.
 
-Read edges omit analyses by default. `include: { providers: true }` attaches the sorted
+Read edges omit analyses by default. `include: ["providers"]` attaches the sorted
 `providers` set, for example `["engine", "lsp", "static"]`.
 SPARQL keeps `:provider` for explicit selections and filters over the stored facts.
 

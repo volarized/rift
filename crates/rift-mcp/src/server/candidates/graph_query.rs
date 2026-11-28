@@ -104,7 +104,13 @@ impl RiftMcp {
             .query;
         if params.revision.as_ref() == Some(&revision)
             && let Some(output) = self
-                .retained_query_page(key, paging, revision.clone(), configuration, deadline)
+                .retained_query_page(
+                    key,
+                    paging.clone(),
+                    revision.clone(),
+                    configuration,
+                    deadline,
+                )
                 .await?
         {
             return Ok(output);
@@ -941,7 +947,7 @@ mod tests {
 
     #[test]
     fn query_pages_project_requested_providers_before_counting_graph_rows() -> TestResult {
-        use rift_protocol::query::{QueryInclude, RdfTerm, RdfTriple};
+        use rift_protocol::query::{QuerySection, RdfTerm, RdfTriple};
         use rift_protocol::read::EdgeProvider;
         let providers = [
             EdgeProvider::Engine,
@@ -987,9 +993,10 @@ mod tests {
                     &view,
                     &answer,
                     QueryPageOptions {
-                        include: QueryInclude {
-                            providers: included,
-                        },
+                        include: included
+                            .then_some(QuerySection::Providers)
+                            .into_iter()
+                            .collect(),
                         configuration: &QueryConfiguration::default(),
                         page,
                         max_results: 1,

@@ -6,9 +6,9 @@ use std::path::Path;
 
 use crate::workspace_client::query;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+use rift_protocol::mcp_symbol::GetSymbolResult;
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use rift_protocol::read::SymbolId;
-use rift_protocol::symbol_read::GetSymbolResult;
 use serde_json::{Value, json};
 
 use crate::harness::{
@@ -110,7 +110,7 @@ async fn configure_engine(root: &Path, profile: Option<&str>, script: &str) -> T
 fn search() -> TestResult<Value> {
     let selected = |scope: &str| {
         format!(
-            r#"{{ SERVICE <{}> {{ ?hit :query "beacon"; :target "symbol"; :scope "{scope}"; :paths '{{"include":["lib.rs"]}}'^^rdf:JSON; :order "path"; :include '{{"source":true}}'^^rdf:JSON; :symbol ?symbol; :source ?source; :path ?path . ?symbol :name ?name . }} }}"#,
+            r#"{{ SERVICE <{}> {{ ?hit :query "beacon"; :target "symbol"; :scope "{scope}"; :paths '{{"include":["lib.rs"]}}'^^rdf:JSON; :order "path"; :include '["source"]'^^rdf:JSON; :symbol ?symbol; :source ?source; :path ?path . ?symbol :name ?name . }} }}"#,
             "urn:rift:vocabulary:search",
         )
     };
@@ -153,14 +153,11 @@ async fn symbol_read(
     let answer = proxied_call(client, "get_symbol", &arguments).await?;
     let result: GetSymbolResult = serde_json::from_value(answer.clone())
         .map_err(|error| format!("invalid symbol result: {error}; {answer}"))?;
-    let GetSymbolResult::Found {
-        symbol,
-        declarations,
-        ..
-    } = result
-    else {
+    let GetSymbolResult::Found(found) = result else {
         return Err(format!("symbol not found: request {arguments}; {answer}").into());
     };
+    let symbol = &found.symbol;
+    let declarations = &found.declarations;
     assert_eq!(symbol.id.as_ref(), Some(id), "{answer}");
     assert_eq!(declarations.len(), 1, "{answer}");
     let syntax_elements = proxied_call(
@@ -175,7 +172,11 @@ async fn symbol_read(
         "{syntax_elements}"
     );
     assert_eq!(
-        declarations[0].path.as_ref().map(|path| path.0.as_str()),
+        declarations[0]
+            .binding
+            .path
+            .as_ref()
+            .map(|path| path.0.as_str()),
         Some("lib.rs"),
         "{answer}"
     );
@@ -195,7 +196,6 @@ async fn named_missing_read(
         identity.language().clone(),
         path,
     )?);
-    let mut first = None;
     for _ in 0..2 {
         let arguments = json!({"id":missing});
         let response = within(
@@ -206,37 +206,14 @@ async fn named_missing_read(
             ),
         )
         .await??;
-        assert_eq!(response.is_error, Some(true), "{response:?}");
+        assert_eq!(response.is_error, Some(false), "{response:?}");
+        assert!(response.content.is_empty(), "{response:?}");
         let value = response
             .structured_content
             .ok_or("typed missing answer absent")?;
-        let result: GetSymbolResult = serde_json::from_value(value.clone())?;
-        let GetSymbolResult::Missing {
-            symbol_not_found, ..
-        } = result
-        else {
-            return Err(format!("expected named symbol miss: {value}").into());
-        };
-        assert_eq!(symbol_not_found.id, missing, "{value}");
-        assert!(
-            symbol_not_found
-                .alternatives
-                .iter()
-                .any(|alternative| &alternative.id == found),
-            "{value}"
-        );
-        for alternative in symbol_not_found.alternatives {
-            assert_eq!(
-                SymbolIdentity::parse(alternative.id.as_str())?.owner(),
-                identity.owner(),
-                "{value}"
-            );
-        }
-        if let Some(previous) = &first {
-            assert_eq!(&value, previous, "a repeated miss answers the same");
-        } else {
-            first = Some(value);
-        }
+        assert_eq!(value, json!({}));
+        let result: GetSymbolResult = serde_json::from_value(value)?;
+        assert!(matches!(result, GetSymbolResult::Missing { .. }));
     }
     Ok(())
 }

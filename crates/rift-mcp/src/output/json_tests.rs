@@ -232,3 +232,16 @@ fn a_refused_resource_text_is_the_registered_failure_as_a_json_rpc_error() {
     assert_eq!(data.code, ErrorCode::LimitExceeded);
     assert_eq!(data.phase, ErrorPhase::Read);
 }
+
+#[test]
+fn a_definite_symbol_miss_has_no_content_and_an_empty_structured_object() {
+    let answer = rift_protocol::mcp_symbol::GetSymbolResult::Missing {
+        warnings: vec![ReadWarning::GlobalAccessDisabled],
+    };
+    let Ok(CallToolResponse::Complete(result)) = Json(answer).into_call_tool_result() else {
+        panic!("a definite miss completes successfully");
+    };
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(result.structured_content, Some(serde_json::json!({})));
+    assert!(result.content.is_empty());
+}

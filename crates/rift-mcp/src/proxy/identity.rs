@@ -1,7 +1,7 @@
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{PROFILE_SEPARATOR, SymbolIdentity, SymbolOwner};
+use rift_protocol::mcp_symbol::GetSymbolResult;
 use rift_protocol::read::{ReadWarning, SearchHit, SearchHitTarget, Symbol, SymbolId, TypeBinding};
-use rift_protocol::symbol_read::GetSymbolResult;
 
 pub(super) fn public_owner(owner: &SymbolOwner, backend: &str) -> Result<SymbolOwner, RiftError> {
     let owner = match owner {
@@ -189,34 +189,27 @@ pub(super) fn qualify_symbol_result(
     backend: &str,
 ) -> Result<(), RiftError> {
     match result {
-        GetSymbolResult::Found {
-            symbol,
-            history,
-            documentation,
-            warnings,
-            ..
-        } => {
-            qualify_symbol(symbol, backend)?;
-            if let Some(history) = history {
+        GetSymbolResult::Found(found) => {
+            qualify_symbol(&mut found.symbol, backend)?;
+            if let Some(history) = &mut found.history {
                 qualify_id(&mut history.symbol, backend)?;
             }
-            if let Some(documentation) = documentation {
+            if let Some(documentation) = &mut found.documentation {
                 for reference in &mut documentation.references {
                     qualify_id(&mut reference.reference.target, backend)?;
                     qualify_optional(&mut reference.documentation.block.symbol, backend)?;
                 }
             }
-            qualify_warnings(warnings, backend)?;
-        }
-        GetSymbolResult::Missing {
-            symbol_not_found,
-            warnings,
-            ..
-        } => {
-            qualify_id(&mut symbol_not_found.id, backend)?;
-            for alternative in &mut symbol_not_found.alternatives {
-                qualify_id(&mut alternative.id, backend)?;
+            if let Some(edges) = &mut found.edges {
+                for edge in &mut *edges {
+                    qualify_id(&mut edge.target, backend)?;
+                }
+                edges.sort_unstable();
+                edges.dedup();
             }
+            qualify_warnings(&mut found.warnings, backend)?;
+        }
+        GetSymbolResult::Missing { warnings } => {
             qualify_warnings(warnings, backend)?;
         }
         GetSymbolResult::Unavailable { id, warnings, .. } => {
@@ -233,8 +226,8 @@ mod tests {
         SymbolOwner, backend_key, backend_owner, dispatch_id, qualify_hit, qualify_id,
         qualify_symbol_result, scope_key,
     };
+    use rift_protocol::mcp_symbol::GetSymbolResult;
     use rift_protocol::read::{SearchHit, SymbolId};
-    use rift_protocol::symbol_read::GetSymbolResult;
 
     #[test]
     fn named_identity_roundtrip_preserves_escaping() -> Result<(), Box<dyn std::error::Error>> {
@@ -361,33 +354,30 @@ mod tests {
     #[test]
     fn named_symbol_links_change_only_typed_identities() -> Result<(), Box<dyn std::error::Error>> {
         let mut result: GetSymbolResult = serde_json::from_value(serde_json::json!({
-            "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function", "container":"rift://symbol/local/rust/app", "documentation":[{"format":"markdown","text":"rift://symbol/local/rust/app/load"}], "signatures":[{"display":"load()", "language":"rust", "links":[{"range":{"start":0,"end":4},"symbol":"rift://symbol/local/rust/app/load"}]}]},
-            "revision":"rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11", "pagination":{"page":1,"pages":1,"max_results":10,"total":1}, "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
+            "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function", "container":"rift://symbol/local/rust/app", "documentation":[{"format":"markdown","text":"rift://symbol/local/rust/app/load"}], "signatures":[{"display":"load()", "language":"rust", "links":[{"range":{"start":0,"end":4},"symbol":"rift://symbol/local/rust/app/load"}]}]},
+            "revision":"rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11", "edges":[{"kind":"calls","target":"rift://symbol/local/rust/app/parse"}],"pagination":{"page":1,"pages":1,"max_results":10,"total":1}, "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
         }))?;
         let original = result.clone();
-        qualify_symbol_result(&mut result, "cloud")?;
-        let (
-            GetSymbolResult::Found {
-                symbol,
-                declarations,
-                ..
-            },
-            GetSymbolResult::Found {
-                symbol: old_symbol,
-                declarations: old_declarations,
-                ..
-            },
-        ) = (result, original)
+        qualify_symbol_result(&mut result, "example")?;
+        let (GetSymbolResult::Found(found), GetSymbolResult::Found(original)) = (result, original)
         else {
             return Err("found result required".into());
         };
+        let symbol = &found.symbol;
+        let old_symbol = &original.symbol;
+        let declarations = &found.declarations;
+        let old_declarations = &original.declarations;
+        assert_eq!(
+            found.edges.as_ref().expect("edges")[0].target.as_str(),
+            "rift://symbol/local@example/rust/app/parse"
+        );
         assert_eq!(
             symbol.id.as_ref().map(SymbolId::as_str),
-            Some("rift://symbol/local@cloud/rust/app/load")
+            Some("rift://symbol/local@example/rust/app/load")
         );
         assert_eq!(
             symbol.signatures[0].links[0].symbol.as_str(),
-            "rift://symbol/local@cloud/rust/app/load"
+            "rift://symbol/local@example/rust/app/load"
         );
         assert_eq!(symbol.documentation, old_symbol.documentation);
         assert_eq!(

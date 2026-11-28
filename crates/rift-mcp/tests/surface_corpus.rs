@@ -28,14 +28,14 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         // The fixture global API answers a package symbol's history with release edges.
         (
             "get_symbol",
-            json!({ "name": "helper_beacon", "scope": "global", "include": {"history": true} }),
+            json!({ "name": "helper_beacon", "scope": "global", "include": ["history"] }),
         ),
         ("search", json!({ "query": "beacon", "scope": "all" })),
         // The fixture's committed baseline serves the timeline: one
         // `introduced` version from the walk's first commit.
         (
             "get_symbol",
-            json!({ "name": "beacon_one", "include": {"history": true} }),
+            json!({ "name": "beacon_one", "include": ["history"] }),
         ),
         ("search", json!({ "query": "beacon" })),
         (

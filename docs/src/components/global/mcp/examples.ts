@@ -1,36 +1,26 @@
 import type { Arguments, FieldSpec } from "@/components/global/mcp/schema-form";
-import type { JsonValue } from "@/components/json-tree";
 
 /** One named call the console offers for a tool. */
 export type ToolExample = { label: string; arguments: Arguments };
 
-function isFlags(value: JsonValue): value is Record<string, boolean> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value) &&
-    Object.values(value).every((member) => typeof member === "boolean")
-  );
-}
-
 /**
- * The arguments of an example as the connected server reads them. An example
- * selects optional projections with an object of booleans,
- * `{ "documentation": true }`. A server whose schema declares that argument as
- * an array takes the names of the members set to `true` in its place.
+ * An older connected server can still advertise boolean include fields.
+ * Convert the example's selection to that server's advertised shape.
  */
 export function argumentsFor(example: ToolExample, specs: FieldSpec[]): Arguments {
-  const arrays = new Set(
-    specs.filter((spec) => spec.typeLabel === "array").map((spec) => spec.name),
-  );
-  return Object.fromEntries(
-    Object.entries(example.arguments).map(([name, value]) => [
-      name,
-      arrays.has(name) && isFlags(value)
-        ? Object.keys(value).filter((member) => value[member])
-        : value,
-    ]),
-  );
+  const include = example.arguments.include;
+  if (
+    !Array.isArray(include) ||
+    !specs.some((spec) => spec.name === "include" && spec.typeLabel === "object")
+  ) {
+    return example.arguments;
+  }
+  return {
+    ...example.arguments,
+    include: Object.fromEntries(
+      include.filter((member) => typeof member === "string").map((member) => [member, true]),
+    ),
+  };
 }
 
 type Package = { manager: string; registry: string; name: string; version?: string };
@@ -113,14 +103,14 @@ export const GLOBAL_EXAMPLES: Record<string, ToolExample[]> = {
       arguments: {
         id: ITOA_BUFFER,
         revision: ITOA_REVISION,
-        include: { documentation: true },
+        include: ["documentation"],
       },
     },
     {
       label: "Python class",
       arguments: {
         id: "rift://symbol/pypi/pypi.org/requests/python/requests/sessions/Session",
-        include: { documentation: true },
+        include: ["documentation"],
       },
     },
     {

@@ -1,4 +1,4 @@
-//! Markdown tables for SPARQL answers.
+//! Plain-text tables for SPARQL answers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -239,7 +239,7 @@ fn render_table(
     let row_bytes = columns.saturating_mul(3).saturating_add(2);
     let mut occupied_width = columns.saturating_mul(DIVIDER_WIDTH_MIN);
     let mut compact_bytes = row_bytes.saturating_add(occupied_width);
-    let mut escaped_rows = Vec::new();
+    let mut table_rows = Vec::new();
     for row in std::iter::once(Ok(headers)).chain(rows) {
         let mut row = row?;
         if row.is_empty() {
@@ -247,24 +247,24 @@ fn render_table(
         }
         compact_bytes = compact_bytes.saturating_add(row_bytes);
         out.check_capacity(compact_bytes)?;
-        let mut escaped = Vec::with_capacity(columns);
+        let mut cells = Vec::with_capacity(columns);
         for (value, column_width) in row.into_iter().zip(&mut widths) {
-            let cell = markdown_cell(&value);
+            let cell = table_cell(&value);
             compact_bytes = compact_bytes.saturating_add(cell.text.len());
             out.check_capacity(compact_bytes)?;
             *column_width = (*column_width).max(cell.width);
             occupied_width = occupied_width.saturating_add(cell.width);
-            escaped.push(cell);
+            cells.push(cell);
         }
-        escaped_rows.push(escaped);
+        table_rows.push(cells);
     }
     let aligned_width: usize = widths.iter().sum();
     let padding = aligned_width
-        .saturating_mul(escaped_rows.len() + 1)
+        .saturating_mul(table_rows.len() + 1)
         .saturating_sub(occupied_width);
     let aligned = compact_bytes.saturating_add(padding) <= out.remaining_bytes();
     let widths = if aligned { widths.as_slice() } else { &[] };
-    let mut rows = escaped_rows.into_iter();
+    let mut rows = table_rows.into_iter();
     let header = rows.next().expect("the table has a header");
     table_row(out, &header, widths)?;
     let divider = (0..columns)
@@ -288,17 +288,8 @@ struct TableCell {
     width: usize,
 }
 
-fn markdown_cell(value: &str) -> TableCell {
-    let mut text = String::with_capacity(value.len());
-    for character in visible(value).chars() {
-        if matches!(
-            character,
-            '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '<' | '&' | '~'
-        ) {
-            text.push('\\');
-        }
-        text.push(character);
-    }
+fn table_cell(value: &str) -> TableCell {
+    let text = visible(value).into_owned();
     let width = text.width();
     TableCell { text, width }
 }
@@ -423,11 +414,11 @@ mod tests {
             output,
             concat!(
                 "rows 1-3 of 3 | page 1/1\n\n",
-                "| ?blank          | ?value | ?typed                         | ?predicate |\n",
-                "| --------------- | ------ | ------------------------------ | ---------- |\n",
-                "| \\_:first-retain | 42     | \"invalid boolean\"^^xsd:boolean | :name      |\n",
-                "| \\_:different-re | true   | \"source\"@en                    |            |\n",
-                "| \\_:first-retain |        |                                |            |\n",
+                "| ?blank         | ?value | ?typed                         | ?predicate |\n",
+                "| -------------- | ------ | ------------------------------ | ---------- |\n",
+                "| _:first-retain | 42     | \"invalid boolean\"^^xsd:boolean | :name      |\n",
+                "| _:different-re | true   | \"source\"@en                    |            |\n",
+                "| _:first-retain |        |                                |            |\n",
             )
         );
         Ok(())
@@ -461,18 +452,18 @@ mod tests {
             text,
             concat!(
                 "rows 3-4 of 4 | page 2/2\n\n",
-                "| subject                                       | predicate | object |\n",
-                "| --------------------------------------------- | --------- | ------ |\n",
-                "| \\_:anonymous (providers: engine, lsp, static) | :name     | \"Rift\" |\n",
-                "| \\_:anonymous (providers: engine, lsp, static) | :count    | 7      |\n",
+                "| subject                                      | predicate | object |\n",
+                "| -------------------------------------------- | --------- | ------ |\n",
+                "| _:anonymous (providers: engine, lsp, static) | :name     | \"Rift\" |\n",
+                "| _:anonymous (providers: engine, lsp, static) | :count    | 7      |\n",
             )
         );
         Ok(())
     }
 
     #[test]
-    fn markdown_cells_escape_projected_code_on_one_line() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn plain_text_cells_keep_punctuation_and_one_line_per_row()
+    -> Result<(), Box<dyn std::error::Error>> {
         let text = raw_answer(serde_json::json!({
             "answer": {
                 "result": "bindings",
@@ -480,7 +471,7 @@ mod tests {
                 "bindings": [{
                     "source": {
                         "type": "literal",
-                        "value": "a|b\\c\n<t>*x*",
+                        "value": "a | b\\c\n<t>*x*_",
                         "datatype": XSD_STRING
                     },
                     "rank": {
@@ -496,9 +487,9 @@ mod tests {
             text,
             concat!(
                 "row 1 | page 1/1\n\n",
-                "| ?source                 | ?rank               | ?symbol                               |\n",
-                "| ----------------------- | ------------------- | ------------------------------------- |\n",
-                "| \"a\\|b\\\\\\\\c\\\\n\\<t>\\*x\\*\" | \"1.0E0\"^^xsd:double | \\<rift://symbol/local/rust/app/retry> |\n",
+                "| ?source             | ?rank               | ?symbol                              |\n",
+                "| ------------------- | ------------------- | ------------------------------------ |\n",
+                "| \"a | b\\\\c\\n<t>*x*_\" | \"1.0E0\"^^xsd:double | <rift://symbol/local/rust/app/retry> |\n",
             )
         );
         Ok(())
@@ -539,7 +530,7 @@ mod tests {
                 r#""12345678""#,
                 r#""abcdef01""#,
                 r#""1234567890""#,
-                &format!(r"\<{release}>")
+                &format!("<{release}>")
             ]
         );
         assert!(text.contains(&format!("\"{sha1}\"")));
@@ -667,9 +658,9 @@ mod tests {
             )
         };
         for (index, value, expected) in [
-            (1, first.clone(), r"| \_:retained\_node\_á |"),
-            (2, second, r"| \_:retained\_node\_ã |"),
-            (3, first, r"| \_:retained\_node\_á |"),
+            (1, first.clone(), "| _:retained_node_á |"),
+            (2, second, "| _:retained_node_ã |"),
+            (3, first, "| _:retained_node_á |"),
         ] {
             let output = super::super::text_of(&page(index, value))?;
             assert_eq!(output.lines().nth(4), Some(expected));

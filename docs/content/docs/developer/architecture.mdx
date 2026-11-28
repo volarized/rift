@@ -32,14 +32,15 @@ The server stores searchable provider output in an embedded index under `.rift`.
 `rift.toml` selects an embedding model, a local model adds vector ranking.
 
 <FlatDiagram
+  variant="architecture"
   alt="An agent launches rift mcp, which forwards requests to one local server. Source resolvers catalog project files and read the dependency context, providers supply code facts, the server builds a searchable index, and package reads reach the global index through its API."
   chart={`
-    flowchart LR
+    flowchart TB
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
       mcp -- "HTTP :port" --> server["rift server<br/>one per workspace"]:::rift
       agent -. "MCP over HTTP" .-> server
       lock[".rift/server.json"]:::store -- "port + token" --> mcp
-      toml["rift.toml"]:::store -- "acceptance" --> server
+      toml["rift.toml"]:::config -- "acceptance" --> server
       server -- "discover" --> resolvers["source resolvers"]:::provider
       server -- "facts" --> providers["providers"]:::provider
       resolvers -- "inspect" --> workspace["workspace tree"]:::store
@@ -626,8 +627,9 @@ hit. Under `target: "all"`, an attached comment keeps its symbol result when tha
 A file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
-`get_symbol` with its established `id` and `include: {"documentation": true}`. The reference resolves only
-when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
+`get_symbol` with that symbol's established `id`. Documentation is selected by default.
+The reference resolves when the selected declaration set establishes one exact target.
+Ambiguous names remain unresolved.
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
 page. The server logs missing bytes and reached bounds.
 
@@ -757,8 +759,9 @@ ranking inputs, and the server logs preparation progress.
 ### Retrieve symbol
 
 [`get_symbol`](/docs/mcp#tool-get_symbol) reads one logical symbol by its canonical `id`.
-The answer separates the symbol from its declaration bindings. [`facets`](/docs/mcp#tool-facets)
-reads a declaration's source. The answer names the `revision` it was read at, and its
+The answer separates the symbol from its declaration bindings and includes their source and
+documentation by default, when available. [`facets`](/docs/mcp#tool-facets) reads the syntax
+elements of each declaration. The symbol answer names the `revision` it was read at, and
 `page` selects declarations at that revision.
 
 A Symbol carries `id` when the index established one identity for the declaration. A symbol

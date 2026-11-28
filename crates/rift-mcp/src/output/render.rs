@@ -1,34 +1,10 @@
 //! Text of tool answers and execution errors, written through [`TextWriter`].
 //!
-//! Each answer type implements [`Render`]. [`text_of`] renders one answer under the output byte
-//! limit. Every text is laid out for reading, in the manner of a compact command: the normal state
-//! is implicit, and only exceptional metadata is written. An answer is a sequence of counted
-//! sections, each a title at column 0 and its entries indented by one level. A level is one
-//! indent unit of the writer, a tab; the example shows each level as two spaces. `search` and
-//! `get_symbol` answers:
-//!
-//! ```text
-//! 2 results | page 1/3
-//!   [1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-//!       src/config.rs:10 | name
-//!       rift://symbol/rust/src/config.rs/load_config
-//!       Loads the workspace configuration from `rift.toml`.
-//!
-//!       pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-//!           parse_config(&text)
-//!       }
-//!   [2] src/lib.rs:7 | content
-//!           let config = load_config(&arguments.path)?;
-//! ```
-//!
-//! The title counts the results and names the page when there are several; the page is the only
-//! pagination fact. One item has no marker and indents its lines by one level. Several items each
-//! start with `[n] `
-//! at one level and indent their further lines by two. Text an answer copies, such as source,
-//! keeps its own whitespace after the indent. No blank line separates two items or two sections.
-//! The hits an edge walk reached are written as a tree; see the `walk` module.
-//! `facets` answers, failures, and workspace pages follow the same principles; see the
-//! `facets`, `error`, and `workspace` modules.
+//! Each answer type implements [`Render`]. [`text_of`] renders an answer under a byte limit.
+//! Search writes a plain-text table with its row range and page. An exact symbol read opens
+//! with its canonical identity, then declaration facets and the selected sections.
+//! Text copied from a declaration keeps its own whitespace after the layout indent.
+//! Other tool and resource layouts live in the modules below.
 
 mod error;
 mod facets;
@@ -59,6 +35,11 @@ pub(crate) trait Render {
     /// Whether this typed answer reports a failed tool call.
     fn is_error(&self) -> bool {
         false
+    }
+
+    /// Whether this result carries a text block.
+    fn has_text(&self) -> bool {
+        true
     }
 
     /// Records read warnings before serialization to a client.
@@ -215,16 +196,12 @@ mod tests;
 #[path = "resource_render_tests.rs"]
 mod resource_tests;
 
-impl Render for rift_protocol::symbol_read::GetSymbolResult {
+impl Render for rift_protocol::mcp_symbol::GetSymbolResult {
     fn log_warnings(&mut self) {
         match self {
-            Self::Found {
-                warnings,
-                documentation,
-                ..
-            } => {
-                record_warnings(warnings);
-                record_documentation(documentation);
+            Self::Found(found) => {
+                record_warnings(&mut found.warnings);
+                record_documentation(&mut found.documentation);
             }
             Self::Missing { warnings, .. } | Self::Unavailable { warnings, .. } => {
                 record_warnings(warnings);
@@ -232,8 +209,8 @@ impl Render for rift_protocol::symbol_read::GetSymbolResult {
         }
     }
 
-    fn is_error(&self) -> bool {
-        matches!(self, Self::Missing { .. })
+    fn has_text(&self) -> bool {
+        !matches!(self, Self::Missing { .. })
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {

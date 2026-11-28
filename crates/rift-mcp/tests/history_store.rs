@@ -88,23 +88,20 @@ async fn travelled_history(
     assert_eq!(identity.wire_identity(), id);
     let structured = call_retrying_acceptance(
         client,
-        tool_request(
-            "get_symbol",
-            &json!({"id": id, "include": {"history": true}}),
-        ),
+        tool_request("get_symbol", &json!({"id": id, "include": ["history"]})),
     )
     .await?;
-    assert_eq!(structured["outcome"], "found", "{structured}");
+    assert!(structured.get("outcome").is_none(), "{structured}");
     assert_eq!(structured["symbol"]["id"], id);
     let repeated = call_retrying_acceptance(
         client,
         tool_request(
             "get_symbol",
-            &json!({"id": id, "include": {"history": true}, "revision": structured["revision"]}),
+            &json!({"id": id, "include": ["history"], "revision": structured["revision"]}),
         ),
     )
     .await?;
-    assert_eq!(repeated["outcome"], "found", "{repeated}");
+    assert!(repeated.get("outcome").is_none(), "{repeated}");
     assert_eq!(repeated["symbol"]["id"], id);
     assert_eq!(repeated["revision"], structured["revision"]);
     structured

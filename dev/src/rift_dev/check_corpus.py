@@ -274,9 +274,9 @@ def corpus_request(parameters: JsonObject) -> JsonObject:
     columns = list(CORPUS_COLUMNS)
     if parameters.get("target") == "file":
         columns.extend(("target", "size"))
-    include = object_value(parameters.get("include", {}), "retrieval include")
+    include = array_value(parameters.get("include", []), "retrieval include")
     for field in ("source", "score"):
-        if include.get(field) is True:
+        if field in include:
             columns.append(field)
     return retrieval_request(parameters, columns)
 
@@ -825,11 +825,11 @@ class Corpus:
             else None
         )
         if anchor is not None:
-            detail = await client.call("get_symbol", {"id": anchor})
+            detail = await client.call(
+                "get_symbol", {"id": anchor, "exclude": ["documentation", "source"]}
+            )
             require(
-                detail.get("outcome") == "found"
-                and object_value(detail.get("symbol"), "anchor symbol").get("id")
-                == anchor,
+                object_value(detail.get("symbol"), "anchor symbol").get("id") == anchor,
                 "canonical sample anchor was not found",
             )
             paths = {
@@ -1327,7 +1327,7 @@ class Corpus:
                 "query": "corpus_probe",
                 "target": "symbol",
                 "paths": {"include": [PROBE_PATH]},
-                "include": {"source": True},
+                "include": ["source"],
                 "max_results": 5,
             }
         )
@@ -1640,11 +1640,11 @@ class Corpus:
         }
         if self.pin.name in anchors:
             anchor, path = anchors[self.pin.name]
-            exact = await client.call("get_symbol", {"id": anchor})
+            exact = await client.call(
+                "get_symbol", {"id": anchor, "exclude": ["documentation", "source"]}
+            )
             require(
-                exact.get("outcome") == "found"
-                and object_value(exact.get("symbol"), "linked symbol").get("id")
-                == anchor,
+                object_value(exact.get("symbol"), "linked symbol").get("id") == anchor,
                 "symlink root lost the canonical declaration",
             )
             declared = [
@@ -1717,9 +1717,12 @@ class Corpus:
                 answer = await settled_local(
                     client,
                     "get_symbol",
-                    {"id": identity, "include": {"history": True}},
+                    {
+                        "id": identity,
+                        "include": ["history"],
+                        "exclude": ["documentation", "source"],
+                    },
                 )
-                require(answer.get("outcome") == "found", "shallow class was not found")
                 require(
                     object_value(answer.get("symbol"), "shallow symbol").get("id")
                     == identity,
@@ -1849,10 +1852,11 @@ class Corpus:
                     [literal(row, "name") for row in bindings(captured)] == ["TEST"],
                     "Bun lost its established Rust TEST identity",
                 )
-                exact = await client.call("get_symbol", {"id": anchor})
+                exact = await client.call(
+                    "get_symbol", {"id": anchor, "exclude": ["documentation", "source"]}
+                )
                 require(
-                    exact.get("outcome") == "found"
-                    and object_value(exact.get("symbol"), "symbol").get("id") == anchor
+                    object_value(exact.get("symbol"), "symbol").get("id") == anchor
                     and bool(objects(exact, "declarations")),
                     "lexical overflow removed symbol reads",
                 )

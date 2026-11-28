@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
 use rift_error::{RiftError, errors};
-use rift_protocol::feedback::{FeedbackParams, FeedbackResult};
+use rift_protocol::feedback::{FeedbackField, FeedbackParams, FeedbackResult};
 use serde::Serialize;
 
 pub(crate) const TOOL_NAME: &str = "feedback";
@@ -33,8 +33,12 @@ impl From<FeedbackParams> for Report {
     fn from(params: FeedbackParams) -> Self {
         let include = params.include;
         let details = (!include.is_empty()).then(|| Details {
-            os: include.os.then_some(std::env::consts::OS),
-            rift_version: include.rift_version.then_some(env!("CARGO_PKG_VERSION")),
+            os: include
+                .contains(&FeedbackField::Os)
+                .then_some(std::env::consts::OS),
+            rift_version: include
+                .contains(&FeedbackField::RiftVersion)
+                .then_some(env!("CARGO_PKG_VERSION")),
         });
         Self {
             text: params.text,
@@ -165,13 +169,13 @@ mod tests {
     fn report_only_carries_selected_diagnostics() -> TestResult {
         let text = "  Unexpected result: λ\n";
         for (requested, expected) in [
-            (json!({}), json!({"text": text})),
+            (json!([]), json!({"text": text})),
             (
-                json!({"os": true, "rift_version": false}),
+                json!(["os"]),
                 json!({"text": text, "details": {"os": std::env::consts::OS}}),
             ),
             (
-                json!({"rift_version": true, "os": true}),
+                json!(["rift_version", "os"]),
                 json!({"text": text, "details": {
                     "os": std::env::consts::OS,
                     "rift_version": env!("CARGO_PKG_VERSION")

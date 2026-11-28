@@ -7,6 +7,7 @@
 mod layout;
 
 use rmcp::model::CallToolResult;
+use unicode_width::UnicodeWidthStr as _;
 
 use layout::Tool;
 
@@ -32,6 +33,19 @@ pub(crate) fn assert_text_states(tool: &str, result: &CallToolResult) {
 ///
 /// The failure names the JSON path of the missing fact and prints the text.
 fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
+    if tool == GET_SYMBOL_TOOL
+        && result
+            .structured_content
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        return if result.content.is_empty() && result.is_error != Some(true) {
+            Ok(())
+        } else {
+            Err("a definite symbol miss must have empty content".to_owned())
+        };
+    }
     let [block] = result.content.as_slice() else {
         return Err(format!(
             "content must be one block, got {:?}",
@@ -53,10 +67,7 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
             query_text_states(text, structured)
         }
         SEARCH_TOOL => layout::text_states(Tool::Search, text, structured),
-        GET_SYMBOL_TOOL if structured.get("outcome").is_some() => {
-            canonical_text_states(text, structured)
-        }
-        GET_SYMBOL_TOOL => layout::text_states(Tool::GetSymbol, text, structured),
+        GET_SYMBOL_TOOL => canonical_text_states(text, structured),
         FACETS_TOOL if structured.get("declarations").is_some() => {
             syntax_elements_summary_text_states(text, structured)
         }
@@ -100,13 +111,35 @@ fn syntax_elements_summary_text_states(
 
 /// Checks the exact symbol and its original declaration projections in canonical text.
 fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
-    let outcome = structured["outcome"].as_str().ok_or("$.outcome")?;
-    if outcome == "found" {
-        token(text, &structured["symbol"]["id"], "$.symbol.id")?;
-        for declaration in structured["declarations"]
+    if structured.get("outcome").is_some() || structured.get("warnings").is_some() {
+        return Err("symbol diagnostics or outcome tag in the response".to_owned());
+    }
+    if let Some(id) = structured["symbol"]["id"].as_str() {
+        if text.lines().next() != Some(id) {
+            return Err("compact symbol must begin with its exact identity".to_owned());
+        }
+        let declarations = structured["declarations"]
             .as_array()
-            .ok_or("$.declarations")?
-        {
+            .ok_or("$.declarations")?;
+        let page = &structured["pagination"];
+        let total = page["total"].as_u64().ok_or("$.pagination.total")?;
+        let offset = page["page"]
+            .as_u64()
+            .ok_or("$.pagination.page")?
+            .saturating_sub(1)
+            .saturating_mul(
+                page["max_results"]
+                    .as_u64()
+                    .ok_or("$.pagination.max_results")?,
+            );
+        for (index, declaration) in declarations.iter().enumerate() {
+            let ordinal = offset.saturating_add(index as u64).saturating_add(1);
+            if !text
+                .lines()
+                .any(|line| line == format!("facets {ordinal}/{total}:"))
+            {
+                return Err(format!("missing facet {ordinal}/{total}"));
+            }
             let place = declaration
                 .get("path")
                 .or_else(|| declaration.get("unit"))
@@ -120,10 +153,7 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
                 return Err(format!("declaration range {range}"));
             }
             if let Some(source) = declaration.get("source") {
-                source_lines(text, source, "\t\t")?;
-            }
-            if let Some(syntax_element) = declaration.get("syntax_element") {
-                token(text, syntax_element, "declaration syntax element")?;
+                source_lines(text, &source["text"], "\t\t")?;
             }
         }
         if let Some(history) = structured.get("history") {
@@ -140,24 +170,20 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
                 token(text, &serde_json::json!(spaced), "$.history.edges.edge")?;
             }
         }
-    } else if outcome == "missing" {
-        token(
-            text,
-            &structured["symbol_not_found"]["id"],
-            "$.symbol_not_found.id",
-        )?;
-        if !text.contains("symbol_not_found") {
-            return Err("$.outcome missing".to_owned());
-        }
-        for candidate in structured["symbol_not_found"]["alternatives"]
-            .as_array()
-            .ok_or("$.symbol_not_found.alternatives")?
-        {
-            token(text, &candidate["id"], "alternative id")?;
-            token(text, &candidate["name"], "alternative name")?;
+        if let Some(edges) = structured.get("edges") {
+            if !text.lines().any(|line| line == "edges:") {
+                return Err("missing edges section".to_owned());
+            }
+            for edge in edges.as_array().ok_or("$.edges")? {
+                token(text, &edge["kind"], "$.edges.kind")?;
+                token(text, &edge["target"], "$.edges.target")?;
+            }
         }
     } else {
         token(text, &structured["id"], "$.id")?;
+        if !text.contains("unavailable") || !structured["reason"].is_string() {
+            return Err("missing typed symbol unavailability".to_owned());
+        }
     }
     if let Some(revision) = structured["revision"].as_str()
         && revision.starts_with("rift://revision/tree/")
@@ -269,33 +295,42 @@ fn query_iri(value: &str) -> String {
     format!("<{value}>")
 }
 
-// Spaces around column separators belong to the table, so cell whitespace stays intact.
 fn query_cells(line: Option<&str>) -> Result<Vec<String>, String> {
     let body = line
         .and_then(|line| line.strip_prefix("| "))
         .and_then(|line| line.strip_suffix(" |"))
         .ok_or("query table row")?;
-    body.split(" | ")
-        .map(|cell| {
-            let mut chars = cell.trim_ascii().chars();
-            let mut value = String::new();
-            while let Some(character) = chars.next() {
-                value.push(match character {
-                    '\\' => chars.next().ok_or("incomplete Markdown escape")?,
-                    '|' => return Err("unescaped table delimiter".into()),
-                    other => other,
-                });
-            }
-            Ok(value)
-        })
-        .collect()
+    Ok(body
+        .split(" | ")
+        .map(|cell| cell.trim_ascii().to_owned())
+        .collect())
+}
+
+/// Aligned column boundaries distinguish a literal pipe in a cell from a separator.
+fn aligned_query_cells(line: Option<&str>, widths: &[usize]) -> Option<Vec<String>> {
+    let mut body = line?.strip_prefix("| ")?;
+    let mut cells = Vec::with_capacity(widths.len());
+    for width in widths {
+        let (separator, _) = body
+            .match_indices(" |")
+            .find(|(index, _)| body[..*index].width() == *width)?;
+        cells.push(body[..separator].trim_ascii().to_owned());
+        let tail = &body[separator..];
+        body = if tail == " |" {
+            ""
+        } else {
+            tail.strip_prefix(" | ")?
+        };
+    }
+    body.is_empty().then_some(cells)
 }
 
 fn query_rdf_row<'a>(
     line: Option<&str>,
+    widths: &[usize],
     terms: impl IntoIterator<Item = (Option<&'a str>, Option<&'a serde_json::Value>)>,
 ) -> Result<(), String> {
-    let cells = query_cells(line)?;
+    let cells = aligned_query_cells(line, widths).map_or_else(|| query_cells(line), Ok)?;
     let mut cells = cells.iter();
     for (column, term) in terms {
         let actual = cells.next().ok_or("missing query cell")?;
@@ -373,7 +408,7 @@ fn query_heading(
 fn query_columns(
     lines: &mut std::str::Lines<'_>,
     headers: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<(), String> {
+) -> Result<Vec<usize>, String> {
     let found = query_cells(lines.next())?;
     let expected = headers
         .into_iter()
@@ -388,7 +423,7 @@ fn query_columns(
     {
         return Err("query table header differs".into());
     }
-    Ok(())
+    Ok(divider.iter().map(String::len).collect())
 }
 
 fn bindings_text(
@@ -403,15 +438,16 @@ fn bindings_text(
         .collect::<Result<Vec<_>, _>>()?;
     let rows = answer["bindings"].as_array().ok_or("binding rows")?;
     if variables.is_empty() {
-        query_columns(lines, ["result"])?;
+        let widths = query_columns(lines, ["result"])?;
         for _ in rows {
-            query_rdf_row(lines.next(), [(None, None)])?;
+            query_rdf_row(lines.next(), &widths, [(None, None)])?;
         }
     } else {
-        query_columns(lines, variables.iter().map(|name| format!("?{name}")))?;
+        let widths = query_columns(lines, variables.iter().map(|name| format!("?{name}")))?;
         for row in rows {
             query_rdf_row(
                 lines.next(),
+                &widths,
                 variables.iter().map(|name| (Some(*name), row.get(*name))),
             )?;
         }
@@ -431,10 +467,11 @@ fn query_table(lines: &mut std::str::Lines<'_>, answer: &serde_json::Value) -> R
         }
         Some("graph") => {
             let columns = ["subject", "predicate", "object"];
-            query_columns(lines, columns)?;
+            let widths = query_columns(lines, columns)?;
             for triple in answer["triples"].as_array().ok_or("query triples")? {
                 query_rdf_row(
                     lines.next(),
+                    &widths,
                     columns.map(|column| (None, triple.get(column))),
                 )?;
             }
@@ -499,7 +536,7 @@ mod tests {
         });
         let text = concat!(
             "row 1 | page 1/1\n\n",
-            "| ?edge                                    |\n| ---------------------------------------- |\n| \\_:edge (providers: engine, lsp, static) |\n",
+            "| ?edge                                   |\n| --------------------------------------- |\n| _:edge (providers: engine, lsp, static) |\n",
         );
         let included = result_of(text, answer.clone());
         assert_eq!(text_states(SEARCH_TOOL, &included), Ok(()));

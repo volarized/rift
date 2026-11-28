@@ -122,45 +122,42 @@ async fn failing_tool_error(
     failed_call(outcome)
 }
 
-/// Learns the original fixture declaration before requesting its refused history read.
-async fn failing_observed_symbol_error(
+/// Discovers the fixture's symbol before testing the exact read surface.
+async fn observed_symbol_call(
     root: &std::path::Path,
     mut request: serde_json::Value,
-) -> TestResult<ToolFailure> {
+) -> TestResult<rmcp::model::CallToolResult> {
     fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"history-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
     )?;
     let (client, server_task) = workspace_client::served_root(root).await?;
-    let answer = workspace_client::search_after_population(
-        &client,
-        &json!({"query": "beacon", "target": "symbol", "include": {"source": true}}),
-    )
-    .await?;
-    let results = answer["results"]
-        .as_array()
-        .ok_or("fixture symbol results")?;
-    let mut exact = results.iter().filter(|row| {
-        row["hit"]["symbol"]["name"] == "beacon"
-            && row["hit"]["symbol"]["language"] == "rust"
-            && row["path"] == "lib.rs"
-    });
-    let declaration = exact.next().ok_or("original beacon declaration")?;
-    assert!(exact.next().is_none(), "one fixture declaration: {answer}");
-    assert_eq!(declaration["hit"]["symbol"]["kind"], "function");
-    let identity = declaration["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("original beacon identity")?;
-    let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
-    assert_eq!(parsed.owner(), &rift_protocol::identity::SymbolOwner::Local);
-    assert_eq!(parsed.wire_identity(), identity);
-    request["id"] = identity.into();
+    let id = workspace_client::captured_seed(&client, "beacon", "lib.rs").await?;
+    request["id"] = id.into();
     let outcome = client
         .call_tool(workspace_client::tool_request("get_symbol", &request))
         .await;
     client.cancel().await?;
     server_task.await?;
-    failed_call(outcome)
+    Ok(outcome?)
+}
+
+async fn failing_observed_symbol_error(
+    root: &std::path::Path,
+    request: serde_json::Value,
+) -> TestResult<ToolFailure> {
+    let result = observed_symbol_call(root, request).await?;
+    workspace_client::tool_failure(&result)
+}
+
+async fn assert_symbol_without_history(root: &std::path::Path) -> TestResult {
+    let result = observed_symbol_call(root, json!({"include": ["history"]})).await?;
+    assert_eq!(result.is_error, Some(false), "{result:?}");
+    let answer = result.structured_content.ok_or("found symbol absent")?;
+    assert!(answer["symbol"]["id"].is_string(), "{answer}");
+    assert!(answer.get("history").is_none(), "{answer}");
+    assert!(answer.get("warnings").is_none(), "{answer}");
+    Ok(())
 }
 
 #[tokio::test]
@@ -187,30 +184,19 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
 }
 
 #[tokio::test]
-async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
+async fn symbol_without_a_repository_keeps_the_found_declarations() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure =
-        failing_observed_symbol_error(directory.path(), json!({ "include": {"history": true} }))
-            .await?;
-    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
-    assert_eq!(failure.retry, RetryDirective::OperatorAction);
-    let message = &failure.message;
-    assert!(
-        message.contains("requires a git repository - run `git init`"),
-        "the refusal must name the remedy: {message}"
-    );
-    Ok(())
+    assert_symbol_without_history(directory.path()).await
 }
 
-/// `get_symbol` serves no declaration source: `include: {"source": true}` names no
-/// projection, so the served schema refuses it like any unknown member.
+/// The symbol request accepts typed section sets and refuses the former boolean map.
 #[tokio::test]
-async fn symbol_source_include_is_refused_as_an_unknown_value() -> TestResult {
+async fn symbol_include_refuses_the_former_boolean_map() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
@@ -224,8 +210,8 @@ async fn symbol_source_include_is_refused_as_an_unknown_value() -> TestResult {
     assert_eq!(failure.retry, RetryDirective::Never);
     let message = &failure.message;
     assert!(
-        message.contains("accepted documentation, history") && message.contains("include"),
-        "the refusal must name the accepted values and the field: {message}"
+        message.contains("include"),
+        "the refusal must name the field: {message}"
     );
     assert!(
         failure
@@ -239,7 +225,7 @@ async fn symbol_source_include_is_refused_as_an_unknown_value() -> TestResult {
 }
 
 #[tokio::test]
-async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
+async fn symbol_history_disabled_keeps_the_found_declarations() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
@@ -249,16 +235,7 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
             hermetic_search::HERMETIC_TABLES
         ),
     )?;
-    let failure =
-        failing_observed_symbol_error(directory.path(), json!({ "include": {"history": true} }))
-            .await?;
-    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
-    let message = &failure.message;
-    assert!(
-        message.contains("symbol history (providers.history disabled)"),
-        "the refusal must name the disabling configuration: {message}"
-    );
-    Ok(())
+    assert_symbol_without_history(directory.path()).await
 }
 
 #[tokio::test]

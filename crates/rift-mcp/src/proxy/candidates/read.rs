@@ -1,8 +1,8 @@
 use super::{CANDIDATE_BYTES_MAX, RiftProxy, invalid};
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
+use rift_protocol::mcp_symbol::{GetSymbolParams, GetSymbolResult};
 use rift_protocol::read::{FacetsParams, FacetsResult};
-use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, ServerResult,
@@ -49,7 +49,7 @@ impl RiftProxy {
             .forward_read(symbol_request(request, &dispatched)?)
             .await?;
         if let Ok(CallToolResponse::Complete(result)) = &response
-            && canonical_symbol_response(result)
+            && result.is_error != Some(true)
         {
             let mut decoded = decode_symbol(result)?;
             validate_symbol(&dispatched, &decoded)?;
@@ -204,13 +204,6 @@ fn decode_symbol(result: &rmcp::model::CallToolResult) -> Result<GetSymbolResult
     })?;
     serde_json::from_value(value)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
-}
-
-fn canonical_symbol_response(result: &rmcp::model::CallToolResult) -> bool {
-    result.is_error != Some(true)
-        || result.structured_content.as_ref().is_some_and(|value| {
-            value.get("outcome").and_then(serde_json::Value::as_str) == Some("missing")
-        })
 }
 
 fn symbol_response(

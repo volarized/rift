@@ -3,6 +3,7 @@
 use rift_protocol::documentation::{
     DocumentationContext, DocumentationHit, DocumentationReferenceHit,
 };
+use rift_protocol::mcp_symbol::{FoundSymbol, GetSymbolResult, SymbolDeclaration};
 use rift_protocol::read::{
     CoChangeTruncation, GetSymbolHit, HistoryCommit, HistoryEdge, ProjectPath, SymbolHistory,
 };
@@ -248,70 +249,11 @@ fn commit_spelling(revision: &Revision) -> &str {
 
 pub(super) fn canonical(
     out: &mut crate::output::text::TextWriter,
-    result: &rift_protocol::symbol_read::GetSymbolResult,
+    result: &GetSymbolResult,
 ) -> Result<(), TextError> {
-    use rift_protocol::symbol_read::GetSymbolResult;
-    let revision = match result {
-        GetSymbolResult::Found {
-            symbol,
-            revision,
-            declarations,
-            pagination,
-            history,
-            documentation,
-            ..
-        } => {
-            let mut lines = Lines::new(out, 0, 1);
-            let described = describe(symbol)?;
-            lines.head(&described.declaration)?;
-            declarations_section(&mut lines, declarations)?;
-            if let Some(id) = described.id {
-                lines.line(0, id.as_str())?;
-            }
-            lines.line(0, described.facts.as_str())?;
-            for block in described.documentation {
-                text_section(&mut lines, &block.text)?;
-            }
-            if let Some(context) = documentation {
-                context_section(&mut lines, context)?;
-            }
-            if let Some(history) = history {
-                history_section(
-                    &mut lines,
-                    history,
-                    declarations
-                        .first()
-                        .and_then(|declaration| declaration.path.as_ref()),
-                )?;
-            }
-            if let Some(page) = layout::page_fact(pagination) {
-                lines.line(0, &page)?;
-            }
-            Some(revision)
-        }
-        GetSymbolResult::Missing {
-            symbol_not_found,
-            revision,
-            ..
-        } => {
-            out.raw_line(0, "error: symbol_not_found")?;
-            let mut lines = Lines::new(out, 0, 1);
-            lines.line(0, symbol_not_found.id.as_str())?;
-            if !symbol_not_found.alternatives.is_empty() {
-                lines.line(0, "closest matches:")?;
-            }
-            for alternative in &symbol_not_found.alternatives {
-                lines.line(
-                    1,
-                    &format!("{} | {}", alternative.id.as_str(), alternative.name),
-                )?;
-                lines.line(2, &format!("{:?}", alternative.match_context))?;
-            }
-            if let Some(detail) = &symbol_not_found.detail {
-                lines.verbatim(0, detail)?;
-            }
-            Some(revision)
-        }
+    match result {
+        GetSymbolResult::Found(found) => found_symbol(out, found),
+        GetSymbolResult::Missing { .. } => Ok(()),
         GetSymbolResult::Unavailable {
             id,
             revision,
@@ -321,28 +263,99 @@ pub(super) fn canonical(
             let mut lines = Lines::new(out, 0, 1);
             lines.head(&super::unavailable::line(*reason))?;
             lines.line(0, id.as_str())?;
-            revision.as_ref()
+            layout::selected_revision(out, revision.as_ref())
         }
-    };
-    layout::selected_revision(out, revision)
+    }
 }
 
-fn declarations_section(
-    lines: &mut Lines<'_>,
-    declarations: &[rift_protocol::symbol_read::SymbolDeclaration],
+fn found_symbol(
+    out: &mut crate::output::text::TextWriter,
+    found: &FoundSymbol,
 ) -> Result<(), TextError> {
-    for declaration in declarations {
-        let mut facts = Facts::default();
-        facts.push(&location(
-            declaration.path.as_ref(),
-            declaration.unit.as_ref(),
-            Some(declaration.line),
-        ));
-        facts.push(&format!(
-            "bytes {}..{}",
-            declaration.range.start, declaration.range.end
-        ));
-        lines.line(0, facts.as_str())?;
+    let id = found
+        .symbol
+        .id
+        .as_ref()
+        .ok_or(TextError::Unsupported("exact symbol without an identity"))?;
+    out.raw_line(0, id.as_str())?;
+    let total = found.pagination.total;
+    let offset = found.pagination.offset();
+    for (index, declaration) in found.declarations.iter().enumerate() {
+        let ordinal = offset.saturating_add(index).saturating_add(1);
+        out.raw_line(0, &format!("facets {ordinal}/{total}:"))?;
+        declaration_section(&mut Lines::new(out, 0, 1), found, declaration)?;
+    }
+
+    if let Some(edges) = &found.edges {
+        out.raw_line(0, "edges:")?;
+        let mut previous = None;
+        for edge in edges {
+            let kind = edge.kind.0.as_str();
+            if previous != Some(kind) {
+                layout::entry(out, 0, &format!("{kind}:"))?;
+                previous = Some(kind);
+            }
+            layout::entry(out, 1, edge.target.as_str())?;
+        }
+    }
+    let mut lines = Lines::new(out, 0, 1);
+    if total == 0 {
+        for block in &found.symbol.documentation {
+            text_section(&mut lines, &block.text)?;
+        }
+    }
+    if let Some(context) = &found.documentation {
+        context_section(&mut lines, context)?;
+    }
+    if let Some(history) = &found.history {
+        history_section(
+            &mut lines,
+            history,
+            found
+                .declarations
+                .first()
+                .and_then(|declaration| declaration.binding.path.as_ref()),
+        )?;
+    }
+    if let Some(page) = layout::page_fact(&found.pagination) {
+        lines.line(0, &page)?;
+    }
+    layout::selected_revision(out, Some(&found.revision))
+}
+
+fn declaration_section(
+    lines: &mut Lines<'_>,
+    found: &FoundSymbol,
+    declaration: &SymbolDeclaration,
+) -> Result<(), TextError> {
+    let binding = &declaration.binding;
+    let mut facts = Facts::default();
+    facts.push(&location(
+        binding.path.as_ref(),
+        binding.unit.as_ref(),
+        Some(binding.line),
+    ));
+    facts.push(&format!(
+        "bytes {}..{}",
+        binding.range.start, binding.range.end
+    ));
+    lines.line(0, facts.as_str())?;
+    if let Some(source) = &declaration.source {
+        lines.line(0, "source:")?;
+        lines.verbatim(1, &source.text)?;
+    }
+    for (index, documentation) in binding
+        .documentation_indices
+        .iter()
+        .filter_map(|index| usize::try_from(*index).ok())
+        .filter_map(|index| found.symbol.documentation.get(index))
+        .filter(|documentation| !documentation.text.trim().is_empty())
+        .enumerate()
+    {
+        if index == 0 {
+            lines.line(0, "doc:")?;
+        }
+        lines.verbatim(1, &documentation.text)?;
     }
     Ok(())
 }

@@ -22,8 +22,8 @@ use std::{fs, time::Duration};
 
 use axum::http::StatusCode;
 use global_api::{
-    BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold, SymbolFixture,
-    UNSATISFIED_REQUIREMENT,
+    BODY_MATCH_QUERY, COLLECTED_UNIT, EdgeFixture, FixtureOptions, GlobalFixture, Hold,
+    SymbolFixture, UNSATISFIED_REQUIREMENT,
 };
 use rift_protocol::error::ErrorCode;
 use rmcp::model::ReadResourceRequestParams;
@@ -789,6 +789,16 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     let release = "rift://revision/cargo/crates.io/demo@1.0.0";
     let read = call_tool(&client, "get_symbol", json!({"id": id})).await?;
     assert_eq!(read["revision"], release, "{read:#}");
+    assert_eq!(
+        read["declarations"][0]["source"]["text"], "pub fn beacon() {}",
+        "{read:#}"
+    );
+    assert_eq!(
+        read["declarations"][0]["source"]["span"]["unit"], COLLECTED_UNIT,
+        "{read:#}"
+    );
+    assert!(read["documentation"].is_object(), "{read:#}");
+    assert!(read.get("edges").is_none(), "{read:#}");
     let syntax_elements = call_tool(&client, "facets", json!({"symbol": id})).await?;
     assert_eq!(syntax_elements["revision"], release, "{syntax_elements:#}");
     for endpoint in ["/v1/symbols", "/v1/facets"] {
@@ -800,7 +810,8 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
             .filter_map(|request| request.body)
             .map(|body| body["revision"].clone())
             .collect::<Vec<_>>();
-        assert_eq!(asked, [json!(release)], "{endpoint}");
+        let expected = if endpoint == "/v1/symbols" { 1 } else { 2 };
+        assert_eq!(asked, vec![json!(release); expected], "{endpoint}");
     }
     drop(directory);
     client.cancel().await?;
@@ -808,7 +819,7 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     Ok(())
 }
 
-/// A package `get_symbol` read with `include.history` asks the global API for the history
+/// A package `get_symbol` read with `history` in `include` asks the global API for the history
 /// and answers the release edges it names, newest release first; a read without it carries
 /// no history.
 #[tokio::test]
@@ -825,10 +836,10 @@ async fn a_package_symbol_history_names_the_releases_the_global_api_answers() ->
     let read = call_tool(
         &client,
         "get_symbol",
-        json!({"id": id, "include": {"history": true}}),
+        json!({"id": id, "include": ["history"]}),
     )
     .await?;
-    assert_eq!(read["outcome"], "found", "{read:#}");
+    assert_eq!(read["symbol"]["id"], id, "{read:#}");
     assert_eq!(read["history"]["symbol"], id, "{read:#}");
     assert_eq!(
         read["history"]["edges"],
@@ -850,9 +861,71 @@ async fn a_package_symbol_history_names_the_releases_the_global_api_answers() ->
         .filter_map(|request| request.body)
         .map(|body| body["include"].clone())
         .collect::<Vec<_>>();
-    assert_eq!(asked, [json!({"history": true})]);
+    assert_eq!(
+        asked,
+        [json!({"documentation": true}), json!({"history": true})]
+    );
     let without = call_tool(&client, "get_symbol", json!({"id": id})).await?;
     assert!(without.get("history").is_none(), "{without:#}");
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn package_symbol_edges_read_only_the_answered_release() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        edges: EdgeFixture::Outgoing,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n{DEMO_PACKAGE}",
+        fixture.endpoint,
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let target = global_api::collected_identity(SymbolFixture::Valid, "helper_beacon");
+    let answer = call_tool(
+        &client,
+        "get_symbol",
+        json!({
+            "id":id, "include":["edges"], "exclude":["source", "documentation"]
+        }),
+    )
+    .await?;
+    assert_eq!(
+        answer["revision"],
+        "rift://revision/cargo/crates.io/demo@1.0.0"
+    );
+    assert_eq!(
+        answer["edges"],
+        json!([{"kind":"contains", "target": target}]),
+        "{answer:#}"
+    );
+    assert!(answer.get("documentation").is_none(), "{answer:#}");
+    assert!(
+        answer["declarations"][0].get("source").is_none(),
+        "{answer:#}"
+    );
+    let requests = fixture.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.uri.ends_with("/v1/facets"))
+    );
+    let edges = requests
+        .iter()
+        .filter_map(|request| request.body.as_ref())
+        .find(|body| body.get("edges").is_some())
+        .ok_or("expected raw edge request")?;
+    assert_eq!(edges["edges"]["seeds"], json!([id]));
+    assert_eq!(edges["edges"]["direction"], "outgoing");
+    assert_eq!(
+        edges["packages"],
+        json!([{"manager":"cargo", "registry":"crates.io", "name":"demo", "version":"1.0.0"}])
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -2373,7 +2446,12 @@ async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() ->
 #[tokio::test]
 async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailable() -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
-        withheld_features: &["patterns", "documentation_search", "symbol_documentation"],
+        withheld_features: &[
+            "patterns",
+            "documentation_search",
+            "symbol_documentation",
+            "facets",
+        ],
         ..FixtureOptions::default()
     })
     .await?;
@@ -2433,15 +2511,19 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
         );
     }
     let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
-    let refused = failed_call(
-        client
-            .call_tool(tool_request(
-                "get_symbol",
-                &json!({"id": id, "include": {"documentation": true}}),
-            ))
-            .await,
-    )?;
-    assert!(!refused.message.is_empty(), "{}", refused.text);
+    let answer = call_tool(
+        &client,
+        "get_symbol",
+        json!({"id": id, "include":["edges"]}),
+    )
+    .await?;
+    assert_eq!(answer["symbol"]["id"], id, "{answer:#}");
+    assert!(answer.get("documentation").is_none(), "{answer:#}");
+    assert!(
+        answer["declarations"][0].get("source").is_none(),
+        "{answer:#}"
+    );
+    assert!(answer.get("edges").is_none(), "{answer:#}");
     let reads_asked: Vec<String> = fixture
         .requests()
         .await
@@ -2449,7 +2531,8 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
         .map(|request| request.uri)
         .filter(|uri| !uri.ends_with("/v1/capabilities") && !uri.ends_with("/v1/resolutions"))
         .collect();
-    assert!(reads_asked.is_empty(), "{reads_asked:#?}");
+    assert_eq!(reads_asked.len(), 1, "{reads_asked:#?}");
+    assert!(reads_asked[0].ends_with("/v1/symbols"), "{reads_asked:#?}");
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -2695,7 +2778,6 @@ async fn assert_original_identifier(
         .ok_or("symbol carries identity")?;
     assert!(id.ends_with(&format!("/{name}")), "{id}");
     let answer = call_tool(client, "get_symbol", json!({"id": id})).await?;
-    assert_eq!(answer["outcome"], "found", "{scope}: {answer:#}");
     assert_eq!(answer["symbol"]["id"], id, "{scope}: {answer:#}");
     assert_eq!(answer["symbol"]["name"], name, "{scope}: {answer:#}");
     assert_eq!(

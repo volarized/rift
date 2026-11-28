@@ -2397,19 +2397,18 @@ impl RiftMcp {
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Submit))
     }
 
-    /// Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
-    /// revision it read, and `page` selects its declarations at that revision.
-    /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
-    /// An unavailable selection returns its typed cause. A found symbol carries its facts and
-    /// each declaration's location; `facets` with `symbol` reads a declaration's source. Use
-    /// `search` for discovery.
+    /// Reads one logical symbol by its canonical `id` and reports the selected `revision`.
+    /// `page` selects declarations at that revision. Documentation and declaration source are
+    /// selected by default. `include` adds sections and `exclude` removes them. A complete miss
+    /// returns no content. An unavailable selection returns its typed cause. Use `search` to
+    /// discover identities and `facets` to read syntax structure.
     #[tool]
     async fn get_symbol(
         &self,
-        Parameters(params): Parameters<rift_protocol::symbol_read::GetSymbolParams>,
+        Parameters(params): Parameters<rift_protocol::mcp_symbol::GetSymbolParams>,
         extensions: rmcp::model::Extensions,
-    ) -> Result<Json<rift_protocol::symbol_read::GetSymbolResult>, ToolFailure> {
-        let result = self.exact_symbol(params).await;
+    ) -> Result<Json<rift_protocol::mcp_symbol::GetSymbolResult>, ToolFailure> {
+        let result = Box::pin(self.read_mcp_symbol(params)).await;
         if let Err(ToolFailure::Registered(failure, _)) = &result
             && let Some(operation) = extensions.get::<rift_tracing::Span>()
         {
@@ -7153,7 +7152,7 @@ done
         let structured = symbol
             .structured_content
             .ok_or("get_symbol must return structured content")?;
-        assert_eq!(structured["outcome"], "found");
+        assert!(structured.get("outcome").is_none());
         assert_eq!(structured["symbol"]["name"], "beacon");
         assert_eq!(structured["symbol"]["id"], serde_json::to_value(&id)?);
         let declarations = structured["declarations"]
@@ -7161,6 +7160,7 @@ done
             .ok_or("declaration array")?;
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["path"], "lib.rs");
+        assert_eq!(declarations[0]["source"]["text"], "pub fn beacon() {}");
         assert_eq!(
             declarations[0]["range"],
             json!({"start": 0, "end": "pub fn beacon() {}".len()})
@@ -8610,7 +8610,7 @@ done
         let published = current_publication(server).await;
         let id = captured_traversal_seed(&published.reads, "beacon")?;
         let params = serde_json::from_value(json!({
-            "id": id, "include": {"history": true}
+            "id": id, "include": ["history"]
         }))?;
         let answer = tokio::time::timeout(
             UNWAITED_READ_MAX,
@@ -8619,16 +8619,16 @@ done
         .await
         .map_err(|_| "a history read waits on no fill")??
         .0;
-        let rift_protocol::symbol_read::GetSymbolResult::Found {
+        let rift_protocol::mcp_symbol::GetSymbolResult::Found(found) = answer else {
+            return Err(format!("canonical beacon must be found: {answer:?}").into());
+        };
+        let rift_protocol::mcp_symbol::FoundSymbol {
             symbol,
             declarations,
             history,
             warnings,
             ..
-        } = answer
-        else {
-            return Err(format!("canonical beacon must be found: {answer:?}").into());
-        };
+        } = *found;
         assert_eq!(
             symbol
                 .id
@@ -8648,11 +8648,18 @@ done
             .next()
             .ok_or("beacon declaration")?;
         assert_eq!(
-            declaration.path.as_ref().map(|path| path.0.as_str()),
+            declaration
+                .binding
+                .path
+                .as_ref()
+                .map(|path| path.0.as_str()),
             Some("lib.rs")
         );
         assert_eq!(
-            (declaration.range.start, declaration.range.end),
+            (
+                declaration.binding.range.start,
+                declaration.binding.range.end
+            ),
             (0, "pub fn beacon() {}".len() as u64)
         );
         Ok(history.ok_or("the symbol carries its history")?)
@@ -11186,18 +11193,17 @@ done
             .get_symbol(Parameters(request), rmcp::model::Extensions::default())
             .await
             .map_err(rmcp::ErrorData::from)?;
-        let rift_protocol::symbol_read::GetSymbolResult::Found {
-            symbol,
-            declarations,
-            ..
-        } = symbol
-        else {
+        let rift_protocol::mcp_symbol::GetSymbolResult::Found(found) = symbol else {
             return Err("the parsed BLOB declaration remains retrievable".into());
         };
-        assert_eq!(symbol.name, "BLOB");
-        assert_eq!(declarations.len(), 1);
+        assert_eq!(found.symbol.name, "BLOB");
+        assert_eq!(found.declarations.len(), 1);
         assert_eq!(
-            declarations[0].path.as_ref().map(|path| path.0.as_str()),
+            found.declarations[0]
+                .binding
+                .path
+                .as_ref()
+                .map(|path| path.0.as_str()),
             Some("src/blob.rs")
         );
         let facets = server

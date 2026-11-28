@@ -3586,65 +3586,91 @@ fn output_allocation_cost() {
 
 #[test]
 fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() {
-    use rift_protocol::symbol_read::GetSymbolResult;
+    use rift_protocol::mcp_symbol::{FoundSymbol, GetSymbolResult};
     let id = SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity");
-    let answer = GetSymbolResult::Found {
+    let answer = GetSymbolResult::Found(Box::new(FoundSymbol {
         symbol: Box::new(symbol(Some(id.as_str()), "A")),
         revision: tree_revision(),
         declarations: Vec::new(),
         pagination: Pagination::new(1, 10, 0),
         history: None,
         documentation: None,
+        edges: None,
         warnings: Vec::new(),
-    };
-    let text = rendered(&answer);
-    assert!(text.contains(id.as_str()));
-    assert!(!text.contains("view "));
-    assert!(!text.contains(&tree_revision().to_string()));
-    assert!(!text.contains("declarations:"));
-    assert!(!text.contains("a.rs:1"));
+    }));
+    assert_eq!(rendered(&answer), format!("{}\n", id.as_str()));
 }
 
 #[test]
 fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation() {
-    use rift_protocol::symbol_read::{GetSymbolResult, SymbolDeclaration};
-    let logical = symbol(Some("rift://symbol/local/rust/app/a/A"), "A");
-    let source = "// original\nstruct A;\n";
-    let answer = GetSymbolResult::Found {
+    use rift_protocol::mcp_symbol::{FoundSymbol, GetSymbolResult, SymbolDeclaration, SymbolEdge};
+    use rift_protocol::read::{SourceExcerpt, SourceUnitSpan};
+    let id = "rift://symbol/local/rust/app/a/A";
+    let mut logical = symbol(Some(id), "A");
+    logical.documentation.push(Documentation {
+        format: DocumentationFormat::Plain,
+        text: "A declaration.".to_owned(),
+    });
+    let source = "// original\nstruct A;";
+    let span = range(0, source.len() as u64);
+    let first = "rift://symbol/local/rust/app/b/B";
+    let second = "rift://symbol/local/rust/app/c/C";
+    let answer = GetSymbolResult::Found(Box::new(FoundSymbol {
         declarations: vec![SymbolDeclaration {
-            origin: logical.origin.clone(),
-            path: Some(project_path("a.rs")),
-            unit: None,
-            range: range(0, source.len() as u64),
-            line: 1,
-            signature_indices: Vec::new(),
-            type_indices: Vec::new(),
-            documentation_indices: Vec::new(),
+            binding: rift_protocol::symbol_read::SymbolDeclaration {
+                origin: logical.origin.clone(),
+                path: Some(project_path("a.rs")),
+                unit: None,
+                range: span.clone(),
+                line: 1,
+                signature_indices: Vec::new(),
+                type_indices: Vec::new(),
+                documentation_indices: vec![0],
+            },
+            source: Some(SourceExcerpt {
+                span: SourceUnitSpan {
+                    unit: SourceUnitId::project("a.rs"),
+                    range: span,
+                },
+                text: source.to_owned(),
+            }),
         }],
         symbol: Box::new(logical),
         revision: tree_revision(),
-        pagination: Pagination::new(1, 1, 2),
+        pagination: Pagination::new(2, 1, 2),
         history: None,
         documentation: None,
+        edges: Some(vec![
+            SymbolEdge {
+                kind: ExactKind("calls".to_owned()),
+                target: SymbolId(first.to_owned()),
+            },
+            SymbolEdge {
+                kind: ExactKind("calls".to_owned()),
+                target: SymbolId(second.to_owned()),
+            },
+            SymbolEdge {
+                kind: ExactKind("references".to_owned()),
+                target: SymbolId(second.to_owned()),
+            },
+        ]),
         warnings: Vec::new(),
-    };
-    let text = rendered(&answer);
-    assert!(text.contains("a.rs:1"));
-    assert!(text.contains(&format!("0..{}", source.len())));
-    assert!(text.contains("page 1/2, total 2 results"));
+    }));
+    assert_eq!(
+        rendered(&answer),
+        format!(
+            "{id}\nfacets 2/2:\n\ta.rs:1 | bytes 0..{}\n\tsource:\n\t\t// original\n\t\tstruct A;\n\tdoc:\n\t\tA declaration.\nedges:\n\tcalls:\n\t\t{first}\n\t\t{second}\n\treferences:\n\t\t{second}\n\tpage 2/2, total 2 results\n",
+            source.len()
+        )
+    );
 }
 
 #[test]
 fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
-    use rift_protocol::symbol_read::{GetSymbolResult, SymbolNotFound, SymbolUnavailableReason};
+    use rift_protocol::mcp_symbol::GetSymbolResult;
+    use rift_protocol::symbol_read::SymbolUnavailableReason;
     let id = SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity");
     let missing = GetSymbolResult::Missing {
-        symbol_not_found: SymbolNotFound {
-            id: id.clone(),
-            alternatives: Vec::new(),
-            detail: None,
-        },
-        revision: tree_revision(),
         warnings: Vec::new(),
     };
     let unavailable = GetSymbolResult::Unavailable {
@@ -3653,12 +3679,9 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
         reason: SymbolUnavailableReason::IndexPreparing,
         warnings: Vec::new(),
     };
-    let missing = rendered(&missing);
-    assert!(missing.contains("symbol_not_found"));
-    assert!(!missing.contains("revision rift://revision/tree/"));
+    assert_eq!(rendered(&missing), "");
     let text = rendered(&unavailable);
     assert!(text.contains("unavailable | indexing is in progress"));
-    assert!(!text.contains("symbol_not_found"));
     assert!(!text.contains("revision "));
 }
 
@@ -3692,7 +3715,8 @@ fn unavailable_search(
 
 #[test]
 fn a_preparing_symbol_read_keeps_the_reason_and_clears_progress_warnings() {
-    use rift_protocol::symbol_read::{GetSymbolResult, SymbolUnavailableReason};
+    use rift_protocol::mcp_symbol::GetSymbolResult;
+    use rift_protocol::symbol_read::SymbolUnavailableReason;
     let progress = local_preparation(2048, Some(3951));
     let mut unavailable = GetSymbolResult::Unavailable {
         id: SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity"),

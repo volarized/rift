@@ -5,6 +5,7 @@ use oxrdf::{
     vocab::{rdf, xsd},
 };
 use rift_error::{RiftError, errors};
+use rift_protocol::query::RetrievalInclude;
 use rift_protocol::read::{SearchInclude, SearchParams, SearchParamsTarget, SearchScope};
 use serde_json::{Map, Value};
 use spargebra::algebra::QueryExpression;
@@ -139,7 +140,7 @@ fn request(
     flows: bool,
 ) -> Result<(SearchParams, ScopeChoice), RiftError> {
     let mut fields = Map::new();
-    let mut include = Map::new();
+    let mut inferred = SearchInclude::default();
     let mut pending = vec![(inner, true)];
     while let Some((pattern, required)) = pending.pop() {
         match pattern {
@@ -151,9 +152,8 @@ fn request(
                     let Some(key) = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE) else {
                         continue;
                     };
-                    if matches!(key, "source" | "score") {
-                        include.insert(key.to_owned(), Value::Bool(true));
-                    }
+                    inferred.source |= key == "source";
+                    inferred.score |= key == "score";
                     if flows
                         && INPUT_FIELDS.contains(&key)
                         && matches!(&triple.object, TermPattern::Variable(_))
@@ -222,16 +222,19 @@ fn request(
             }
         }
     }
-    if !include.is_empty() && !fields.contains_key("include") {
-        fields.insert("include".to_owned(), Value::Object(include));
-    }
+    let include = fields
+        .remove("include")
+        .map(serde_json::from_value::<RetrievalInclude>)
+        .transpose()
+        .map_err(|error| invalid(&error.to_string()))?;
     let scope_choice = if flows || fields.contains_key(SCOPE_FIELD) {
         ScopeChoice::Service
     } else {
         ScopeChoice::Workspace
     };
-    let request: SearchParams = serde_json::from_value(Value::Object(fields))
+    let mut request: SearchParams = serde_json::from_value(Value::Object(fields))
         .map_err(|error| invalid(&error.to_string()))?;
+    request.include = include.map_or(inferred, SearchInclude::from);
     refuse_unowned_packages(&request)?;
     Ok((request, scope_choice))
 }
@@ -254,7 +257,8 @@ const PACKAGE_REGISTRY_REQUIRED: &str = "every `:packages` entry names its `regi
 
 /// Inputs that carry a structured value, written as an `rdf:JSON` literal, each with the
 /// value its refusal shows.
-const JSON_FIELDS: [(&str, &str); 3] = [
+const JSON_FIELDS: [(&str, &str); 4] = [
+    ("include", r#"["source"]"#),
     ("paths", r#"{"include":["src/**"]}"#),
     (
         "packages",
@@ -376,6 +380,47 @@ mod tests {
 
     fn parsed(text: &str) -> Result<GraphQuery, rift_error::RiftError> {
         GraphQuery::parse(text, &GraphLimits::default())
+    }
+
+    #[test]
+    fn explicit_retrieval_sections_override_inferred_source_and_score()
+    -> Result<(), rift_error::RiftError> {
+        let projection = |include| {
+            format!(
+                "SELECT ?source ?score {{ SERVICE :search {{ ?hit :query 'beacon'; :source ?source; :score ?score {include} }} }}"
+            )
+        };
+        for (include, expected) in [
+            (
+                "",
+                SearchInclude {
+                    source: true,
+                    score: true,
+                    providers: false,
+                },
+            ),
+            ("; :include '[]'^^rdf:JSON", SearchInclude::default()),
+            (
+                r#"; :include '["providers","source"]'^^rdf:JSON"#,
+                SearchInclude {
+                    source: true,
+                    score: false,
+                    providers: true,
+                },
+            ),
+        ] {
+            let query = parsed(&projection(include))?;
+            assert_eq!(query.retrieval_requests()[0].request.include, expected);
+        }
+        for include in [
+            r#"; :include '{"source":true}'^^rdf:JSON"#,
+            r#"; :include '["source","source"]'^^rdf:JSON"#,
+            r#"; :include '["other"]'^^rdf:JSON"#,
+        ] {
+            let error = parsed(&projection(include)).expect_err(include);
+            assert_eq!(error.slug(), errors::search::query_syntax_invalid::SLUG);
+        }
+        Ok(())
     }
 
     #[test]

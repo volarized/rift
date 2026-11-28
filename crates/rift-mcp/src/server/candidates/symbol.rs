@@ -3,55 +3,58 @@ use super::read_failure;
 use crate::output::Json;
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+use rift_protocol::mcp_symbol::{GetSymbolParams, GetSymbolResult, SymbolSections};
+use rift_protocol::symbol_read::GetSymbolParams as ExactSymbolParams;
+
+mod projections;
 
 impl RiftMcp {
-    /// Reads one symbol by its canonical identity: a package or runtime symbol from the
-    /// global API, a project symbol from the publication its revision selects.
-    pub(in crate::server) async fn exact_symbol(
+    /// Reads a symbol and its requested sections from one selected revision.
+    pub(in crate::server) async fn read_mcp_symbol(
         &self,
         params: GetSymbolParams,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
-        let owner = SymbolIdentity::parse(params.id.as_str())
-            .map_err(read_failure)?
-            .owner()
-            .clone();
+        let sections = params.selection();
+        let mut exact = params.into_exact(&sections);
+        // The history section cannot refuse an already established symbol.
+        exact.include.history = false;
+        let owner = SymbolIdentity::parse(exact.id.as_str()).map_err(read_failure)?;
         if matches!(
-            owner,
+            owner.owner(),
             SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
         ) {
-            return self.global_symbol(&params).await;
+            return self.global_mcp_symbol(exact, &sections).await;
         }
-        let git = params
+        let git = exact
             .revision
             .as_ref()
             .and_then(rift_protocol::revision::Revision::git_revision);
         if git.is_some() {
             return self
-                .read_at(git, move |reads| reads.exact_symbol(&params, true))
+                .read_at(git, move |reads| {
+                    projections::project_symbol(reads, &exact, &sections, true, false)
+                })
                 .await;
         }
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(super::wire::ErrorPhase::Read, deadline)
             .await?;
-        self.exact_symbol_in_publication(&resolved, params).await
+        self.mcp_symbol_in_publication(&resolved, exact, sections)
+            .await
     }
 
     /// Reads an exact symbol from the publication this request already resolved.
-    pub(in crate::server) async fn exact_symbol_in_publication(
+    async fn mcp_symbol_in_publication(
         &self,
         resolved: &super::super::ResolvedWorkspace,
-        params: GetSymbolParams,
+        exact: ExactSymbolParams,
+        sections: SymbolSections,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
         let ready = resolved.published.preparation.is_none();
-        let verified_current = ready && resolved.verified_current;
+        let verified_current = resolved.verified_current;
         self.current_tree_read(resolved, true, move |reads| {
-            if verified_current {
-                reads.exact_current_symbol(&params)
-            } else {
-                reads.exact_symbol(&params, ready)
-            }
+            projections::project_symbol(reads, &exact, &sections, ready, verified_current)
         })
         .await
     }
@@ -90,9 +93,10 @@ impl RiftMcp {
         .map(Json)
     }
 
-    async fn global_symbol(
+    async fn global_mcp_symbol(
         &self,
-        params: &GetSymbolParams,
+        mut exact: ExactSymbolParams,
+        sections: &SymbolSections,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
         let deadline = self.request_deadline().await;
         let resolved = self
@@ -103,34 +107,41 @@ impl RiftMcp {
             .configuration
             .accepted_for_tool(super::wire::ErrorPhase::Read)?;
         let configuration = resolved.published.configuration.global_configuration();
-        let mut selected = params.clone();
-        if selected.revision.is_none() {
-            selected.revision =
-                SymbolIdentity::parse(selected.id.as_str())
-                    .ok()
-                    .and_then(|identity| {
-                        crate::global::workspace_release(
-                            resolved.published.reads.dependency_context(),
-                            identity.owner(),
-                        )
-                    });
+        if exact.revision.is_none() {
+            exact.revision = SymbolIdentity::parse(exact.id.as_str())
+                .ok()
+                .and_then(|identity| {
+                    crate::global::workspace_release(
+                        resolved.published.reads.dependency_context(),
+                        identity.owner(),
+                    )
+                });
         }
-        within_deadline(
+
+        let client =
+            within_deadline(deadline, "get_symbol", self.global.client(&configuration)).await?;
+        let answer = within_deadline(
             deadline,
             "get_symbol",
-            self.global.exact_symbol(&configuration, &selected),
+            client.get_symbol_with_available_documentation(&exact),
         )
-        .await
-        .map(Json)
+        .await?;
+        let mut answer = GetSymbolResult::from_exact(answer, sections);
+        if let GetSymbolResult::Found(found) = &mut answer {
+            Box::pin(projections::release_sections(
+                &client, deadline, sections, &exact.id, found,
+            ))
+            .await;
+        }
+        Ok(Json(answer))
     }
 }
 
 impl super::ReadAnswer for GetSymbolResult {
     fn warnings_mut(&mut self) -> &mut Vec<super::ReadWarning> {
         match self {
-            Self::Found { warnings, .. }
-            | Self::Missing { warnings, .. }
-            | Self::Unavailable { warnings, .. } => warnings,
+            Self::Found(found) => &mut found.warnings,
+            Self::Missing { warnings } | Self::Unavailable { warnings, .. } => warnings,
         }
     }
 }
@@ -171,7 +182,8 @@ mod tests {
 
     fn request() -> TestResult<GetSymbolParams> {
         Ok(serde_json::from_value(json!({
-            "id": "rift://symbol/local/typescript/.%2Findex.ts/known"
+            "id": "rift://symbol/local/typescript/.%2Findex.ts/known",
+            "exclude": ["documentation"]
         }))?)
     }
 
@@ -188,8 +200,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_exact_symbol_proof_requires_current_provenance() -> TestResult {
-        let (_directory, server) = fixture().await?;
+    async fn exact_source_uses_the_accepted_publication_after_a_file_edit() -> TestResult {
+        let (directory, server) = fixture().await?;
         let phase = crate::server::wire::ErrorPhase::Read;
         let current = server
             .published_workspace(phase, server.request_deadline().await)
@@ -199,25 +211,39 @@ mod tests {
         assert!(current.published.preparation.is_none());
         let params = request()?;
         let identity = params.id.clone();
+        let sections = params.selection();
         let accepted = server
-            .exact_symbol_in_publication(&current, params)
+            .mcp_symbol_in_publication(
+                &current,
+                params.clone().into_exact(&sections),
+                sections.clone(),
+            )
             .await?
             .0;
-        let GetSymbolResult::Found {
-            revision,
-            declarations,
-            ..
-        } = &accepted
-        else {
+        let GetSymbolResult::Found(found) = &accepted else {
             return Err("the verified current snapshot must establish the symbol".into());
         };
         assert!(accepted.is_valid_for(&identity));
-        assert_eq!(*revision, current.published.reads.served_revision()?);
-        assert_eq!(declarations.len(), 1);
+        assert_eq!(found.revision, current.published.reads.served_revision()?);
+        assert_eq!(found.declarations.len(), 1);
+        let declaration = &found.declarations[0];
         assert_eq!(
-            declarations[0].path.as_ref().map(|path| path.0.as_str()),
+            declaration
+                .binding
+                .path
+                .as_ref()
+                .map(|path| path.0.as_str()),
             Some("index.ts")
         );
+        let source = declaration.source.as_ref().ok_or("source is selected")?;
+        assert_eq!(source.span.unit.as_str(), "rift://source/project/index.ts");
+        assert_eq!(source.span.range, declaration.binding.range);
+        assert_eq!(
+            source.text,
+            "export function known(x: number) { return x; }"
+        );
+        assert!(found.edges.is_none());
+        assert_eq!(accepted, server.read_mcp_symbol(params.clone()).await?.0);
 
         let publication = Arc::clone(&current.published);
         let digests = publication.reads.workspace_digests();
@@ -230,21 +256,85 @@ mod tests {
             ResolvedWorkspace::stale(publication, &digests, None, &reason, phase, Duration::ZERO)?;
         assert!(!stale.verified_current);
         assert!(stale.stale.is_none());
+        std::fs::write(
+            directory.path().join("index.ts"),
+            "export function known() {}\n",
+        )?;
         assert_eq!(
             accepted,
             server
-                .exact_symbol_in_publication(&stale, request()?)
+                .mcp_symbol_in_publication(&stale, params.into_exact(&sections), sections)
                 .await?
                 .0
         );
-        assert_eq!(accepted, server.exact_symbol(request()?).await?.0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_symbol_adds_unique_outgoing_edges_and_honors_exclusions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("index.ts"),
+            "export function helper() { return 1; }\nexport function known() { return helper() + helper(); }\n",
+        )?;
+        let server =
+            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let params = serde_json::from_value(json!({
+            "id": request()?.id,
+            "include": ["edges", "source"],
+            "exclude": ["documentation", "source"]
+        }))?;
+        let GetSymbolResult::Found(found) = server.read_mcp_symbol(params).await?.0 else {
+            return Err("the captured function is found".into());
+        };
+        assert!(found.documentation.is_none());
+        assert!(found.declarations[0].source.is_none());
+        let edges = found.edges.ok_or("edges are selected")?;
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind.0 == "calls" && edge.target.as_str().ends_with("/helper"))
+                .count(),
+            1,
+            "repeated calls share a target and kind: {edges:#?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_source_of_a_git_revision_uses_committed_bytes() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        let path = directory.path().join("index.ts");
+        std::fs::write(&path, "export function known() { return 1; }\n")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce known");
+        std::fs::write(&path, "export function known() { return 2; }\n")?;
+        let server =
+            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let params = serde_json::from_value(json!({
+            "id": request()?.id, "revision": "rift://revision/git/HEAD"
+        }))?;
+        let GetSymbolResult::Found(found) = server.read_mcp_symbol(params).await?.0 else {
+            return Err("the committed function is found".into());
+        };
+        assert!(matches!(
+            found.revision.point(),
+            rift_protocol::revision::RevisionPoint::Commit(_)
+        ));
+        let source = found.declarations[0]
+            .source
+            .as_ref()
+            .ok_or("committed source")?;
+        assert_eq!(source.text, "export function known() { return 1; }");
         Ok(())
     }
 
     #[tokio::test]
     async fn preparing_exact_read_keeps_its_typed_response() -> TestResult {
         let (_directory, assembled) = crate::server::tests::starting_fixture().await?;
-        let result = assembled.server.exact_symbol(request()?).await?.0;
+        let result = assembled.server.read_mcp_symbol(request()?).await?.0;
         assert!(matches!(
             result,
             GetSymbolResult::Unavailable {
@@ -272,7 +362,7 @@ mod tests {
         });
         admitted.await?;
 
-        let mut pending = Box::pin(server.exact_symbol(request()?));
+        let mut pending = Box::pin(server.read_mcp_symbol(request()?));
         poll_fn(|context| {
             assert!(pending.as_mut().poll(context).is_pending());
             Poll::Ready(())

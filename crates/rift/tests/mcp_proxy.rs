@@ -1021,10 +1021,10 @@ fn assert_term_kind_text(text: &str) -> TestResult {
     };
     assert!(
         blank
-            .strip_prefix(r"\_:")
+            .strip_prefix("_:")
             .is_some_and(|value| !value.is_empty())
     );
-    assert_eq!(*iri, r"\<urn:fixture:term>");
+    assert_eq!(*iri, "<urn:fixture:term>");
     assert_eq!(*number, "1");
     assert_eq!(*language, r#""hello"@en"#);
     assert!(lines.next().is_none());

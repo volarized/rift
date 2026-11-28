@@ -2,7 +2,7 @@
 
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
-use rift_protocol::read::{ReadWarning, SymbolHistory};
+use rift_protocol::read::{ReadWarning, SymbolHistory, SymbolId};
 use rift_protocol::symbol_read::{
     GetSymbolParams, GetSymbolResult, SymbolAlternative, SymbolDeclaration, SymbolMatchContext,
     SymbolNotFound, SymbolUnavailableReason,
@@ -28,7 +28,7 @@ impl ReadService {
         request: &GetSymbolParams,
         ready: bool,
     ) -> Result<GetSymbolResult, RiftError> {
-        self.read_exact_symbol(request, ready, false)
+        self.read_exact_symbol(request, ready, false, true)
     }
 
     /// Reads one symbol from the complete publication a request accepted as current.
@@ -40,14 +40,55 @@ impl ReadService {
         &self,
         request: &GetSymbolParams,
     ) -> Result<GetSymbolResult, RiftError> {
-        self.read_exact_symbol(request, true, self.revision().is_none())
+        self.read_exact_symbol(
+            request,
+            true,
+            self.revision().is_none() && request.include.is_empty(),
+            true,
+        )
+    }
+
+    /// Reads an exact symbol without selecting alternatives for a complete miss.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::exact_symbol`].
+    pub fn exact_symbol_without_alternatives(
+        &self,
+        request: &GetSymbolParams,
+        ready: bool,
+        verified_current: bool,
+    ) -> Result<GetSymbolResult, RiftError> {
+        self.read_exact_symbol(
+            request,
+            ready,
+            ready && verified_current && self.revision().is_none() && !request.include.history,
+            false,
+        )
+    }
+
+    /// Borrows the exact declaration range from this snapshot's accepted source bytes.
+    #[must_use]
+    pub fn declaration_source(&self, declaration: &SymbolDeclaration) -> Option<&str> {
+        let path = rift_core::ProjectPath::new(declaration.path.as_ref()?.0.as_str()).ok()?;
+        let start = usize::try_from(declaration.range.start).ok()?;
+        let end = usize::try_from(declaration.range.end).ok()?;
+        self.index.file(&path)?.source().get(start..end)
+    }
+
+    /// Reads the history of a symbol addressed in this snapshot.
+    ///
+    /// # Errors
+    /// Returns an invalid identity or a history read refusal.
+    pub fn exact_symbol_history(&self, id: &SymbolId) -> Result<Option<SymbolHistory>, RiftError> {
+        self.exact_history(id, &rift_core::SymbolId::new(id.as_str())?)
     }
 
     fn read_exact_symbol(
         &self,
         request: &GetSymbolParams,
         ready: bool,
-        verified_current: bool,
+        allow_direct: bool,
+        alternatives_requested: bool,
     ) -> Result<GetSymbolResult, RiftError> {
         let identity = SymbolIdentity::parse(request.id.as_str())?;
         let limit = super::accepted_max_results(
@@ -68,10 +109,7 @@ impl ReadService {
             ));
         }
         let key = rift_core::SymbolId::new(request.id.as_str())?;
-        let direct = (verified_current
-            && request.revision.is_none()
-            && request.include.is_empty()
-            && offset == 0)
+        let direct = (allow_direct && request.revision.is_none() && offset == 0)
             .then(|| self.index.exact_relative_singleton(&key))
             .flatten();
         let (readable, direct_declaration) = match direct {
@@ -94,7 +132,11 @@ impl ReadService {
                     warnings,
                 ));
             }
-            let (alternatives, detail) = symbol_alternatives(&index, &identity)?;
+            let (alternatives, detail) = if alternatives_requested {
+                symbol_alternatives(&index, &identity)?
+            } else {
+                (Vec::new(), None)
+            };
             return Ok(GetSymbolResult::Missing {
                 symbol_not_found: SymbolNotFound {
                     id: request.id.clone(),
@@ -139,7 +181,7 @@ impl ReadService {
             ));
         }
         let history = if request.include.history {
-            let Some(history) = self.exact_history(request, key)? else {
+            let Some(history) = self.exact_history(&request.id, key)? else {
                 return Ok(unavailable(
                     request,
                     SymbolUnavailableReason::InsufficientCoverage,
@@ -178,7 +220,7 @@ impl ReadService {
     /// binds it.
     fn exact_history(
         &self,
-        request: &GetSymbolParams,
+        id: &SymbolId,
         key: &rift_core::SymbolId,
     ) -> Result<Option<SymbolHistory>, RiftError> {
         let (bindings, _) =
@@ -189,7 +231,7 @@ impl ReadService {
         }
         let mut timelines = self.symbol_timelines()?;
         timelines
-            .symbol_timeline(&self.index, &bindings, request.id.clone())
+            .symbol_timeline(&self.index, &bindings, id.clone())
             .map(Some)
     }
 }

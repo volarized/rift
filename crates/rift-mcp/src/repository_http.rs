@@ -1161,7 +1161,7 @@ mod tests {
         assert_eq!(indigo["symbol"]["name"], "indigo", "{indigo}");
         assert_eq!(quartz["symbol"]["name"], "quartz", "{quartz}");
         for (answer, (_, name)) in [&amber, &cedar, &indigo, &quartz].into_iter().zip(fixtures) {
-            assert_eq!(answer["outcome"], "found");
+            assert!(answer.get("outcome").is_none());
             assert_eq!(answer["declarations"][0]["path"], "lib.rs");
             assert_eq!(
                 answer["declarations"][0]["range"]["end"],

@@ -4,10 +4,12 @@ mod answer;
 
 pub use answer::{QueryAnswer, RdfTerm, RdfTriple};
 
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{Pagination, ReadWarning};
+use crate::read::{Pagination, ReadWarning, SearchInclude};
 use crate::search_read::SearchUnavailable;
 use crate::symbol_read::CapturedView;
 
@@ -34,12 +36,16 @@ pub enum QueryLanguage {
     },
     {
         "query": "SELECT ?edge { ?caller :calls ?callee . ?edge a :Edge; :from ?caller; :to ?callee }",
-        "include": { "providers": true }
+        "include": ["providers"]
     }
 ]))]
 pub struct QueryParams {
-    /// Attaches the sorted analyses that produced each returned edge.
-    #[serde(default, skip_serializing_if = "QueryInclude::is_empty")]
+    /// Optional sections to attach to the query result. Omitted adds none.
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp_projection::deserialize_set",
+        skip_serializing_if = "QueryInclude::is_empty"
+    )]
     pub include: QueryInclude,
     /// Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex
     /// retrieval and `SERVICE :flows` for call paths around ranked symbols.
@@ -60,22 +66,65 @@ pub struct QueryParams {
     pub revision: Option<crate::revision::Revision>,
 }
 
-/// Optional projections of a query answer. An omitted member is `false`.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-#[schemars(example = serde_json::json!({"providers": true}))]
-pub struct QueryInclude {
-    /// Attaches `providers` to merged edge terms and call steps. Explicit SPARQL
-    /// selections and filters on `:provider` retain the stored producer facts.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub providers: bool,
+/// The optional sections a query can attach to its answer.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum QuerySection {
+    /// Attaches the sorted analyses that produced each returned edge or call step.
+    /// Explicit SPARQL selections and filters on `:provider` retain the stored facts.
+    Providers,
 }
 
-impl QueryInclude {
-    /// Whether the caller requested no projection.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        !self.providers
+/// The selected sections of a query answer.
+pub type QueryInclude = BTreeSet<QuerySection>;
+
+/// The optional sections of a `SERVICE :search` result.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalSection {
+    /// Attaches the sorted analyses that produced each merged edge.
+    Providers,
+    /// Attaches the ranking value of each hit.
+    Score,
+    /// Attaches the source text around each hit.
+    Source,
+}
+
+/// An explicit `SERVICE :search` projection in an `rdf:JSON` literal.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RetrievalInclude(
+    #[serde(deserialize_with = "crate::mcp_projection::deserialize_set")]
+    BTreeSet<RetrievalSection>,
+);
+
+impl From<RetrievalInclude> for SearchInclude {
+    fn from(include: RetrievalInclude) -> Self {
+        let fields = include.0;
+        Self {
+            providers: fields.contains(&RetrievalSection::Providers),
+            score: fields.contains(&RetrievalSection::Score),
+            source: fields.contains(&RetrievalSection::Source),
+        }
+    }
+}
+
+impl From<SearchInclude> for RetrievalInclude {
+    fn from(include: SearchInclude) -> Self {
+        Self(
+            [
+                (include.providers, RetrievalSection::Providers),
+                (include.score, RetrievalSection::Score),
+                (include.source, RetrievalSection::Source),
+            ]
+            .into_iter()
+            .filter_map(|(selected, section)| selected.then_some(section))
+            .collect(),
+        )
     }
 }
 
@@ -245,5 +294,39 @@ impl QueryConfiguration {
                 QUERY_RETAINED_BYTES_MAX,
             ),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn query_projections_are_a_distinct_set_of_typed_sections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = serde_json::to_value(schemars::schema_for!(QueryParams))?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let value = json!({"query":"ASK {}", "include":["providers"]});
+        assert!(validator.is_valid(&value));
+        let params: QueryParams = serde_json::from_value(value)?;
+        assert_eq!(
+            params.include,
+            QueryInclude::from([QuerySection::Providers])
+        );
+        assert_eq!(
+            serde_json::to_value(params)?["include"],
+            json!(["providers"])
+        );
+        for include in [
+            json!({"providers":true}),
+            json!(["providers", "providers"]),
+            json!(["source"]),
+        ] {
+            let rejected = json!({"query":"ASK {}", "include":include});
+            assert!(!validator.is_valid(&rejected), "{rejected}");
+            assert!(serde_json::from_value::<QueryParams>(rejected).is_err());
+        }
+        Ok(())
     }
 }
