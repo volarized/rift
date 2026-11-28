@@ -19,6 +19,7 @@ use super::{
 };
 
 mod argument_properties;
+mod lexical_bindings;
 
 /// One written function value and its ordinal among the unit's function expressions.
 #[derive(Clone, Copy)]

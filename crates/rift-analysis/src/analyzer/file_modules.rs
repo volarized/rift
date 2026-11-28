@@ -59,7 +59,7 @@ impl Records {
             )?;
         }
         self.retain_quoted_callback_argument_properties(owner, analyzed, limits)?;
-        Ok(())
+        self.retain_typescript_callback_bindings(owner, analyzed, limits)
     }
 
     fn retain_checked_commonjs_modules(

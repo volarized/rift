@@ -1286,3 +1286,94 @@ fn checked_method_return_pair_keeps_the_separate_read_local() {
             })
     }));
 }
+const CALLBACK_MANIFEST: &str =
+    r#"{"name":"beacon","version":"1.0.0","main":"./index.js","type":"module"}"#;
+const CALLBACK_BINDINGS: &str = r#"
+import { prepare } from "../index.js";
+suite(() => {
+    check(() => { const marker = prepare(); return marker; });
+    check(() => { const marker = prepare() + 1; return marker; });
+});
+"#;
+
+#[test]
+fn repeated_typescript_bindings_keep_their_admitted_callback_scopes() {
+    let found = analyze(
+        CALLBACK_MANIFEST,
+        &[
+            ("index.js", "export function prepare() { return 3; }"),
+            ("lib/check.ts", CALLBACK_BINDINGS),
+        ],
+    );
+    let publication = found.publication();
+    publication
+        .validate_facts()
+        .expect("valid callback bindings");
+    let markers = publication
+        .objects
+        .iter()
+        .filter(|object| object.name == "marker" && object.id.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2);
+    let mut owners = BTreeSet::new();
+    for (ordinal, spelling) in ["const marker = prepare()", "const marker = prepare() + 1"]
+        .into_iter()
+        .enumerate()
+    {
+        let start = CALLBACK_BINDINGS.find(spelling).expect("written binding");
+        let expected = format!("marker#{ordinal}");
+        let object = markers
+            .iter()
+            .find(|object| {
+                spelled(object.id.as_ref().expect("placed local").as_str()).last()
+                    == Some(&expected)
+            })
+            .expect("separate lexical identity");
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| Some(&row.symbol) == object.id.as_ref())
+            .expect("written binding facet");
+        assert_eq!(
+            binding.range.start,
+            u64::try_from(start).expect("source offset")
+        );
+        assert_eq!(binding.source, spelling);
+        assert!(binding.source_complete && !binding.public && object.document_local);
+        let owner = object.container.as_ref().expect("physical callable owner");
+        assert!(owners.insert(owner));
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol == *owner
+                && row.unit == binding.unit
+                && row.source_complete
+                && row.range.start < binding.range.start
+                && binding.range.end < row.range.end
+                && row.syntax_element_kind.as_deref() == Some("arrow_function")
+        }));
+    }
+}
+
+#[test]
+fn repeated_typescript_bindings_refuse_incomplete_callback_groups() {
+    let missing_owner = CALLBACK_BINDINGS.replace("prepare() + 1", "4");
+    let unsupported = CALLBACK_BINDINGS.replace(
+        "const marker = prepare() + 1; return marker;",
+        "function marker() { return prepare() + 1; } return marker();",
+    );
+    for source in [&missing_owner, &unsupported] {
+        let found = analyze(
+            CALLBACK_MANIFEST,
+            &[
+                ("index.js", "export function prepare() { return 3; }"),
+                ("lib/check.ts", source),
+            ],
+        );
+        assert!(
+            found
+                .publication()
+                .objects
+                .iter()
+                .all(|object| object.name != "marker" || object.id.is_none())
+        );
+    }
+}
