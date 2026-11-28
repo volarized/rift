@@ -45,7 +45,7 @@ impl<'source> FileScopes<'source> {
         let mut groups = BTreeMap::<&str, Vec<&SyntaxSymbol>>::new();
         for symbol in file.syntax.symbols() {
             let name = symbol.qualified_name.as_str();
-            if repeated.contains(name) && anchors.contains_key(name) && !placed.contains_key(name) {
+            if repeated.contains(name) && anchors.contains_key(name) {
                 groups.entry(name).or_default().push(symbol);
             }
         }
@@ -96,29 +96,68 @@ impl<'source> FileScopes<'source> {
             .cloned()
             .collect::<BTreeSet<_>>();
         for (name, declarations) in groups {
-            let (locals, members): (Vec<_>, Vec<_>) = declarations
+            let (mut locals, members): (Vec<_>, Vec<_>) = declarations
                 .into_iter()
                 .partition(|symbol| mixed_local(symbol));
-            let [local] = locals.as_slice() else { continue };
-            let Some(written) = bindings.get(local.name.as_str()) else {
-                continue;
+            let prior = placed.get(name);
+            let declarations = if prior.is_none()
+                && let [local] = locals.as_slice()
+                && let Some(written) = bindings.get(local.name.as_str())
+                && self.proves_mixed_shorthand(file, local, &members, written, &evidence)
+            {
+                locals.extend(members);
+                locals
+            } else {
+                self.checked_class_argument_members(file, &members, &evidence.owners)
             };
-            if !self.proves_mixed_shorthand(file, local, &members, written, &evidence) {
+            if declarations.is_empty() {
                 continue;
             }
-            let exact = std::iter::once(*local)
-                .chain(members)
+            let exact = declarations
+                .into_iter()
+                .filter(|symbol| {
+                    !prior.is_some_and(|group| group.contains_key(&symbol.declaration_ordinal))
+                })
                 .map(|symbol| {
                     let ordinal = symbol.declaration_ordinal;
                     let id = local_group_identity(anchors.get(name)?, ordinal)?;
                     (!occupied.contains(&id)).then_some((ordinal, id))
                 })
                 .collect::<Option<BTreeMap<_, _>>>();
-            if let Some(exact) = exact {
+            if let Some(exact) = exact.filter(|exact| !exact.is_empty()) {
                 occupied.extend(exact.values().cloned());
-                placed.insert(name.to_owned(), exact);
+                placed.entry(name.to_owned()).or_default().extend(exact);
             }
         }
+    }
+
+    /// Keeps independent fields of a direct `this` argument under the written class method.
+    fn checked_class_argument_members(
+        &self,
+        file: &SelectedFile<'source>,
+        members: &[&'source SyntaxSymbol],
+        owners: &LiteralOwners<'source>,
+    ) -> Vec<&'source SyntaxSymbol> {
+        let mut bodies = BTreeMap::new();
+        for &symbol in members {
+            let Some(member) = self.body_members.get(&symbol.item_range) else {
+                continue;
+            };
+            let checked = ordinary_private_property(symbol, file.source)
+                && self.of(symbol, file) == Scope::Body(member.body, false)
+                && placed_function(owners, member.body, true).is_some_and(|method| {
+                    method.syntax_element_kind == Some("method_definition")
+                        && symbol.container.as_deref() == Some(method.qualified_name.as_str())
+                        && method.body_range.is_some_and(|body| {
+                            written_this_argument(file.source, owners, member, body)
+                        })
+                });
+            bodies
+                .entry(member.body)
+                .and_modify(|prior| *prior = None)
+                .or_insert(checked.then_some(symbol));
+        }
+        bodies.into_values().flatten().collect()
     }
 
     fn proves_mixed_shorthand(
@@ -354,6 +393,24 @@ fn direct_callable_argument(
             ) && call.callee_range.end <= member.holder.start
                 && call.range.encloses(member.holder)
                 && scope.encloses(call.range)
+                && !owners.bound_calls.contains(&call.range)
+        })
+    })
+}
+
+fn written_this_argument(
+    source: &str,
+    owners: &LiteralOwners<'_>,
+    member: &StaticBodyMember,
+    body: ByteRange,
+) -> bool {
+    owners.calls.get(&member.holder.end).is_some_and(|calls| {
+        calls.iter().any(|call| {
+            matches!(call.callee, StaticCallee::Member { receiver, .. }
+                if source_text(source, receiver) == Some("this"))
+                && call.callee_range.end <= member.holder.start
+                && call.range.encloses(member.holder)
+                && body.encloses(call.range)
                 && !owners.bound_calls.contains(&call.range)
         })
     })

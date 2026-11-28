@@ -101,8 +101,8 @@ mod wrapped_parameters;
 pub(crate) use conditional_type_members::check as checked_conditional_type_members;
 pub use inline_import_types::CheckedInlineTypeImport;
 pub(crate) use inline_import_types::check as checked_inline_import_types;
-pub use property_selectors::CheckedPropertySelector;
-pub(crate) use property_selectors::check as checked_property_selectors;
+pub use property_selectors::{CheckedKeyofBound, CheckedPropertySelector};
+pub(crate) use property_selectors::{check as checked_property_selectors, closed_keyof_members};
 pub(crate) use wrapped_parameters::arrow_body_with_wrapped_parameters;
 
 use tree_sitter::{Node, Parser};
@@ -428,6 +428,7 @@ pub(crate) struct EcmaScriptKinds {
     variable_declaration: u16,
     export_statement: u16,
     identifier: u16,
+    literal_property: [u16; 2],
     comment: u16,
     decorator: u16,
     /// `Some` on the TypeScript grammars; the JavaScript grammar spells no
@@ -559,6 +560,10 @@ impl EcmaScriptKinds {
             variable_declaration: kind_id(language, VARIABLE_DECLARATION_KIND),
             export_statement: kind_id(language, EXPORT_STATEMENT_KIND),
             identifier: kind_id(language, IDENTIFIER_KIND),
+            literal_property: [
+                kind_id(language, "string"),
+                kind_id(language, "string_fragment"),
+            ],
             comment: kind_id(language, COMMENT_KIND),
             decorator: kind_id(language, DECORATOR_KIND),
             accessibility_modifier: None,
@@ -1392,6 +1397,26 @@ pub(crate) struct EcmaScriptRules<'text> {
     exports: ModuleExports<'text>,
 }
 
+/// One unescaped written property name, excluding its quote delimiters.
+pub(crate) fn literal_property_fragment<'tree>(
+    key: Node<'tree>,
+    [string, fragment]: [u16; 2],
+    source: &str,
+) -> Option<Node<'tree>> {
+    if key.kind_id() != string || key.has_error() || key.named_child_count() != 1 {
+        return None;
+    }
+    let name = key
+        .named_child(0)
+        .filter(|node| node.kind_id() == fragment)?;
+    let value = source.get(name.byte_range())?;
+    (!value.is_empty()
+        && value.trim() == value
+        && !value.contains('.')
+        && !value.chars().any(char::is_control))
+    .then_some(name)
+}
+
 impl EcmaScriptRules<'_> {
     /// The name range of a named function a module-scope assignment gives to
     /// `module.exports`: the function is declared under the name it is written with.
@@ -1654,6 +1679,15 @@ impl EcmaScriptRules<'_> {
         let name = self.kinds.name_syntax_element(syntax_element)?;
         if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
             return None;
+        }
+        if matches!(
+            kind,
+            EcmaScriptSymbolKind::Field
+                | EcmaScriptSymbolKind::Method
+                | EcmaScriptSymbolKind::Property
+        ) && let Some(name) = literal_property_fragment(name, self.kinds.literal_property, text)
+        {
+            return text.get(name.byte_range()).map(Into::into);
         }
         text.get(name.byte_range()).map(Into::into)
     }
@@ -2206,11 +2240,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
         if !kind.opens_scope() {
             return None;
         }
-        let name = self.kinds.name_syntax_element(syntax_element)?;
-        if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
-            return None;
-        }
-        text.get(name.byte_range()).map(Into::into)
+        self.declaration_name(syntax_element, kind, text)
     }
 
     /// A constructor parameter property belongs to the class: it drops the

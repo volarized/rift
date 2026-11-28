@@ -584,6 +584,18 @@ impl EdgePythonKinds {
                         names.direct_binding(source, name, scope_range, scope_range.start, kind);
                     }
                 }
+                if scope.kind_id() == self.scopes[3]
+                    && !scope.has_error()
+                    && crate::python::parameter_name(parameter) == Some(name)
+                    && let Some(body) = scope.child_by_field_id(self.body)
+                {
+                    names.body_binding(
+                        source,
+                        byte_range(name)?,
+                        self.scope_range(scope)?,
+                        byte_range(body)?,
+                    );
+                }
                 facts.bindings.push(self.scoped_binding(
                     name,
                     scope,
@@ -838,7 +850,7 @@ impl EdgePythonKinds {
         while let Some((target, place)) = pending.pop() {
             if target.kind_id() == self.identifier {
                 if let Some(body) = loop_body {
-                    names.loop_binding(source, byte_range(target)?, self.scope_range(scope)?, body);
+                    names.body_binding(source, byte_range(target)?, self.scope_range(scope)?, body);
                 }
                 let kind = self.edge_assignment_kind(visited, target, place)?;
                 let available = match kind {

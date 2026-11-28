@@ -11,10 +11,82 @@ use rift_syntax::{
 
 use super::{
     FileScopes, SelectedFile, binding_name, conflicting_assignment_name, literal_property_identity,
-    ordinary_private_property, unique_declarations,
+    local_group_identity, ordinary_private_property, unique_declarations,
 };
 
 impl<'source> FileScopes<'source> {
+    /// Places written object keys independently of the lexical bindings their arrows read.
+    pub(in crate::analyzer::namespace::typescript::internal_modules) fn place_module_arrow_properties(
+        &self,
+        file: &SelectedFile<'source>,
+        repeated: &BTreeSet<&str>,
+        anchors: &BTreeMap<String, SymbolId>,
+        placed: &mut ScopedIdentityAnchors,
+    ) {
+        if repeated.is_empty()
+            || file.syntax.language().name != "javascript"
+            || file.syntax.has_errors()
+            || file.syntax.left_out_declaration_count() != 0
+        {
+            return;
+        }
+        let mut properties = BTreeMap::new();
+        for symbol in file.syntax.symbols() {
+            let name = symbol.qualified_name.as_str();
+            let Some(member) = self.body_members.get(&symbol.item_range) else {
+                continue;
+            };
+            if repeated.contains(name)
+                && anchors.contains_key(name)
+                && symbol.container.is_none()
+                && ordinary_private_property(symbol, file.source)
+            {
+                properties
+                    .entry((member.body, name))
+                    .and_modify(|prior| *prior = None)
+                    .or_insert(Some(symbol));
+            }
+        }
+        let selected = properties
+            .values()
+            .flatten()
+            .filter(|symbol| {
+                !placed
+                    .get(&symbol.qualified_name)
+                    .is_some_and(|group| group.contains_key(&symbol.declaration_ordinal))
+            })
+            .map(|symbol| symbol.item_range)
+            .collect();
+        let checked = JavaScriptSyntaxProvider::module_arrow_argument_properties(
+            file.source,
+            file.syntax.syntax_limits().unwrap_or_default(),
+            &selected,
+        );
+        if checked.is_empty() {
+            return;
+        }
+        let mut occupied = anchors
+            .values()
+            .chain(placed.values().flat_map(BTreeMap::values))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for property in properties.into_values().flatten() {
+            let ordinal = property.declaration_ordinal;
+            let name = &property.qualified_name;
+            if checked.contains(&property.item_range)
+                && let Some(identity) = anchors
+                    .get(name)
+                    .and_then(|id| local_group_identity(id, ordinal))
+                && occupied.insert(identity.clone())
+            {
+                placed
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(ordinal, identity);
+            }
+        }
+    }
+
     /// Keeps a checked lexical declaration and its class members at their written ordinals.
     pub(in crate::analyzer::namespace::typescript::internal_modules) fn place_disjoint_module_bindings(
         &self,

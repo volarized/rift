@@ -272,6 +272,36 @@ pub(super) struct FileScopes<'source> {
     namespaces: BTreeSet<(&'source str, u64)>,
 }
 
+#[derive(Default)]
+struct ModuleArgumentBindings {
+    local: BTreeSet<ByteRange>,
+    required: BTreeSet<ByteRange>,
+    writes: BTreeSet<String>,
+}
+
+impl ModuleArgumentBindings {
+    fn captured(source: &str, facts: &StaticFacts) -> Self {
+        let mut bound = Self::default();
+        for binding in facts.bindings() {
+            match binding.kind {
+                StaticBindingKind::Local | StaticBindingKind::JavaScriptClassValue { .. } => {
+                    bound.local.insert(binding.name);
+                }
+                StaticBindingKind::JavaScriptRequire { .. } => {
+                    bound.required.insert(binding.name);
+                }
+                _ => {}
+            }
+        }
+        bound.writes = facts
+            .assignments()
+            .iter()
+            .filter_map(|&range| binding_name(source, range))
+            .collect();
+        bound
+    }
+}
+
 impl<'source> FileScopes<'source> {
     pub(super) fn new(syntax: &'source SyntaxFacts, source: &str) -> Self {
         let facts = syntax.static_facts();
@@ -365,7 +395,7 @@ impl<'source> FileScopes<'source> {
         repeated
     }
 
-    /// Keeps an authored module binding and scopes a same-named direct argument property.
+    /// Keeps an authored binding beside a same-named object key.
     pub(super) fn separate_module_argument_properties(
         &self,
         file: &SelectedFile<'source>,
@@ -387,42 +417,27 @@ impl<'source> FileScopes<'source> {
                 groups.entry(name).or_default().push(symbol);
             }
         }
-        let bound = facts
-            .bindings()
-            .iter()
-            .filter(|binding| {
-                matches!(
-                    binding.kind,
-                    StaticBindingKind::Local | StaticBindingKind::JavaScriptClassValue { .. }
-                )
-            })
-            .map(|binding| binding.name)
-            .collect::<BTreeSet<_>>();
-        let written = facts
-            .assignments()
-            .iter()
-            .filter_map(|&range| binding_name(file.source, range))
-            .collect::<BTreeSet<_>>();
+        let bound = ModuleArgumentBindings::captured(file.source, facts);
+        let mut physical = BTreeMap::new();
         let candidates = groups
             .into_iter()
             .filter_map(|(name, group)| {
                 let [a, b] = group.as_slice() else {
                     return None;
                 };
-                let (binding, property) = if ordinary_private_property(a, file.source) {
+                let (binding, property) = if a.syntax_element_kind == Some("pair") {
                     (*b, *a)
                 } else {
                     (*a, *b)
                 };
-                if !ordinary_private_property(property, file.source)
-                    || property.syntax_element_kind != Some("pair")
+                let binding_name = binding.name_range?;
+                if property.syntax_element_kind != Some("pair")
                     || !matches!(
                         binding.syntax_element_kind,
                         Some("class_declaration" | "variable_declarator")
                     )
                     || binding.is_ecmascript_package_binding()
-                    || !bound.contains(&binding.name_range?)
-                    || written.contains(binding.name.as_str())
+                    || bound.writes.contains(binding.name.as_str())
                     || !self.body_members.contains_key(&property.item_range)
                 {
                     return None;
@@ -433,8 +448,26 @@ impl<'source> FileScopes<'source> {
                 {
                     return None;
                 }
-                let identity =
-                    local_group_identity(anchors.get(name)?, property.declaration_ordinal)?;
+                let original = anchors.get(name)?;
+                if nested.is_none()
+                    && binding.syntax_element_kind == Some("variable_declarator")
+                    && (bound.local.contains(&binding_name)
+                        || bound.required.contains(&binding_name))
+                    && quoted_private_property(property, file.source)
+                {
+                    // The key has no checked owner, so only the lexical declaration keeps the name.
+                    physical.insert(
+                        name.to_owned(),
+                        BTreeMap::from([(binding.declaration_ordinal, original.clone())]),
+                    );
+                    return None;
+                }
+                if !bound.local.contains(&binding_name)
+                    || !ordinary_private_property(property, file.source)
+                {
+                    return None;
+                }
+                let identity = local_group_identity(original, property.declaration_ordinal)?;
                 Some((
                     property.item_range,
                     (name, property.declaration_ordinal, identity, nested),
@@ -459,7 +492,6 @@ impl<'source> FileScopes<'source> {
             &nested,
         );
         let mut occupied = anchors.values().cloned().collect::<BTreeSet<_>>();
-        let mut physical = BTreeMap::new();
         for (range, (name, ordinal, identity, _)) in candidates {
             if accepted.contains(&range) && occupied.insert(identity.clone()) {
                 repeated.remove(name);
@@ -564,7 +596,7 @@ impl<'source> FileScopes<'source> {
                 &mut occupied,
                 &mut scoped,
             );
-            self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped);
+            self.scope_nested_properties(file, repeated, anchors, &mut occupied, &mut scoped, None);
             self.scope_named_function_arguments(
                 file,
                 repeated,
@@ -585,6 +617,7 @@ impl<'source> FileScopes<'source> {
         anchors: &BTreeMap<String, SymbolId>,
         occupied: &mut BTreeSet<SymbolId>,
         scoped: &mut ScopedIdentityAnchors,
+        mut placed_parents: Option<&mut BTreeSet<ByteRange>>,
     ) {
         let properties = file
             .syntax
@@ -633,7 +666,10 @@ impl<'source> FileScopes<'source> {
         }
         // Parent pairs start before their literal's members.
         for (parent, child, body, array) in members.into_values() {
-            if counts.get(&(body, child.name.as_str())) != Some(&1)
+            if placed_parents
+                .as_ref()
+                .is_some_and(|parents| !parents.contains(&parent.item_range))
+                || counts.get(&(body, child.name.as_str())) != Some(&1)
                 || scoped
                     .get(&child.qualified_name)
                     .is_some_and(|group| group.contains_key(&child.declaration_ordinal))
@@ -663,6 +699,9 @@ impl<'source> FileScopes<'source> {
                 continue;
             };
             if occupied.insert(id.clone()) {
+                if let Some(parents) = placed_parents.as_mut() {
+                    parents.insert(child.item_range);
+                }
                 scoped
                     .entry(child.qualified_name.clone())
                     .or_default()
@@ -1871,6 +1910,20 @@ fn ordinary_private_property(symbol: &SyntaxSymbol, source: &str) -> bool {
         source.get(start..end)
     });
     name.is_some_and(|name| name == symbol.name && !name.contains(['"', '\'', '`']))
+}
+
+fn quoted_private_property(symbol: &SyntaxSymbol, source: &str) -> bool {
+    if symbol.kind != "property" || symbol.kinds.contains(&SymbolKind::Public) {
+        return false;
+    }
+    symbol.name_range.is_some_and(|range| {
+        let spelling = usize::try_from(range.start)
+            .ok()
+            .zip(usize::try_from(range.end).ok())
+            .and_then(|(start, end)| source.get(start..end));
+        spelling.is_some_and(|name| name.starts_with(['\'', '"']))
+            && binding_name(source, range).as_deref() == Some(symbol.name.as_str())
+    })
 }
 
 /// Whether a type literal or an interface declares the member.

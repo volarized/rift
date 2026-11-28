@@ -196,15 +196,15 @@ fn is_unique_key(
 
 fn authored_key(source: &str, property: &SyntaxSymbol) -> Option<String> {
     let name = property.name_range?;
+    let key = binding_name(source, name)?;
     (property.kind == "property"
         && matches!(
             property.syntax_element_kind,
             Some("pair" | "shorthand_property_identifier")
         )
-        && range_text(source, name)? == property.name
+        && (key == property.name || range_text(source, name)? == property.name)
         && !property.name.starts_with('['))
-    .then(|| binding_name(source, name))
-    .flatten()
+    .then_some(key)
 }
 
 fn range_text(source: &str, range: ByteRange) -> Option<&str> {

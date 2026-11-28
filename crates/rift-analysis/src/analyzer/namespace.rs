@@ -385,8 +385,15 @@ fn identity_anchors_with_roots(
             let Some(name) = python_declaration_name(symbol) else {
                 continue;
             };
-            let names = if symbol.is_python_comprehension_binding() {
-                let Some(names) = python_comprehension_path(symbol, &name) else {
+            let expression = if symbol.is_python_comprehension_binding() {
+                Some("$comprehension#")
+            } else if symbol.is_python_lambda_parameter() {
+                Some("$lambda#")
+            } else {
+                None
+            };
+            let names = if let Some(expression) = expression {
+                let Some(names) = python_expression_binding_path(symbol, &name, expression) else {
                     continue;
                 };
                 names
@@ -491,15 +498,16 @@ fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String>
     }
 }
 
-/// The checked source scope before a comprehension's ordinary Python binding name.
-fn python_comprehension_path<'a>(
+/// The checked expression scope before its ordinary Python binding name.
+fn python_expression_binding_path<'a>(
     symbol: &'a rift_syntax::SyntaxSymbol,
     ordinary: &str,
+    expression: &str,
 ) -> Option<Vec<&'a str>> {
     let parent = ordinary.strip_suffix(symbol.name.as_str())?;
     let prefix = symbol.qualified_name.strip_prefix(parent)?;
     let (scope, name) = prefix.split_once('.')?;
-    let position = scope.strip_prefix("$comprehension#")?;
+    let position = scope.strip_prefix(expression)?;
     if name != symbol.name.as_str()
         || position.is_empty()
         || !position.bytes().all(|byte| byte.is_ascii_digit())

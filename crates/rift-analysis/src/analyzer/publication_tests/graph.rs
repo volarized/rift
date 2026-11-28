@@ -444,6 +444,90 @@ fn package_python_method_receiver_reads_follow_earlier_edges() {
 }
 
 #[test]
+fn package_python_lambda_parameters_keep_their_own_body_reads() {
+    const SOURCE: &str = concat!(
+        "def target(): return 0\n",
+        "def observed(values):\n",
+        "    direct = lambda target=target: target\n",
+        "    return direct(values), sorted(values, key=lambda target: target[0])\n",
+    );
+    let files = [("click.py", SOURCE)];
+    let result = publication(&files, None, &["click"]);
+    let offset = |written, prefix| {
+        u64::try_from(SOURCE.find(written).expect("written site") + prefix).expect("offset")
+    };
+    let sites = [
+        (
+            offset("lambda target=", 7),
+            offset("target=target: target", 15),
+        ),
+        (offset("lambda target:", 7), offset("target: target[0]", 8)),
+    ];
+    let mut parameters = std::collections::BTreeSet::new();
+    for (start, read) in sites {
+        let declaration = result
+            .declarations
+            .iter()
+            .find(|entry| {
+                entry.range.start == start
+                    && entry.range.end == start + 6
+                    && entry.source == "target"
+            })
+            .expect("authored lambda parameter");
+        let reads = result
+            .edges
+            .iter()
+            .filter(|edge| edge.to == declaration.symbol && edge.kinds == [EdgeKind::Reads])
+            .map(|edge| {
+                assert!(edge.from.as_str().ends_with("/observed"));
+                let site = edge.occurrence.as_ref().expect("written read");
+                (site.range.start, site.range.end)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads, [(read, read + 6)]);
+        assert!(parameters.insert(&declaration.symbol));
+    }
+    let default = offset("target=target:", 7);
+    assert!(result.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.to.as_str() == "rift://symbol/pypi/pypi.org/click/python/click/target"
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|site| site.range.start == default)
+    }));
+    let declarations = result
+        .declarations
+        .iter()
+        .filter(|entry| !parameters.contains(&entry.symbol))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        declarations
+            .iter()
+            .any(|entry| entry.symbol.as_str().ends_with("/observed/direct"))
+    );
+    let edges = result
+        .edges
+        .iter()
+        .filter(|edge| !parameters.contains(&edge.to))
+        .cloned()
+        .collect::<Vec<_>>();
+    let capped = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: u32::try_from(declarations.len()).expect("declaration count"),
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+        Some(edges.len()),
+    );
+    assert_eq!(capped.declarations, declarations);
+    assert_eq!(capped.edges, edges);
+}
+
+#[test]
 fn package_python_assignment_expressions_keep_the_target_and_reads() {
     const SOURCE: &str = concat!(
         "def target(): return 0\n",

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_core::ProjectPath;
 use rift_protocol::read::ProjectPath as ObservationPath;
 
-use super::{PackageMetadata, entry_path, export_subpath_is_valid};
+use super::{Loader, PackageMetadata, entry_path, export_subpath_is_valid};
 use crate::static_resolution::{declared_extensions, is_declaration_file};
 use crate::{ArchiveMemberKind, NamespaceInput, PackageSource};
 
@@ -193,6 +193,55 @@ impl<'input> PackageFiles<'input> {
             types_candidates(&path)?
         };
         self.unique_declaration(candidates)
+    }
+
+    /// Resolves a captured runtime file at a written relative specifier. A `CommonJS`
+    /// extensionless request can name a single captured JavaScript file or its directory index.
+    pub(super) fn relative_runtime(
+        &self,
+        from: &ProjectPath,
+        specifier: &str,
+        loader: Loader,
+    ) -> Option<ProjectPath> {
+        if !(specifier.starts_with("./") || specifier.starts_with("../"))
+            || specifier.contains(['%', '?', '#'])
+            || specifier.contains("//")
+            || specifier.ends_with('/')
+        {
+            return None;
+        }
+        let directory = from
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        let path = folder_path(directory, specifier)?;
+        if !export_subpath_is_valid(&path) {
+            return None;
+        }
+        if self.presence(&path) == Presence::File {
+            return ProjectPath::new(path).ok();
+        }
+        if loader != Loader::CommonJs || std::path::Path::new(&path).extension().is_some() {
+            return None;
+        }
+        if self.observed.is_some_and(|observed| {
+            matches!(
+                observed.get(&ObservationPath(path.clone())),
+                Some(Some(ArchiveMemberKind::Link))
+            )
+        }) || self.presence(&format!("{path}/package.json")) == Presence::File
+        {
+            return None;
+        }
+        let mut candidates = [format!("{path}.js"), format!("{path}/index.js")]
+            .into_iter()
+            .filter(|candidate| self.presence(candidate) == Presence::File);
+        let target = candidates.next()?;
+        candidates
+            .next()
+            .is_none()
+            .then(|| ProjectPath::new(target).ok())
+            .flatten()
     }
 
     fn unique_declaration(

@@ -1,14 +1,28 @@
 //! Property selectors in written TypeScript declarations.
 
+mod keyof;
+
 use std::collections::BTreeMap;
 
 use rift_error::errors;
-use tree_sitter::{Language, Node};
+use tree_sitter::{Language, Node, Tree};
 
 use crate::extract::{byte_range, push_named_children};
 use crate::{ByteRange, SyntaxLimits, SyntaxSource, failure::RiftError};
 
 use super::parser_for_ranges;
+
+/// The syntax that bounds the index to the written object's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedKeyofBound {
+    /// The type parameter declares the bound directly.
+    Parameter,
+    /// A conditional's true branch provides the bound.
+    TrueBranch {
+        /// The read of the type parameter in the conditional test.
+        key: ByteRange,
+    },
+}
 
 /// A property selector with its checked written type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +32,23 @@ pub enum CheckedPropertySelector {
         /// The written type name.
         owner: ByteRange,
         /// The written property name, excluding its quotes.
+        selector: ByteRange,
+    },
+    /// A literal member of an object indexed through its own checked `keyof` bound.
+    KeyofIndexedAccess {
+        /// The written object type in the indexed access.
+        owner: ByteRange,
+        /// The object type stated in the bound.
+        bound: ByteRange,
+        /// The read of the index type parameter.
+        key: ByteRange,
+        /// The declaration of the index type parameter.
+        parameter: ByteRange,
+        /// The source of the checked bound.
+        proof: CheckedKeyofBound,
+        /// The property name, excluding its quotes.
+        member: ByteRange,
+        /// The complete literal at the final index, including its quotes.
         selector: ByteRange,
     },
     /// A destructured parameter names a property in its own object annotation.
@@ -36,6 +67,7 @@ struct Kinds {
     string: u16,
     fragment: u16,
     parameters: ParameterKinds,
+    keyof: keyof::Kinds,
 }
 
 impl Kinds {
@@ -48,17 +80,19 @@ impl Kinds {
             string: named("string"),
             fragment: named("string_fragment"),
             parameters: ParameterKinds::resolve(grammar),
+            keyof: keyof::Kinds::resolve(grammar),
         }
     }
 
-    fn indexed<'tree>(&self, indexed: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    fn indexed<'tree>(
+        &self,
+        indexed: Node<'tree>,
+    ) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>)> {
         let mut cursor = indexed.walk();
         let mut parts = indexed
             .named_children(&mut cursor)
             .filter(|node| !node.is_extra());
-        let owner = parts
-            .next()
-            .filter(|node| self.owners.contains(&node.kind_id()))?;
+        let owner = parts.next()?;
         let literal = parts.next().filter(|node| node.kind_id() == self.literal)?;
         if parts.next().is_some() {
             return None;
@@ -70,7 +104,8 @@ impl Kinds {
             .named_child(0)
             .filter(|node| node.kind_id() == self.fragment)?;
         // One source fragment states the name without decoding an escape sequence.
-        (string.named_child_count() == 1 && !fragment.is_missing()).then_some((owner, fragment))
+        (string.named_child_count() == 1 && !fragment.is_missing())
+            .then_some((owner, string, fragment))
     }
 }
 
@@ -182,11 +217,7 @@ pub(crate) fn check(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
 ) -> Result<Vec<CheckedPropertySelector>, RiftError> {
-    limits.admit_source(source)?;
-    let mut parser = parser_for_ranges(grammar, &[])?;
-    let tree = parser
-        .parse(source.text, None)
-        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    let tree = parse(grammar, source, limits)?;
     let root = tree.root_node();
     if root.has_error() {
         return Ok(Vec::new());
@@ -204,16 +235,53 @@ pub(crate) fn check(
         }
         left -= 1;
         if node.kind_id() == kinds.indexed
-            && let Some((owner, selector)) = kinds.indexed(node)
+            && let Some((owner, selector, member)) = kinds.indexed(node)
         {
-            selected.push(CheckedPropertySelector::IndexedAccess {
-                owner: byte_range(owner)?,
-                selector: byte_range(selector)?,
-            });
+            if kinds.owners.contains(&owner.kind_id()) {
+                selected.push(CheckedPropertySelector::IndexedAccess {
+                    owner: byte_range(owner)?,
+                    selector: byte_range(member)?,
+                });
+            } else if owner.kind_id() == kinds.indexed {
+                selected.extend(kinds.keyof.select(
+                    owner,
+                    selector,
+                    member,
+                    source.text,
+                    limits.syntax_depth_max(),
+                )?);
+            }
         } else if kinds.parameters.declarations.contains(&node.kind_id()) {
             kinds.parameters.append(node, source.text, &mut selected)?;
         }
         push_named_children(&mut pending, &mut cursor, node, |child| (child, depth + 1));
     }
     Ok(selected)
+}
+
+pub(crate) fn closed_keyof_members(
+    grammar: &Language,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    owner: ByteRange,
+    member: &str,
+) -> Result<Option<Vec<ByteRange>>, RiftError> {
+    let tree = parse(grammar, source, limits)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(None);
+    }
+    keyof::Kinds::resolve(grammar).closed_members(root, owner, member, source.text, limits)
+}
+
+fn parse(
+    grammar: &Language,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+) -> Result<Tree, RiftError> {
+    limits.admit_source(source)?;
+    let mut parser = parser_for_ranges(grammar, &[])?;
+    parser
+        .parse(source.text, None)
+        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())
 }

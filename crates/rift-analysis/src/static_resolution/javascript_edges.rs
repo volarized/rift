@@ -1331,7 +1331,7 @@ impl<'source> Index<'source> {
                     break 'files;
                 }
                 if sites.remove(&call.range)
-                    && let Some(module) = Self::commonjs_literal_require(file, call)
+                    && let Some(module) = commonjs_literal_require(file.document.source, call)
                     && self.builtin_require(file, call.callee_range.start, work)
                     && let Some(imported) =
                         self.javascript_module_specifier(file, module, true, work)
@@ -1395,7 +1395,7 @@ impl<'source> Index<'source> {
                 if symbol.syntax_element_kind == Some("pair")
                     && pairs.contains(&symbol.item_range)
                     && let Some(Some(call)) = symbol.body_range.and_then(|body| calls.get(&body))
-                    && let Some(module) = Self::commonjs_literal_require(file, call)
+                    && let Some(module) = commonjs_literal_require(file.document.source, call)
                     && self.builtin_require(file, call.callee_range.start, work)
                     && let Some(imported) =
                         self.javascript_module_specifier(file, module, true, work)
@@ -1404,42 +1404,6 @@ impl<'source> Index<'source> {
                 }
             }
         }
-    }
-
-    /// The unquoted relative specifier in a captured direct call with one string argument.
-    fn commonjs_literal_require(file: &File<'source>, call: &StaticCall) -> Option<ByteRange> {
-        if call.callee != StaticCallee::Direct || file.text(call.callee_range)? != "require" {
-            return None;
-        }
-        let start = call.callee_range.end;
-        let tail = file.text(ByteRange {
-            start,
-            end: call.range.end,
-        })?;
-        let arguments = tail
-            .trim_ascii_start()
-            .strip_prefix('(')?
-            .strip_suffix(')')?;
-        let value = arguments.trim_ascii();
-        let [quote, bytes @ .., close] = value.as_bytes() else {
-            return None;
-        };
-        if quote != close
-            || !matches!(quote, b'\'' | b'"')
-            || !(bytes.starts_with(b"./") || bytes.starts_with(b"../"))
-            || bytes
-                .iter()
-                .any(|byte| byte == quote || *byte == b'\\' || byte.is_ascii_control())
-        {
-            return None;
-        }
-        let opening =
-            tail.len() - arguments.len() + arguments.len() - arguments.trim_ascii_start().len();
-        let start = start.checked_add(u64::try_from(opening).ok()?)?;
-        Some(ByteRange {
-            start,
-            end: start.checked_add(u64::try_from(bytes.len()).ok()?)?,
-        })
     }
 
     /// Retains a checked relative import at the written module specifier.
@@ -1630,4 +1594,43 @@ impl Target<'_> {
             .is_none()
             && placement.logical_identity_for_symbol(self.symbol).is_some()
     }
+}
+
+/// The unquoted relative specifier in a captured direct call with one string argument.
+pub(crate) fn commonjs_literal_require(source: &str, call: &StaticCall) -> Option<ByteRange> {
+    let text = |range: ByteRange| {
+        source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+    };
+    if call.callee != StaticCallee::Direct || text(call.callee_range)? != "require" {
+        return None;
+    }
+    let start = call.callee_range.end;
+    let tail = text(ByteRange {
+        start,
+        end: call.range.end,
+    })?;
+    let arguments = tail
+        .trim_ascii_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    let value = arguments.trim_ascii();
+    let [quote, bytes @ .., close] = value.as_bytes() else {
+        return None;
+    };
+    if quote != close
+        || !matches!(quote, b'\'' | b'"')
+        || !(bytes.starts_with(b"./") || bytes.starts_with(b"../"))
+        || bytes
+            .iter()
+            .any(|byte| byte == quote || *byte == b'\\' || byte.is_ascii_control())
+    {
+        return None;
+    }
+    let opening =
+        tail.len() - arguments.len() + arguments.len() - arguments.trim_ascii_start().len();
+    let start = start.checked_add(u64::try_from(opening).ok()?)?;
+    Some(ByteRange {
+        start,
+        end: start.checked_add(u64::try_from(bytes.len()).ok()?)?,
+    })
 }

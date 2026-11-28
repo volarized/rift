@@ -10,13 +10,15 @@ use crate::static_resolution::is_declaration_file;
 use rift_syntax::ScopedIdentityAnchors;
 use serde::Deserialize;
 
+mod private_imports;
 mod scopes;
 pub(super) use scopes::{class_member_identities, private_local_identities};
 
 /// Names every remaining selected source by its package-relative path.
 ///
-/// An entry or observed file keeps its module. A source of a nested package takes none, and
-/// a path that another file's module or an `exports` subpath spells stays with that one.
+/// An entry or observed file keeps its module. A nested package can supply files reached
+/// through an exact private import. A path that another file's module or an `exports`
+/// subpath spells stays with that one.
 /// With an `exports` map no consumer reaches these files by path, so their declarations are
 /// public only through an alias of a file that a consumer reaches. A name the file declares
 /// in more than one scope takes no identity, since one path would name distinct declarations.
@@ -32,6 +34,7 @@ pub(super) fn prepare(
         return;
     }
     let foreign = foreign_directories(input, &metadata.name);
+    let private = private_imports::reached_modules(input, files, selected, &foreign, metadata);
     let mut modules = held_modules(prepared);
     let relative_types = metadata
         .exports
@@ -56,7 +59,7 @@ pub(super) fn prepare(
         if !supported
             || entries.contains(&(language.name.as_str(), file.path.clone()))
             || !selected_source_is_valid(input, file)
-            || is_foreign(file.path.as_str(), &foreign)
+            || (is_foreign(file.path.as_str(), &foreign) && !private.contains(file.path))
         {
             continue;
         }
@@ -100,7 +103,7 @@ pub(super) fn prepare(
                     .extend(physical);
             }
             modules.insert((language.name.clone(), module), Some(path.to_owned()));
-            if metadata.exports.is_some() || script {
+            if metadata.exports.is_some() || script || private.contains(file.path) {
                 prepared
                     .unreached_modules
                     .insert(path.to_owned(), ambient.into_keys().collect());
@@ -142,8 +145,9 @@ fn module_scoped_anchors(
     scopes.place_mixed_shorthand(file, &withheld, anchors, &mut physical);
     scopes.place_checked_method_return_pairs(file, &withheld, anchors, &mut physical);
     scopes.place_module_assignment_shorthand(file, &withheld, anchors, &mut physical);
-    scopes.place_scoped_initializer_children(file, anchors, &mut physical);
+    scopes.place_scoped_initializer_children(file, &withheld, anchors, &mut physical);
     scopes.place_disjoint_module_bindings(file, &withheld, anchors, &mut physical);
+    scopes.place_module_arrow_properties(file, &withheld, anchors, &mut physical);
     anchors.retain(|name, _| {
         ambient.contains_key(name)
             || class_members.contains_key(name)
@@ -241,26 +245,7 @@ fn relative_type_modules(
         if !visited.insert(file.path) {
             continue;
         }
-        let reexports = file
-            .syntax
-            .export_bindings()
-            .unwrap_or_default()
-            .iter()
-            .filter(|binding| binding.container.is_none())
-            .filter_map(|binding| binding.source);
-        let imports = file
-            .syntax
-            .static_facts()
-            .into_iter()
-            .flat_map(rift_syntax::StaticFacts::typescript_module_imports)
-            .copied();
-        for range in reexports.chain(imports).collect::<BTreeSet<_>>() {
-            let Some(specifier) = observations::literal_module_name(file.source, range) else {
-                continue;
-            };
-            let Some(path) = files.relative_declaration(file.path, &specifier) else {
-                continue;
-            };
+        for path in declaration_targets(file, files) {
             let Some(next) = declarations.get(&path).copied() else {
                 continue;
             };
@@ -278,6 +263,33 @@ fn relative_type_modules(
         }
     }
     relative
+}
+
+fn declaration_targets<'a>(
+    file: &'a SelectedFile<'_>,
+    files: &'a PackageFiles<'_>,
+) -> impl Iterator<Item = ProjectPath> + 'a {
+    let reexports = file
+        .syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter(|binding| binding.container.is_none())
+        .filter_map(|binding| binding.source);
+    let imports = file
+        .syntax
+        .static_facts()
+        .into_iter()
+        .flat_map(rift_syntax::StaticFacts::typescript_module_imports)
+        .copied();
+    reexports
+        .chain(imports)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|range| {
+            let specifier = observations::literal_module_name(file.source, range)?;
+            files.relative_declaration(file.path, &specifier)
+        })
 }
 
 /// Whether a TypeScript file is no module: what it declares belongs to the global scope and
@@ -321,6 +333,8 @@ fn held_modules(prepared: &PreparedNamespace) -> BTreeMap<(String, String), Opti
 #[derive(Deserialize)]
 struct NestedManifest {
     name: Option<String>,
+    #[serde(rename = "type")]
+    module_type: Option<serde_json::Value>,
 }
 
 /// Directories below the package root whose own manifest names another package, or cannot

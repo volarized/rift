@@ -4,6 +4,181 @@ use super::*;
 use rift_protocol::read::{EdgeDerivation, EdgeProvider};
 
 #[test]
+fn declaration_keyof_index_recovers_every_checked_nested_member() {
+    const ROUTES: &str = concat!(
+        "export interface Routes {\n",
+        "  \"/one\": { response: number; parameters: boolean };\n",
+        "  \"/two\": { response: string; parameters: boolean };\n",
+        "}\n",
+        "export interface Other { \"/one\": { response: number }; }\n",
+        "export interface Open { [route: string]: { response: number }; one: { response: number }; }\n",
+        "export interface Incomplete { one: { response: number }; two: { parameters: number }; }\n",
+    );
+    const USE: &str = concat!(
+        "import type { Routes, Other, Open, Incomplete } from './routes.js';\n",
+        "export interface Pager {\n",
+        "  <R extends keyof Routes>(route: R): Promise<Routes[R][\"response\"]>;\n",
+        "}\n",
+        "export type Arguments<R extends keyof Routes> = Routes[R][\"parameters\"];\n",
+        "export type Wrong<R extends keyof Other> = Routes[R][\"response\"];\n",
+        "export type Dynamic<R extends keyof Open> = Open[R][\"response\"];\n",
+        "export type Absent<R extends keyof Incomplete> = Incomplete[R][\"response\"];\n",
+        "export type Shadow<R extends keyof Routes> = { <R extends keyof Other>(): Routes[R][\"response\"]; };\n",
+    );
+    for (prefix, declaration) in [(ROUTES, "index.d.ts"), ("", "routes.d.ts")] {
+        let use_text = if declaration == "index.d.ts" {
+            USE.split_once('\n').expect("relative import line").1
+        } else {
+            USE
+        };
+        let source = format!("{prefix}{use_text}");
+        let mut files = vec![("index.d.ts", source.as_str())];
+        if declaration == "routes.d.ts" {
+            files.push((declaration, ROUTES));
+        }
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some((
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+            )),
+        )
+        .expect("checked declarations");
+        let graph = result.publication();
+        graph.validate_facts().expect("checked graph");
+        let unit = &graph
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == "index.d.ts")
+            .expect("use unit")
+            .unit;
+        for (line, member, target_count) in [
+            ("<R extends keyof Routes>(route:", "response", 2),
+            ("export type Arguments<", "parameters", 2),
+            ("export type Wrong<", "response", 0),
+            ("export type Dynamic<", "response", 0),
+            ("export type Absent<", "response", 0),
+            ("export type Shadow<", "response", 0),
+        ] {
+            let start = source.find(line).expect("written declaration");
+            let token = format!("\"{member}\"");
+            let begin = start + source[start..].find(&token).expect("written selector");
+            let range = TextRange {
+                start: u64::try_from(begin).expect("start"),
+                end: u64::try_from(begin + token.len()).expect("end"),
+            };
+            let references = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kinds == [EdgeKind::References]
+                        && edge
+                            .occurrence
+                            .as_ref()
+                            .is_some_and(|site| &site.unit == unit && site.range == range)
+                        && edge.to.as_str().ends_with(&format!("/{member}"))
+                })
+                .map(|edge| edge.to.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                references.len(),
+                target_count,
+                "{declaration} {line}: {references:?}"
+            );
+            if target_count > 0 {
+                for route in ["/one", "/two"] {
+                    let expected = ["Routes".to_owned(), route.to_owned(), member.to_owned()];
+                    assert!(
+                        references.iter().any(|target| {
+                            rift_protocol::identity::SymbolIdentity::parse(target)
+                                .expect("checked member identity")
+                                .qualified_path()
+                                .ends_with(&expected)
+                        }),
+                        "{declaration} {line}: {references:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_keyof_selectors_follow_the_matching_true_branch() {
+    const SOURCE: &str = concat!(
+        "interface Routes { one: { response: number }; two: { response: string }; }\n",
+        "interface Other { three: { response: number }; }\n",
+        "declare namespace Request { type Route = string; }\n",
+        "export type Positive<R extends string> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+        "export type Opaque<R extends Request.Route> = R extends keyof Routes ? Promise<Routes[R][\"response\"]> : never;\n",
+        "export type False<R> = R extends keyof Routes ? never : Routes[R][\"response\"];\n",
+        "export type WrongObject<R> = R extends keyof Other ? Routes[R][\"response\"] : never;\n",
+        "export type WrongKey<R, S> = S extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+        "export type Shadow<R> = R extends keyof Routes ? { <R>(): Routes[R][\"response\"]; } : never;\n",
+        "export type Impossible<R extends false> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+        "export type Narrow<R extends 'one'> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#,
+        )),
+    )
+    .expect("checked declarations");
+    let graph = result.publication();
+    graph.validate_facts().expect("checked graph");
+    for (name, count) in [
+        ("Positive", 2),
+        ("Opaque", 2),
+        ("False", 0),
+        ("WrongObject", 0),
+        ("WrongKey", 0),
+        ("Shadow", 0),
+        ("Impossible", 0),
+        ("Narrow", 0),
+    ] {
+        let declaration = SOURCE.find(name).expect("type name");
+        let token = "\"response\"";
+        let start = declaration + SOURCE[declaration..].find(token).expect("selector");
+        let range = TextRange {
+            start: u64::try_from(start).expect("start"),
+            end: u64::try_from(start + token.len()).expect("end"),
+        };
+        let targets = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kinds == [EdgeKind::References]
+                    && edge
+                        .occurrence
+                        .as_ref()
+                        .is_some_and(|site| site.range == range)
+                    && edge.to.as_str().ends_with("/response")
+            })
+            .map(|edge| edge.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(targets.len(), count, "{name}: {targets:?}");
+        if count == 2 {
+            assert!(
+                targets
+                    .iter()
+                    .any(|target| target.ends_with("/Routes/one/response"))
+            );
+            assert!(
+                targets
+                    .iter()
+                    .any(|target| target.ends_with("/Routes/two/response"))
+            );
+        }
+    }
+}
+
+#[test]
 fn declaration_indexed_access_preserves_written_property_reference() {
     const TYPE: &str = "export interface Preferences { transport: string; }\n";
     const USE: &str = concat!(

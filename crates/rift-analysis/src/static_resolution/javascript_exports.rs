@@ -130,13 +130,56 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        self.resolve_file(
-            self.imported_for(from, module, name, work)?,
-            name,
-            mode,
-            role,
-            work,
-        )
+        let imported = if mode == ModuleMode::CommonJs && self.modes.exact_import(module) {
+            package_import_file(self.files, self.modes, from, module, true, work)?
+        } else {
+            self.imported_for(from, module, name, work)?
+        };
+        let mode = if mode == ModuleMode::Esm
+            && module.starts_with('#')
+            && from.document.facts.language().name == "javascript"
+            && self.named_private_commonjs_export(imported, module, name, work)
+        {
+            ModuleMode::CommonJs
+        } else {
+            mode
+        };
+        self.resolve_file(imported, name, mode, role, work)
+    }
+
+    fn named_private_commonjs_export(
+        &self,
+        file: &File<'source>,
+        module: &str,
+        name: &'source str,
+        work: &mut Work,
+    ) -> bool {
+        let path = file.document.path.as_str();
+        if name == "default"
+            || !self.modes.exact_nested_import(module, path, work)
+            || self.modes.mode(path, work) != ModuleMode::CommonJs
+        {
+            return false;
+        }
+        let Some(exports) = file.exports.as_ref() else {
+            return false;
+        };
+        // An ESM import can use a directly written, named CommonJS export at this checked entry.
+        for binding in exports.candidates(ExportSlot::Named(name)) {
+            if !work.charge() {
+                return false;
+            }
+            if binding.kind == SyntaxExportKind::Named
+                && binding.container.is_none()
+                && binding.source.is_none()
+                && file.text(binding.range).is_some_and(|written| {
+                    written.starts_with("exports.") || written.starts_with("module.exports.")
+                })
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub(super) fn resolve_file(
@@ -788,9 +831,9 @@ pub(crate) fn is_declaration_file(path: &str) -> bool {
         .any(|extension| path.ends_with(extension))
 }
 
-/// The file a specifier of a declaration file names: the TypeScript source in place of the
-/// written runtime file, else the declaration file. Two of one rank name none. A folder names
-/// what its manifest writes as types or as `main`, else its index.
+/// The file a declaration specifier names. Prefer the exact TypeScript source, the source
+/// substituted for a runtime spelling, or the corresponding shipped declaration. Two of one
+/// rank name none. A folder names its manifest's types or `main` entry, else its index.
 pub(super) fn declared_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     modes: &PackageModes<'source>,
@@ -804,6 +847,21 @@ pub(super) fn declared_file<'index, 'source>(
         }
         if let Some((stem, sources, declarations)) = declared_extensions(path) {
             return first_declared(files, &[stem.to_owned()], sources, declarations);
+        }
+        if !is_declaration_file(path)
+            && let Some(file) = [
+                (".ts", ".d.ts"),
+                (".tsx", ".d.ts"),
+                (".mts", ".d.mts"),
+                (".cts", ".d.cts"),
+            ]
+            .into_iter()
+            .find_map(|(source, declaration)| {
+                let stem = path.strip_suffix(source)?;
+                typed_file(files, &format!("{stem}{declaration}"))
+            })
+        {
+            return Some(file);
         }
         stems.push(path.to_owned());
     }

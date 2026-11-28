@@ -35,6 +35,158 @@ fn workspace_javascript_initializer_calls_keep_their_execution_owners() {
     }
 }
 
+const KEYOF_REMAINDER_DECLARATION: &str = concat!(
+    "export interface Plain { safe: number; }\n",
+    "export type Earlier = Plain[\"safe\"];\n",
+    "export interface Routes { one: { response: number }; two: { response: string }; }\n",
+    "export type Guard<R> = R extends keyof Routes ? Routes[R][\"response\"] : never;\n",
+    "export type Result<R extends keyof Routes> = Routes[R][\"response\"];\n",
+);
+
+#[test]
+fn keyof_member_expansion_spends_work_after_earlier_declaration_selectors() {
+    let collect = |budget| {
+        resolution_by(
+            "typescript",
+            &[("index.d.ts", KEYOF_REMAINDER_DECLARATION)],
+            &[],
+            WORK_MAX,
+            &|graph, documents, namespace, work_max| {
+                let mut indexing = super::Work::new(work_max);
+                let index = super::Index::new(graph, (documents, &[]), namespace, &mut indexing)
+                    .expect("complete test index");
+                let mut work = super::Work::new(budget);
+                let mut result = super::StaticResolution::default();
+                let keyof = index.resolve_typescript_property_selectors(&mut work, &mut result);
+                index.resolve_keyof_members(keyof, &mut work, &mut result);
+                result.exhausted = work.exhausted;
+                result
+            },
+        )
+    };
+    let full = collect(WORK_MAX);
+    assert_eq!(full.typescript_keyof_member_start, Some(1));
+    assert_eq!(full.typescript_conditional_keyof_member_start, Some(3));
+    assert_eq!(full.occurrences.len(), 5);
+    let first_budget = |row_count| {
+        let mut lower = 0;
+        let mut upper = WORK_MAX;
+        while upper - lower > 1 {
+            let middle = lower + (upper - lower) / 2;
+            if collect(middle).occurrences.len() < row_count {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        upper
+    };
+    let bounded = collect(first_budget(1));
+    assert!(bounded.exhausted);
+    assert_eq!(bounded.typescript_keyof_member_start, None);
+    assert_eq!(bounded.occurrences.len(), 1);
+    assert_eq!(
+        target(&bounded.occurrences[0]),
+        target(&full.occurrences[0])
+    );
+    assert_eq!(
+        bounded.occurrences[0].binding.range(),
+        full.occurrences[0].binding.range(),
+    );
+    let parameter_only = collect(first_budget(3));
+    assert!(parameter_only.exhausted);
+    assert_eq!(parameter_only.typescript_keyof_member_start, Some(1));
+    assert_eq!(
+        parameter_only.typescript_conditional_keyof_member_start,
+        None
+    );
+    let edge = |row: &super::StaticOccurrence| (row.binding.range(), target(row).to_owned());
+    assert_eq!(
+        parameter_only
+            .occurrences
+            .iter()
+            .map(edge)
+            .collect::<Vec<_>>(),
+        full.occurrences[..3].iter().map(edge).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn keyof_member_expansion_uses_only_remaining_edge_capacity() {
+    resolution_by(
+        "typescript",
+        &[("index.d.ts", KEYOF_REMAINDER_DECLARATION)],
+        &[],
+        WORK_MAX,
+        &|graph, documents, namespace, work_max| {
+            let complete = || resolve(graph, documents, &[], namespace, work_max);
+            let earlier_only = || {
+                let mut resolution = complete();
+                let start = resolution
+                    .typescript_keyof_member_start
+                    .take()
+                    .expect("late members");
+                resolution.typescript_conditional_keyof_member_start.take();
+                resolution.occurrences.truncate(start);
+                resolution
+            };
+            let incumbent = crate::edge::EdgeStore::build_resolving(
+                graph,
+                std::collections::BTreeMap::new(),
+                WORK_MAX,
+                earlier_only,
+            )
+            .0;
+            let budget = incumbent.edges().count();
+            assert!(incumbent.edges().any(|edge| {
+                edge.kind() == rift_protocol::read::EdgeKind::References
+                    && edge.to().as_str().ends_with("/Plain/safe")
+            }));
+            let expanded = crate::edge::EdgeStore::build_resolving(
+                graph,
+                std::collections::BTreeMap::new(),
+                budget,
+                complete,
+            )
+            .0;
+            assert_eq!(
+                expanded.edges().collect::<Vec<_>>(),
+                incumbent.edges().collect::<Vec<_>>()
+            );
+            assert_eq!(expanded.dropped_edges(), 4);
+            let without_condition = || {
+                let mut resolution = complete();
+                let start = resolution
+                    .typescript_conditional_keyof_member_start
+                    .take()
+                    .expect("conditional members");
+                resolution.occurrences.truncate(start);
+                resolution
+            };
+            let parameters = crate::edge::EdgeStore::build_resolving(
+                graph,
+                std::collections::BTreeMap::new(),
+                WORK_MAX,
+                without_condition,
+            )
+            .0;
+            let bounded = crate::edge::EdgeStore::build_resolving(
+                graph,
+                std::collections::BTreeMap::new(),
+                parameters.edges().count(),
+                complete,
+            )
+            .0;
+            assert_eq!(
+                bounded.edges().collect::<Vec<_>>(),
+                parameters.edges().collect::<Vec<_>>(),
+            );
+            assert_eq!(bounded.dropped_edges(), 2);
+            StaticResolution::default()
+        },
+    );
+}
+
 #[test]
 fn test_typescript_export_overloads_keep_one_checked_callable() {
     let source = "function leaf() {} export function run(value: string): void; export function run(value: number): void; export function run(value: unknown) { leaf(); }";

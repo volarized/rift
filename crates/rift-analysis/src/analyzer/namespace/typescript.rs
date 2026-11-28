@@ -664,6 +664,11 @@ fn entry_modules(
         };
     };
     let mut candidates = BTreeMap::<ProjectPath, Vec<EntryCandidate<'_>>>::new();
+    let mut declaration_subpaths = if language == "typescript" {
+        runtime_subpath_declarations(files, exports)
+    } else {
+        BTreeMap::new()
+    };
     let mut unresolved = false;
     for (key, target) in &exports.0 {
         let suffix = if key == "." {
@@ -681,6 +686,7 @@ fn entry_modules(
         let path = (key == ".")
             .then(|| declaration_root.take())
             .flatten()
+            .or_else(|| declaration_subpaths.remove(key.as_str()))
             .or_else(|| {
                 target
                     .target(language)
@@ -707,6 +713,40 @@ fn entry_modules(
         })
         .collect();
     (modules, unresolved)
+}
+
+/// A direct runtime subpath can seed a declaration only when no other route claims it.
+fn runtime_subpath_declarations<'exports>(
+    files: &PackageFiles<'_>,
+    exports: &'exports OrderedConditions,
+) -> BTreeMap<&'exports str, ProjectPath> {
+    let mut explicit = BTreeSet::new();
+    let mut inferred = BTreeMap::new();
+    for (key, target) in &exports.0 {
+        if key != "." && !key.strip_prefix("./").is_some_and(export_subpath_is_valid) {
+            continue;
+        }
+        let Some(path) = target
+            .target("typescript")
+            .and_then(|path| path.strip_prefix("./"))
+            .filter(|path| export_subpath_is_valid(path))
+        else {
+            continue;
+        };
+        if crate::static_resolution::is_declaration_file(path) {
+            explicit.insert(path);
+        } else if let Some(declaration) = files.runtime_declaration(path) {
+            let candidate = key != "." && matches!(target, ExportTarget::Direct(_));
+            inferred
+                .entry(declaration)
+                .and_modify(|prior| *prior = None)
+                .or_insert(candidate.then_some(key.as_str()));
+        }
+    }
+    inferred
+        .into_iter()
+        .filter_map(|(path, key)| (!explicit.contains(path.as_str())).then_some((key?, path)))
+        .collect()
 }
 
 /// One subpath whose target is a file.
@@ -1096,6 +1136,11 @@ impl PackageImports {
             ))
         });
         Some(Self { exact, patterns })
+    }
+
+    /// Whether the manifest spells this complete import specifier.
+    pub(crate) fn has_exact(&self, specifier: &str) -> bool {
+        self.exact.contains_key(specifier)
     }
 
     pub(crate) fn destination(

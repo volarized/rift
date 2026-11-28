@@ -4040,7 +4040,7 @@ pub fn unlocated() {}
             "function value() { return 1; }\nvar headers = {\n  'etag': value()\n};\n",
         )?;
         let reads = reads(directory.path())?;
-        let target = symbol(&reads, "'etag'");
+        let target = symbol(&reads, "etag");
         let key = location(directory.path(), "headers.js", 2, 3, 7);
         let report = ReferenceReport {
             definitions: BTreeMap::from([(super::reference_key(&key), vec![key.clone()])]).into(),

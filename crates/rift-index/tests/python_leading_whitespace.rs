@@ -144,3 +144,38 @@ fn python_scopes_of_one_definition_files_stay_apart_from_the_module() {
         }
     }
 }
+
+#[test]
+fn python_member_reads_keep_their_class_when_its_span_matches_the_module() {
+    let class = "class x:\n    from pkg.model import Other\n    y = Other()\n    y.leaf";
+    let module = "from pkg.model import Other\ny = Other()\ny.leaf";
+    let target = "rift://symbol/local/python/pkg/model/Other/leaf";
+    let from = |owner| format!("reads rift://symbol/local/python/{owner} {target}");
+    let owners = |source: &str| {
+        let (rows, _) = rows(&[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/model.py",
+                "class Other:\n    def leaf(self): return 2\n",
+            ),
+            ("pkg/use.py", source),
+        ]);
+        rows.into_iter()
+            .filter(|row| row.starts_with("reads ") && row.ends_with(target))
+            .collect::<Vec<_>>()
+    };
+    for text in [
+        class.to_owned(),
+        format!("{class}\n"),
+        format!("\n{class}"),
+        format!("{class}\nafter = 0"),
+        format!("\n{}", class.replace("    y.leaf", "    del x\n    y.leaf")),
+    ] {
+        assert_eq!(owners(&text), [from("pkg/use/x")], "{text:?}");
+    }
+    assert_eq!(owners(module), [from("pkg/use")]);
+    assert_eq!(
+        owners(&format!("{class}\n{module}")),
+        [from("pkg/use"), from("pkg/use/x")],
+    );
+}

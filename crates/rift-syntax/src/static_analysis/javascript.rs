@@ -50,7 +50,8 @@ pub(super) struct Kinds {
     subscript: u16,
     parenthesized: u16,
     new: u16,
-    string: u16,
+    /// The string wrapper and an unescaped value fragment.
+    string_literal: [u16; 2],
     variable: u16,
     var: u16,
     for_in: u16,
@@ -83,6 +84,7 @@ pub(super) struct Kinds {
     callee: u16,
     object: u16,
     property: u16,
+    index: u16,
     constructor: u16,
     arguments: u16,
     source: u16,
@@ -365,7 +367,7 @@ impl Kinds {
             subscript: id("subscript_expression"),
             parenthesized: id("parenthesized_expression"),
             new: id("new_expression"),
-            string: id("string"),
+            string_literal: [id("string"), id("string_fragment")],
             variable: id("variable_declarator"),
             var: id("variable_declaration"),
             for_in: id("for_in_statement"),
@@ -401,6 +403,7 @@ impl Kinds {
             callee: field("function"),
             object: field("object"),
             property: field("property"),
+            index: field("index"),
             constructor: field("constructor"),
             arguments: field("arguments"),
             source: field("source"),
@@ -433,8 +436,8 @@ impl Kinds {
         self.record_module_syntax(visited, source, facts);
         self.record_commonjs_write(visited, source, facts)?;
         self.record_skippable(visited, facts)?;
-        self.record_reference(visited, facts)?;
-        self.record_member(syntax_element, facts)?;
+        self.record_reference(visited, source, facts)?;
+        self.record_member(syntax_element, source, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
         self.record_member_type_shape(syntax_element, source, facts)?;
         self.record_type_signature(syntax_element, facts)?;
@@ -1052,6 +1055,7 @@ impl Kinds {
     fn record_member(
         &self,
         element: Node<'_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let id = element.kind_id();
@@ -1064,16 +1068,31 @@ impl Kinds {
         else {
             return Ok(());
         };
-        let member = element.child_by_field_id(self.property).filter(|member| {
-            [self.property_identifier, self.private_property].contains(&member.kind_id())
-                && !member.is_missing()
-        });
+        let member = if id == self.subscript {
+            self.literal_subscript(element, source)
+        } else {
+            element.child_by_field_id(self.property).filter(|member| {
+                [self.property_identifier, self.private_property].contains(&member.kind_id())
+                    && !member.is_missing()
+            })
+        };
         facts.members.push(StaticMember {
             range: byte_range(element)?,
             receiver: byte_range(receiver)?,
             member: member.map(byte_range).transpose()?,
         });
         Ok(())
+    }
+
+    fn literal_subscript<'tree>(&self, element: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+        if self.type_shapes.is_some() {
+            return None;
+        }
+        crate::ecmascript::literal_property_fragment(
+            element.child_by_field_id(self.index)?,
+            self.string_literal,
+            source,
+        )
     }
 
     fn record_function(
@@ -1767,13 +1786,17 @@ impl Kinds {
     fn record_reference(
         &self,
         visited: Visited<'_, '_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let element = visited.syntax_element();
         let id = element.kind_id();
         let lexical = [self.identifier, self.shorthand, self.shorthand_pattern].contains(&id)
             && self.value_reference(visited);
-        if id == self.member || lexical {
+        if id == self.member
+            || lexical
+            || (id == self.subscript && self.literal_subscript(element, source).is_some())
+        {
             let access = self.access_target(visited);
             let parent = access.parent().map(Visited::syntax_element);
             let access = access.syntax_element();
@@ -2394,8 +2417,8 @@ impl Kinds {
         syntax_element: Node<'_>,
         source: &str,
     ) -> Result<Option<ByteRange>, RiftError> {
-        let Some(value) =
-            text(syntax_element, source).filter(|_| syntax_element.kind_id() == self.string)
+        let Some(value) = text(syntax_element, source)
+            .filter(|_| syntax_element.kind_id() == self.string_literal[0])
         else {
             return Ok(None);
         };

@@ -181,6 +181,7 @@ const FORMATTED_PREFIXES: [char; 2] = ['f', 'F'];
 const FUNCTION_KIND_WORD: &str = "function";
 /// Provider kind for an ordinary function parameter at its name token.
 pub(crate) const PARAMETER_KIND_WORD: &str = "parameter";
+pub(crate) const LAMBDA_PARAMETER_KIND_WORD: &str = "python_lambda_parameter";
 pub(crate) const VARIADIC_PARAMETER_KIND_WORD: &str = "variadic_parameter";
 pub(crate) const OVERLOAD_PARAMETER_KIND_WORD: &str = "overload_parameter";
 pub(crate) const PROPERTY_RECEIVER_KIND_WORD: &str = "python_property_receiver";
@@ -204,6 +205,7 @@ const SCOPE_QUALIFICATION_SEPARATOR: &str = ".";
 #[derive(Debug)]
 struct PythonKinds {
     function: u16,
+    lambda: u16,
     class: u16,
     decorated: u16,
     block: u16,
@@ -263,6 +265,7 @@ impl PythonKinds {
     fn resolve(language: &tree_sitter::Language) -> Self {
         Self {
             function: kind_id(language, FUNCTION_KIND),
+            lambda: kind_id(language, "lambda"),
             class: kind_id(language, CLASS_KIND),
             decorated: kind_id(language, DECORATED_KIND),
             block: kind_id(language, BLOCK_KIND),
@@ -755,7 +758,8 @@ impl PythonRules {
             };
         let parameters = parameter.parent()?;
         let owner = parameters.parent()?.syntax_element();
-        if owner.kind_id() != self.kinds.function
+        let lambda = owner.kind_id() == self.kinds.lambda;
+        if (!lambda && owner.kind_id() != self.kinds.function)
             || owner.child_by_field_id(self.kinds.parameters.get())
                 != Some(parameters.syntax_element())
             || parameter_name(parameter.syntax_element()) != Some(name)
@@ -763,7 +767,9 @@ impl PythonRules {
             return None;
         }
         Some(Declaration {
-            kind: if variadic {
+            kind: if lambda {
+                LAMBDA_PARAMETER_KIND_WORD
+            } else if variadic {
                 VARIADIC_PARAMETER_KIND_WORD
             } else {
                 PARAMETER_KIND_WORD
@@ -1051,6 +1057,7 @@ impl PythonRules {
             if symbol.container.is_some()
                 || symbol.kind == MODULE_KIND
                 || symbol.is_python_comprehension_binding()
+                || symbol.is_python_lambda_parameter()
             {
                 continue;
             }
@@ -1439,7 +1446,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         )?);
         export_bindings.sort_by_key(|binding| binding.range.start);
         let (mut static_facts, invalid_default) = capture.finish_python(tree.root_node())?;
-        retain_comprehension_bindings(&mut symbols, &static_facts);
+        retain_expression_bindings(&mut symbols, &static_facts);
         variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         retain_loop_bindings(&mut symbols, &static_facts, source.text);
         assignment_expressions::retain(&mut symbols, &mut static_facts, source.text);
@@ -1485,14 +1492,10 @@ impl SyntaxProvider for PythonSyntaxProvider {
 }
 
 /// Keeps a comprehension target's name within its checked physical expression scope.
-fn retain_comprehension_bindings(
-    symbols: &mut Vec<crate::SyntaxSymbol>,
-    facts: &crate::StaticFacts,
-) {
-    if !symbols
-        .iter()
-        .any(crate::SyntaxSymbol::is_python_comprehension_binding)
-    {
+fn retain_expression_bindings(symbols: &mut Vec<crate::SyntaxSymbol>, facts: &crate::StaticFacts) {
+    if !symbols.iter().any(|symbol| {
+        symbol.is_python_comprehension_binding() || symbol.is_python_lambda_parameter()
+    }) {
         return;
     }
     let expression_scopes = facts
@@ -1507,13 +1510,17 @@ fn retain_comprehension_bindings(
         .map(|binding| (binding.name, binding.scope))
         .collect::<BTreeMap<_, _>>();
     symbols.retain_mut(|symbol| {
-        if !symbol.is_python_comprehension_binding() {
+        let expression = if symbol.is_python_comprehension_binding() {
+            "$comprehension#"
+        } else if symbol.is_python_lambda_parameter() {
+            "$lambda#"
+        } else {
             return true;
-        }
+        };
         let Some(scope) = symbol.name_range.and_then(|name| bindings.get(&name)) else {
             return false;
         };
-        let scope_name = format!("$comprehension#{}", scope.start);
+        let scope_name = format!("{expression}{}", scope.start);
         let parent = extract::qualify(
             SCOPE_QUALIFICATION_SEPARATOR,
             symbol.container.as_deref().unwrap_or_default(),
@@ -1660,6 +1667,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
     [
         FUNCTION_KIND_WORD,
         PARAMETER_KIND_WORD,
+        LAMBDA_PARAMETER_KIND_WORD,
         VARIADIC_PARAMETER_KIND_WORD,
         OVERLOAD_PARAMETER_KIND_WORD,
         PROPERTY_RECEIVER_KIND_WORD,

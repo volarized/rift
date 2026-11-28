@@ -182,6 +182,133 @@ fn checked_commonjs_export_object_values_keep_their_literal_imports() {
 }
 
 #[test]
+fn declaration_imports_follow_a_written_typescript_extension_to_its_declaration() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const SOURCE: &str = concat!(
+        "import type { Item as Local } from './relay.ts';\n",
+        "import type { Entry } from './actual.ts';\n",
+        "import type { View } from './view.tsx';\n",
+        "import type { Module } from './typed.mts';\n",
+        "import type { Common } from './typed.cts';\n",
+        "import type { Mismatch } from './mismatch.mts';\n",
+        "export type Result = Local | Entry | View | Module | Common | Mismatch;\n",
+    );
+    let collected = internal_modules::analyze(
+        MANIFEST,
+        &[
+            ("index.d.ts", SOURCE),
+            ("relay.d.ts", "export * from './leaf.ts';"),
+            ("leaf.d.ts", "export interface Item { size: number; }"),
+            ("actual.ts", "export interface Entry { actual: true; }"),
+            ("actual.d.ts", "export interface Entry { actual: false; }"),
+            ("view.d.ts", "export interface View { kind: 0; }"),
+            ("typed.d.mts", "export interface Module { kind: 1; }"),
+            ("typed.d.cts", "export interface Common { kind: 2; }"),
+            ("mismatch.d.ts", "export interface Mismatch { kind: 3; }"),
+        ],
+    );
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    let source = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("chosen type entry");
+    for (selector, target, name) in [
+        ("Local", "leaf.d.ts", "/Item"),
+        ("Entry", "actual.ts", "/Entry"),
+        ("View", "view.d.ts", "/View"),
+        ("Module", "typed.d.mts", "/Module"),
+        ("Common", "typed.d.cts", "/Common"),
+    ] {
+        let target_unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == target)
+            .expect("shipped target");
+        let target = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == target_unit.unit && row.symbol.as_str().ends_with(name))
+            .expect("exact target declaration");
+        let start = SOURCE.find(selector).expect("written import selector");
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.kinds == [EdgeKind::Imports]
+                    && edge.to == target.symbol
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == source.unit
+                            && site.range == module_runtime_range(start, selector)
+                    })
+            }),
+            "missing import selector {selector}"
+        );
+    }
+    let literal = "'./relay.ts'";
+    let start = SOURCE.find(literal).expect("written import specifier");
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.to.as_str().ends_with("relay.d.ts")
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == source.unit && site.range == module_runtime_range(start, literal)
+            })
+    }));
+    let start = SOURCE.find("Mismatch").expect("wrong extension");
+    assert!(!publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == source.unit && site.range == module_runtime_range(start, "Mismatch")
+            })
+    }));
+}
+
+#[test]
+fn typescript_quoted_member_signatures_keep_the_written_name() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.mts"}"#;
+    const SOURCE: &str = concat!(
+        "export interface Visitor {\n",
+        "  \"item:exit\"?: (name: string) => void;\n",
+        "  'item:enter'(name: string): void;\n",
+        "  '\\u0041'?: string;\n",
+        "}\n",
+    );
+    let collected = internal_modules::analyze(MANIFEST, &[("index.d.mts", SOURCE)]);
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    for (name, written) in [
+        ("item:exit", "\"item:exit\"?: (name: string) => void"),
+        ("item:enter", "'item:enter'(name: string): void"),
+    ] {
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == written)
+            .expect("written member signature");
+        let identity = rift_protocol::identity::SymbolIdentity::parse(declaration.symbol.as_str())
+            .expect("checked member identity");
+        assert_eq!(
+            identity.qualified_path().last().map(String::as_str),
+            Some(name)
+        );
+        assert_eq!(
+            declaration.range,
+            module_runtime_range(
+                SOURCE.find(written).expect("exact property source"),
+                written
+            )
+        );
+    }
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .all(|row| !row.symbol.as_str().ends_with("/A"))
+    );
+}
+
+#[test]
 fn typescript_selectors_reference_uniquely_imported_declarations() {
     const MANIFEST: &str =
         r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
@@ -4073,6 +4200,113 @@ fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
 }
 
 #[test]
+fn quoted_indirect_argument_key_keeps_the_module_binding_and_its_read() {
+    const SOURCE: &str = concat!(
+        "var local = require('./');\n",
+        "var worker = require('worker-fixture');\n",
+        "jobs.add('check', function () { worker.read(); })\n",
+        "    .finish({ 'worker': true });\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    let independent = SOURCE.replace("'worker':", "'enabled':");
+    for source in [&independent, SOURCE] {
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", "exports.ready = true;"), ("runner.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let binding = "worker = require('worker-fixture')";
+        let start = source.find(binding).expect("written local");
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.symbol.as_str().ends_with("/worker")
+                    && row.source == binding
+                    && row.range == module_runtime_range(start, binding)
+            })
+            .expect("original exact local identity");
+        let start = source.find("worker.read()").expect("written receiver");
+        assert!(
+            publication.edges.iter().any(|edge| {
+                edge.to == declaration.symbol
+                    && edge.kinds == [EdgeKind::Reads]
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.unit == declaration.unit
+                            && site.range == module_runtime_range(start, "worker")
+                    })
+            }),
+            "missing receiver read in {source}"
+        );
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| { row.symbol != declaration.symbol || row.source == binding })
+        );
+    }
+}
+
+#[test]
+fn class_method_arguments_keep_written_properties_beside_local_names() {
+    const SOURCE: &str = concat!(
+        "export class Builder {\n",
+        "  convert(input) {\n",
+        "    switch (input) {\n",
+        "      case 0: {\n",
+        "        const mode = 'early';\n",
+        "        return this.wrap(input, { mode, length: 1 });\n",
+        "      }\n",
+        "      case 1: {\n",
+        "        const mode = 'late';\n",
+        "        return this.wrap(input, { mode: mode, length: 2 });\n",
+        "      }\n",
+        "      case 2: return this.wrap(input, { mode: 'fallback', length: 3 });\n",
+        "      case 3: return this['wrap'](input, { mode: 'computed' });\n",
+        "      default: return this.wrap(input, { mode: 'skip', mode: 'duplicate' });\n",
+        "    }\n",
+        "  }\n",
+        "  wrap(input, options) { return options; }\n",
+        "}\n",
+    );
+    let collected = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| row.source == "length: 1")
+    );
+    let mut identities = BTreeSet::new();
+    for (witness, member) in [
+        ("mode, length", "mode"),
+        ("mode: mode", "mode: mode"),
+        ("mode: 'fallback'", "mode: 'fallback'"),
+    ] {
+        let start = SOURCE.find(witness).expect("written member");
+        let property = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == member && row.range == module_runtime_range(start, member))
+            .expect("physical class method argument");
+        assert!(property.symbol.as_str().contains("/Builder/convert/"));
+        assert!(identities.insert(&property.symbol));
+    }
+    assert!(publication.declarations.iter().all(|row| {
+        !matches!(
+            row.source.as_str(),
+            "mode: 'skip'" | "mode: 'duplicate'" | "mode: 'computed'"
+        )
+    }));
+}
+
+#[test]
 fn non_entry_class_methods_keep_properties_of_returned_call_arguments() {
     const SOURCE: &str = concat!(
         "export class Builder {\n",
@@ -5938,6 +6172,126 @@ fn javascript_nested_array_elements_keep_checked_property_owners() {
 }
 
 #[test]
+fn javascript_uses_the_value_of_a_written_string_property_key() {
+    const SOURCE: &str = concat!(
+        "const selector = 'hidden';\n",
+        "export const settings = { 'fresh': 1, \"cache-size\": 2, [selector]: 3 };\n",
+        "export class Meter { \"rotate\"() { return 1; } }\n",
+        "export function sample() {\n",
+        "  return [settings.fresh, settings['fresh'], settings['cache-size']];\n",
+        "}\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js"}"#,
+        )),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let declaration = |source: &str, name: &str| {
+        let offset = SOURCE.find(source).expect("written declaration");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source == source
+                    && row.source_complete
+                    && row.range == module_runtime_range(offset, source)
+            })
+            .expect("exact source declaration");
+        assert!(row.symbol.as_str().ends_with(&format!("/{name}")));
+        assert!(
+            publication
+                .objects
+                .iter()
+                .any(|object| { object.id.as_ref() == Some(&row.symbol) && object.name == name })
+        );
+        row
+    };
+    let fresh = declaration("'fresh': 1", "fresh");
+    let size = declaration("\"cache-size\": 2", "cache-size");
+    declaration("\"rotate\"() { return 1; }", "rotate");
+    for (selector, significant, target) in [
+        ("settings.fresh", "fresh", &fresh.symbol),
+        ("settings['fresh']", "fresh", &fresh.symbol),
+        ("settings['cache-size']", "cache-size", &size.symbol),
+    ] {
+        let offset = SOURCE.find(selector).expect("written read")
+            + selector.find(significant).expect("written property");
+        let range = module_runtime_range(offset, significant);
+        assert!(
+            publication.edges.iter().any(|edge| {
+                &edge.to == target
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start <= range.start && range.end <= site.range.end
+                    })
+            }),
+            "written read {selector}"
+        );
+    }
+    assert!(
+        publication
+            .objects
+            .iter()
+            .all(|object| object.name != "hidden")
+    );
+}
+
+#[test]
+fn javascript_keeps_written_module_arrow_getter_properties_beside_a_reassignment() {
+    const SOURCE: &str = concat!(
+        "import { install } from './helper.js';\n",
+        "let entry;\n",
+        "install({ entry: () => entry });\n",
+        "install({ entry: () => entry, flag: true });\n",
+        "install({ nested: { entry: () => entry } });\n",
+        "install({ entry: () => entry, entry: () => entry });\n",
+        "entry = () => 1;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export const root = true;"),
+            ("helper.js", "export function install() {}"),
+            ("register.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js"}"#,
+        )),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "register.js" && unit.source_complete)
+        .expect("retained module");
+    let written = "entry: () => entry";
+    let retained = SOURCE
+        .match_indices(written)
+        .map(|(offset, _)| {
+            publication.declarations.iter().find(|row| {
+                row.unit == unit.unit
+                    && row.source == written
+                    && row.range == module_runtime_range(offset, written)
+            })
+        })
+        .collect::<Vec<_>>();
+    let first = retained[0].expect("first independent getter property");
+    let second = retained[1].expect("second independent getter property");
+    assert_ne!(first.symbol, second.symbol);
+    assert!(retained[3..].iter().all(Option::is_none));
+}
+
+#[test]
 fn typescript_follows_declarations_from_an_exact_runtime_export_root() {
     const ROOT: &str = "export * from './branch/index.js';";
     const BRANCH: &str = "export { Entry } from './detail.js';";
@@ -5994,6 +6348,114 @@ fn typescript_follows_declarations_from_an_exact_runtime_export_root() {
                 .declarations
                 .iter()
                 .all(|row| row.unit != unit("branch/unused.d.ts").unit)
+        );
+    }
+}
+
+#[test]
+fn typescript_follows_declarations_from_an_exact_runtime_subpath() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./index.js","./feature":"./branch/feature.js","./*.js":"./*.js","./*":"./*.js"}}"#;
+    const FEATURE: &str = "export { Detail } from './detail.js';";
+    const LEAF: &str = "export interface Detail { readonly value: number }";
+    for alternate in [
+        None,
+        Some(("branch/feature.ts", "export const separate = true;")),
+    ] {
+        let mut files = vec![
+            ("index.js", "export const entry = true;"),
+            ("branch/feature.js", "export const enabled = true;"),
+            ("branch/feature.d.ts", FEATURE),
+            ("branch/detail.d.ts", LEAF),
+            (
+                "branch/unused.d.ts",
+                "export interface Unused { value: boolean }",
+            ),
+        ];
+        files.extend(alternate);
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked runtime subpath");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path && unit.source_complete)
+                .expect("retained selected source")
+        };
+        let leaf = unit("branch/detail.d.ts");
+        let found = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == leaf.unit && row.symbol.as_str().ends_with("/Detail"));
+        assert_eq!(found.is_some(), alternate.is_none());
+        if let Some(row) = found {
+            let declaration = LEAF.strip_prefix("export ").expect("written declaration");
+            assert_eq!(
+                row.range,
+                module_runtime_range("export ".len(), declaration)
+            );
+            assert_eq!(row.source, declaration);
+            assert!(publication.declarations.iter().any(|row| {
+                row.unit == unit("branch/feature.d.ts").unit
+                    && row.symbol.as_str().ends_with("/beacon%2Ffeature")
+            }));
+        }
+        assert!(publication.declarations.iter().any(|row| {
+            row.unit == unit("branch/feature.js").unit
+                && row.symbol.as_str().ends_with("/beacon%2Ffeature/enabled")
+        }));
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit("branch/unused.d.ts").unit)
+        );
+    }
+}
+
+#[test]
+fn typescript_keeps_existing_declarations_when_runtime_subpaths_compete() {
+    const SIDE: &str = "export interface Detail { readonly value: number }";
+    for (route, identity) in [
+        (
+            r#""./alternate":"./branch/feature.js""#,
+            "/beacon%2Fbranch%2Ffeature.d.ts/Detail",
+        ),
+        (
+            r#""./alternate":{"types":"./branch/feature.d.ts","default":"./branch/feature.js"}"#,
+            "/beacon%2Falternate/Detail",
+        ),
+    ] {
+        let manifest = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","exports":{{".":"./index.js","./feature":"./branch/feature.js",{route}}}}}"#,
+        );
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.js", "export const entry = true;"),
+                ("branch/feature.js", "export const enabled = true;"),
+                ("branch/feature.d.ts", SIDE),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked package");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let declaration = SIDE.strip_prefix("export ").expect("written declaration");
+        assert!(
+            publication.declarations.iter().any(|row| {
+                row.symbol.as_str().ends_with(identity)
+                    && row.source == declaration
+                    && row.range == module_runtime_range("export ".len(), declaration)
+            }),
+            "missing previous declaration for {route}"
         );
     }
 }
@@ -6218,6 +6680,264 @@ fn typescript_relative_imports_keep_checked_declarations_beside_runtime_wildcard
     assert!(publication.declarations.iter().any(|row| {
         row.unit == unit("index.js").unit && row.symbol.as_str().ends_with("/beacon/kept")
     }));
+}
+
+const RUNTIME_PRIVATE_MANIFEST: &str = r#"{"name":"bridge","type":"commonjs"}"#;
+const RUNTIME_PRIVATE_ROOT: &str =
+    "import { start } from '#bridge/start'; export function boot() { return start(); }";
+const RUNTIME_PRIVATE_START: &str = concat!(
+    "const { step } = require('./leaf'); ",
+    "function value(x) { return x; } value(require('./wrapped.cjs')); ",
+    "const { fringe } = require('./other/fringe.cjs'); ",
+    "function opaque(require) { const hidden = require('./hidden.cjs'); return hidden(); } ",
+    "function start() { return step() + fringe(); } exports.start = start;",
+);
+
+fn private_runtime_fixture(root: &str, manifest: &str) -> PackageAnalysis {
+    const MANIFEST: &str = r##"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js","imports":{"#bridge/start":"./bundled/start.cjs","#bridge/unused":"./bundled/unused.cjs"}}"##;
+    const LEAF: &str = "function step() { return 2; } exports.step = step;";
+    fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.js", root),
+            ("bundled/package.json", manifest),
+            ("bundled/start.cjs", RUNTIME_PRIVATE_START),
+            ("bundled/leaf.js", LEAF),
+            ("bundled/wrapped.cjs", "exports.held = function held() {};"),
+            (
+                "bundled/unused.cjs",
+                "exports.unused = function unused() {};",
+            ),
+            (
+                "bundled/hidden.cjs",
+                "exports.hidden = function hidden() {};",
+            ),
+            ("bundled/other/package.json", RUNTIME_PRIVATE_MANIFEST),
+            (
+                "bundled/other/fringe.cjs",
+                "exports.fringe = function fringe() {};",
+            ),
+            ("neighbor/package.json", RUNTIME_PRIVATE_MANIFEST),
+            ("neighbor/index.cjs", LEAF),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package")
+}
+
+#[test]
+fn checked_private_import_keeps_the_runtime_same_manifest_closure() {
+    for (root, manifest, admitted) in [
+        (RUNTIME_PRIVATE_ROOT, RUNTIME_PRIVATE_MANIFEST, true),
+        (RUNTIME_PRIVATE_ROOT, "{", false),
+        ("export function boot() {}", RUNTIME_PRIVATE_MANIFEST, false),
+    ] {
+        let result = private_runtime_fixture(root, manifest);
+        let graph = result.publication();
+        graph.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            &graph
+                .units
+                .iter()
+                .find(|row| row.path.0 == path && row.source_complete)
+                .expect("retained source")
+                .unit
+        };
+        let declaration = |path, name: &str| {
+            graph.declarations.iter().find(|row| {
+                &row.unit == unit(path) && row.symbol.as_str().ends_with(&format!("/{name}"))
+            })
+        };
+        for (path, name) in [
+            ("bundled/start.cjs", "start"),
+            ("bundled/leaf.js", "step"),
+            ("bundled/wrapped.cjs", "held"),
+        ] {
+            let held = declaration(path, name);
+            assert_eq!(held.is_some(), admitted, "{path}");
+            if let Some(held) = held {
+                assert!(held.source_complete && !held.public);
+                let identity = rift_protocol::identity::SymbolIdentity::parse(held.symbol.as_str())
+                    .expect("checked private module identity");
+                assert_eq!(
+                    identity.qualified_path(),
+                    [format!("beacon/{path}"), name.to_owned()]
+                );
+            }
+        }
+        for path in [
+            "bundled/unused.cjs",
+            "bundled/hidden.cjs",
+            "bundled/other/fringe.cjs",
+            "neighbor/index.cjs",
+        ] {
+            assert!(
+                graph
+                    .declarations
+                    .iter()
+                    .all(|decl| &decl.unit != unit(path)),
+                "{path}"
+            );
+        }
+        if admitted {
+            for (from, from_name, to, to_name, text) in [
+                (
+                    "index.js",
+                    "boot",
+                    "bundled/start.cjs",
+                    "start",
+                    RUNTIME_PRIVATE_ROOT,
+                ),
+                (
+                    "bundled/start.cjs",
+                    "start",
+                    "bundled/leaf.js",
+                    "step",
+                    RUNTIME_PRIVATE_START,
+                ),
+            ] {
+                assert_checked_runtime_call(
+                    graph,
+                    declaration(from, from_name).expect("caller"),
+                    declaration(to, to_name).expect("callee"),
+                    text,
+                    to_name,
+                );
+            }
+        }
+    }
+}
+
+fn assert_checked_runtime_call(
+    graph: &PackagePublication,
+    source: &rift_protocol::index::PackageSymbol,
+    target: &rift_protocol::index::PackageSymbol,
+    text: &str,
+    name: &str,
+) {
+    let call = format!("{name}()");
+    let start = text.find(&call).expect("written call");
+    assert!(
+        graph.edges.iter().any(|edge| {
+            edge.from == source.symbol
+                && edge.to == target.symbol
+                && edge.kinds == [EdgeKind::Calls]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == source.unit && site.range == module_runtime_range(start, &call)
+                })
+        }),
+        "{} calling {} around {start}: {:?}",
+        source.symbol.as_str(),
+        target.symbol.as_str(),
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == source.symbol || edge.to == target.symbol)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn checked_package_import_reaches_its_private_embedded_declaration_modules() {
+    const MANIFEST: &str = r##"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js","imports":{"#private":"./embedded/lib/index.js"}}"##;
+    const EMBEDDED: &str = r#"{"name":"embedded","type":"module"}"#;
+    const IMPORTER: &str =
+        "import { recover } from '#private';\nexport const read = () => recover();\n";
+    const TYPES: &str = concat!(
+        "export { Options } from './options.js';\n",
+        "export { Isolated } from './isolated/index.js';\n",
+        "export declare function recover(): boolean;\n",
+    );
+    const OPTIONS: &str = "export interface Options { ready: boolean }\n";
+    for (entry, manifest, admitted) in [
+        (IMPORTER, EMBEDDED, true),
+        (IMPORTER, "{", false),
+        ("export const read = true;", EMBEDDED, false),
+        (
+            "export { read } from './delegate/index.js';",
+            EMBEDDED,
+            false,
+        ),
+    ] {
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.js", entry),
+                (
+                    "delegate/package.json",
+                    r#"{"name":"beacon","type":"module"}"#,
+                ),
+                ("delegate/index.js", IMPORTER),
+                ("embedded/package.json", manifest),
+                (
+                    "embedded/lib/index.js",
+                    "export function recover() { return true; }",
+                ),
+                ("embedded/lib/index.d.ts", TYPES),
+                ("embedded/lib/options.d.ts", OPTIONS),
+                (
+                    "embedded/lib/unused.d.ts",
+                    "export interface Unused { hidden: number }",
+                ),
+                ("embedded/lib/isolated/package.json", EMBEDDED),
+                (
+                    "embedded/lib/isolated/index.d.ts",
+                    "export interface Isolated { hidden: number }",
+                ),
+                (
+                    "adjacent/package.json",
+                    r#"{"name":"adjacent","type":"module"}"#,
+                ),
+                (
+                    "adjacent/index.d.ts",
+                    "export interface Adjacent { hidden: number }",
+                ),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package sources");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            publication
+                .units
+                .iter()
+                .find(|row| row.path.0 == path && row.source_complete)
+                .expect("retained physical source")
+        };
+        let selected = unit("embedded/lib/options.d.ts");
+        let options = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == selected.unit && row.symbol.as_str().ends_with("/Options"));
+        assert_eq!(options.is_some(), admitted);
+        if let Some(row) = options {
+            assert!(row.source_complete && !row.public);
+            assert!(
+                row.symbol
+                    .as_str()
+                    .ends_with("beacon%2Fembedded%2Flib%2Foptions.d.ts/Options")
+            );
+            let start = OPTIONS.find("interface").expect("written declaration");
+            let written = OPTIONS[start..].trim_end();
+            assert_eq!(row.source, written);
+            assert_eq!(row.range, module_runtime_range(start, written));
+        }
+        for unrelated in [
+            "embedded/lib/unused.d.ts",
+            "embedded/lib/isolated/index.d.ts",
+            "adjacent/index.d.ts",
+        ] {
+            assert!(
+                publication
+                    .declarations
+                    .iter()
+                    .all(|row| row.unit != unit(unrelated).unit)
+            );
+        }
+    }
 }
 
 #[test]
@@ -7737,8 +8457,8 @@ fn returned_properties_keep_their_distinct_private_function_owners() {
         for (suffix, text) in [
             ("/folder", "folder: root"),
             ("/read", "read: function"),
-            ("/'package'", "'package':"),
-            ("/'package'/entry", "entry:"),
+            ("/package", "'package':"),
+            ("/package/entry", "entry:"),
         ] {
             let identity = format!("{}{suffix}", owner.symbol.as_str());
             let row = publication
@@ -7966,7 +8686,7 @@ fn secondary_default_array_keeps_each_written_property_tree() {
     };
     assert_ne!(left.symbol, right.symbol);
     for (root, extrema, rank) in [(left, "maximum: 8", 2), (right, "maximum: 12", 3)] {
-        let scope = format!("{}/'max-size'", root.symbol.as_str());
+        let scope = format!("{}/max-size", root.symbol.as_str());
         let child = publication
             .declarations
             .iter()
@@ -8131,8 +8851,8 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
         })
         .expect("earlier local binding");
     for (key, text) in [
-        ("'alpha'", "'alpha': ['parseAlpha']"),
-        ("'beta'", "'beta': ['parseBeta']"),
+        ("alpha", "'alpha': ['parseAlpha']"),
+        ("beta", "'beta': ['parseBeta']"),
     ] {
         let identity = format!("{}/{key}", owner.symbol.as_str());
         let property = publication
@@ -8155,8 +8875,8 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
         format!("(function (outside) {{ outside = {{ 'alpha': ['other'] }}; }}({{}}));\n{SOURCE}");
     let separated = analyze(&sibling);
     for (owner, source) in [
-        ("/rules/'alpha'", "'alpha': ['parseAlpha']"),
-        ("/beacon/'alpha'", "'alpha': ['other']"),
+        ("/rules/alpha", "'alpha': ['parseAlpha']"),
+        ("/beacon/alpha", "'alpha': ['other']"),
     ] {
         assert!(
             separated
@@ -8176,14 +8896,14 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
     for control in [shadow, outer] {
         let other = analyze(&control);
         assert!(other.publication().declarations.iter().any(|row| {
-            row.symbol.as_str().ends_with("/'alpha'") && row.source == "'alpha': ['parseAlpha']"
+            row.symbol.as_str().ends_with("/alpha") && row.source == "'alpha': ['parseAlpha']"
         }));
         assert!(
             !other
                 .publication()
                 .declarations
                 .iter()
-                .any(|row| { row.symbol.as_str().ends_with("/rules/'alpha'") })
+                .any(|row| { row.symbol.as_str().ends_with("/rules/alpha") })
         );
     }
 }
@@ -8254,6 +8974,90 @@ fn initializer_members_stay_with_the_separately_placed_local_binding() {
             child.symbol.as_str() == format!("{}/{key}", shorthand.symbol.as_str())
         }));
     }
+}
+
+#[test]
+fn scoped_initializer_keeps_nested_objects_and_separate_array_elements() {
+    const SOURCE: &str = concat!(
+        "register('first', () => {\n",
+        "  const settings = { theme: { style: { tone: 1 }, bands: [{ limit: 2 }, { limit: 3 }],\n",
+        "    duplicate: { skipped: 5, skipped: 6 }, generated: build({ guessed: 7 }) } };\n",
+        "  return settings;\n",
+        "});\n",
+        "register('second', () => {\n",
+        "  const settings = { theme: { style: { tone: 9 }, bands: [{ limit: 10 }] } };\n",
+        "  return settings;\n",
+        "});\n",
+    );
+    let collected = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.mjs", "export const fixed = true;"),
+            ("settings.mjs", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked package");
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "settings.mjs")
+        .expect("source");
+    let mut bindings = publication
+        .declarations
+        .iter()
+        .filter(|row| {
+            row.unit == unit.unit && row.source.starts_with("settings = {") && row.source_complete
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| binding.range.start);
+    let [first, second] = bindings.as_slice() else {
+        panic!("two exact scoped bindings")
+    };
+    assert_ne!(first.symbol, second.symbol);
+    let mut named_elements = BTreeSet::new();
+    for (owner, tone, limits) in [
+        (*first, "tone: 1", &["limit: 2", "limit: 3"][..]),
+        (*second, "tone: 9", &["limit: 10"][..]),
+    ] {
+        let written = |text| {
+            let start = SOURCE.find(text).expect("written property");
+            publication
+                .declarations
+                .iter()
+                .find(|row| {
+                    row.unit == unit.unit
+                        && row.source == text
+                        && row.source_complete
+                        && row.range == module_runtime_range(start, text)
+                })
+                .expect("checked nested property")
+        };
+        assert_eq!(
+            written(tone).symbol.as_str(),
+            format!("{}/theme/style/tone", owner.symbol.as_str())
+        );
+        for limit in limits {
+            let member = written(limit);
+            assert!(
+                member
+                    .symbol
+                    .as_str()
+                    .starts_with(&format!("{}/theme/bands/limit", owner.symbol.as_str()))
+            );
+            assert!(named_elements.insert(&member.symbol));
+        }
+    }
+    assert!(publication.declarations.iter().all(|row| {
+        !row.symbol.as_str().contains("/theme/duplicate/skipped")
+            && !row.symbol.as_str().contains("/theme/generated/guessed")
+    }));
 }
 
 #[test]
@@ -9297,6 +10101,68 @@ fn checked_javascript_export_subpath_keeps_forwarding_module() {
                     .as_ref()
                     .is_some_and(|site| site.unit == module.unit)
         }));
+    }
+}
+
+#[test]
+fn retained_literal_name_omission_keeps_other_javascript_module_calls() {
+    const SOURCE: &str = concat!(
+        "const annotate = (target) => target;\n",
+        "const labels = { '\t': 'tab', kept: 1 };\n",
+        "function sample() { return labels.kept; }\n",
+        "annotate(sample);\n",
+        "export { sample };\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    let collect = |source| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package")
+    };
+    let clean = SOURCE.replace('\t', "ordinary");
+    for source in [&clean, SOURCE] {
+        let collected = collect(source);
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let module = checked_module_declaration(publication, "index.js", source)
+            .expect("complete authored module");
+        let target = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/annotate"))
+            .expect("exact arrow binding");
+        let call = "annotate(sample)";
+        let start = source.find(call).expect("written call");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.from == module.symbol
+                && edge.to == target.symbol
+                && edge.kinds == [EdgeKind::Calls]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == module.unit && site.range == module_runtime_range(start, call)
+                })
+        }));
+        if source == SOURCE {
+            assert!(publication.warnings.iter().any(|warning| matches!(
+                warning,
+                rift_protocol::index::PackageAnalysisWarning::IdentityUnresolved {
+                    qualified_name, ..
+                } if qualified_name.contains('\t')
+            )));
+        }
+    }
+    let missing_name = format!(
+        "{SOURCE}const {} = 1;\n",
+        "a".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1)
+    );
+    let malformed = format!("{SOURCE}const unfinished =");
+    for source in [&missing_name, &malformed] {
+        let collected = collect(source);
+        assert!(checked_module_declaration(collected.publication(), "index.js", source).is_none());
     }
 }
 
