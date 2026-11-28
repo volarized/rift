@@ -428,6 +428,7 @@ pub(crate) struct EcmaScriptKinds {
     variable_declaration: u16,
     export_statement: u16,
     identifier: u16,
+    literal_property: [u16; 2],
     comment: u16,
     decorator: u16,
     /// `Some` on the TypeScript grammars; the JavaScript grammar spells no
@@ -559,6 +560,10 @@ impl EcmaScriptKinds {
             variable_declaration: kind_id(language, VARIABLE_DECLARATION_KIND),
             export_statement: kind_id(language, EXPORT_STATEMENT_KIND),
             identifier: kind_id(language, IDENTIFIER_KIND),
+            literal_property: [
+                kind_id(language, "string"),
+                kind_id(language, "string_fragment"),
+            ],
             comment: kind_id(language, COMMENT_KIND),
             decorator: kind_id(language, DECORATOR_KIND),
             accessibility_modifier: None,
@@ -1390,6 +1395,27 @@ fn field_id(language: &tree_sitter::Language, field: &str) -> NonZeroU16 {
 pub(crate) struct EcmaScriptRules<'text> {
     kinds: &'static EcmaScriptKinds,
     exports: ModuleExports<'text>,
+    javascript: bool,
+}
+
+/// One unescaped written property name, excluding its quote delimiters.
+pub(crate) fn literal_property_fragment<'tree>(
+    key: Node<'tree>,
+    [string, fragment]: [u16; 2],
+    source: &str,
+) -> Option<Node<'tree>> {
+    if key.kind_id() != string || key.has_error() || key.named_child_count() != 1 {
+        return None;
+    }
+    let name = key
+        .named_child(0)
+        .filter(|node| node.kind_id() == fragment)?;
+    let value = source.get(name.byte_range())?;
+    (!value.is_empty()
+        && value.trim() == value
+        && !value.contains('.')
+        && !value.chars().any(char::is_control))
+    .then_some(name)
 }
 
 impl EcmaScriptRules<'_> {
@@ -1654,6 +1680,17 @@ impl EcmaScriptRules<'_> {
         let name = self.kinds.name_syntax_element(syntax_element)?;
         if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
             return None;
+        }
+        if self.javascript
+            && matches!(
+                kind,
+                EcmaScriptSymbolKind::Field
+                    | EcmaScriptSymbolKind::Method
+                    | EcmaScriptSymbolKind::Property
+            )
+            && let Some(name) = literal_property_fragment(name, self.kinds.literal_property, text)
+        {
+            return text.get(name.byte_range()).map(Into::into);
         }
         text.get(name.byte_range()).map(Into::into)
     }
@@ -2206,11 +2243,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
         if !kind.opens_scope() {
             return None;
         }
-        let name = self.kinds.name_syntax_element(syntax_element)?;
-        if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
-            return None;
-        }
-        text.get(name.byte_range()).map(Into::into)
+        self.declaration_name(syntax_element, kind, text)
     }
 
     /// A constructor parameter property belongs to the class: it drops the
@@ -2375,6 +2408,7 @@ pub(crate) fn analyze_included(
     let mut rules = EcmaScriptRules {
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
+        javascript: language.name == "javascript",
     };
     let commonjs = commonjs::record(
         tree.root_node(),

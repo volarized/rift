@@ -6,7 +6,7 @@ use rift_core::SymbolId;
 use rift_protocol::{identity::SymbolIdentity, read::SymbolKind};
 use rift_syntax::{ByteRange, ScopedIdentityAnchors, StaticFacts, SyntaxSymbol};
 
-use super::SelectedFile;
+use super::{SelectedFile, binding_name};
 
 struct ReturnedOwner<'source> {
     declaration: &'source SyntaxSymbol,
@@ -172,7 +172,10 @@ fn authored_property(source: &str, property: &SyntaxSymbol) -> bool {
             Some("pair" | "shorthand_property_identifier")
         )
         && !property.name.starts_with('[')
-        && property.name_range.and_then(|name| text(source, name)) == Some(property.name.as_str())
+        && property.name_range.is_some_and(|name| {
+            text(source, name) == Some(property.name.as_str())
+                || binding_name(source, name).is_some_and(|key| key == property.name)
+        })
 }
 
 fn text(source: &str, range: ByteRange) -> Option<&str> {

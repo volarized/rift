@@ -392,6 +392,10 @@ fn argument_properties<'file, Owner: Copy>(
         let Some(Some((call, callback))) = calls.get(&member.holder.end) else {
             continue;
         };
+        let Some(written) = source_text(source, name) else {
+            continue;
+        };
+        let literal = quoted::is_simple_quoted_name(written);
         if property.syntax_element_kind != Some("pair")
             || property.kinds.contains(&SymbolKind::Public)
             || !member.body.encloses(property.item_range)
@@ -400,14 +404,14 @@ fn argument_properties<'file, Owner: Copy>(
             || call.callee_range.end > member.holder.start
             || !source_text(source, member.holder)
                 .is_some_and(|text| text.starts_with('(') && text.ends_with(')'))
-            || source_text(source, name) != Some(property.name.as_str())
-            || (property.name.contains(['\'', '"', '`', '['])
-                && (!quoted || !quoted::is_simple_quoted_name(&property.name)))
+            || (written != property.name
+                && (!literal || quoted::unquoted_name(written) != property.name))
+            || (written.contains(['\'', '"', '`', '[']) && (!quoted || !literal))
         {
             continue;
         }
         let key = if quoted {
-            quoted::unquoted_name(&property.name)
+            quoted::unquoted_name(written)
         } else {
             &property.name
         };
@@ -419,15 +423,15 @@ fn argument_properties<'file, Owner: Copy>(
                 name,
                 *callback,
                 matches!(call.callee, StaticCallee::Member { .. }),
+                literal,
             )));
     }
     let ordinary_bodies = if quoted {
         fields
             .iter()
             .filter_map(|(&(body, _), candidate)| {
-                let (property, _, _, _) = candidate.as_ref()?;
-                (!quoted::is_simple_quoted_name(&property.name) && placed.contains(&property.range))
-                    .then_some(body)
+                let (property, _, _, _, literal) = candidate.as_ref()?;
+                (!literal && placed.contains(&property.range)).then_some(body)
             })
             .collect::<BTreeSet<_>>()
     } else {
@@ -436,9 +440,9 @@ fn argument_properties<'file, Owner: Copy>(
     fields
         .into_iter()
         .filter_map(|((body, _), candidate)| {
-            let (property, name, callback, member) = candidate?;
+            let (property, name, callback, member, literal) = candidate?;
             let shaped = if quoted {
-                quoted::is_simple_quoted_name(&property.name) && ordinary_bodies.contains(&body)
+                literal && ordinary_bodies.contains(&body)
             } else {
                 names[property.qualified_name.as_str()] > 1
             };

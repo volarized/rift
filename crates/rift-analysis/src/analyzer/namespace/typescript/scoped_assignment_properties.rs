@@ -76,10 +76,11 @@ pub(super) fn place(
             )
             || property.name.starts_with('[')
             || name != property.name
-            || property
-                .name_range
-                .and_then(|range| text(file.source, range))
-                != Some(name)
+            || (key != property.name
+                && property
+                    .name_range
+                    .and_then(|range| text(file.source, range))
+                    != Some(name))
             || occurrences.get(&(member.body, key)) != Some(&1)
             || !anchors.contains_key(name)
             || scoped

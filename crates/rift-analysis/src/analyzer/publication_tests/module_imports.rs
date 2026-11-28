@@ -5938,6 +5938,77 @@ fn javascript_nested_array_elements_keep_checked_property_owners() {
 }
 
 #[test]
+fn javascript_uses_the_value_of_a_written_string_property_key() {
+    const SOURCE: &str = concat!(
+        "const selector = 'hidden';\n",
+        "export const settings = { 'fresh': 1, \"cache-size\": 2, [selector]: 3 };\n",
+        "export class Meter { \"rotate\"() { return 1; } }\n",
+        "export function sample() {\n",
+        "  return [settings.fresh, settings['fresh'], settings['cache-size']];\n",
+        "}\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![("index.js", SOURCE)],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js"}"#,
+        )),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let declaration = |source: &str, name: &str| {
+        let offset = SOURCE.find(source).expect("written declaration");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source == source
+                    && row.source_complete
+                    && row.range == module_runtime_range(offset, source)
+            })
+            .expect("exact source declaration");
+        assert!(row.symbol.as_str().ends_with(&format!("/{name}")));
+        assert!(
+            publication
+                .objects
+                .iter()
+                .any(|object| { object.id.as_ref() == Some(&row.symbol) && object.name == name })
+        );
+        row
+    };
+    let fresh = declaration("'fresh': 1", "fresh");
+    let size = declaration("\"cache-size\": 2", "cache-size");
+    declaration("\"rotate\"() { return 1; }", "rotate");
+    for (selector, significant, target) in [
+        ("settings.fresh", "fresh", &fresh.symbol),
+        ("settings['fresh']", "fresh", &fresh.symbol),
+        ("settings['cache-size']", "cache-size", &size.symbol),
+    ] {
+        let offset = SOURCE.find(selector).expect("written read")
+            + selector.find(significant).expect("written property");
+        let range = module_runtime_range(offset, significant);
+        assert!(
+            publication.edges.iter().any(|edge| {
+                &edge.to == target
+                    && edge.occurrence.as_ref().is_some_and(|site| {
+                        site.range.start <= range.start && range.end <= site.range.end
+                    })
+            }),
+            "written read {selector}"
+        );
+    }
+    assert!(
+        publication
+            .objects
+            .iter()
+            .all(|object| object.name != "hidden")
+    );
+}
+
+#[test]
 fn javascript_keeps_written_module_arrow_getter_properties_beside_a_reassignment() {
     const SOURCE: &str = concat!(
         "import { install } from './helper.js';\n",
@@ -7786,8 +7857,8 @@ fn returned_properties_keep_their_distinct_private_function_owners() {
         for (suffix, text) in [
             ("/folder", "folder: root"),
             ("/read", "read: function"),
-            ("/'package'", "'package':"),
-            ("/'package'/entry", "entry:"),
+            ("/package", "'package':"),
+            ("/package/entry", "entry:"),
         ] {
             let identity = format!("{}{suffix}", owner.symbol.as_str());
             let row = publication
@@ -8015,7 +8086,7 @@ fn secondary_default_array_keeps_each_written_property_tree() {
     };
     assert_ne!(left.symbol, right.symbol);
     for (root, extrema, rank) in [(left, "maximum: 8", 2), (right, "maximum: 12", 3)] {
-        let scope = format!("{}/'max-size'", root.symbol.as_str());
+        let scope = format!("{}/max-size", root.symbol.as_str());
         let child = publication
             .declarations
             .iter()
@@ -8180,8 +8251,8 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
         })
         .expect("earlier local binding");
     for (key, text) in [
-        ("'alpha'", "'alpha': ['parseAlpha']"),
-        ("'beta'", "'beta': ['parseBeta']"),
+        ("alpha", "'alpha': ['parseAlpha']"),
+        ("beta", "'beta': ['parseBeta']"),
     ] {
         let identity = format!("{}/{key}", owner.symbol.as_str());
         let property = publication
@@ -8204,8 +8275,8 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
         format!("(function (outside) {{ outside = {{ 'alpha': ['other'] }}; }}({{}}));\n{SOURCE}");
     let separated = analyze(&sibling);
     for (owner, source) in [
-        ("/rules/'alpha'", "'alpha': ['parseAlpha']"),
-        ("/beacon/'alpha'", "'alpha': ['other']"),
+        ("/rules/alpha", "'alpha': ['parseAlpha']"),
+        ("/beacon/alpha", "'alpha': ['other']"),
     ] {
         assert!(
             separated
@@ -8225,14 +8296,14 @@ fn inline_assigned_literal_properties_keep_their_written_local_owner() {
     for control in [shadow, outer] {
         let other = analyze(&control);
         assert!(other.publication().declarations.iter().any(|row| {
-            row.symbol.as_str().ends_with("/'alpha'") && row.source == "'alpha': ['parseAlpha']"
+            row.symbol.as_str().ends_with("/alpha") && row.source == "'alpha': ['parseAlpha']"
         }));
         assert!(
             !other
                 .publication()
                 .declarations
                 .iter()
-                .any(|row| { row.symbol.as_str().ends_with("/rules/'alpha'") })
+                .any(|row| { row.symbol.as_str().ends_with("/rules/alpha") })
         );
     }
 }
