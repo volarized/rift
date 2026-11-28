@@ -1201,6 +1201,72 @@ pub fn read(clock: &Clock) -> u8 { clock.hour() }
 }
 
 #[test]
+fn package_rust_places_written_default_trait_macro_method() {
+    let source = r#"
+macro_rules! methods {
+    ($($name:ident => $value:literal;)*) => {
+        $(fn $name(&self) -> u8 { $value })*
+    };
+}
+/// Reads the next value.
+#[allow(dead_code)]
+pub trait Reader {
+    methods! { from_macro => 1; }
+    fn explicit(&self) -> u8 { 2 }
+}
+pub(crate) trait Restricted {
+    methods! { restricted => 4; }
+}
+pub struct Plain;
+impl Reader for Plain {}
+#[cfg(feature = "disabled")]
+pub trait Inactive {
+    methods! { hidden => 3; }
+}
+pub fn read(value: &Plain) -> u8 { Reader::from_macro(value) }
+"#;
+    let publication = analyze_rust_root(vec![("src/lib.rs", source)], MANIFEST);
+    let publication = publication.publication();
+    let declaration = publication
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/Reader/from_macro"))
+        .expect("written default method");
+    let start = usize::try_from(declaration.range.start).expect("fixture range");
+    let end = usize::try_from(declaration.range.end).expect("fixture range");
+    assert_eq!(&source[start..end], "from_macro");
+    assert_eq!(
+        declaration.syntax_element_kind.as_deref(),
+        Some("identifier")
+    );
+    assert!(declaration.public);
+    assert!(declaration.signature_indices.is_empty());
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str().ends_with("/Restricted/restricted") && !row.public })
+    );
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str().ends_with("/Reader/explicit") })
+    );
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from.as_str().ends_with("/read")
+            && edge.to == declaration.symbol
+    }));
+    assert!(
+        !publication
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str().ends_with("/Inactive/hidden") })
+    );
+}
+
+#[test]
 fn package_rust_feature_guarded_documentation_preserves_its_authored_module() {
     let root = "#[cfg_attr(feature = \"extra\", doc(cfg(feature = \"extra\")))]
 pub mod child;
