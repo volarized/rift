@@ -7860,3 +7860,89 @@ fn secondary_commonjs_callbacks_keep_separate_private_return_functions() {
         row.source.starts_with("function configure(") && row.symbol.as_str().contains("/configure")
     }));
 }
+
+#[test]
+fn secondary_default_array_keeps_each_written_property_tree() {
+    const SOURCE: &str = concat!(
+        "const presets = [];\n",
+        "export default [\n",
+        "  { once: true }, { rules: { alpha: true, 'max-size': [2, { maximum: 8 }] } },\n",
+        "  ...presets,\n",
+        "  { rules: { beta: false, 'max-size': [3, { maximum: 12 }] } },\n",
+        "];\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#;
+    let analyze = |source: &str| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![
+                ("index.mjs", "export const keep = 'value';"),
+                ("config.mjs", source),
+            ],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked secondary default array")
+    };
+    let result = analyze(SOURCE);
+    let publication = result.publication();
+    publication
+        .validate_facts()
+        .expect("checked property anchors");
+    let mut groups = publication
+        .declarations
+        .iter()
+        .filter(|row| {
+            row.source_complete
+                && row.source.starts_with("rules: {")
+                && row.syntax_element_kind.as_deref() == Some("pair")
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by_key(|row| row.range.start);
+    let [left, right] = groups.as_slice() else {
+        panic!("separate literal property roots");
+    };
+    assert_ne!(left.symbol, right.symbol);
+    for (root, extrema, rank) in [(left, "maximum: 8", 2), (right, "maximum: 12", 3)] {
+        let scope = format!("{}/'max-size'", root.symbol.as_str());
+        let child = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.symbol.as_str() == scope
+                    && row.source.starts_with(&format!("'max-size': [{rank}, "))
+            })
+            .expect("quoted child belongs to its written rules slot");
+        let grandchild = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.symbol.as_str() == format!("{scope}/maximum")
+                    && row.source == extrema
+            })
+            .expect("exact option in the written list");
+        assert!(root.range.start <= child.range.start && child.range.end <= root.range.end);
+        assert!(
+            child.range.start <= grandchild.range.start && grandchild.range.end <= child.range.end
+        );
+    }
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str().ends_with("/once") && row.source == "once: true" })
+    );
+
+    let ambiguous = SOURCE.replace("{ beta: false,", "{ beta: false, beta: true,");
+    let made = analyze(&ambiguous);
+    assert!(
+        !made
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| { row.symbol.as_str() == format!("{}/beta", right.symbol.as_str()) })
+    );
+}

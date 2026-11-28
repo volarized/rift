@@ -18,6 +18,7 @@ use super::{SelectedFile, binding_name};
 use crate::EnclosingDefinitions;
 
 mod conditional_types;
+mod default_array_properties;
 mod disjoint_properties;
 mod function_arguments;
 mod mixed_shorthand;
