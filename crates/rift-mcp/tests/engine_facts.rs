@@ -240,17 +240,19 @@ async fn served_facts(
 /// Waits until a live engine answers the call inventory, then reads the facts.
 async fn live_facts(client: &Client, owner: &str) -> TestResult<Facts> {
     for _attempt in 0..LIVE_ATTEMPTS {
-        let answer = select(client, "SELECT ?s ?t WHERE { ?s :calls ?t }".to_owned()).await?;
-        let loading = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|warning| {
-                warning["code"] == "engine_analysis_unavailable"
-                    && warning["detail"]
-                        .as_str()
-                        .is_some_and(|detail| detail.contains("analyzing"))
-            });
+        let (answer, warnings) = workspace_client::populated_answer(
+            client,
+            "search",
+            &serde_json::json!({"query":"SELECT ?s ?t WHERE { ?s :calls ?t }"}),
+        )
+        .await?;
+        assert!(answer.get("warnings").is_none());
+        let loading = warnings.iter().any(|warning| {
+            warning["code"] == "engine_analysis_unavailable"
+                && warning["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("analyzing"))
+        });
         if !loading {
             return facts(client, owner).await;
         }

@@ -9,6 +9,7 @@ import {
   type IsoPlate,
 } from "@/lib/iso-scene";
 import { parseFlowchart } from "@/lib/mermaid-flowchart";
+import { cn } from "@/lib/utils";
 
 export type FlatDiagramNodePanel = {
   title: string;
@@ -50,8 +51,8 @@ export type FlatDiagramProps = {
   alt: string;
   /** Overrides for the scene's proportions. See `IsoMetrics`. */
   metrics?: Partial<IsoMetrics>;
-  /** Muted, rounded node boxes, or the default background-filled outlines. */
-  variant?: "outline" | "soft";
+  /** Box styling. Architecture diagrams use their Mermaid classes as roles. */
+  variant?: "outline" | "soft" | "architecture";
   /** Optional icons keyed by Mermaid node id. */
   icons?: Readonly<Record<string, ReactNode>>;
   /** Optional inset option boxes keyed by Mermaid node id. */
@@ -73,6 +74,15 @@ const FLAT_METRICS: Partial<IsoMetrics> = {
   minDepth: 46,
   rankSep: 56,
   nodeSep: 34,
+};
+
+const ARCHITECTURE_METRICS: Partial<IsoMetrics> = {
+  label: 14,
+  note: 12,
+  margin: 11,
+  minDepth: 42,
+  rankSep: 32,
+  nodeSep: 20,
 };
 
 /** Clearance kept around the drawing inside the viewBox. */
@@ -145,9 +155,12 @@ export async function FlatDiagram({
   className,
 }: FlatDiagramProps) {
   const flow = await parseFlowchart(chart);
+  const architecture = variant === "architecture";
+  const roles = new Map(flow.nodes.map((node) => [node.id, node.classes[0]]));
   const sceneMetrics = {
     ...DEFAULT_METRICS,
     ...FLAT_METRICS,
+    ...(architecture && ARCHITECTURE_METRICS),
     ...metrics,
   };
   const scene = buildScene(
@@ -184,15 +197,21 @@ export async function FlatDiagram({
   const width = scene.bounds.x1 - scene.bounds.x0 + FRAME_PADDING * 2;
   const height = scene.bounds.z1 - scene.bounds.z0 + FRAME_PADDING * 2;
   const { label, note, icon, gutter, margin } = scene.metrics;
-  const noteOpacity = variant === "soft" ? 0.8 : INK.note;
+  const ink = architecture ? { plate: 1, connector: 1, label: 1, note: 1, group: 0.6 } : INK;
+  const noteOpacity = variant === "soft" ? 0.8 : ink.note;
 
   return (
-    <DiagramFullscreen className={className}>
+    <DiagramFullscreen
+      className={cn(
+        architecture && "border border-input bg-card p-2 sm:p-3 [&_svg]:max-h-[48rem]",
+        className,
+      )}
+    >
       <svg
         viewBox={`${x0} ${y0} ${width} ${height}`}
         role="img"
         aria-label={alt}
-        className="w-full h-auto font-mono"
+        className={cn("h-auto w-full font-mono", architecture && "architecture-diagram")}
       >
         {scene.groups.map((group) => {
           const badge = groupBadges[group.id];
@@ -209,7 +228,7 @@ export async function FlatDiagram({
                 rx={8}
                 fill="none"
                 stroke="currentColor"
-                strokeOpacity={INK.group}
+                strokeOpacity={ink.group}
                 strokeDasharray="3 5"
               />
               <text
@@ -232,14 +251,26 @@ export async function FlatDiagram({
           );
         })}
         {scene.connectors.map((connector) => (
-          <g key={connector.key} opacity={INK.connector}>
+          <g
+            key={connector.key}
+            color={architecture ? "var(--muted-foreground)" : undefined}
+            opacity={ink.connector}
+          >
             <path
               d={connector.points
                 .map(([x, z], index) => `${index === 0 ? "M" : "L"}${x} ${z}`)
                 .join(" ")}
               fill="none"
               stroke="currentColor"
-              strokeWidth={connector.style === "thick" ? 2 : 1}
+              strokeWidth={
+                architecture
+                  ? connector.style === "thick"
+                    ? 2.5
+                    : 1.6
+                  : connector.style === "thick"
+                    ? 2
+                    : 1
+              }
               strokeDasharray={connector.style === "dotted" ? "2 4" : undefined}
             />
             {connector.head && (
@@ -261,16 +292,23 @@ export async function FlatDiagram({
           const headerY = hasBody ? plateTop + margin + (plate.mark ? icon : label) / 2 : plate.z;
 
           return (
-            <g key={plate.id}>
+            <g key={plate.id} data-role={architecture ? roles.get(plate.id) : undefined}>
               <rect
                 x={plateLeft}
                 y={plateTop}
                 width={plate.width}
                 height={plate.depth}
-                rx={variant === "soft" ? 10 : 5}
-                fill={variant === "soft" ? "var(--color-fd-muted)" : "var(--color-fd-background)"}
-                stroke="currentColor"
-                strokeOpacity={variant === "soft" ? 0.18 : INK.plate}
+                rx={variant === "outline" ? 5 : 10}
+                fill={
+                  architecture
+                    ? "var(--diagram-node-fill)"
+                    : variant === "soft"
+                      ? "var(--color-fd-muted)"
+                      : "var(--color-fd-background)"
+                }
+                stroke={architecture ? "var(--diagram-node-border)" : "currentColor"}
+                strokeWidth={architecture ? 2 : undefined}
+                strokeOpacity={variant === "soft" ? 0.18 : ink.plate}
               />
               {plate.mark && (
                 <g transform={`translate(${plateLeft + margin} ${iconTop})`}>
@@ -288,7 +326,7 @@ export async function FlatDiagram({
                     dominantBaseline="central"
                     fontSize={label}
                     fill="currentColor"
-                    fillOpacity={INK.label}
+                    fillOpacity={ink.label}
                   >
                     {panel.title}
                   </text>
@@ -370,7 +408,7 @@ export async function FlatDiagram({
                           dominantBaseline="central"
                           fontSize={note}
                           fill="currentColor"
-                          fillOpacity={INK.label}
+                          fillOpacity={ink.label}
                         >
                           {option.label}
                         </text>
@@ -400,7 +438,8 @@ export async function FlatDiagram({
                     dominantBaseline="central"
                     fontSize={label}
                     fill="currentColor"
-                    fillOpacity={INK.label}
+                    fillOpacity={ink.label}
+                    fontWeight={architecture ? 600 : undefined}
                   >
                     {plate.label[0]}
                   </text>
@@ -412,7 +451,7 @@ export async function FlatDiagram({
                       dominantBaseline="central"
                       fontSize={label}
                       fill="currentColor"
-                      fillOpacity={variant === "soft" ? 0.8 : INK.label}
+                      fillOpacity={variant === "soft" ? 0.8 : ink.label}
                     >
                       {plate.label.slice(1).map((line, index) => (
                         <tspan key={line} x={headerX} dy={index === 0 ? 0 : label * 1.45}>
@@ -445,7 +484,7 @@ export async function FlatDiagram({
               fill="currentColor"
               fillOpacity={noteOpacity}
               stroke="var(--color-fd-background)"
-              strokeWidth={4}
+              strokeWidth={architecture ? 5 : 4}
               paintOrder="stroke"
             >
               {connector.label.map((line, index) => (

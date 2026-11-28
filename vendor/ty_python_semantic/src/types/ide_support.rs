@@ -2025,7 +2025,7 @@ fn reachable_class_literals_in_file<'db>(
             continue;
         }
 
-        // Drop classes in dead code — e.g. a class under if sys.version_info < (3, 9): on a newer Python.
+        // Drop classes in dead code - e.g. a class under if sys.version_info < (3, 9): on a newer Python.
         let file_scope_id = scope_id.file_scope_id(db);
         if !is_range_reachable(db, index, file_scope_id, class_node.node(&parsed).range()) {
             continue;

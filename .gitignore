@@ -37,6 +37,16 @@ __pycache__/
 .playwright-mcp
 docs/public/schemas/
 
+# Artifacts generated from the Rust workspace.
+/crates/rift-analysis/analyzer-manifest.json
+/docs/public/cli-help.txt
+/docs/public/errors.json
+/docs/public/global-api.openapi.json
+/docs/public/mcp.json
+/docs/public/package-index.schema.json
+/docs/public/rift.schema.json
+/docs/src/components/workspace-examples.generated.json
+
 AGENTS.md
 CLAUDE.md
 .experiments

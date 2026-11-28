@@ -19,8 +19,9 @@ Local index regressions compare complete incremental read-service facts with a c
 replacement, deletion, restoration, and case changes. The comparison keeps file digests, map
 values, index documents, documentation metadata, symbol pages, and edge rows.
 
-Live MCP cases validate partial maps and preparation warnings against the served schema. Worker
-and database cases force queue exhaustion, cancellation, publication ordering, and shutdown.
+Live MCP cases validate partial maps against the served schema and check preparation diagnostics
+in the server logs. Worker and database cases force queue exhaustion, cancellation, publication
+ordering, and shutdown.
 Resource cases verify published paging without recapturing every source file.
 
 Background validation tests force elapsed deadlines under continuous events and recover edits
@@ -210,8 +211,8 @@ Embedding model downloads stay disabled for corpus runs, so repository checks me
 The Next.js churn case writes a probe declaration every two seconds while `search` and `facets`,
 by the probe's symbol, read it. It runs at least 50 calls across those reads and requires at least two writes
 during pending reads. Every call must return the same symbol identity, a complete written source
-revision, and its matching byte range. Source older than the revision present when the call started
-must carry `stale_index`.
+revision, and its matching byte range. When a read serves an older revision, the check looks for
+the corresponding `stale_index` diagnostic in the server logs.
 
 Each budget the case applies stands strictly inside the one outside it, so a breach fails naming
 the action that ran long instead of tearing down whatever the next budget out was waiting on:
@@ -228,9 +229,9 @@ the action that ran long instead of tearing down whatever the next budget out wa
 A tool's first read waits for the index the workspace is still building. Every read after it
 answers from a published index and never enters the readiness wait, so a steady read that does
 start waiting fails the case rather than hiding inside the first read's room. After writes stop,
-the check repeats only reads that returned older source with `stale_index`. Older source without
-that warning fails. The report records source revisions, warnings, each call's duration and its
-own deadline, its overlapping writes, and each tool's first and maximum duration.
+the check repeats each tool until it reads the final source. It checks for a `stale_index` record
+for the tool during each stale read. The report records source revisions, each call's duration
+and deadline, its overlapping writes, and each tool's first and maximum duration.
 
 Artifact, agent, and conformance checks also retain original OTLP records and collection
 accounting in their persistent report directories through server cleanup.

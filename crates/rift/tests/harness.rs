@@ -1784,7 +1784,7 @@ pub(crate) async fn await_workspace_ready(client: &RunningService<RoleClient, ()
                 .and_then(|block| block.as_text())
                 .and_then(|block| block.text.lines().next())
             {
-                Some(line) if line.starts_with("unavailable · indexing is in progress") => true,
+                Some(line) if line.starts_with("unavailable | indexing is in progress") => true,
                 Some("true" | "false") => false,
                 _ => {
                     return Err(format!("unexpected text graph readiness probe: {result:?}").into());
@@ -1889,7 +1889,7 @@ pub(crate) struct ToolFailure {
 /// Reads the failure of an error result.
 ///
 /// Requires `is_error == Some(true)`, no structured content, and exactly one text block.
-/// Line 1 is `N error(s)`; line 2 is the first entry head `  <code> · retry <directive>`;
+/// Line 1 is `N error(s)`; line 2 is the first entry head `  <code> | retry <directive>`;
 /// line 3 is its message at 4 spaces, on one line.
 pub(crate) fn tool_failure(result: &CallToolResult) -> TestResult<ToolFailure> {
     if result.is_error != Some(true) {
@@ -1939,14 +1939,14 @@ fn failure_title(line: &str) -> bool {
         .is_some_and(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// The code and retry directive of the entry head `<code> · retry <directive>`, one level deep.
+/// The code and retry directive of the entry head `<code> | retry <directive>`, one level deep.
 fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
     let (code, retry) = line
         .strip_prefix(INDENT_UNIT)
         .filter(|rest| !rest.starts_with(INDENT_UNIT))
-        .and_then(|rest| rest.split_once(" · retry "))
+        .and_then(|rest| rest.split_once(" | retry "))
         .ok_or_else(|| {
-            format!("line 2 must be `<code> · retry <directive>` at one level: {line}")
+            format!("line 2 must be `<code> | retry <directive>` at one level: {line}")
         })?;
     Ok((
         serde_json::from_value(serde_json::Value::String(code.to_owned()))?,

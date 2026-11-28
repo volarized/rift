@@ -1,5 +1,7 @@
 //! Validation for the published global package contract.
 
+mod document;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -21,6 +23,8 @@ use rift_protocol::read::{
 use rift_ranking::{
     IDENTIFIER_CANDIDATES_MAX, PARSED_QUERY_MEMBERS_MAX, QUERY_BYTES_MAX, QUERY_TERM_BYTES_MAX,
 };
+
+pub use document::document;
 
 /// Published path below the repository root.
 pub const CONTRACT_PATH: &str = "docs/public/global-api.openapi.json";

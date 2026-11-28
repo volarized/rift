@@ -1,7 +1,7 @@
 //! Optional producer facts in graph answers.
 
 use rift_error::RiftError;
-use rift_protocol::query::{QueryAnswer, QueryInclude, RdfTerm};
+use rift_protocol::query::{QueryAnswer, QueryInclude, QuerySection, RdfTerm};
 use rift_protocol::read::EdgeProvider;
 
 impl super::GraphDataset {
@@ -66,7 +66,7 @@ impl QueryAnswerProjection for QueryAnswer {
         if let QueryAnswer::Graph { triples } = &mut self {
             triples.retain(|triple| !is_provider(&triple.predicate));
         }
-        if !include.providers {
+        if !include.contains(&QuerySection::Providers) {
             for term in terms_mut(&mut self) {
                 if let RdfTerm::BlankNode { providers, .. } = term {
                     providers.clear();
@@ -145,7 +145,9 @@ mod tests {
             let mut answer: QueryAnswer =
                 dataset.evaluate(&query, &QueryCancellation::new())?.into();
             dataset.annotate_providers(&mut answer)?;
-            let included = answer.clone().project(QueryInclude { providers: true });
+            let included = answer
+                .clone()
+                .project(QueryInclude::from([QuerySection::Providers]));
             let included = serde_json::to_value(included)?;
             assert_eq!(
                 included["bindings"][0]["edge"]["providers"],
@@ -181,7 +183,9 @@ mod tests {
         let mut answer: QueryAnswer = dataset.evaluate(&query, &QueryCancellation::new())?.into();
         dataset.annotate_providers(&mut answer)?;
         let default = answer.clone().project(QueryInclude::default());
-        let included = answer.clone().project(QueryInclude { providers: true });
+        let included = answer
+            .clone()
+            .project(QueryInclude::from([QuerySection::Providers]));
         let QueryAnswer::Graph { triples } = &default else {
             panic!("graph answer")
         };

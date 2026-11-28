@@ -221,7 +221,7 @@ impl<'a> SourceOrderVisitor<'a> for CallSitesFinder<'a, '_> {
         match node {
             // Walk by call site rather than by identifier. This is structurally
             // faster (call sites are much rarer than identifier occurrences)
-            // and — critically — it makes alias-routed calls work: `bar()`
+            // and - critically - it makes alias-routed calls work: `bar()`
             // where `bar` is a local rebinding/alias of the target resolves
             // semantically without needing the alias name in the text needle.
             AnyNodeRef::ExprCall(call) => {
@@ -482,7 +482,7 @@ fn module_item(db: &dyn Db, file: ResolverFile<'_>) -> CallHierarchyItem {
 
 /// Returns `true` when `attribute` is the immediate callee of an enclosing
 /// `ExprCall` or `Decorator`. The `ExprCall` / `Decorator` arms in
-/// `CallSitesFinder::enter_node` already record those sites — skipping here
+/// `CallSitesFinder::enter_node` already record those sites - skipping here
 /// avoids the descriptor-+-call double-count pyright exhibits.
 fn attribute_is_callee_of_parent<'a>(
     ancestors: &[AnyNodeRef<'a>],
@@ -609,15 +609,15 @@ mod tests {
                 pass
 
             def caller():
-                cb = foo  # not a call — should NOT appear
-                foo()     # this is a call — should appear once
+                cb = foo  # not a call - should NOT appear
+                foo()     # this is a call - should appear once
             "#,
         );
         assert_snapshot!(test.incoming_calls(), @"
         info[incoming-calls]: Incoming calls to `foo`
          --> main.py:7:5
           |
-        7 |     foo()     # this is a call — should appear once
+        7 |     foo()     # this is a call - should appear once
           |     ^^^ Call site
         info: Function: `caller` (`main`)
          --> main.py:5:5
@@ -965,7 +965,7 @@ def make() -> C:
     #[test]
     fn property_setter_write() {
         // Querying the setter must surface the assignment (`c.prop = 5`) but
-        // not the read (`c.prop`) — pyright lumps them; we don't.
+        // not the read (`c.prop`) - pyright lumps them; we don't.
         let test = cursor_test(
             r#"
             class C:
@@ -1199,7 +1199,7 @@ def make() -> C:
     #[test]
     fn lambda_inside_function_attributed_to_lambda() {
         // A call inside a lambda nested in a function must be attributed
-        // to the lambda, not to the enclosing function — the lambda is
+        // to the lambda, not to the enclosing function - the lambda is
         // the innermost callable scope.
         let test = cursor_test(
             r#"
@@ -1227,7 +1227,7 @@ def make() -> C:
 
     #[test]
     fn comprehension_attributed_to_enclosing_function() {
-        // Comprehensions are NOT synthesized as items — a call inside a
+        // Comprehensions are NOT synthesized as items - a call inside a
         // list comprehension is still attributed to the enclosing named
         // scope (regression guard for "lambda only, not comprehensions").
         let test = cursor_test(
@@ -1259,7 +1259,7 @@ def make() -> C:
         // caller has a `selection_range` whose start is the `lambda` keyword.
         // A follow-up `incomingCalls` / `outgoingCalls` request that lands
         // on that position has no `Definition` to resolve to, so both must
-        // return empty — matching pyright's "lambda is a leaf" behavior.
+        // return empty - matching pyright's "lambda is a leaf" behavior.
         let test = cursor_test(
             r#"
             def tar<CURSOR>get(x):

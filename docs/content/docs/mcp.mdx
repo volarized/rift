@@ -88,6 +88,9 @@ optional `language`, whose default is `sparql`:
 
 <ReadExample name="select-symbols" />
 
+The **response** tab shows an aligned table in a code block.
+See [search result text](/docs/developer/protocol/mcp#search-result-text) for the format.
+
 The empty prefix names `urn:rift:vocabulary:`. `r:`, `rdf:`, `rdfs:`, and `xsd:` are also
 available. An explicit `PREFIX` declaration can name another namespace.
 
@@ -95,6 +98,10 @@ available. An explicit `PREFIX` declaration can name another namespace.
 return triples. The selected variables are the answer's columns. An unbound variable is
 absent from its row. An IRI, blank node, literal with a datatype, and literal with a language
 remain distinct terms.
+
+The example project has no declaration named `load_configs`.
+
+<ReadExample name="empty-search" />
 
 ### Names and declarations
 
@@ -144,7 +151,7 @@ describes selection and refusal behavior.
 
 `:packages` names releases beside the ones the workspace depends on. Each entry names its
 `manager`, `registry`, and `name`, and an optional exact `version`. Without one, the newest
-collected release answers:
+collected release answers. This request finds `beacon` in the example package `demo`:
 
 <ReadExample name="package-scope" />
 
@@ -154,9 +161,6 @@ is `global` reads this service with no `:scope`.
 
 Global edge queries read facts already collected for the selected package or runtime.
 
-The local example project runs with the Global connection disabled. Its response shows what
-happens when the named package index cannot be read.
-
 ### Edge provider
 
 Read answers merge edges with the same source, exact kind, target, and physical occurrence.
@@ -164,9 +168,12 @@ They omit the [analyses that produced each edge](/docs/developer/protocol/core#e
 by default. The edge's `derivation` records how it was established, and optional `producer`
 names an external producer.
 
-`include: { providers: true }` attaches the sorted `providers` set to returned edge terms
-and call steps. `SELECT` projects the edge or call step identity to carry that set. Explicit SPARQL bindings and filters on `:provider` keep their
-selected producer facts.
+`include: ["providers"]` attaches the sorted `providers` set to returned edge terms
+and call steps. Project the edge or call step identity in `SELECT` to return that set.
+
+<ReadExample name="edge-provider-set" />
+
+Explicit SPARQL bindings and filters on `:provider` keep their selected producer facts.
 
 A query can check for edges from static analysis with `:provider`:
 
@@ -199,8 +206,8 @@ Local reference and call questions use the configured
 [language engine](/docs/developer/configuration#languages-and-lsp) when required facts
 are absent from the captured publication. Acquisition preserves physical locations and
 continues through admitted dependency sources. These facts belong to the request and do
-not enter global collection. Captured static calls and references answer first, and an
-`engine_analysis_unavailable` warning names a language whose engine analysis is missing.
+not enter global collection. Captured static calls and references answer first. The server logs
+`engine_analysis_unavailable` for a language whose engine analysis is missing.
 
 ### Changes and commits [#search-change]
 
@@ -235,25 +242,32 @@ crate and declaration, rather than the physical file:
 
 <ReadExample name="local-symbol" />
 
-The result carries `outcome: "found"`, one `symbol`, the `revision` it was read at, and
-`declarations` in deterministic source order. Each declaration keeps its own origin,
-source address, byte range, and indices into the symbol's signatures, types, and documentation.
-Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
-be found with no declarations. A runtime symbol, such as `readFile` in Node's `fs` module, reads
-the same way, and its `revision` names the runtime release:
+Text starts with the symbol IRI. Each `facets X/Y:` section shows one declaration's
+available source and documentation, where `X` is its position among the `Y` declarations.
+Structured content carries one `symbol`, the `revision` it was read at, and
+`declarations` in source order. Each declaration keeps its own origin, source address,
+byte range, and indices into the symbol's signatures, types, and documentation.
+Every declaration of one qualified path, such as two `cfg` variants of a Rust function,
+belongs to that symbol. A source-less object can have an empty declaration list.
+A runtime symbol, such as `len` in Python's builtins, has a `revision` that names its release:
 
 <ReadExample name="runtime-symbol" />
 
-Use the `include` object to select optional projections, such as
-`"include": {"documentation": true, "history": true}`:
+The default selection is `["documentation", "source"]`. Use `include` to add selections
+and `exclude` to remove them. If both arrays name a field, `exclude` wins.
 
-| Member | Adds when `true` |
+| Selection | Result |
 | --- | --- |
-| `documentation` | Bounded documentation referring to the exact declaration |
-| `history` | The logical symbol's history edges: the commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
+| `documentation` | Attached documentation and bounded documentation that refers to the symbol |
+| `source` | A source excerpt from each declaration |
+| `history` | The commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
+| `edges` | Outgoing edges from the symbol, grouped by kind in text |
 
-The members combine. An omitted member is `false`, and an omitted `include` adds neither. A
-declaration's source comes from [`facets`](#tool-facets) with the symbol's `id`.
+This request adds outgoing edges and excludes source.
+
+<ReadExample name="local-symbol-selection" />
+
+Use [`facets`](#tool-facets) with the symbol's `id` to read the declaration's syntax elements.
 
 `history` answers edges from the symbol. The commit edges come first, newest first, each naming
 its commit as a `rift://revision/git/<commit>` revision with the commit's author and the path the
@@ -293,9 +307,8 @@ later declarations. The server refuses a tree revision once the index serves ano
 
 <span id="get_symbol-scope" />
 
-A named local identity selects an extra project accepted by the connection:
-
-<ReadExample name="named-symbol" />
+A named local identity such as `rift://symbol/local@sdk/rust/docs_sdk/load_config` selects an
+extra project accepted by the connection.
 
 A package or runtime identity names an owner across releases. Discover it with
 `:scope "global"` and `:packages` inside `SERVICE :search`, then pass the identity and selected
@@ -307,7 +320,7 @@ If the requested release has no complete coverage, `search` can return an unavai
 answer. Check `rift server logs` for the release and the coverage details.
 
 Several declaration bindings share one identity, such as the `cfg(unix)` and `cfg(windows)`
-declarations of `data_dir` in the `sdk` project. `page` and `max_results` select those bindings
+declarations of `data_dir` in the example below. `page` and `max_results` select those bindings
 at the same revision:
 
 <ReadExample name="multi-declaration-full" />
@@ -319,10 +332,8 @@ at the same revision:
 For a package or runtime symbol, `revision` can only name a release of the symbol's owner. Released source units remain physical addresses separate from
 logical symbol identities.
 
-A valid absent identity returns MCP `isError: true` and `outcome: "missing"` with
-`symbol_not_found` and bounded structural alternatives. Its compact text starts with
-`error: symbol_not_found` and lists alternatives under `closest matches:`. The
-`--output all` policy retains the typed answer in `structuredContent`:
+A valid identity whose lookup establishes absence returns empty text.
+With `--output all`, structured content is `{}`.
 
 <ReadExample name="missing-symbol" />
 
@@ -330,8 +341,7 @@ A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
 
- An incomplete exact selection returns
-`outcome: "unavailable"` with its typed reason, rather than a definite miss.
+An incomplete exact selection returns the requested `id` and a typed `reason`.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
 ## Facets [#tool-facets]
@@ -365,15 +375,10 @@ Describe the Rift behavior and what the caller expected. A report can include a 
 redacted Rift error or response excerpt. Before including an exact excerpt from the
 conversation, show the user that excerpt and get approval to send it in this report.
 
-```json
-{
-  "text": "The facets tool returned an empty result for a symbol it found.",
-  "include": {"os": true, "rift_version": true}
-}
-```
-
-The server sends the diagnostic fields set to `true` in `include`. Omit it to send the text alone.
-See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for the payload and failure behavior.
+The `include` array names the diagnostic fields to send. Pass `["os", "rift_version"]` to
+send both diagnostics. Omit it or pass `[]` to send the text alone.
+See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for a request example
+and failure behavior.
 
 ## Edits and index updates [#edit-and-index-updates]
 
@@ -391,13 +396,12 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 RDF triples for a graph query. `page` and `max_results` select answer rows. Exact `get_symbol`
 and `facets` reads select declarations with the same pair at the reported revision.
 
-A query over the captured inventory answers from partly covered facts, and its `warnings` name
-the files, languages, or engines left out. A query whose answer needs every fact returns
-`outcome: "unavailable"` with `insufficient_coverage`: an empty result, a false `ASK`, a count,
-a negation, or an `OPTIONAL`. Run `rift server logs` to inspect missing facts or preparation
-still in progress.
+A query over the captured inventory answers from partly covered facts. An empty result, a false
+`ASK`, a count, a negation, or an `OPTIONAL` requires complete coverage. The server returns
+`outcome: "unavailable"` with `insufficient_coverage` when that coverage is missing. Run
+`rift server logs` to inspect missing facts or preparation still in progress.
 
-The proxy returns compact text by default. Start `rift mcp --output=all` for structured
+The proxy returns text by default. Start `rift mcp --output=all` for structured
 results and output schemas. The map and workspace resources then carry both compact text
 and JSON.
 
@@ -406,7 +410,7 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-Every `get_symbol` and `facets` answer names the revision it was read at, such as
+Successful `get_symbol` and `facets` reads name the revision they were read at, such as
 `rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
 project code by adding `revision` to either tool. For example, this reads the function from
 `main` without changing the working tree:
@@ -432,57 +436,8 @@ and argument constraints.
 </Accordion>
 <Accordion title="Errors" id="errors">
 
-When a call fails, the agent gets a result marked as an error instead of an answer. Its text is one
-section, titled with the count of errors, that lists the failure first and then its causes,
-outermost first. Each entry names its `code` and a `retry` directive, which says whether sending
-the same request again can help, and the line below states what failed:
-
-<Tabs items={["invalid_request", "limit_exceeded", "causes"]}>
-
-<Tab value="invalid_request">
-
-**Tool execution failure, compact text** of a request whose `max_results` is below 1:
-
-```text
-1 error
-	invalid_request · retry never
-		the request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request
-```
-
-</Tab>
-
-<Tab value="limit_exceeded">
-
-**Tool execution failure, compact text** of a request that crosses a limit on `source.files`, with one cause:
-
-```text
-2 errors
-	limit_exceeded · retry never
-		the request crosses a limit
-		limit source.files: 11 over 10
-	storage_failure · retry same_request
-		the store refused
-```
-
-</Tab>
-
-<Tab value="causes">
-
-**Tool execution failure, compact text** of a history store that could not be opened, with two causes:
-
-```text
-3 errors
-	storage_failure · retry same_request
-		history store database operation failed: open: unable to open database file; check the history store database and retry
-	storage_failure · retry same_request
-		unable to open database file
-	storage_failure · retry same_request
-		Permission denied (os error 13)
-```
-
-</Tab>
-
-</Tabs>
+When a call fails, the agent gets a result marked as an error. Its text lists the failure first,
+then its causes from outermost to innermost. Each entry names its `code` and a `retry` directive.
 
 - `retry never` tells the agent to change its arguments first. `retry same_request` says the same
   request can succeed later.
@@ -491,8 +446,8 @@ the same request again can help, and the line below states what failed:
 - The `retry` of the first entry governs the call. A cause's `retry` says what could be done
   about that cause.
 
-See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for the other
-directives and the complete form.
+See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for examples
+and the complete form. The [error registry](/docs/developer/errors) lists registered errors.
 
 </Accordion>
 </Accordions>
@@ -517,24 +472,6 @@ Complete tool examples, resource fields, limits, and failure behavior.
 </IconCard>
 </Cards>
 
-The workspace resource comes as compact text, in the same form as a tool result:
-
-**`rift://workspace`, compact text** of a workspace with one TypeScript language and one source file:
-
-```text
-workspace
-languages:
-	typescript:tsx · syntax · lsp typescript:tsx ready
-		include src/**/*.tsx
-		exclude src/generated/**
-source:
-	src/view.tsx · typescript:tsx
-```
-
-
 The workspace text lists effective languages with their include and exclude patterns, then
 lists source paths with their languages. Follow the next URI when the catalog spans pages.
-
-
-See [resource contents](/docs/developer/protocol/mcp#resource-contents) for the compact text and
-the JSON body a read carries.
+See the [workspace resource](/docs/developer/protocol/mcp#resource-workspace) for an example.

@@ -5,7 +5,7 @@
 //!
 //! This module is instrumented with debug-level `tracing` messages. You can set the `TY_LOG`
 //! environment variable to see this output when testing locally. `tracing` log messages typically
-//! have a `target` field, which is the name of the module the message appears in — in this case,
+//! have a `target` field, which is the name of the module the message appears in - in this case,
 //! `ty_python_semantic::types::call::bind`.
 
 mod constructor;

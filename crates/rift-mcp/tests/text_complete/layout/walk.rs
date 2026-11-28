@@ -40,7 +40,7 @@ const AT: &str = "at ";
 /// Word before the first kind of a heuristic edge.
 const HEURISTIC: &str = "probably ";
 /// Text between an edge and the external producer that emitted it.
-const PRODUCER: &str = " · ";
+const PRODUCER: &str = " | ";
 /// Matched field that the tree states, so the facts line leaves it out.
 const STATED_FIELD: &str = "edge";
 /// Each edge kind, read from the target back to the source.

@@ -1,8 +1,23 @@
-use std::process::{Command as ProcessCommand, ExitCode, ExitStatus};
+mod errors;
+
+use std::path::Path;
+use std::process::{Command, ExitCode, ExitStatus};
+
+const USAGE: &str = "usage: cargo xtask <docs | analyzer-manifest | errors <generate|check> | docs-examples <generate|check>>";
+const HELP_COMMANDS: &[&[&str]] = &[
+    &["--help"],
+    &["config", "--help"],
+    &["config", "set", "--help"],
+    &["mcp", "--help"],
+    &["server", "--help"],
+    &["server", "logs", "--help"],
+];
+
+type TaskResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    match run(&arguments, ProcessCommand::status) {
+    match run(&arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -11,216 +26,195 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(
-    arguments: &[String],
-    capture: impl FnOnce(&mut ProcessCommand) -> std::io::Result<ExitStatus>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let root = workspace_root()?;
-    match arguments {
-        [group, command] if group == "docs-examples" => {
-            if !matches!(command.as_str(), "generate" | "check") {
-                return Err(USAGE.into());
-            }
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut process = ProcessCommand::new(cargo);
-            process
-                .current_dir(root)
-                .env("RIFT_DOCS_EXAMPLES", command)
-                .args([
-                    "test",
-                    "--locked",
-                    "-p",
-                    "rift-mcp",
-                    "--test",
-                    "docs_examples",
-                    "--",
-                    "--ignored",
-                    "--exact",
-                    "capture_docs_examples",
-                ]);
-            let status = capture(&mut process)?;
-            if !status.success() {
-                return Err(format!("docs example capture failed: {status}").into());
-            }
-            Ok(())
-        }
-        _ => execute(root, parse_command(arguments)?),
-    }
-}
-
-const USAGE: &str = "usage: cargo xtask <errors|docs-examples> <generate|check>";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Command {
-    Generate,
-    Check,
-}
-
-fn parse_command(arguments: &[String]) -> Result<Command, &'static str> {
-    match arguments {
-        [group, command] if group == "errors" && command == "generate" => Ok(Command::Generate),
-        [group, command] if group == "errors" && command == "check" => Ok(Command::Check),
-        _ => Err(USAGE),
-    }
-}
-
-fn workspace_root() -> Result<&'static std::path::Path, &'static str> {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn run(arguments: &[String]) -> TaskResult {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .ok_or("xtask manifest has no workspace parent")
-}
-
-/// A repository-relative path spelled with `/` on every platform.
-fn slash_form(path: &std::path::Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Every generated file, as a path under `crates/rift-error/src` and its content.
-fn expected_files(
-    module: rift_error_codegen::GeneratedModule,
-) -> std::collections::BTreeMap<std::path::PathBuf, String> {
-    let mut files = std::collections::BTreeMap::new();
-    files.insert(std::path::PathBuf::from("errors.rs"), module.parent);
-    for (namespace, content) in module.namespaces {
-        files.insert(
-            std::path::Path::new("errors").join(format!("{namespace}.rs")),
-            content,
-        );
-    }
-    files
-}
-
-/// Every file under `directory`, as a path relative to it.
-fn present_files(
-    directory: &std::path::Path,
-    relative: &std::path::Path,
-    files: &mut Vec<std::path::PathBuf>,
-) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = relative.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            present_files(&entry.path(), &path, files)?;
-        } else {
-            files.push(path);
+        .ok_or("xtask manifest has no workspace parent")?;
+    match arguments {
+        [task] if task == "docs" => {
+            export_schema(root, "--docs")?;
+            export_errors(root, "generate")?;
+            export_cli_help(root)?;
+            capture_docs_examples(root, "generate", Command::status)
         }
+        [task] if task == "analyzer-manifest" => export_schema(root, "--analyzer-manifest"),
+        [task, mode] if task == "errors" && matches!(mode.as_str(), "generate" | "check") => {
+            export_errors(root, mode)
+        }
+        [task, mode]
+            if task == "docs-examples" && matches!(mode.as_str(), "generate" | "check") =>
+        {
+            capture_docs_examples(root, mode, Command::status)
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn cargo(root: &Path) -> Command {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut command = Command::new(cargo);
+    command.current_dir(root);
+    command
+}
+
+fn export_schema(root: &Path, target: &str) -> TaskResult {
+    let status = cargo(root)
+        .args([
+            "run",
+            "--locked",
+            "--quiet",
+            "-p",
+            "rift-schema-export",
+            "--",
+            target,
+        ])
+        .arg(if target == "--analyzer-manifest" {
+            "."
+        } else {
+            "docs"
+        })
+        .status()?;
+    if !status.success() {
+        return Err(format!("schema export failed: {status}").into());
     }
     Ok(())
 }
 
-fn execute(root: &std::path::Path, command: Command) -> Result<(), Box<dyn std::error::Error>> {
-    let source_path = root.join("crates/rift-error/errors.toml");
-    let source_root = root.join("crates/rift-error/src");
-    let source = std::fs::read_to_string(source_path)?;
-    let expected = expected_files(rift_error_codegen::generate_module(&source)?);
-
-    let mut present = Vec::new();
-    present_files(
-        &source_root.join("errors"),
-        std::path::Path::new("errors"),
-        &mut present,
-    )?;
-    let mut stale = present
-        .into_iter()
-        .filter(|path| !expected.contains_key(path))
-        .collect::<Vec<_>>();
-    stale.sort_by_key(|path| slash_form(path));
-
-    match command {
-        Command::Generate => {
-            std::fs::create_dir_all(source_root.join("errors"))?;
-            for (path, content) in &expected {
-                std::fs::write(source_root.join(path), content)?;
-            }
-            for path in &stale {
-                std::fs::remove_file(source_root.join(path))?;
-            }
-        }
-        Command::Check => {
-            let mut problems = Vec::new();
-            for (path, content) in &expected {
-                match std::fs::read_to_string(source_root.join(path)) {
-                    Ok(current) if current == *content => {}
-                    Ok(_) => problems.push(format!("differs: {}", slash_form(path))),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        problems.push(format!("missing: {}", slash_form(path)));
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            problems.extend(
-                stale
-                    .iter()
-                    .map(|path| format!("unexpected: {}", slash_form(path))),
+fn export_errors(root: &Path, mode: &str) -> TaskResult {
+    let path = root.join("docs/public/errors.json");
+    let json = errors::json()?;
+    if mode == "check" {
+        if std::fs::read_to_string(&path)? != json {
+            return Err(
+                "errors.json differs from the Rust registry; run `cargo xtask errors generate`"
+                    .into(),
             );
-            if !problems.is_empty() {
-                return Err(format!(
-                    "generated error source is stale ({}); run `cargo xtask errors generate`",
-                    problems.join(", ")
-                )
-                .into());
-            }
         }
+    } else {
+        std::fs::create_dir_all(root.join("docs/public"))?;
+        std::fs::write(path, json)?;
+    }
+    Ok(())
+}
+
+fn export_cli_help(root: &Path) -> TaskResult {
+    let mut transcript = String::new();
+    for (index, arguments) in HELP_COMMANDS.iter().enumerate() {
+        let output = cargo(root)
+            .args(["run", "--locked", "--quiet", "-p", "rift", "--"])
+            .args(*arguments)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "rift {} failed: {}\n{}",
+                arguments.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            )
+            .into());
+        }
+        if index > 0 {
+            transcript.push('\n');
+        }
+        std::fmt::Write::write_fmt(
+            &mut transcript,
+            format_args!("$ rift {}\n", arguments.join(" ")),
+        )?;
+        transcript.push_str(&String::from_utf8(output.stdout)?);
+    }
+    std::fs::write(root.join("docs/public/cli-help.txt"), transcript)?;
+    Ok(())
+}
+
+fn capture_docs_examples(
+    root: &Path,
+    mode: &str,
+    capture: impl FnOnce(&mut Command) -> std::io::Result<ExitStatus>,
+) -> TaskResult {
+    let mut process = cargo(root);
+    // A Git hook exports repository variables that would redirect fixture commands
+    // from their temporary workspaces into the checkout running the hook.
+    let variables = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--local-env-vars"])
+        .output()?;
+    if !variables.status.success() {
+        return Err(format!(
+            "git could not list repository variables: {}",
+            variables.status
+        )
+        .into());
+    }
+    for variable in String::from_utf8(variables.stdout)?.lines() {
+        process.env_remove(variable);
+    }
+    process.env("RIFT_DOCS_EXAMPLES", mode).args([
+        "test",
+        "--locked",
+        "--profile",
+        "dev",
+        "-p",
+        "rift-mcp",
+        "--test",
+        "docs_examples",
+        "--",
+        "--ignored",
+        "--exact",
+        "capture_docs_examples",
+    ]);
+    let status = capture(&mut process)?;
+    if !status.success() {
+        return Err(format!("docs example capture failed: {status}").into());
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsStr;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt as _;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt as _;
+    use std::path::Path;
     use std::process::ExitStatus;
 
-    use super::{Command, USAGE, execute, parse_command, run, slash_form, workspace_root};
+    use super::{USAGE, capture_docs_examples, export_errors, run};
 
-    const REGISTRY: &str = r#"
-[registry]
-namespace = "rift"
-schema = 1
-
-[error.test.failure]
-message = "failure for {field}"
-action = "retry after checking {field}"
-fields = { field = { type = "string" } }
-"#;
-
-    fn fixture() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().expect("create temporary workspace");
-        std::fs::create_dir_all(directory.path().join("crates/rift-error/src"))
-            .expect("create generated source directory");
-        std::fs::write(
-            directory.path().join("crates/rift-error/errors.toml"),
-            REGISTRY,
-        )
-        .expect("write test registry");
-        directory
+    #[test]
+    fn errors_export_generates_the_registry_and_checks_its_bytes() {
+        let directory = tempfile::tempdir().expect("a workspace");
+        let root = directory.path();
+        export_errors(root, "generate").expect("generate the registry");
+        export_errors(root, "check").expect("the exported registry is current");
+        std::fs::write(root.join("docs/public/errors.json"), "{}\n").expect("a stale registry");
+        let error = export_errors(root, "check").expect_err("a stale registry must fail");
+        assert!(error.to_string().contains("differs from the Rust registry"));
     }
 
     #[test]
     fn docs_examples_dispatches_both_modes_to_the_capture() {
+        let directory = tempfile::tempdir().expect("a workspace");
         for mode in ["generate", "check"] {
-            run(&["docs-examples".to_owned(), mode.to_owned()], |process| {
-                assert_eq!(process.get_current_dir(), workspace_root().ok());
+            capture_docs_examples(directory.path(), mode, |process| {
+                assert_eq!(process.get_current_dir(), Some(directory.path()));
+                let environment = process.get_envs().collect::<BTreeMap<_, _>>();
                 assert_eq!(
-                    process.get_envs().collect::<Vec<_>>(),
-                    [(OsStr::new("RIFT_DOCS_EXAMPLES"), Some(OsStr::new(mode)))]
+                    environment.get(OsStr::new("RIFT_DOCS_EXAMPLES")),
+                    Some(&Some(OsStr::new(mode)))
                 );
+                for variable in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+                    assert_eq!(environment.get(OsStr::new(variable)), Some(&None));
+                }
+                assert!(!environment.contains_key(OsStr::new("PATH")));
                 assert_eq!(
                     process.get_args().collect::<Vec<_>>(),
                     [
                         "test",
                         "--locked",
+                        "--profile",
+                        "dev",
                         "-p",
                         "rift-mcp",
                         "--test",
@@ -240,189 +234,26 @@ fields = { field = { type = "string" } }
     #[test]
     fn docs_examples_refuses_other_modes_and_reports_capture_errors() {
         for group in ["docs-examples", "unknown"] {
-            let error = run(&[group.to_owned(), "bad".to_owned()], |_| {
-                panic!("invalid commands must not run the capture")
-            })
-            .expect_err("invalid command");
+            let error = run(&[group.to_owned(), "bad".to_owned()]).expect_err("invalid command");
             assert_eq!(error.to_string(), USAGE);
         }
 
-        let args = ["docs-examples".to_owned(), "check".to_owned()];
-        let error =
-            run(&args, |_| Ok(ExitStatus::from_raw(1 << 8))).expect_err("nonzero capture exit");
+        let root = Path::new(".");
+        let error = capture_docs_examples(root, "check", |_| Ok(ExitStatus::from_raw(1 << 8)))
+            .expect_err("nonzero capture exit");
         assert!(
             error
                 .to_string()
                 .starts_with("docs example capture failed:")
         );
-        let error = run(&args, |_| Err(std::io::ErrorKind::NotFound.into()))
-            .expect_err("capture could not start");
+        let error =
+            capture_docs_examples(root, "check", |_| Err(std::io::ErrorKind::NotFound.into()))
+                .expect_err("capture could not start");
         assert_eq!(
             error
                 .downcast_ref::<std::io::Error>()
                 .map(std::io::Error::kind),
             Some(std::io::ErrorKind::NotFound)
         );
-    }
-
-    #[test]
-    fn slash_form_joins_components_with_forward_slashes() {
-        let path = std::path::Path::new("errors").join("test.rs");
-        assert_eq!(slash_form(&path), "errors/test.rs");
-        assert!(!slash_form(&path).contains('\\'));
-        assert_eq!(slash_form(std::path::Path::new("errors.rs")), "errors.rs");
-    }
-
-    #[test]
-    fn accepts_only_error_generation_commands() {
-        assert_eq!(
-            parse_command(&["errors".to_owned(), "generate".to_owned()]),
-            Ok(Command::Generate)
-        );
-        assert_eq!(
-            parse_command(&["errors".to_owned(), "check".to_owned()]),
-            Ok(Command::Check)
-        );
-        assert!(parse_command(&[]).is_err());
-        assert!(parse_command(&["errors".to_owned(), "other".to_owned()]).is_err());
-        assert!(
-            parse_command(&["errors".to_owned(), "check".to_owned(), "extra".to_owned()]).is_err()
-        );
-    }
-
-    const TWO_NAMESPACES: &str = r#"
-[registry]
-namespace = "rift"
-schema = 1
-
-[error.test.failure]
-message = "failure for {field}"
-action = "retry after checking {field}"
-fields = { field = { type = "string" } }
-
-[error.other.broken]
-message = "broken"
-action = "retry"
-"#;
-
-    fn source(root: &std::path::Path) -> std::path::PathBuf {
-        root.join("crates/rift-error/src")
-    }
-
-    fn set_registry(root: &std::path::Path, registry: &str) {
-        std::fs::write(root.join("crates/rift-error/errors.toml"), registry)
-            .expect("write test registry");
-    }
-
-    #[test]
-    fn generate_writes_parent_and_one_file_per_namespace_and_check_preserves_stale_source() {
-        let directory = fixture();
-        let root = directory.path();
-        let parent = source(root).join("errors.rs");
-        let file = source(root).join("errors/test.rs");
-
-        execute(root, Command::Generate).expect("generate source");
-        let generated = std::fs::read_to_string(&file).expect("read generated namespace");
-        assert!(
-            std::fs::read_to_string(&parent)
-                .expect("read generated parent")
-                .contains("pub mod test;")
-        );
-        execute(root, Command::Check).expect("check current source");
-        assert_eq!(
-            std::fs::read_to_string(&file).expect("read generated source again"),
-            generated,
-            "check must not rewrite current source"
-        );
-
-        std::fs::write(&file, "stale").expect("write stale source");
-        assert!(execute(root, Command::Check).is_err());
-        assert_eq!(
-            std::fs::read_to_string(&file).expect("read stale source"),
-            "stale",
-            "check must not rewrite stale source"
-        );
-
-        execute(root, Command::Generate).expect("replace stale source");
-        assert_eq!(
-            std::fs::read_to_string(&file).expect("read regenerated source"),
-            generated
-        );
-    }
-
-    #[test]
-    fn adding_a_namespace_creates_its_file_and_check_fails_until_generated() {
-        let directory = fixture();
-        let root = directory.path();
-        execute(root, Command::Generate).expect("generate source");
-        set_registry(root, TWO_NAMESPACES);
-
-        let message = execute(root, Command::Check)
-            .expect_err("check must fail on a new namespace")
-            .to_string();
-        assert!(message.contains("missing: errors/other.rs"), "{message}");
-        assert!(!source(root).join("errors/other.rs").exists());
-
-        execute(root, Command::Generate).expect("generate added namespace");
-        assert!(source(root).join("errors/other.rs").is_file());
-        execute(root, Command::Check).expect("check after generate");
-    }
-
-    #[test]
-    fn removing_a_namespace_deletes_its_file_and_check_fails_on_the_leftover() {
-        let directory = fixture();
-        let root = directory.path();
-        set_registry(root, TWO_NAMESPACES);
-        execute(root, Command::Generate).expect("generate two namespaces");
-        let leftover = source(root).join("errors/other.rs");
-        assert!(leftover.is_file());
-        set_registry(root, REGISTRY);
-
-        let message = execute(root, Command::Check)
-            .expect_err("check must fail on a leftover file")
-            .to_string();
-        assert!(message.contains("unexpected: errors/other.rs"), "{message}");
-        assert!(leftover.is_file(), "check must not delete files");
-
-        execute(root, Command::Generate).expect("generate after removal");
-        assert!(!leftover.exists());
-        execute(root, Command::Check).expect("check after generate");
-    }
-
-    #[test]
-    fn check_fails_on_a_hand_edited_file() {
-        let directory = fixture();
-        let root = directory.path();
-        execute(root, Command::Generate).expect("generate source");
-        let file = source(root).join("errors/test.rs");
-        let mut edited = std::fs::read_to_string(&file).expect("read generated namespace");
-        edited.push_str("// hand edit\n");
-        std::fs::write(&file, edited).expect("edit generated namespace");
-
-        let message = execute(root, Command::Check)
-            .expect_err("check must fail on an edited file")
-            .to_string();
-        assert!(message.contains("differs: errors/test.rs"), "{message}");
-    }
-
-    #[test]
-    fn check_fails_on_an_extra_file_and_generate_removes_it() {
-        let directory = fixture();
-        let root = directory.path();
-        execute(root, Command::Generate).expect("generate source");
-        let extra = source(root).join("errors/handwritten.rs");
-        std::fs::write(&extra, "pub fn extra() {}\n").expect("write extra file");
-
-        let message = execute(root, Command::Check)
-            .expect_err("check must fail on an extra file")
-            .to_string();
-        assert!(
-            message.contains("unexpected: errors/handwritten.rs"),
-            "{message}"
-        );
-
-        execute(root, Command::Generate).expect("generate over extra file");
-        assert!(!extra.exists());
-        execute(root, Command::Check).expect("check after generate");
     }
 }

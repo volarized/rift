@@ -4,7 +4,7 @@ import { type ReactNode, useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const tabStyle =
-  "h-full border-0 border-b border-transparent bg-transparent px-0 py-2 text-sm after:hidden data-active:border-fd-primary data-active:bg-transparent data-active:text-fd-primary dark:data-active:border-fd-primary dark:data-active:bg-transparent";
+  "h-full border-0 border-b border-transparent bg-transparent px-0 py-2 font-mono text-sm after:hidden data-active:border-fd-primary data-active:bg-transparent data-active:text-fd-primary dark:data-active:border-fd-primary dark:data-active:bg-transparent";
 const panel = "bg-fd-background text-[0.9375rem] outline-none";
 const formatLabels = { sparql: "SPARQL", mcp: "MCP", map: "Map", text: "Text", json: "JSON" };
 type Format = keyof typeof formatLabels;
@@ -72,10 +72,10 @@ export function ExampleTabs({
       <div className="flex min-h-10 flex-wrap items-center gap-x-2 gap-y-1 border-b border-fd-border bg-fd-secondary px-2 sm:gap-x-3 sm:px-3">
         <TabsList aria-label="Example view" className="min-h-10 gap-3 bg-transparent p-0">
           <TabsTrigger value="request" className={tabStyle}>
-            Request
+            request
           </TabsTrigger>
           <TabsTrigger value="response" className={tabStyle}>
-            Response
+            response
           </TabsTrigger>
         </TabsList>
 

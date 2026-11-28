@@ -4,9 +4,7 @@
 ///
 /// `@flags` folds the declaration flags into `[display sensitive]` first: `hidden`
 /// clears display and `sensitive` sets redaction. The kind arms then re-enter
-/// `__rift_error_field!` at `@emit`. Kind words are the `type` names of `errors.toml`;
-/// `source` and `cause` are its two roles, whose fields carry `type = "error"` and
-/// `type = "rift_error"`.
+/// `__rift_error_field!` at `@emit`, or return the field's registry definition.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rift_error_kind {
@@ -16,6 +14,17 @@ macro_rules! __rift_error_kind {
     (@flags [$display:tt $sensitive:tt] [sensitive $($flag:ident)*] $($rest:tt)*) => {
         $crate::__rift_error_kind! { @flags [$display true] [$($flag)*] $($rest)* }
     };
+    (@flags [$display:tt $sensitive:tt] [] @registry $kind:ident $field:ident $presence:ident) => {
+        $crate::errors::FieldDefinition {
+            name: ::core::stringify!($field),
+            kind: ::core::stringify!($kind),
+            optional: $crate::__rift_error_kind!(@optional $presence),
+            display: $display,
+            sensitive: $sensitive,
+        }
+    };
+    (@optional optional) => { true };
+    (@optional required) => { false };
     (@flags $flags:tt [$flag:ident $($other:ident)*] $kind:ident $field:ident $($rest:tt)*) => {
         ::core::compile_error!(::core::concat!(
             "field `",

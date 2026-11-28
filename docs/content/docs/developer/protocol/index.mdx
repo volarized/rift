@@ -19,8 +19,8 @@ exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
 
 An agent's `rift mcp` reads the workspace's
 [`ServerLock`](/docs/developer/protocol/reference#ServerLock) - or starts the server that writes
-it - and forwards MCP requests to the endpoint it names. Each request carries its own arguments. Exact reads
-name the `revision` they were read at. Search uses `page`. `get_symbol` uses
+it - and forwards MCP requests to the endpoint it names. Each request carries its own arguments.
+Successful exact reads name the `revision` they were read at. Search uses `page`. `get_symbol` uses
 `page` for the remaining declarations of one logical symbol at the same revision.
 
 ## Versioning

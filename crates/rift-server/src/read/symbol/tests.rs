@@ -133,6 +133,13 @@ fn current_exact_symbol_falls_back_for_docs_continuations_and_unavailable_identi
     assert_eq!(result, with_docs.exact_symbol(&params, true)?);
     assert!(with_docs.index.exact_relative_singleton(&key).is_none());
 
+    let mcp = build(directory.path())?;
+    assert_eq!(
+        mcp.exact_symbol_without_alternatives(&params, true, true)?,
+        result
+    );
+    assert!(mcp.index.exact_relative_singleton(&key).is_some());
+
     let continued = build(directory.path())?;
     params.include = GetSymbolInclude::default();
     params.page = 2;

@@ -29,6 +29,12 @@ const required = [
   path.join(basePath.replace(/^\//, ""), "docs", "index.html"),
   path.join(basePath.replace(/^\//, ""), "install.sh"),
   path.join(basePath.replace(/^\//, ""), "install.ps1"),
+  path.join(basePath.replace(/^\//, ""), "cli-help.txt"),
+  path.join(basePath.replace(/^\//, ""), "errors.json"),
+  path.join(basePath.replace(/^\//, ""), "global-api.openapi.json"),
+  path.join(basePath.replace(/^\//, ""), "mcp.json"),
+  path.join(basePath.replace(/^\//, ""), "package-index.schema.json"),
+  path.join(basePath.replace(/^\//, ""), "rift.schema.json"),
   path.join(basePath.replace(/^\//, ""), "404.html"),
 ];
 
@@ -45,7 +51,7 @@ async function pack() {
   try {
     await readdir(outDir);
   } catch {
-    console.error("✗ no out/ directory — run `bun run build` first");
+    console.error("✗ no out/ directory. Run `bun run build` first.");
     exit(1);
   }
 
@@ -60,8 +66,8 @@ async function pack() {
 
 /**
  * Absolute URLs that do not start with the basePath resolve against the apex
- * and 404 in production. Next rewrites routes and /_next assets itself, but
- * not everything — `metadata.icons` is the known offender.
+ * and 404 in production. Next rewrites routes and /_next assets itself.
+ * `metadata.icons` requires the basePath in its own URLs.
  */
 async function findUnprefixedRefs() {
   const pattern = /(?:href|src)="(\/[^"]*)"/g;
@@ -116,4 +122,4 @@ if (problems.length > 0) {
   exit(1);
 }
 
-console.log(`✓ dist/ packed and verified — site at dist${basePath}/`);
+console.log(`✓ Packed and verified the site at dist${basePath}/`);

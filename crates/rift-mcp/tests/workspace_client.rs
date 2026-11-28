@@ -14,6 +14,10 @@ use rmcp::ServiceExt as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ReadResourceResult, ResourceContents};
 use serde_json::{Value, json};
 
+#[path = "read_diagnostics.rs"]
+mod read_diagnostics;
+pub(crate) use read_diagnostics::ReadDiagnostics;
+
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// One served workspace: the directory that holds it, the client speaking
@@ -272,7 +276,9 @@ pub(crate) async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &Value,
 ) -> TestResult<Value> {
-    populated_answer(client, "search_retrieval", arguments).await
+    populated_answer(client, "search_retrieval", arguments)
+        .await
+        .map(|(answer, _warnings)| answer)
 }
 
 /// Retries the public SPARQL query while its selected corpus is still preparing.
@@ -280,35 +286,33 @@ pub(crate) async fn query_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &rift_protocol::query::QueryParams,
 ) -> TestResult<Value> {
-    populated_answer(client, "search", &serde_json::to_value(arguments)?).await
+    populated_answer(client, "search", &serde_json::to_value(arguments)?)
+        .await
+        .map(|(answer, _warnings)| answer)
 }
 
-async fn populated_answer(
+/// The settled answer and its request warnings from the server log.
+pub(crate) async fn populated_answer(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tool: &'static str,
     arguments: &Value,
-) -> TestResult<Value> {
+) -> TestResult<(Value, Vec<Value>)> {
     const ATTEMPTS: usize = 60;
     const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut diagnostics = ReadDiagnostics::capture()?;
     let mut answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
     for _attempt in 0..ATTEMPTS {
+        assert!(answer.get("warnings").is_none(), "{answer:#}");
+        let warnings = diagnostics.take()?;
         let pending = answer["reason"] == "index_preparing"
-            || answer["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|warning| {
-                    matches!(
-                        warning["code"].as_str(),
-                        Some(
-                            "lexical_ranking_unavailable"
-                                | "stale_index"
-                                | "pattern_index_preparing"
-                        )
-                    )
-                });
+            || warnings.iter().any(|warning| {
+                matches!(
+                    warning["code"].as_str(),
+                    Some("lexical_ranking_unavailable" | "stale_index" | "pattern_index_preparing")
+                )
+            });
         if !pending {
-            return Ok(answer);
+            return Ok((answer, warnings));
         }
         tokio::time::sleep(DELAY).await;
         answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
@@ -408,7 +412,7 @@ pub(crate) fn failed_call(
 /// Reads the failure of an error result.
 ///
 /// Requires `is_error == Some(true)`, no structured content, and exactly one text block.
-/// Line 1 is `N error(s)`; line 2 is the first entry head `  <code> · retry <directive>`;
+/// Line 1 is `N error(s)`; line 2 is the first entry head `  <code> | retry <directive>`;
 /// line 3 is its message at 4 spaces, on one line.
 pub(crate) fn tool_failure(result: &CallToolResult) -> TestResult<ToolFailure> {
     if result.is_error != Some(true) {
@@ -458,14 +462,14 @@ fn failure_title(line: &str) -> bool {
         .is_some_and(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// The code and retry directive of the entry head `<code> · retry <directive>`, one level deep.
+/// The code and retry directive of the entry head `<code> | retry <directive>`, one level deep.
 fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
     let (code, retry) = line
         .strip_prefix(INDENT_UNIT)
         .filter(|rest| !rest.starts_with(INDENT_UNIT))
-        .and_then(|rest| rest.split_once(" · retry "))
+        .and_then(|rest| rest.split_once(" | retry "))
         .ok_or_else(|| {
-            format!("line 2 must be `<code> · retry <directive>` at one level: {line}")
+            format!("line 2 must be `<code> | retry <directive>` at one level: {line}")
         })?;
     Ok((
         serde_json::from_value(Value::String(code.to_owned()))?,

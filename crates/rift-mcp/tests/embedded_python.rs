@@ -53,7 +53,7 @@ async fn incoming_references(configuration: &str, provider: &str) -> TestResult 
             "search_retrieval",
             &json!({"target":"symbol", "traversal":{
                 "seed":seed, "direction":"incoming", "kinds":["references"]
-            }, "include": {"providers": true}}),
+            }, "include": ["providers"]}),
         ),
     )
     .await?;

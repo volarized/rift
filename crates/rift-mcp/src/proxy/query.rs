@@ -315,7 +315,7 @@ impl RiftProxy {
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
                 }
-                let display = QueryDisplay::selected(&answer, query.presentation());
+                let display = QueryDisplay::for_answer(&answer);
                 let retained = key
                     .map(|key| {
                         let bytes = serde_json::to_vec(&(&answer, &warnings, &display))
@@ -564,7 +564,18 @@ fn producer_result(response: Response) -> Result<SearchReadResult, ProducerFailu
     if let Ok(CallToolResponse::Complete(result)) = &response
         && result.is_error != Some(true)
     {
-        return Ok(decode(result)?);
+        let result_value = decode(result)?;
+        let coverage = super::candidates::decode_retrieval_coverage(result)?;
+        return Ok(match (result_value, coverage) {
+            (SearchReadResult::Results(page), Some(reason)) => {
+                SearchReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason,
+                    view: page.view,
+                    warnings: page.warnings,
+                })
+            }
+            (result, _) => result,
+        });
     }
     Err(ProducerFailure::Forwarded(Box::new(response)))
 }

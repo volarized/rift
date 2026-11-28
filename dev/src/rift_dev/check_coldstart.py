@@ -156,7 +156,7 @@ async def check_first_use(client: Client, name: str) -> None:
             {
                 "pattern": r"\bbeacon_cold\b",
                 "target": "symbol",
-                "include": {"source": True},
+                "include": ["source"],
             },
             ("name", "language", "source"),
         ),

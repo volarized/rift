@@ -131,6 +131,16 @@ impl TextWriter {
         }
     }
 
+    /// Bytes that still fit before the output limit.
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        self.sink.limit - self.sink.output.len()
+    }
+
+    /// Checks whether a planned write fits without changing the output.
+    pub(crate) fn check_capacity(&mut self, bytes: usize) -> Result<(), TextError> {
+        self.sink.admit(bytes)
+    }
+
     /// Writes `text` as one raw line indented by `indent` levels, each one [`INDENT_UNIT`].
     ///
     /// Empty text writes an empty line with no indent, so no line ends in an indent. `text` holds

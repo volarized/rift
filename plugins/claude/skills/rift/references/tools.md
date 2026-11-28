@@ -31,36 +31,33 @@ Parameters:
 
 ## get_symbol
 
-Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
-revision it read, and `page` selects its declarations at that revision.
-A complete exact miss returns `symbol_not_found` and up to three alternatives.
-An unavailable selection returns its typed cause. A found symbol carries its facts and
-each declaration's location; `facets` with `symbol` reads a declaration's source. Use
-`search` for discovery.
+Reads one logical symbol by its canonical `id` and reports the selected `revision`.
+`page` selects declarations at that revision. Documentation and declaration source are
+selected by default. `include` adds sections and `exclude` removes them. A complete miss
+returns no content. An unavailable selection returns its typed cause. Use `search` to
+discover identities and `facets` to read syntax structure.
 
 Parameters:
 
 - `id` (required) - Canonical identity.
-- `include` - Requested projections.
-- `revision` - The revision to read.
-- `max_results` - Results per page, at most 10,000.
-- `page` - The 1-based page to read.
+- `include` - Sections to add to the default `documentation` and `source` selections.
+- `exclude` - Sections to remove after applying the defaults and `include`.
+- `revision` - Selects a commit, release, or served tree.
+- `page` - The 1-based declaration page.
+- `max_results` - Declarations per page, at most 10,000.
 
 ## search
 
 Performs search across the index using a query language. `language` names the query
 language and defaults to `sparql`.
-A query over the captured inventory answers from partly covered facts, and `warnings`
-name the files, languages, or engines left out. A query whose answer needs every fact - an empty
-result, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with
-`insufficient_coverage` instead. A bound never makes an answer unavailable: a file a bound
-left out of the index is outside the indexed set, and a producer or acquisition bound ends
-the answer with the rows it reached; the server logs the bound, and `warnings` carry
-nothing for it.
+A query over the captured inventory answers from partly covered facts. A query whose
+answer needs every fact answers `unavailable` with `insufficient_coverage` when the
+selected coverage cannot establish that answer. A bound ends the answer with the rows
+it reached. The server records read warnings and bounds in its logs.
 
 Parameters:
 
-- `include` - Attaches the sorted analyses that produced each returned edge.
+- `include` - Optional sections to attach to the query result.
 - `query` (required) - Query text in `language`.
 - `language` - The language of `query`.
 - `page` - The 1-based page to read.

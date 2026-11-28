@@ -30,6 +30,7 @@ rift-syntax = { workspace = true, optional = true }
 rift-tracing = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
 toml.workspace = true
 unicode-normalization.workspace = true
 semver = { workspace = true, optional = true }
@@ -45,6 +46,13 @@ rawzip = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+
+[build-dependencies]
+data-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true

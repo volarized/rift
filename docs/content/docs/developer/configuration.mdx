@@ -86,8 +86,8 @@ readiness_timeout = "30s"
   the last response completed, 1s to 1d. The next `rift mcp` or `rift server start` brings it back
 - `readiness_timeout` bounds one request's waiting, 1s to 1h. A read takes the deadline once,
   where it enters. Workspace index validation and language-engine reference waits spend what is
-  left of that one budget. A search that meets a pending lexical commit returns identifier
-  matching with `lexical_ranking_unavailable` instead of waiting for the transaction
+  left of that one budget. A search that meets a pending lexical commit uses identifier matching.
+  The server logs `lexical_ranking_unavailable`
 - `port` pins the exact loopback port, 1024 or above. When `port` is omitted, the server picks
   the first free port from `port_range`, which defaults to `{ min = 12000, max = 13000 }`.
   The two keys exclude each other.
@@ -98,10 +98,9 @@ requests as soon as the file is accepted.
 
 <VersionBadge version="v0.0.47" />
 
-Initial source preparation runs in the background. A local read can return prepared files with
-[`local_index_preparing`](/docs/developer/protocol/mcp#reads). A `facets` read refuses while
-source preparation is incomplete. The warning reports
-incomplete source independently of lexical and vector readiness.
+Initial source preparation runs in the background. A local read can return prepared files. The
+server logs [`local_index_preparing`](/docs/developer/protocol/mcp#reads) independently of lexical
+and vector readiness. A `facets` read refuses while source preparation is incomplete.
 
 Three additional keys bound background validation and repository serving:
 
@@ -590,17 +589,15 @@ The client does not contact the endpoint at server startup. A `local` read and a
 also make no global request.
 
 A connection failure, timeout, retry exhaustion, authentication failure, invalid response, or
-non-success response marks global access unavailable for `failure_ttl`. The package read that met
-it, and every package read until `failure_ttl` passes, answers the project hits it has and reports
-a typed warning with that failure's class. A valid remote page keeps its items and reports each
-bounded service condition as `global_page_warning`.
+non-success response marks global access unavailable for `failure_ttl`. The server logs the
+failure's class for that read and every package read before `failure_ttl` passes. A valid remote
+page keeps its items. The server logs bounded service conditions as `global_page_warning`.
 
-A valid resolution answers package reads from the global index, and the nearest collected release
-answers an entry whose version it lacks, reporting `package_substituted`. A package with no
-collected release reports `package_absent`, or `package_requirement_absent` for a declared
-requirement. A package no public registry serves - a path outside the workspace, a git
-repository, a private registry, or a URL - never reaches the global API and reports
-`package_unavailable`.
+A valid resolution answers package reads from the global index. When the nearest collected
+release answers an entry whose version the index lacks, the server logs `package_substituted`.
+It logs `package_absent` for a package with no collected release, or `package_requirement_absent`
+for a declared requirement. A package no public registry serves - a path outside the workspace,
+a git repository, a private registry, or a URL - stays local and the server logs `package_unavailable`.
 
 ## Languages and LSP
 
@@ -948,7 +945,7 @@ unanswered after `request_timeout`, Rift ends the process only if the engine sen
 that long and holds no work it announced over `$/progress`. An engine still working keeps
 running: Rift sends `$/cancelRequest` for the request and retries it on the same process. The
 read's own deadline, `[server] readiness_timeout`, bounds every wait. A request still waiting
-there is cancelled the same way and the answer carries `engine_analysis_unavailable`.
+there is cancelled the same way, and the server logs `engine_analysis_unavailable`.
 
 `retry` bounds repeated requests while an answer stays unsettled. `attempts` includes the first
 request. Waits start at `delay`, double, and stop at `delay_limit`. `restart` bounds replacement
@@ -1115,8 +1112,7 @@ index the file.
 Framework context is separate from language selection. Angular component imports establish
 ownership for literal inline and external templates. Tailwind requires a captured package
 version and applicable configuration or stylesheet evidence. An unresolved version or dynamic
-expression appears as `framework_context_unresolved` in read warnings, with its source and
-framework.
+expression causes the server to log `framework_context_unresolved` with its source and framework.
 
 `providers.syntax.frameworks` supplies explicit context for selected paths:
 
@@ -1144,8 +1140,8 @@ directives publish authored names. Dynamic expressions retain source ranges and 
 Compiler resolution remains outside syntax analysis.
 
 Provider configuration does not set merge order or freshness. A provider rebuilding after a file
-change can serve its previous immutable revision. The result then carries a `stale_index` entry
-in `warnings` naming the two tree revision digests.
+change can serve its previous immutable revision. The server logs `stale_index` with the two
+tree revision digests.
 
 ## Search
 
@@ -1220,14 +1216,14 @@ journal_size_limit = "64mb"
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
 - `results` caps results collected by one local search or symbol lookup, 1 to 10000, default
-  `1000`. An answer that reaches it reports `results_truncated`
-- `symbol_alternatives_work` bounds one complete closest-declaration ranking, 1 to 1073741824,
+  `1000`. The server logs `results_truncated` when a read reaches the cap
+- `symbol_alternatives_work` bounds one complete closest-declaration ranking where alternatives
+  are requested, 1 to 1073741824,
   default `16777216`. Every visited file and declaration costs one work unit, including
   language exclusions. Lowercase allocation reserves the configured weight per input byte.
   A distance comparison reserves `(Q + 1) * L` units for the lowercase query and candidate
   character counts. Stable ordering reserves three times the sum of qualified-name bytes,
-  path bytes, and one byte. Exhaustion discards all alternatives. `symbol_not_found.detail`
-  reports the configured bound, required work, remaining work, and recovery action
+  path bytes, and one byte. Exhaustion discards all alternatives
 - `symbol_alternatives_lowercase_work` sets that reservation weight, 12 to 1024, default `12`.
   Rust lowercase mappings return at most three characters, each at most four UTF-8 bytes.
   Values below 12 are refused. Larger values reserve more work without changing Unicode
@@ -1281,8 +1277,8 @@ excluded_lockfiles = ["Cargo.lock", "uv.lock", "package-lock.json", "bun.lock"]
   `max_file` is held as text the syntax provider does not parse, up to [`[source]`](#source)
   `workspace_size`. The index build records such files in `rift server logs`, and symbol answers
   cover the declarations the index holds. Under
-  `skip` the file leaves the text index, a file past `max_file` leaves the index entirely, and an
-  answer whose `paths` reach one counts it in a `large_file_skipped` warning
+  `skip` the file leaves the text index and a file past `max_file` leaves the index entirely. The
+  server logs a `large_file_skipped` count for files a read's `paths` reach
 - `excluded_lockfiles` names the lockfiles search leaves out, matched against each visible file's
   final path segment, at most 64 names of up to 255 bytes. The default lists `Cargo.lock`,
   `uv.lock`, `package-lock.json`, `bun.lock`, `pnpm-lock.yaml`, `yarn.lock`, `poetry.lock`,
@@ -1290,9 +1286,9 @@ excluded_lockfiles = ["Cargo.lock", "uv.lock", "package-lock.json", "bun.lock"]
   indexes every lockfile
 
 A lockfile search leaves out answers no search and no symbol lookup, while
-[`rift://map`](/docs/mcp#resource-map) still carries the versions it pins. A search whose
-`paths.include` selects one warns `lockfile_excluded`, and naming it in `paths.force_include`
-searches it for one request.
+[`rift://map`](/docs/mcp#resource-map) still carries the versions it pins. The server logs
+`lockfile_excluded` when a search selects the file through `paths.include`. Naming it in
+`paths.force_include` searches it for one request.
 
 A regex [`pattern`](/docs/developer/protocol/mcp#search-pattern) search runs under four `[search]`
 keys:
@@ -1311,12 +1307,12 @@ pattern_matches_per_file = 1000
 - `pattern_verified_size` bounds the file text one search verifies, 1mb to 64gb
 - `pattern_matches_per_file` bounds the matches one file contributes, 1 to 100000
 
-A search that would pass one of the first three refuses naming the key. A file past
-`pattern_matches_per_file` is cut there, and the answer warns `pattern_matches_truncated`.
+A search that would pass one of the first three refuses naming the key. The server stops
+collecting matches in a file at `pattern_matches_per_file` and logs `pattern_matches_truncated`.
 
 While the trigram index catches up after a write, the rows it lacks are verified within what the
 selection leaves of `pattern_candidate_rows` and `pattern_verified_size`. Past either, the search
-answers from the rows the index holds and warns `pattern_index_preparing` rather than refusing.
+answers from the rows the index holds. The server logs `pattern_index_preparing`.
 
 <VersionBadge
   version="v0.0.16"
@@ -1455,9 +1451,9 @@ transaction_size = "16mb"
 mmap_size = "1gb"
 ```
 
-A workspace past it publishes its index without the lexical ranking: the store refuses the
-commit, and `search` answers from identifier matching with a `lexical_ranking_unavailable`
-warning naming `units_max`, the observed count, and the maximum. Raise the key, or narrow
+A workspace past it publishes its index without lexical ranking. The store refuses the commit,
+and `search` answers from identifier matching. The server logs `lexical_ranking_unavailable`
+with `units_max`, the observed count, and the maximum. Raise the key, or narrow
 [`[source]`](/docs/developer/configuration#source) so fewer files reach the index.
 
 `transaction_units`, 100 to 1000000, and `transaction_size`, 1mb to 1gb, bound one

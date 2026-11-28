@@ -26,7 +26,7 @@ use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -79,7 +79,10 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
-    assert_fixture_warnings(name, request, structured);
+    assert!(
+        structured.get("warnings").is_none(),
+        "{context}: {structured:#}"
+    );
     assert!(
         structured["documentation"].get("warnings").is_none(),
         "{context}: {structured:#}"
@@ -132,43 +135,6 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             }
         }
     }
-}
-
-fn assert_fixture_warnings(name: &str, request: &Value, structured: &Value) {
-    use rift_protocol::read::ReadWarning;
-
-    let Some(warnings) = structured.get("warnings") else {
-        return;
-    };
-    assert_eq!(name, "search", "{structured:#}");
-    let query = request["query"].as_str().expect("query statement");
-    assert!(
-        [":calls", ":references", ":usages"]
-            .iter()
-            .any(|predicate| query.contains(predicate)),
-        "only edge reads omit the fixture's unlinked declarations: {request:#}"
-    );
-    let warnings: Vec<rift_protocol::read::ReadWarning> =
-        serde_json::from_value(warnings.clone()).expect("typed read warnings");
-    // The unlinked change_witness.rs holds two declarations without identities.
-    assert_eq!(
-        warnings
-            .iter()
-            .filter(|warning| matches!(warning,
-        ReadWarning::EdgeCoverageMissing { kinds, detail }
-            if kinds.is_empty() && detail.contains("identities: 2;")))
-            .count(),
-        1,
-        "{warnings:?}"
-    );
-    // Mixed-language reads retain their captured and engine coverage warnings too.
-    assert!(
-        warnings.iter().all(|warning| matches!(
-            warning,
-            ReadWarning::EdgeCoverageMissing { .. } | ReadWarning::EngineAnalysisUnavailable { .. }
-        )),
-        "{warnings:?}"
-    );
 }
 
 /// Exact retrieval reaches the released owner its canonical identity names.
@@ -432,7 +398,7 @@ async fn absent_request(
         rift_protocol::read::Language::from_identity_segment(language)?,
         path,
     )?;
-    let mut request = json!({"id":missing.wire_identity(),"include":{}});
+    let mut request = json!({"id":missing.wire_identity(),"include":[]});
     if let Some(revision) = revision {
         request["revision"] = json!(format!("rift://revision/git/{revision}"));
     }
@@ -494,91 +460,48 @@ async fn tools_list_examples_follow_the_default_scope() -> TestResult {
     Ok(())
 }
 
-/// A miss keeps the empty answer and proposes declarations the caller can retrieve (#590).
+/// A complete miss has an empty body even when nearby declarations exist.
 #[tokio::test]
-async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
+async fn get_symbol_proved_miss_is_empty_and_schema_validates() -> TestResult {
     let (_fixture, client, server_task) = served_canonical_miss_fixture(None, None).await?;
-    let tools = client.list_all_tools().await?;
-    let tool = tools
-        .iter()
-        .find(|tool| tool.name == "get_symbol")
-        .ok_or("get_symbol absent")?;
-    let schema = Value::Object(
-        tool.output_schema
-            .as_deref()
-            .ok_or("output schema absent")?
-            .clone(),
-    );
-    let validator = jsonschema::validator_for(&schema)?;
-    assert_symbol_alternative_bounds(tool, &schema);
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (input, output) = validators
+        .get("get_symbol")
+        .ok_or("get_symbol advertised")?;
     let request = absent_request(&client, "beacon_ane", "rust", None).await?;
+    assert_validates(input, &request, "get_symbol request");
+    assert!(input.is_valid(&json!({"id": request["id"], "include":["history","edges"]})));
+    for invalid in [
+        json!({"id":request["id"], "include":{"history":true}}),
+        json!({"id":request["id"], "include":["source","source"]}),
+        json!({"id":request["id"], "exclude":["other"]}),
+    ] {
+        assert!(!input.is_valid(&invalid), "{invalid}");
+    }
     let result = client
         .call_tool(tools_call_request("get_symbol", &request)?)
         .await?;
-    assert!(
-        result.is_error.unwrap_or(false),
-        "a miss must report a tool error with its typed answer"
-    );
-    let answer = result
-        .structured_content
-        .ok_or("structured answer absent")?;
-    assert_validates(&validator, &answer, "get_symbol miss");
-    assert_eq!(answer["outcome"], "missing");
-    let warning = &answer["symbol_not_found"];
-    assert_eq!(warning["id"], request["id"]);
-    assert!(warning.get("detail").is_none());
-    let mut expected = Vec::new();
-    for name in ["beacon_one", "beacon_two", "beacon_three"] {
-        expected.push(workspace_client::captured_seed(&client, name, "lib.rs").await?);
-    }
-    let actual: Vec<_> = warning["alternatives"]
-        .as_array()
-        .ok_or("alternatives")?
-        .iter()
-        .map(|item| item["id"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(actual, expected);
-    for alternative in warning["alternatives"].as_array().ok_or("alternatives")? {
-        assert_eq!(
-            alternative["match_context"],
-            json!(["owner", "language", "name"])
-        );
-    }
-    let text = result
-        .content
-        .iter()
-        .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        text.contains(request["id"].as_str().ok_or("requested id")?),
-        "the missing name must reach the caller: {text}"
-    );
-    assert!(
-        text.contains("beacon_one"),
-        "the closest declaration must reach the caller: {text}"
-    );
+    assert_definite_miss(output, &result)?;
+    assert!(!output.is_valid(&json!({"outcome":"missing"})));
     client.cancel().await?;
     server_task.await?;
     Ok(())
 }
 
-fn assert_symbol_alternative_bounds(tool: &rmcp::model::Tool, schema: &Value) {
-    let miss = &schema["$defs"]["SymbolNotFound"];
-    assert_eq!(
-        miss["properties"]["alternatives"]["maxItems"],
-        json!(rift_protocol::read::SYMBOL_ALTERNATIVES_MAX)
-    );
-    assert_eq!(
-        schema["$defs"]["SymbolAlternative"]["properties"]["name"]["maxLength"],
-        json!(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
-    );
-    assert!(tool.input_schema["properties"].get("id").is_some());
-    assert_eq!(miss["properties"]["detail"]["maxLength"], json!(4096));
+fn assert_definite_miss(output: &Validator, result: &CallToolResult) -> TestResult {
+    assert_eq!(result.is_error, Some(false), "{result:?}");
+    assert!(result.content.is_empty(), "{result:?}");
+    let answer = result
+        .structured_content
+        .as_ref()
+        .ok_or("structured answer absent")?;
+    assert_validates(output, answer, "get_symbol miss");
+    assert_eq!(*answer, json!({}));
+    Ok(())
 }
 
 #[tokio::test]
-async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> TestResult {
+async fn get_symbol_exact_reads_ignore_alternatives_work_limits() -> TestResult {
     let search = rift_protocol::configuration::SearchConfiguration {
         symbol_alternatives_work: 1,
         symbol_alternatives_lowercase_work: 24,
@@ -590,13 +513,6 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
     let (_, output) = validators
         .get("get_symbol")
         .ok_or("get_symbol advertised")?;
-    let expected = rift_error::errors::server::read_symbol_alternatives_unavailable()
-        .work(1_u64)
-        .lowercase_work(24_u64)
-        .remaining(1_u64)
-        .required(48_u128)
-        .error()
-        .to_string();
     for request in [
         absent_request(&client, "İ", "rust", None).await?,
         absent_request(&client, "İ", "python", None).await?,
@@ -605,48 +521,37 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
             .await?;
-        assert!(result.is_error.unwrap_or(false));
-        let answer = result
-            .structured_content
-            .ok_or("structured answer absent")?;
-        assert_validates(output, &answer, "configured work result");
-        let warning = &answer["symbol_not_found"];
-        assert_eq!(
-            warning,
-            &json!({"id":request["id"],"alternatives":[],"detail":expected})
-        );
-        assert_eq!(answer["outcome"], "missing");
-        let text = result
-            .content
-            .iter()
-            .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains(&expected), "{text}");
+        assert_definite_miss(output, &result)?;
     }
-    let exact_id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
-    let result = client
-        .call_tool(tools_call_request(
-            "get_symbol",
-            &json!({"id":exact_id,"include":{}}),
-        )?)
-        .await?;
-    assert!(!result.is_error.unwrap_or(false));
-    let answer = result.structured_content.ok_or("exact answer absent")?;
-    assert_eq!(answer["outcome"], "found");
-    assert_eq!(answer["symbol"]["id"], exact_id);
-    assert!(!answer["warnings"].as_array().is_some_and(|warnings| {
-        warnings
-            .iter()
-            .any(|warning| warning["code"] == "symbol_not_found")
-    }));
+    let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
+    for (request, has_source) in [
+        (json!({"id":id}), true),
+        (
+            json!({"id":id, "include":["source"], "exclude":["documentation","source"]}),
+            false,
+        ),
+    ] {
+        let result = client
+            .call_tool(tools_call_request("get_symbol", &request)?)
+            .await?;
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        text_complete::assert_text_states("get_symbol", &result);
+        let answer = result.structured_content.ok_or("exact answer absent")?;
+        assert_validates(output, &answer, "get_symbol found");
+        assert_eq!(answer["symbol"]["id"], id);
+        assert_eq!(
+            answer["declarations"][0].get("source").is_some(),
+            has_source
+        );
+        assert!(answer.get("outcome").is_none());
+    }
     client.cancel().await?;
     server_task.await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() -> TestResult {
+async fn get_symbol_miss_stays_empty_with_many_similar_declarations() -> TestResult {
     use std::fmt::Write as _;
 
     let source = (0..160).fold(String::new(), |mut source, index| {
@@ -656,84 +561,36 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
     });
     let (_fixture, client, server_task) =
         served_canonical_miss_fixture(Some(&source), None).await?;
-    let tools = client.list_all_tools().await?;
-    let schema = tools
-        .iter()
-        .find(|tool| tool.name == "get_symbol")
-        .and_then(|tool| tool.output_schema.as_deref())
-        .ok_or("get_symbol output schema absent")?;
-    let validator = jsonschema::validator_for(&Value::Object(schema.clone()))?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (_, output) = validators
+        .get("get_symbol")
+        .ok_or("get_symbol advertised")?;
     let name = "x".repeat(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX);
-    for request in [
-        absent_request(&client, &name, "rust", None).await?,
-        absent_request(&client, &name, "python", None).await?,
-        absent_request(&client, &name, "rust", Some("baseline")).await?,
-    ] {
-        let result = client
-            .call_tool(tools_call_request("get_symbol", &request)?)
-            .await?;
-        assert!(result.is_error.unwrap_or(false));
-        let answer = result
-            .structured_content
-            .ok_or("structured answer absent")?;
-        assert_validates(&validator, &answer, "get_symbol work bound");
-        let warning = &answer["symbol_not_found"];
-        assert_eq!(warning["id"], request["id"]);
-        let requested = rift_protocol::identity::SymbolIdentity::parse(
-            request["id"].as_str().ok_or("requested id")?,
-        )?;
-        let exhausted = request.get("revision").is_none() && requested.language().name == "rust";
-        assert_eq!(warning.get("detail").is_some(), exhausted, "{answer:#}");
-        if exhausted {
-            assert_eq!(warning["alternatives"], json!([]));
-            let text = result
-                .content
-                .iter()
-                .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(text.contains(request["id"].as_str().ok_or("requested id")?));
-            assert!(text.contains("work bound"), "{text}");
-            assert!(text.contains("closest"), "{text}");
-        } else {
-            assert!(
-                !warning["alternatives"]
-                    .as_array()
-                    .ok_or("alternatives absent")?
-                    .is_empty()
-            );
-        }
-    }
+    let request = absent_request(&client, &name, "rust", None).await?;
+    let result = client
+        .call_tool(tools_call_request("get_symbol", &request)?)
+        .await?;
+    assert_definite_miss(output, &result)?;
     client.cancel().await?;
     server_task.await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_warning() -> TestResult
-{
+async fn get_symbol_captures_requested_revision_and_keeps_remote_matches() -> TestResult {
     let (_fixture, client, server_task) = served_canonical_miss_fixture(None, None).await?;
-    for (revision, expected) in [(None, true), (Some("baseline"), false)] {
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (_, output) = validators
+        .get("get_symbol")
+        .ok_or("get_symbol advertised")?;
+    for revision in [None, Some("baseline")] {
         let request = absent_request(&client, "change_witnesz", "rust", revision).await?;
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
             .await?;
-        let answer = result
-            .structured_content
-            .ok_or("structured answer absent")?;
-        let alternatives = answer["symbol_not_found"]["alternatives"]
-            .as_array()
-            .ok_or("alternatives absent")?;
-        let carries_current = alternatives.iter().any(|identity| {
-            identity["id"]
-                .as_str()
-                .is_some_and(|identity| identity.ends_with("/change_witness"))
-        });
-        assert_eq!(
-            carries_current, expected,
-            "revision controls which declarations can be proposed: {answer:#}"
-        );
+        assert_definite_miss(output, &result)?;
     }
+
     let remote = surface_corpus::prepared_corpus(&client)
         .await?
         .into_iter()
@@ -750,30 +607,22 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
         .await?
         .structured_content
         .ok_or("remote answer")?;
-    assert_eq!(answer["outcome"], "found");
     assert_eq!(answer["symbol"]["id"], remote["id"]);
-    assert!(answer.get("symbol_not_found").is_none());
+    assert!(answer.get("outcome").is_none());
     for request in [
         json!({"query":"helper_beacon","scope":"global","include":{}}),
         json!({"query":"helper_beacon","scope":"all","include":{}}),
         json!({"query":"helper_beacon","scope":"all","include":{},"max_results":1,"page":100}),
     ] {
         let request = serde_json::to_value(workspace_client::query::retrieval(
-            &serde_json::from_value(request.clone())?,
+            &serde_json::from_value(request)?,
         )?)?;
         let answer =
             call_tool_retrying_acceptance(&client, tools_call_request("search", &request)?)
                 .await?
                 .structured_content
                 .ok_or("remote discovery")?;
-        assert!(
-            !answer["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|warning| warning["code"] == "symbol_not_found"),
-            "matched remote discovery clears the miss, including an empty later page: {answer:#}"
-        );
+        assert!(answer.get("warnings").is_none(), "{answer:#}");
     }
     client.cancel().await?;
     server_task.await?;
@@ -1273,6 +1122,7 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     let caller = workspace_client::captured_seed(&client, "caller", "lib.rs").await?;
     let unconfirmed = serde_json::to_value(workspace_client::query::path(&caller, ":calls")?)?;
     assert_validates(input_validator, &unconfirmed, "an outgoing walk");
+    let mut diagnostics = workspace_client::ReadDiagnostics::capture()?;
     let structured = workspace_client::call_retrying_acceptance(
         &client,
         workspace_client::tool_request("search", &unconfirmed),
@@ -1287,19 +1137,18 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         !workspace_client::query::rows(&structured)?.is_empty(),
         "{structured}"
     );
+    assert!(structured.get("warnings").is_none(), "{structured}");
     assert!(
-        structured["warnings"]
-            .as_array()
-            .is_some_and(|warnings| warnings
-                .iter()
-                .any(|warning| warning["code"] == "engine_readiness_unconfirmed")),
-        "{structured}"
+        diagnostics
+            .take()?
+            .iter()
+            .any(|warning| warning["code"] == "engine_readiness_unconfirmed")
     );
     client.cancel().await?;
     Ok(())
 }
 
-/// A named runtime call remains schema-valid beside a warning for missing edge coverage.
+/// A named runtime call validates against the schema and establishes edge coverage.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> TestResult {
@@ -1330,6 +1179,7 @@ async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> Tes
     let caller = workspace_client::captured_seed(&client, "caller", "caller.py").await?;
     let walk = json!({"query":format!("SELECT ?symbol {{ <{caller}> :calls ?symbol }}")});
     assert_validates(input_validator, &walk, "an outgoing walk");
+    let mut diagnostics = workspace_client::ReadDiagnostics::capture()?;
     let structured = workspace_client::call_retrying_acceptance(
         &client,
         workspace_client::tool_request("search", &walk),
@@ -1347,13 +1197,12 @@ async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> Tes
         "rift://symbol/stdlib/cpython/python/builtins/len",
         "{structured}"
     );
+    assert!(structured.get("warnings").is_none(), "{structured}");
     assert!(
-        structured["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .all(|warning| warning["code"] != "edge_coverage_missing"),
-        "{structured}"
+        diagnostics
+            .take()?
+            .iter()
+            .all(|warning| warning["code"] != "edge_coverage_missing")
     );
     client.cancel().await?;
     Ok(())

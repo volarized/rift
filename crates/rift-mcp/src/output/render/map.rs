@@ -20,7 +20,7 @@ pub(super) fn answer(out: &mut TextWriter, map: &WorkspaceMap) -> Result<(), Tex
             sections.entry(
                 0,
                 &format!(
-                    "{} · {} · {}",
+                    "{} | {} | {}",
                     language.language.identity_segment(),
                     counted(language.files, "file"),
                     counted(language.symbols, "declaration")
@@ -33,7 +33,7 @@ pub(super) fn answer(out: &mut TextWriter, map: &WorkspaceMap) -> Result<(), Tex
         for module in map.modules.iter().take(ENTRIES_MAX) {
             sections.entry(
                 0,
-                &format!("{} · {}", module.path.0, counted(module.files, "file")),
+                &format!("{} | {}", module.path.0, counted(module.files, "file")),
             )?;
         }
     }
@@ -50,7 +50,7 @@ pub(super) fn answer(out: &mut TextWriter, map: &WorkspaceMap) -> Result<(), Tex
             sections.entry(
                 0,
                 &format!(
-                    "{} · {}",
+                    "{} | {}",
                     hub.symbol.as_str(),
                     counted(hub.references, "reference")
                 ),
@@ -75,7 +75,7 @@ pub(super) fn answer(out: &mut TextWriter, map: &WorkspaceMap) -> Result<(), Tex
             sections.entry(
                 0,
                 &format!(
-                    "{} · {}",
+                    "{} | {}",
                     recommendation.language.identity_segment(),
                     recommendation.root,
                 ),
@@ -86,7 +86,7 @@ pub(super) fn answer(out: &mut TextWriter, map: &WorkspaceMap) -> Result<(), Tex
     if map.languages.is_empty() && map.modules.is_empty() && map.docs.is_empty() {
         out.raw_line(0, "No indexed files.")?;
     }
-    out.raw_line(0, &format!("source catalog · {WORKSPACE_URI}"))
+    out.raw_line(0, &format!("source catalog | {WORKSPACE_URI}"))
 }
 
 /// One dependency context entry: `name@version` for a pinned release, `name requirement` for a
@@ -105,6 +105,6 @@ fn package_line(package: &PackageContextEntry) -> String {
             .ok()
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_default();
-        format!("{selected} ({} · {availability})", package.manager)
+        format!("{selected} ({} | {availability})", package.manager)
     }
 }

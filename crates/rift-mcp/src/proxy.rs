@@ -3437,9 +3437,12 @@ mod tests {
                                 warnings: vec![rift_protocol::read::ReadWarning::GlobalAccessDisabled],
                             },
                         );
-                        return std::future::ready(crate::output::Json(answer).retrieval_result());
+                        return std::future::ready(Ok(CallToolResult::structured(
+                            serde_json::to_value(answer).expect("legacy retrieval result"),
+                        )
+                        .into()));
                     }
-                    assert_eq!(pattern, "beacon");
+                    assert!(matches!(pattern, "beacon" | "partial"));
                     let answer: rift_protocol::search_read::SearchReadResult = serde_json::from_value(json!({
                         "results": [{"hit":{"target":"symbol", "symbol":{
                             "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
@@ -3448,6 +3451,12 @@ mod tests {
                     })).expect("typed latest search result");
                     let mut meta = rmcp::model::MetaObject::new();
                     meta.insert("traceparent".to_owned(), json!("selected-search"));
+                    if pattern == "partial" {
+                        meta.insert(
+                            crate::server::candidates::RETRIEVAL_COVERAGE_KEY.to_owned(),
+                            json!("read_failed"),
+                        );
+                    }
                     Ok(CallToolResult::structured(
                         serde_json::to_value(answer).expect("search result"),
                     )
@@ -3951,11 +3960,33 @@ mod tests {
         );
         assert_eq!(
             answer.content[0].as_text().ok_or("text answer")?.text,
-            "unavailable · InsufficientCoverage\n",
+            "unavailable | InsufficientCoverage\n",
         );
         assert!(drain.queued_records().iter().any(|record| {
             record.message() == "read warning" && record.fields().contains("global_access_disabled")
         }));
+        upstream.cancel().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_peer_coverage_outcome_prevents_a_query_from_counting_partial_rows() -> TestResult {
+        let primary = tempfile::tempdir()?;
+        let proxy = profile_proxy(primary.path())?;
+        let upstream = connect_selected_upstream(&proxy, ":docs").await?;
+        let request = selected_pattern("partial", "local:docs")?;
+        let CallToolResponse::Complete(answer) = proxy
+            .routed_read(&request)
+            .await?
+            .ok_or("selected search")??
+        else {
+            return Err("complete selected search".into());
+        };
+        assert_eq!(
+            answer.structured_content,
+            Some(json!({"outcome": "unavailable", "reason": "read_failed"})),
+        );
+        assert!(answer.meta.is_none());
         upstream.cancel().await?;
         Ok(())
     }

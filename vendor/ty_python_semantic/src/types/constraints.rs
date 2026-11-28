@@ -75,7 +75,7 @@
 //!
 //! This module is instrumented with debug- and trace-level `tracing` messages. You can set the
 //! `TY_LOG` environment variable to see this output when testing locally. `tracing` log messages
-//! typically have a `target` field, which is the name of the module the message appears in — in
+//! typically have a `target` field, which is the name of the module the message appears in - in
 //! this case, `ty_python_semantic::types::constraints`. We add additional detail to these targets,
 //! in case you only want to debug parts of the implementation. For instance, if you want to debug
 //! how we construct sequent maps, you could use
@@ -1753,7 +1753,7 @@ impl<'db> BoundTypeVarInstance<'db> {
     /// are "later" according to that order than the typevar being constrained. Having an order
     /// ensures that we can build up transitive relationships between constraints without incurring
     /// any cycles. This particular ordering plays nicely with how we are ordering constraints
-    /// within a BDD — it means that if a typevar has another typevar as a bound, all of the
+    /// within a BDD - it means that if a typevar has another typevar as a bound, all of the
     /// constraints that apply to the bound will appear lower in the BDD.
     fn can_be_bound_for(
         self,
@@ -2164,7 +2164,7 @@ impl ConstraintId {
     /// earlier in the source), this tends to minimize the amount of "node shuffling" that we have
     /// to do when combining BDDs.
     ///
-    /// Previously, we tried to be more clever — for instance, by comparing the typevars of each
+    /// Previously, we tried to be more clever - for instance, by comparing the typevars of each
     /// constraint first, in an attempt to keep all of the constraints for a single typevar
     /// adjacent in the BDD structure. However, this proved to be counterproductive; we've found
     /// empirically that we get smaller BDDs with an ordering that is more aligned with source
@@ -2398,7 +2398,7 @@ impl Node {
                 NodeId::with_uncertain(storage, constraint, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_TRUE)
             }
             // The result holds regardless of the constraint's truth value, so only
-            // `if_uncertain` needs to be `ALWAYS_TRUE` — `n? 0: 1: 0`. It would also be
+            // `if_uncertain` needs to be `ALWAYS_TRUE` - `n? 0: 1: 0`. It would also be
             // correct to use `n? 1: 1: 1` (i.e., `ALWAYS_TRUE` for all outgoing edges), but
             // that would throw away some of the efficiency gains this representation gives us.
             Assignment::Unconstrained(constraint) => {

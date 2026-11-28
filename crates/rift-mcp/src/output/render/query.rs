@@ -1,59 +1,42 @@
-//! Compact text for retrieved code, call paths, and RDF terms.
+//! Plain-text tables for SPARQL answers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_protocol::identity::SymbolIdentity;
-use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult, RdfTerm, RdfTriple};
-use rift_protocol::read::ReadWarning;
+use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult, RdfTerm};
+use rift_protocol::revision::{REVISION_FIELD, is_commit_id};
 use rift_protocol::search_read::SearchUnavailable;
-use rift_search::sparql::{QueryField, QueryPresentation, VOCABULARY_NAMESPACE};
+use rift_search::sparql::VOCABULARY_NAMESPACE;
 use rmcp::model::MetaObject;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthStr as _;
 
+use super::facts::cut_hash;
 use super::{Render, TextError, TextWriter};
 use crate::output::text::visible;
 
 const BLANK_PREFIX_MIN: usize = 12;
-const FIELD_SEPARATOR: &str = " | ";
-const SCORE_DECIMAL_BYTES_MAX: usize = 32;
 const PRESENTATION_KEY: &str = "rift/query-presentation";
 const XSD_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema#";
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const RDF_NAMESPACE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS_NAMESPACE: &str = "http://www.w3.org/2000/01/rdf-schema#";
 
 type Row = BTreeMap<String, RdfTerm>;
-type Fields = BTreeMap<QueryField, String>;
 
-/// Query text choices retained with the evaluated rows, before they split into pages.
+/// Blank node label width retained across pages of a query.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct QueryDisplay {
-    presentation: QueryPresentation,
     blank_prefix: usize,
-    multiple_flows: bool,
 }
 
 impl QueryDisplay {
-    pub(crate) fn selected(answer: &QueryAnswer, presentation: QueryPresentation) -> Self {
-        let multiple_flows = match (answer, &presentation) {
-            (QueryAnswer::Bindings { bindings, .. }, QueryPresentation::Flows(fields)) => {
-                let mut ids = bindings
-                    .iter()
-                    .filter_map(|row| field(row, fields, QueryField::Flow));
-                ids.next()
-                    .is_some_and(|first| ids.any(|other| other != first))
-            }
-            _ => false,
-        };
+    pub(crate) fn for_answer(answer: &QueryAnswer) -> Self {
         Self {
-            presentation,
             blank_prefix: blank_prefix(answer),
-            multiple_flows,
         }
     }
 }
@@ -111,7 +94,7 @@ impl QueryOutput {
         Self { result, display }
     }
 
-    /// Recovers the original projection when the proxy qualifies an extra project's result.
+    /// Recovers the retained blank node label width when the proxy qualifies a result.
     pub(crate) fn take_display(meta: &mut Option<MetaObject>) -> QueryDisplay {
         let value = meta
             .as_mut()
@@ -145,37 +128,20 @@ impl Render for QueryOutput {
     }
 
     fn log_warnings(&mut self) {
-        match &mut self.result {
-            QueryReadResult::Results(result) => {
-                crate::output::log_warnings(&result.warnings);
-                result
-                    .warnings
-                    .retain(|warning| query_warning_text(warning).is_some());
+        let warnings = match &mut self.result {
+            QueryReadResult::Results(result) => &mut result.warnings,
+            QueryReadResult::Unavailable(SearchUnavailable::Unavailable { warnings, .. }) => {
+                warnings
             }
-            QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                reason,
-                warnings,
-                ..
-            }) => {
-                crate::output::log_warnings(warnings);
-                warnings.retain(|warning| {
-                    query_warning_text(warning).is_some()
-                        || super::unavailable::reports(*reason, warning)
-                });
-            }
-        }
+        };
+        crate::output::record_warnings(warnings);
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match &self.result {
             QueryReadResult::Results(result) => render_result(out, result, &self.display),
-            QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                reason,
-                warnings,
-                ..
-            }) => {
-                out.raw_line(0, &super::unavailable::line(*reason, warnings))?;
-                write_query_warnings(out, warnings)
+            QueryReadResult::Unavailable(SearchUnavailable::Unavailable { reason, .. }) => {
+                out.raw_line(0, &super::unavailable::line(*reason))
             }
         }
     }
@@ -186,330 +152,158 @@ fn render_result(
     result: &QueryResult,
     display: &QueryDisplay,
 ) -> Result<(), TextError> {
-    let page = result.pagination.as_ref();
+    let rows = match &result.answer {
+        QueryAnswer::Bindings { bindings, .. } => bindings.len(),
+        QueryAnswer::Graph { triples } => triples.len(),
+        QueryAnswer::Boolean { .. } => 1,
+    };
+    let (total, page, pages, offset) = result
+        .pagination
+        .as_ref()
+        .map_or((rows as u64, 1, 1, 0), |page| {
+            (page.total, page.page, page.pages, page.offset())
+        });
+    if total == 0 {
+        return out.raw_line(
+            0,
+            "No results were found. Please check the query examples to build it correctly.",
+        );
+    }
+
+    let first = offset.saturating_add(1);
+    let range = match (rows, total) {
+        (0, _) => format!("0 rows of {total}"),
+        (1, 1) => "row 1".to_owned(),
+        (1, _) => format!("row {first} of {total}"),
+        _ => {
+            let last = offset.saturating_add(rows);
+            format!("rows {first}-{last} of {total}")
+        }
+    };
+    out.raw_line(0, &format!("{range} | page {page}/{pages}"))?;
+    out.blank_line()?;
+
     let terms = Terms {
         blank_prefix: display.blank_prefix.max(BLANK_PREFIX_MIN),
     };
     match &result.answer {
         QueryAnswer::Boolean { value } => {
-            out.raw_line(0, if *value { "true" } else { "false" })?;
+            render_table(out, ["result"], [Ok(vec![value.to_string()])])
         }
         QueryAnswer::Bindings {
             variables,
             bindings,
-        } => match &display.presentation {
-            QueryPresentation::Matches(fields) => {
-                matches(out, &terms, variables, bindings, fields)?;
-            }
-            QueryPresentation::Flows(fields) => {
-                let page = FlowPage {
-                    multiple_flows: display.multiple_flows,
-                    linked_pages: page.is_some_and(|page| page.pages > 1),
-                };
-                flows(out, &terms, variables, bindings, fields, page)?;
-            }
-            QueryPresentation::Raw => bindings_table(out, &terms, variables, bindings)?,
-        },
-        QueryAnswer::Graph { triples } => {
-            graph(
-                out,
-                &terms,
-                triples,
-                page.is_none_or(|page| page.pages == 1),
-            )?;
+        } => render_table(
+            out,
+            variables.iter().map(|variable| format!("?{variable}")),
+            bindings.iter().map(|row| {
+                variables
+                    .iter()
+                    .map(|variable| {
+                        row.get(variable).map_or_else(
+                            || Ok(String::new()),
+                            |value| terms.term(value, Some(variable)),
+                        )
+                    })
+                    .collect()
+            }),
+        ),
+        QueryAnswer::Graph { triples } => render_table(
+            out,
+            ["subject", "predicate", "object"],
+            triples.iter().map(|triple| {
+                [&triple.subject, &triple.predicate, &triple.object]
+                    .into_iter()
+                    .map(|term| terms.term(term, None))
+                    .collect()
+            }),
+        ),
+    }
+}
+
+const DIVIDER_WIDTH_MIN: usize = 3;
+
+fn render_table(
+    out: &mut TextWriter,
+    headers: impl IntoIterator<Item = impl Into<String>>,
+    rows: impl IntoIterator<Item = Result<Vec<String>, TextError>>,
+) -> Result<(), TextError> {
+    let mut headers = headers.into_iter().map(Into::into).collect::<Vec<_>>();
+    // SELECT * can return one empty binding when the query has no variables.
+    if headers.is_empty() {
+        headers.push("result".to_owned());
+    }
+    let columns = headers.len();
+    let mut widths = vec![DIVIDER_WIDTH_MIN; columns];
+    // Each row has an opening pipe and line feed, and three delimiter bytes per cell.
+    let row_bytes = columns.saturating_mul(3).saturating_add(2);
+    let mut occupied_width = columns.saturating_mul(DIVIDER_WIDTH_MIN);
+    let mut compact_bytes = row_bytes.saturating_add(occupied_width);
+    let mut table_rows = Vec::new();
+    for row in std::iter::once(Ok(headers)).chain(rows) {
+        let mut row = row?;
+        if row.is_empty() {
+            row.push(String::new());
         }
+        compact_bytes = compact_bytes.saturating_add(row_bytes);
+        out.check_capacity(compact_bytes)?;
+        let mut cells = Vec::with_capacity(columns);
+        for (value, column_width) in row.into_iter().zip(&mut widths) {
+            let cell = table_cell(&value);
+            compact_bytes = compact_bytes.saturating_add(cell.text.len());
+            out.check_capacity(compact_bytes)?;
+            *column_width = (*column_width).max(cell.width);
+            occupied_width = occupied_width.saturating_add(cell.width);
+            cells.push(cell);
+        }
+        table_rows.push(cells);
     }
-    if let Some(page) = page.and_then(super::layout::page_fact) {
-        out.raw_line(0, &page)?;
-    }
-    write_query_warnings(out, &result.warnings)
-}
-
-fn graph(
-    out: &mut TextWriter,
-    terms: &Terms,
-    triples: &[RdfTriple],
-    complete: bool,
-) -> Result<(), TextError> {
-    let Some(first) = triples.first() else {
-        return out.raw_line(0, "No triples.");
-    };
-    // An isolated blank subject needs no label when its entire graph is in this answer.
-    if complete
-        && matches!(&first.subject, RdfTerm::BlankNode { providers, .. } if providers.is_empty())
-        && triples
-            .iter()
-            .all(|triple| triple.subject == first.subject && triple.object != first.subject)
-    {
-        let properties = triples
-            .iter()
-            .map(|triple| {
-                Ok(format!(
-                    "{} {}",
-                    terms.term(&triple.predicate)?,
-                    terms.term(&triple.object)?
-                ))
-            })
-            .collect::<Result<Vec<_>, TextError>>()?;
-        return out.raw_line(0, &format!("[ {} ] .", properties.join(" ; ")));
-    }
-    for triple in triples {
-        out.raw_line(
-            0,
-            &format!(
-                "{} {} {} .",
-                terms.term(&triple.subject)?,
-                terms.term(&triple.predicate)?,
-                terms.term(&triple.object)?
-            ),
-        )?;
-    }
-    Ok(())
-}
-
-fn bindings_table(
-    out: &mut TextWriter,
-    terms: &Terms,
-    variables: &[String],
-    bindings: &[Row],
-) -> Result<(), TextError> {
-    let header = variables
-        .iter()
-        .map(|variable| format!("?{variable}"))
+    let aligned_width: usize = widths.iter().sum();
+    let padding = aligned_width
+        .saturating_mul(table_rows.len() + 1)
+        .saturating_sub(occupied_width);
+    let aligned = compact_bytes.saturating_add(padding) <= out.remaining_bytes();
+    let widths = if aligned { widths.as_slice() } else { &[] };
+    let mut rows = table_rows.into_iter();
+    let header = rows.next().expect("the table has a header");
+    table_row(out, &header, widths)?;
+    let divider = (0..columns)
+        .map(|column| {
+            let width = widths.get(column).copied().unwrap_or(DIVIDER_WIDTH_MIN);
+            TableCell {
+                text: "-".repeat(width),
+                width,
+            }
+        })
         .collect::<Vec<_>>();
-    out.raw_line(0, &header.join("\t"))?;
-    for row in bindings {
-        let cells = variables
-            .iter()
-            .map(|variable| {
-                row.get(variable)
-                    .map_or_else(|| Ok(String::new()), |value| terms.term(value))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        out.raw_line(0, &cells.join("\t"))?;
+    table_row(out, &divider, widths)?;
+    for row in rows {
+        table_row(out, &row, widths)?;
     }
     Ok(())
 }
 
-fn matches(
-    out: &mut TextWriter,
-    terms: &Terms,
-    variables: &[String],
-    bindings: &[Row],
-    fields: &Fields,
-) -> Result<(), TextError> {
-    use QueryField::{End, Line, Name, Path, Score, Source, Start, Symbol};
-    if bindings.is_empty() {
-        return out.raw_line(0, "No matches.");
-    }
-    for row in bindings {
-        let mut title = Vec::new();
-        let name = field(row, fields, Name);
-        let symbol = field(row, fields, Symbol);
-        if let Some(name) = name {
-            title.push(terms.label(name)?);
-        } else if let Some(symbol) = symbol {
-            title.push(symbol_name(symbol, terms)?);
-        }
-        if let Some(path) = field(row, fields, Path) {
-            let path = terms.label(path)?;
-            let location = if let Some(line) = field(row, fields, Line) {
-                format!("{path}:{}", terms.term(line)?)
-            } else {
-                path
-            };
-            title.push(location);
-        } else if let Some(line) = field(row, fields, Line) {
-            title.push(format!("line {}", terms.term(line)?));
-        }
-        range(
-            &mut title,
-            terms,
-            field(row, fields, Start),
-            field(row, fields, End),
-        )?;
-        if let Some(score) = field(row, fields, Score) {
-            title.push(format!("score {}", terms.score(score)?));
-        }
-        title.retain(|field| !field.is_empty());
-        if !title.is_empty() {
-            out.raw_line(0, &title.join(FIELD_SEPARATOR))?;
-        }
-        if let Some(source) = field(row, fields, Source) {
-            if let RdfTerm::Literal { value, datatype } = source
-                && datatype == XSD_STRING
-            {
-                out.raw_lines(1, value)?;
-            } else {
-                out.raw_line(1, &terms.term(source)?)?;
-            }
-        }
-        if let Some(symbol) = symbol {
-            out.raw_line(1, &terms.label(symbol)?)?;
-        }
-        other_fields(out, terms, variables, row, fields)?;
-    }
-    Ok(())
+struct TableCell {
+    text: String,
+    width: usize,
 }
 
-fn range(
-    title: &mut Vec<String>,
-    terms: &Terms,
-    start: Option<&RdfTerm>,
-    end: Option<&RdfTerm>,
-) -> Result<(), TextError> {
-    match (start, end) {
-        (Some(start), Some(end)) => title.push(format!(
-            "bytes {}..{}",
-            terms.term(start)?,
-            terms.term(end)?
-        )),
-        (Some(start), None) => title.push(format!("start byte {}", terms.term(start)?)),
-        (None, Some(end)) => title.push(format!("end byte {}", terms.term(end)?)),
-        (None, None) => {}
-    }
-    Ok(())
+fn table_cell(value: &str) -> TableCell {
+    let text = visible(value).into_owned();
+    let width = text.width();
+    TableCell { text, width }
 }
 
-#[derive(Clone, Copy)]
-struct FlowPage {
-    multiple_flows: bool,
-    linked_pages: bool,
-}
-
-fn flows(
-    out: &mut TextWriter,
-    terms: &Terms,
-    variables: &[String],
-    bindings: &[Row],
-    fields: &Fields,
-    page: FlowPage,
-) -> Result<(), TextError> {
-    use QueryField::{Flow, Name, Score, Step, Symbol};
-    if bindings.is_empty() {
-        return out.raw_line(0, "No call paths.");
+fn table_row(out: &mut TextWriter, cells: &[TableCell], widths: &[usize]) -> Result<(), TextError> {
+    let mut line = String::from("|");
+    for (column, cell) in cells.iter().enumerate() {
+        line.push(' ');
+        line.push_str(&cell.text);
+        let width = widths.get(column).copied().unwrap_or(0);
+        line.extend(std::iter::repeat_n(' ', width.saturating_sub(cell.width)));
+        line.push_str(" |");
     }
-    // Keep the query's row order. Step indexes stay absolute when a page splits a path.
-    let mut previous = None;
-    let mut path_numbers = BTreeMap::new();
-    for row in bindings {
-        let flow = field(row, fields, Flow);
-        let score = field(row, fields, Score);
-        let heading = (flow, score);
-        if previous != Some(heading) {
-            let mut title = vec![flow_title(flow, terms, page, &mut path_numbers)?];
-            if let Some(score) = score {
-                title.push(format!("score {}", terms.score(score)?));
-            }
-            out.raw_line(0, &title.join(FIELD_SEPARATOR))?;
-        }
-        let symbol = field(row, fields, Symbol);
-        let name = match field(row, fields, Name) {
-            Some(name) => terms.label(name)?,
-            None => symbol.map_or_else(|| Ok(String::new()), |id| symbol_name(id, terms))?,
-        };
-        let mut step = match field(row, fields, Step) {
-            Some(index) => format!("{} → {name}", terms.term(index)?),
-            None => format!("→ {name}"),
-        };
-        if let Some(symbol) = symbol {
-            step.push_str(FIELD_SEPARATOR);
-            step.push_str(&terms.label(symbol)?);
-        }
-        out.raw_line(1, &step)?;
-        other_fields(out, terms, variables, row, fields)?;
-        previous = Some(heading);
-    }
-    Ok(())
-}
-
-fn flow_title<'a>(
-    flow: Option<&'a RdfTerm>,
-    terms: &Terms,
-    page: FlowPage,
-    path_numbers: &mut BTreeMap<&'a str, usize>,
-) -> Result<String, TextError> {
-    match flow {
-        Some(RdfTerm::BlankNode { .. }) if !page.multiple_flows => Ok("Call path".to_owned()),
-        Some(RdfTerm::BlankNode { value, .. }) if !page.linked_pages => {
-            let next = path_numbers.len() + 1;
-            let ordinal = path_numbers.entry(value).or_insert(next);
-            Ok(format!("Call path {ordinal}"))
-        }
-        Some(flow) => Ok(format!("Call path {}", terms.label(flow)?)),
-        None => Ok("Call path".to_owned()),
-    }
-}
-
-fn field<'a>(row: &'a Row, fields: &Fields, field: QueryField) -> Option<&'a RdfTerm> {
-    row.get(fields.get(&field)?)
-}
-
-fn symbol_name(symbol: &RdfTerm, terms: &Terms) -> Result<String, TextError> {
-    if let RdfTerm::Iri { value } = symbol
-        && let Ok(identity) = SymbolIdentity::parse(value)
-        && let Some(name) = identity.qualified_path().last()
-    {
-        return Ok(visible(name).into_owned());
-    }
-    terms.label(symbol)
-}
-
-fn other_fields(
-    out: &mut TextWriter,
-    terms: &Terms,
-    variables: &[String],
-    row: &Row,
-    fields: &Fields,
-) -> Result<(), TextError> {
-    for variable in variables
-        .iter()
-        .filter(|variable| !fields.values().any(|field| field == *variable))
-    {
-        if let Some(value) = row.get(variable) {
-            out.raw_line(1, &format!("?{variable} = {}", terms.term(value)?))?;
-        }
-    }
-    Ok(())
-}
-
-fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Result<(), TextError> {
-    for detail in warnings.iter().filter_map(query_warning_text) {
-        out.raw_line(0, &format!("warning · {detail}"))?;
-    }
-    if warnings
-        .iter()
-        .any(|warning| matches!(warning, ReadWarning::TraversalTruncated { .. }))
-    {
-        out.raw_line(
-            0,
-            "Narrow the flow query to search again. A page continues the retained result.",
-        )?;
-    }
-    Ok(())
-}
-
-/// The text of a warning a query answer carries: the coverage and discovery conditions that
-/// name what is missing from it. Every other warning is logged and left out of the answer.
-fn query_warning_text(warning: &ReadWarning) -> Option<String> {
-    match warning {
-        ReadWarning::LocalSymbolInventoryUnavailable => Some(
-            "The local symbol inventory is unavailable. Use `SERVICE :search` to select package facts."
-                .to_owned(),
-        ),
-        ReadWarning::EdgeCoverageMissing { detail, .. }
-        | ReadWarning::TraversalTruncated { detail, .. }
-        | ReadWarning::EngineAnalysisUnavailable { detail, .. }
-        | ReadWarning::EngineReadinessUnconfirmed { detail, .. }
-        | ReadWarning::CalleesDropped { detail, .. }
-        | ReadWarning::SourceUnavailable { detail, .. }
-        | ReadWarning::LargeFileUnparsed { detail, .. } => Some(detail.clone()),
-        ReadWarning::FrameworkContextUnresolved { unit, detail, .. } => Some(
-            unit.project_path()
-                .map_or_else(|| detail.clone(), |path| format!("{path}: {detail}")),
-        ),
-        _ => None,
-    }
+    out.raw_line(0, &line)
 }
 
 struct Terms {
@@ -517,32 +311,7 @@ struct Terms {
 }
 
 impl Terms {
-    fn label(&self, term: &RdfTerm) -> Result<String, TextError> {
-        match term {
-            RdfTerm::Iri { value } => Ok(visible(value).into_owned()),
-            RdfTerm::Literal { value, datatype } if datatype == XSD_STRING => {
-                Ok(visible(value).into_owned())
-            }
-            _ => self.term(term),
-        }
-    }
-
-    fn score(&self, term: &RdfTerm) -> Result<String, TextError> {
-        match term {
-            RdfTerm::Literal { value, datatype } if datatype == XSD_DOUBLE => {
-                let score = value
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|score| score.is_finite())
-                    .map(|score| score.to_string())
-                    .filter(|decimal| decimal.len() <= SCORE_DECIMAL_BYTES_MAX);
-                Ok(score.unwrap_or_else(|| visible(value).into_owned()))
-            }
-            _ => self.term(term),
-        }
-    }
-
-    fn term(&self, term: &RdfTerm) -> Result<String, TextError> {
+    fn term(&self, term: &RdfTerm, column: Option<&str>) -> Result<String, TextError> {
         let quoted = |value: &str| {
             serde_json::to_string(value).map_err(|error| TextError::Custom(error.to_string()))
         };
@@ -564,7 +333,14 @@ impl Terms {
                 };
                 Ok(format!("_:{}{analyses}", &value[..end]))
             }
-            RdfTerm::Literal { value, datatype } if datatype == XSD_STRING => quoted(value),
+            RdfTerm::Literal { value, datatype } if datatype == XSD_STRING => {
+                let text = if column == Some(REVISION_FIELD) && is_commit_id(value) {
+                    cut_hash(value)
+                } else {
+                    value
+                };
+                quoted(text)
+            }
             RdfTerm::Literal { value, datatype }
                 if (datatype == XSD_INTEGER && is_integer(value))
                     || (datatype == XSD_BOOLEAN && matches!(value.as_str(), "true" | "false")) =>
@@ -631,166 +407,220 @@ mod tests {
                     { "blank": { "type": "blank_node", "value": "first-retained-label" } }
                 ]
             },
-            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 3},
             "view": { "id": "retained.answer", "expires_at": "2030-01-01T00:15:00Z" }
         }))?;
         assert_eq!(
             output,
-            "?blank\t?value\t?typed\t?predicate\n_:first-retain\t42\t\"invalid boolean\"^^xsd:boolean\t:name\n_:different-re\ttrue\t\"source\"@en\t\n_:first-retain\t\t\t\n"
+            concat!(
+                "rows 1-3 of 3 | page 1/1\n\n",
+                "| ?blank         | ?value | ?typed                         | ?predicate |\n",
+                "| -------------- | ------ | ------------------------------ | ---------- |\n",
+                "| _:first-retain | 42     | \"invalid boolean\"^^xsd:boolean | :name      |\n",
+                "| _:different-re | true   | \"source\"@en                    |            |\n",
+                "| _:first-retain |        |                                |            |\n",
+            )
         );
         Ok(())
     }
 
     #[test]
-    fn graph_text_omits_only_an_isolated_blank_subject_label()
+    fn graph_text_keeps_distinct_triples_and_provider_sets()
     -> Result<(), Box<dyn std::error::Error>> {
-        let query = |triples, pages| {
-            raw_answer(serde_json::json!({
-                "answer": { "result": "graph", "triples": triples },
-                "pagination": { "page": 1, "pages": pages, "max_results": 1, "total": pages }
-            }))
-        };
-        let blank = serde_json::json!({ "type": "blank_node", "value": "anonymous" });
-        let predicate = serde_json::json!({ "type": "iri", "value": "urn:rift:vocabulary:name" });
-        let triple = serde_json::json!({
-            "subject": blank,
-            "predicate": predicate,
-            "object": { "type": "literal", "value": "Rift", "datatype": XSD_STRING }
+        let blank = serde_json::json!({
+            "type": "blank_node", "value": "anonymous", "providers": ["static", "lsp", "engine"]
         });
-        let mut produced = triple.clone();
-        produced["subject"]["providers"] = serde_json::json!(["static", "lsp", "engine"]);
-        assert_eq!(
-            query(vec![produced], 1)?,
-            "_:anonymous (providers: engine, lsp, static) :name \"Rift\" .\n"
-        );
-        let count = serde_json::json!({
-            "subject": blank,
-            "predicate": { "type": "iri", "value": "urn:rift:vocabulary:count" },
-            "object": { "type": "literal", "value": "7", "datatype": XSD_INTEGER }
-        });
-        assert_eq!(
-            query(vec![triple.clone(), count.clone()], 1)?,
-            "[ :name \"Rift\" ; :count 7 ] .\n"
-        );
-        assert_eq!(
-            query(vec![triple.clone(), count], 2)?,
-            "_:anonymous :name \"Rift\" .\n_:anonymous :count 7 .\npage 1/2, total 2 results\n"
-        );
-        let reference = serde_json::json!({
-            "subject": { "type": "blank_node", "value": "other" },
-            "predicate": { "type": "iri", "value": "urn:rift:vocabulary:ref" },
-            "object": blank
-        });
-        assert_eq!(
-            query(vec![triple, reference], 1)?,
-            "_:anonymous :name \"Rift\" .\n_:other :ref _:anonymous .\n"
-        );
-        let self_reference = serde_json::json!({
-            "subject": blank,
-            "predicate": { "type": "iri", "value": "urn:rift:vocabulary:ref" },
-            "object": blank
-        });
-        assert_eq!(
-            query(vec![self_reference], 1)?,
-            "_:anonymous :ref _:anonymous .\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn call_paths_render_indexes_as_arrows_and_label_only_distinct_paths()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let presentation = QueryPresentation::Flows(BTreeMap::from([
-            (QueryField::Flow, "flow".to_owned()),
-            (QueryField::Score, "rank".to_owned()),
-            (QueryField::Step, "index".to_owned()),
-            (QueryField::Symbol, "symbol".to_owned()),
-        ]));
-        let row = |flow: &str, index: &str, symbol: &str| {
-            BTreeMap::from([
-                (
-                    "flow".to_owned(),
-                    RdfTerm::BlankNode {
-                        value: flow.to_owned(),
-                        providers: std::collections::BTreeSet::default(),
+        let text = raw_answer(serde_json::json!({
+            "answer": {
+                "result": "graph",
+                "triples": [
+                    {
+                        "subject": blank,
+                        "predicate": {"type": "iri", "value": "urn:rift:vocabulary:name"},
+                        "object": {"type": "literal", "value": "Rift", "datatype": XSD_STRING}
                     },
-                ),
-                (
-                    "rank".to_owned(),
-                    RdfTerm::Literal {
-                        value: "1.0E0".to_owned(),
-                        datatype: XSD_DOUBLE.to_owned(),
-                    },
-                ),
-                (
-                    "index".to_owned(),
-                    RdfTerm::Literal {
-                        value: index.to_owned(),
-                        datatype: XSD_INTEGER.to_owned(),
-                    },
-                ),
-                (
-                    "symbol".to_owned(),
-                    RdfTerm::Iri {
-                        value: format!("rift://symbol/local/rust/app/{symbol}"),
-                    },
-                ),
-            ])
-        };
-        let first = row("first", "0", "checkout");
-        let second = row("second", "0", "charge");
-        let later = row("first", "2", "retry");
-        let answer = |bindings| QueryAnswer::Bindings {
-            variables: ["flow", "rank", "index", "symbol"]
-                .map(str::to_owned)
-                .to_vec(),
-            bindings,
-        };
-        let page = |bindings, retained, page: u64, pages: u64| {
-            let result = QueryOutput::new(
-                QueryReadResult::Results(Box::new(QueryResult {
-                    answer: answer(bindings),
-                    pagination: rift_protocol::read::Pagination {
-                        page: page + 1,
-                        pages,
-                        max_results: 1,
-                        total: pages,
+                    {
+                        "subject": blank,
+                        "predicate": {"type": "iri", "value": "urn:rift:vocabulary:count"},
+                        "object": {"type": "literal", "value": "7", "datatype": XSD_INTEGER}
                     }
-                    .into(),
-                    view: None,
-                    revision: None,
-                    warnings: Vec::new(),
-                })),
-                QueryDisplay::selected(&answer(retained), presentation.clone()),
-            );
-            super::super::text_of(&result)
-        };
+                ]
+            },
+            "pagination": { "page": 2, "pages": 2, "max_results": 2, "total": 4 }
+        }))?;
         assert_eq!(
-            page(
-                vec![later.clone()],
-                vec![first.clone(), later.clone()],
-                1,
-                2
-            )?,
-            "Call path | score 1\n\t2 → retry | rift://symbol/local/rust/app/retry\npage 2/2, total 2 results\n"
+            text,
+            concat!(
+                "rows 3-4 of 4 | page 2/2\n\n",
+                "| subject                                      | predicate | object |\n",
+                "| -------------------------------------------- | --------- | ------ |\n",
+                "| _:anonymous (providers: engine, lsp, static) | :name     | \"Rift\" |\n",
+                "| _:anonymous (providers: engine, lsp, static) | :count    | 7      |\n",
+            )
         );
-        let retained = vec![first.clone(), second, later.clone()];
-        let multiple = page(retained.clone(), retained.clone(), 0, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn plain_text_cells_keep_punctuation_and_one_line_per_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let text = raw_answer(serde_json::json!({
+            "answer": {
+                "result": "bindings",
+                "variables": ["source", "rank", "symbol"],
+                "bindings": [{
+                    "source": {
+                        "type": "literal",
+                        "value": "a | b\\c\n<t>*x*_",
+                        "datatype": XSD_STRING
+                    },
+                    "rank": {
+                        "type": "literal",
+                        "value": "1.0E0",
+                        "datatype": "http://www.w3.org/2001/XMLSchema#double"
+                    },
+                    "symbol": { "type": "iri", "value": "rift://symbol/local/rust/app/retry" }
+                }]
+            }
+        }))?;
         assert_eq!(
-            multiple
-                .lines()
-                .filter(|line| line.starts_with("Call path"))
-                .collect::<Vec<_>>(),
+            text,
+            concat!(
+                "row 1 | page 1/1\n\n",
+                "| ?source             | ?rank               | ?symbol                              |\n",
+                "| ------------------- | ------------------- | ------------------------------------ |\n",
+                "| \"a | b\\\\c\\n<t>*x*_\" | \"1.0E0\"^^xsd:double | <rift://symbol/local/rust/app/retry> |\n",
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_full_git_commits_in_revision_columns_shorten_in_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sha1 = format!("12345678{}", "a".repeat(32));
+        let sha256 = format!("abcdef01{}", "b".repeat(56));
+        let literal = |value: &str| serde_json::json!({ "type": "literal", "value": value, "datatype": XSD_STRING });
+        let release = "rift://revision/cargo/crates.io/demo@1.0.0";
+        let structured = serde_json::json!({
+            "answer": {
+                "result": "bindings",
+                "variables": ["revision", "message"],
+                "bindings": [
+                    {"revision": literal(&sha1), "message": literal(&sha1)},
+                    {"revision": literal(&sha256)},
+                    {"revision": literal("1234567890")},
+                    {"revision": {"type": "iri", "value": release}},
+                ]
+            }
+        });
+        let output = QueryOutput::from(serde_json::from_value::<QueryReadResult>(
+            structured.clone(),
+        )?);
+        assert_eq!(serde_json::to_value(&output)?, structured);
+        let text = super::super::text_of(&output)?;
+        let cells: Vec<_> = text
+            .lines()
+            .skip(4)
+            .map(|line| line.split('|').nth(1).unwrap_or_default().trim())
+            .collect();
+        assert_eq!(
+            cells,
             [
-                "Call path 1 | score 1",
-                "Call path 2 | score 1",
-                "Call path 1 | score 1"
+                r#""12345678""#,
+                r#""abcdef01""#,
+                r#""1234567890""#,
+                &format!("<{release}>")
             ]
         );
-        for (index, binding) in [(0, first), (2, later)] {
-            let output = page(vec![binding], retained.clone(), index, 3)?;
-            assert!(output.starts_with("Call path _:first | score 1\n"));
+        assert!(text.contains(&format!("\"{sha1}\"")));
+        assert!(!text.contains(&sha256));
+        Ok(())
+    }
+
+    #[test]
+    fn ask_text_counts_false_as_one_result() -> Result<(), Box<dyn std::error::Error>> {
+        for value in [true, false] {
+            let text = raw_answer(serde_json::json!({
+                "answer": { "result": "boolean", "value": value }
+            }))?;
+            assert_eq!(
+                text,
+                format!("row 1 | page 1/1\n\n| result |\n| ------ |\n| {value:<6} |\n")
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_answer_differs_from_empty_page_and_empty_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let text = |total, pages, bindings| {
+            raw_answer(serde_json::json!({
+                "answer": {"result": "bindings", "variables": [], "bindings": bindings},
+                "pagination": {"page": 2, "pages": pages, "max_results": 1, "total": total}
+            }))
+        };
+        assert_eq!(
+            text(0, 0, serde_json::json!([]))?,
+            "No results were found. Please check the query examples to build it correctly.\n"
+        );
+        assert_eq!(
+            text(1, 1, serde_json::json!([]))?,
+            "0 rows of 1 | page 2/1\n\n| result |\n| ------ |\n"
+        );
+        assert_eq!(
+            text(2, 2, serde_json::json!([{}]))?,
+            "row 2 of 2 | page 2/2\n\n| result |\n| ------ |\n|        |\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn row_heading_uses_actual_page_rows() -> Result<(), Box<dyn std::error::Error>> {
+        for (page, total, rows, heading) in [
+            (2, 24, 10, "rows 11-20 of 24 | page 2/3"),
+            (3, 24, 4, "rows 21-24 of 24 | page 3/3"),
+            (3, 21, 1, "row 21 of 21 | page 3/3"),
+            (4, 24, 0, "0 rows of 24 | page 4/3"),
+        ] {
+            let text = raw_answer(serde_json::json!({
+                "answer": {
+                    "result": "bindings",
+                    "variables": ["value"],
+                    "bindings": vec![serde_json::json!({}); rows]
+                },
+                "pagination": rift_protocol::read::Pagination::new(page, 10, total),
+            }))?;
+            assert_eq!(text.lines().next(), Some(heading));
+            assert_eq!(text.lines().count(), 4 + rows);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn marks_table_columns_by_display_width_and_drops_padding_at_the_byte_limit()
+    -> Result<(), TextError> {
+        let table = |writer: &mut TextWriter| {
+            render_table(
+                writer,
+                ["name", "value"],
+                [Ok(vec!["界界界".to_owned(), "e\u{301}".to_owned()])],
+            )
+        };
+        let compact = "| name | value |\n| --- | --- |\n| 界界界 | e\u{301} |\n";
+        let mut padded = TextWriter::new(100);
+        table(&mut padded)?;
+        assert_eq!(
+            padded.finish()?,
+            "| name   | value |\n| ------ | ----- |\n| 界界界 | e\u{301}     |\n"
+        );
+        let mut unpadded = TextWriter::new(compact.len());
+        table(&mut unpadded)?;
+        assert_eq!(unpadded.finish()?, compact);
+        let mut refuses = TextWriter::new(compact.len() - 1);
+        assert!(matches!(table(&mut refuses), Err(TextError::Overflow(_))));
+        assert!(matches!(refuses.finish(), Err(TextError::Overflow(_))));
         Ok(())
     }
 
@@ -811,7 +641,7 @@ mod tests {
             variables: variables.clone(),
             bindings: vec![row(first.clone()), row(second.clone()), row(first.clone())],
         };
-        let display = QueryDisplay::selected(&full, QueryPresentation::Raw);
+        let display = QueryDisplay::for_answer(&full);
         let page = |page, value| {
             QueryOutput::new(
                 QueryReadResult::Results(Box::new(QueryResult {
@@ -819,13 +649,7 @@ mod tests {
                         variables: variables.clone(),
                         bindings: vec![row(value)],
                     },
-                    pagination: rift_protocol::read::Pagination {
-                        page,
-                        pages: 3,
-                        max_results: 10,
-                        total: 0,
-                    }
-                    .into(),
+                    pagination: Some(rift_protocol::read::Pagination::new(page, 1, 3)),
                     view: None,
                     revision: None,
                     warnings: Vec::new(),
@@ -834,12 +658,12 @@ mod tests {
             )
         };
         for (index, value, expected) in [
-            (0, first.clone(), "_:retained_node_á"),
-            (1, second, "_:retained_node_ã"),
-            (2, first, "_:retained_node_á"),
+            (1, first.clone(), "| _:retained_node_á |"),
+            (2, second, "| _:retained_node_ã |"),
+            (3, first, "| _:retained_node_á |"),
         ] {
             let output = super::super::text_of(&page(index, value))?;
-            assert_eq!(output.lines().nth(1), Some(expected));
+            assert_eq!(output.lines().nth(4), Some(expected));
         }
         Ok(())
     }

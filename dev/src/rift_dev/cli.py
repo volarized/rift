@@ -269,17 +269,24 @@ def clock_inventory() -> None:
 
 @app.command()
 def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None:
-    """Check prose and source files for banned dash characters."""
+    """Check text for em dashes, en dashes, and middle dots.
+
+    Checks tracked and unignored files by default. Pass explicit paths to check
+    generated output or other ignored files.
+    """
     raise typer.Exit(check_dashes.main([str(path) for path in paths or []]))
 
 
 @app.command()
 def generate(
     check: Annotated[
-        bool, typer.Option(help="Fail on a stale generated file instead of writing.")
+        bool,
+        typer.Option(
+            help="Fail when a generated file shipped in the checkout differs."
+        ),
     ] = False,
 ) -> None:
-    """Write the schemas, analyzer manifest, API client, and CLI help transcript."""
+    """Export docs data and write or check generated files shipped in the checkout."""
     generated.generate(check)
 
 

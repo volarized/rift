@@ -2569,7 +2569,7 @@ fn background_start_keeps_listening_and_reads_report_source_file_limit() -> Test
         let response: serde_json::Value = serde_json::from_str(body)?;
         let result = &response["result"];
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
-        if result["isError"] == true && text.starts_with("1 error\n\tlimit_exceeded · retry ") {
+        if result["isError"] == true && text.starts_with("1 error\n\tlimit_exceeded | retry ") {
             refusal = Some((result.clone(), text.to_owned()));
             break;
         }

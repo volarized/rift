@@ -712,7 +712,7 @@ impl<'db> GenericContext<'db> {
         impl<'db> TypeVarLocations<'db> {
             /// Returns a set of all of the typevars that _only_ appear in a `Callable` in the
             /// return type, along with a "replacement map" for those `Callable`s. (The key of the
-            /// map will be a `Callable` as it originally appears in the return type — i.e., with
+            /// map will be a `Callable` as it originally appears in the return type - i.e., with
             /// no generic context. The corresponding value will be the updated `Callable` with a
             /// generic context.)
             fn finalize(

@@ -550,9 +550,9 @@ pub fn strip_optional_null_arms(schema: &mut Map<String, Value>) {
     }
 }
 
-/// Removes response diagnostics from the MCP view of shared result schemas.
+/// Removes response diagnostics and their unused definitions from MCP result schemas.
 pub fn strip_response_warnings(schema: &mut Map<String, Value>) {
-    let mut pending = vec![schema];
+    let mut pending = vec![&mut *schema];
     while let Some(syntax_element) = pending.pop() {
         if let Some(properties) = syntax_element
             .get_mut(keyword::PROPERTIES)
@@ -568,6 +568,42 @@ pub fn strip_response_warnings(schema: &mut Map<String, Value>) {
             if required.is_empty() {
                 syntax_element.remove(keyword::REQUIRED);
             }
+        }
+        pending.extend(subschemas(syntax_element));
+    }
+    retain_referenced_definitions(schema);
+}
+
+/// Retains the definitions reachable from a generated schema's root. Each definition is
+/// visited once, including when it refers to itself.
+fn retain_referenced_definitions(schema: &mut Map<String, Value>) {
+    let Some(Value::Object(mut definitions)) = schema.remove(keyword::DEFS) else {
+        return;
+    };
+    let mut pending = Vec::new();
+    let mut referenced = std::collections::BTreeSet::new();
+    collect_definition_names(schema, &mut pending);
+    while let Some(name) = pending.pop() {
+        if referenced.insert(name.clone())
+            && let Some(definition) = definitions.get_mut(&name).and_then(Value::as_object_mut)
+        {
+            collect_definition_names(definition, &mut pending);
+        }
+    }
+    definitions.retain(|name, _| referenced.contains(name));
+    if !definitions.is_empty() {
+        schema.insert(keyword::DEFS.to_owned(), Value::Object(definitions));
+    }
+}
+
+fn collect_definition_names(schema: &mut Map<String, Value>, names: &mut Vec<String>) {
+    let mut pending = vec![schema];
+    while let Some(syntax_element) = pending.pop() {
+        if let Some(reference) = syntax_element.get(keyword::REF).and_then(Value::as_str)
+            && let Some(pointer) = reference.strip_prefix("#/$defs/")
+            && let Some(name) = pointer.split('/').next()
+        {
+            names.push(name.replace("~1", "/").replace("~0", "~"));
         }
         pending.extend(subschemas(syntax_element));
     }

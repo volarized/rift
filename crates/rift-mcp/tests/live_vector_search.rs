@@ -7,12 +7,11 @@
 //! acquired from the hub, the published declarations are embedded, and a query
 //! sharing no word with the code it describes still reaches it.
 //!
-//! The suite drives a live rmcp client and reads the tier's state the way a
-//! caller does, from a `search` result's own warnings: `local_index_preparing`
+//! The suite drives a live rmcp client and reads the tier's `read.warning` records:
+//! `local_index_preparing`
 //! while files prepare, `lexical_ranking_unavailable` while the lexical lane commits
 //! the published tree, then `vector_index_preparing` while declarations are embedded.
-//! Nothing here reads server internals, because nothing a caller cannot see is
-//! what this suite is for.
+//! The served answer carries the resulting search hits.
 //!
 //! Every wait is bounded and every bound is named below. A hub that is slow or
 //! unreachable fails a test with the readiness it reached; no wait here can hang.
@@ -20,12 +19,14 @@
 //! The serving helper is local rather than `workspace_client`'s, because every
 //! fixture that helper lays out carries the table this suite must not have.
 
+mod read_diagnostics;
 mod search_live_gate;
 
 use std::error::Error;
 use std::fs;
 use std::time::{Duration, Instant};
 
+use read_diagnostics::ReadDiagnostics;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
@@ -129,18 +130,15 @@ async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestRes
 
 /// Whether local preparation, the lexical commit, or vector ranking still prevents a
 /// complete answer.
-fn tier_is_waiting(answer: &Value) -> bool {
-    answer["warnings"]
-        .as_array()
-        .is_some_and(|warnings| warnings.iter().any(is_preparation_warning))
+fn tier_is_waiting(answer: &Value, warnings: &[Value]) -> bool {
+    answer["reason"] == "index_preparing" || warnings.iter().any(is_preparation_warning)
 }
 
 /// Whether one warning reports unfinished local preparation, a full-text tier that did
 /// not rank the answer, or unfinished vector ranking.
 ///
-/// The vector ranking's readiness travels with the store's ranking. An answer carrying
-/// `lexical_ranking_unavailable` was ranked by identifier matching alone, so it carries no
-/// vector warning and states nothing about the vector ranking.
+/// When the server logs `lexical_ranking_unavailable`, it ranked by identifier matching
+/// alone. It did not run the vector ranking and has no vector warning to log.
 fn is_preparation_warning(warning: &Value) -> bool {
     matches!(
         warning["code"].as_str(),
@@ -166,18 +164,23 @@ async fn ready_answer(
 ) -> TestResult<(Value, Duration)> {
     let started = Instant::now();
     let attempts_max = budget.as_millis() / READINESS_POLL.as_millis();
+    let mut diagnostics = ReadDiagnostics::capture()?;
     let mut last = Value::Null;
+    let mut last_warnings = Vec::new();
     for _attempt in 0..attempts_max {
         let answer = search(client, query).await?;
-        if !tier_is_waiting(&answer) {
+        assert!(answer.get("warnings").is_none(), "{answer:#}");
+        let warnings = diagnostics.take()?;
+        if !tier_is_waiting(&answer, &warnings) {
             return Ok((answer, started.elapsed()));
         }
         last = answer;
+        last_warnings = warnings;
         tokio::time::sleep(READINESS_POLL).await;
     }
     Err(format!(
-        "the vector ranking did not answer within {budget:?}; last warnings: {}",
-        last["warnings"]
+        "the vector ranking did not answer within {budget:?}; last answer: {last}; \
+         last warnings: {last_warnings:?}"
     )
     .into())
 }
@@ -212,12 +215,10 @@ const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 fn test_tier_is_waiting_for_empty_and_nonempty_local_preparation() {
     // Issue #509: a partial answer cannot establish completed vector ranking.
     for results in [json!([]), json!([{"path": "lib.rs"}])] {
-        let answer = json!({
-            "results": results,
-            "warnings": [{"code": "local_index_preparing", "prepared": 0}]
-        });
+        let answer = json!({"results": results});
+        let warnings = [json!({"code": "local_index_preparing", "prepared": 0})];
         assert!(
-            tier_is_waiting(&answer),
+            tier_is_waiting(&answer, &warnings),
             "local preparation remains: {answer:#}"
         );
     }
@@ -227,15 +228,13 @@ fn test_tier_is_waiting_for_empty_and_nonempty_local_preparation() {
 fn test_tier_is_waiting_for_a_pending_lexical_commit() {
     // A search that meets a pending lexical commit is ranked by identifier matching alone:
     // the store ranked nothing, so the answer carries no vector warning either.
-    let answer = json!({
-        "results": [],
-        "warnings": [{
-            "code": "lexical_ranking_unavailable",
-            "detail": "the lexical index is still committing tree revision bb5939cd"
-        }]
-    });
+    let answer = json!({"results": []});
+    let warnings = [json!({
+        "code": "lexical_ranking_unavailable",
+        "detail": "the lexical index is still committing tree revision bb5939cd"
+    })];
     assert!(
-        tier_is_waiting(&answer),
+        tier_is_waiting(&answer, &warnings),
         "the lexical commit remains: {answer:#}"
     );
 }
@@ -243,9 +242,9 @@ fn test_tier_is_waiting_for_a_pending_lexical_commit() {
 #[test]
 fn test_tier_is_waiting_preserves_vector_preparation_and_unavailable() {
     for code in ["vector_index_preparing", "vector_ranking_unavailable"] {
-        let answer = json!({"warnings": [{"code": code}]});
+        let answer = json!({"results": []});
         assert!(
-            tier_is_waiting(&answer),
+            tier_is_waiting(&answer, &[json!({"code": code})]),
             "vector ranking remains: {answer:#}"
         );
     }
@@ -253,13 +252,13 @@ fn test_tier_is_waiting_preserves_vector_preparation_and_unavailable() {
 
 #[test]
 fn test_tier_is_waiting_accepts_completed_answers_without_vector_warnings() {
-    for answer in [
-        json!({"results": []}),
-        json!({"results": [{"path": "lib.rs"}], "warnings": []}),
-        json!({"warnings": [{"code": "stale_index"}]}),
+    for (answer, warnings) in [
+        (json!({"results": []}), vec![]),
+        (json!({"results": [{"path": "lib.rs"}]}), vec![]),
+        (json!({"results": []}), vec![json!({"code": "stale_index"})]),
     ] {
         assert!(
-            !tier_is_waiting(&answer),
+            !tier_is_waiting(&answer, &warnings),
             "preparation has finished: {answer:#}"
         );
     }

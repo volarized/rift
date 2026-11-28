@@ -122,6 +122,72 @@
   --color-fd-primary-foreground: var(--background);
 }
 
+.architecture-diagram {
+  --diagram-node-fill: var(--card);
+  --diagram-node-border: var(--muted-foreground);
+  color: var(--foreground);
+}
+
+.architecture-diagram [data-role="agent"] {
+  --diagram-node-fill: #f3edff;
+  --diagram-node-border: #8252b4;
+}
+
+.architecture-diagram [data-role="rift"] {
+  --diagram-node-fill: #fbeae6;
+  --diagram-node-border: #b84735;
+}
+
+.architecture-diagram [data-role="provider"] {
+  --diagram-node-fill: #e2f4ed;
+  --diagram-node-border: #25765b;
+}
+
+.architecture-diagram [data-role="store"] {
+  --diagram-node-fill: #e9f1fc;
+  --diagram-node-border: #3e6fa8;
+}
+
+.architecture-diagram [data-role="model"] {
+  --diagram-node-fill: #fff1dc;
+  --diagram-node-border: #a26923;
+}
+
+.architecture-diagram [data-role="config"] {
+  --diagram-node-fill: #edf0f5;
+  --diagram-node-border: #68748b;
+}
+
+.dark .architecture-diagram [data-role="agent"] {
+  --diagram-node-fill: #28213c;
+  --diagram-node-border: #a98be5;
+}
+
+.dark .architecture-diagram [data-role="rift"] {
+  --diagram-node-fill: #371e20;
+  --diagram-node-border: #e68170;
+}
+
+.dark .architecture-diagram [data-role="provider"] {
+  --diagram-node-fill: #162e27;
+  --diagram-node-border: #6cc5a6;
+}
+
+.dark .architecture-diagram [data-role="store"] {
+  --diagram-node-fill: #1c2c42;
+  --diagram-node-border: #81aade;
+}
+
+.dark .architecture-diagram [data-role="model"] {
+  --diagram-node-fill: #352717;
+  --diagram-node-border: #dfab66;
+}
+
+.dark .architecture-diagram [data-role="config"] {
+  --diagram-node-fill: #262b34;
+  --diagram-node-border: #a4adc2;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

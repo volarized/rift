@@ -550,7 +550,8 @@ def stderr_log(
 
 FAILURE_TITLE = re.compile(r"([0-9]+) (errors?)")
 INDENT_UNIT = "\t"
-FAILURE_HEAD = re.compile(re.escape(INDENT_UNIT) + r"(\S+) · retry (\S+)")
+# Artifact checks also accept binaries from releases that used U+00B7.
+FAILURE_HEAD = re.compile(re.escape(INDENT_UNIT) + r"(\S+) (?:\||\u00b7) retry (\S+)")
 FAILURE_LIMIT = re.compile(r"limit (\S+): (\d+) over (\d+)")
 # The registered identity a registered failure writes last in its first entry.
 FAILURE_IDENTITY = re.compile(r"rift(?:\.[a-z0-9_]+){2,}")
@@ -622,8 +623,8 @@ def parse_failure(tool: str, text: str) -> ToolFailure:
     """Parse the failure text of a tool result; the only place that decodes it.
 
     Line 1 is the title `N error(s)`. Each entry is a head line at one level,
-    `<code> · retry <directive>`, then lines at two levels. A level is one tab. The first entry is the
-    failure: its message, an optional `limit` line, then raw diagnostic lines.
+    `<code> | retry <directive>`, then lines at two levels. A level is one tab.
+    The first entry carries its message, an optional `limit` line, and raw diagnostic lines.
     Every later entry is a cause and has its message only. N must equal the
     number of entries.
     """

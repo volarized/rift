@@ -70,7 +70,7 @@ pub(super) enum ReturnCallableTypeVarScope {
 /// will always infer the parameters and return of a function in its PEP-695 typevar scope, if
 /// there is one; otherwise they will be inferred in the function definition scope, but will always
 /// be deferred. (This prevents spurious salsa cycles when we need the signature of the function
-/// while in the middle of inferring its definition scope — for instance, when applying
+/// while in the middle of inferring its definition scope - for instance, when applying
 /// decorators.)
 pub(super) fn function_signature_expression_type<'db>(
     db: &'db dyn Db,
@@ -700,7 +700,7 @@ struct SignatureExtras<'db> {
     /// `ParamSpecs` only match the parameter list of a callable, so the values assigned to them do
     /// not "have" return types. We store the return type as `Unknown`, since that is usually the
     /// correct interpretation when _forced_ to consider the non-existent return type. But many
-    /// callers should instead _ignore_ the `return_ty` field of a `paramspec_value` — for
+    /// callers should instead _ignore_ the `return_ty` field of a `paramspec_value` - for
     /// instance, when visiting, mapping, or comparing types.
     is_paramspec_value: bool,
 }

@@ -52,6 +52,8 @@ def preparing_local(
 
     >>> preparing_local({"outcome": "unavailable", "reason": "index_preparing"}, selection="current")
     True
+    >>> preparing_local({"id": "rift://symbol/local/rust/lib/a", "reason": "index_preparing"}, selection="current")
+    True
     >>> preparing_local({"outcome": "unavailable", "reason": "insufficient_coverage"}, selection="current")
     False
     >>> preparing_local({"warnings": [{"code": "local_index_preparing"}]}, selection="current")
@@ -84,7 +86,7 @@ def preparing_local(
     )
     if any(warning.get("code") not in accepted for warning in observed):
         return False
-    if answer.get("outcome") == "unavailable":
+    if "reason" in answer or answer.get("outcome") == "unavailable":
         if answer.get("reason") == "index_preparing":
             return True
         if answer.get("reason") != "insufficient_coverage":

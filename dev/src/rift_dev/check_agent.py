@@ -179,7 +179,6 @@ async def declaration_facet(client: Client, name: str) -> str:
     hit = await symbol_hit(client, name)
     identity = symbol_id(hit)
     answer = await client.call("get_symbol", {"id": identity})
-    require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
     require(
         object_value(answer.get("symbol"), "symbol").get("id") == identity,
         f"symbol identity changed: {answer}",
@@ -194,15 +193,17 @@ async def declaration_facet(client: Client, name: str) -> str:
         == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
         f"changed range: {answer}",
     )
-    require(
-        "source" not in declaration,
-        f"symbol declaration carried source: {answer}",
-    )
     span = object_value(declaration.get("range"), "declaration.range")
     start, end = span.get("start"), span.get("end")
     require(
         type(start) is int and type(end) is int and 0 <= start < end,
         f"declaration range is invalid: {span}",
+    )
+    source = object_value(declaration.get("source"), "declaration source")
+    require(
+        source.get("span") == {"unit": iri(hit, "unit"), "range": span}
+        and source.get("text") == literal(hit, "source"),
+        f"symbol source disagrees with the selected declaration: {answer}",
     )
     revision = string_value(answer.get("revision"), "symbol.revision")
     listing = await client.call(

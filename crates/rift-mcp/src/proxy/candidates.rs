@@ -1,8 +1,10 @@
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::{SearchParams, SearchScope};
+use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 use rift_server::RetainedViewLimits;
+use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ServerResult,
 };
@@ -11,7 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::global::candidates::{CANDIDATE_BYTES_MAX, SearchCandidatePool};
 use crate::server::candidates::{
-    SearchCandidateRequest, SearchCandidateResponse, SearchCandidateResult,
+    RETRIEVAL_COVERAGE_KEY, SearchCandidateRequest, SearchCandidateResponse, SearchCandidateResult,
+    retrieval_coverage_for,
 };
 
 use super::RiftProxy;
@@ -22,9 +25,9 @@ pub(in crate::proxy) use read::dispatch_facets_request;
 
 #[derive(Debug)]
 pub(super) enum CandidateAnswer {
-    Captured(CapturedCandidates),
+    Captured(CapturedCandidates, Option<SymbolUnavailableReason>),
     Response(CallToolResult),
-    /// A project no longer holds the view the continued search named.
+    /// The reason the selected project cannot answer the retrieval.
     Unavailable(SymbolUnavailableReason),
 }
 
@@ -413,7 +416,7 @@ impl RiftProxy {
                 SymbolUnavailableReason::ViewContext,
             )));
         }
-        let captured = match self
+        let (captured, coverage) = match self
             .captured_candidates(&params, pools, require_ready_ranking)
             .await?
         {
@@ -422,7 +425,7 @@ impl RiftProxy {
             Ok(CandidateAnswer::Unavailable(reason)) => {
                 return Ok(Some(unavailable_search(reason)));
             }
-            Ok(CandidateAnswer::Captured(captured)) => captured,
+            Ok(CandidateAnswer::Captured(captured, coverage)) => (captured, coverage),
         };
         let view = match previous {
             Some(saved) => {
@@ -463,7 +466,15 @@ impl RiftProxy {
                 .filter(|pool| pool.backend != "global")
                 .map(|pool| pool.revision.as_ref()),
         )?;
-        Ok(Some(crate::output::Json(merged).retrieval_result()))
+        let answer = match coverage {
+            Some(reason) => SearchReadResult::Unavailable(SearchUnavailable::Unavailable {
+                reason,
+                view: merged.view,
+                warnings: merged.warnings,
+            }),
+            None => SearchReadResult::Results(Box::new(merged)),
+        };
+        Ok(Some(crate::output::Json(answer).into_call_tool_result()))
     }
     fn candidate_context_matches(
         &self,
@@ -520,6 +531,7 @@ impl RiftProxy {
         require_ready_ranking: bool,
     ) -> Result<Result<CandidateAnswer, rmcp::ErrorData>, RiftError> {
         let mut pools = Vec::new();
+        let mut coverage = None;
         let mut ranking = None;
         let mut results_max = 0;
         for (name, backend) in self.candidate_backends(params)? {
@@ -529,43 +541,38 @@ impl RiftProxy {
                 .ok_or_else(|| invalid("root", "accepted project root is unavailable"))?
                 .to_str()
                 .ok_or_else(|| invalid("root", "project root is not UTF-8"))?;
-            let view = previous
-                .iter()
-                .find(|pool| pool.backend == name && pool.root == root)
-                .map(|pool| pool.view.clone());
-            if !previous.is_empty() && view.is_none() {
-                return Err(invalid("view", "captured backend mapping does not match"));
-            }
-            let mut selected = params.clone();
-            selected.view = None;
-            selected.page = 1;
-            selected.scope = if name == "local" {
-                params.scope.clone()
-            } else {
-                selected.packages.clear();
-                SearchScope::Local
-            };
-            let named = view.is_some();
-            let result = backend
-                .candidate_response(SearchCandidateRequest {
-                    params: selected,
-                    view,
-                    require_ready_ranking,
-                })
-                .await?;
+            let request =
+                dispatch_candidate_request(params, name, root, previous, require_ready_ranking)?;
+            let named = request.view.is_some();
+            let result = backend.candidate_response(request).await?;
             let mut response = match result {
                 Err(error) => return Ok(Err(error)),
                 Ok(result) if result.is_error == Some(true) => {
                     return Ok(Ok(CandidateAnswer::Response(result)));
                 }
                 Ok(result) => match decode_response(&result)? {
-                    SearchCandidateResult::Captured(response) => *response,
+                    SearchCandidateResult::Captured(response) => {
+                        if require_ready_ranking {
+                            coverage = combine_retrieval_coverage(
+                                coverage,
+                                decode_retrieval_coverage(&result)?,
+                            );
+                        }
+                        *response
+                    }
                     SearchCandidateResult::Unavailable(answer) => {
                         if let Some(reason) = view_refusal(&answer, named) {
                             return Ok(Ok(CandidateAnswer::Unavailable(reason)));
                         }
                         validate_preparing_response(&answer, require_ready_ranking)?;
-                        return Ok(Ok(CandidateAnswer::Response(result)));
+                        let rift_protocol::search_read::SearchUnavailable::Unavailable {
+                            warnings,
+                            ..
+                        } = answer;
+                        crate::output::log_warnings(&warnings);
+                        return Ok(Ok(CandidateAnswer::Unavailable(
+                            SymbolUnavailableReason::IndexPreparing,
+                        )));
                     }
                 },
             };
@@ -602,12 +609,20 @@ impl RiftProxy {
             super::encode_bounded(&pools, CANDIDATE_BYTES_MAX)
                 .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         }
+        if require_ready_ranking {
+            let legacy_warnings = pools.iter().flat_map(|pool| &pool.inputs.warnings);
+            let legacy = retrieval_coverage_for(legacy_warnings, params.view.is_none());
+            coverage = combine_retrieval_coverage(coverage, legacy);
+        }
         let ranking = ranking.ok_or_else(|| invalid("scope", "primary project is unavailable"))?;
-        Ok(Ok(CandidateAnswer::Captured(CapturedCandidates {
-            pools,
-            ranking,
-            results_max,
-        })))
+        Ok(Ok(CandidateAnswer::Captured(
+            CapturedCandidates {
+                pools,
+                ranking,
+                results_max,
+            },
+            coverage,
+        )))
     }
 
     async fn candidate_response(
@@ -633,6 +648,35 @@ impl RiftProxy {
     }
 }
 
+/// Dispatches a search to one project's candidate producer, pinning its retained view.
+fn dispatch_candidate_request(
+    params: &SearchParams,
+    name: &str,
+    root: &str,
+    previous: &[SearchCandidatePool],
+    require_ready_ranking: bool,
+) -> Result<SearchCandidateRequest, RiftError> {
+    let view = previous
+        .iter()
+        .find(|pool| pool.backend == name && pool.root == root)
+        .map(|pool| pool.view.clone());
+    if !previous.is_empty() && view.is_none() {
+        return Err(invalid("view", "captured backend mapping does not match"));
+    }
+    let mut selected = params.clone();
+    selected.view = None;
+    selected.page = 1;
+    if name != "local" {
+        selected.packages.clear();
+        selected.scope = SearchScope::Local;
+    }
+    Ok(SearchCandidateRequest {
+        params: selected,
+        view,
+        require_ready_ranking,
+    })
+}
+
 fn decode_response(result: &CallToolResult) -> Result<SearchCandidateResult, RiftError> {
     super::encode_bounded(&result, CANDIDATE_BYTES_MAX)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
@@ -644,6 +688,42 @@ fn decode_response(result: &CallToolResult) -> Result<SearchCandidateResult, Rif
     })?;
     serde_json::from_value(value)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
+}
+
+pub(super) fn decode_retrieval_coverage(
+    result: &CallToolResult,
+) -> Result<Option<SymbolUnavailableReason>, RiftError> {
+    let Some(coverage) = result
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0.get(RETRIEVAL_COVERAGE_KEY))
+    else {
+        return Ok(None);
+    };
+    let reason = serde_json::from_value::<SymbolUnavailableReason>(coverage.clone())
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    if !matches!(
+        reason,
+        SymbolUnavailableReason::ReadFailed
+            | SymbolUnavailableReason::InsufficientCoverage
+            | SymbolUnavailableReason::IndexPreparing
+    ) {
+        return Err(invalid("coverage", "unexpected retrieval coverage outcome"));
+    }
+    Ok(Some(reason))
+}
+
+fn combine_retrieval_coverage(
+    left: Option<SymbolUnavailableReason>,
+    right: Option<SymbolUnavailableReason>,
+) -> Option<SymbolUnavailableReason> {
+    [
+        SymbolUnavailableReason::ReadFailed,
+        SymbolUnavailableReason::InsufficientCoverage,
+        SymbolUnavailableReason::IndexPreparing,
+    ]
+    .into_iter()
+    .find(|reason| Some(*reason) == left || Some(*reason) == right)
 }
 
 /// The reason a project refused the view a continued search named, as the combined
@@ -672,17 +752,18 @@ fn validate_preparing_response(
     } = answer;
     if *reason != SymbolUnavailableReason::IndexPreparing
         || view.is_some()
-        || !warnings.iter().any(|warning| {
-            matches!(
-                warning,
-                rift_protocol::read::ReadWarning::LocalIndexPreparing { prepared, total, .. }
-                    if total.is_none_or(|total| *prepared < total)
-            ) || require_ready_ranking
-                && matches!(
+        || !warnings.is_empty()
+            && !warnings.iter().any(|warning| {
+                matches!(
                     warning,
-                    rift_protocol::read::ReadWarning::LexicalRankingUnavailable { .. }
-                )
-        })
+                    rift_protocol::read::ReadWarning::LocalIndexPreparing { prepared, total, .. }
+                        if total.is_none_or(|total| *prepared < total)
+                ) || require_ready_ranking
+                    && matches!(
+                        warning,
+                        rift_protocol::read::ReadWarning::LexicalRankingUnavailable { .. }
+                    )
+            })
     {
         return Err(invalid("view", "captured search selector is unavailable"));
     }
@@ -798,6 +879,29 @@ mod tests {
     }
 
     #[test]
+    fn combined_retrieval_coverage_keeps_the_strongest_unavailability() {
+        use SymbolUnavailableReason::{IndexPreparing, InsufficientCoverage, ReadFailed};
+
+        for (left, right, expected) in [
+            (None, None, None),
+            (None, Some(IndexPreparing), Some(IndexPreparing)),
+            (
+                Some(InsufficientCoverage),
+                Some(IndexPreparing),
+                Some(InsufficientCoverage),
+            ),
+            (
+                Some(ReadFailed),
+                Some(InsufficientCoverage),
+                Some(ReadFailed),
+            ),
+        ] {
+            assert_eq!(combine_retrieval_coverage(left, right), expected);
+            assert_eq!(combine_retrieval_coverage(right, left), expected);
+        }
+    }
+
+    #[test]
     fn preparing_response_rejects_wrong_reason_view_warning_and_extra_fields() {
         let valid = json!({
             "outcome": "unavailable",
@@ -823,7 +927,8 @@ mod tests {
         let mut no_warning = valid.clone();
         no_warning["warnings"] = json!([]);
         let no_warning = serde_json::from_value(no_warning).expect("existing empty warnings");
-        assert!(validate_preparing_response(&no_warning, false).is_err());
+        validate_preparing_response(&no_warning, false)
+            .expect("typed outcome needs no diagnostics");
         let mut complete_warning = valid.clone();
         complete_warning["warnings"][0]["total"] = json!(0);
         let complete_warning =

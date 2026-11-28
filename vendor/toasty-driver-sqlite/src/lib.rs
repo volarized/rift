@@ -146,7 +146,7 @@ impl Driver for Sqlite {
                 }
             }
             Sqlite::InMemory => {
-                // Nothing to do — each connect() creates a fresh in-memory database
+                // Nothing to do - each connect() creates a fresh in-memory database
             }
         }
 

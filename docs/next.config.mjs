@@ -8,7 +8,7 @@ const config = {
   reactStrictMode: true,
 
   // Served as static assets by an assets-only Cloudflare Worker at
-  // volar.sh/rift — no Node runtime, so no SSR, ISR, or dynamic routes.
+  // volar.sh/rift. The deployment has no Node runtime.
   output: "export",
   basePath,
   trailingSlash: true,

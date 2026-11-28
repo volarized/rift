@@ -14,7 +14,7 @@ const SECTION_LEVELS: usize = 1;
 /// Levels, past the section level, that indent the further lines of an item among several.
 const MARKER_LEVELS: usize = 1;
 /// Separates the facts of one line.
-const SEPARATOR: &str = " · ";
+const SEPARATOR: &str = " | ";
 /// Characters of a hash that stay when it is cut.
 const HASH_CUT: usize = 8;
 /// Relative difference under which a score token states a score.
@@ -26,7 +26,7 @@ const HISTORY_INCOMPLETE_LABEL: &str = "history (incomplete):";
 /// Line after the message of a cut commit.
 const MESSAGE_TRUNCATED_LINE: &str = "message truncated";
 /// Tail of the label of a cut path list.
-const PATHS_TRUNCATED_TAIL: &str = "+ paths · truncated";
+const PATHS_TRUNCATED_TAIL: &str = "+ paths | truncated";
 
 /// The tool whose answer the text states.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,7 +114,7 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
         let (last, preceding) = rest
             .split_last()
             .ok_or("$.view: the text has no captured view")?;
-        if last.title != format!("view {id} · expires {expiry}") || !last.entries.is_empty() {
+        if last.title != format!("view {id} | expires {expiry}") || !last.entries.is_empty() {
             return Err(
                 "$.view: the text must state the original captured view and expiry".to_owned(),
             );
@@ -819,21 +819,21 @@ mod tests {
 
     /// The text the layout writes for [`search_answer`].
     const SEARCH_TEXT: &str = "\
-3 results · page 2/3
+3 results | page 2/3
 \t[1] pub fn a()
-\t\tsrc/a.rs:10 · name, documentation · score 2
+\t\tsrc/a.rs:10 | name, documentation | score 2
 \t\trift://symbol/rust/src/a.rs/a
 
 \t\tpub fn a() {
 \t\t    1
 \t\t}
-\t[2] 9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
+\t[2] 9c1d4e7a | Alice <alice@example.com> | 2026-09-22 14:03 +02:00
 \t\tBound comparisons
 
 \t\tA body line
 \t\tmessage truncated
 
-\t\t2+ paths · truncated
+\t\t2+ paths | truncated
 \t\t\ta.rs
 \t\t\tb.rs
 \t\t\t...
@@ -845,7 +845,7 @@ mod tests {
 
 \t\t\t↳ probably calls, has type (providers: static)
 \t\t\t\tpub fn d()
-\t\t\t\tin src/d.rs:30 · name · score 1.5
+\t\t\t\tin src/d.rs:30 | name | score 1.5
 \t\t\t\tat rift://symbol/rust/src/d.rs/d
 
 \t\t\t\tpub fn d() {
@@ -906,10 +906,10 @@ mod tests {
 \trift://symbol/rust/src/a.rs/a
 
 \thistory (incomplete):
-\t\t2026-08-21 · 1f2080e5 · changed in · signature changed · Alice <alice@example.com>
+\t\t2026-08-21 | 1f2080e5 | changed in | signature changed | Alice <alice@example.com>
 \t\t\tReturn an error
-\t\t2026-08-17 · 2b000000 · introduced in · Alice <alice@example.com>
-\t\tco changes · rift://symbol/rust/src/b.rs/b · 2 commits
+\t\t2026-08-17 | 2b000000 | introduced in | Alice <alice@example.com>
+\t\tco changes | rift://symbol/rust/src/b.rs/b | 2 commits
 
 \tpub fn a() {}
 ";
@@ -976,7 +976,7 @@ mod tests {
             "pagination": {"page": 5, "pages": 2, "max_results": 10, "total": 20}
         });
         assert_eq!(
-            text_states(Tool::Search, "0 results · page 5/2\n", &answer),
+            text_states(Tool::Search, "0 results | page 5/2\n", &answer),
             Ok(())
         );
         let failure = refused(Tool::Search, "0 results\n", &answer)?;
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn a_title_without_its_page_is_refused() -> Result<(), String> {
-        search_refusal(" · page 2/3", "", "$.pagination")?;
+        search_refusal(" | page 2/3", "", "$.pagination")?;
         search_refusal("page 2/3", "page 1/3", "$.pagination")
     }
 
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn a_wrong_score_is_refused_and_a_distance_is_not_required() -> Result<(), String> {
-        search_refusal(" · score 2", " · score 3", "$.results[0].score")?;
+        search_refusal(" | score 2", " | score 3", "$.results[0].score")?;
         assert!(!SEARCH_TEXT.contains("distance"));
         assert_eq!(
             text_states(Tool::Search, SEARCH_TEXT, &search_answer()),
@@ -1195,11 +1195,11 @@ mod tests {
     /// The text the layout writes for [`walk_answer`].
     const WALK_TEXT: &str = "\
 6 results
-\tREADME.md:3 · content
+\tREADME.md:3 | content
 \tReadme line
 
 \tpub fn load_config()
-\tin src/load_config.rs:10 · name
+\tin src/load_config.rs:10 | name
 \tat rift://symbol/rust/src/load_config.rs/load_config
 
 \t\t↳ referenced (providers: static)
@@ -1209,7 +1209,7 @@ mod tests {
 
 \t\t\t↳ called (providers: static)
 \t\t\t\tby fn main()
-\t\t\t\tin src/main.rs:9 · name · score 0.5
+\t\t\t\tin src/main.rs:9 | name | score 0.5
 \t\t\t\tat rift://symbol/rust/src/main.rs/main
 
 \t\t↳ called (providers: static)
@@ -1280,7 +1280,7 @@ mod tests {
         results.remove(0);
         let text = edited(
             WALK_TEXT,
-            "6 results\n\tREADME.md:3 · content\n\tReadme line\n\n",
+            "6 results\n\tREADME.md:3 | content\n\tReadme line\n\n",
             "5 results\n",
         )?;
         assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()));
@@ -1384,8 +1384,8 @@ mod tests {
     fn a_root_that_is_a_hit_needs_in_and_at_and_a_root_that_is_no_hit_needs_at()
     -> Result<(), String> {
         walk_refusal(
-            "\tin src/load_config.rs:10 · name\n",
-            "\tsrc/load_config.rs:10 · name\n",
+            "\tin src/load_config.rs:10 | name\n",
+            "\tsrc/load_config.rs:10 | name\n",
             "$.results[1]",
         )?;
         walk_refusal(
@@ -1409,8 +1409,8 @@ mod tests {
             .insert(1, named_hit("lone", 7, &["name"], Vec::new()));
         let text = edited(
             WALK_TEXT,
-            "6 results\n\tREADME.md:3 · content\n\tReadme line\n",
-            "7 results\n\t[1] README.md:3 · content\n\t\tReadme line\n\t[2] fn lone()\n\t\tsrc/lone.rs:7 · name\n\t\trift://symbol/rust/src/lone.rs/lone\n",
+            "6 results\n\tREADME.md:3 | content\n\tReadme line\n",
+            "7 results\n\t[1] README.md:3 | content\n\t\tReadme line\n\t[2] fn lone()\n\t\tsrc/lone.rs:7 | name\n\t\trift://symbol/rust/src/lone.rs/lone\n",
         )?;
         assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()));
         let worded = edited(&text, "\t\tsrc/lone.rs:7", "\t\tin src/lone.rs:7")?;
@@ -1447,8 +1447,8 @@ mod tests {
             "$.results[5].traversal_path[0]",
         )?;
         walk_refusal(
-            "\tin src/load_config.rs:10 · name",
-            "\t\t\tsrc/load_config.rs:10 · name",
+            "\tin src/load_config.rs:10 | name",
+            "\t\t\tsrc/load_config.rs:10 | name",
             "$.results[1]",
         )
     }
@@ -1467,7 +1467,7 @@ mod tests {
             "$.results[5].traversal_path[0]",
         )?;
         walk_refusal(
-            "\n\t\t\t↳ called (providers: static)\n\t\t\t\tby fn main()\n\t\t\t\tin src/main.rs:9 · name · score 0.5\n\t\t\t\tat rift://symbol/rust/src/main.rs/main\n",
+            "\n\t\t\t↳ called (providers: static)\n\t\t\t\tby fn main()\n\t\t\t\tin src/main.rs:9 | name | score 0.5\n\t\t\t\tat rift://symbol/rust/src/main.rs/main\n",
             "",
             "$.results[3].traversal_path[1]",
         )
@@ -1533,8 +1533,8 @@ mod tests {
             .insert(1, named_hit("lone", 7, &["name"], Vec::new()));
         let text = edited(
             WALK_TEXT,
-            "6 results\n\tREADME.md:3 · content\n\tReadme line\n",
-            "7 results\n\t[1] README.md:3 · content\n\t\tReadme line\n\t[2] fn lone()\n\t\tsrc/lone.rs:7 · name\n\t\trift://symbol/rust/src/lone.rs/lone\n",
+            "6 results\n\tREADME.md:3 | content\n\tReadme line\n",
+            "7 results\n\t[1] README.md:3 | content\n\t\tReadme line\n\t[2] fn lone()\n\t\tsrc/lone.rs:7 | name\n\t\trift://symbol/rust/src/lone.rs/lone\n",
         )?;
         assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()));
         let unmarked = edited(&text, "\t[2] fn lone()", "\tfn lone()")?;
@@ -1582,18 +1582,18 @@ mod tests {
     #[test]
     fn a_symbol_leaves_out_the_edge_field_and_keeps_the_others() -> Result<(), String> {
         walk_refusal(
-            "in src/main.rs:9 · name",
-            "in src/main.rs:9 · edge, name",
+            "in src/main.rs:9 | name",
+            "in src/main.rs:9 | edge, name",
             "$.results[3]",
         )?;
         walk_refusal(
-            "in src/main.rs:9 · name · score 0.5",
-            "in src/main.rs:9 · score 0.5",
+            "in src/main.rs:9 | name | score 0.5",
+            "in src/main.rs:9 | score 0.5",
             "$.results[3].matched_by[1]",
         )?;
         walk_refusal(
-            "in src/main.rs:9 · name · score 0.5",
-            "in src/main.rs:9 · name",
+            "in src/main.rs:9 | name | score 0.5",
+            "in src/main.rs:9 | name",
             "$.results[3].score",
         )?;
         walk_refusal(
@@ -1669,7 +1669,7 @@ mod tests {
         file["traversal_path"] = json!([hop("outgoing", ("a", "b"), &["calls"], "resolution")]);
         let answer = page_of(&[file]);
         assert_eq!(
-            text_states(Tool::Search, "1 result\n\ta.rs:2 · content\n", &answer),
+            text_states(Tool::Search, "1 result\n\ta.rs:2 | content\n", &answer),
             Ok(())
         );
         let tree = "1 result\n\trift://symbol/rust/src/a.rs/a\n";
@@ -1833,7 +1833,7 @@ mod tests {
         let message = "$.results[1].hit.commit.message_truncated";
         let paths = "$.results[1].hit.commit.paths_truncated";
         search_refusal("\t\tmessage truncated\n", "", message)?;
-        search_refusal("2+ paths · truncated", "2 paths:", paths)?;
+        search_refusal("2+ paths | truncated", "2 paths:", paths)?;
         let clear = |pointer: &str| with(search_answer(), pointer, json!(false));
         let failure = refused(
             Tool::Search,
@@ -1852,7 +1852,7 @@ mod tests {
 
     #[test]
     fn a_history_edge_without_its_entry_is_refused() -> Result<(), String> {
-        let text = edited(SYMBOL_TEXT, " · signature changed", " · signature_changed")?;
+        let text = edited(SYMBOL_TEXT, " | signature changed", " | signature_changed")?;
         let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
         assert!(
             failure.contains("$.hits[0].history.edges[0].change"),
@@ -1863,14 +1863,14 @@ mod tests {
         assert!(failure.contains("edges[0].commit.revision"), "{failure}");
         let text = edited(
             SYMBOL_TEXT,
-            " · 2b000000 · introduced in",
-            " · 2b000000 · introduced",
+            " | 2b000000 | introduced in",
+            " | 2b000000 | introduced",
         )?;
         let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
         assert!(failure.contains("edges[1].edge"), "{failure}");
         let text = edited(
             SYMBOL_TEXT,
-            "\t\tco changes · rift://symbol/rust/src/b.rs/b · 2 commits\n",
+            "\t\tco changes | rift://symbol/rust/src/b.rs/b | 2 commits\n",
             "",
         )?;
         let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
@@ -1915,7 +1915,7 @@ mod tests {
         let text = "\
 2 results
 \t[1] Guide
-\t\tdocs/g.md:7 · documentation
+\t\tdocs/g.md:7 | documentation
 \t\trift://symbol/rust/a.rs/a
 \t\t# Guide
 \t[2] rift://source/p/a.rs

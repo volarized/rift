@@ -73,9 +73,8 @@ it:
 
 A resolver publishes a new catalog revision when files, manifests, lockfiles, version pins, or
 generated-source metadata change, and fact providers publish a new revision after they analyze
-one. A read whose `scope` reaches packages reports a resolver that read less than the workspace
-states as a `package_context_degraded`
-[`ReadWarning`](/docs/developer/protocol/reference#ReadWarning), naming the resolver by its
+one. For a read whose `scope` reaches packages, the server logs `package_context_degraded`
+when a resolver read less than the workspace states. The record names the resolver by its
 manager name, such as `cargo` or `npm`.
 
 ## Semantic facts
@@ -85,11 +84,10 @@ between symbols, resolved types, diagnostics, and history. A family no provider 
 refuses with `capability_unavailable`. Signatures and documentation travel on the symbol itself,
 covered under the `types` family.
 
-A search result carries the answer, `pagination`, and `warnings`. An exact symbol read carries
-an `outcome` and the `revision` it was read at, and carries declaration `pagination`. A condition the caller must
-weigh - an index that lags the tree - arrives as a typed entry in `warnings`. The
-[Reads](/docs/developer/protocol/mcp#reads) section in the MCP reference states the paging and warning
-contract.
+A search result carries the answer and `pagination` for paged results. A successful exact
+symbol lookup carries the `symbol` and the `revision` it was read at. A paged symbol answer
+also carries declaration `pagination`. See [Reads](/docs/developer/protocol/mcp#reads) for
+paging and the diagnostic records available through `rift server logs`.
 
 [`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin) keeps source location separate from
 source kind. A synthetic symbol carries neither a location nor a package. Dependency and
@@ -107,7 +105,7 @@ through LSP. Read answers merge rows with the same `from`, `kind`, `to`, and `oc
 Their `derivation` records resolution, syntax, or heuristic analysis. Optional `producer` names
 an external producer.
 
-Read edges omit analyses by default. `include: { providers: true }` attaches the sorted
+Read edges omit analyses by default. `include: ["providers"]` attaches the sorted
 `providers` set, for example `["engine", "lsp", "static"]`.
 SPARQL keeps `:provider` for explicit selections and filters over the stored facts.
 

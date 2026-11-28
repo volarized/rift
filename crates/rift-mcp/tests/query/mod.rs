@@ -6,7 +6,7 @@ use std::error::Error;
 use std::fmt::Write as _;
 
 use oxrdf::{Literal, NamedNode, NamedNodeRef};
-use rift_protocol::query::{QueryLanguage, QueryParams};
+use rift_protocol::query::{QueryLanguage, QueryParams, RetrievalInclude};
 use rift_protocol::read::SearchParams;
 use serde_json::Value;
 
@@ -43,7 +43,10 @@ pub(crate) fn projected_retrieval(
     if parameters.traversal.is_some() {
         return Err("edge tests must express the requested path in SPARQL".into());
     }
-    let fields = serde_json::to_value(parameters)?;
+    let mut fields = serde_json::to_value(parameters)?;
+    if let Some(include) = fields.get_mut("include") {
+        *include = serde_json::to_value(RetrievalInclude::from(parameters.include))?;
+    }
     let fields = fields
         .as_object()
         .ok_or("retrieval parameters must serialize as an object")?;

@@ -20,7 +20,7 @@ use text::TextError;
 pub(crate) use failure::ToolFailure;
 pub use policy::OutputPolicy;
 pub(crate) use render::{QueryDisplay, QueryOutput};
-pub(crate) use warnings::log_warnings;
+pub(crate) use warnings::{log_warnings, record_warnings};
 
 /// A typed tool answer that serves as compact text and as structured content.
 ///
@@ -31,22 +31,24 @@ pub(crate) struct Json<T>(pub(crate) T);
 impl<T: Render + Serialize> IntoCallToolResult for Json<T> {
     fn into_call_tool_result(mut self) -> Result<CallToolResponse, ErrorData> {
         self.0.log_warnings();
-        self.retrieval_result()
+        self.encode()
     }
 }
 
 impl<T: Render + Serialize> Json<T> {
-    /// Encodes an internal answer whose warnings still inform retrieval coverage.
-    pub(crate) fn retrieval_result(self) -> Result<CallToolResponse, ErrorData> {
-        let text = match text_of(&self.0) {
-            Ok(text) => text,
-            Err(error) => return refused(AnswerFault::Text(error)),
+    fn encode(self) -> Result<CallToolResponse, ErrorData> {
+        let content = if self.0.has_text() {
+            match text_of(&self.0) {
+                Ok(text) => vec![ContentBlock::text(text)],
+                Err(error) => return refused(AnswerFault::Text(error)),
+            }
+        } else {
+            Vec::new()
         };
         let structured = match serde_json::to_value(&self.0) {
             Ok(structured) => structured,
             Err(error) => return refused(AnswerFault::Structured(error)),
         };
-        let content = vec![ContentBlock::text(text)];
         let mut result = if self.0.is_error() {
             CallToolResult::error(content)
         } else {

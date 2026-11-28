@@ -18,7 +18,7 @@ pub enum RdfTerm {
     BlankNode {
         /// The identity retained across every page of this answer.
         value: String,
-        /// Sorted analyses for an edge or call step, present when `include.providers` is `true`.
+        /// Sorted analyses for an edge or call step, present when `include` selects `providers`.
         #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
         providers: std::collections::BTreeSet<crate::read::EdgeProvider>,
     },

@@ -25,8 +25,8 @@ use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, READ_RESULTS_MAX_DEFAULT};
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, failed_call, served_root, served_root_unsettled, served_workspace, tool_failure,
-    tool_request,
+    ReadDiagnostics, TestResult, failed_call, served_root, served_root_unsettled, served_workspace,
+    tool_failure, tool_request,
 };
 
 /// Polls of one served answer a test waits on before it gives up: two seconds, at
@@ -94,12 +94,10 @@ async fn search_page(
         .ok_or_else(|| "search answers with structured content".into())
 }
 
-/// The `detail` of the first warning on `answer` whose code is `code`, when one is.
-fn warning_detail<'a>(answer: &'a Value, code: &str) -> Option<&'a str> {
-    answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
+/// The `detail` of the first logged warning whose code is `code`, when one is.
+fn warning_detail<'a>(warnings: &'a [Value], code: &str) -> Option<&'a str> {
+    warnings
+        .iter()
         .find(|warning| warning["code"] == code)
         .and_then(|warning| warning["detail"].as_str())
 }
@@ -109,11 +107,12 @@ async fn search_until(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     query: &str,
     what: &str,
-    accept: impl Fn(&Value) -> bool,
+    accept: impl Fn(&Value, &[Value]) -> bool,
 ) -> TestResult<Value> {
+    let mut diagnostics = ReadDiagnostics::capture()?;
     let mut answer = search_page(client, query).await?;
     for _attempt in 0..ANSWER_ATTEMPTS_MAX {
-        if accept(&answer) {
+        if accept(&answer, &diagnostics.take()?) {
             return Ok(answer);
         }
         tokio::time::sleep(ANSWER_POLL).await;
@@ -139,8 +138,8 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
         &client,
         "beacon",
         "the refused commit never reached search",
-        |answer| {
-            warning_detail(answer, "lexical_ranking_unavailable").is_some_and(|detail| {
+        |_, warnings| {
+            warning_detail(warnings, "lexical_ranking_unavailable").is_some_and(|detail| {
                 detail.ends_with(
                     "lexical index received more units than its accepted limit of 1000: field units_max, observed 1109; resend the same request after a short delay",
                 )
@@ -161,7 +160,7 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
         &client,
         "beacon",
         "the lexical ranking never recovered after removing excess input",
-        |answer| warning_detail(answer, "lexical_ranking_unavailable").is_none(),
+        |_, warnings| warning_detail(warnings, "lexical_ranking_unavailable").is_none(),
     )
     .await?;
     assert!(hit_paths(&recovered).contains(&"lib.rs"), "{recovered:#}");
@@ -225,7 +224,7 @@ async fn a_raised_providers_syntax_bound_indexes_the_file_the_default_leaves_out
         &client,
         "deep",
         "the deep file never answered search",
-        |answer| hit_paths(answer).contains(&"src/deep.rs"),
+        |answer, _| hit_paths(answer).contains(&"src/deep.rs"),
     )
     .await?;
     assert!(
@@ -238,14 +237,12 @@ async fn a_raised_providers_syntax_bound_indexes_the_file_the_default_leaves_out
     Ok(())
 }
 
-/// Whether one search answer names `path` in a `source_unavailable` warning.
-fn names_unavailable(answer: &Value, path: &str) -> bool {
+/// Whether the request logged a `source_unavailable` warning naming `path`.
+fn names_unavailable(warnings: &[Value], path: &str) -> bool {
     let unit = format!("rift://source/project/{path}");
-    answer["warnings"].as_array().is_some_and(|warnings| {
-        warnings
-            .iter()
-            .any(|warning| warning["code"] == "source_unavailable" && warning["unit"] == unit)
-    })
+    warnings
+        .iter()
+        .any(|warning| warning["code"] == "source_unavailable" && warning["unit"] == unit)
 }
 
 /// `search` with `paths.force_include` naming a binary file the walk skipped
@@ -266,10 +263,11 @@ async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_w
     )
     .await?;
 
+    let mut diagnostics = ReadDiagnostics::capture()?;
     let plain = search_page(&client, "beacon").await?;
     assert!(hit_paths(&plain).contains(&"src/lib.rs"), "{plain:#}");
     assert!(
-        !names_unavailable(&plain, "src/wide.rs"),
+        !names_unavailable(&diagnostics.take()?, "src/wide.rs"),
         "the walk never reaches the ignored file: {plain:#}"
     );
 
@@ -284,7 +282,7 @@ async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_w
         .ok_or("search answers with structured content")?;
     assert!(hit_paths(&forced).contains(&"src/lib.rs"), "{forced:#}");
     assert!(
-        names_unavailable(&forced, "src/wide.rs"),
+        names_unavailable(&diagnostics.take()?, "src/wide.rs"),
         "the answer names the refused file: {forced:#}"
     );
 
@@ -378,9 +376,11 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
     fs::write(directory.path().join("rift.toml"), lowered)?;
     // The rebuild under the lowered bound fails, and the read answers from the last
     // snapshot with the failure rather than waiting for a rebuild that cannot land.
+    let mut diagnostics = ReadDiagnostics::capture()?;
     let stale = search_page(&client, "beacon").await?;
     assert!(hit_paths(&stale).contains(&"lib.rs"), "{stale:#}");
-    let detail = warning_detail(&stale, "stale_index")
+    let warnings = diagnostics.take()?;
+    let detail = warning_detail(&warnings, "stale_index")
         .ok_or_else(|| format!("the answer carries stale_index: {stale:#}"))?;
     let failed_path = directory.path().canonicalize()?.join("bulk-15.txt");
     assert!(
@@ -401,8 +401,9 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
         &client,
         "beacon",
         "the restored bound must serve the workspace again without a warning",
-        |answer| {
-            hit_paths(answer).contains(&"lib.rs") && warning_detail(answer, "stale_index").is_none()
+        |answer, warnings| {
+            hit_paths(answer).contains(&"lib.rs")
+                && warning_detail(warnings, "stale_index").is_none()
         },
     )
     .await?;

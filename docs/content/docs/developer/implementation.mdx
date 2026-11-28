@@ -8,9 +8,10 @@ This page goes into how Rift is built. It's developer-oriented - if you just wan
 check the [main documentation](/docs).
 
 <FlatDiagram
+  variant="architecture"
   alt="rift mcp forwards requests over Streamable HTTP to the Axum server on Tokio. Providers build an in-memory index and persist search data through Toasty over SQLite into the index and vectors databases. The server writes its logs into the metrics database through rusqlite."
   chart={`
-    flowchart LR
+    flowchart TB
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
       mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "acceptance" --> server
@@ -135,8 +136,8 @@ Startup runs one cycle:
 2. Parse `rift.toml` and accept the workspace. An invalid file keeps the server running but
    refuses every request until fixed.
 3. Start the native filesystem watcher.
-4. Publish an empty index carrying `local_index_preparing`, then start background discovery
-   and preparation on the bounded worker pool.
+4. Publish an empty index, then start background discovery and preparation on the bounded worker
+   pool.
 5. Bind the first free loopback port of the accepted
    [`[server]` selection](/docs/developer/configuration#server) - the pinned `port` or the configured
    `port_range` - mint the bearer token, and write both into `.rift/server.json`.
@@ -347,7 +348,8 @@ waiting for the watcher to report the `.gitignore` write.
 The watcher can report that `.gitignore` write after the read's capture already found it. The
 report asks for the whole workspace, so it supersedes the rebuild the read asked for, and the
 read captures again: a capture that matches its previous one waits for the next rebuild, and only
-a capture that differs, a tree still moving, answers from the published index with `stale_index`.
+a capture that differs answers from the published index. The server logs `stale_index` for that
+read.
 
 A rebuild that is still running asks the same question publication asks, between files and at
 each phase boundary: whether a later observation asks for the whole workspace, or names a path
@@ -447,9 +449,10 @@ declaration inventory are built over every prepared file of a publication, so a 
 each larger part of the files would build them again for the files already published. Each
 publication owns its map, source catalog, configuration, and preparation counts.
 
-`search` and `get_symbol` use the declarations already prepared. Their
-[`local_index_preparing`](/docs/developer/protocol/mcp#reads) warning remains until their selected
-local scope is complete, including an exact symbol read that already found a declaration. A `facets` read refuses while source preparation is incomplete.
+`search` and `get_symbol` use the declarations already prepared. The server logs
+[`local_index_preparing`](/docs/developer/protocol/mcp#reads) until the selected local scope is
+complete, including for an exact read that already found a declaration. A `facets` read refuses
+while source preparation is incomplete.
 
 Static calls, references, and containment resolve across files. A publication of a part of the
 sources leaves that pass out: it holds no static edge and reports unavailable static call coverage
@@ -471,9 +474,9 @@ syntax facts. Its key includes the full content digest, language provider, and p
 Path-dependent declarations remain with their workspace placement. Dropping the last publication
 that owns content releases it, while live publications remain readable.
 
-A read that meets a recorded rebuild failure at or past the published counter waits for nothing:
-it answers from the published index and carries `stale_index`, whose `detail` names the counter
-the failed rebuild answered for, the counter the tree is at, and the failure's causes. The next observation retries the rebuild.
+A read that meets a recorded rebuild failure at or past the published counter answers from the
+published index. The server logs `stale_index` with the failed rebuild's counter, the current tree
+counter, and the causes. The next observation retries the rebuild.
 
 <VersionBadge version="v0.0.34" />
 
@@ -612,9 +615,9 @@ snapshots. In the index and vectors databases, `search.busy_timeout` bounds a lo
 another process, and a wait for a pooled connection when every one of the `search.pool_slots` is
 checked out.
 
-Past that wait, a `search` ranks without the store: it answers from identifier matching and warns
-`lexical_ranking_unavailable`, with a `detail` naming the slot wait. A regex search verifies every
-file its `paths` select in place of the rows the trigram index would select, and warns nothing.
+Past that wait, a `search` ranks by identifier matching. The server logs
+`lexical_ranking_unavailable` with the slot wait in `detail`. A regex search verifies every file
+its `paths` select in place of the rows the trigram index would select.
 Every other checkout refuses, a write among them, with `index.database_failed`, which names the
 database and its path, as a failed open does.
 
@@ -673,9 +676,8 @@ The index database's tables:
   revision it was built under, and a digest of what besides the files' bytes derived the rows,
   which a later write compares before it keeps any row. One read transaction reads that stamp and runs the query, so a commit landing
   between the two cannot slip another tree's rows into an answer. A store holding another tree
-  returns no rows at all: either the lane has not committed the captured publication yet, and
-  `search` warns naming that revision, or the publication has since been superseded, and the
-  request recaptures rather than ranking rows it cannot place. A store holding another corpus
+  returns no rows. The server logs the captured revision when its commit is pending. If a newer
+  publication superseded it, the request captures the tree again. A store holding another corpus
   revision returns no rows either: its columns, derivation, tokenizer, or weights are not this
   build's. A stamp that names no tree answers the same way as an empty store.
 - `lexical_documents_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over the
@@ -896,7 +898,7 @@ at `warn` when the count is not zero. A second `TracingRuntimeBuilder::install` 
 returns `InstallError` and leaves the installation in place untouched.
 
 Stderr, `rift server logs`, and a failure window print a record
-through one renderer, `LogLines` in `rift-tracing`. A message or a field value holding ` · ` or
+through one renderer, `LogLines` in `rift-tracing`. A message or a field value holding ` | ` or
 `: ` prints as a JSON string. A line holds the time in UTC with milliseconds, the level, the
 function, three spaces, the context, two spaces, the nested operation, and the message:
 
@@ -1177,52 +1179,29 @@ store that published it, and deciding which identities win does not.
 
 ## Error registry
 
-`crates/rift-error/errors.toml` defines concrete Rift failures and evidence fields. `rift-error-codegen` validates those
-definitions and writes the `errors` module of `rift-error`: `crates/rift-error/src/errors.rs` holds the registry
-constants and one `pub mod` line per namespace, and `crates/rift-error/src/errors/<namespace>.rs` holds one
-`__rift_error_definition!` declaration per error in that namespace, carrying only its name, slug, message, action, and
-fields. A namespace is the slug segment after `rift.`, such as `analysis` or `cli`. Builder types, bounds, conversions, typestate, and setter
-names are derived by the macros, not written into the file. The `committed_registry_files_stay_within_generated_line_bound`
-test in `rift-error-codegen` holds each generated file under a fixed line bound.
+`crates/rift-error/src/errors/<namespace>.rs` declares each error's name, message, action, and
+evidence fields. The namespace and name form a slug such as `rift.analysis.context7_malformed`.
+The declarations supply the error builders and the [error registry](/docs/developer/errors).
 
-```rust
-__rift_error_definition!(
-    context7_malformed,
-    slug = "rift.analysis.context7_malformed",
-    message = "context7.json has an invalid JSON shape",
-    action = "correct context7.json shape and retry",
-    fields = {
-        file: required(path),
-        key: optional(string),
-        source: optional(source),
-    },
-);
-```
-
-Each field reads `name: presence(kind, flags...)`. Presence is `required` or `optional`. The kind is the field's
-`type` in `errors.toml` (`string`, `bool`, `integer`, `unsigned`, `pid`, `port`, `path`, `duration`), or its role
-(`source`, `cause`). The flags are `hidden` for `display = false` and `sensitive` for `sensitive = true`.
+Each field reads `name: presence(kind, flags...)`. Presence is `required` or `optional`. The kind
+sets the evidence type or the field's role as a `source` or `cause`. The flags are `hidden` and
+`sensitive`.
 
 The macros in `crates/rift-error/src/definition` expand each declaration into the builder. The kind table maps each
 kind to the Rust bound a setter accepts and the `ErrorValue` conversion it applies. Each required field adds one builder
 type parameter that starts at `Unset` and becomes `Set` when its setter runs. `.error()`, `.fail()`, and the
 `IntoRiftError` implementation exist only once every parameter is `Set`. Each optional field adds `.maybe_<field>()`,
 which takes `Option<T>` and leaves the builder type unchanged. The `maybe_<field>` and `<Field>State` names come from
-`rift-error-macros`, which depends on `proc_macro` alone. A crate that reaches `rift-error` by path, such as the
-generated-code compile test in `rift-error-codegen`, therefore builds it with `--offline` and no downloaded crates.
+`rift-error-macros`, which depends on `proc_macro` alone.
 
 A `source` field retains an underlying Rust error and exposes it through `std::error::Error::source`.
 A `cause` field retains another `RiftError` in that chain. The runtime also converts owned and
 borrowed `RiftError` values, including shared `Arc` values, without dropping their source chains.
 Sensitive evidence is redacted in rendered output.
 
-The registry does not contain transport codes. The MCP adapter maps each slug to its wire code and
-retry directive, then supplies the request phase with `.tool_error(phase)`. Calling `.fail()` on
-that representation returns its JSON-RPC error. `cargo xtask errors generate` updates generated
-Rust. The generator writes the declarations as text in the layout above, which `rustfmt` leaves
-unchanged, and parses the result before returning it. `cargo xtask errors generate` also removes any file under `crates/rift-error/src/errors/` that the registry no longer
-generates. `cargo xtask errors check` compares generated output without writing it and fails on a differing, missing,
-or unexpected file. CI runs that check through `just generate-check`.
+The MCP adapter maps each slug to its wire code and retry directive, then supplies the request
+phase with `.tool_error(phase)`. Calling `.fail()` on that representation returns its JSON-RPC
+error. The docs build exports the registry from `rift-error` as `errors.json`.
 
 ## Vector search
 
@@ -1611,10 +1590,9 @@ bytes under the same analyzer revision produce byte-identical output, and an ada
 added, replaced, and removed records by identity and digest alone. A publication addresses source
 by package-relative path and source unit, so no machine's directory layout reaches a consumer.
 
-The analyzer manifest is generated beside the served schemas and committed at
-`crates/rift-analysis/src/analyzer-manifest.json`, so a change to any of those files
-that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
-exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
+The `rift-analysis` build computes `analyzer_revision` from the same inputs as the manifest. The
+publication's own schema is exported to
+[`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
 `documentation.coverage` always states `fields_omitted`: the headings, languages, links, and
 reference spellings left out of parsed documentation sources, as `limit_exceeded` and

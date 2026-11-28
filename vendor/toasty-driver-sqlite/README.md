@@ -31,7 +31,7 @@
 [discord-url]: https://discord.gg/tokio
 
 Toasty supports SQL databases (SQLite/Turso, PostgreSQL, MySQL) and DynamoDB.
-It does not hide database capabilities — it exposes features based on the
+It does not hide database capabilities - it exposes features based on the
 target database.
 
 ## Using Toasty

@@ -2397,19 +2397,18 @@ impl RiftMcp {
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Submit))
     }
 
-    /// Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
-    /// revision it read, and `page` selects its declarations at that revision.
-    /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
-    /// An unavailable selection returns its typed cause. A found symbol carries its facts and
-    /// each declaration's location; `facets` with `symbol` reads a declaration's source. Use
-    /// `search` for discovery.
+    /// Reads one logical symbol by its canonical `id` and reports the selected `revision`.
+    /// `page` selects declarations at that revision. Documentation and declaration source are
+    /// selected by default. `include` adds sections and `exclude` removes them. A complete miss
+    /// returns no content. An unavailable selection returns its typed cause. Use `search` to
+    /// discover identities and `facets` to read syntax structure.
     #[tool]
     async fn get_symbol(
         &self,
-        Parameters(params): Parameters<rift_protocol::symbol_read::GetSymbolParams>,
+        Parameters(params): Parameters<rift_protocol::mcp_symbol::GetSymbolParams>,
         extensions: rmcp::model::Extensions,
-    ) -> Result<Json<rift_protocol::symbol_read::GetSymbolResult>, ToolFailure> {
-        let result = self.exact_symbol(params).await;
+    ) -> Result<Json<rift_protocol::mcp_symbol::GetSymbolResult>, ToolFailure> {
+        let result = Box::pin(self.read_mcp_symbol(params)).await;
         if let Err(ToolFailure::Registered(failure, _)) = &result
             && let Some(operation) = extensions.get::<rift_tracing::Span>()
         {
@@ -2421,13 +2420,10 @@ impl RiftMcp {
     /// Performs search across the index using a query language. `language` names the query
     /// language and defaults to `sparql`.
     ///
-    /// A query over the captured inventory answers from partly covered facts, and `warnings`
-    /// name the files, languages, or engines left out. A query whose answer needs every fact - an empty
-    /// result, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with
-    /// `insufficient_coverage` instead. A bound never makes an answer unavailable: a file a bound
-    /// left out of the index is outside the indexed set, and a producer or acquisition bound ends
-    /// the answer with the rows it reached; the server logs the bound, and `warnings` carry
-    /// nothing for it.
+    /// A query over the captured inventory answers from partly covered facts. A query whose
+    /// answer needs every fact answers `unavailable` with `insufficient_coverage` when the
+    /// selected coverage cannot establish that answer. A bound ends the answer with the rows
+    /// it reached. The server records read warnings and bounds in its logs.
     #[tool(name = "search")]
     async fn search_query(
         &self,
@@ -2490,18 +2486,21 @@ impl RiftMcp {
                         .into_call_tool_result();
                 }
             };
+        let current = params.view.is_none() && params.revision.is_none();
         match self.search(Parameters(params)).await {
             Ok(answer) => {
-                use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
-                let warnings = match &answer.0 {
-                    SearchReadResult::Results(page) => &page.warnings,
-                    SearchReadResult::Unavailable(SearchUnavailable::Unavailable {
-                        warnings,
-                        ..
-                    }) => warnings,
+                use rift_protocol::search_read::SearchReadResult;
+                let coverage = match &answer.0 {
+                    SearchReadResult::Results(page) => {
+                        candidates::retrieval_coverage_for(page.warnings.iter(), current)
+                    }
+                    SearchReadResult::Unavailable(_) => None,
                 };
-                crate::output::log_warnings(warnings);
-                answer.retrieval_result()
+                let mut response = answer.into_call_tool_result()?;
+                if let CallToolResponse::Complete(result) = &mut response {
+                    candidates::set_retrieval_coverage(result, coverage);
+                }
+                Ok(response)
             }
             Err(failure) => failure.into_call_tool_result(),
         }
@@ -5376,11 +5375,26 @@ done
         };
         let text = &content.as_text().ok_or("facets read refusal is text")?.text;
         assert!(
-            text.contains("temporarily_unavailable · retry same_request"),
+            text.contains("temporarily_unavailable | retry same_request"),
             "{text}"
         );
         assert!(text.contains("rift.server.read_unavailable"), "{text}");
         assert!(!text.contains("local_index_preparing"), "{text}");
+        Ok(())
+    }
+
+    fn assert_peer_preparing(answer: &CallToolResult) -> TestResult {
+        let structured = answer
+            .structured_content
+            .as_ref()
+            .ok_or("structured preparation answer")?;
+        assert!(structured.get("warnings").is_none());
+        let coverage = answer
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get(super::candidates::RETRIEVAL_COVERAGE_KEY))
+            .ok_or("typed preparation metadata")?;
+        assert_eq!(coverage, "index_preparing");
         Ok(())
     }
 
@@ -5389,21 +5403,7 @@ done
         request: &CallToolRequestParams,
     ) -> TestResult {
         let answer = client.call_tool(request.clone()).await?;
-        let empty: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured symbol answer")?,
-        )?;
-        assert!(empty.results.is_empty());
-        assert!(empty.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: None,
-                ready_in: None,
-                ..
-            }
-        )));
+        assert_peer_preparing(&answer)?;
         for uri in ["rift://map", "rift://workspace"] {
             let value = preparation_resource(client, uri).await?;
             assert!(value.get("warnings").is_none());
@@ -5447,20 +5447,7 @@ done
         assert_preparing_facets_refusal(&facets)?;
 
         let answer = client.call_tool(request.clone()).await?;
-        let partial: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured partial symbol answer")?,
-        )?;
-        assert!(partial.results.is_empty());
-        assert!(partial.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: Some(2),
-                ..
-            }
-        )));
+        assert_peer_preparing(&answer)?;
 
         crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
         let answer = client.call_tool(request).await?;
@@ -5599,6 +5586,7 @@ done
                 "pattern": "beacon", "target": "symbol", "scope": "local", "include": {"source": true}
             }))?);
         let answer = client.call_tool(request.clone()).await?;
+        assert_peer_preparing(&answer)?;
         let partial: SearchResult = serde_json::from_value(
             answer
                 .structured_content
@@ -5613,23 +5601,7 @@ done
             partial.results[0].source.as_deref(),
             Some("pub fn beacon() {}")
         );
-        assert_eq!(
-            partial
-                .warnings
-                .iter()
-                .filter(|warning| matches!(
-                    warning,
-                    ReadWarning::LocalIndexPreparing {
-                        prepared: 2,
-                        total: Some(3),
-                        ready_in: None,
-                        ..
-                    }
-                ))
-                .count(),
-            1,
-            "an existing name hit does not finish the selected local scope"
-        );
+        assert!(partial.warnings.is_empty());
         assembled.context.validation.observe_whole_workspace()?;
         let pending = assembled.context.validation.take_pending();
         assert_eq!(
@@ -7180,7 +7152,7 @@ done
         let structured = symbol
             .structured_content
             .ok_or("get_symbol must return structured content")?;
-        assert_eq!(structured["outcome"], "found");
+        assert!(structured.get("outcome").is_none());
         assert_eq!(structured["symbol"]["name"], "beacon");
         assert_eq!(structured["symbol"]["id"], serde_json::to_value(&id)?);
         let declarations = structured["declarations"]
@@ -7188,6 +7160,7 @@ done
             .ok_or("declaration array")?;
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["path"], "lib.rs");
+        assert_eq!(declarations[0]["source"]["text"], "pub fn beacon() {}");
         assert_eq!(
             declarations[0]["range"],
             json!({"start": 0, "end": "pub fn beacon() {}".len()})
@@ -7540,7 +7513,7 @@ done
         assert!(title == "1 error" || title.ends_with(" errors"), "{text}");
         assert_eq!(
             lines.next(),
-            Some(format!("\t{code} · retry never").as_str()),
+            Some(format!("\t{code} | retry never").as_str()),
             "{text}"
         );
         assert!(!text.contains("phase"), "{text}");
@@ -7605,7 +7578,7 @@ done
         let text = assert_error_result(&result, "invalid_request")?;
         assert_eq!(
             text,
-            "1 error\n\tinvalid_request · retry never\n\
+            "1 error\n\tinvalid_request | retry never\n\
              \t\tthe request does not match the documented form: field max_results, \
              violation expected 1..=10000, received 0; \
              correct the reported field and resend the request\n\
@@ -8637,7 +8610,7 @@ done
         let published = current_publication(server).await;
         let id = captured_traversal_seed(&published.reads, "beacon")?;
         let params = serde_json::from_value(json!({
-            "id": id, "include": {"history": true}
+            "id": id, "include": ["history"]
         }))?;
         let answer = tokio::time::timeout(
             UNWAITED_READ_MAX,
@@ -8646,16 +8619,16 @@ done
         .await
         .map_err(|_| "a history read waits on no fill")??
         .0;
-        let rift_protocol::symbol_read::GetSymbolResult::Found {
+        let rift_protocol::mcp_symbol::GetSymbolResult::Found(found) = answer else {
+            return Err(format!("canonical beacon must be found: {answer:?}").into());
+        };
+        let rift_protocol::mcp_symbol::FoundSymbol {
             symbol,
             declarations,
             history,
             warnings,
             ..
-        } = answer
-        else {
-            return Err(format!("canonical beacon must be found: {answer:?}").into());
-        };
+        } = *found;
         assert_eq!(
             symbol
                 .id
@@ -8675,11 +8648,18 @@ done
             .next()
             .ok_or("beacon declaration")?;
         assert_eq!(
-            declaration.path.as_ref().map(|path| path.0.as_str()),
+            declaration
+                .binding
+                .path
+                .as_ref()
+                .map(|path| path.0.as_str()),
             Some("lib.rs")
         );
         assert_eq!(
-            (declaration.range.start, declaration.range.end),
+            (
+                declaration.binding.range.start,
+                declaration.binding.range.end
+            ),
             (0, "pub fn beacon() {}".len() as u64)
         );
         Ok(history.ok_or("the symbol carries its history")?)
@@ -11213,18 +11193,17 @@ done
             .get_symbol(Parameters(request), rmcp::model::Extensions::default())
             .await
             .map_err(rmcp::ErrorData::from)?;
-        let rift_protocol::symbol_read::GetSymbolResult::Found {
-            symbol,
-            declarations,
-            ..
-        } = symbol
-        else {
+        let rift_protocol::mcp_symbol::GetSymbolResult::Found(found) = symbol else {
             return Err("the parsed BLOB declaration remains retrievable".into());
         };
-        assert_eq!(symbol.name, "BLOB");
-        assert_eq!(declarations.len(), 1);
+        assert_eq!(found.symbol.name, "BLOB");
+        assert_eq!(found.declarations.len(), 1);
         assert_eq!(
-            declarations[0].path.as_ref().map(|path| path.0.as_str()),
+            found.declarations[0]
+                .binding
+                .path
+                .as_ref()
+                .map(|path| path.0.as_str()),
             Some("src/blob.rs")
         );
         let facets = server
@@ -12579,10 +12558,10 @@ done
             let structured = answer
                 .structured_content
                 .ok_or("search must return structured content")?;
-            let results = structured["results"]
+            if structured["results"]
                 .as_array()
-                .ok_or("results must be an array")?;
-            if results.iter().any(|hit| hit["path"] == json!(path)) {
+                .is_some_and(|results| results.iter().any(|hit| hit["path"] == json!(path)))
+            {
                 return Ok(structured);
             }
             last_answer = structured;

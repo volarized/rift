@@ -270,13 +270,13 @@ impl SpecialFormType {
 
     /// Given the special form we resolved (`self`) and the module the user actually
     /// imported the symbol from (`import_module`), return the variant that matches the
-    /// import path — or `self` if there's no better match.
+    /// import path - or `self` if there's no better match.
     ///
     /// This exists because typeshed defines some special forms as re-exports from other modules.
     /// Following the alias chain to the definition site would otherwise erase distinctions such as
     /// `typing.Callable` versus `collections.abc.Callable`.
     ///
-    /// Called at module-attribute resolution — the one boundary where the import-path
+    /// Called at module-attribute resolution - the one boundary where the import-path
     /// module is still observable.
     pub(super) fn rewrap_for_import_module(self, name: &str, import_module: KnownModule) -> Self {
         match (self, name, import_module) {

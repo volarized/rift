@@ -23,6 +23,25 @@ impl GlobalClient {
         &self,
         request: &GetSymbolParams,
     ) -> Result<GetSymbolResult, RiftError> {
+        self.read_symbol(request, true).await
+    }
+
+    /// Reads the symbol with its requested documentation when the API advertises it.
+    ///
+    /// # Errors
+    /// Returns the same request, response, and transport failures as [`Self::get_symbol`].
+    pub async fn get_symbol_with_available_documentation(
+        &self,
+        request: &GetSymbolParams,
+    ) -> Result<GetSymbolResult, RiftError> {
+        self.read_symbol(request, false).await
+    }
+
+    async fn read_symbol(
+        &self,
+        request: &GetSymbolParams,
+        require_documentation: bool,
+    ) -> Result<GetSymbolResult, RiftError> {
         rift_tracing::traced!(component = "global", operation = "get_symbol", async {
             if !self.inner.enabled {
                 return Err(failure::configuration_invalid(
@@ -32,9 +51,9 @@ impl GlobalClient {
             }
             validate_request(request)?;
             let capabilities = self.get_capabilities().await?;
-            if request.include.documentation
-                && !supports_feature(&capabilities, SYMBOL_DOCUMENTATION_FEATURE)
-            {
+            let documentation_unavailable = request.include.documentation
+                && !supports_feature(&capabilities, SYMBOL_DOCUMENTATION_FEATURE);
+            if documentation_unavailable && require_documentation {
                 return Err(failure::configuration_invalid(
                     "feature",
                     &format!(
@@ -42,6 +61,20 @@ impl GlobalClient {
                     ),
                 ));
             }
+            let mut available;
+            let request = if documentation_unavailable {
+                rift_tracing::warn!(
+                    component = "global",
+                    operation = "read.symbol.documentation",
+                    feature = SYMBOL_DOCUMENTATION_FEATURE,
+                    "the global API does not advertise symbol documentation"
+                );
+                available = request.clone();
+                available.include.documentation = false;
+                &available
+            } else {
+                request
+            };
             let body = serialize_body(request, self.inner.config.max_request)?;
             validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
             let raw = match self

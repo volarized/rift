@@ -1,8 +1,7 @@
 //! Expansion of one compact registered-error declaration.
 //!
-//! The generator writes only what an error is: its name, slug, message, action, and
-//! field declarations. These macros own how a registered error is implemented: the
-//! builder typestate, field modules, setters, and completion methods.
+//! The registry declares each error's name, message, action, and fields. These macros
+//! expand the builder typestate, field modules, setters, and completion methods.
 //!
 //! Responsibilities split by module:
 //!
@@ -122,21 +121,21 @@ mod state;
 macro_rules! __rift_error_definition {
     (
         $name:ident,
-        slug = $slug:literal,
+        slug = $slug:expr,
         message = $message:literal,
         action = $action:literal,
         fields = { $($field:ident : $presence:ident ( $($spec:tt)* )),* $(,)? }
         $(,)?
     ) => {
         $crate::__rift_error_state! {
-            @partition [$name $slug $message $action]
+            @partition [$name ($slug) $message $action]
             required []
             all [$($field $presence ($($spec)*))*]
             rest [$($field $presence ($($spec)*))*]
         }
     };
     (
-        @emit $name:ident $slug:literal $message:literal $action:literal
+        @emit $name:ident ($slug:expr) $message:literal $action:literal
         count [$($count:tt)*]
         states [$($state:ident => $complete:ty,)*]
         items { $($items:tt)* }
@@ -203,7 +202,7 @@ macro_rules! __rift_error_definition {
         pub fn $name() -> $name::Builder {
             $name::Builder {
                 core: $crate::BuilderCore::new(
-                    $crate::ErrorSlug::new($slug),
+                    $name::SLUG,
                     $message,
                     $action,
                     <[()]>::len(&[$($count),*]),

@@ -9,7 +9,7 @@
 //!   each overload separately; in others we need to consider all of the overloads (and any
 //!   implementation) as a single collective entity.
 //!
-//! - Certain “known” functions need special treatment — for instance, inferring a special return
+//! - Certain “known” functions need special treatment - for instance, inferring a special return
 //!   type, or raising custom diagnostics.
 //!
 //! - TODO: Some functions don't correspond to a function definition in the AST, and are instead
@@ -22,7 +22,7 @@
 //! to it. [`FunctionType`] is the outermost type, which is what [`Type::FunctionLiteral`] wraps.
 //! It contains the list of type mappings to apply. It wraps a [`FunctionLiteral`], which collects
 //! together all of the overloads (and implementation) of an overloaded function. An
-//! [`OverloadLiteral`] represents an individual function definition in the AST — that is, each
+//! [`OverloadLiteral`] represents an individual function definition in the AST - that is, each
 //! overload (and implementation) of an overloaded function, or the single definition of a
 //! non-overloaded function.
 //!

@@ -17,7 +17,7 @@ const PLUGIN_DIR_DEFAULT: &str = "plugins/claude";
 const PLUGIN_MANIFEST_PATH: &str = ".claude-plugin/plugin.json";
 const PLUGIN_SKILL_PATH: &str = "skills/rift/SKILL.md";
 const PLUGIN_TOOLS_PATH: &str = "skills/rift/references/tools.md";
-const USAGE: &str = "usage: rift-schema-export [--check] [--analyzer-manifest | --global-contract] [OUTPUT_DIR] [PLUGIN_DIR]";
+const USAGE: &str = "usage: rift-schema-export [--check] [--docs | --plugin | --analyzer-manifest | --global-contract] [OUTPUT_DIR] [PLUGIN_DIR]";
 const REGENERATE_COMMAND: &str = "just generate";
 
 /// Why an export run could not complete.
@@ -139,6 +139,8 @@ impl ExportError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExportTarget {
     Documents,
+    Docs,
+    Plugin,
     AnalyzerManifest,
     GlobalContract,
 }
@@ -168,6 +170,10 @@ where
     for argument in arguments {
         if argument == "--check" {
             check = true;
+        } else if argument == "--docs" {
+            target = ExportTarget::Docs;
+        } else if argument == "--plugin" {
+            target = ExportTarget::Plugin;
         } else if argument == "--analyzer-manifest" {
             target = ExportTarget::AnalyzerManifest;
         } else if argument == "--global-contract" {
@@ -190,7 +196,7 @@ where
     })
 }
 
-/// Writes or checks generated artifacts, or validates one authored contract.
+/// Writes or checks generated artifacts.
 ///
 /// # Errors
 ///
@@ -198,12 +204,16 @@ where
 pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
     match request.target {
         ExportTarget::AnalyzerManifest => return run_analyzer_manifest(request),
-        ExportTarget::GlobalContract => return validate_global_contract(request),
+        ExportTarget::GlobalContract => return run_global_contract(request),
+        ExportTarget::Docs => return run_docs(request),
+        ExportTarget::Plugin => return run_plugin(request),
         ExportTarget::Documents => {}
     }
-    let tools = rift_mcp::schema::tool_listing();
-    let generated = skill::generate(&tools, SkillForm::Plugin)
-        .map_err(|missing| ExportError::TemplateToolMissing { name: missing.name })?;
+    run_docs(request)?;
+    run_plugin(request)
+}
+
+fn run_docs(request: &ExportRequest) -> Result<(), ExportError> {
     let documents = [
         (
             request.output_dir.join(MCP_SCHEMA_PATH),
@@ -217,6 +227,16 @@ pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
             request.output_dir.join(PACKAGE_INDEX_SCHEMA_PATH),
             rift_protocol::schema::package_index_schema_document(),
         ),
+    ];
+    write_documents(request.check, &documents)?;
+    run_global_contract(request)
+}
+
+fn run_plugin(request: &ExportRequest) -> Result<(), ExportError> {
+    let tools = rift_mcp::schema::tool_listing();
+    let generated = skill::generate(&tools, SkillForm::Plugin)
+        .map_err(|missing| ExportError::TemplateToolMissing { name: missing.name })?;
+    let documents = [
         (
             request.plugin_dir.join(PLUGIN_MANIFEST_PATH),
             skill::plugin_manifest(),
@@ -230,68 +250,56 @@ pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
             generated.tools_md,
         ),
     ];
-    if request.check {
-        for (path, document) in &documents {
+    write_documents(request.check, &documents)
+}
+
+fn write_documents(check: bool, documents: &[(PathBuf, String)]) -> Result<(), ExportError> {
+    for (path, document) in documents {
+        if check {
             check_document(path, document)?;
+        } else {
+            write_document(path, document)?;
         }
-        return Ok(());
-    }
-    for (path, document) in &documents {
-        let parent = path.parent().unwrap_or(request.output_dir.as_path());
-        fs::create_dir_all(parent).map_err(|source| ExportError::WriteFailed {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        fs::write(path, document).map_err(|source| ExportError::WriteFailed {
-            path: path.clone(),
-            source,
-        })?;
-        println!("wrote {}", path.display());
     }
     Ok(())
 }
 
-fn validate_global_contract(request: &ExportRequest) -> Result<(), ExportError> {
-    let path = request
-        .output_dir
-        .join(rift_cloud_client::contract::DOCUMENT_PATH);
-    if !request.check {
-        let bytes = fs::read(&path).map_err(|source| ExportError::CheckUnreadable {
-            path: path.clone(),
-            source,
-        })?;
-        let mut document: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|source| ExportError::GlobalContract {
-                source: rift_cloud_client::contract::ContractError::Parse {
-                    path: path.clone(),
-                    source,
-                },
-            })?;
-        let schemas = document["components"]["schemas"]
-            .as_object_mut()
-            .ok_or_else(|| ExportError::GlobalContract {
-                source: rift_cloud_client::contract::ContractError::Invalid {
-                    path: path.clone(),
-                    rule: "components must carry schemas".to_owned(),
-                },
-            })?;
-        for (name, schema) in rift_cloud_client::contract::shared_schemas() {
-            schemas.insert(name, schema);
-        }
-        let mut bytes =
-            serde_json::to_vec_pretty(&document).map_err(|source| ExportError::WriteFailed {
-                path: path.clone(),
-                source: io::Error::other(source),
-            })?;
-        bytes.push(b'\n');
-        fs::write(&path, bytes).map_err(|source| ExportError::WriteFailed {
-            path: path.clone(),
+fn write_document(path: &Path, document: &str) -> Result<(), ExportError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| ExportError::WriteFailed {
+            path: parent.to_path_buf(),
             source,
         })?;
     }
+    fs::write(path, document).map_err(|source| ExportError::WriteFailed {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn run_global_contract(request: &ExportRequest) -> Result<(), ExportError> {
+    let path = request
+        .output_dir
+        .join(rift_cloud_client::contract::DOCUMENT_PATH);
+    let mut document = serde_json::to_string_pretty(&rift_cloud_client::contract::document())
+        .map_err(|source| ExportError::WriteFailed {
+            path: path.clone(),
+            source: io::Error::other(source),
+        })?;
+    document.push('\n');
+    if !request.check {
+        write_document(&path, &document)?;
+    }
     rift_cloud_client::contract::validate(&path)
         .map_err(|source| ExportError::GlobalContract { source })?;
-    println!("{} is valid", path.display());
+    if request.check {
+        check_document(&path, &document)?;
+    }
     Ok(())
 }
 
@@ -303,12 +311,7 @@ fn run_analyzer_manifest(request: &ExportRequest) -> Result<(), ExportError> {
     if request.check {
         return check_document(&path, &document);
     }
-    fs::write(&path, &document).map_err(|source| ExportError::WriteFailed {
-        path: path.clone(),
-        source,
-    })?;
-    println!("wrote {}", path.display());
-    Ok(())
+    write_document(&path, &document)
 }
 
 fn check_document(path: &Path, document: &str) -> Result<(), ExportError> {

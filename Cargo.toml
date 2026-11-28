@@ -28,7 +28,6 @@ rift-analysis = { path = "crates/rift-analysis", default-features = false }
 rift-cloud-client = { path = "crates/rift-cloud-client" }
 rift-core = { path = "crates/rift-core" }
 rift-error = { path = "crates/rift-error" }
-rift-error-codegen = { path = "crates/rift-error-codegen" }
 rift-error-macros = { path = "crates/rift-error-macros" }
 rift-dependency = { path = "crates/rift-dependency" }
 rift-history = { path = "crates/rift-history" }

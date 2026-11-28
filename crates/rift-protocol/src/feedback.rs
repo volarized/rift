@@ -1,30 +1,20 @@
 //! Wire models for the `feedback` tool.
 
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 const TEXT_BYTES_MAX: usize = 4096;
 
-/// The diagnostic fields the caller elects to send with a feedback report. An omitted member
-/// is `false`.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
-#[schemars(example = serde_json::json!({"os": true, "rift_version": true}))]
-pub struct FeedbackInclude {
+/// One diagnostic field the caller elects to send with a feedback report.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackField {
     /// Sends the operating system name, such as `linux`.
-    #[serde(default)]
-    pub os: bool,
+    Os,
     /// Sends Rift's package version, such as `0.0.78`.
-    #[serde(default)]
-    pub rift_version: bool,
-}
-
-impl FeedbackInclude {
-    /// Whether the caller elected no diagnostic field.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        !self.os && !self.rift_version
-    }
+    RiftVersion,
 }
 
 /// The report and any diagnostic fields the caller elects to send.
@@ -33,7 +23,7 @@ impl FeedbackInclude {
 #[schemars(extend("rift:since" = "v0.0.79"))]
 #[schemars(example = serde_json::json!({
     "text": "The facets tool returned an empty result for a symbol it found.",
-    "include": {"os": true, "rift_version": true}
+    "include": ["os", "rift_version"]
 }))]
 pub struct FeedbackParams {
     /// Report text sent verbatim. The caller MUST send nonblank text of at most 4096 UTF-8 bytes.
@@ -41,8 +31,8 @@ pub struct FeedbackParams {
     #[schemars(length(min = 1, max = TEXT_BYTES_MAX), regex(pattern = r"\S"))]
     pub text: String,
     /// Diagnostic fields to send alongside `text`. Omitted sends no diagnostic field.
-    #[serde(default)]
-    pub include: FeedbackInclude,
+    #[serde(default, deserialize_with = "crate::mcp_projection::deserialize_set")]
+    pub include: BTreeSet<FeedbackField>,
 }
 
 fn report_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -77,9 +67,9 @@ mod tests {
             json!({"text": " \n\t "}),
             json!({"text": "λ".repeat(TEXT_BYTES_MAX / 2 + 1)}),
             json!({"text": "valid", "include": null}),
-            json!({"text": "valid", "include": ["os"]}),
-            json!({"text": "valid", "include": {"os": "yes"}}),
-            json!({"text": "valid", "include": {"host": true}}),
+            json!({"text": "valid", "include": ["os", "os"]}),
+            json!({"text": "valid", "include": ["os", "host"]}),
+            json!({"text": "valid", "include": {"os": true}}),
             json!({"text": "valid", "include_details": ["os"]}),
             json!({"text": "valid", "url": "https://example.test"}),
         ] {
@@ -90,5 +80,14 @@ mod tests {
             serde_json::from_value::<FeedbackParams>(json!({"text": text})).expect("at limit");
         assert_eq!(largest.text, text);
         assert!(largest.include.is_empty());
+
+        let selected = serde_json::from_value::<FeedbackParams>(json!({
+            "text": "valid", "include": ["rift_version", "os"]
+        }))
+        .expect("both diagnostic fields are accepted");
+        assert_eq!(
+            selected.include,
+            BTreeSet::from([FeedbackField::Os, FeedbackField::RiftVersion])
+        );
     }
 }

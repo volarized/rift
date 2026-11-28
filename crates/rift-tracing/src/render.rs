@@ -20,7 +20,7 @@
 //!   `busy` and `idle` for a span close; a mark and the message for a lifecycle record;
 //!   the message and the record's own fields otherwise.
 //!
-//! A message or a field value holding ` · ` or `: ` prints as a JSON string, between quotes.
+//! A message or a field value holding ` | ` or `: ` prints as a JSON string, between quotes.
 //!
 //! A group is a run of consecutive records of one request; without a request, of one
 //! root span; without a span, of one function. A blank line separates two groups. A stored page pads each column to the
@@ -75,10 +75,10 @@ const LIVE_CONTEXT_WIDTH: usize = 48;
 const LIVE_NESTED_NAME_WIDTH: usize = 24;
 /// The width a live stream pads the nearest span's fields to.
 const LIVE_NESTED_FIELDS_WIDTH: usize = 40;
-/// The separators the compact text of a resource splits a line on, ` · ` and `: `. A
+/// The separators the compact text of a resource splits a line on, ` | ` and `: `. A
 /// message or a field value holding one prints quoted, so a `rift server logs` reader keeps it
 /// whole.
-const LINE_DELIMITERS: [&str; 2] = [" · ", ": "];
+const LINE_DELIMITERS: [&str; 2] = [" | ", ": "];
 
 /// Whether a rendered line colors its level with ANSI escape codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

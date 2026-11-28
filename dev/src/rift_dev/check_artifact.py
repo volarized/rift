@@ -79,7 +79,6 @@ async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
     """Read the observed identity and retain its original declaration location."""
     identity = symbol_id(hit)
     answer = await client.call("get_symbol", {"id": identity})
-    require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
     require(
         object_value(answer.get("symbol"), "symbol").get("id") == identity,
         f"symbol identity changed: {answer}",
@@ -98,7 +97,13 @@ async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
         == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
         f"symbol declaration changed range: {answer}",
     )
-    require("source" not in declaration, f"exact declaration carried source: {answer}")
+    source = object_value(declaration.get("source"), "declaration source")
+    require(
+        source.get("span")
+        == {"unit": iri(hit, "unit"), "range": declaration.get("range")}
+        and source.get("text") == literal(hit, "source"),
+        f"symbol source disagrees with the selected declaration: {answer}",
+    )
     return declaration
 
 

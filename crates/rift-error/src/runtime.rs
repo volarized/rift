@@ -65,7 +65,7 @@ pub struct Unset;
 /// Builder state after required evidence is set.
 pub struct Set;
 
-/// Sets required generated evidence on a builder.
+/// Sets required evidence on a builder.
 pub trait FieldSet<Target> {
     /// Builder state after the field is set.
     type Output;
@@ -79,7 +79,7 @@ pub trait FieldSet<Target> {
 pub struct ErrorSlug(&'static str);
 
 impl ErrorSlug {
-    /// Creates a registry identity from a generated string literal.
+    /// Creates a registry identity from its stable string.
     #[must_use]
     pub const fn new(value: &'static str) -> Self {
         Self(value)
@@ -364,7 +364,7 @@ pub struct RiftError {
     templated_fields: Vec<&'static str>,
 }
 
-/// Storage shared by generated error builders.
+/// Storage shared by registered error builders.
 pub struct BuilderCore {
     slug: ErrorSlug,
     message: &'static str,
