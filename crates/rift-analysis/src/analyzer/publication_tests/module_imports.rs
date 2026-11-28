@@ -5938,6 +5938,67 @@ fn javascript_nested_array_elements_keep_checked_property_owners() {
 }
 
 #[test]
+fn typescript_follows_declarations_from_an_exact_runtime_export_root() {
+    const ROOT: &str = "export * from './branch/index.js';";
+    const BRANCH: &str = "export { Entry } from './detail.js';";
+    const DETAIL: &str = "export interface Entry { value: number }";
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./index.js","./*.js":"./*.js","./*":"./*.js"}}"#;
+    for alternate in [None, Some(("index.ts", "export const alternate = true;"))] {
+        let mut files = vec![
+            ("index.js", "export const runtime = true;"),
+            ("index.d.ts", ROOT),
+            ("branch/index.d.ts", BRANCH),
+            ("branch/detail.d.ts", DETAIL),
+            (
+                "branch/unused.d.ts",
+                "export interface Unused { hidden: boolean }",
+            ),
+        ];
+        files.extend(alternate);
+        let result = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package");
+        let publication = result.publication();
+        publication.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            publication
+                .units
+                .iter()
+                .find(|row| row.path.0 == path && row.source_complete)
+                .expect("retained source")
+        };
+        let detail = unit("branch/detail.d.ts");
+        assert_eq!(detail.source, DETAIL);
+        let found = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == detail.unit && row.symbol.as_str().ends_with("/Entry"));
+        assert_eq!(found.is_some(), alternate.is_none());
+        if let Some(row) = found {
+            let start = DETAIL.find("interface").expect("written declaration");
+            assert_eq!(row.source, &DETAIL[start..]);
+            assert_eq!(row.range, module_runtime_range(start, &DETAIL[start..]));
+            assert!(publication.declarations.iter().any(|row| {
+                row.unit == detail.unit && row.symbol.as_str().ends_with("/Entry/value")
+            }));
+        }
+        assert!(publication.declarations.iter().any(|row| {
+            row.unit == unit("index.js").unit && row.symbol.as_str().ends_with("/beacon/runtime")
+        }));
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit("branch/unused.d.ts").unit)
+        );
+    }
+}
+
+#[test]
 fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildcards() {
     const ROOT: &str = "export { read } from './branch/index.js';";
     const BRANCH: &str = "export * from '../detail';";

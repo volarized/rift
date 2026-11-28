@@ -153,6 +153,14 @@ impl<'input> PackageFiles<'input> {
         })
     }
 
+    /// The checked declaration beside a runtime file named by a direct package export.
+    pub(super) fn runtime_declaration(&self, runtime: &str) -> Option<ProjectPath> {
+        if !export_subpath_is_valid(runtime) || self.presence(runtime) != Presence::File {
+            return None;
+        }
+        self.unique_declaration(type_substitutions(runtime)?)
+    }
+
     /// A written relative module confirms only one captured declaration path. A typed
     /// source or another possible declaration with captured file evidence takes precedence
     /// over this proof.
@@ -184,6 +192,13 @@ impl<'input> PackageFiles<'input> {
             }
             types_candidates(&path)?
         };
+        self.unique_declaration(candidates)
+    }
+
+    fn unique_declaration(
+        &self,
+        candidates: impl IntoIterator<Item = String>,
+    ) -> Option<ProjectPath> {
         let mut existing = candidates
             .into_iter()
             .filter(|path| self.presence(path) == Presence::File);
