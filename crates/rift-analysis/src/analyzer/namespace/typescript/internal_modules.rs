@@ -123,6 +123,10 @@ fn module_scoped_anchors(
     let mut physical = scopes.literal_properties(file, &withheld, anchors);
     physical.extend(lexical);
     physical.extend(arguments);
+    if input.release_version().is_some() {
+        physical.extend(scopes.withheld_private_return_functions(file, &withheld, anchors));
+        super::scoped_returns::place(file, anchors, &mut physical);
+    }
     scopes.place_scoped_call_argument_properties(file, &withheld, anchors, &mut physical);
     physical.extend(scopes.withheld_union_properties(file, &withheld, anchors));
     physical.extend(scopes.withheld_conditional_properties(

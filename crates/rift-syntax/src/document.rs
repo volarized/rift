@@ -197,10 +197,17 @@ impl SyntaxSymbol {
             || self.is_typescript_destructured_parameter()
     }
 
-    /// Whether this is the physical parameter of a JavaScript function value.
+    /// Whether this is a physical parameter of an ECMAScript callback.
     #[must_use]
     pub fn is_ecmascript_callback_parameter(&self) -> bool {
         self.kind == crate::ecmascript::CALLBACK_PARAMETER_KIND
+            || self.is_typescript_argument_callback_parameter()
+    }
+
+    /// Whether this is the physical formal of a written TypeScript arrow argument.
+    #[must_use]
+    pub fn is_typescript_argument_callback_parameter(&self) -> bool {
+        self.kind == crate::ecmascript::TYPED_ARGUMENT_CALLBACK_PARAMETER_KIND
     }
 
     /// Whether this is a written binding in a JavaScript function value's parameter pattern.

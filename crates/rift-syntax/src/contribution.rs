@@ -57,6 +57,7 @@ pub struct PackageBindingSlots {
     typescript_mapped_type_parameter: usize,
     typescript_callable_type_rest_parameter: usize,
     typescript_callable_type_pattern_parameter: usize,
+    typescript_argument_callback_parameter: usize,
     typescript_destructured_parameter: usize,
     typescript_method_type_parameter: usize,
     rust_macro_method: usize,
@@ -111,6 +112,7 @@ impl PackageBindingSlots {
             typescript_mapped_type_parameter: 0,
             typescript_callable_type_rest_parameter: 0,
             typescript_callable_type_pattern_parameter: 0,
+            typescript_argument_callback_parameter: 0,
             typescript_destructured_parameter: 0,
             typescript_method_type_parameter: 0,
             rust_macro_method: 0,
@@ -352,6 +354,13 @@ impl PackageBindingSlots {
         self
     }
 
+    /// Uses the remaining declaration capacity for written TypeScript arrow argument parameters.
+    #[must_use]
+    pub const fn with_typescript_argument_callback_parameters(mut self, count: usize) -> Self {
+        self.typescript_argument_callback_parameter = count;
+        self
+    }
+
     /// Uses the remaining declaration capacity for object-pattern bindings in callable types.
     #[must_use]
     pub const fn with_typescript_callable_type_pattern_parameters(mut self, count: usize) -> Self {
@@ -427,6 +436,7 @@ impl PackageBindingSlots {
             .saturating_add(self.typescript_mapped_type_parameter)
             .saturating_add(self.typescript_callable_type_rest_parameter)
             .saturating_add(self.typescript_callable_type_pattern_parameter)
+            .saturating_add(self.typescript_argument_callback_parameter)
             .saturating_add(self.typescript_destructured_parameter)
             .saturating_add(self.typescript_method_type_parameter)
             .saturating_add(self.rust_macro_method)
@@ -460,7 +470,9 @@ impl PackageBindingSlots {
         methods: &std::collections::BTreeSet<&str>,
     ) -> bool {
         let language = syntax.language().name.as_str();
-        let available = if symbol.is_ecmascript_callback_parameter() {
+        let available = if symbol.is_typescript_argument_callback_parameter() {
+            &mut self.typescript_argument_callback_parameter
+        } else if symbol.is_ecmascript_callback_parameter() {
             &mut self.javascript_callback_parameter
         } else if symbol.is_javascript_callback_pattern_parameter() {
             &mut self.javascript_callback_pattern
@@ -548,11 +560,9 @@ impl PackageBindingSlots {
         } else {
             &mut self.rust_local
         };
-        if *available == 0 {
-            return false;
-        }
-        *available -= 1;
-        true
+        let admitted = *available > 0;
+        *available = available.saturating_sub(1);
+        admitted
     }
 }
 

@@ -114,7 +114,7 @@ impl Records {
             let file = files_by_unit[unit];
             if let Some(placed) = placed.get(&file.unit) {
                 let caller = |range| calls.get(&range).and_then(Option::as_ref);
-                for (property, name, callback) in argument_properties(file, caller, placed) {
+                for (property, name, callback, _) in argument_properties(file, caller, placed) {
                     candidates.push(ArgumentProperty {
                         file,
                         property,
@@ -164,8 +164,9 @@ impl Records {
                 continue;
             };
             let mut callers = BTreeMap::<_, Option<SymbolId>>::new();
+            let mut retained_callers = BTreeMap::<_, Option<SymbolId>>::new();
             let caller = |range| written_callback(file, range);
-            for (property, name, callback) in argument_properties(file, caller, placed) {
+            for (property, name, callback, member) in argument_properties(file, caller, placed) {
                 if self.symbols_truncated {
                     return Ok(());
                 }
@@ -181,6 +182,23 @@ impl Records {
                             false,
                         )?)
                     }
+                };
+                let id = if id.is_none() && member && placed.contains(&callback.range) {
+                    match retained_callers.entry(callback.range) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(self.publish_ecmascript_callback(
+                                owner,
+                                file,
+                                callback,
+                                &occupied,
+                                declaration_limit,
+                                true,
+                            )?)
+                        }
+                    }
+                } else {
+                    id
                 };
                 if let Some(id) = id {
                     occupied.insert(id.clone());
@@ -319,7 +337,7 @@ fn argument_properties<'file, Owner: Copy>(
     file: &'file CallbackFile<'_>,
     caller: impl Fn(ByteRange) -> Option<Owner>,
     placed: &BTreeSet<ByteRange>,
-) -> Vec<(&'file SyntaxSymbol, ByteRange, Owner)> {
+) -> Vec<(&'file SyntaxSymbol, ByteRange, Owner, bool)> {
     let syntax = file.file.file.syntax();
     let Some(facts) = syntax.static_facts() else {
         return Vec::new();
@@ -375,12 +393,17 @@ fn argument_properties<'file, Owner: Copy>(
         fields
             .entry((member.body, property.name.as_str()))
             .and_modify(|candidate| *candidate = None)
-            .or_insert(Some((property, name, *callback)));
+            .or_insert(Some((
+                property,
+                name,
+                *callback,
+                matches!(call.callee, StaticCallee::Member { .. }),
+            )));
     }
     fields
         .into_values()
         .flatten()
-        .filter(|(property, _, _)| {
+        .filter(|(property, _, _, _)| {
             names[property.qualified_name.as_str()] > 1 && !placed.contains(&property.range)
         })
         .collect()
