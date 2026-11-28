@@ -88,11 +88,16 @@ fn declaration_keyof_index_recovers_every_checked_nested_member() {
                 "{declaration} {line}: {references:?}"
             );
             if target_count > 0 {
-                for route in ["%22%2Fone%22", "%22%2Ftwo%22"] {
+                for route in ["/one", "/two"] {
+                    let expected = ["Routes".to_owned(), route.to_owned(), member.to_owned()];
                     assert!(
-                        references
-                            .iter()
-                            .any(|target| target.ends_with(&format!("/Routes/{route}/{member}")))
+                        references.iter().any(|target| {
+                            rift_protocol::identity::SymbolIdentity::parse(target)
+                                .expect("checked member identity")
+                                .qualified_path()
+                                .ends_with(&expected)
+                        }),
+                        "{declaration} {line}: {references:?}"
                     );
                 }
             }

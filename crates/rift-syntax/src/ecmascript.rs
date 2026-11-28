@@ -1395,7 +1395,6 @@ fn field_id(language: &tree_sitter::Language, field: &str) -> NonZeroU16 {
 pub(crate) struct EcmaScriptRules<'text> {
     kinds: &'static EcmaScriptKinds,
     exports: ModuleExports<'text>,
-    javascript: bool,
 }
 
 /// One unescaped written property name, excluding its quote delimiters.
@@ -1681,14 +1680,12 @@ impl EcmaScriptRules<'_> {
         if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
             return None;
         }
-        if self.javascript
-            && matches!(
-                kind,
-                EcmaScriptSymbolKind::Field
-                    | EcmaScriptSymbolKind::Method
-                    | EcmaScriptSymbolKind::Property
-            )
-            && let Some(name) = literal_property_fragment(name, self.kinds.literal_property, text)
+        if matches!(
+            kind,
+            EcmaScriptSymbolKind::Field
+                | EcmaScriptSymbolKind::Method
+                | EcmaScriptSymbolKind::Property
+        ) && let Some(name) = literal_property_fragment(name, self.kinds.literal_property, text)
         {
             return text.get(name.byte_range()).map(Into::into);
         }
@@ -2408,7 +2405,6 @@ pub(crate) fn analyze_included(
     let mut rules = EcmaScriptRules {
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
-        javascript: language.name == "javascript",
     };
     let commonjs = commonjs::record(
         tree.root_node(),

@@ -264,6 +264,51 @@ fn declaration_imports_follow_a_written_typescript_extension_to_its_declaration(
 }
 
 #[test]
+fn typescript_quoted_member_signatures_keep_the_written_name() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.mts"}"#;
+    const SOURCE: &str = concat!(
+        "export interface Visitor {\n",
+        "  \"item:exit\"?: (name: string) => void;\n",
+        "  'item:enter'(name: string): void;\n",
+        "  '\\u0041'?: string;\n",
+        "}\n",
+    );
+    let collected = internal_modules::analyze(MANIFEST, &[("index.d.mts", SOURCE)]);
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    for (name, written) in [
+        ("item:exit", "\"item:exit\"?: (name: string) => void"),
+        ("item:enter", "'item:enter'(name: string): void"),
+    ] {
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == written)
+            .expect("written member signature");
+        let identity = rift_protocol::identity::SymbolIdentity::parse(declaration.symbol.as_str())
+            .expect("checked member identity");
+        assert_eq!(
+            identity.qualified_path().last().map(String::as_str),
+            Some(name)
+        );
+        assert_eq!(
+            declaration.range,
+            module_runtime_range(
+                SOURCE.find(written).expect("exact property source"),
+                written
+            )
+        );
+    }
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .all(|row| !row.symbol.as_str().ends_with("/A"))
+    );
+}
+
+#[test]
 fn typescript_selectors_reference_uniquely_imported_declarations() {
     const MANIFEST: &str =
         r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;

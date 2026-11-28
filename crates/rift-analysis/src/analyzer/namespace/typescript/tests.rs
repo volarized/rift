@@ -404,10 +404,10 @@ fn literal_occurrence_spelling_in_source_name_is_not_a_qualifier() {
                 .expect("canonical identity")
                 .qualified_path()
                 .last()
-                .is_some_and(|name| name.contains("method~2"))
+                .is_some_and(|name| name == "method~2")
         })
         .expect("literal named method");
-    assert!(member.as_str().ends_with("/%22method%7E2%22"), "{member:?}");
+    assert!(member.as_str().ends_with("/method%7E2"), "{member:?}");
 }
 
 #[test]
