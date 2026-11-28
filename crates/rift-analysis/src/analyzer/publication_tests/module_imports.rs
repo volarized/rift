@@ -6353,6 +6353,114 @@ fn typescript_follows_declarations_from_an_exact_runtime_export_root() {
 }
 
 #[test]
+fn typescript_follows_declarations_from_an_exact_runtime_subpath() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","exports":{".":"./index.js","./feature":"./branch/feature.js","./*.js":"./*.js","./*":"./*.js"}}"#;
+    const FEATURE: &str = "export { Detail } from './detail.js';";
+    const LEAF: &str = "export interface Detail { readonly value: number }";
+    for alternate in [
+        None,
+        Some(("branch/feature.ts", "export const separate = true;")),
+    ] {
+        let mut files = vec![
+            ("index.js", "export const entry = true;"),
+            ("branch/feature.js", "export const enabled = true;"),
+            ("branch/feature.d.ts", FEATURE),
+            ("branch/detail.d.ts", LEAF),
+            (
+                "branch/unused.d.ts",
+                "export interface Unused { value: boolean }",
+            ),
+        ];
+        files.extend(alternate);
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            files,
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked runtime subpath");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            publication
+                .units
+                .iter()
+                .find(|unit| unit.path.0 == path && unit.source_complete)
+                .expect("retained selected source")
+        };
+        let leaf = unit("branch/detail.d.ts");
+        let found = publication
+            .declarations
+            .iter()
+            .find(|row| row.unit == leaf.unit && row.symbol.as_str().ends_with("/Detail"));
+        assert_eq!(found.is_some(), alternate.is_none());
+        if let Some(row) = found {
+            let declaration = LEAF.strip_prefix("export ").expect("written declaration");
+            assert_eq!(
+                row.range,
+                module_runtime_range("export ".len(), declaration)
+            );
+            assert_eq!(row.source, declaration);
+            assert!(publication.declarations.iter().any(|row| {
+                row.unit == unit("branch/feature.d.ts").unit
+                    && row.symbol.as_str().ends_with("/beacon%2Ffeature")
+            }));
+        }
+        assert!(publication.declarations.iter().any(|row| {
+            row.unit == unit("branch/feature.js").unit
+                && row.symbol.as_str().ends_with("/beacon%2Ffeature/enabled")
+        }));
+        assert!(
+            publication
+                .declarations
+                .iter()
+                .all(|row| row.unit != unit("branch/unused.d.ts").unit)
+        );
+    }
+}
+
+#[test]
+fn typescript_keeps_existing_declarations_when_runtime_subpaths_compete() {
+    const SIDE: &str = "export interface Detail { readonly value: number }";
+    for (route, identity) in [
+        (
+            r#""./alternate":"./branch/feature.js""#,
+            "/beacon%2Fbranch%2Ffeature.d.ts/Detail",
+        ),
+        (
+            r#""./alternate":{"types":"./branch/feature.d.ts","default":"./branch/feature.js"}"#,
+            "/beacon%2Falternate/Detail",
+        ),
+    ] {
+        let manifest = format!(
+            r#"{{"name":"beacon","version":"1.0.0","type":"module","exports":{{".":"./index.js","./feature":"./branch/feature.js",{route}}}}}"#,
+        );
+        let collected = fixture::package_result_with_metadata(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.js", "export const entry = true;"),
+                ("branch/feature.js", "export const enabled = true;"),
+                ("branch/feature.d.ts", SIDE),
+            ],
+            None,
+            Some(("package.json", &manifest)),
+        )
+        .expect("checked package");
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let declaration = SIDE.strip_prefix("export ").expect("written declaration");
+        assert!(
+            publication.declarations.iter().any(|row| {
+                row.symbol.as_str().ends_with(identity)
+                    && row.source == declaration
+                    && row.range == module_runtime_range("export ".len(), declaration)
+            }),
+            "missing previous declaration for {route}"
+        );
+    }
+}
+
+#[test]
 fn typescript_relative_reexports_keep_checked_declarations_beside_runtime_wildcards() {
     const ROOT: &str = "export { read } from './branch/index.js';";
     const BRANCH: &str = "export * from '../detail';";
