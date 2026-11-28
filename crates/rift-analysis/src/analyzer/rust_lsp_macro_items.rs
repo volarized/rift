@@ -20,6 +20,7 @@ use rift_syntax::{
 use super::{PackageAnalyzer, bound, digest_of, file_digest, line_of, line_starts};
 use crate::ExactPackageLimits;
 
+mod associated_members;
 mod variant_fields;
 
 /// A Rust macro invocation whose selected owner can be checked through a language server.
@@ -108,6 +109,45 @@ impl PackageAnalyzer {
         limits: SyntaxLimits,
     ) -> Vec<RustLspMacroSite> {
         macro_sites(path, source, limits, true)
+    }
+
+    /// Finds Rust macro invocations inside a checked inherent implementation.
+    ///
+    /// An independently selected dependency definition and exact authored name remain
+    /// necessary before any member can be published.
+    #[must_use]
+    pub fn rust_lsp_dependency_macro_member_sites(
+        path: &ProjectPath,
+        source: &str,
+        limits: SyntaxLimits,
+    ) -> Vec<RustLspMacroSite> {
+        let scopes = associated_members::scopes(source, limits);
+        if scopes.is_empty() || !source.contains('!') {
+            return Vec::new();
+        }
+        let Some(document) = parse(path, source, limits) else {
+            return Vec::new();
+        };
+        sites(&document, true, Some(&scopes))
+            .into_values()
+            .collect()
+    }
+
+    /// Finds exact written names in supported original Rust method signatures.
+    ///
+    /// The emitted signatures supply names and shapes. Definition checks must still
+    /// establish the written member and its parameters at their own source positions.
+    #[must_use]
+    pub fn rust_lsp_macro_member_name_sites(
+        path: &ProjectPath,
+        source: &str,
+        invocation: SourceRange,
+        expansion: &str,
+        limits: SyntaxLimits,
+    ) -> Vec<SourceRange> {
+        associated_members::candidates(path, source, invocation, expansion, limits)
+            .into_keys()
+            .collect()
     }
 
     /// Finds exact original candidate names for definition checks in one macro invocation.
@@ -293,10 +333,14 @@ fn macro_sites(
     let Some(document) = parse(path, source, limits) else {
         return Vec::new();
     };
-    sites(&document, qualified).into_values().collect()
+    sites(&document, qualified, None).into_values().collect()
 }
 
-fn sites(document: &SyntaxDocument, qualified: bool) -> BTreeMap<SourceRange, RustLspMacroSite> {
+fn sites(
+    document: &SyntaxDocument,
+    qualified: bool,
+    member_scopes: Option<&BTreeSet<ByteRange>>,
+) -> BTreeMap<SourceRange, RustLspMacroSite> {
     let elements = document.syntax_elements();
     let mut sites = BTreeMap::new();
     for element in elements {
@@ -329,13 +373,7 @@ fn sites(document: &SyntaxDocument, qualified: bool) -> BTreeMap<SourceRange, Ru
             };
             scope = parent;
         }
-        if scope.kind != "source_file"
-            && !(scope.kind == "declaration_list"
-                && scope
-                    .parent
-                    .and_then(|index| elements.get(index))
-                    .is_some_and(|parent| parent.kind == "mod_item"))
-        {
+        if !site_scope(elements, scope, member_scopes) {
             continue;
         }
         let Some((name, invocation)) = range(element.range).zip(range(invocation.range)) else {
@@ -344,6 +382,37 @@ fn sites(document: &SyntaxDocument, qualified: bool) -> BTreeMap<SourceRange, Ru
         sites.insert(invocation, RustLspMacroSite { name, invocation });
     }
     sites
+}
+
+fn site_scope(
+    elements: &[rift_syntax::SyntaxElement],
+    scope: &rift_syntax::SyntaxElement,
+    member_scopes: Option<&BTreeSet<ByteRange>>,
+) -> bool {
+    if scope.kind == "source_file" {
+        return member_scopes.is_none();
+    }
+    if scope.kind != "declaration_list" {
+        return false;
+    }
+    let Some(owner) = scope.parent.and_then(|index| elements.get(index)) else {
+        return false;
+    };
+    let Some(scopes) = member_scopes else {
+        return owner.kind == "mod_item";
+    };
+    if owner.kind != "impl_item" || !scopes.contains(&owner.range) || owner.has_error {
+        return false;
+    }
+    let Some(lexical) = owner.parent.and_then(|index| elements.get(index)) else {
+        return false;
+    };
+    lexical.kind == "source_file"
+        || (lexical.kind == "declaration_list"
+            && lexical
+                .parent
+                .and_then(|index| elements.get(index))
+                .is_some_and(|parent| parent.kind == "mod_item"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -379,6 +448,7 @@ struct Candidate {
     kind: ItemKind,
     visibility: Option<String>,
     variant_owner: Option<VariantOwner>,
+    member_owner: Option<SourceRange>,
 }
 
 struct VariantOwner {
@@ -517,6 +587,7 @@ fn primary_candidates<'source>(
             kind,
             visibility: symbol.visibility.clone(),
             variant_owner: None,
+            member_owner: None,
         };
         output
             .entry(symbol.name.as_str())
@@ -756,6 +827,8 @@ struct Observed<'a> {
     expansion_digest: FileDigest,
     parent: SymbolId,
     symbol: SymbolId,
+    only_type_witness: bool,
+    needs_type_witness: bool,
 }
 
 fn collect_file<'a>(
@@ -770,7 +843,9 @@ fn collect_file<'a>(
     let Some(original) = parse(file.path, &unit.source, limits) else {
         return;
     };
-    let sites = sites(&original, true);
+    let sites = sites(&original, true, None);
+    let scopes = member_scopes(file, &unit.source, &sites, limits);
+    let members = sites_in_members(&original, &scopes);
     let (objects, definitions) = inventory;
     let starts = line_starts(&unit.source);
     let mut work = limits.source_bytes_max();
@@ -778,8 +853,10 @@ fn collect_file<'a>(
         if observation.names.len() > limits.syntax_elements_max() {
             continue;
         }
+        let associated = members.contains_key(&observation.site.invocation);
         let Some(site) = sites
             .get(&observation.site.invocation)
+            .or_else(|| members.get(&observation.site.invocation))
             .filter(|site| site.name == observation.site.name)
         else {
             continue;
@@ -801,7 +878,12 @@ fn collect_file<'a>(
         };
         work = left;
         let expansion_digest = FileDigest::of(observation.expansion.as_bytes());
-        let Some(owner) = module_owner(&original, site.invocation, existing, objects) else {
+        let owner = if associated {
+            associated_members::owner(&original, site.invocation, &scopes, existing, objects)
+        } else {
+            module_owner(&original, site.invocation, existing, objects)
+        };
+        let Some(owner) = owner else {
             continue;
         };
         let Ok(module) = SymbolIdentity::parse(owner.symbol.as_str()) else {
@@ -814,54 +896,151 @@ fn collect_file<'a>(
             continue;
         }
         let dependency = definition.identity.owner() != module.owner();
-        let mut names = candidates(
-            file.path,
-            &unit.source,
-            site.invocation,
-            observation.expansion,
-            limits,
-            true,
+        let names = if associated && dependency {
+            associated_members::candidates(
+                file.path,
+                &unit.source,
+                site.invocation,
+                observation.expansion,
+                limits,
+            )
+        } else if associated {
+            continue;
+        } else {
+            candidates(
+                file.path,
+                &unit.source,
+                site.invocation,
+                observation.expansion,
+                limits,
+                true,
+            )
+        };
+        collect_names(
+            output,
+            names,
+            observation,
+            &module,
+            objects,
+            ObservedScope {
+                unit,
+                owner,
+                dependency,
+                definition,
+                expansion_digest,
+                starts: &starts,
+                needs_type_witness: associated
+                    && objects
+                        .get(&owner.symbol)
+                        .is_some_and(|object| object.kind.0 == "impl_item"),
+            },
         );
-        let claimed = unique_claims(observation.names);
-        for (&range, &unique) in &claimed {
-            if range.start() <= site.name.end() || !unique {
-                continue;
-            }
-            let Some(name) = names.remove(&range) else {
-                continue;
-            };
-            if name
-                .variant_owner
-                .as_ref()
-                .is_some_and(|owner| !owner.confirmed(&claimed))
-            {
-                continue;
-            }
-            let Some((symbol, parent)) = item_identity(&module, &name.relative) else {
-                continue;
-            };
-            if objects.contains_key(&symbol) {
-                continue;
-            }
-            output
-                .entry((dependency, symbol.clone()))
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(Observed {
-                    unit,
-                    owner,
-                    name,
-                    range,
-                    line: line_of(&starts, range.start()),
-                    invocation: site.invocation,
-                    definition: observation.definition.range,
-                    definition_unit: definition.unit,
-                    dependency_definition: dependency
-                        .then_some((definition.revision, definition.digest)),
-                    expansion_digest,
-                    parent,
-                    symbol,
-                }));
+    }
+}
+
+fn sites_in_members(
+    original: &SyntaxDocument,
+    scopes: &BTreeSet<ByteRange>,
+) -> BTreeMap<SourceRange, RustLspMacroSite> {
+    if scopes.is_empty() {
+        return BTreeMap::new();
+    }
+    sites(original, true, Some(scopes))
+}
+
+fn member_scopes(
+    file: &RustLspMacroFile<'_>,
+    source: &str,
+    module_items: &BTreeMap<SourceRange, RustLspMacroSite>,
+    limits: SyntaxLimits,
+) -> BTreeSet<ByteRange> {
+    if file
+        .expansions
+        .iter()
+        .any(|row| !module_items.contains_key(&row.site.invocation))
+    {
+        return associated_members::scopes(source, limits);
+    }
+    BTreeSet::new()
+}
+
+#[derive(Clone, Copy)]
+struct ObservedScope<'a, 'line> {
+    unit: &'a PackageSourceUnit,
+    owner: &'a PackageSymbol,
+    dependency: bool,
+    definition: &'line Definition<'a>,
+    expansion_digest: FileDigest,
+    starts: &'line [usize],
+    needs_type_witness: bool,
+}
+
+fn collect_names<'a>(
+    output: &mut Observations<'a>,
+    mut names: BTreeMap<SourceRange, Candidate>,
+    observation: &RustLspMacroItems<'_>,
+    module: &SymbolIdentity,
+    objects: &Objects<'_>,
+    scope: ObservedScope<'a, '_>,
+) {
+    let ObservedScope {
+        unit,
+        owner,
+        dependency,
+        definition,
+        expansion_digest,
+        starts,
+        needs_type_witness,
+    } = scope;
+    let claimed = unique_claims(observation.names);
+    for (&range, &unique) in &claimed {
+        if range.start() <= observation.site.name.end() || !unique {
+            continue;
         }
+        let Some(name) = names.remove(&range) else {
+            continue;
+        };
+        if name
+            .variant_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.confirmed(&claimed))
+            || name
+                .member_owner
+                .is_some_and(|owner| claimed.get(&owner) != Some(&true))
+        {
+            continue;
+        }
+        let Some((symbol, parent)) = item_identity(module, &name.relative) else {
+            continue;
+        };
+        let only_type_witness = if let Some(object) = objects.get(&symbol) {
+            if !associated_members::nominal(name.kind.exact) || object.kind.0 != "impl_item" {
+                continue;
+            }
+            true
+        } else {
+            false
+        };
+        output
+            .entry((dependency, symbol.clone()))
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(Observed {
+                unit,
+                owner,
+                name,
+                range,
+                line: line_of(starts, range.start()),
+                invocation: observation.site.invocation,
+                definition: observation.definition.range,
+                definition_unit: definition.unit,
+                dependency_definition: dependency
+                    .then_some((definition.revision, definition.digest)),
+                expansion_digest,
+                parent,
+                symbol,
+                only_type_witness,
+                needs_type_witness,
+            }));
     }
 }
 
@@ -1016,27 +1195,26 @@ fn records(
             )
         },
     );
-    let local_symbols = output
-        .keys()
-        .take_while(|(dependency, _)| !dependency)
-        .map(|(_, symbol)| symbol.clone())
-        .collect::<BTreeSet<_>>();
-    let mut admitted = output
-        .into_iter()
-        .filter_map(|((dependency, symbol), row)| {
-            (!dependency || !local_symbols.contains(&symbol)).then_some((dependency, row?))
-        })
-        .collect::<Vec<_>>();
-    // Keep incumbent local items and fields ahead of the independent dependency stage.
-    admitted.sort_by_key(|(dependency, row)| (*dependency, row.name.variant_owner.is_some()));
-    let has_fields = admitted
-        .iter()
-        .any(|(_, row)| row.name.variant_owner.is_some());
+    let admitted = ordered_records(output);
+    let has_fields = admitted.iter().any(|row| row.name.variant_owner.is_some());
     let mut variant_anchors = retained_variant_anchors(publication, has_fields);
-    for (_, row) in admitted {
-        if !known.contains(&row.parent)
+    let type_anchors = admitted
+        .iter()
+        .filter(|row| row.only_type_witness)
+        .map(|row| (row.symbol.clone(), row.unit.unit.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut member_anchors = BTreeSet::new();
+    for row in admitted {
+        if row.only_type_witness
+            || !known.contains(&row.parent)
+            || (row.needs_type_witness
+                && row.name.kind.exact == "function"
+                && !type_anchors.contains(&(row.parent.clone(), row.unit.unit.clone())))
             || row.name.variant_owner.as_ref().is_some_and(|owner| {
                 !variant_anchors.contains(&(row.parent.clone(), row.unit.unit.clone(), owner.name))
+            })
+            || row.name.member_owner.is_some_and(|owner| {
+                !member_anchors.contains(&(row.parent.clone(), row.unit.unit.clone(), owner))
             })
         {
             continue;
@@ -1048,6 +1226,9 @@ fn records(
         }
         if has_fields && row.name.kind.exact == "variant" {
             variant_anchors.insert((row.symbol.clone(), row.unit.unit.clone(), row.range));
+        }
+        if row.name.kind.exact == "function" {
+            member_anchors.insert((row.symbol.clone(), row.unit.unit.clone(), row.range));
         }
         append(
             publication,
@@ -1062,6 +1243,30 @@ fn records(
     }
     report.admitted = declarations.len();
     Ok((objects, declarations, report))
+}
+
+fn ordered_records(output: Observations<'_>) -> Vec<Observed<'_>> {
+    let local_symbols = output
+        .keys()
+        .take_while(|(dependency, _)| !dependency)
+        .map(|(_, symbol)| symbol.clone())
+        .collect::<BTreeSet<_>>();
+    let mut admitted = output
+        .into_iter()
+        .filter_map(|((dependency, symbol), row)| {
+            (!dependency || !local_symbols.contains(&symbol)).then_some((dependency, row?))
+        })
+        .collect::<Vec<_>>();
+    // Existing local and dependency items keep capacity before associated members.
+    admitted.sort_by_key(|(dependency, row)| {
+        (
+            *dependency,
+            row.name.kind.exact == "function" || row.name.member_owner.is_some(),
+            row.name.variant_owner.is_some(),
+            row.name.member_owner.is_some(),
+        )
+    });
+    admitted.into_iter().map(|(_, row)| row).collect()
 }
 
 fn retained_variant_anchors(
@@ -1109,7 +1314,14 @@ fn append(
             start: row.range.start(),
             end: row.range.end(),
         },
-        syntax_element_kind: Some("identifier".to_owned()),
+        syntax_element_kind: Some(
+            if row.name.kind.exact == "parameter_binding" && row.name.name == "self" {
+                "self"
+            } else {
+                "identifier"
+            }
+            .to_owned(),
+        ),
         line: row.line,
         signature_indices: Vec::new(),
         type_indices: Vec::new(),
@@ -1803,6 +2015,296 @@ pub mod shadow {
             fixture.observe(&[fixture.authority()], digest, limits, true),
             local
         );
+    }
+
+    const MEMBERS_SOURCE: &str = r"
+use support::define;
+pub struct First;
+pub struct Second;
+impl First {
+    define! {
+        #[doc = stringify!(score)]
+        fn score(&self, amount: u32) -> u32;
+    }
+}
+impl First {
+    support::define!(fn check(&self, delta: u32) -> u32;);
+}
+impl Second {
+    support::define!(fn score(&self, ticket: u32) -> u32;);
+}
+trait Other {}
+impl Other for First {
+    support::define!(fn refused(&self););
+}
+mod shadow {
+    pub struct Third;
+    macro_rules! define { ($name:ident) => { pub struct $name; }; }
+    impl Third { define!(fn refused(&self);); }
+}
+";
+
+    const MEMBER_EXPANSIONS: [&str; 4] = [
+        "pub fn score(&self, amount: u32) -> u32 { amount }",
+        "pub fn check(&self, delta: u32) -> u32 { delta }",
+        "pub fn score(&self, ticket: u32) -> u32 { ticket }",
+        "pub fn refused(&self) {}",
+    ];
+
+    struct MemberFixture {
+        dependency: DependencyCase,
+        publication: PackagePublication,
+        sites: Vec<RustLspMacroSite>,
+        names: Vec<Vec<SourceRange>>,
+        definition: SourceRange,
+    }
+
+    impl MemberFixture {
+        fn new() -> Self {
+            let dependency = DependencyCase::new();
+            let sites = PackageAnalyzer::rust_lsp_dependency_macro_member_sites(
+                &dependency.unit,
+                MEMBERS_SOURCE,
+                dependency.limits.syntax(),
+            );
+            assert_eq!(
+                sites.len(),
+                4,
+                "trait implementations remain outside this route"
+            );
+            let names = sites
+                .iter()
+                .zip(MEMBER_EXPANSIONS)
+                .map(|(site, expansion)| {
+                    PackageAnalyzer::rust_lsp_macro_member_name_sites(
+                        &dependency.unit,
+                        MEMBERS_SOURCE,
+                        site.invocation,
+                        expansion,
+                        dependency.limits.syntax(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names.iter().map(Vec::len).collect::<Vec<_>>(), [3, 3, 3, 2]);
+            let start = u64::try_from(DEPENDENCY_SOURCE.find("define").expect("export"))
+                .expect("export byte position");
+            Self {
+                dependency,
+                publication: authored_macro_fixture(vec![("src/lib.rs", MEMBERS_SOURCE)]),
+                sites,
+                names,
+                definition: SourceRange::new(start, start + 6).expect("export name"),
+            }
+        }
+
+        fn collect(
+            &self,
+            dependencies: &[RustLspMacroDependency<'_>],
+            limits: ExactPackageLimits,
+        ) -> PackagePublication {
+            let observations = self
+                .sites
+                .iter()
+                .copied()
+                .zip(MEMBER_EXPANSIONS)
+                .zip(&self.names)
+                .map(|((site, expansion), names)| RustLspMacroItems {
+                    site,
+                    definition: RustLspMacroDefinition {
+                        path: &self.dependency.locator,
+                        digest: FileDigest::of(DEPENDENCY_SOURCE.as_bytes()),
+                        range: self.definition,
+                    },
+                    expansion,
+                    names,
+                })
+                .collect::<Vec<_>>();
+            let mut result = self.publication.clone();
+            PackageAnalyzer::admit_rust_lsp_macro_items_with_dependencies(
+                &mut result,
+                &[RustLspMacroFile {
+                    path: &self.dependency.unit,
+                    digest: FileDigest::of(MEMBERS_SOURCE.as_bytes()),
+                    expansions: &observations,
+                }],
+                dependencies,
+                &FactProducer {
+                    name: ProducerName::parse("rust-analyzer").expect("producer"),
+                    revision: ProducerRevision::parse("1").expect("revision"),
+                },
+                limits,
+            )
+            .expect("checked macro members");
+            result
+        }
+    }
+
+    #[test]
+    fn dependency_impl_members_keep_written_type_scope_and_parameters() {
+        let fixture = MemberFixture::new();
+        let result = fixture.collect(&[fixture.dependency.authority()], fixture.dependency.limits);
+        for (relative, argument) in [
+            ("First/score", "amount"),
+            ("First/check", "delta"),
+            ("Second/score", "ticket"),
+        ] {
+            let method = result
+                .declarations
+                .iter()
+                .find(|row| row.symbol.as_str().ends_with(relative))
+                .expect("written method declaration");
+            let names = [
+                format!("{relative}/self%23parameter0"),
+                format!("{relative}/{argument}%23parameter0"),
+            ];
+            for name in names {
+                let object = result
+                    .objects
+                    .iter()
+                    .find(|row| {
+                        row.id
+                            .as_ref()
+                            .is_some_and(|symbol| symbol.as_str().ends_with(&name))
+                    })
+                    .expect("written parameter");
+                assert_eq!(object.container.as_ref(), Some(&method.symbol));
+            }
+            let start = usize::try_from(method.range.start).expect("source offset");
+            assert!(MEMBERS_SOURCE[..start].ends_with("fn "));
+        }
+        assert_eq!(
+            result.declarations.len(),
+            fixture.publication.declarations.len() + 9
+        );
+        assert_eq!(result.edges, fixture.publication.edges);
+        result
+            .validate_facts()
+            .expect("checked owners and source witnesses");
+    }
+
+    #[test]
+    fn dependency_impl_members_refuse_missing_authority_and_uncorroborated_parameters() {
+        let mut fixture = MemberFixture::new();
+        assert_eq!(
+            fixture.collect(&[], fixture.dependency.limits),
+            fixture.publication
+        );
+        assert_eq!(
+            fixture.collect(
+                &[
+                    fixture.dependency.authority(),
+                    fixture.dependency.authority()
+                ],
+                fixture.dependency.limits,
+            ),
+            fixture.publication
+        );
+        let count = u32::try_from(fixture.publication.declarations.len() + 1)
+            .expect("fixture declaration count");
+        let capped = fixture.collect(
+            &[fixture.dependency.authority()],
+            fixture
+                .dependency
+                .limits
+                .with_declarations(count)
+                .expect("one member"),
+        );
+        assert_eq!(
+            capped.declarations.len(),
+            fixture.publication.declarations.len() + 1
+        );
+        let unconfirmed = fixture.names[0].remove(0);
+        assert_eq!(text_at(MEMBERS_SOURCE, unconfirmed), Some("score"));
+        let reduced = fixture.collect(&[fixture.dependency.authority()], fixture.dependency.limits);
+        assert_eq!(
+            reduced.declarations.len(),
+            fixture.publication.declarations.len() + 6
+        );
+        assert!(
+            !reduced
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().contains("/First/score"))
+        );
+    }
+
+    #[test]
+    fn dependency_impl_requires_a_concrete_nominal_type_or_an_independent_written_witness() {
+        let source =
+            "support::define!(Product);\nimpl Product { support::define!(fn show(&self);); }";
+        let fixture = DependencyCase::new();
+        let scope = fixture.limits.syntax();
+        let root = PackageAnalyzer::rust_lsp_dependency_macro_sites(&fixture.unit, source, scope);
+        let members =
+            PackageAnalyzer::rust_lsp_dependency_macro_member_sites(&fixture.unit, source, scope);
+        let written_type = "pub struct Product;";
+        let written_method = "pub fn show(&self) {}";
+        let type_names = PackageAnalyzer::rust_lsp_macro_name_sites(
+            &fixture.unit,
+            source,
+            root[0].invocation,
+            written_type,
+            scope,
+        );
+        let member_names = PackageAnalyzer::rust_lsp_macro_member_name_sites(
+            &fixture.unit,
+            source,
+            members[0].invocation,
+            written_method,
+            scope,
+        );
+        let start = u64::try_from(DEPENDENCY_SOURCE.find("define").expect("macro name"))
+            .expect("export byte position");
+        let definition = RustLspMacroDefinition {
+            path: &fixture.locator,
+            digest: FileDigest::of(DEPENDENCY_SOURCE.as_bytes()),
+            range: SourceRange::new(start, start + 6).expect("exact export token"),
+        };
+        let root_row = RustLspMacroItems {
+            site: root[0],
+            definition,
+            expansion: written_type,
+            names: &type_names,
+        };
+        let member_row = RustLspMacroItems {
+            site: members[0],
+            definition,
+            expansion: written_method,
+            names: &member_names,
+        };
+        let base = authored_macro_fixture(vec![("src/lib.rs", source)]);
+        let Some(placeholder) = base.objects.iter().find(|row| row.name == "Product") else {
+            panic!("retained authored implementation");
+        };
+        assert_eq!(placeholder.kind.0, "impl_item");
+        let producer = FactProducer {
+            name: ProducerName::parse("rust-analyzer").expect("producer"),
+            revision: ProducerRevision::parse("1").expect("revision"),
+        };
+        for (observed, admitted) in [
+            (vec![member_row], 0),
+            (vec![root_row, member_row], 2),
+            (vec![root_row, root_row, member_row], 0),
+        ] {
+            let mut graph = base.clone();
+            let report = PackageAnalyzer::admit_rust_lsp_macro_items_with_dependencies(
+                &mut graph,
+                &[RustLspMacroFile {
+                    path: &fixture.unit,
+                    digest: FileDigest::of(source.as_bytes()),
+                    expansions: &observed,
+                }],
+                &[fixture.authority()],
+                &producer,
+                fixture.limits,
+            )
+            .expect("checked owner scope");
+            assert_eq!(report.admitted, admitted);
+            assert_eq!(
+                graph.objects.iter().find(|row| row.name == "Product"),
+                Some(placeholder),
+            );
+        }
     }
 
     fn authored_macro_fixture(files: Vec<(&str, &str)>) -> PackagePublication {

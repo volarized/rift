@@ -82,6 +82,7 @@ pub(super) fn extend(
                     enumeration: enum_token,
                     name: variant_token,
                 }),
+                member_owner: None,
             };
             names
                 .entry(*written)
