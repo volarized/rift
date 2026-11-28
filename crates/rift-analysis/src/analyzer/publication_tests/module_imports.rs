@@ -8194,3 +8194,59 @@ fn initializer_members_stay_with_the_separately_placed_local_binding() {
         }));
     }
 }
+
+#[test]
+fn nested_array_initializers_keep_properties_under_their_written_variable() {
+    const SOURCE: &str = concat!(
+        "export const values = [[{ present: 1 }], [{ present: 2 }]];\n",
+        "export const generated = build([[{ present: 3 }], [{ present: 4 }]]);\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.mjs", "export const keep = 0;"),
+            ("values.mjs", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.mjs"}"#,
+        )),
+    )
+    .expect("checked array source");
+    let found = result.publication();
+    found.validate_facts().expect("exact written array keys");
+    let values = found
+        .declarations
+        .iter()
+        .find(|row| {
+            row.syntax_element_kind.as_deref() == Some("variable_declarator")
+                && row.symbol.as_str().ends_with("/values")
+        })
+        .expect("physical literal initializer holder");
+    let mut ids = BTreeSet::new();
+    for source in ["present: 1", "present: 2"] {
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.source_complete
+                    && row.source == source
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("written property declaration");
+        assert_eq!(
+            row.range,
+            module_runtime_range(SOURCE.find(source).expect("property byte range"), source),
+        );
+        assert!(ids.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&values.symbol)
+        }));
+    }
+    assert!(!found.declarations.iter().any(|row| {
+        row.symbol.as_str().contains("/generated/present")
+            && (row.source == "present: 3" || row.source == "present: 4")
+    }));
+}
