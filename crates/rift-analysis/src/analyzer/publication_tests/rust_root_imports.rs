@@ -529,7 +529,7 @@ mod inline {
     pub fn WideName() -> u16 { 8 }
 }
 
-#[rustfmt::skip]
+#[other_tool::transform]
 mod opaque;
 
 #[cfg_attr(all(), path = "elsewhere.rs")]

@@ -1469,6 +1469,54 @@ mod tests {
     }
 
     #[test]
+    fn test_module_path_rustfmt_skip_keeps_only_bare_outer_attribute() {
+        let text = "#[rustfmt :: skip]\nmod child;";
+        let document = analyze(text);
+        let symbol = &document.symbols()[0];
+        assert_eq!(symbol.module_path, Some(crate::RustModulePath::Absent));
+        assert_eq!(text_at(text, symbol.item_range), "mod child;");
+
+        for attribute in [
+            "other::skip",
+            "rustfmt::transform",
+            "rustfmt::skip()",
+            "rustfmt::skip = \"value\"",
+            "cfg_attr(active, rustfmt::skip)",
+        ] {
+            let document = analyze(&format!("#[{attribute}]\nmod child;"));
+            assert_eq!(
+                document.symbols()[0].module_path,
+                Some(crate::RustModulePath::Unknown),
+                "{attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_module_path_accepts_only_the_checked_test_deprecation_note() {
+        let document = analyze(
+            r#"#[cfg_attr(not(test), deprecated(note = "Use the other path."))] mod child;"#,
+        );
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Absent)
+        );
+        for attribute in [
+            r#"cfg_attr(feature = "alternate", deprecated(note = "message"))"#,
+            r#"cfg_attr(not(test), tool::deprecated(note = "message"))"#,
+            r#"cfg_attr(not(test), deprecated(note = concat!("message")))"#,
+            r#"cfg_attr(not(test), deprecated(note = "message"), transform)"#,
+        ] {
+            let document = analyze(&format!("#[{attribute}] mod child;"));
+            assert_eq!(
+                document.symbols()[0].module_path,
+                Some(crate::RustModulePath::Unknown),
+                "{attribute}"
+            );
+        }
+    }
+
+    #[test]
     fn test_module_path_inner_attributes_preserve_unknown_path_state() {
         for text in [
             "mod outer { #![path = \"custom\"] mod child; }",
