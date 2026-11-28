@@ -4200,6 +4200,60 @@ fn non_entry_javascript_member_calls_keep_separate_argument_properties() {
 }
 
 #[test]
+fn class_method_arguments_keep_written_properties_beside_local_names() {
+    const SOURCE: &str = concat!(
+        "export class Builder {\n",
+        "  convert(input) {\n",
+        "    switch (input) {\n",
+        "      case 0: {\n",
+        "        const mode = 'early';\n",
+        "        return this.wrap(input, { mode, length: 1 });\n",
+        "      }\n",
+        "      case 1: {\n",
+        "        const mode = 'late';\n",
+        "        return this.wrap(input, { mode: mode, length: 2 });\n",
+        "      }\n",
+        "      case 2: return this.wrap(input, { mode: 'fallback', length: 3 });\n",
+        "      case 3: return this['wrap'](input, { mode: 'computed' });\n",
+        "      default: return this.wrap(input, { mode: 'skip', mode: 'duplicate' });\n",
+        "    }\n",
+        "  }\n",
+        "  wrap(input, options) { return options; }\n",
+        "}\n",
+    );
+    let collected = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let publication = collected.publication();
+    publication.validate_facts().expect("valid package facts");
+    assert!(
+        publication
+            .declarations
+            .iter()
+            .any(|row| row.source == "length: 1")
+    );
+    let mut identities = BTreeSet::new();
+    for (witness, member) in [
+        ("mode, length", "mode"),
+        ("mode: mode", "mode: mode"),
+        ("mode: 'fallback'", "mode: 'fallback'"),
+    ] {
+        let start = SOURCE.find(witness).expect("written member");
+        let property = publication
+            .declarations
+            .iter()
+            .find(|row| row.source == member && row.range == module_runtime_range(start, member))
+            .expect("physical class method argument");
+        assert!(property.symbol.as_str().contains("/Builder/convert/"));
+        assert!(identities.insert(&property.symbol));
+    }
+    assert!(publication.declarations.iter().all(|row| {
+        !matches!(
+            row.source.as_str(),
+            "mode: 'skip'" | "mode: 'duplicate'" | "mode: 'computed'"
+        )
+    }));
+}
+
+#[test]
 fn non_entry_class_methods_keep_properties_of_returned_call_arguments() {
     const SOURCE: &str = concat!(
         "export class Builder {\n",
