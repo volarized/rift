@@ -771,12 +771,6 @@ fn python_binding_path(
     let mut path = identifier_path(module, ".", work)?;
     if let Some(export) = export {
         path.push(file.text(export)?.to_owned());
-    } else {
-        // `import a.b` binds `a`; the site spells the rest.
-        let name = file.text(binding.name)?;
-        if path.len() > 1 && path.first().is_some_and(|root| root == name) {
-            path.truncate(1);
-        }
     }
     Some(path)
 }

@@ -135,6 +135,27 @@ fn python_sites_name_distributions_builtins_and_standard_modules() {
 }
 
 #[test]
+fn test_python_dotted_imports_retain_same_name_alias_targets() {
+    let source = "import http.client as http\nimport http.server as server\n\
+                  def run(): return http.HTTPConnection('host'), server.HTTPServer()\n";
+    let result = resolution("python", &[("app/main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        targets(&result, ReferenceRole::Import),
+        BTreeSet::from([
+            "rift://symbol/stdlib/cpython/python/http/client",
+            "rift://symbol/stdlib/cpython/python/http/server",
+        ]),
+    );
+    assert_eq!(
+        targets(&result, ReferenceRole::Call),
+        BTreeSet::from([
+            "rift://symbol/stdlib/cpython/python/http/client/HTTPConnection",
+            "rift://symbol/stdlib/cpython/python/http/server/HTTPServer",
+        ]),
+    );
+}
+
+#[test]
 fn typescript_sites_name_packages_and_node_modules() {
     let source = "import { z, ZodType } from \"zod\";\nimport * as fs from \"node:fs\";\n\
                   import parse from \"@scope/parser/sub\";\nimport { near } from \"./near\";\n\
