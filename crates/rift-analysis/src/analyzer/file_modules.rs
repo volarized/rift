@@ -922,8 +922,17 @@ fn file_module_candidates<'file>(
         let previous = explicit || javascript_module_source(owner, file);
         let written = syntax.primary_symbols_len() > 0
             && (previous || proven_receivers.contains(file.placement.unit()));
-        let authored_module =
-            language == "javascript" && authored.contains(path) && !file.file.source().is_empty();
+        let authored_module = !file.file.source().is_empty()
+            && match language {
+                "javascript" => authored.contains(path),
+                "typescript" => {
+                    !crate::static_resolution::is_declaration_file(path)
+                        && syntax.static_facts().is_some_and(|facts| {
+                            facts.has_javascript_module_statement() && !facts.reexports().is_empty()
+                        })
+                }
+                _ => false,
+            };
         let proven = matches!(language, "javascript" | "typescript")
             && (written || authored_module)
             && !syntax.has_errors()

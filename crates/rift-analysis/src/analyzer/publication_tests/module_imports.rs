@@ -9039,3 +9039,87 @@ fn non_entry_typescript_class_keeps_overloads_of_each_method_owner() {
         method("solo", false, 1);
     }
 }
+
+#[test]
+fn checked_typescript_source_reexport_retains_its_module_and_specifier() {
+    const META: &str = r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./dist/index.js","types":"./dist/index.d.ts"}"#;
+    const FACADE: &str = "export { ready } from './worker.js';\n";
+    const USE: &str = "import { ready } from '../index.js';\nexport const observed = ready;\n";
+    fn collect(facade: &str, caller: &str) -> PackageAnalysis {
+        internal_modules::analyze(
+            META,
+            &[
+                ("dist/index.js", "export const ready = 1;\n"),
+                ("dist/index.d.ts", "export declare const ready: number;\n"),
+                ("src/index.ts", facade),
+                ("src/worker.ts", "export const ready = 1;\n"),
+                ("src/tests/check.ts", caller),
+            ],
+        )
+    }
+    let analysis = collect(FACADE, USE);
+    let graph = analysis.publication();
+    graph
+        .validate_facts()
+        .expect("checked selected source module");
+    let source_unit = graph
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "src/index.ts")
+        .expect("selected complete unit");
+    let module = graph
+        .declarations
+        .iter()
+        .find(|row| {
+            row.unit == source_unit.unit
+                && row.range.start == 0
+                && row.source == FACADE
+                && graph.objects.iter().any(|object| {
+                    object.id.as_ref() == Some(&row.symbol)
+                        && object.kinds.contains(&SymbolKind::Module)
+                })
+        })
+        .expect("whole reexport module");
+    let caller = graph
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "src/tests/check.ts")
+        .expect("selected import unit");
+    let specifier = "'../index.js'";
+    let begin = USE.find(specifier).expect("written specifier");
+    let end = begin + specifier.len();
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Imports]
+            && edge.to == module.symbol
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == caller.unit
+                    && usize::try_from(site.range.start) == Ok(begin)
+                    && usize::try_from(site.range.end) == Ok(end)
+            })
+    }));
+    assert!(
+        graph.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::Reads] && edge.to.0.contains("worker.ts/ready")
+        })
+    );
+
+    let missing_target = USE.replace("../index.js", "../absent.js");
+    let missing = collect(FACADE, &missing_target);
+    assert!(
+        !missing
+            .publication()
+            .edges
+            .iter()
+            .any(|edge| { edge.kinds == [EdgeKind::Imports] && edge.to == module.symbol })
+    );
+    for source in ["0;\n", "import './worker.js';\n"] {
+        let without_reexport = collect(source, USE);
+        assert!(
+            !without_reexport
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| row.symbol == module.symbol)
+        );
+    }
+}
