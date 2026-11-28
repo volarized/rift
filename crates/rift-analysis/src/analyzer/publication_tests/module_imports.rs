@@ -5938,6 +5938,55 @@ fn javascript_nested_array_elements_keep_checked_property_owners() {
 }
 
 #[test]
+fn javascript_keeps_written_module_arrow_getter_properties_beside_a_reassignment() {
+    const SOURCE: &str = concat!(
+        "import { install } from './helper.js';\n",
+        "let entry;\n",
+        "install({ entry: () => entry });\n",
+        "install({ entry: () => entry, flag: true });\n",
+        "install({ nested: { entry: () => entry } });\n",
+        "install({ entry: () => entry, entry: () => entry });\n",
+        "entry = () => 1;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "export const root = true;"),
+            ("helper.js", "export function install() {}"),
+            ("register.js", SOURCE),
+        ],
+        None,
+        Some((
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js"}"#,
+        )),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "register.js" && unit.source_complete)
+        .expect("retained module");
+    let written = "entry: () => entry";
+    let retained = SOURCE
+        .match_indices(written)
+        .map(|(offset, _)| {
+            publication.declarations.iter().find(|row| {
+                row.unit == unit.unit
+                    && row.source == written
+                    && row.range == module_runtime_range(offset, written)
+            })
+        })
+        .collect::<Vec<_>>();
+    let first = retained[0].expect("first independent getter property");
+    let second = retained[1].expect("second independent getter property");
+    assert_ne!(first.symbol, second.symbol);
+    assert!(retained[3..].iter().all(Option::is_none));
+}
+
+#[test]
 fn typescript_follows_declarations_from_an_exact_runtime_export_root() {
     const ROOT: &str = "export * from './branch/index.js';";
     const BRANCH: &str = "export { Entry } from './detail.js';";

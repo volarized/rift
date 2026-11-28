@@ -59,6 +59,18 @@ impl JavaScriptSyntaxProvider {
         Self::scoped_call_argument_properties(source, limits, selected, &BTreeMap::new())
     }
 
+    /// Checks written zero-argument arrow properties of direct module call arguments.
+    #[must_use]
+    pub fn module_arrow_argument_properties(
+        source: &str,
+        limits: SyntaxLimits,
+        selected: &BTreeSet<ByteRange>,
+    ) -> BTreeSet<ByteRange> {
+        module_object_members(source, limits, selected.len(), |root, node, range, _| {
+            selected.contains(&range) && direct_arrow_getter(root, node)
+        })
+    }
+
     /// Checks direct argument properties in complete module and function bodies.
     ///
     /// A function case requires the property and its independent class or variable
