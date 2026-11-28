@@ -164,6 +164,28 @@ impl<'source> PackageModes<'source> {
         imports.destination(specifier, typescript, require, || work.charge())
     }
 
+    pub(super) fn exact_import(&self, specifier: &str) -> bool {
+        self.imports
+            .as_ref()
+            .is_some_and(|imports| imports.has_exact(specifier))
+    }
+
+    /// Whether the exact root import points inside a checked nested package scope.
+    pub(super) fn exact_nested_import(&self, specifier: &str, path: &str, work: &mut Work) -> bool {
+        if !self.exact_import(specifier) {
+            return false;
+        }
+        for (end, _) in path.rmatch_indices('/') {
+            if !work.charge() {
+                return false;
+            }
+            if let Some(folder) = self.folder(&path[..end]) {
+                return folder.known;
+            }
+        }
+        false
+    }
+
     pub(super) fn mode(&self, path: &str, work: &mut Work) -> ModuleMode {
         match path.rsplit_once('.').map(|(_, extension)| extension) {
             Some("mjs" | "ts" | "tsx" | "mts" | "cts") => return ModuleMode::Esm,

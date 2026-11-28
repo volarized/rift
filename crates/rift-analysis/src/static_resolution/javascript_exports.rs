@@ -130,13 +130,56 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        self.resolve_file(
-            self.imported_for(from, module, name, work)?,
-            name,
-            mode,
-            role,
-            work,
-        )
+        let imported = if mode == ModuleMode::CommonJs && self.modes.exact_import(module) {
+            package_import_file(self.files, self.modes, from, module, true, work)?
+        } else {
+            self.imported_for(from, module, name, work)?
+        };
+        let mode = if mode == ModuleMode::Esm
+            && module.starts_with('#')
+            && from.document.facts.language().name == "javascript"
+            && self.named_private_commonjs_export(imported, module, name, work)
+        {
+            ModuleMode::CommonJs
+        } else {
+            mode
+        };
+        self.resolve_file(imported, name, mode, role, work)
+    }
+
+    fn named_private_commonjs_export(
+        &self,
+        file: &File<'source>,
+        module: &str,
+        name: &'source str,
+        work: &mut Work,
+    ) -> bool {
+        let path = file.document.path.as_str();
+        if name == "default"
+            || !self.modes.exact_nested_import(module, path, work)
+            || self.modes.mode(path, work) != ModuleMode::CommonJs
+        {
+            return false;
+        }
+        let Some(exports) = file.exports.as_ref() else {
+            return false;
+        };
+        // An ESM import can use a directly written, named CommonJS export at this checked entry.
+        for binding in exports.candidates(ExportSlot::Named(name)) {
+            if !work.charge() {
+                return false;
+            }
+            if binding.kind == SyntaxExportKind::Named
+                && binding.container.is_none()
+                && binding.source.is_none()
+                && file.text(binding.range).is_some_and(|written| {
+                    written.starts_with("exports.") || written.starts_with("module.exports.")
+                })
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub(super) fn resolve_file(

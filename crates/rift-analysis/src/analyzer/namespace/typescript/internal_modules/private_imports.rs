@@ -1,4 +1,6 @@
-//! Declaration modules reached from an exact private package import.
+//! Same-archive modules reached from an exact private package import.
+
+mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -6,16 +8,19 @@ use rift_syntax::StaticBindingKind;
 
 use super::super::PackageImports;
 use super::{
-    NamespaceInput, NestedManifest, PackageFiles, ProjectPath, SelectedFile, declaration_targets,
-    is_declaration_file, is_foreign, is_script, selected_source_is_valid,
+    NamespaceInput, NestedManifest, PackageFiles, PackageMetadata, ProjectPath, SelectedFile,
+    declaration_targets, is_declaration_file, is_foreign, is_script, selected_source_is_valid,
 };
 
-/// Retains the selected declaration closure within the target's nearest package scope.
-pub(super) fn declaration_modules(
+type PackageScopes<'a> = BTreeMap<&'a str, Option<NestedManifest>>;
+
+/// Retains the reached modules within each target's nearest package scope.
+pub(super) fn reached_modules(
     input: &NamespaceInput<'_>,
     files: &PackageFiles<'_>,
     selected: &[SelectedFile<'_>],
     foreign: &BTreeSet<String>,
+    metadata: &PackageMetadata,
 ) -> BTreeSet<ProjectPath> {
     let Some(imports) = (!foreign.is_empty())
         .then(|| PackageImports::captured(input))
@@ -30,18 +35,34 @@ pub(super) fn declaration_modules(
         .chain(input.context_sources())
         .filter_map(|source| {
             let scope = source.path().as_str().strip_suffix("/package.json")?;
-            let valid = source.text().len() <= input.syntax().source_bytes_max()
-                && serde_json::from_str::<NestedManifest>(source.text()).is_ok();
-            Some((scope, valid))
+            let manifest = (source.text().len() <= input.syntax().source_bytes_max())
+                .then(|| serde_json::from_str::<NestedManifest>(source.text()).ok())
+                .flatten();
+            Some((scope, manifest))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<PackageScopes<'_>>();
+    let mut admitted = declaration_modules(input, files, selected, foreign, &imports, &scopes);
+    admitted.extend(runtime::modules(
+        input, files, selected, foreign, &imports, &scopes, metadata,
+    ));
+    admitted
+}
+
+fn declaration_modules(
+    input: &NamespaceInput<'_>,
+    files: &PackageFiles<'_>,
+    selected: &[SelectedFile<'_>],
+    foreign: &BTreeSet<String>,
+    imports: &PackageImports,
+    scopes: &PackageScopes<'_>,
+) -> BTreeSet<ProjectPath> {
     let declarations = selected
         .iter()
         .filter_map(|file| {
             let path = file.path.as_str();
-            let (scope, valid) = nearest_scope(path, &scopes)?;
+            let (scope, manifest) = nearest_scope(path, scopes)?;
             (file.syntax.language().name == "typescript"
-                && valid
+                && manifest.is_some()
                 && is_declaration_file(path)
                 && is_foreign(path, foreign)
                 && !is_script(file)
@@ -50,7 +71,7 @@ pub(super) fn declaration_modules(
             .then_some((file.path, (file, scope)))
         })
         .collect::<BTreeMap<_, _>>();
-    let roots = import_specifiers(input, selected, &scopes).filter_map(|name| {
+    let roots = import_specifiers(input, selected, scopes).filter_map(|name| {
         if !imports.exact.contains_key(name) {
             return None;
         }
@@ -83,18 +104,21 @@ pub(super) fn declaration_modules(
     admitted
 }
 
-fn nearest_scope<'a>(path: &str, scopes: &BTreeMap<&'a str, bool>) -> Option<(&'a str, bool)> {
+fn nearest_scope<'a, 'manifest>(
+    path: &str,
+    scopes: &'manifest PackageScopes<'a>,
+) -> Option<(&'a str, Option<&'manifest NestedManifest>)> {
     path.match_indices('/').rev().find_map(|(end, _)| {
         scopes
             .get_key_value(&path[..end])
-            .map(|(&name, &valid)| (name, valid))
+            .map(|(&name, manifest)| (name, manifest.as_ref()))
     })
 }
 
 fn import_specifiers<'a, 'source>(
     input: &'a NamespaceInput<'_>,
     selected: &'a [SelectedFile<'source>],
-    scopes: &'a BTreeMap<&'source str, bool>,
+    scopes: &'a PackageScopes<'source>,
 ) -> impl Iterator<Item = &'source str> + 'a {
     selected
         .iter()

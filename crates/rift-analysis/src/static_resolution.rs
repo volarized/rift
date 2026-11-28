@@ -4,6 +4,7 @@ mod external;
 mod javascript;
 mod javascript_callbacks;
 mod javascript_edges;
+pub(crate) use javascript_edges::commonjs_literal_require;
 mod javascript_exports;
 mod javascript_member_callbacks;
 mod javascript_members;

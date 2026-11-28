@@ -1098,6 +1098,11 @@ impl PackageImports {
         Some(Self { exact, patterns })
     }
 
+    /// Whether the manifest spells this complete import specifier.
+    pub(crate) fn has_exact(&self, specifier: &str) -> bool {
+        self.exact.contains_key(specifier)
+    }
+
     pub(crate) fn destination(
         &self,
         specifier: &str,

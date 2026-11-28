@@ -6574,6 +6574,162 @@ fn typescript_relative_imports_keep_checked_declarations_beside_runtime_wildcard
     }));
 }
 
+const RUNTIME_PRIVATE_MANIFEST: &str = r#"{"name":"bridge","type":"commonjs"}"#;
+const RUNTIME_PRIVATE_ROOT: &str =
+    "import { start } from '#bridge/start'; export function boot() { return start(); }";
+const RUNTIME_PRIVATE_START: &str = concat!(
+    "const { step } = require('./leaf'); ",
+    "function value(x) { return x; } value(require('./wrapped.cjs')); ",
+    "const { fringe } = require('./other/fringe.cjs'); ",
+    "function opaque(require) { const hidden = require('./hidden.cjs'); return hidden(); } ",
+    "function start() { return step() + fringe(); } exports.start = start;",
+);
+
+fn private_runtime_fixture(root: &str, manifest: &str) -> PackageAnalysis {
+    const MANIFEST: &str = r##"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js","imports":{"#bridge/start":"./bundled/start.cjs","#bridge/unused":"./bundled/unused.cjs"}}"##;
+    const LEAF: &str = "function step() { return 2; } exports.step = step;";
+    fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![
+            ("index.js", root),
+            ("bundled/package.json", manifest),
+            ("bundled/start.cjs", RUNTIME_PRIVATE_START),
+            ("bundled/leaf.js", LEAF),
+            ("bundled/wrapped.cjs", "exports.held = function held() {};"),
+            (
+                "bundled/unused.cjs",
+                "exports.unused = function unused() {};",
+            ),
+            (
+                "bundled/hidden.cjs",
+                "exports.hidden = function hidden() {};",
+            ),
+            ("bundled/other/package.json", RUNTIME_PRIVATE_MANIFEST),
+            (
+                "bundled/other/fringe.cjs",
+                "exports.fringe = function fringe() {};",
+            ),
+            ("neighbor/package.json", RUNTIME_PRIVATE_MANIFEST),
+            ("neighbor/index.cjs", LEAF),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package")
+}
+
+#[test]
+fn checked_private_import_keeps_the_runtime_same_manifest_closure() {
+    for (root, manifest, admitted) in [
+        (RUNTIME_PRIVATE_ROOT, RUNTIME_PRIVATE_MANIFEST, true),
+        (RUNTIME_PRIVATE_ROOT, "{", false),
+        ("export function boot() {}", RUNTIME_PRIVATE_MANIFEST, false),
+    ] {
+        let result = private_runtime_fixture(root, manifest);
+        let graph = result.publication();
+        graph.validate_facts().expect("valid package facts");
+        let unit = |path| {
+            &graph
+                .units
+                .iter()
+                .find(|row| row.path.0 == path && row.source_complete)
+                .expect("retained source")
+                .unit
+        };
+        let declaration = |path, name: &str| {
+            graph.declarations.iter().find(|row| {
+                &row.unit == unit(path) && row.symbol.as_str().ends_with(&format!("/{name}"))
+            })
+        };
+        for (path, name) in [
+            ("bundled/start.cjs", "start"),
+            ("bundled/leaf.js", "step"),
+            ("bundled/wrapped.cjs", "held"),
+        ] {
+            let held = declaration(path, name);
+            assert_eq!(held.is_some(), admitted, "{path}");
+            if let Some(held) = held {
+                assert!(held.source_complete && !held.public);
+                let identity = rift_protocol::identity::SymbolIdentity::parse(held.symbol.as_str())
+                    .expect("checked private module identity");
+                assert_eq!(
+                    identity.qualified_path(),
+                    [format!("beacon/{path}"), name.to_owned()]
+                );
+            }
+        }
+        for path in [
+            "bundled/unused.cjs",
+            "bundled/hidden.cjs",
+            "bundled/other/fringe.cjs",
+            "neighbor/index.cjs",
+        ] {
+            assert!(
+                graph
+                    .declarations
+                    .iter()
+                    .all(|decl| &decl.unit != unit(path)),
+                "{path}"
+            );
+        }
+        if admitted {
+            for (from, from_name, to, to_name, text) in [
+                (
+                    "index.js",
+                    "boot",
+                    "bundled/start.cjs",
+                    "start",
+                    RUNTIME_PRIVATE_ROOT,
+                ),
+                (
+                    "bundled/start.cjs",
+                    "start",
+                    "bundled/leaf.js",
+                    "step",
+                    RUNTIME_PRIVATE_START,
+                ),
+            ] {
+                assert_checked_runtime_call(
+                    graph,
+                    declaration(from, from_name).expect("caller"),
+                    declaration(to, to_name).expect("callee"),
+                    text,
+                    to_name,
+                );
+            }
+        }
+    }
+}
+
+fn assert_checked_runtime_call(
+    graph: &PackagePublication,
+    source: &rift_protocol::index::PackageSymbol,
+    target: &rift_protocol::index::PackageSymbol,
+    text: &str,
+    name: &str,
+) {
+    let call = format!("{name}()");
+    let start = text.find(&call).expect("written call");
+    assert!(
+        graph.edges.iter().any(|edge| {
+            edge.from == source.symbol
+                && edge.to == target.symbol
+                && edge.kinds == [EdgeKind::Calls]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == source.unit && site.range == module_runtime_range(start, &call)
+                })
+        }),
+        "{} calling {} around {start}: {:?}",
+        source.symbol.as_str(),
+        target.symbol.as_str(),
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == source.symbol || edge.to == target.symbol)
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn checked_package_import_reaches_its_private_embedded_declaration_modules() {
     const MANIFEST: &str = r##"{"name":"beacon","version":"1.0.0","type":"module","exports":"./index.js","imports":{"#private":"./embedded/lib/index.js"}}"##;

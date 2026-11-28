@@ -16,8 +16,9 @@ pub(super) use scopes::{class_member_identities, private_local_identities};
 
 /// Names every remaining selected source by its package-relative path.
 ///
-/// An entry or observed file keeps its module. A source of a nested package takes none, and
-/// a path that another file's module or an `exports` subpath spells stays with that one.
+/// An entry or observed file keeps its module. A nested package can supply files reached
+/// through an exact private import. A path that another file's module or an `exports`
+/// subpath spells stays with that one.
 /// With an `exports` map no consumer reaches these files by path, so their declarations are
 /// public only through an alias of a file that a consumer reaches. A name the file declares
 /// in more than one scope takes no identity, since one path would name distinct declarations.
@@ -33,7 +34,7 @@ pub(super) fn prepare(
         return;
     }
     let foreign = foreign_directories(input, &metadata.name);
-    let private = private_imports::declaration_modules(input, files, selected, &foreign);
+    let private = private_imports::reached_modules(input, files, selected, &foreign, metadata);
     let mut modules = held_modules(prepared);
     let relative_types = metadata
         .exports
@@ -332,6 +333,8 @@ fn held_modules(prepared: &PreparedNamespace) -> BTreeMap<(String, String), Opti
 #[derive(Deserialize)]
 struct NestedManifest {
     name: Option<String>,
+    #[serde(rename = "type")]
+    module_type: Option<serde_json::Value>,
 }
 
 /// Directories below the package root whose own manifest names another package, or cannot
