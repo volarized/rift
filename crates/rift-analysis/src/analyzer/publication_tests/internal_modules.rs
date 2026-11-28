@@ -1012,3 +1012,107 @@ fn dual_commonjs_getter_keys_keep_checked_bindings_and_children() {
             })
     );
 }
+
+#[test]
+fn restored_esm_callable_keeps_its_exact_argument_members_and_local_binding() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    const ENTRY: &str =
+        "import { registry } from './helper.js';\nexport const result = registry;\n";
+    const SOURCE: &str = concat!(
+        "const registry = {};\n",
+        "publish(registry, { visit: () => visit });\n",
+        "function visit(parser) {\n",
+        "    const index = 1;\n",
+        "    parser.collect({ type: 'head', index, token: { option: index } });\n",
+        "    parser.collect({ type: 'tail', index, token: { option: index } });\n",
+        "    parser.collect({ type: 'duplicate', type: 'competing' });\n",
+        "    defer(() => { parser.collect({ type: 'deferred' }); });\n",
+        "}\n",
+        "export { registry };\n",
+    );
+    let result = analyze(MANIFEST, &[("index.js", ENTRY), ("helper.js", SOURCE)]);
+    let graph = result.publication();
+    graph
+        .validate_facts()
+        .expect("separate literal and binding facts");
+    let owner = graph
+        .declarations
+        .iter()
+        .find(|row| row.source.starts_with("function visit(") && row.source_complete)
+        .expect("checked visit owner");
+    let container = |symbol: &rift_protocol::read::SymbolId| {
+        graph
+            .objects
+            .iter()
+            .find(|row| row.id.as_ref() == Some(symbol))
+            .and_then(|row| row.container.as_ref())
+    };
+    let direct = graph
+        .declarations
+        .iter()
+        .filter(|row| row.unit == owner.unit && container(&row.symbol) == Some(&owner.symbol))
+        .collect::<Vec<_>>();
+    for written in ["type: 'head'", "type: 'tail'"] {
+        assert!(direct.iter().any(|row| row.source == written));
+    }
+    assert_eq!(
+        direct
+            .iter()
+            .filter(|row| {
+                row.source == "index"
+                    && row.syntax_element_kind.as_deref() == Some("shorthand_property_identifier")
+            })
+            .count(),
+        2
+    );
+    for token in direct
+        .iter()
+        .filter(|row| row.source == "token: { option: index }")
+    {
+        assert!(graph.declarations.iter().any(|row| {
+            row.source == "option: index"
+                && container(&row.symbol) == Some(&token.symbol)
+                && token.range.start < row.range.start
+                && row.range.end < token.range.end
+        }));
+    }
+    assert_eq!(
+        direct
+            .iter()
+            .filter(|row| row.source == "token: { option: index }")
+            .count(),
+        2
+    );
+    assert!(direct.iter().all(|row| !matches!(
+        row.source.as_str(),
+        "type: 'duplicate'" | "type: 'competing'" | "type: 'deferred'"
+    )));
+    assert!(
+        !graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == owner.symbol && edge.kinds == [EdgeKind::Calls])
+    );
+    let local = graph
+        .declarations
+        .iter()
+        .find(|row| row.source == "index = 1")
+        .expect("authored local binding");
+    let refused = SOURCE.replace("() => visit", "() => 0");
+    let open = analyze(MANIFEST, &[("index.js", ENTRY), ("helper.js", &refused)]);
+    let before = open
+        .publication()
+        .declarations
+        .iter()
+        .find(|row| row.source == local.source)
+        .expect("existing local binding");
+    assert_eq!(before.symbol, local.symbol);
+    assert!(
+        !open
+            .publication()
+            .declarations
+            .iter()
+            .any(|row| row.symbol == owner.symbol || row.source == "type: 'head'")
+    );
+}

@@ -24,6 +24,7 @@ mod function_arguments;
 mod mixed_shorthand;
 mod module_assignment_shorthand;
 mod private_return_functions;
+mod restored_arguments;
 mod scoped_initializer_children;
 
 /// Where a declaration binds its name. Two declarations of one qualified name are one entity
