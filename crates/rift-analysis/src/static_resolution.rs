@@ -149,6 +149,8 @@ pub(crate) struct StaticResolution {
     pub(crate) rust_parent_module_start: Option<usize>,
     /// First reference from a written TypeScript export selector to a local declaration.
     pub(crate) typescript_local_export_start: Option<usize>,
+    /// First checked local export selector inside a declaration namespace.
+    pub(crate) typescript_namespace_local_export_start: Option<usize>,
     /// First internal and external Read of an established Python call receiver.
     pub(crate) python_value_qualifier_start: Option<(usize, usize)>,
     /// Class qualifier Reads awaiting remaining edge capacity.
@@ -425,6 +427,7 @@ fn resolve_by<'source>(
     index.resolve_javascript_wrapped_arrow_reads(&mut work, &mut resolution);
     index.resolve_typescript_enum_qualifiers(&mut work, &mut resolution);
     index.resolve_javascript_call_object_selectors(&mut work, &mut resolution);
+    index.resolve_typescript_namespace_local_exports(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

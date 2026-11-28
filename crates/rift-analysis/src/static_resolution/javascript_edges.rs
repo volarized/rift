@@ -15,9 +15,90 @@ use rift_syntax::{
 use super::javascript::{AssignedMemberSite, MemberMode, ModuleMode, js_binding};
 use super::javascript_exports::{self, is_declaration_file, matches_export_form};
 use super::javascript_parameters::ParameterReads;
-use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
+use super::{Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
 impl<'source> Index<'source> {
+    /// References local export names at their written declaration namespace sites.
+    pub(super) fn resolve_typescript_namespace_local_exports(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values() {
+            let facts = file.document.facts;
+            if facts.language().name != "typescript"
+                || !facts.declaration_syntax_complete()
+                || !is_declaration_file(file.document.path.as_str())
+            {
+                continue;
+            }
+            for export in facts
+                .export_bindings()
+                .unwrap_or_default()
+                .iter()
+                .filter(|export| export.container.is_some())
+            {
+                if !work.charge() {
+                    break 'files;
+                }
+                result.record(self.typescript_namespace_local_export(file, export, work));
+            }
+        }
+        result.typescript_namespace_local_export_start =
+            (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn typescript_namespace_local_export(
+        &self,
+        file: &File<'source>,
+        export: &SyntaxExportBinding,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let range = export.local?;
+        if export.kind != SyntaxExportKind::Named
+            || export.source.is_some()
+            || file.by_range.contains_key(&range)
+            || file.blocked(range.start, work)
+            || !matches_export_form(file.text(export.range)?, ModuleMode::Esm)
+        {
+            return None;
+        }
+        let mut scopes = file
+            .by_qualified_name
+            .get(export.container.as_deref()?)?
+            .iter()
+            .filter(|symbol| {
+                symbol.syntax_element_kind == Some("internal_module")
+                    && symbol.item_range.encloses(export.range)
+                    && symbol
+                        .name_range
+                        .and_then(|name| file.text(name))
+                        .is_some_and(|name| name == symbol.name)
+            });
+        let scope = *scopes.next()?;
+        if scopes.next().is_some() {
+            return None;
+        }
+        let name = file.text(range)?;
+        let Binding::Found(binding) = file.binding(name, range.start, |_| true, work) else {
+            return None;
+        };
+        let target = file.target_at(binding.name)?;
+        if export.type_only && !target.symbol.kinds.contains(&SymbolKind::Type) {
+            return None;
+        }
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Unknown, target)?;
+        if !matches!(occurrence.target, NormalizedTarget::Symbol(_)) {
+            return None;
+        }
+        occurrence.edge_from = Some(self.javascript_identity(Target {
+            file: file.document,
+            symbol: scope,
+        })?);
+        Some(occurrence)
+    }
+
     /// Records the enum named by the qualifier of a resolved member type.
     pub(super) fn resolve_typescript_enum_qualifiers(
         &self,

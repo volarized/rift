@@ -7439,3 +7439,59 @@ fn checked_commonjs_default_arrow_keeps_the_selected_entry_and_relative_importer
         }
     }
 }
+
+#[test]
+fn typescript_declaration_namespaces_keep_local_export_selector_references() {
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","types":"./index.d.ts"}"#;
+    const SOURCE: &str = concat!(
+        "declare function build(input: Options): Options;\n",
+        "declare namespace build {\n",
+        "  type Shadow = { inner: string };\n",
+        "  export { Options, Shadow };\n",
+        "  export { Missing };\n",
+        "}\n",
+        "type Options = { count: number };\n",
+        "type Shadow = { outer: number };\n",
+        "export = build;\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("selected TypeScript source");
+    let doc = result.publication();
+    doc.validate_facts().expect("valid package facts");
+    let unit = doc.units.first().expect("retained declaration source");
+    let statement = SOURCE.find("export { Options").expect("written selectors");
+    let selectors = [
+        ("Options", "/Options", statement + "export { ".len()),
+        (
+            "Shadow",
+            "/build/Shadow",
+            statement + "export { Options, ".len(),
+        ),
+    ];
+    for (name, target, at) in selectors {
+        let expected = module_runtime_range(at, name);
+        let mut edges = doc.edges.iter().filter(|edge| {
+            edge.kinds == [EdgeKind::References]
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit.unit && site.range == expected)
+        });
+        let edge = edges.next().expect("checked local selector reference");
+        assert!(edges.next().is_none());
+        assert!(edge.from.as_str().ends_with("/build"));
+        assert!(edge.to.as_str().ends_with(target));
+    }
+    let unresolved = SOURCE.find("Missing").expect("written unresolved selector");
+    assert!(!doc.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::References]
+            && edge.occurrence.as_ref().is_some_and(|site| {
+                site.unit == unit.unit && site.range == module_runtime_range(unresolved, "Missing")
+            })
+    }));
+}
