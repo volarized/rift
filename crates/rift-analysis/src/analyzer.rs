@@ -2280,6 +2280,24 @@ fn javascript_module_source(owner: &SymbolOwner, held: &AnalyzedFile) -> bool {
         })
 }
 
+/// A retained JavaScript literal key can lack its own identity without obscuring the module.
+fn file_module_declarations_retained(file: &AnalyzedFile) -> bool {
+    let syntax = file.file.syntax();
+    let omitted = syntax.left_out_symbols();
+    syntax.left_out_declaration_count() == 0
+        || (syntax.language().name == "javascript"
+            && syntax.left_out_declaration_count() == omitted.len()
+            && omitted.iter().all(|symbol| {
+                symbol.syntax_element_kind == Some("pair")
+                    && matches!(
+                        symbol.name.as_bytes(),
+                        [b'\'', .., b'\''] | [b'"', .., b'"']
+                    )
+                    && symbol.name_range.is_some()
+                    && retained_declaration_ranges(file.file.source(), symbol)
+            }))
+}
+
 fn javascript_declaration_scopes(syntax: &SyntaxFacts) -> Option<crate::EnclosingDefinitions<()>> {
     let expressions = syntax
         .static_facts()?
@@ -2475,7 +2493,7 @@ impl Records {
                         || javascript_module_source(owner, held))
                         && units.get(&unit) == Some(&true)
                         && !syntax.has_errors()
-                        && syntax.left_out_declaration_count() == 0
+                        && file_module_declarations_retained(held)
                         && semantics.edges().edge_module(held.placement.unit()) == Some(module);
                     modules
                         .entry(module)

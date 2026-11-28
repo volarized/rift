@@ -9689,6 +9689,68 @@ fn checked_javascript_export_subpath_keeps_forwarding_module() {
 }
 
 #[test]
+fn retained_literal_name_omission_keeps_other_javascript_module_calls() {
+    const SOURCE: &str = concat!(
+        "const annotate = (target) => target;\n",
+        "const labels = { '\t': 'tab', kept: 1 };\n",
+        "function sample() { return labels.kept; }\n",
+        "annotate(sample);\n",
+        "export { sample };\n",
+    );
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","main":"./index.js"}"#;
+    let collect = |source| {
+        fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", source)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("checked package")
+    };
+    let clean = SOURCE.replace('\t', "ordinary");
+    for source in [&clean, SOURCE] {
+        let collected = collect(source);
+        let publication = collected.publication();
+        publication.validate_facts().expect("valid package facts");
+        let module = checked_module_declaration(publication, "index.js", source)
+            .expect("complete authored module");
+        let target = publication
+            .declarations
+            .iter()
+            .find(|row| row.symbol.as_str().ends_with("/annotate"))
+            .expect("exact arrow binding");
+        let call = "annotate(sample)";
+        let start = source.find(call).expect("written call");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.from == module.symbol
+                && edge.to == target.symbol
+                && edge.kinds == [EdgeKind::Calls]
+                && edge.occurrence.as_ref().is_some_and(|site| {
+                    site.unit == module.unit && site.range == module_runtime_range(start, call)
+                })
+        }));
+        if source == SOURCE {
+            assert!(publication.warnings.iter().any(|warning| matches!(
+                warning,
+                rift_protocol::index::PackageAnalysisWarning::IdentityUnresolved {
+                    qualified_name, ..
+                } if qualified_name.contains('\t')
+            )));
+        }
+    }
+    let missing_name = format!(
+        "{SOURCE}const {} = 1;\n",
+        "a".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1)
+    );
+    let malformed = format!("{SOURCE}const unfinished =");
+    for source in [&missing_name, &malformed] {
+        let collected = collect(source);
+        assert!(checked_module_declaration(collected.publication(), "index.js", source).is_none());
+    }
+}
+
+#[test]
 fn checked_javascript_command_path_keeps_its_written_module() {
     const SOURCE: &str = "#!/usr/bin/env node\nawait import('../worker.mjs');\n";
     for (field, expected) in [

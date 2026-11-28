@@ -15,8 +15,8 @@ use rift_provider::AssembledSymbol;
 
 use super::{
     AnalyzedFile, ExactPackageInput, ExactPackageLimits, Records, bound, digest_of,
-    javascript_module_source, namespace::typescript::JavaScriptModulePaths, truncation, wire_path,
-    wire_unit,
+    file_module_declarations_retained, javascript_module_source,
+    namespace::typescript::JavaScriptModulePaths, truncation, wire_path, wire_unit,
 };
 
 impl Records {
@@ -1004,7 +1004,7 @@ fn file_module_candidates<'file>(
             };
         let proven = (written || authored_module || supplemental)
             && !syntax.has_errors()
-            && syntax.left_out_declaration_count() == 0
+            && file_module_declarations_retained(file)
             && complete.contains(file.placement.unit().to_string().as_str());
         modules
             .entry(module)
