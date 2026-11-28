@@ -8,8 +8,8 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::index::{PackagePublication, PackageSourceUnit, PackageSymbol};
 use rift_protocol::producer::FactProducer;
 use rift_protocol::read::{
-    Digest, ExactKind, ExtensionKey, ExtensionValue, Extensions, SourceKind, Symbol, SymbolId,
-    SymbolKind, TextRange,
+    Digest, ExactKind, ExtensionKey, ExtensionValue, Extensions, SourceKind,
+    SourceUnitId as PublishedUnitId, Symbol, SymbolId, SymbolKind, TextRange,
 };
 use rift_syntax::{
     ByteRange, RustSyntaxProvider, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource,
@@ -18,6 +18,8 @@ use rift_syntax::{
 
 use super::{PackageAnalyzer, bound, digest_of, file_digest, line_of, line_starts};
 use crate::ExactPackageLimits;
+
+mod variant_fields;
 
 /// A Rust macro invocation whose selected owner can be checked through a language server.
 #[derive(Debug, Clone, Copy)]
@@ -101,8 +103,31 @@ impl PackageAnalyzer {
         expansion: &str,
         limits: SyntaxLimits,
     ) -> Vec<SourceRange> {
-        candidates(path, source, invocation, expansion, limits)
+        candidates(path, source, invocation, expansion, limits, false)
             .into_keys()
+            .collect()
+    }
+
+    /// Finds exact written variant field names after their original enum and variant names
+    /// are confirmed. A caller can reserve its remaining definition checks for these fields.
+    #[must_use]
+    pub fn rust_lsp_macro_variant_field_sites(
+        path: &ProjectPath,
+        source: &str,
+        invocation: SourceRange,
+        expansion: &str,
+        limits: SyntaxLimits,
+        confirmed: &[SourceRange],
+    ) -> Vec<SourceRange> {
+        if confirmed.is_empty() || confirmed.len() > limits.syntax_elements_max() {
+            return Vec::new();
+        }
+        let names = unique_claims(confirmed);
+        candidates(path, source, invocation, expansion, limits, true)
+            .into_iter()
+            .filter_map(|(range, candidate)| {
+                candidate.variant_owner?.confirmed(&names).then_some(range)
+            })
             .collect()
     }
 
@@ -286,6 +311,29 @@ struct Candidate {
     relative: Vec<String>,
     kind: ItemKind,
     visibility: Option<String>,
+    variant_owner: Option<VariantOwner>,
+}
+
+struct VariantOwner {
+    enumeration: SourceRange,
+    name: SourceRange,
+}
+
+impl VariantOwner {
+    fn confirmed(&self, names: &BTreeMap<SourceRange, bool>) -> bool {
+        names.get(&self.enumeration) == Some(&true) && names.get(&self.name) == Some(&true)
+    }
+}
+
+fn unique_claims(ranges: &[SourceRange]) -> BTreeMap<SourceRange, bool> {
+    let mut claims = BTreeMap::new();
+    for &range in ranges {
+        claims
+            .entry(range)
+            .and_modify(|unique| *unique = false)
+            .or_insert(true);
+    }
+    claims
 }
 
 fn candidates(
@@ -294,6 +342,7 @@ fn candidates(
     invocation: SourceRange,
     expansion: &str,
     limits: SyntaxLimits,
+    include_variant_fields: bool,
 ) -> BTreeMap<SourceRange, Candidate> {
     let generated = SyntaxSource {
         path,
@@ -320,7 +369,48 @@ fn candidates(
     } else {
         BTreeSet::new()
     };
-    let clean = checked_emitted_items(&emitted, &invalid);
+    let output = primary_candidates(&emitted, &invalid);
+    let mut written = BTreeMap::new();
+    if !rift_syntax::tokens(source, bytes(invocation), limits, |token| {
+        let Some(position) = range(token) else {
+            return false;
+        };
+        if let Some(name) = text_at(source, position)
+            && output.contains_key(name)
+        {
+            written
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(position));
+        }
+        true
+    }) {
+        return BTreeMap::new();
+    }
+    let mut output = output
+        .into_iter()
+        .filter_map(|(name, candidate)| Some((written.get(name).copied().flatten()?, candidate?)))
+        .collect();
+    if include_variant_fields {
+        variant_fields::extend(
+            path,
+            &emitted,
+            &invalid,
+            source,
+            invocation,
+            limits,
+            &mut output,
+        );
+    }
+    output
+}
+
+fn primary_candidates<'source>(
+    emitted: &'source SyntaxDocument,
+    invalid: &BTreeSet<ByteRange>,
+) -> BTreeMap<&'source str, Option<Candidate>> {
+    let facts = emitted.facts();
+    let clean = checked_emitted_items(emitted, invalid);
     let supported = |symbol: &SyntaxSymbol| {
         clean
             .contains(&(symbol.item_range, symbol.syntax_element_kind?))
@@ -359,34 +449,14 @@ fn candidates(
             relative,
             kind,
             visibility: symbol.visibility.clone(),
+            variant_owner: None,
         };
         output
             .entry(symbol.name.as_str())
             .and_modify(|entry| *entry = None)
             .or_insert(Some(candidate));
     }
-
-    let mut written = BTreeMap::new();
-    if !rift_syntax::tokens(source, bytes(invocation), limits, |token| {
-        let Some(position) = range(token) else {
-            return false;
-        };
-        if let Some(name) = text_at(source, position)
-            && output.contains_key(name)
-        {
-            written
-                .entry(name)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(position));
-        }
-        true
-    }) {
-        return BTreeMap::new();
-    }
     output
-        .into_iter()
-        .filter_map(|(name, candidate)| Some((written.get(name).copied().flatten()?, candidate?)))
-        .collect()
 }
 
 fn checked_emitted_items(
@@ -609,21 +679,23 @@ fn collect_file<'a>(
             site.invocation,
             observation.expansion,
             limits,
+            true,
         );
-        let mut claimed = BTreeMap::new();
-        for &range in observation.names {
-            claimed
-                .entry(range)
-                .and_modify(|unique| *unique = false)
-                .or_insert(true);
-        }
-        for (range, unique) in claimed {
+        let claimed = unique_claims(observation.names);
+        for (&range, &unique) in &claimed {
             if range.start() <= site.name.end() || !unique {
                 continue;
             }
             let Some(name) = names.remove(&range) else {
                 continue;
             };
+            if name
+                .variant_owner
+                .as_ref()
+                .is_some_and(|owner| !owner.confirmed(&claimed))
+            {
+                continue;
+            }
             let Some((symbol, parent)) = item_identity(&module, &name.relative) else {
                 continue;
             };
@@ -771,14 +843,27 @@ fn records(
             )
         },
     );
-    for row in output.into_values().flatten() {
-        if !known.contains(&row.parent) {
+    let (fields, primary): (Vec<_>, Vec<_>) = output
+        .into_values()
+        .flatten()
+        .partition(|row| row.name.variant_owner.is_some());
+    let has_fields = !fields.is_empty();
+    let mut variant_anchors = retained_variant_anchors(publication, &fields);
+    for row in primary.into_iter().chain(fields) {
+        if !known.contains(&row.parent)
+            || row.name.variant_owner.as_ref().is_some_and(|owner| {
+                !variant_anchors.contains(&(row.parent.clone(), row.unit.unit.clone(), owner.name))
+            })
+        {
             continue;
         }
         let length = row.range.end() - row.range.start();
         if remaining == 0 || length > record_max || length > bytes_left {
             report.dropped_at_limit += 1;
             continue;
+        }
+        if has_fields && row.name.kind.exact == "variant" {
+            variant_anchors.insert((row.symbol.clone(), row.unit.unit.clone(), row.range));
         }
         append(
             publication,
@@ -793,6 +878,35 @@ fn records(
     }
     report.admitted = declarations.len();
     Ok((objects, declarations, report))
+}
+
+fn retained_variant_anchors(
+    publication: &PackagePublication,
+    fields: &[Observed<'_>],
+) -> BTreeSet<(SymbolId, PublishedUnitId, SourceRange)> {
+    if fields.is_empty() {
+        return BTreeSet::new();
+    }
+    let variants = publication
+        .objects
+        .iter()
+        .filter(|object| object.kinds.contains(&SymbolKind::Variant))
+        .filter_map(|object| object.id.as_ref())
+        .collect::<BTreeSet<_>>();
+    publication
+        .declarations
+        .iter()
+        .filter_map(|declaration| {
+            if declaration.origin.source_kind != SourceKind::Authored
+                || declaration.syntax_element_kind.as_deref() != Some("identifier")
+                || !variants.contains(&declaration.symbol)
+            {
+                return None;
+            }
+            let range = SourceRange::new(declaration.range.start, declaration.range.end).ok()?;
+            Some((declaration.symbol.clone(), declaration.unit.clone(), range))
+        })
+        .collect()
 }
 
 fn append(
@@ -1039,6 +1153,211 @@ pub mod api {
                 assert_eq!(publication, base);
             }
         }
+    }
+
+    const VARIANT_SOURCE: &str = r"
+macro_rules! describe {
+    (pub enum $name:ident<$l:lifetime> {
+        $($variant:ident { $field:ident : $ty:ty } : [$inputs:expr] => [$outputs:expr]),*
+    }) => {
+        pub enum $name<$l> { $($variant { $field: $ty, generated: u8 }),* }
+    };
+}
+describe! {
+    pub enum Node<'a> {
+        Leaf { value: &'a str } : [generated] => [1],
+        Branch { value: u16 } : [0] => [1]
+    }
+}";
+    const VARIANT_EXPANSION: &str = r"
+pub enum Node<'a> {
+    Leaf { value: &'a str, generated: u8 },
+    Branch { value: u16, generated: u8 }
+}";
+
+    #[test]
+    fn variant_field_proof_requires_original_group_and_confirmed_owner() {
+        let path = ProjectPath::new("src/lib.rs").expect("fixture path");
+        let limits = SyntaxLimits::DEFAULT;
+        let source = VARIANT_SOURCE;
+        let site = PackageAnalyzer::rust_lsp_macro_sites(&path, source, limits)[0];
+        let fields = |confirmed| {
+            PackageAnalyzer::rust_lsp_macro_variant_field_sites(
+                &path,
+                source,
+                site.invocation,
+                VARIANT_EXPANSION,
+                limits,
+                confirmed,
+            )
+        };
+        let names = PackageAnalyzer::rust_lsp_macro_name_sites(
+            &path,
+            source,
+            site.invocation,
+            VARIANT_EXPANSION,
+            limits,
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter_map(|&name| text_at(source, name))
+                .collect::<Vec<_>>(),
+            ["Node", "Leaf", "Branch"]
+        );
+        assert!(fields(&names[..1]).is_empty());
+        assert_eq!(fields(&names[..2]).len(), 1);
+        assert_eq!(fields(&names).len(), 2);
+        assert_eq!(fields(&[names[0], names[1], names[1], names[2]]).len(), 1);
+
+        for malformed in ["value: u16, value: u16", "value: "] {
+            let source = source.replace("value: u16", malformed);
+            let site = PackageAnalyzer::rust_lsp_macro_sites(&path, &source, limits)[0];
+            let confirmed = PackageAnalyzer::rust_lsp_macro_name_sites(
+                &path,
+                &source,
+                site.invocation,
+                VARIANT_EXPANSION,
+                limits,
+            );
+            let remaining = PackageAnalyzer::rust_lsp_macro_variant_field_sites(
+                &path,
+                &source,
+                site.invocation,
+                VARIANT_EXPANSION,
+                limits,
+                &confirmed,
+            );
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(text_at(&source, remaining[0]), Some("value"));
+            assert!(remaining[0].start() < confirmed[2].start());
+        }
+    }
+
+    #[test]
+    fn local_expansion_keeps_repeated_field_names_under_their_written_variants() {
+        let path = ProjectPath::new("src/lib.rs").expect("fixture path");
+        let limits = ExactPackageLimits::new(1024, 2 * 1024 * 1024);
+        let site = PackageAnalyzer::rust_lsp_macro_sites(&path, VARIANT_SOURCE, limits.syntax())[0];
+        let mut names = PackageAnalyzer::rust_lsp_macro_name_sites(
+            &path,
+            VARIANT_SOURCE,
+            site.invocation,
+            VARIANT_EXPANSION,
+            limits.syntax(),
+        );
+        names.extend(PackageAnalyzer::rust_lsp_macro_variant_field_sites(
+            &path,
+            VARIANT_SOURCE,
+            site.invocation,
+            VARIANT_EXPANSION,
+            limits.syntax(),
+            &names,
+        ));
+        let definition = VARIANT_SOURCE.find("describe").expect("macro name");
+        let definition = u64::try_from(definition).expect("source offset");
+        let digest = FileDigest::of(VARIANT_SOURCE.as_bytes());
+        let observation = RustLspMacroItems {
+            site,
+            definition: RustLspMacroDefinition {
+                path: &path,
+                digest,
+                range: SourceRange::new(definition, definition + 8).expect("macro range"),
+            },
+            expansion: VARIANT_EXPANSION,
+            names: &names,
+        };
+        let producer = FactProducer {
+            name: ProducerName::parse("rust-analyzer").expect("producer"),
+            revision: ProducerRevision::parse("1").expect("revision"),
+        };
+        let base = authored_macro_fixture(vec![("src/lib.rs", VARIANT_SOURCE)]);
+        let apply = |publication: &mut PackagePublication, observation, limits| {
+            PackageAnalyzer::admit_rust_lsp_macro_items(
+                publication,
+                &[RustLspMacroFile {
+                    path: &path,
+                    digest,
+                    expansions: &[observation],
+                }],
+                &producer,
+                limits,
+            )
+            .expect("bounded scoped field admission")
+        };
+
+        let mut complete = base.clone();
+        assert_eq!(apply(&mut complete, observation, limits).admitted, 5);
+        assert_variant_field_publication(&complete);
+
+        let mut capped = base.clone();
+        let bound = limits
+            .with_declarations(u32::try_from(base.declarations.len() + 3).expect("fixture count"))
+            .expect("fixture bound");
+        let report = apply(&mut capped, observation, bound);
+        assert_eq!((report.admitted, report.dropped_at_limit), (3, 2));
+        assert!(
+            capped
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with("/Node/Leaf"))
+        );
+        assert!(
+            capped
+                .declarations
+                .iter()
+                .any(|row| row.symbol.as_str().ends_with("/Node/Branch"))
+        );
+        assert_eq!(apply(&mut capped, observation, limits).admitted, 2);
+        assert_eq!(capped, complete);
+
+        let mut incomplete = base.clone();
+        let subset = names
+            .iter()
+            .copied()
+            .filter(|&name| text_at(VARIANT_SOURCE, name) != Some("Branch"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            apply(
+                &mut incomplete,
+                RustLspMacroItems {
+                    names: &subset,
+                    ..observation
+                },
+                limits
+            )
+            .admitted,
+            3
+        );
+        assert!(
+            incomplete
+                .declarations
+                .iter()
+                .all(|row| !row.symbol.as_str().contains("/Node/Branch"))
+        );
+    }
+
+    fn assert_variant_field_publication(complete: &PackagePublication) {
+        for (variant, written) in [("Leaf", "value: &'a str"), ("Branch", "value: u16")] {
+            let start = u64::try_from(VARIANT_SOURCE.find(written).expect("written field"))
+                .expect("source offset");
+            let suffix = format!("/Node/{variant}/value");
+            let field = complete
+                .declarations
+                .iter()
+                .find(|row| row.symbol.as_str().ends_with(&suffix))
+                .expect("variant field declaration");
+            assert_eq!(field.source, "value");
+            assert_eq!((field.range.start, field.range.end), (start, start + 5));
+            assert!(field.signature_indices.is_empty());
+        }
+        assert!(
+            complete
+                .declarations
+                .iter()
+                .all(|row| !row.symbol.as_str().ends_with("/generated"))
+        );
+        complete.validate_facts().expect("validated publication");
     }
 
     fn authored_macro_fixture(files: Vec<(&str, &str)>) -> PackagePublication {
