@@ -11,7 +11,7 @@ use rift_syntax::ScopedIdentityAnchors;
 use serde::Deserialize;
 
 mod scopes;
-pub(super) use scopes::private_local_identities;
+pub(super) use scopes::{class_member_identities, private_local_identities};
 
 /// Names every remaining selected source by its package-relative path.
 ///
@@ -89,8 +89,9 @@ pub(super) fn prepare(
         }
         prepared.anchors.remove(path);
         let mut anchors = declaration_anchors(input, file, Some(&module));
-        let physical = module_scoped_anchors(input, file, &mut anchors, &ambient);
-        if prepare_anchors(input, file, &module, anchors, prepared) {
+        let class_members = class_member_identities(file, &anchors);
+        let physical = module_scoped_anchors(input, file, &mut anchors, &ambient, &class_members);
+        if prepare_anchors(input, file, &module, anchors, class_members, prepared) {
             if !physical.is_empty() {
                 prepared
                     .scoped_anchors
@@ -114,6 +115,7 @@ fn module_scoped_anchors(
     file: &SelectedFile<'_>,
     anchors: &mut BTreeMap<String, SymbolId>,
     ambient: &BTreeMap<String, SymbolId>,
+    class_members: &ScopedIdentityAnchors,
 ) -> ScopedIdentityAnchors {
     let scopes = scopes::FileScopes::new(file.syntax, file.source);
     let mut withheld = scopes.repeated_names(file);
@@ -143,7 +145,9 @@ fn module_scoped_anchors(
     scopes.place_scoped_initializer_children(file, anchors, &mut physical);
     scopes.place_disjoint_module_bindings(file, &withheld, anchors, &mut physical);
     anchors.retain(|name, _| {
-        ambient.contains_key(name) || !super::conflicting_assignment_name(name, &withheld)
+        ambient.contains_key(name)
+            || class_members.contains_key(name)
+            || !super::conflicting_assignment_name(name, &withheld)
     });
     if input.release_version().is_none() {
         return physical;

@@ -1317,6 +1317,64 @@ fn package_stores_typescript_imported_type_uses_at_each_written_site() {
 }
 
 #[test]
+fn package_rust_module_keeps_formatter_skip_source_and_call() {
+    let root = "#[rustfmt::skip]\nmod child;\npub fn caller() { child::leaf(); }";
+    let publication = fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![("src/lib.rs", root), ("src/child.rs", "pub fn leaf() {}")],
+        None,
+    )
+    .expect("checked Rust package")
+    .into_parts()
+    .0;
+    let child = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0.as_str() == "src/child.rs")
+        .expect("authored child source");
+    assert!(publication.declarations.iter().any(|declaration| {
+        declaration.symbol.as_str().ends_with("/beacon/child/leaf")
+            && declaration.unit == child.unit
+            && declaration.source == "pub fn leaf() {}"
+    }));
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/beacon/caller")
+            && edge.to.as_str().ends_with("/beacon/child/leaf")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+}
+
+#[test]
+fn package_rust_module_keeps_conditional_deprecation_source_and_call() {
+    let root = r#"
+#[cfg_attr(not(test), deprecated(note = "Use the replacement."))]
+pub mod child;
+#[allow(deprecated)]
+pub fn caller() -> u8 { child::leaf() }
+"#;
+    let publication = fixture::package_result(
+        ShippedLanguage::Rust,
+        vec![
+            ("src/lib.rs", root),
+            ("src/child.rs", "pub fn leaf() -> u8 { 7 }"),
+        ],
+        None,
+    )
+    .expect("checked Rust package")
+    .into_parts()
+    .0;
+    assert!(publication.declarations.iter().any(|declaration| {
+        declaration.symbol.as_str().ends_with("/beacon/child/leaf")
+            && declaration.unit.as_str().ends_with("/src/child.rs")
+    }));
+    assert!(publication.edges.iter().any(|edge| {
+        edge.from.as_str().ends_with("/beacon/caller")
+            && edge.to.as_str().ends_with("/beacon/child/leaf")
+            && edge.kinds == [EdgeKind::Calls]
+    }));
+}
+
+#[test]
 fn package_rust_module_source_facet_keeps_written_declaration_and_existing_caps() {
     let root = "pub mod child; pub fn call() { child::run(); }";
     let child = "// é\npub fn run() {}\n";

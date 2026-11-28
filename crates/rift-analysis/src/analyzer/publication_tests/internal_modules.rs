@@ -492,7 +492,6 @@ fn a_name_declared_in_several_scopes_takes_no_identity() {
         "dup/secret",
         "dup/block",
         "dup/twice",
-        "A/x",
         "E/s",
         "option",
         "build/part",
@@ -501,6 +500,8 @@ fn a_name_declared_in_several_scopes_takes_no_identity() {
     }
     for (name, count) in [
         ("A", 1),
+        ("A/x", 1),
+        ("A/x#1", 1),
         ("A/y", 1),
         ("B/v", 2),
         ("pair", 2),
@@ -513,7 +514,7 @@ fn a_name_declared_in_several_scopes_takes_no_identity() {
     ] {
         assert_eq!(counted.get(name), Some(&count), "{name} {counted:?}");
     }
-    for name in ["helper", "dup", "secret", "block", "x"] {
+    for name in ["helper", "dup", "secret", "block", "s"] {
         assert!(
             analysis
                 .publication()
@@ -654,7 +655,14 @@ export class Overloads { go(a: 1): void; go(a: 2): void; go() {} constructor(rea
 fn an_entry_keeps_the_identities_of_names_in_several_scopes() {
     let analysis = analyze(MAIN, &[("index.js", REPEATED)]);
     let counts = counted(&analysis, "beacon");
-    for (name, count) in [("helper", 1), ("helper#1", 1), ("dup", 2), ("A/x", 2)] {
+    for (name, count) in [
+        ("helper", 1),
+        ("helper#1", 1),
+        ("dup", 2),
+        ("A/x", 1),
+        ("A/x#1", 1),
+        ("E/s", 2),
+    ] {
         assert_eq!(counts.get(name), Some(&count), "{name} {counts:?}");
     }
     let publication = analysis.publication();
@@ -1285,4 +1293,190 @@ fn checked_method_return_pair_keeps_the_separate_read_local() {
                     && site.range.end <= property.range.end
             })
     }));
+}
+const CALLBACK_MANIFEST: &str =
+    r#"{"name":"beacon","version":"1.0.0","main":"./index.js","type":"module"}"#;
+const CALLBACK_BINDINGS: &str = r#"
+import { prepare } from "../index.js";
+suite(() => {
+    check(() => { const marker = prepare(); return marker; });
+    check(() => { const marker = prepare() + 1; return marker; });
+});
+"#;
+
+#[test]
+fn repeated_typescript_bindings_keep_their_admitted_callback_scopes() {
+    let found = analyze(
+        CALLBACK_MANIFEST,
+        &[
+            ("index.js", "export function prepare() { return 3; }"),
+            ("lib/check.ts", CALLBACK_BINDINGS),
+        ],
+    );
+    let publication = found.publication();
+    publication
+        .validate_facts()
+        .expect("valid callback bindings");
+    let markers = publication
+        .objects
+        .iter()
+        .filter(|object| object.name == "marker" && object.id.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2);
+    let mut owners = BTreeSet::new();
+    for (ordinal, spelling) in ["const marker = prepare()", "const marker = prepare() + 1"]
+        .into_iter()
+        .enumerate()
+    {
+        let start = CALLBACK_BINDINGS.find(spelling).expect("written binding");
+        let expected = format!("marker#{ordinal}");
+        let object = markers
+            .iter()
+            .find(|object| {
+                spelled(object.id.as_ref().expect("placed local").as_str()).last()
+                    == Some(&expected)
+            })
+            .expect("separate lexical identity");
+        let binding = publication
+            .declarations
+            .iter()
+            .find(|row| Some(&row.symbol) == object.id.as_ref())
+            .expect("written binding facet");
+        assert_eq!(
+            binding.range.start,
+            u64::try_from(start).expect("source offset")
+        );
+        assert_eq!(binding.source, spelling);
+        assert!(binding.source_complete && !binding.public && object.document_local);
+        let owner = object.container.as_ref().expect("physical callable owner");
+        assert!(owners.insert(owner));
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol == *owner
+                && row.unit == binding.unit
+                && row.source_complete
+                && row.range.start < binding.range.start
+                && binding.range.end < row.range.end
+                && row.syntax_element_kind.as_deref() == Some("arrow_function")
+        }));
+    }
+}
+
+#[test]
+fn typescript_callback_locals_coexist_with_same_spelled_formals() {
+    let source = r#"
+import { prepare } from "../index.js";
+suite(() => {
+    check(() => { const marker = prepare(); return marker; });
+    check(() => { const marker = prepare() + 1; return marker; });
+    check((marker: number) => {
+        consume(marker);
+        {
+            const marker = prepare() + 2;
+            return marker;
+        }
+    });
+});
+"#;
+    let found = analyze(
+        CALLBACK_MANIFEST,
+        &[
+            ("index.js", "export function prepare() { return 3; }"),
+            ("lib/check.ts", source),
+        ],
+    );
+    let publication = found.publication();
+    publication
+        .validate_facts()
+        .expect("valid callback bindings");
+    let bindings = publication
+        .objects
+        .iter()
+        .filter_map(|object| {
+            (object.name == "marker")
+                .then_some(object.id.as_ref())
+                .flatten()
+                .map(|id| (object, id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bindings.len(), 4);
+    let mut owners = BTreeSet::new();
+    let mut shadow_owner = None;
+    for (ordinal, expression) in ["prepare()", "prepare() + 1", "prepare() + 2"]
+        .into_iter()
+        .enumerate()
+    {
+        let written = format!("const marker = {expression}");
+        let expected = format!("marker#{ordinal}");
+        let (object, id) = bindings
+            .iter()
+            .find(|(_, id)| spelled(id.as_str()).last() == Some(&expected))
+            .expect("separate private binding");
+        let facets = publication
+            .declarations
+            .iter()
+            .filter(|row| &row.symbol == *id)
+            .collect::<Vec<_>>();
+        assert_eq!(facets.len(), 1);
+        let binding = facets[0];
+        let start = source.find(&written).expect("written binding");
+        assert_eq!(
+            binding.range.start,
+            u64::try_from(start).expect("source offset")
+        );
+        assert_eq!(binding.source, written);
+        assert!(binding.source_complete && !binding.public && object.document_local);
+        let owner = object.container.as_ref().expect("physical callback");
+        assert!(owners.insert(owner));
+        assert!(publication.declarations.iter().any(|row| {
+            row.symbol == *owner
+                && row.unit == binding.unit
+                && row.range.start < binding.range.start
+                && binding.range.end < row.range.end
+                && row.syntax_element_kind.as_deref() == Some("arrow_function")
+        }));
+        shadow_owner = Some(owner);
+    }
+    let formal = bindings
+        .iter()
+        .find(|(object, _)| object.kinds.contains(&SymbolKind::Parameter))
+        .expect("written arrow formal");
+    let mut expected_formal_path = spelled(shadow_owner.expect("shadowing callback").as_str());
+    expected_formal_path.push("marker".to_owned());
+    assert_eq!(spelled(formal.1.as_str()), expected_formal_path);
+    let facets = publication
+        .declarations
+        .iter()
+        .filter(|row| &row.symbol == formal.1)
+        .collect::<Vec<_>>();
+    assert_eq!(facets.len(), 1);
+    assert_eq!(facets[0].source, "marker");
+    assert_eq!(
+        facets[0].range.start,
+        u64::try_from(source.find("marker:").expect("written parameter")).expect("source offset")
+    );
+}
+
+#[test]
+fn repeated_typescript_bindings_refuse_incomplete_callback_groups() {
+    let missing_owner = CALLBACK_BINDINGS.replace("prepare() + 1", "4");
+    let unsupported = CALLBACK_BINDINGS.replace(
+        "const marker = prepare() + 1; return marker;",
+        "function marker() { return prepare() + 1; } return marker();",
+    );
+    for source in [&missing_owner, &unsupported] {
+        let found = analyze(
+            CALLBACK_MANIFEST,
+            &[
+                ("index.js", "export function prepare() { return 3; }"),
+                ("lib/check.ts", source),
+            ],
+        );
+        assert!(
+            found
+                .publication()
+                .objects
+                .iter()
+                .all(|object| object.name != "marker" || object.id.is_none())
+        );
+    }
 }

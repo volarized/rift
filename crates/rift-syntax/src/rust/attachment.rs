@@ -196,6 +196,9 @@ pub(super) fn module_path(
         else {
             return Ok(crate::RustModulePath::Unknown);
         };
+        if rustfmt_skip(attribute, text) {
+            continue;
+        }
         let Some(name) = semantic_attribute_name(attribute, text) else {
             return Ok(crate::RustModulePath::Unknown);
         };
@@ -217,7 +220,9 @@ pub(super) fn module_path(
             | "forbid"
             | "deprecated"
             | "no_implicit_prelude" => {}
-            "cfg_attr" if documentation_cfg_attribute(attribute, text) => {}
+            "cfg_attr"
+                if documentation_cfg_attribute(attribute, text)
+                    || test_deprecation_attribute(attribute, text) => {}
             "cfg_attr"
                 if visited
                     .syntax_element()
@@ -245,6 +250,25 @@ pub(super) fn module_path(
     }
 }
 
+fn rustfmt_skip(attribute: Node<'_>, text: &str) -> bool {
+    if attribute.has_error() || attribute.named_child_count() != 1 {
+        return false;
+    }
+    let Some(scoped) = attribute
+        .named_child(0)
+        .filter(|node| node.kind() == "scoped_identifier")
+    else {
+        return false;
+    };
+    let component = |field| {
+        scoped
+            .child_by_field_name(field)
+            .filter(|node| node.kind() == "identifier")
+            .and_then(|node| text.get(node.byte_range()))
+    };
+    component("path") == Some("rustfmt") && component("name") == Some("skip")
+}
+
 fn semantic_attribute_name<'source>(
     attribute: Node<'_>,
     text: &'source str,
@@ -255,18 +279,54 @@ fn semantic_attribute_name<'source>(
         .and_then(|syntax_element| text.get(syntax_element.byte_range()))
 }
 
-fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
-    let Some(arguments) = attribute.child_by_field_name("arguments") else {
+fn bounded_cfg_arguments(attribute: Node<'_>) -> Option<Node<'_>> {
+    let arguments = attribute.child_by_field_name("arguments")?;
+    (!attribute.has_error()
+        && attribute.named_child_count() == 2
+        && arguments.kind() == "token_tree"
+        && arguments.end_byte() - arguments.start_byte()
+            <= rift_core::constants::PROJECT_PATH_BYTES_MAX)
+        .then_some(arguments)
+}
+
+fn test_deprecation_attribute(attribute: Node<'_>, text: &str) -> bool {
+    let Some(arguments) = bounded_cfg_arguments(attribute) else {
         return false;
     };
-    if attribute.has_error()
-        || attribute.named_child_count() != 2
-        || arguments.kind() != "token_tree"
-        || arguments.end_byte() - arguments.start_byte()
-            > rift_core::constants::PROJECT_PATH_BYTES_MAX
-    {
+    let token = |group: Node<'_>, index| {
+        group
+            .child(index)
+            .and_then(|node| text.get(node.byte_range()))
+    };
+    let (Some(guard), Some(deprecation)) = (arguments.child(2), arguments.child(5)) else {
         return false;
-    }
+    };
+    arguments.child_count() == 7
+        && token(arguments, 0) == Some("(")
+        && token(arguments, 1) == Some("not")
+        && token(arguments, 3) == Some(",")
+        && token(arguments, 4) == Some("deprecated")
+        && token(arguments, 6) == Some(")")
+        && guard.kind() == "token_tree"
+        && guard.child_count() == 3
+        && token(guard, 0) == Some("(")
+        && token(guard, 1) == Some("test")
+        && token(guard, 2) == Some(")")
+        && deprecation.kind() == "token_tree"
+        && deprecation.child_count() == 5
+        && token(deprecation, 0) == Some("(")
+        && token(deprecation, 1) == Some("note")
+        && token(deprecation, 2) == Some("=")
+        && deprecation
+            .child(3)
+            .is_some_and(|value| matches!(value.kind(), "string_literal" | "raw_string_literal"))
+        && token(deprecation, 4) == Some(")")
+}
+
+fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
+    let Some(arguments) = bounded_cfg_arguments(attribute) else {
+        return false;
+    };
     let token = |index| {
         arguments
             .child(index)
