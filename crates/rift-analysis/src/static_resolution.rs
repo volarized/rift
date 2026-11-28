@@ -16,6 +16,7 @@ mod rust;
 #[cfg(test)]
 mod tests;
 mod typescript_inline_imports;
+mod typescript_property_selectors;
 
 use javascript_parameters::{ParameterReads, ScopedParameterReads};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -84,6 +85,8 @@ pub(crate) struct StaticResolution {
     pub(crate) python_dataclass_initializer_start: Option<usize>,
     /// Primary Calls retained for the last initializer pass.
     pub(crate) pending_dataclass_calls: Vec<(ProjectPath, usize, python_edges::InitializerCalls)>,
+    /// First Read of a target written in a Python assignment expression.
+    pub(crate) python_assignment_expression_start: Option<usize>,
     /// First reference inside a compound Python string annotation.
     pub(crate) python_quoted_type_start: Option<usize>,
     pub(crate) python_overload_parameter_start: Option<usize>,
@@ -176,6 +179,8 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_incomplete_local_export_start: Option<usize>,
     /// First checked type occurrence at a relative inline import qualifier.
     pub(crate) typescript_inline_import_type_start: Option<usize>,
+    /// First appended written TypeScript declaration property selector.
+    pub(crate) typescript_property_selector_start: Option<usize>,
     /// First module edge at a checked inline import specifier.
     pub(crate) typescript_inline_import_module_start: Option<usize>,
     /// First checked reference at a TypeScript enum qualifier.
@@ -433,6 +438,8 @@ fn resolve_by<'source>(
     index.resolve_javascript_call_object_selectors(&mut work, &mut resolution);
     index.resolve_typescript_namespace_local_exports(&mut work, &mut resolution);
     index.resolve_python_dataclass_keywords(&mut work, &mut resolution);
+    index.resolve_python_assignment_expression_reads(&mut work, &mut resolution);
+    index.resolve_typescript_property_selectors(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution
@@ -897,6 +904,7 @@ struct File<'source> {
     /// Supplemental parameter witnesses do not participate in primary binding lookup.
     python_parameters: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     python_loop_bindings: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
+    python_assignment_expression_bindings: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     has_python_property_receiver: bool,
     python_comprehension_bindings: BTreeMap<ByteRange, &'source SyntaxSymbol>,
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -1089,6 +1097,7 @@ impl<'source> File<'source> {
             javascript_shorthand_parameters: BTreeMap::new(),
             python_parameters: BTreeMap::new(),
             python_loop_bindings: BTreeMap::new(),
+            python_assignment_expression_bindings: BTreeMap::new(),
             has_python_property_receiver: false,
             python_comprehension_bindings: BTreeMap::new(),
             classes: EnclosingDefinitions::new([]),
@@ -1402,6 +1411,9 @@ impl<'source> File<'source> {
             } else if symbol.is_python_loop_binding() {
                 self.python_loop_bindings
                     .insert(name, admitted.then_some(symbol));
+            } else if symbol.is_python_assignment_expression_binding() {
+                self.python_assignment_expression_bindings
+                    .insert(name, admitted.then_some(symbol));
             } else if admitted && symbol.is_python_comprehension_binding() {
                 self.python_comprehension_bindings.insert(name, symbol);
             } else if admitted && symbol.is_typescript_type_parameter() {
@@ -1698,7 +1710,11 @@ impl<'source> File<'source> {
 
     fn has_python_local_reads(&self) -> bool {
         self.facts.python_local_reads().iter().any(|(_, name)| {
-            if self.python_loop_bindings.contains_key(name) {
+            if self.python_loop_bindings.contains_key(name)
+                || self
+                    .python_assignment_expression_bindings
+                    .contains_key(name)
+            {
                 return false;
             }
             match self.python_parameters.get(name) {

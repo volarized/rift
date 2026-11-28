@@ -89,6 +89,7 @@ mod conditional_type_members;
 mod inline_import_types;
 mod members;
 mod overload_parameters;
+mod property_selectors;
 pub(crate) mod recovery;
 mod scoped_function_parameters;
 mod shorthand_parameters;
@@ -100,6 +101,8 @@ mod wrapped_parameters;
 pub(crate) use conditional_type_members::check as checked_conditional_type_members;
 pub use inline_import_types::CheckedInlineTypeImport;
 pub(crate) use inline_import_types::check as checked_inline_import_types;
+pub use property_selectors::CheckedPropertySelector;
+pub(crate) use property_selectors::check as checked_property_selectors;
 pub(crate) use wrapped_parameters::arrow_body_with_wrapped_parameters;
 
 use tree_sitter::{Node, Parser};

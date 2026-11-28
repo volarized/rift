@@ -650,8 +650,14 @@ fn entry_modules(
     language: &str,
     has_files: bool,
 ) -> (BTreeMap<ProjectPath, Option<String>>, bool) {
+    let mut declaration_root = (language == "typescript")
+        .then(|| metadata.exports.as_ref()?.direct_root()?.strip_prefix("./"))
+        .flatten()
+        .and_then(|runtime| files.runtime_declaration(runtime));
     let Some(Exports::Subpaths(exports)) = &metadata.exports else {
-        return match entry::resolve(files, metadata, language) {
+        let entry =
+            declaration_root.map_or_else(|| entry::resolve(files, metadata, language), Entry::File);
+        return match entry {
             Entry::File(path) => (BTreeMap::from([(path, Some(metadata.name.clone()))]), false),
             Entry::Unknown => (BTreeMap::new(), has_files),
             Entry::Absent => (BTreeMap::new(), false),
@@ -672,11 +678,16 @@ fn entry_modules(
             unresolved = true;
             continue;
         };
-        let path = target
-            .target(language)
-            .and_then(|path| path.strip_prefix("./"))
-            .filter(|relative| export_subpath_is_valid(relative))
-            .and_then(|relative| ProjectPath::new(relative).ok());
+        let path = (key == ".")
+            .then(|| declaration_root.take())
+            .flatten()
+            .or_else(|| {
+                target
+                    .target(language)
+                    .and_then(|path| path.strip_prefix("./"))
+                    .filter(|relative| export_subpath_is_valid(relative))
+                    .and_then(|relative| ProjectPath::new(relative).ok())
+            });
         let Some(path) = path else {
             unresolved = true;
             continue;
@@ -1227,6 +1238,17 @@ impl Exports {
         };
         let (_, target) = paths.0.iter().find(|(key, _)| key == ".")?;
         Some(target)
+    }
+
+    /// The single authored root path shared by both static consumers.
+    fn direct_root(&self) -> Option<&str> {
+        match self {
+            Self::Direct(path) => Some(path),
+            Self::Subpaths(_) => match self.entry()? {
+                ExportTarget::Direct(path) => Some(path),
+                _ => None,
+            },
+        }
     }
 
     /// Whether the conditions of the package entry name more than one file that is no

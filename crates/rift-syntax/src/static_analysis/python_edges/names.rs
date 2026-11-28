@@ -96,6 +96,7 @@ pub(in crate::static_analysis) struct Names<'source> {
     reads: Vec<ByteRange>,
     direct_locals: BTreeMap<&'source str, BTreeMap<ByteRange, DirectLocal>>,
     loop_locals: BTreeMap<&'source str, BTreeMap<ByteRange, LoopLocal>>,
+    assignment_expressions: BTreeMap<&'source str, BTreeMap<ByteRange, AssignmentExpressionLocal>>,
     receivers: BTreeMap<ByteRange, ByteRange>,
     /// Written names with the scope that holds the target.
     writes: Vec<(ByteRange, ByteRange, NameUse)>,
@@ -103,6 +104,22 @@ pub(in crate::static_analysis) struct Names<'source> {
 }
 
 impl<'source> Names<'source> {
+    pub(super) fn assignment_expression(
+        &mut self,
+        source: &'source str,
+        name: ByteRange,
+        scope: ByteRange,
+        end: u64,
+    ) {
+        if let Some(spelling) = text(source, name) {
+            self.assignment_expressions
+                .entry(spelling)
+                .or_default()
+                .entry(scope)
+                .or_insert(AssignmentExpressionLocal { name, end });
+        }
+    }
+
     pub(super) fn receiver_binding(&mut self, scope: ByteRange, name: ByteRange) {
         self.receivers.insert(scope, name);
     }
@@ -139,6 +156,11 @@ impl<'source> Names<'source> {
                 .or_insert(DirectLocal { name, end, kind });
         }
     }
+}
+
+struct AssignmentExpressionLocal {
+    name: ByteRange,
+    end: u64,
 }
 
 /// A loop target and the written suite where it already has its item.
@@ -400,7 +422,8 @@ impl EdgePythonKinds {
         };
         let assignments = names.direct_locals.get(spelling);
         let loops = names.loop_locals.get(spelling);
-        if assignments.is_none() && loops.is_none() {
+        let expressions = names.assignment_expressions.get(spelling);
+        if assignments.is_none() && loops.is_none() && expressions.is_none() {
             return Ok(());
         }
         let Some(scope) = self.direct_local_read_scope(visited) else {
@@ -409,6 +432,11 @@ impl EdgePythonKinds {
         let inner = byte_range(scope)?;
         if let Some(local) = loops.and_then(|loops| loops.get(&inner))
             && local.body.encloses(range)
+        {
+            facts.python_local_reads.push((range, local.name));
+        }
+        if let Some(local) = expressions.and_then(|expressions| expressions.get(&inner))
+            && local.end <= range.start
         {
             facts.python_local_reads.push((range, local.name));
         }

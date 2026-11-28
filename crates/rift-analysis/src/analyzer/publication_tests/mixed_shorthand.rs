@@ -313,6 +313,31 @@ fn returned_shorthand_keeps_function_scoped_binding() {
 }
 
 #[test]
+fn returned_shorthand_keeps_arrow_initializer_binding() {
+    const SOURCE: &str = concat!(
+        "export const collect = (input) => {\n",
+        "    const data = [];\n",
+        "    data.push(input);\n",
+        "    return { data };\n",
+        "};\n",
+    );
+    assert_return_shorthand(SOURCE, None);
+}
+
+#[test]
+fn returned_properties_keep_explicit_pair_before_local_binding() {
+    const SOURCE: &str = concat!(
+        "export function collect(input) {\n",
+        "    if (!input) return { data: [] };\n",
+        "    const data = [];\n",
+        "    data.push(input);\n",
+        "    return { data };\n",
+        "}\n",
+    );
+    assert_return_shorthand(SOURCE, Some("data: []"));
+}
+
+#[test]
 fn returned_pairs_keep_checked_lexical_binding_inside_its_scope() {
     const SOURCE: &str = concat!(
         "export function collect(input) {\n",

@@ -369,6 +369,7 @@ fn identity_anchors_with_roots(
     for symbol in syntax.symbols() {
         if (symbol.is_python_parameter()
             || symbol.is_python_loop_binding()
+            || symbol.is_python_assignment_expression_binding()
             || symbol.is_python_comprehension_binding())
             && (input.release_version().is_none()
                 || !matches!(

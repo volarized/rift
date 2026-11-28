@@ -220,9 +220,7 @@ impl EdgePythonKinds {
                 self.edge_direct_local(visited, target, source, names)?;
             }
         } else if id == self.named {
-            if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
-                self.edge_shadow(name, visited, source, facts, names)?;
-            }
+            self.edge_named_expression(visited, source, facts, names)?;
         } else if id == self.names.type_alias {
             self.edge_type_alias(visited, facts)?;
         } else if id == self.type_parameter_default {
@@ -787,6 +785,28 @@ impl EdgePythonKinds {
         } else {
             rift_core::ReferenceRole::Type
         }
+    }
+
+    fn edge_named_expression<'source>(
+        &self,
+        visited: Visited<'_, '_>,
+        source: &'source str,
+        facts: &mut StaticFactsParts,
+        names: &mut Names<'source>,
+    ) -> Result<(), RiftError> {
+        let expression = visited.syntax_element();
+        if let Some(name) = expression.child_by_field_id(self.name.get()) {
+            self.edge_shadow(name, visited, source, facts, names)?;
+            if let Some(owner) = crate::python::direct_assignment_expression_owner(expression) {
+                names.assignment_expression(
+                    source,
+                    byte_range(name)?,
+                    self.scope_range(owner)?,
+                    byte_range(expression)?.end,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn edge_shadow<'source>(

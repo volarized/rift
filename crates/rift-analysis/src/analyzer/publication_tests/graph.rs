@@ -444,6 +444,124 @@ fn package_python_method_receiver_reads_follow_earlier_edges() {
 }
 
 #[test]
+fn package_python_assignment_expressions_keep_the_target_and_reads() {
+    const SOURCE: &str = concat!(
+        "def target(): return 0\n",
+        "def observed(value):\n",
+        "    early = target\n",
+        "    ordinary = value\n",
+        "    if (target := value) and target:\n",
+        "        return target, ordinary\n",
+        "    return target\n",
+    );
+    const SYMBOL: &str = "rift://symbol/pypi/pypi.org/click/python/click/observed/target";
+    let files = [("click.py", SOURCE)];
+    let complete = publication(&files, None, &["click"]);
+    let offset =
+        |written| u64::try_from(SOURCE.find(written).expect("written target")).expect("offset");
+    let declarations = complete
+        .declarations
+        .iter()
+        .filter(|entry| entry.symbol.as_str() == SYMBOL)
+        .map(|entry| (entry.range.start, entry.range.end, entry.source.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declarations,
+        [(offset("target :="), offset("target :=") + 6, "target")]
+    );
+    let reads = complete
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::Reads] && edge.to.as_str() == SYMBOL)
+        .map(|edge| {
+            let occurrence = edge.occurrence.as_ref().expect("written read");
+            assert!(edge.from.as_str().ends_with("/observed"));
+            assert_eq!(occurrence.range.end, occurrence.range.start + 6);
+            occurrence.range.start
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            offset("target:\n"),
+            offset("target, ordinary"),
+            offset("    return target\n") + 11,
+        ],
+    );
+    let incumbent_edges = complete
+        .edges
+        .iter()
+        .filter(|edge| edge.to.as_str() != SYMBOL)
+        .cloned()
+        .collect::<Vec<_>>();
+    let capped = python_publication_with_limits(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration::default(),
+        Some(incumbent_edges.len()),
+    );
+    assert_eq!(capped.declarations, complete.declarations);
+    assert_eq!(capped.edges, incumbent_edges);
+    let incumbent_declarations = complete
+        .declarations
+        .iter()
+        .filter(|entry| entry.symbol.as_str() != SYMBOL)
+        .cloned()
+        .collect::<Vec<_>>();
+    let capped_symbols = publication_with_configuration(
+        &files,
+        None,
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: u32::try_from(incumbent_declarations.len()).expect("declaration count"),
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    assert_eq!(capped_symbols.declarations, incumbent_declarations);
+    assert_eq!(capped_symbols.edges, incumbent_edges);
+}
+
+#[test]
+fn package_python_assignment_expression_targets_preserve_existing_owners() {
+    const SOURCE: &str = concat!(
+        "global_name = 0\n",
+        "def existing(value):\n",
+        "    local = value\n",
+        "    if (local := 0): return local\n",
+        "    return local\n",
+        "def redirected(value):\n",
+        "    global global_name\n",
+        "    if (global_name := value): return global_name\n",
+        "def guarded(value):\n",
+        "    if value and (local := 0): pass\n",
+        "    return local\n",
+    );
+    let result = publication(&[("click.py", SOURCE)], None, &["click"]);
+    assert_eq!(
+        result
+            .declarations
+            .iter()
+            .filter(|entry| entry.symbol.as_str().ends_with("/existing/local"))
+            .map(|entry| entry.source.as_str())
+            .collect::<Vec<_>>(),
+        ["local = value"],
+    );
+    assert!(
+        result
+            .declarations
+            .iter()
+            .all(|entry| { !entry.symbol.as_str().ends_with("/redirected/global_name") })
+    );
+    assert!(result.declarations.iter().any(|entry| {
+        entry.symbol.as_str().ends_with("/guarded/local") && entry.source == "local"
+    }));
+    assert!(result.edges.iter().all(|edge| {
+        !(edge.kinds == [EdgeKind::Reads] && edge.to.as_str().ends_with("/guarded/local"))
+    }));
+}
+
+#[test]
 fn package_python_loop_targets_keep_authored_declarations() {
     const SOURCE: &str = concat!(
         "def collect(items):\n",

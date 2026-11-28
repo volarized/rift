@@ -74,9 +74,12 @@ mod retained_tests;
 mod rust_lsp_declarations;
 mod rust_lsp_macro_items;
 pub use rust_lsp_macro_items::{
-    RustLspMacroAdmission, RustLspMacroDefinition, RustLspMacroFile, RustLspMacroItems,
-    RustLspMacroSite,
+    RustLspForeignDeclarationFile, RustLspMacroAdmission, RustLspMacroConstantFile,
+    RustLspMacroDefinition, RustLspMacroDependency, RustLspMacroFile, RustLspMacroItems,
+    RustLspMacroSite, RustLspTraitMethodFile,
 };
+mod rust_lsp_macro_references;
+pub use rust_lsp_macro_references::{RustLspMacroReference, RustLspMacroReferenceEdges};
 mod rust_lsp_operators;
 
 use join::ModuleRole;
@@ -573,6 +576,7 @@ struct BindingDemands {
     python_parameters: BindingDemand,
     python_receivers: BindingDemand,
     python_loop_bindings: BindingDemand,
+    python_assignment_expression_bindings: BindingDemand,
     python_comprehension_bindings: BindingDemand,
     python_variadic_parameters: BindingDemand,
     python_overload_parameters: BindingDemand,
@@ -645,6 +649,8 @@ impl BindingDemands {
                     &mut demands.rust_parameters
                 } else if symbol.is_python_loop_binding() {
                     &mut demands.python_loop_bindings
+                } else if symbol.is_python_assignment_expression_binding() {
+                    &mut demands.python_assignment_expression_bindings
                 } else if symbol.is_python_comprehension_binding() {
                     &mut demands.python_comprehension_bindings
                 } else {
@@ -662,6 +668,7 @@ impl BindingDemands {
             + self.python_parameters.count
             + self.python_receivers.count
             + self.python_loop_bindings.count
+            + self.python_assignment_expression_bindings.count
             + self.python_comprehension_bindings.count
             + self.python_variadic_parameters.count
             + self.python_overload_parameters.count
@@ -764,6 +771,7 @@ fn binding_capacity(
             [
                 &demands.python_comprehension_bindings,
                 &demands.python_property_receivers,
+                &demands.python_assignment_expression_bindings,
             ],
             (slots, bytes),
             record,
@@ -812,7 +820,11 @@ impl EcmaScriptBindingDemand {
             rust_macro_methods,
             rust_disjoint,
         ]: [&BindingDemand; 4],
-        [python_comprehensions, python_property_receivers]: [&BindingDemand; 2],
+        [
+            python_comprehensions,
+            python_property_receivers,
+            python_assignment_expressions,
+        ]: [&BindingDemand; 3],
         (mut slots, mut bytes): (usize, u64),
         record: u64,
         established: &rift_syntax::PackageBindingSlots,
@@ -847,6 +859,7 @@ impl EcmaScriptBindingDemand {
             callable_rest_slots,
             callable_pattern_slots,
             typed_arrow_argument_slots,
+            assignment_expression_slots,
         ] = reserve_scoped_parameters(
             documents,
             [
@@ -879,6 +892,7 @@ impl EcmaScriptBindingDemand {
                 &self.typescript_callable_rest,
                 &self.typescript_callable_pattern,
                 &self.typescript_argument_callbacks,
+                python_assignment_expressions,
             ],
             &mut slots,
             &mut bytes,
@@ -914,6 +928,7 @@ impl EcmaScriptBindingDemand {
             .with_typescript_callable_type_rest_parameters(callable_rest_slots)
             .with_typescript_callable_type_pattern_parameters(callable_pattern_slots)
             .with_typescript_argument_callback_parameters(typed_arrow_argument_slots)
+            .with_python_assignment_expression_binding_slots(assignment_expression_slots)
     }
 
     fn classify(

@@ -54,6 +54,12 @@ enum LocalReadScope {
     Reassigned(Scope),
 }
 
+#[derive(Clone, Copy)]
+enum SupplementalLocalBinding {
+    Loop,
+    AssignmentExpression,
+}
+
 impl<'source> Index<'source> {
     /// Records direct function-local reads after all earlier reference work.
     pub(in crate::static_resolution) fn python_local_reads(
@@ -65,7 +71,11 @@ impl<'source> Index<'source> {
     ) -> Vec<ReassignedLocalRead<'source>> {
         let mut reassigned = Vec::new();
         for &(read, name) in file.facts.python_local_reads() {
-            if file.python_loop_bindings.contains_key(&name) {
+            if file.python_loop_bindings.contains_key(&name)
+                || file
+                    .python_assignment_expression_bindings
+                    .contains_key(&name)
+            {
                 continue;
             }
             let target = match file.python_parameters.get(&name) {
@@ -173,7 +183,11 @@ impl<'source> Index<'source> {
                 .python_property_receiver_start
                 .get_or_insert(result.occurrences.len());
             for &(read, name) in file.facts.python_local_reads() {
-                if file.python_loop_bindings.contains_key(&name) {
+                if file.python_loop_bindings.contains_key(&name)
+                    || file
+                        .python_assignment_expression_bindings
+                        .contains_key(&name)
+                {
                     continue;
                 }
                 if !work.charge() {
@@ -280,12 +294,41 @@ impl<'source> Index<'source> {
         result: &mut StaticResolution,
     ) {
         result.python_loop_read_start = Some(result.occurrences.len());
-        for file in self
-            .python_files()
-            .filter(|file| !file.python_loop_bindings.is_empty())
-        {
+        self.resolve_python_supplemental_local_reads(SupplementalLocalBinding::Loop, work, result);
+    }
+
+    /// Resolves file-local reads of an established assignment expression.
+    pub(in crate::static_resolution) fn resolve_python_assignment_expression_reads(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        result.python_assignment_expression_start = Some(result.occurrences.len());
+        self.resolve_python_supplemental_local_reads(
+            SupplementalLocalBinding::AssignmentExpression,
+            work,
+            result,
+        );
+    }
+
+    fn resolve_python_supplemental_local_reads(
+        &self,
+        kind: SupplementalLocalBinding,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for file in self.python_files() {
+            let bindings = match kind {
+                SupplementalLocalBinding::Loop => &file.python_loop_bindings,
+                SupplementalLocalBinding::AssignmentExpression => {
+                    &file.python_assignment_expression_bindings
+                }
+            };
+            if bindings.is_empty() {
+                continue;
+            }
             for &(read, name) in file.facts.python_local_reads() {
-                let Some(&Some(symbol)) = file.python_loop_bindings.get(&name) else {
+                let Some(&Some(symbol)) = bindings.get(&name) else {
                     continue;
                 };
                 if !work.charge() {
@@ -830,7 +873,9 @@ impl<'source> File<'source> {
         let in_scope = if target.symbol.is_python_parameter() {
             caller.symbol.item_range.encloses(item) && item.end <= body.start
         } else {
-            (target.symbol.kind == "variable" || target.symbol.is_python_loop_binding())
+            (target.symbol.kind == "variable"
+                || target.symbol.is_python_loop_binding()
+                || target.symbol.is_python_assignment_expression_binding())
                 && body.encloses(item)
         };
         if !in_scope

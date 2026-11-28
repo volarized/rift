@@ -174,6 +174,12 @@ impl SyntaxSymbol {
         self.kind == crate::python::LOOP_BINDING_KIND_WORD
     }
 
+    /// Whether this is the physical name an assignment expression binds.
+    #[must_use]
+    pub fn is_python_assignment_expression_binding(&self) -> bool {
+        self.kind == crate::python::ASSIGNMENT_EXPRESSION_BINDING_KIND
+    }
+
     /// Whether this is the physical name of a Python comprehension target.
     #[must_use]
     pub fn is_python_comprehension_binding(&self) -> bool {
@@ -387,6 +393,7 @@ impl SyntaxSymbol {
             || self.is_rust_macro_method()
             || self.is_python_parameter()
             || self.is_python_loop_binding()
+            || self.is_python_assignment_expression_binding()
             || self.is_python_comprehension_binding()
             || self.is_ecmascript_package_binding()
     }
