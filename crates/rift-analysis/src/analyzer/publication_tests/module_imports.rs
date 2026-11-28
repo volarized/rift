@@ -5312,6 +5312,93 @@ fn javascript_array_records_keep_separate_written_properties() {
 }
 
 #[test]
+fn checked_local_assignments_keep_exact_literal_properties_under_the_written_function() {
+    const SOURCE: &str = concat!(
+        "export function build(ready) {\n",
+        "  let token;\n",
+        "  if (ready) token = { kind: 'ready', line: 1 };\n",
+        "  else token = { kind: 'pending', line: 2 };\n",
+        "  token = { settled: true };\n",
+        "  token.entries = [{ kind: 'nested', line: 3 }];\n",
+        "  return token;\n",
+        "}\n",
+    );
+    let analysis = non_entry_lexical_binding_analysis(SOURCE, 64);
+    let found = analysis.publication();
+    found
+        .validate_facts()
+        .expect("complete authored declarations");
+    let function = found
+        .declarations
+        .iter()
+        .find(|row| row.symbol.as_str().ends_with("/build"))
+        .expect("named function");
+    let mut identities = BTreeSet::new();
+    for text in [
+        "kind: 'ready'",
+        "line: 1",
+        "kind: 'pending'",
+        "line: 2",
+        "kind: 'nested'",
+        "line: 3",
+    ] {
+        let start = SOURCE.find(text).expect("written property");
+        let row = found
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == function.unit
+                    && row.range == module_runtime_range(start, text)
+                    && row.source_complete
+                    && row.source == text
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("exact literal property");
+        assert!(identities.insert(&row.symbol));
+        assert!(found.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&function.symbol)
+        }));
+    }
+    assert_eq!(
+        found
+            .declarations
+            .iter()
+            .filter(|row| row.source == "token")
+            .count(),
+        1
+    );
+    assert!(
+        !found
+            .declarations
+            .iter()
+            .any(|row| row.source == "token.entries")
+    );
+    for source in [
+        SOURCE.replace("  let token;\n", ""),
+        SOURCE.replace("token.entries =", "token['entries'] ="),
+        SOURCE.replace("token = { settled: true };", "token = ready;"),
+        SOURCE.replace(
+            "token = { settled: true };",
+            "if (ready) { token = { settled: true }; }",
+        ),
+        SOURCE.replace(
+            "  token.entries = [{ kind: 'nested', line: 3 }];",
+            "  { let token; token.entries = [{ kind: 'nested', line: 3 }]; }",
+        ),
+    ] {
+        let control = non_entry_lexical_binding_analysis(&source, 64);
+        assert!(
+            !control
+                .publication()
+                .declarations
+                .iter()
+                .any(|row| row.source == "kind: 'nested'")
+        );
+    }
+}
+
+#[test]
 fn commonjs_named_export_arrays_keep_properties_under_their_written_slots() {
     const SOURCE: &str = concat!(
         "const control = { preserved: 1 };\n",
@@ -6988,4 +7075,215 @@ fn written_argument_properties_keep_the_same_callback_without_a_call_target() {
         0,
     );
     assert_eq!(resolved, unresolved);
+}
+
+#[test]
+fn typescript_enum_members_keep_references_at_their_written_qualifiers() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"module","types":"./index.d.ts"}"#;
+    const SOURCE: &str = concat!(
+        "import { Status as State, Details } from './codes.js';\n",
+        "export type Report = State.Ready | State.Waiting;\n",
+        "export type UnknownMember = State.Missing;\n",
+        "export type UnknownEnum = Other.Ready;\n",
+        "export type Detail = Details.Leaf;\n",
+    );
+    const TARGET: &str = concat!(
+        "export declare enum Status { Ready = 1, Waiting = 2 }\n",
+        "export declare namespace Details { type Leaf = number; }\n",
+    );
+    let result = fixture::package_result_with_metadata(
+        ShippedLanguage::TypeScript,
+        vec![("index.d.ts", SOURCE), ("codes.d.ts", TARGET)],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked package");
+    let publication = result.publication();
+    publication.validate_facts().expect("valid package facts");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "index.d.ts")
+        .expect("retained source");
+    let qualifiers = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kinds == [EdgeKind::References])
+        .filter_map(|edge| {
+            let site = edge.occurrence.as_ref()?;
+            (site.unit == unit.unit).then_some((
+                edge.from.as_str(),
+                edge.to.as_str(),
+                site.range.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(qualifiers.len(), 2);
+    for (member, target) in [("State.Ready", "/Ready"), ("State.Waiting", "/Waiting")] {
+        let start = SOURCE.find(member).expect("written type");
+        let range = module_runtime_range(start, "State");
+        assert!(qualifiers.iter().any(|(from, to, site)| {
+            from.ends_with("/Report") && to.ends_with("codes.d.ts/Status") && *site == range
+        }));
+        let range = module_runtime_range(start, member);
+        let target = format!("codes.d.ts/Status{target}");
+        assert!(publication.edges.iter().any(|edge| {
+            edge.kinds == [EdgeKind::HasType]
+                && edge.from.as_str().ends_with("/Report")
+                && edge.to.as_str().ends_with(&target)
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|site| site.unit == unit.unit && site.range == range)
+        }));
+    }
+}
+
+#[test]
+fn closed_anonymous_commonjs_callable_keeps_its_exact_literal_properties() {
+    const ENTRY: &str = "const build = require('./worker.js');\nmodule.exports = build;\n";
+    const WORKER: &str = concat!(
+        "module.exports = function (ready) {\n",
+        "    const results = [];\n",
+        "    if (ready) results.push({ kind: 'ready', line: 1 });\n",
+        "    else results.push({ kind: 'pending', line: 2 });\n",
+        "    return results;\n",
+        "};\n",
+    );
+    const MANIFEST: &str = r#"{"name":"beacon","version":"1.0.0","main":"./index.js"}"#;
+    let closed = |worker: &str| {
+        let analysis = fixture::package_result_with_metadata(
+            ShippedLanguage::JavaScript,
+            vec![("index.js", ENTRY), ("worker.js", worker)],
+            None,
+            Some(("package.json", MANIFEST)),
+        )
+        .expect("analyzed source");
+        analysis
+            .publication()
+            .validate_facts()
+            .expect("valid source");
+        analysis.into_parts().0
+    };
+    let publication = closed(WORKER);
+    let module = publication
+        .declarations
+        .iter()
+        .find(|row| row.source_complete && row.source == WORKER)
+        .expect("complete worker module");
+    let callable = publication
+        .declarations
+        .iter()
+        .find(|row| {
+            row.unit == module.unit
+                && row.syntax_element_kind.as_deref() == Some("assignment_expression")
+                && row.symbol.as_str().ends_with("/default")
+        })
+        .expect("existing physical default callable");
+    let mut properties = BTreeSet::new();
+    for text in ["kind: 'ready'", "line: 1", "kind: 'pending'", "line: 2"] {
+        let start = u64::try_from(WORKER.find(text).expect("written property")).expect("offset");
+        let row = publication
+            .declarations
+            .iter()
+            .find(|row| {
+                row.unit == module.unit
+                    && row.range.start == start
+                    && row.source_complete
+                    && row.source == text
+                    && row.syntax_element_kind.as_deref() == Some("pair")
+            })
+            .expect("complete written property");
+        assert!(properties.insert(&row.symbol));
+        assert!(publication.objects.iter().any(|object| {
+            object.id.as_ref() == Some(&row.symbol)
+                && object.container.as_ref() == Some(&callable.symbol)
+        }));
+    }
+    for worker in [
+        format!("if (enabled) {{ {WORKER} }}"),
+        format!("{WORKER} if (enabled) module.exports = other;"),
+        format!("{WORKER} inspect(module);"),
+        WORKER.replace("function (ready)", "async function (ready)"),
+    ] {
+        assert!(!closed(&worker).declarations.iter().any(|row| {
+            row.source == worker || row.source == "kind: 'ready'" || row.source == "line: 1"
+        }));
+    }
+}
+
+#[test]
+fn checked_commonjs_loads_keep_reads_of_the_required_namespace() {
+    const MANIFEST: &str =
+        r#"{"name":"beacon","version":"1.0.0","type":"commonjs","main":"./index.js"}"#;
+    const SOURCE: &str = concat!(
+        "const helper = require('./helper');\n",
+        "function run() { return helper.apply(); }\n",
+        "function shadow(helper) { return helper.apply(); }\n",
+        "let changing = require('./helper');\n",
+        "changing = {};\n",
+        "function ignore() { return changing.apply(); }\n",
+    );
+    let analysis = fixture::package_result_with_metadata(
+        ShippedLanguage::JavaScript,
+        vec![
+            ("index.js", "module.exports = require('./helper');\n"),
+            (
+                "helper.js",
+                "function apply() { return 7; }\nmodule.exports = { apply };\n",
+            ),
+            ("secondary.js", SOURCE),
+        ],
+        None,
+        Some(("package.json", MANIFEST)),
+    )
+    .expect("checked CommonJS sources");
+    let publication = analysis.publication();
+    publication.validate_facts().expect("valid facts");
+    let site = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "secondary.js")
+        .expect("secondary source");
+    let receiver = SOURCE.find("helper.apply").expect("written receiver");
+    let receiver_range = module_runtime_range(receiver, "helper");
+    let reads = publication
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kinds == [EdgeKind::Reads]
+                && edge.to.as_str().ends_with("beacon%2Fhelper.js")
+                && edge
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|span| span.unit == site.unit)
+        })
+        .collect::<Vec<_>>();
+    let [read] = reads.as_slice() else {
+        panic!("expected one checked receiver Read, got {reads:?}");
+    };
+    assert!(read.from.as_str().ends_with("secondary.js/run"));
+    assert_eq!(
+        read.occurrence.as_ref().expect("receiver span").range,
+        receiver_range
+    );
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Reads]
+            && edge.from == read.from
+            && edge.to.as_str().ends_with("secondary.js/helper")
+            && edge
+                .occurrence
+                .as_ref()
+                .is_some_and(|span| span.unit == site.unit && span.range == receiver_range)
+    }));
+    assert!(publication.edges.iter().any(|edge| {
+        edge.kinds == [EdgeKind::Calls]
+            && edge.from == read.from
+            && edge.to.as_str().ends_with("helper.js/apply")
+            && edge.occurrence.as_ref().is_some_and(|span| {
+                span.unit == site.unit
+                    && span.range == module_runtime_range(receiver, "helper.apply()")
+            })
+    }));
 }

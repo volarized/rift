@@ -18,6 +18,81 @@ use super::javascript_parameters::ParameterReads;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
 
 impl<'source> Index<'source> {
+    /// Records the enum named by the qualifier of a resolved member type.
+    pub(super) fn resolve_typescript_enum_qualifiers(
+        &self,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        let start = result.occurrences.len();
+        'files: for file in self.files.values() {
+            if file.document.facts.language().name != "typescript" {
+                continue;
+            }
+            for reference in file
+                .facts
+                .references()
+                .iter()
+                .filter(|reference| reference.role == ReferenceRole::Type)
+            {
+                let range = reference.target;
+                let Some((qualifier, member)) =
+                    file.text(range).and_then(|text| text.split_once('.'))
+                else {
+                    continue;
+                };
+                if member.contains('.') {
+                    continue;
+                }
+                if !work.charge() {
+                    break 'files;
+                }
+                let Ok(width) = u64::try_from(qualifier.trim_end().len()) else {
+                    continue;
+                };
+                let Some(end) = range.start.checked_add(width) else {
+                    continue;
+                };
+                let qualifier = ByteRange {
+                    start: range.start,
+                    end,
+                };
+                result.record(self.checked_typescript_enum_qualifier(file, range, qualifier, work));
+            }
+        }
+        result.typescript_enum_qualifier_start =
+            (result.occurrences.len() != start).then_some(start);
+    }
+
+    fn checked_typescript_enum_qualifier(
+        &self,
+        file: &File<'source>,
+        written: ByteRange,
+        qualifier: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let member = self.javascript_target(file, written, ReferenceRole::Type, work)?;
+        if member.symbol.kind != "enum_member" {
+            return None;
+        }
+        let enumeration = self.javascript_target(file, qualifier, ReferenceRole::Type, work)?;
+        if enumeration.symbol.kind != "enum"
+            || member.file.path != enumeration.file.path
+            || member.symbol.container.as_deref()
+                != Some(enumeration.symbol.qualified_name.as_str())
+        {
+            return None;
+        }
+        let occurrence = self.occurrence(
+            file,
+            qualifier,
+            qualifier,
+            ReferenceRole::Unknown,
+            enumeration,
+        )?;
+        matches!(occurrence.target, NormalizedTarget::Symbol(_)).then_some(occurrence)
+    }
+
     /// References named selectors after admitting the existing static facts.
     pub(super) fn resolve_typescript_local_exports(
         &self,

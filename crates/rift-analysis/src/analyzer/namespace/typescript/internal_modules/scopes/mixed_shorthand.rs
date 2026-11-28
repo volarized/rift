@@ -13,7 +13,7 @@ use super::{
 };
 
 impl<'source> FileScopes<'source> {
-    /// Keeps separate identities for a checked binding and the literals that read it.
+    /// Keeps separate identities for a checked binding and its same-named literal properties.
     pub(in crate::analyzer::namespace::typescript::internal_modules) fn place_mixed_shorthand(
         &self,
         file: &SelectedFile<'source>,
@@ -40,7 +40,7 @@ impl<'source> FileScopes<'source> {
             group.iter().any(|symbol| destructured_local(symbol))
                 && group
                     .iter()
-                    .any(|symbol| shorthand_member(symbol, file.source))
+                    .any(|symbol| ordinary_private_property(symbol, file.source))
         });
         if groups.is_empty() {
             return;
@@ -64,6 +64,11 @@ impl<'source> FileScopes<'source> {
             }
         }
         let owners = LiteralOwners::new(file, facts, anchors);
+        let returned = facts
+            .returned_objects()
+            .iter()
+            .filter_map(|&(_, body)| body)
+            .collect::<BTreeSet<_>>();
         let mut occupied = anchors
             .values()
             .chain(placed.values().flat_map(|group| group.values()))
@@ -77,7 +82,7 @@ impl<'source> FileScopes<'source> {
             let Some(written) = bindings.get(local.name.as_str()) else {
                 continue;
             };
-            if !self.proves_mixed_shorthand(file, local, &members, written, &owners) {
+            if !self.proves_mixed_shorthand(file, local, &members, written, &owners, &returned) {
                 continue;
             }
             let exact = std::iter::once(*local)
@@ -102,6 +107,7 @@ impl<'source> FileScopes<'source> {
         members: &[&SyntaxSymbol],
         written: &[&StaticBinding],
         owners: &LiteralOwners<'source>,
+        returned: &BTreeSet<ByteRange>,
     ) -> bool {
         let Some((scope, name)) = self
             .checked_lexical_scope(file, local)
@@ -133,7 +139,11 @@ impl<'source> FileScopes<'source> {
             let Some(row) = self.body_members.get(&member.item_range) else {
                 return false;
             };
-            shorthand_member(member, file.source)
+            let direct_return = member.syntax_element_kind == Some("pair")
+                && returned.contains(&row.body)
+                && owners.returned.get(&row.body) == Some(&Some(owner.qualified_name.as_str()));
+            (member.syntax_element_kind == Some("shorthand_property_identifier") || direct_return)
+                && ordinary_private_property(member, file.source)
                 && local.item_range.end <= row.body.start
                 && scope.encloses(row.body)
                 && placed_function(owners, row.body)
@@ -156,9 +166,4 @@ fn placed_function<'source>(
 fn destructured_local(symbol: &SyntaxSymbol) -> bool {
     private_variable_declaration(symbol)
         && symbol.syntax_element_kind == Some("shorthand_property_identifier_pattern")
-}
-
-fn shorthand_member(symbol: &SyntaxSymbol, source: &str) -> bool {
-    symbol.syntax_element_kind == Some("shorthand_property_identifier")
-        && ordinary_private_property(symbol, source)
 }

@@ -170,6 +170,8 @@ pub(crate) struct StaticResolution {
     pub(crate) typescript_inline_import_type_start: Option<usize>,
     /// First module edge at a checked inline import specifier.
     pub(crate) typescript_inline_import_module_start: Option<usize>,
+    /// First checked reference at a TypeScript enum qualifier.
+    pub(crate) typescript_enum_qualifier_start: Option<usize>,
     pub(crate) python_comprehension_start: Option<usize>,
     /// Authored parent-module sites already resolved by the qualified-call pass.
     pub(crate) rust_call_parent_sites: BTreeMap<rift_core::SourceUnitId, BTreeSet<ByteRange>>,
@@ -419,6 +421,7 @@ fn resolve_by<'source>(
         append_late_occurrences(&mut resolution.occurrences, &mut inline_modules);
     index.resolve_typescript_namespace_type_uses(&mut work, &mut resolution);
     index.resolve_javascript_wrapped_arrow_reads(&mut work, &mut resolution);
+    index.resolve_typescript_enum_qualifiers(&mut work, &mut resolution);
     resolution.exhausted = work.exhausted || index.edge_python_classes.ended;
     resolution.ended |= resolution.exhausted;
     resolution

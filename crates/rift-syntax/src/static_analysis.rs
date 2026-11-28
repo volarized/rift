@@ -171,6 +171,17 @@ pub struct StaticAssignedCall {
     pub block: ByteRange,
 }
 
+/// One direct object literal assigned to a local name in an ECMAScript statement block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticAssignedObject {
+    /// The written lexical target.
+    pub target: ByteRange,
+    /// The complete object literal assigned to the target.
+    pub object: ByteRange,
+    /// The authored statement block that contains the assignment directly.
+    pub block: ByteRange,
+}
+
 /// One member of an ECMAScript object literal, type literal or class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticBodyMember {
@@ -469,6 +480,23 @@ pub struct StaticCommonJsExport {
     pub initialized: Vec<ByteRange>,
     /// The physical right-hand side of a checked direct object literal assignment.
     pub literal: Option<ByteRange>,
+    /// The physical function expression of a checked direct anonymous callable assignment.
+    pub anonymous_callable: Option<ByteRange>,
+}
+
+impl StaticCommonJsExport {
+    fn ranges_valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
+        valid(self.assignment)
+            && self.anonymous_callable.is_none_or(|callable| {
+                valid(callable)
+                    && contains(self.assignment, callable)
+                    && !self.synchronized
+                    && self.literal.is_none()
+                    && self.initialized.is_empty()
+            })
+            && self.initialized.iter().copied().all(valid)
+            && self.initialized.windows(2).all(|pair| pair[0] < pair[1])
+    }
 }
 
 /// A direct type annotation use with its written generic binding.
@@ -551,6 +579,8 @@ pub struct StaticFactsParts {
     pub assignments: Vec<ByteRange>,
     /// Direct call-result assignments and the blocks that contain them.
     pub assigned_calls: Vec<StaticAssignedCall>,
+    /// Direct object assignments and the blocks that contain them.
+    pub assigned_objects: Vec<StaticAssignedObject>,
     /// Name and member targets of assignments whose value is a function written in place.
     pub function_writes: Vec<ByteRange>,
     /// Plain assignments copying a member from `this`.
@@ -925,6 +955,12 @@ impl StaticFacts {
         &self.0.assigned_calls
     }
 
+    /// Object assignments whose written local target and direct block are known.
+    #[must_use]
+    pub fn assigned_objects(&self) -> &[StaticAssignedObject] {
+        &self.0.assigned_objects
+    }
+
     /// Name and member targets of assignments whose value is a function written in place.
     #[must_use]
     pub fn function_writes(&self) -> &[ByteRange] {
@@ -1176,6 +1212,7 @@ impl StaticFacts {
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
             vector_capacity(&self.0.assigned_calls),
+            vector_capacity(&self.0.assigned_objects),
             vector_capacity(&self.0.function_writes),
             vector_capacity(&self.0.member_copies),
             vector_capacity(&self.0.element_types),
@@ -1274,6 +1311,7 @@ impl StaticFacts {
             self.reexports().len(),
             self.assignments().len(),
             self.assigned_calls().len(),
+            self.assigned_objects().len(),
             self.function_writes().len(),
             self.member_copies().len(),
             self.element_types().len(),
@@ -1487,6 +1525,18 @@ impl StaticFacts {
                 .assigned_calls()
                 .windows(2)
                 .all(|pair| pair[0].target.start < pair[1].target.start)
+            && self.assigned_objects().iter().all(|row| {
+                valid(row.target)
+                    && valid(row.object)
+                    && valid(row.block)
+                    && row.target.end < row.object.start
+                    && row.block.encloses(row.target)
+                    && row.block.encloses(row.object)
+            })
+            && self
+                .assigned_objects()
+                .windows(2)
+                .all(|pair| pair[0].target.start < pair[1].target.start)
             && self.member_copies().iter().all(|copy| {
                 valid(copy.assignment)
                     && valid(copy.target)
@@ -1556,11 +1606,9 @@ impl StaticFacts {
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
         if !self.typescript_module_imports().iter().copied().all(valid)
-            || self.commonjs_export().is_some_and(|export| {
-                !valid(export.assignment)
-                    || !export.initialized.iter().copied().all(valid)
-                    || !export.initialized.windows(2).all(|pair| pair[0] < pair[1])
-            })
+            || self
+                .commonjs_export()
+                .is_some_and(|export| !export.ranges_valid(valid))
         {
             return errors::syntax::facts_range_invalid().fail();
         }

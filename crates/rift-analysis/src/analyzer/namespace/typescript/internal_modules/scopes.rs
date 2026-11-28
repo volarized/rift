@@ -1224,6 +1224,7 @@ struct LiteralOwners<'source> {
     returned: BTreeMap<ByteRange, Option<&'source str>>,
     array_initializers: BTreeMap<&'source str, ByteRange>,
     assigned_arrays: BTreeMap<ByteRange, &'source str>,
+    assigned_literal_bodies: BTreeMap<ByteRange, &'source str>,
 }
 
 impl<'source> LiteralOwners<'source> {
@@ -1250,13 +1251,17 @@ impl<'source> LiteralOwners<'source> {
         let object_methods = literal_object_method_owners(&unique, facts, anchors);
         let array_initializers = array_literal_owners(file, &unique, anchors);
         let mut initializers = BTreeMap::new();
-        for function in functions
-            .values()
-            .filter(|owner| owner.syntax_element_kind == Some("variable_declarator"))
-        {
-            if let Some(range) = function.body_range.and_then(|value| values.get(&value)) {
+        for function in functions.values() {
+            let range = match function.syntax_element_kind {
+                Some("variable_declarator") => function
+                    .body_range
+                    .and_then(|value| values.get(&value).copied()),
+                Some("assignment_expression") => closed_callable_scope(facts, function),
+                _ => None,
+            };
+            if let Some(range) = range {
                 initializers
-                    .entry(*range)
+                    .entry(range)
                     .and_modify(|owner| *owner = None)
                     .or_insert(Some(*function));
             }
@@ -1294,6 +1299,8 @@ impl<'source> LiteralOwners<'source> {
         }
         let assigned_arrays =
             assigned_literals::array_owners(file, facts, anchors, &unique, &enclosing);
+        let assigned_literal_bodies =
+            assigned_literals::local_assignment_owners(file, facts, anchors, &unique, &enclosing);
         Self {
             enclosing,
             callbacks: facts
@@ -1318,6 +1325,7 @@ impl<'source> LiteralOwners<'source> {
             returned: returned_literal_owners(&functions, &object_methods, facts),
             array_initializers,
             assigned_arrays,
+            assigned_literal_bodies,
         }
     }
 
@@ -1330,7 +1338,8 @@ impl<'source> LiteralOwners<'source> {
         if let Some(owner) = container
             && (self.returned.get(&member.body) == Some(&Some(owner))
                 || self.array_initializers.get(owner) == Some(&member.holder)
-                || self.assigned_arrays.get(&member.holder) == Some(&owner))
+                || self.assigned_arrays.get(&member.holder) == Some(&owner)
+                || self.assigned_literal_bodies.get(&member.body) == Some(&owner))
         {
             return true;
         }
@@ -1517,6 +1526,7 @@ fn literal_callable_owners<'source>(
             anchors.contains_key(&symbol.qualified_name)
                 && match symbol.syntax_element_kind {
                     Some("function_declaration") => true,
+                    Some("assignment_expression") => closed_callable_scope(facts, symbol).is_some(),
                     Some("variable_declarator") if symbol.kind == "variable" => {
                         symbol.kinds.contains(&SymbolKind::Callable)
                             && symbol.body_range.is_some_and(|value| {
@@ -1533,6 +1543,17 @@ fn literal_callable_owners<'source>(
         })
         .filter_map(|symbol| Some((symbol.name_range?, symbol)))
         .collect()
+}
+
+/// The unique physical function expression of an already placed anonymous default callable.
+fn closed_callable_scope(facts: &StaticFacts, symbol: &SyntaxSymbol) -> Option<ByteRange> {
+    let export = facts.commonjs_export()?;
+    let callable = export.anonymous_callable?;
+    (symbol.name == "default"
+        && symbol.kind == "function"
+        && symbol.item_range == export.assignment
+        && callable.encloses(symbol.body_range?))
+    .then_some(callable)
 }
 
 /// Names a placed method whose literal is the entire value of one checked declaration.

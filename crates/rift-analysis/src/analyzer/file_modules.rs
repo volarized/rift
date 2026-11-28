@@ -42,13 +42,13 @@ impl Records {
         self.retain_commonjs_argument_imports(semantics, limits.edges_max());
         self.retain_checked_inline_import_modules(semantics, limits.edges_max());
         if super::namespace::typescript::checked_commonjs_package(&namespace) {
-            self.retain_commonjs_expression_entry(owner, analyzed, semantics, limits)?;
+            self.retain_checked_commonjs_modules(owner, analyzed, semantics, limits)?;
         }
         self.retain_written_callback_argument_properties(owner, analyzed, limits)?;
         Ok(())
     }
 
-    fn retain_commonjs_expression_entry(
+    fn retain_checked_commonjs_modules(
         &mut self,
         owner: &SymbolOwner,
         analyzed: &[AnalyzedFile],
@@ -59,33 +59,78 @@ impl Records {
             return Ok(());
         }
         let candidates = commonjs_expression_entries(owner, analyzed, &self.units);
-        if candidates.values().all(Option::is_none) {
-            return Ok(());
+        if candidates.values().any(Option::is_some) {
+            self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
         }
-        self.retain_file_module_candidates(owner, &candidates, limits.declarations_max())?;
-        let complete = self
-            .declarations
-            .iter()
-            .filter(|row| row.source_complete && row.range.start == 0)
-            .map(|row| (row.symbol.as_str(), row.unit.as_str()))
-            .collect::<BTreeSet<_>>();
-        let entries = candidates
-            .into_iter()
-            .filter_map(|(id, file)| {
-                let (file, _) = file?;
-                complete
-                    .contains(&(id.as_str(), file.placement.unit().to_string().as_str()))
-                    .then(|| id.as_str().to_owned())
-            })
-            .collect::<BTreeSet<_>>();
-        if entries.is_empty() {
+        let targets = self.complete_require_targets();
+        if targets.is_empty() {
             return Ok(());
         }
         let (loaders, loads) =
-            checked_expression_loaders(owner, analyzed, &self.units, semantics, &entries);
+            checked_relative_require_sources(owner, analyzed, &self.units, semantics, &targets);
+        let before = self.declarations.len();
         self.retain_file_module_candidates(owner, &loaders, limits.declarations_max())?;
+        let admitted = self.declarations[before..]
+            .iter()
+            .filter(|row| row.source_complete)
+            .map(|row| row.symbol.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
         self.retain_file_module_edge_rows(loads.into_iter(), limits.edges_max());
+        if !admitted.is_empty() {
+            self.retain_ecmascript_callback_edges(
+                owner,
+                analyzed,
+                semantics,
+                limits,
+                EdgeKind::Calls,
+            )?;
+            let store = semantics.edges();
+            self.retain_file_module_edge_rows(
+                store.edges().filter(|edge| {
+                    edge.kind() == EdgeKind::Reads
+                        && edge.is_file_module_reference()
+                        && store
+                            .edge_module(edge.occurrence().unit())
+                            .is_some_and(|module| admitted.contains(module.as_str()))
+                }),
+                limits.edges_max(),
+            );
+        }
         self.retain_javascript_callback_argument_properties(owner, analyzed, limits)
+    }
+
+    fn complete_require_targets(&self) -> BTreeSet<String> {
+        let modules = self
+            .objects
+            .iter()
+            .filter(|object| object.kinds.contains(&SymbolKind::Module))
+            .filter_map(|object| object.id.as_ref())
+            .collect::<BTreeSet<_>>();
+        let units = self
+            .units
+            .iter()
+            .filter(|unit| unit.source_complete)
+            .map(|unit| (unit.unit.as_str(), unit.source.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let mut targets = BTreeMap::new();
+        for row in self
+            .declarations
+            .iter()
+            .filter(|row| modules.contains(&row.symbol))
+        {
+            let complete = row.source_complete
+                && row.range.start == 0
+                && units.get(row.unit.as_str()).copied() == Some(row.source.as_str());
+            targets
+                .entry(row.symbol.as_str())
+                .and_modify(|previous| *previous = false)
+                .or_insert(complete);
+        }
+        targets
+            .into_iter()
+            .filter(|(_, complete)| *complete)
+            .map(|(id, _)| id.to_owned())
+            .collect()
     }
 
     pub(super) fn retain_ecmascript_modules(
@@ -679,8 +724,8 @@ fn commonjs_expression_entries<'file>(
     candidates
 }
 
-/// Admits a complete secondary script only through its checked load of the entry.
-fn checked_expression_loaders<'file, 'edge>(
+/// Admits a complete secondary script through its checked load of a retained module.
+fn checked_relative_require_sources<'file, 'edge>(
     owner: &SymbolOwner,
     analyzed: &'file [AnalyzedFile],
     units: &[PackageSourceUnit],
